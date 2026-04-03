@@ -5,6 +5,8 @@ use tokio::sync::Mutex;
 
 use crate::db;
 use crate::error::{Error, Result};
+use crate::filters::engine::{self, AddressEntry, MessageData};
+use crate::filters::rules::FilterAction;
 use crate::mail::imap::{ImapConfig, ImapConnection};
 
 #[derive(Clone, serde::Serialize)]
@@ -168,6 +170,7 @@ fn sync_account_blocking(
 
 /// Sync a folder by fetching envelopes only (no message bodies).
 /// Bodies are fetched on-demand when the user opens a message.
+/// After syncing, runs filter rules on any newly synced messages.
 fn sync_folder_envelopes(
     db: &Arc<Mutex<rusqlite::Connection>>,
     account_id: &str,
@@ -198,6 +201,7 @@ fn sync_folder_envelopes(
     );
 
     let mut total_synced = 0u32;
+    let mut new_message_ids: Vec<String> = Vec::new();
 
     // Fetch envelopes in batches of 500 (envelopes are tiny, ~200 bytes each)
     for chunk in new_uids.chunks(500) {
@@ -223,7 +227,7 @@ fn sync_folder_envelopes(
             let id = format!("{}_{}_{}", account_id, folder_path, env.uid);
 
             let new_msg = db::messages::NewMessage {
-                id,
+                id: id.clone(),
                 account_id: account_id.to_string(),
                 folder_path: folder_path.to_string(),
                 uid: env.uid,
@@ -244,12 +248,38 @@ fn sync_folder_envelopes(
                 snippet,
             };
             db::messages::insert_message(&conn, &new_msg)?;
+            new_message_ids.push(id);
             total_synced += 1;
         }
 
         // Update last seen UID (use max of all UIDs in this chunk)
         if let Some(&max_uid) = chunk.iter().max() {
             db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+        }
+    }
+
+    // Run filter rules on newly synced messages
+    if !new_message_ids.is_empty() {
+        match run_filters_on_new_messages(db, account_id, folder_path, &new_message_ids, conn_imap)
+        {
+            Ok(filtered) => {
+                if filtered > 0 {
+                    log::info!(
+                        "Filters applied to {} of {} new messages in '{}'",
+                        filtered,
+                        new_message_ids.len(),
+                        folder_path
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Error running filters on new messages in '{}': {}",
+                    folder_path,
+                    e
+                );
+                // Don't fail the sync if filters error out
+            }
         }
     }
 
@@ -352,6 +382,287 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
         |row| row.get(0),
     )?;
     Ok(count)
+}
+
+/// Run filter rules on newly synced messages.
+///
+/// Loads enabled filters for the account from DB, builds MessageData for each
+/// new message, runs the filter engine, and executes any resulting IMAP actions
+/// using the already-open connection. Returns the count of messages affected.
+pub fn run_filters_on_new_messages(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    account_id: &str,
+    folder_path: &str,
+    new_message_ids: &[String],
+    imap_conn: &mut ImapConnection,
+) -> Result<u32> {
+    if new_message_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Load enabled filter rules for this account
+    let rules = {
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+        let all_rules = db::filters::list_filters(&conn, Some(account_id))?;
+        all_rules
+            .into_iter()
+            .filter(|r| r.enabled)
+            .collect::<Vec<_>>()
+    };
+
+    if rules.is_empty() {
+        return Ok(0);
+    }
+
+    log::info!(
+        "Running {} filter rules on {} new messages in '{}'",
+        rules.len(),
+        new_message_ids.len(),
+        folder_path
+    );
+
+    // Load message data for the new messages
+    let messages = {
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+        load_messages_by_ids(&conn, new_message_ids)?
+    };
+
+    // Evaluate filters for each message and collect actions
+    let mut move_targets: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut copy_targets: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut delete_uids: Vec<u32> = Vec::new();
+    let mut flag_add: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut flag_remove: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut mark_read_uids: Vec<u32> = Vec::new();
+    let mut mark_unread_uids: Vec<u32> = Vec::new();
+    let mut moved_ids: Vec<String> = Vec::new();
+    let mut deleted_ids: Vec<String> = Vec::new();
+    let mut affected = 0u32;
+
+    for msg in &messages {
+        let actions = engine::apply_filters(&rules, msg);
+        if actions.is_empty() {
+            continue;
+        }
+        affected += 1;
+
+        for action in &actions {
+            match action {
+                FilterAction::Move { target } => {
+                    move_targets
+                        .entry(target.clone())
+                        .or_default()
+                        .push(msg.uid);
+                    moved_ids.push(msg.id.clone());
+                }
+                FilterAction::Copy { target } => {
+                    copy_targets
+                        .entry(target.clone())
+                        .or_default()
+                        .push(msg.uid);
+                }
+                FilterAction::Delete => {
+                    delete_uids.push(msg.uid);
+                    deleted_ids.push(msg.id.clone());
+                }
+                FilterAction::Flag { value } => {
+                    let flag = format!("\\{}", capitalize_first(value));
+                    flag_add.entry(flag).or_default().push(msg.uid);
+                }
+                FilterAction::Unflag { value } => {
+                    let flag = format!("\\{}", capitalize_first(value));
+                    flag_remove.entry(flag).or_default().push(msg.uid);
+                }
+                FilterAction::MarkRead => {
+                    mark_read_uids.push(msg.uid);
+                }
+                FilterAction::MarkUnread => {
+                    mark_unread_uids.push(msg.uid);
+                }
+                FilterAction::Stop => {}
+            }
+        }
+    }
+
+    if affected == 0 {
+        return Ok(0);
+    }
+
+    // The folder should already be selected from sync, but re-select to be safe
+    imap_conn.select_folder(folder_path)?;
+
+    // Execute IMAP actions
+    if !mark_read_uids.is_empty() {
+        log::info!("Filter: marking {} messages as read", mark_read_uids.len());
+        imap_conn.set_flags(&mark_read_uids, &["\\Seen"], true)?;
+    }
+
+    if !mark_unread_uids.is_empty() {
+        log::info!(
+            "Filter: marking {} messages as unread",
+            mark_unread_uids.len()
+        );
+        imap_conn.set_flags(&mark_unread_uids, &["\\Seen"], false)?;
+    }
+
+    for (flag, uids) in &flag_add {
+        log::info!("Filter: adding flag '{}' to {} messages", flag, uids.len());
+        imap_conn.set_flags(uids, &[flag.as_str()], true)?;
+    }
+
+    for (flag, uids) in &flag_remove {
+        log::info!(
+            "Filter: removing flag '{}' from {} messages",
+            flag,
+            uids.len()
+        );
+        imap_conn.set_flags(uids, &[flag.as_str()], false)?;
+    }
+
+    for (target, uids) in &copy_targets {
+        log::info!("Filter: copying {} messages to '{}'", uids.len(), target);
+        imap_conn.copy_messages(uids, target)?;
+    }
+
+    for (target, uids) in &move_targets {
+        log::info!("Filter: moving {} messages to '{}'", uids.len(), target);
+        imap_conn.move_messages(uids, target)?;
+    }
+
+    // Delete messages not already moved
+    let delete_remaining: Vec<u32> = delete_uids
+        .iter()
+        .filter(|uid| {
+            !move_targets
+                .values()
+                .any(|moved_uids| moved_uids.contains(uid))
+        })
+        .copied()
+        .collect();
+    if !delete_remaining.is_empty() {
+        log::info!("Filter: deleting {} messages", delete_remaining.len());
+        imap_conn.delete_messages(&delete_remaining)?;
+    }
+
+    // Update local DB: remove moved/deleted messages
+    {
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+        let mut to_remove = moved_ids;
+        to_remove.extend(deleted_ids);
+        to_remove.sort();
+        to_remove.dedup();
+        if !to_remove.is_empty() {
+            log::info!(
+                "Filter: removing {} moved/deleted messages from local DB",
+                to_remove.len()
+            );
+            db::messages::delete_messages_by_ids(&conn, &to_remove)?;
+        }
+    }
+
+    Ok(affected)
+}
+
+/// Load messages by their IDs for filter evaluation.
+fn load_messages_by_ids(
+    conn: &rusqlite::Connection,
+    message_ids: &[String],
+) -> Result<Vec<MessageData>> {
+    if message_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!(
+        "SELECT id, uid, folder_path, from_name, from_email, to_addresses, cc_addresses, \
+                subject, size, has_attachments, flags \
+         FROM messages WHERE id IN ({})",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let uid: u32 = row.get(1)?;
+            let folder: String = row.get(2)?;
+            let from_name: Option<String> = row.get(3)?;
+            let from_email: String = row.get(4)?;
+            let to_json: String = row.get(5)?;
+            let cc_json: String = row.get(6)?;
+            let subject: Option<String> = row.get(7)?;
+            let size: i64 = row.get(8)?;
+            let has_attachments: bool = row.get(9)?;
+            let flags_json: String = row.get(10)?;
+
+            Ok((
+                id,
+                uid,
+                folder,
+                from_name,
+                from_email,
+                to_json,
+                cc_json,
+                subject,
+                size,
+                has_attachments,
+                flags_json,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for (id, uid, folder, from_name, from_email, to_json, cc_json, subject, size, has_attach, flags_json) in rows {
+        let to_addresses: Vec<AddressEntry> =
+            serde_json::from_str(&to_json).unwrap_or_default();
+        let cc_addresses: Vec<AddressEntry> =
+            serde_json::from_str(&cc_json).unwrap_or_default();
+        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+
+        messages.push(MessageData {
+            id,
+            uid,
+            folder_path: folder,
+            from_name,
+            from_email,
+            to_addresses,
+            cc_addresses,
+            subject,
+            size: size as u64,
+            has_attachments: has_attach,
+            flags,
+        });
+    }
+
+    Ok(messages)
+}
+
+/// Capitalize the first letter of a string.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
 }
 
 /// Parse an IMAP date string (from ENVELOPE) into RFC 3339.

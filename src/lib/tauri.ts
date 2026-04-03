@@ -99,3 +99,27 @@ export async function copyMessages(
 ): Promise<void> {
   return invoke("copy_messages", { accountId, messageIds, targetFolder });
 }
+
+// Filter rules
+export async function listFilters(
+  accountId?: string,
+): Promise<import("./types").FilterRule[]> {
+  return invoke("list_filters", { accountId: accountId ?? null });
+}
+
+export async function saveFilter(
+  rule: import("./types").FilterRule,
+): Promise<void> {
+  return invoke("save_filter", { rule });
+}
+
+export async function deleteFilter(filterId: string): Promise<void> {
+  return invoke("delete_filter", { filterId });
+}
+
+export async function applyFiltersToFolder(
+  accountId: string,
+  folderPath: string,
+): Promise<number> {
+  return invoke("apply_filters_to_folder", { accountId, folderPath });
+}

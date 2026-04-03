@@ -1006,6 +1006,7 @@ dependencies = [
  "mail-parser",
  "maildir",
  "native-tls",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

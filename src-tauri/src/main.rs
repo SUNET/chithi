@@ -4,6 +4,7 @@
 mod commands;
 mod db;
 mod error;
+mod filters;
 mod logging;
 mod mail;
 mod state;
@@ -40,6 +41,10 @@ fn main() {
             commands::actions::delete_messages,
             commands::actions::set_message_flags,
             commands::actions::copy_messages,
+            commands::filters::list_filters,
+            commands::filters::save_filter,
+            commands::filters::delete_filter,
+            commands::filters::apply_filters_to_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

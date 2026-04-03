@@ -82,6 +82,41 @@ export interface AccountConfig {
   use_tls: boolean;
 }
 
+export interface FilterRule {
+  id: string;
+  account_id: string | null;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  match_type: "all" | "any";
+  conditions: FilterCondition[];
+  actions: FilterAction[];
+  stop_processing: boolean;
+}
+
+export interface FilterCondition {
+  field: "from" | "to" | "cc" | "subject" | "size" | "has_attachment";
+  op:
+    | "contains"
+    | "not_contains"
+    | "equals"
+    | "not_equals"
+    | "matches_regex"
+    | "greater_than"
+    | "less_than";
+  value: string;
+}
+
+export type FilterAction =
+  | { action: "move"; target: string }
+  | { action: "copy"; target: string }
+  | { action: "delete" }
+  | { action: "flag"; value: string }
+  | { action: "unflag"; value: string }
+  | { action: "mark_read" }
+  | { action: "mark_unread" }
+  | { action: "stop" };
+
 export interface ComposeMessage {
   to: string[];
   cc: string[];

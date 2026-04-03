@@ -20,6 +20,11 @@ function goSettings() {
   router.push("/settings");
 }
 
+function goFilters() {
+  closeMenus();
+  router.push("/filters");
+}
+
 function setViewMode(mode: "right" | "tab") {
   uiStore.setMessageViewMode(mode);
   closeMenus();
@@ -55,6 +60,7 @@ function toggleReader() {
         <button class="menu-action" @click="toggleReader">
           {{ uiStore.readerVisible ? 'Hide' : 'Show' }} Message Pane
         </button>
+        <button class="menu-action" @click="goFilters">Message Filters</button>
         <div class="menu-separator"></div>
         <div class="menu-group-label">Message View Position</div>
         <button
