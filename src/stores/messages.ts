@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref, watch } from "vue";
+import { ref, computed, watch } from "vue";
 import type { MessageSummary, MessageBody } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
@@ -12,12 +12,15 @@ export const useMessagesStore = defineStore("messages", () => {
   const activeMessage = ref<MessageBody | null>(null);
   const activeMessageId = ref<string | null>(null);
   const loading = ref(false);
+  const loadingMore = ref(false);
   const loadingBody = ref(false);
   const page = ref(0);
   const total = ref(0);
-  const perPage = 50;
+  const perPage = 100;
   const sortColumn = ref<SortColumn>("date");
   const sortAsc = ref(false);
+
+  const hasMore = computed(() => messages.value.length < total.value);
 
   const accountsStore = useAccountsStore();
   const foldersStore = useFoldersStore();
@@ -29,7 +32,10 @@ export const useMessagesStore = defineStore("messages", () => {
       messages.value = [];
       return;
     }
-    if (resetPage) page.value = 0;
+    if (resetPage) {
+      page.value = 0;
+      messages.value = [];
+    }
     loading.value = true;
     try {
       const result = await api.getMessages(
@@ -40,10 +46,37 @@ export const useMessagesStore = defineStore("messages", () => {
         sortColumn.value,
         sortAsc.value,
       );
-      messages.value = result.messages;
+      if (resetPage) {
+        messages.value = result.messages;
+      } else {
+        messages.value = [...messages.value, ...result.messages];
+      }
       total.value = result.total;
     } finally {
       loading.value = false;
+    }
+  }
+
+  async function loadNextPage() {
+    if (loadingMore.value || !hasMore.value) return;
+    loadingMore.value = true;
+    page.value++;
+    try {
+      const accountId = accountsStore.activeAccountId;
+      const folderPath = foldersStore.activeFolderPath;
+      if (!accountId || !folderPath) return;
+      const result = await api.getMessages(
+        accountId,
+        folderPath,
+        page.value,
+        perPage,
+        sortColumn.value,
+        sortAsc.value,
+      );
+      messages.value = [...messages.value, ...result.messages];
+      total.value = result.total;
+    } finally {
+      loadingMore.value = false;
     }
   }
 
@@ -55,12 +88,9 @@ export const useMessagesStore = defineStore("messages", () => {
     try {
       activeMessage.value = await api.getMessageBody(accountId, messageId);
 
-      // Mark as read if unread
       const msg = messages.value.find((m) => m.id === messageId);
       if (msg && !msg.flags.includes("seen")) {
-        // Update locally first for instant UI feedback
         msg.flags = [...msg.flags, "seen"];
-        // Then sync to IMAP in background
         api
           .setMessageFlags(accountId, [messageId], ["seen"], true)
           .catch((e) => console.error("Failed to mark as read:", e));
@@ -70,17 +100,11 @@ export const useMessagesStore = defineStore("messages", () => {
     }
   }
 
-  async function loadNextPage() {
-    page.value++;
-    await fetchMessages(false);
-  }
-
   function setSort(column: SortColumn) {
     if (sortColumn.value === column) {
       sortAsc.value = !sortAsc.value;
     } else {
       sortColumn.value = column;
-      // Default sort direction per column
       sortAsc.value = column === "subject" || column === "from";
     }
     fetchMessages();
@@ -100,12 +124,14 @@ export const useMessagesStore = defineStore("messages", () => {
     activeMessage,
     activeMessageId,
     loading,
+    loadingMore,
     loadingBody,
     page,
     total,
     perPage,
     sortColumn,
     sortAsc,
+    hasMore,
     fetchMessages,
     loadMessage,
     loadNextPage,

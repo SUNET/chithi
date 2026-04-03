@@ -1,9 +1,11 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import type { SortColumn } from "@/stores/messages";
 import MessageListItem from "./MessageListItem.vue";
 
 const messagesStore = useMessagesStore();
+const scrollContainer = ref<HTMLElement | null>(null);
 
 const emit = defineEmits<{
   openMessage: [messageId: string];
@@ -21,6 +23,15 @@ function onOpen(messageId: string) {
 function sortIndicator(column: SortColumn): string {
   if (messagesStore.sortColumn !== column) return "";
   return messagesStore.sortAsc ? " \u25B4" : " \u25BE";
+}
+
+function onScroll() {
+  const el = scrollContainer.value;
+  if (!el) return;
+  // Load more when within 200px of the bottom
+  if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
+    messagesStore.loadNextPage();
+  }
 }
 </script>
 
@@ -54,11 +65,11 @@ function sortIndicator(column: SortColumn): string {
         Date{{ sortIndicator('date') }}
       </button>
     </div>
-    <div v-if="messagesStore.loading" class="loading">Loading...</div>
+    <div v-if="messagesStore.loading && messagesStore.messages.length === 0" class="loading">Loading...</div>
     <div v-else-if="messagesStore.messages.length === 0" class="empty">
       No messages
     </div>
-    <div v-else class="message-items">
+    <div v-else ref="scrollContainer" class="message-items" @scroll="onScroll">
       <MessageListItem
         v-for="msg in messagesStore.messages"
         :key="msg.id"
@@ -67,9 +78,12 @@ function sortIndicator(column: SortColumn): string {
         @select="onSelect(msg.id)"
         @open="onOpen(msg.id)"
       />
+      <div v-if="messagesStore.loadingMore" class="loading-more">
+        Loading more...
+      </div>
     </div>
     <div class="list-footer">
-      <span class="message-count">{{ messagesStore.total }} messages</span>
+      <span class="message-count">{{ messagesStore.messages.length }} of {{ messagesStore.total }}</span>
     </div>
   </div>
 </template>
@@ -151,6 +165,13 @@ function sortIndicator(column: SortColumn): string {
 .message-items {
   flex: 1;
   overflow-y: auto;
+}
+
+.loading-more {
+  padding: 8px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--color-text-muted);
 }
 
 .list-footer {
