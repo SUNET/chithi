@@ -54,6 +54,17 @@ export const useMessagesStore = defineStore("messages", () => {
     loadingBody.value = true;
     try {
       activeMessage.value = await api.getMessageBody(accountId, messageId);
+
+      // Mark as read if unread
+      const msg = messages.value.find((m) => m.id === messageId);
+      if (msg && !msg.flags.includes("seen")) {
+        // Update locally first for instant UI feedback
+        msg.flags = [...msg.flags, "seen"];
+        // Then sync to IMAP in background
+        api
+          .setMessageFlags(accountId, [messageId], ["seen"], true)
+          .catch((e) => console.error("Failed to mark as read:", e));
+      }
     } finally {
       loadingBody.value = false;
     }
