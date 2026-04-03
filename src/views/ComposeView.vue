@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRouter, useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import * as api from "@/lib/tauri";
 
 const router = useRouter();
+const route = useRoute();
 const accountsStore = useAccountsStore();
 
-const to = ref("");
-const cc = ref("");
+// Prefill from query params (reply/reply-all/forward)
+const to = ref((route.query.to as string) || "");
+const cc = ref((route.query.cc as string) || "");
 const bcc = ref("");
-const subject = ref("");
-const bodyText = ref("");
+const subject = ref((route.query.subject as string) || "");
+const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
 const error = ref<string | null>(null);
-const showCcBcc = ref(false);
+const showCcBcc = ref(!!cc.value);
 
 function parseAddresses(input: string): string[] {
   return input
