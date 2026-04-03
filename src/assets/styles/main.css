@@ -1,0 +1,95 @@
+/* === Dark theme (default) === */
+:root,
+[data-theme="dark"] {
+  --color-bg: #1e1e2e;
+  --color-bg-secondary: #252535;
+  --color-bg-tertiary: #2a2a3c;
+  --color-bg-hover: #313145;
+  --color-bg-active: #3a3a50;
+  --color-text: #cdd6f4;
+  --color-text-secondary: #a6adc8;
+  --color-text-muted: #6c7086;
+  --color-border: #313244;
+  --color-accent: #89b4fa;
+  --color-accent-hover: #74c7ec;
+  --color-unread: #f5e0dc;
+  --color-danger: #f38ba8;
+  --color-success: #a6e3a1;
+  --color-warning: #f9e2af;
+  --color-email-body-bg: #ffffff;
+  --color-email-body-text: #1a1a1a;
+
+  --sidebar-width: 48px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, sans-serif;
+  --font-mono: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+}
+
+/* === Light theme === */
+[data-theme="light"] {
+  --color-bg: #ffffff;
+  --color-bg-secondary: #f5f5f5;
+  --color-bg-tertiary: #eeeeee;
+  --color-bg-hover: #e8e8e8;
+  --color-bg-active: #d8d8e0;
+  --color-text: #1a1a2e;
+  --color-text-secondary: #444466;
+  --color-text-muted: #888899;
+  --color-border: #d0d0d8;
+  --color-accent: #3b6fca;
+  --color-accent-hover: #2a5eb8;
+  --color-unread: #1a1a2e;
+  --color-danger: #d04060;
+  --color-success: #30a060;
+  --color-warning: #b08020;
+  --color-email-body-bg: #ffffff;
+  --color-email-body-text: #1a1a1a;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}

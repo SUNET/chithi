@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/niceda/releases/devtools/schema.json",
+  "productName": "Emails",
+  "version": "0.1.0",
+  "identifier": "com.emails.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "Emails",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
