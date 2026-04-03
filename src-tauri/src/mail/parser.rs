@@ -177,6 +177,11 @@ pub fn parse_message_body(
         })
         .collect();
 
+    let list_id = match parsed.list_id() {
+        HeaderValue::Text(t) => Some(t.to_string()),
+        _ => None,
+    };
+
     Some(MessageBody {
         id: message_id.to_string(),
         subject,
@@ -190,5 +195,6 @@ pub fn parse_message_body(
         attachments,
         is_encrypted,
         is_signed,
+        list_id,
     })
 }

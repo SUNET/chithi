@@ -249,6 +249,10 @@ async function markSpam() {
           <span class="header-label">Date:</span>
           <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString() }}</span>
         </div>
+        <div v-if="messagesStore.activeMessage.list_id" class="header-row">
+          <span class="header-label">List:</span>
+          <span class="header-value list-id">{{ messagesStore.activeMessage.list_id }}</span>
+        </div>
       </div>
       <div class="message-body">
         <div
@@ -428,6 +432,12 @@ async function markSpam() {
 
 .header-value {
   color: var(--color-text-secondary);
+}
+
+.list-id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-text-muted);
 }
 
 .message-body {

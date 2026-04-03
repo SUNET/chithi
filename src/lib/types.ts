@@ -46,6 +46,7 @@ export interface MessageBody {
   attachments: Attachment[];
   is_encrypted: boolean;
   is_signed: boolean;
+  list_id: string | null;
 }
 
 export interface Attachment {

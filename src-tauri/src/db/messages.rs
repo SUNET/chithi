@@ -53,6 +53,7 @@ pub struct MessageBody {
     pub attachments: Vec<Attachment>,
     pub is_encrypted: bool,
     pub is_signed: bool,
+    pub list_id: Option<String>,
 }
 
 pub struct NewMessage {
