@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 
 defineProps<{
@@ -11,6 +11,20 @@ const emit = defineEmits<{
 }>();
 
 const messagesStore = useMessagesStore();
+
+// View mode: plain text by default
+const showHtml = ref(false);
+
+// Reset to plain text when switching messages
+watch(
+  () => messagesStore.activeMessageId,
+  () => {
+    showHtml.value = false;
+  },
+);
+
+const hasHtml = () => !!messagesStore.activeMessage?.body_html;
+const hasText = () => !!messagesStore.activeMessage?.body_text;
 
 // Toast for "link copied" feedback
 const toast = ref<string | null>(null);
@@ -55,7 +69,21 @@ function handleContextMenu(event: MouseEvent) {
     </div>
     <div v-else class="message-content">
       <div class="message-headers">
-        <h2 class="message-subject">{{ messagesStore.activeMessage.subject || "(no subject)" }}</h2>
+        <div class="headers-top">
+          <h2 class="message-subject">{{ messagesStore.activeMessage.subject || "(no subject)" }}</h2>
+          <div v-if="hasHtml()" class="view-toggle">
+            <button
+              class="toggle-btn"
+              :class="{ active: !showHtml }"
+              @click="showHtml = false"
+            >Plain Text</button>
+            <button
+              class="toggle-btn"
+              :class="{ active: showHtml }"
+              @click="showHtml = true"
+            >HTML</button>
+          </div>
+        </div>
         <div class="header-row">
           <span class="header-label">From:</span>
           <span class="header-value">
@@ -85,18 +113,39 @@ function handleContextMenu(event: MouseEvent) {
         </div>
       </div>
       <div class="message-body">
+        <!-- HTML view (user opted in) -->
         <div
-          v-if="messagesStore.activeMessage.body_html"
+          v-if="showHtml && hasHtml()"
           class="body-html-wrapper"
           @click="handleLinkClick"
           @contextmenu="handleContextMenu"
         >
+          <div class="no-remote-notice">Remote content blocked</div>
           <div
             class="body-html"
             v-html="messagesStore.activeMessage.body_html"
           />
         </div>
-        <pre v-else class="body-text" @contextmenu="handleContextMenu">{{ messagesStore.activeMessage.body_text }}</pre>
+        <!-- Plain text view (default) -->
+        <pre
+          v-else-if="hasText()"
+          class="body-text"
+          @contextmenu="handleContextMenu"
+        >{{ messagesStore.activeMessage.body_text }}</pre>
+        <!-- Fallback: only HTML available, no text part -->
+        <div
+          v-else-if="hasHtml()"
+          class="body-html-wrapper"
+          @click="handleLinkClick"
+          @contextmenu="handleContextMenu"
+        >
+          <div class="no-remote-notice">Remote content blocked</div>
+          <div
+            class="body-html"
+            v-html="messagesStore.activeMessage.body_html"
+          />
+        </div>
+        <div v-else class="empty">No message content</div>
       </div>
     </div>
 
@@ -154,11 +203,48 @@ function handleContextMenu(event: MouseEvent) {
   margin-bottom: 16px;
 }
 
+.headers-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
 .message-subject {
   font-size: 18px;
   font-weight: 600;
-  margin-bottom: 12px;
   line-height: 1.3;
+  flex: 1;
+}
+
+.view-toggle {
+  display: flex;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.toggle-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  border-right: 1px solid var(--color-border);
+}
+
+.toggle-btn:last-child {
+  border-right: none;
+}
+
+.toggle-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.toggle-btn.active {
+  background: var(--color-bg-active);
+  color: var(--color-text);
+  font-weight: 600;
 }
 
 .header-row {
@@ -182,6 +268,15 @@ function handleContextMenu(event: MouseEvent) {
   line-height: 1.5;
 }
 
+.no-remote-notice {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  background: #f0f0f0;
+  padding: 4px 8px;
+  border-radius: 3px;
+  margin-bottom: 8px;
+}
+
 .body-html-wrapper {
   background: var(--color-email-body-bg);
   color: var(--color-email-body-text);
@@ -193,11 +288,6 @@ function handleContextMenu(event: MouseEvent) {
 .body-html {
   word-wrap: break-word;
   overflow-wrap: break-word;
-}
-
-.body-html :deep(img) {
-  max-width: 100%;
-  height: auto;
 }
 
 .body-html :deep(a) {

@@ -147,6 +147,7 @@ pub fn parse_message_body(
     let body_html = parsed.body_html(0).map(|s| {
         ammonia::Builder::default()
             .add_generic_attributes(&["style"])
+            .rm_tags(&["img"])  // Strip all images — no remote content
             .clean(&s)
             .to_string()
     });
