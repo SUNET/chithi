@@ -35,6 +35,11 @@ fn main() {
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::get_sync_status,
             commands::sync_cmd::prefetch_bodies,
+            commands::compose::send_message,
+            commands::actions::move_messages,
+            commands::actions::delete_messages,
+            commands::actions::set_message_flags,
+            commands::actions::copy_messages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

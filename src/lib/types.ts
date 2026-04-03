@@ -81,3 +81,12 @@ export interface AccountConfig {
   password: string;
   use_tls: boolean;
 }
+
+export interface ComposeMessage {
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  body_text: string;
+  body_html: string | null;
+}

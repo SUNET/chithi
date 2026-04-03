@@ -60,3 +60,42 @@ export async function getSyncStatus(accountId: string): Promise<SyncStatus> {
 export async function prefetchBodies(accountId: string): Promise<number> {
   return invoke("prefetch_bodies", { accountId });
 }
+
+export async function sendMessage(
+  accountId: string,
+  message: import("./types").ComposeMessage,
+): Promise<void> {
+  return invoke("send_message", { accountId, message });
+}
+
+export async function moveMessages(
+  accountId: string,
+  messageIds: string[],
+  targetFolder: string,
+): Promise<void> {
+  return invoke("move_messages", { accountId, messageIds, targetFolder });
+}
+
+export async function deleteMessages(
+  accountId: string,
+  messageIds: string[],
+): Promise<void> {
+  return invoke("delete_messages", { accountId, messageIds });
+}
+
+export async function setMessageFlags(
+  accountId: string,
+  messageIds: string[],
+  flags: string[],
+  add: boolean,
+): Promise<void> {
+  return invoke("set_message_flags", { accountId, messageIds, flags, add });
+}
+
+export async function copyMessages(
+  accountId: string,
+  messageIds: string[],
+  targetFolder: string,
+): Promise<void> {
+  return invoke("copy_messages", { accountId, messageIds, targetFolder });
+}

@@ -270,10 +270,165 @@ impl ImapConnection {
         Ok(None)
     }
 
+    /// Move messages to a destination folder.
+    ///
+    /// Uses COPY + STORE \Deleted + EXPUNGE, which works on all IMAP servers
+    /// (unlike the MOVE extension which isn't universally supported).
+    pub fn move_messages(&mut self, uids: &[u32], dest_folder: &str) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+
+        let uid_set = uid_set_string(uids);
+        log::info!(
+            "IMAP moving {} messages (UIDs: {}) to '{}'",
+            uids.len(),
+            &uid_set[..uid_set.len().min(80)],
+            dest_folder
+        );
+
+        // 1. Copy messages to destination
+        self.session
+            .uid_copy(&uid_set, dest_folder)
+            .map_err(|e| {
+                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+            })?;
+        log::debug!("IMAP COPY to '{}' succeeded", dest_folder);
+
+        // 2. Mark originals as deleted
+        self.session
+            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+            .map_err(|e| {
+                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
+                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
+            })?;
+        log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
+
+        // 3. Expunge to permanently remove
+        self.session.expunge().map_err(|e| {
+            log::error!("IMAP EXPUNGE failed: {}", e);
+            Error::Imap(format!("EXPUNGE failed: {}", e))
+        })?;
+        log::info!("IMAP move complete: {} messages moved to '{}'", uids.len(), dest_folder);
+
+        Ok(())
+    }
+
+    /// Delete messages from the currently selected folder.
+    ///
+    /// Marks messages with \Deleted flag and expunges them.
+    pub fn delete_messages(&mut self, uids: &[u32]) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+
+        let uid_set = uid_set_string(uids);
+        log::info!(
+            "IMAP deleting {} messages (UIDs: {})",
+            uids.len(),
+            &uid_set[..uid_set.len().min(80)]
+        );
+
+        // Store \Deleted flag
+        self.session
+            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+            .map_err(|e| {
+                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
+                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
+            })?;
+        log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
+
+        // Expunge
+        self.session.expunge().map_err(|e| {
+            log::error!("IMAP EXPUNGE failed: {}", e);
+            Error::Imap(format!("EXPUNGE failed: {}", e))
+        })?;
+        log::info!("IMAP delete complete: {} messages expunged", uids.len());
+
+        Ok(())
+    }
+
+    /// Set or unset flags on messages.
+    ///
+    /// If `add` is true, adds the flags (+FLAGS); otherwise removes them (-FLAGS).
+    pub fn set_flags(&mut self, uids: &[u32], flags: &[&str], add: bool) -> Result<()> {
+        if uids.is_empty() || flags.is_empty() {
+            return Ok(());
+        }
+
+        let uid_set = uid_set_string(uids);
+        let flags_str = flags.join(" ");
+        let action = if add { "+FLAGS" } else { "-FLAGS" };
+        let store_cmd = format!("{} ({})", action, flags_str);
+
+        log::info!(
+            "IMAP {} flags [{}] on {} messages (UIDs: {})",
+            if add { "adding" } else { "removing" },
+            flags_str,
+            uids.len(),
+            &uid_set[..uid_set.len().min(80)]
+        );
+
+        self.session
+            .uid_store(&uid_set, &store_cmd)
+            .map_err(|e| {
+                log::error!("IMAP UID STORE {} failed: {}", store_cmd, e);
+                Error::Imap(format!("STORE {} failed: {}", store_cmd, e))
+            })?;
+
+        log::info!(
+            "IMAP flags updated: {} {} on {} messages",
+            if add { "added" } else { "removed" },
+            flags_str,
+            uids.len()
+        );
+
+        Ok(())
+    }
+
+    /// Copy messages to a destination folder without removing originals.
+    pub fn copy_messages(&mut self, uids: &[u32], dest_folder: &str) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+
+        let uid_set = uid_set_string(uids);
+        log::info!(
+            "IMAP copying {} messages (UIDs: {}) to '{}'",
+            uids.len(),
+            &uid_set[..uid_set.len().min(80)],
+            dest_folder
+        );
+
+        self.session
+            .uid_copy(&uid_set, dest_folder)
+            .map_err(|e| {
+                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+            })?;
+
+        log::info!(
+            "IMAP copy complete: {} messages copied to '{}'",
+            uids.len(),
+            dest_folder
+        );
+
+        Ok(())
+    }
+
     pub fn logout(mut self) {
         log::debug!("IMAP logging out");
         self.session.logout().ok();
     }
+}
+
+/// Build a comma-separated UID set string from a slice of UIDs.
+fn uid_set_string(uids: &[u32]) -> String {
+    uids.iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/tauri";
+import Toolbar from "@/components/mail/Toolbar.vue";
 import FolderTree from "@/components/mail/FolderTree.vue";
 import MessageList from "@/components/mail/MessageList.vue";
 import MessageReader from "@/components/mail/MessageReader.vue";
@@ -78,6 +79,20 @@ async function startBackgroundPrefetch() {
   }
 }
 
+// Periodic sync every 2 minutes
+let syncIntervalId: ReturnType<typeof setInterval> | null = null;
+
+async function periodicSync() {
+  for (const account of accountsStore.accounts) {
+    if (!account.enabled) continue;
+    try {
+      await api.triggerSync(account.id);
+    } catch (e) {
+      console.error("Periodic sync error:", e);
+    }
+  }
+}
+
 onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
@@ -89,7 +104,6 @@ onMounted(async () => {
     if (foldersStore.activeFolderPath) {
       await messagesStore.fetchMessages();
     }
-    // Start background body prefetch after sync completes
     startBackgroundPrefetch();
   });
 
@@ -105,25 +119,34 @@ onMounted(async () => {
       }
     }
   });
+
+  // Start periodic sync every 2 minutes
+  syncIntervalId = setInterval(periodicSync, 2 * 60 * 1000);
+});
+
+onUnmounted(() => {
+  if (syncIntervalId) clearInterval(syncIntervalId);
 });
 </script>
 
 <template>
   <div class="mail-view">
-    <!-- Folder pane -->
-    <div class="folder-pane" :style="{ width: uiStore.folderPaneWidth + 'px' }">
-      <FolderTree />
-    </div>
-    <div class="resize-handle" @mousedown="startResize('folder', $event)"></div>
+    <Toolbar />
+    <div class="mail-panes">
+      <!-- Folder pane -->
+      <div class="folder-pane" :style="{ width: uiStore.folderPaneWidth + 'px' }">
+        <FolderTree />
+      </div>
+      <div class="resize-handle" @mousedown="startResize('folder', $event)"></div>
 
-    <!-- Message list pane -->
-    <div
-      class="message-list-pane"
-      :style="{ width: uiStore.readerVisible ? uiStore.messageListWidth + 'px' : undefined }"
-      :class="{ expanded: !uiStore.readerVisible }"
-    >
-      <MessageList @open-message="onOpenMessage" />
-    </div>
+      <!-- Message list pane -->
+      <div
+        class="message-list-pane"
+        :style="{ width: uiStore.readerVisible ? uiStore.messageListWidth + 'px' : undefined }"
+        :class="{ expanded: !uiStore.readerVisible }"
+      >
+        <MessageList @open-message="onOpenMessage" />
+      </div>
 
     <!-- Resize handle between list and reader -->
     <div
@@ -132,9 +155,10 @@ onMounted(async () => {
       @mousedown="startResize('list', $event)"
     ></div>
 
-    <!-- Reader pane -->
-    <div v-if="uiStore.readerVisible" class="reader-pane">
-      <MessageReader @close="uiStore.hideReader()" />
+      <!-- Reader pane -->
+      <div v-if="uiStore.readerVisible" class="reader-pane">
+        <MessageReader @close="uiStore.hideReader()" />
+      </div>
     </div>
   </div>
 </template>
@@ -142,8 +166,15 @@ onMounted(async () => {
 <style scoped>
 .mail-view {
   display: flex;
+  flex-direction: column;
   height: 100%;
   width: 100%;
+}
+
+.mail-panes {
+  display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
 .folder-pane {

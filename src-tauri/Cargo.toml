@@ -26,6 +26,7 @@ fern = { version = "0.7", features = ["date-based"] }
 futures = "0.3"
 tantivy = "0.22"
 dirs = "6"
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

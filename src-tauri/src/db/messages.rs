@@ -237,6 +237,83 @@ pub fn update_maildir_path(conn: &Connection, message_id: &str, path: &str) -> R
 
 /// Returns (message_id, folder_path, uid, flags_json) for messages whose body
 /// has not been downloaded yet, ordered by date DESC (newest first).
+/// Returns (message_id, folder_path, uid) for each of the given message IDs.
+///
+/// Looks up the folder and IMAP UID for each message so that IMAP actions
+/// can be performed on them.
+pub fn get_message_uids(
+    conn: &Connection,
+    message_ids: &[String],
+) -> Result<Vec<(String, String, u32)>> {
+    if message_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!(
+        "SELECT id, folder_path, uid FROM messages WHERE id IN ({})",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(rows)
+}
+
+/// Delete messages from the local database by their IDs.
+pub fn delete_messages_by_ids(conn: &Connection, message_ids: &[String]) -> Result<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!("DELETE FROM messages WHERE id IN ({})", placeholders);
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    conn.execute(&query, params.as_slice())?;
+    Ok(())
+}
+
+/// Update the flags JSON string for a specific message.
+pub fn update_flags(conn: &Connection, message_id: &str, flags: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET flags = ?1 WHERE id = ?2",
+        params![flags, message_id],
+    )?;
+    Ok(())
+}
+
 pub fn get_unfetched_messages(
     conn: &Connection,
     account_id: &str,
