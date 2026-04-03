@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 
 defineProps<{
@@ -10,6 +11,37 @@ const emit = defineEmits<{
 }>();
 
 const messagesStore = useMessagesStore();
+
+// Toast for "link copied" feedback
+const toast = ref<string | null>(null);
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showToast(msg: string) {
+  toast.value = msg;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.value = null;
+  }, 2000);
+}
+
+function handleLinkClick(event: MouseEvent) {
+  const target = (event.target as HTMLElement).closest("a");
+  if (!target) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const href = target.getAttribute("href");
+  if (!href) return;
+
+  navigator.clipboard.writeText(href).then(() => {
+    showToast("Link copied to clipboard");
+  });
+}
+
+function handleContextMenu(event: MouseEvent) {
+  event.preventDefault();
+}
 </script>
 
 <template>
@@ -53,19 +85,23 @@ const messagesStore = useMessagesStore();
         </div>
       </div>
       <div class="message-body">
-        <!-- HTML emails rendered on white background for readability -->
         <div
           v-if="messagesStore.activeMessage.body_html"
           class="body-html-wrapper"
+          @click="handleLinkClick"
+          @contextmenu="handleContextMenu"
         >
           <div
             class="body-html"
             v-html="messagesStore.activeMessage.body_html"
           />
         </div>
-        <pre v-else class="body-text">{{ messagesStore.activeMessage.body_text }}</pre>
+        <pre v-else class="body-text" @contextmenu="handleContextMenu">{{ messagesStore.activeMessage.body_text }}</pre>
       </div>
     </div>
+
+    <!-- Toast notification -->
+    <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>
 
@@ -74,6 +110,7 @@ const messagesStore = useMessagesStore();
   height: 100%;
   overflow-y: auto;
   background: var(--color-bg);
+  position: relative;
 }
 
 .reader-toolbar {
@@ -145,7 +182,6 @@ const messagesStore = useMessagesStore();
   line-height: 1.5;
 }
 
-/* HTML emails are designed for light backgrounds — always render on white */
 .body-html-wrapper {
   background: var(--color-email-body-bg);
   color: var(--color-email-body-text);
@@ -166,11 +202,26 @@ const messagesStore = useMessagesStore();
 
 .body-html :deep(a) {
   color: #1a73e8;
+  cursor: pointer;
 }
 
 .body-text {
   white-space: pre-wrap;
   font-family: var(--font-mono);
   font-size: 13px;
+}
+
+.toast {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--color-bg-active);
+  color: var(--color-text);
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
 }
 </style>
