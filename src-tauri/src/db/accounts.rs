@@ -69,8 +69,8 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 }
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
-    let account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, password, use_tls, enabled FROM accounts WHERE id = ?1",
+    let mut account = conn.query_row(
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -86,22 +86,34 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 jmap_url: row.get(9)?,
                 caldav_url: row.get(10)?,
                 username: row.get(11)?,
-                password: row.get(12)?,
-                use_tls: row.get(13)?,
-                enabled: row.get(14)?,
+                password: String::new(),
+                use_tls: row.get(12)?,
+                enabled: row.get(13)?,
             })
         },
     ).map_err(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => crate::error::Error::AccountNotFound(id.to_string()),
         other => crate::error::Error::Database(other),
     })?;
+
+    // Fetch password from the system keyring
+    match crate::keyring::get_password(&account.id) {
+        Ok(pw) => account.password = pw,
+        Err(e) => {
+            log::warn!("Could not read password from keyring for account {}: {}", account.id, e);
+        }
+    }
+
     Ok(account)
 }
 
 pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
+    // Store password in system keyring
+    crate::keyring::set_password(id, &config.password)?;
+
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, password, use_tls)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             config.display_name,
@@ -115,7 +127,6 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.jmap_url,
             config.caldav_url,
             config.username,
-            config.password,
             config.use_tls,
         ],
     )?;
@@ -123,11 +134,14 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 }
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
+    // Update password in system keyring
+    crate::keyring::set_password(id, &config.password)?;
+
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
-         caldav_url=?10, username=?11, password=?12, use_tls=?13, updated_at=CURRENT_TIMESTAMP
-         WHERE id=?14",
+         caldav_url=?10, username=?11, use_tls=?12, updated_at=CURRENT_TIMESTAMP
+         WHERE id=?13",
         params![
             config.display_name,
             config.email,
@@ -140,7 +154,6 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.jmap_url,
             config.caldav_url,
             config.username,
-            config.password,
             config.use_tls,
             id,
         ],
@@ -153,6 +166,180 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 }
 
 pub fn delete_account(conn: &Connection, id: &str) -> Result<()> {
+    // Remove password from keyring (best-effort, don't block deletion)
+    if let Err(e) = crate::keyring::delete_password(id) {
+        log::warn!("Failed to remove keyring entry for account {}: {}", id, e);
+    }
     conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE accounts (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                mail_protocol TEXT NOT NULL DEFAULT 'imap',
+                imap_host TEXT NOT NULL DEFAULT '',
+                imap_port INTEGER NOT NULL DEFAULT 993,
+                smtp_host TEXT NOT NULL DEFAULT '',
+                smtp_port INTEGER NOT NULL DEFAULT 587,
+                jmap_url TEXT NOT NULL DEFAULT '',
+                caldav_url TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL,
+                use_tls INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn make_config(email: &str, name: &str) -> AccountConfig {
+        AccountConfig {
+            display_name: name.to_string(),
+            email: email.to_string(),
+            provider: "generic".to_string(),
+            mail_protocol: "imap".to_string(),
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            jmap_url: String::new(),
+            caldav_url: String::new(),
+            username: "user".to_string(),
+            password: "secret123".to_string(),
+            use_tls: true,
+        }
+    }
+
+    #[test]
+    fn test_list_accounts_empty() {
+        let conn = setup_db();
+        let accounts = list_accounts(&conn).unwrap();
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn test_insert_and_list_accounts() {
+        let conn = setup_db();
+        let config = make_config("alice@example.com", "Alice");
+        insert_account(&conn, "acc1", &config).unwrap();
+
+        let accounts = list_accounts(&conn).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "acc1");
+        assert_eq!(accounts[0].email, "alice@example.com");
+        assert_eq!(accounts[0].display_name, "Alice");
+        assert!(accounts[0].enabled);
+    }
+
+    #[test]
+    fn test_get_account_full_reads_all_fields() {
+        let conn = setup_db();
+        let config = make_config("alice@example.com", "Alice");
+        insert_account(&conn, "acc1", &config).unwrap();
+
+        let full = get_account_full(&conn, "acc1").unwrap();
+        assert_eq!(full.id, "acc1");
+        assert_eq!(full.email, "alice@example.com");
+        assert_eq!(full.imap_host, "imap.example.com");
+        assert_eq!(full.imap_port, 993);
+        assert_eq!(full.smtp_host, "smtp.example.com");
+        assert_eq!(full.smtp_port, 587);
+        assert_eq!(full.username, "user");
+        assert!(full.use_tls);
+        // Password comes from keyring, not DB — in test env it may be
+        // from the mock backend or real keyring depending on platform
+    }
+
+    #[test]
+    fn test_get_account_full_not_found() {
+        let conn = setup_db();
+        let result = get_account_full(&conn, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_account() {
+        let conn = setup_db();
+        let config = make_config("alice@example.com", "Alice");
+        insert_account(&conn, "acc1", &config).unwrap();
+
+        let mut updated = config.clone();
+        updated.display_name = "Alice Updated".to_string();
+        updated.imap_host = "new-imap.example.com".to_string();
+        update_account(&conn, "acc1", &updated).unwrap();
+
+        let full = get_account_full(&conn, "acc1").unwrap();
+        assert_eq!(full.display_name, "Alice Updated");
+        assert_eq!(full.imap_host, "new-imap.example.com");
+    }
+
+    #[test]
+    fn test_update_nonexistent_account() {
+        let conn = setup_db();
+        let config = make_config("alice@example.com", "Alice");
+        let result = update_account(&conn, "nonexistent", &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_account() {
+        let conn = setup_db();
+        let config = make_config("alice@example.com", "Alice");
+        insert_account(&conn, "acc1", &config).unwrap();
+
+        delete_account(&conn, "acc1").unwrap();
+        let accounts = list_accounts(&conn).unwrap();
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    fn test_no_password_column_in_db() {
+        let conn = setup_db();
+        // Verify the password column does NOT exist in the schema
+        let has_password = conn
+            .prepare("SELECT password FROM accounts LIMIT 0")
+            .is_ok();
+        assert!(!has_password, "DB should not have a password column");
+    }
+
+    #[test]
+    fn test_multiple_accounts() {
+        let conn = setup_db();
+        insert_account(&conn, "acc1", &make_config("alice@example.com", "Alice")).unwrap();
+        insert_account(&conn, "acc2", &make_config("bob@example.com", "Bob")).unwrap();
+
+        let accounts = list_accounts(&conn).unwrap();
+        assert_eq!(accounts.len(), 2);
+        // Sorted by display_name
+        assert_eq!(accounts[0].display_name, "Alice");
+        assert_eq!(accounts[1].display_name, "Bob");
+    }
+
+    #[test]
+    fn test_jmap_account() {
+        let conn = setup_db();
+        let mut config = make_config("kushal@example.com", "JMAP Account");
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://jmap.example.com".to_string();
+        insert_account(&conn, "acc1", &config).unwrap();
+
+        let full = get_account_full(&conn, "acc1").unwrap();
+        assert_eq!(full.mail_protocol, "jmap");
+        assert_eq!(full.jmap_url, "https://jmap.example.com");
+    }
 }

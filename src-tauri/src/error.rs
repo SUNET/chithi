@@ -26,6 +26,9 @@ pub enum Error {
     #[error("Sync error: {0}")]
     Sync(String),
 
+    #[error("Keyring error: {0}")]
+    Keyring(String),
+
     #[error("{0}")]
     Other(String),
 }

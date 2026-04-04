@@ -6,6 +6,7 @@ mod commands;
 mod db;
 mod error;
 mod filters;
+mod keyring;
 mod logging;
 mod mail;
 mod state;

@@ -20,7 +20,6 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             smtp_port INTEGER NOT NULL DEFAULT 587,
             jmap_url TEXT NOT NULL DEFAULT '',
             username TEXT NOT NULL,
-            password TEXT NOT NULL,
             use_tls INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
