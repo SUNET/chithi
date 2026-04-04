@@ -1,16 +1,21 @@
 <script setup lang="ts">
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
+import { useFoldersStore } from "@/stores/folders";
 import * as api from "@/lib/tauri";
 
 const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
+const foldersStore = useFoldersStore();
 
 async function syncAll() {
   for (const account of accountsStore.accounts) {
     if (account.enabled) {
       try {
-        await api.triggerSync(account.id);
+        await api.triggerSync(
+          account.id,
+          foldersStore.activeFolderPath ?? undefined,
+        );
       } catch (e) {
         console.error("Sync failed:", e);
       }

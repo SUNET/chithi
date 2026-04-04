@@ -86,7 +86,10 @@ async function periodicSync() {
   for (const account of accountsStore.accounts) {
     if (!account.enabled) continue;
     try {
-      await api.triggerSync(account.id);
+      await api.triggerSync(
+        account.id,
+        foldersStore.activeFolderPath ?? undefined,
+      );
     } catch (e) {
       console.error("Periodic sync error:", e);
     }

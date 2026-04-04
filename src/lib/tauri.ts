@@ -49,8 +49,14 @@ export async function getMessageBody(
   return invoke("get_message_body", { accountId, messageId });
 }
 
-export async function triggerSync(accountId: string): Promise<void> {
-  return invoke("trigger_sync", { accountId });
+export async function triggerSync(
+  accountId: string,
+  currentFolder?: string,
+): Promise<void> {
+  return invoke("trigger_sync", {
+    accountId,
+    currentFolder: currentFolder ?? null,
+  });
 }
 
 export async function getSyncStatus(accountId: string): Promise<SyncStatus> {

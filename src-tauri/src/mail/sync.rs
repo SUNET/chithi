@@ -36,7 +36,7 @@ struct SyncError {
     error: String,
 }
 
-/// Sync all folders for an account.
+/// Sync all folders for an account. If `current_folder` is set, sync it first.
 pub async fn sync_account(
     app: AppHandle,
     db: Arc<Mutex<rusqlite::Connection>>,
@@ -44,6 +44,7 @@ pub async fn sync_account(
     account_id: String,
     account_name: String,
     imap_config: ImapConfig,
+    current_folder: Option<String>,
 ) -> Result<()> {
     app.emit(
         "sync-started",
@@ -57,8 +58,9 @@ pub async fn sync_account(
     let app_clone = app.clone();
     let account_id_clone = account_id.clone();
 
+    let current_folder_clone = current_folder;
     let result = tokio::task::spawn_blocking(move || {
-        sync_account_blocking(&app_clone, db, &data_dir, &account_id_clone, &imap_config)
+        sync_account_blocking(&app_clone, db, &data_dir, &account_id_clone, &imap_config, current_folder_clone.as_deref())
     })
     .await
     .map_err(|e| Error::Sync(format!("Sync task panicked: {}", e)))?;
@@ -95,6 +97,7 @@ fn sync_account_blocking(
     data_dir: &PathBuf,
     account_id: &str,
     imap_config: &ImapConfig,
+    current_folder: Option<&str>,
 ) -> Result<u32> {
     let mut conn_imap = ImapConnection::connect(imap_config)?;
 
@@ -111,17 +114,19 @@ fn sync_account_blocking(
         }
     }
 
-    // Sync INBOX first, then others
-    let mut all_folders: Vec<&str> = Vec::new();
+    // Sync order: current folder first, then INBOX, then the rest
+    let mut priority: Vec<&str> = Vec::new();
     let mut others: Vec<&str> = Vec::new();
     for (_, path) in &imap_folders {
-        if path.to_uppercase() == "INBOX" {
-            all_folders.push(path.as_str());
+        if current_folder.map(|cf| cf == path.as_str()).unwrap_or(false) {
+            priority.insert(0, path.as_str());
+        } else if path.to_uppercase() == "INBOX" {
+            priority.push(path.as_str());
         } else {
             others.push(path.as_str());
         }
     }
-    all_folders.extend(others);
+    let all_folders: Vec<&str> = priority.into_iter().chain(others).collect();
 
     let total_folders = all_folders.len();
     let mut grand_total = 0u32;

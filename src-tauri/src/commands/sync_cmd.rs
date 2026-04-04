@@ -12,6 +12,7 @@ pub async fn trigger_sync(
     app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
+    current_folder: Option<String>,
 ) -> Result<()> {
     log::info!("Sync requested for account {}", account_id);
     let account = {
@@ -38,6 +39,7 @@ pub async fn trigger_sync(
         account_id,
         account.display_name,
         imap_config,
+        current_folder,
     )
     .await?;
 
