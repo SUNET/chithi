@@ -240,13 +240,19 @@ async function markSpam() {
     <div v-else class="message-content">
       <!-- Action bar -->
       <div class="message-actions">
-        <button class="action-btn" title="Reply" @click="reply">Reply</button>
-        <button class="action-btn" title="Reply All" @click="replyAll">Reply All</button>
-        <button class="action-btn" title="Forward" @click="forward">Forward</button>
+        <button class="action-btn" title="Reply" @click="reply">
+          <span class="action-icon">&#x21A9;</span> Reply
+        </button>
+        <button class="action-btn" title="Reply All" @click="replyAll">
+          <span class="action-icon">&#x21A9;</span> All
+        </button>
+        <button class="action-btn" title="Forward" @click="forward">
+          <span class="action-icon">&#x21AA;</span> Forward
+        </button>
         <div class="action-separator"></div>
-        <button class="action-btn" title="Archive" @click="archiveMessage">Archive</button>
-        <button class="action-btn" title="Spam" @click="markSpam">Spam</button>
-        <button class="action-btn action-danger" title="Delete" @click="deleteMessage">Delete</button>
+        <button class="icon-action" title="Archive" @click="archiveMessage">&#x1F4E6;</button>
+        <button class="icon-action" title="Report spam" @click="markSpam">&#x26A0;</button>
+        <button class="icon-action danger" title="Delete" @click="deleteMessage">&#x1F5D1;</button>
         <div class="action-spacer"></div>
         <div v-if="hasHtml()" class="view-toggle">
           <button
@@ -394,14 +400,19 @@ async function markSpam() {
   gap: 2px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-secondary);
+  background: var(--color-bg);
 }
 
 .action-btn {
-  padding: 4px 10px;
-  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 6px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--color-text-secondary);
+  transition: all 0.12s;
 }
 
 .action-btn:hover {
@@ -409,18 +420,35 @@ async function markSpam() {
   color: var(--color-text);
 }
 
-.action-danger {
-  color: var(--color-danger);
+.action-icon {
+  font-size: 13px;
 }
 
-.action-danger:hover {
+.icon-action {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  transition: background 0.12s;
+}
+
+.icon-action:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.icon-action.danger:hover {
   background: rgba(243, 139, 168, 0.1);
   color: var(--color-danger);
 }
 
 .action-separator {
   width: 1px;
-  height: 18px;
+  height: 20px;
   background: var(--color-border);
   margin: 0 4px;
 }
@@ -432,16 +460,18 @@ async function markSpam() {
 .view-toggle {
   display: flex;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: 20px;
   overflow: hidden;
   flex-shrink: 0;
 }
 
 .toggle-btn {
-  padding: 3px 10px;
+  padding: 4px 12px;
   font-size: 11px;
+  font-weight: 500;
   color: var(--color-text-muted);
   border-right: 1px solid var(--color-border);
+  transition: all 0.15s;
 }
 
 .toggle-btn:last-child {
@@ -450,12 +480,13 @@ async function markSpam() {
 
 .toggle-btn:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
 .toggle-btn.active {
-  background: var(--color-bg-active);
-  color: var(--color-text);
-  font-weight: 600;
+  background: var(--color-accent);
+  color: white;
+  font-weight: 500;
 }
 
 .message-headers {

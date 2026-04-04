@@ -108,10 +108,10 @@ function toggleReader() {
 .menu-bar {
   display: flex;
   align-items: center;
-  height: 28px;
-  background: var(--color-bg-secondary);
+  height: 32px;
+  background: var(--color-bg);
   border-bottom: 1px solid var(--color-border);
-  padding: 0 4px;
+  padding: 0 8px;
   font-size: 12px;
   flex-shrink: 0;
   user-select: none;
@@ -119,8 +119,8 @@ function toggleReader() {
 
 .menu-item {
   position: relative;
-  padding: 4px 10px;
-  border-radius: 4px;
+  padding: 4px 12px;
+  border-radius: 6px;
   cursor: pointer;
 }
 

@@ -83,8 +83,8 @@ async function syncAll() {
 
 <style scoped>
 .status-bar {
-  height: 28px;
-  background: var(--color-bg-secondary);
+  height: 30px;
+  background: var(--color-bg);
   border-top: 1px solid var(--color-border);
   display: flex;
   align-items: center;
