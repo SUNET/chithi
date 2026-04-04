@@ -369,8 +369,26 @@ fn ical_datetime_to_iso(val: &str, all_day: bool, _tzid: Option<&str>) -> String
 
 /// Convert an ISO 8601 datetime back to iCalendar format for use in REPLY.
 fn to_ical_datetime(iso: &str) -> String {
-    // Strip dashes and colons: "2025-04-15T10:00:00Z" -> "20250415T100000Z"
-    iso.replace('-', "").replace(':', "")
+    // Convert ISO 8601 to iCalendar format: "2025-04-15T10:00:00.000Z" -> "20250415T100000Z"
+    // Parse with chrono to normalize, then format as iCal UTC.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
+        return dt.with_timezone(&chrono::Utc).format("%Y%m%dT%H%M%SZ").to_string();
+    }
+    // Try parsing without timezone (treat as UTC)
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
+        iso.trim_end_matches('Z'),
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ) {
+        return dt.format("%Y%m%dT%H%M%SZ").to_string();
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
+        iso.trim_end_matches('Z'),
+        "%Y-%m-%dT%H:%M:%S",
+    ) {
+        return dt.format("%Y%m%dT%H%M%SZ").to_string();
+    }
+    // Fallback: just strip dashes/colons
+    iso.replace('-', "").replace(':', "").replace(".000", "")
 }
 
 /// Parse the ORGANIZER property from a VEVENT.

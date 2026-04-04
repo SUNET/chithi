@@ -25,6 +25,8 @@ pub struct JmapCalendarEvent {
     pub all_day: bool,
     pub recurrence_rule: Option<String>,
     pub uid: Option<String>,
+    pub organizer_email: Option<String>,
+    pub attendees_json: Option<String>,
 }
 
 #[derive(Clone)]
@@ -647,7 +649,7 @@ impl JmapConnection {
                     "properties": ["id", "calendarIds", "title", "description",
                                    "start", "duration", "showWithoutTime",
                                    "recurrenceRules", "uid", "locations",
-                                   "@type"]
+                                   "participants", "replyTo", "@type"]
                 }, "g1"]
             ]
         });
@@ -714,7 +716,38 @@ impl JmapConnection {
                 .filter(|a| !a.is_empty())
                 .map(|a| serde_json::to_string(a).unwrap_or_default());
 
-            log::debug!("  event: {} ({}) start={} end={}", title, id, start, end);
+            // Participants: JSCalendar uses { "id": { "name": "...", "email": "...", "kind": "individual", "roles": {...}, "participationStatus": "accepted" } }
+            let mut organizer_email = None;
+            let mut attendees: Vec<serde_json::Value> = Vec::new();
+            if let Some(participants) = ev["participants"].as_object() {
+                for (_pid, p) in participants {
+                    let email = p["sendTo"].as_object()
+                        .and_then(|s| s.get("imip"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim_start_matches("mailto:").to_string())
+                        .or_else(|| p["email"].as_str().map(|s| s.to_string()));
+                    let name = p["name"].as_str().map(|s| s.to_string());
+                    let status = p["participationStatus"].as_str().unwrap_or("needs-action").to_string();
+                    let roles = p["roles"].as_object();
+                    let is_owner = roles.map(|r| r.contains_key("owner")).unwrap_or(false);
+
+                    if is_owner {
+                        organizer_email = email.clone();
+                    }
+                    if let Some(ref em) = email {
+                        attendees.push(serde_json::json!({
+                            "email": em,
+                            "name": name,
+                            "status": status,
+                        }));
+                    }
+                }
+            }
+            let attendees_json = if attendees.is_empty() { None } else {
+                Some(serde_json::to_string(&attendees).unwrap_or_default())
+            };
+
+            log::debug!("  event: {} ({}) start={} end={} attendees={}", title, id, start, end, attendees.len());
             events.push(JmapCalendarEvent {
                 id,
                 calendar_id: cal_id,
@@ -726,6 +759,8 @@ impl JmapConnection {
                 all_day,
                 recurrence_rule,
                 uid,
+                organizer_email,
+                attendees_json,
             });
         }
 

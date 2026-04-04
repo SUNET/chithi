@@ -198,6 +198,8 @@ pub async fn create_event(
                 all_day: cal_event.all_day,
                 recurrence_rule: cal_event.recurrence_rule.clone(),
                 uid: cal_event.uid.clone(),
+                organizer_email: None,
+                attendees_json: None,
             };
             match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                 Ok(conn_jmap) => {
@@ -410,8 +412,8 @@ async fn sync_calendars_jmap(
                 all_day: ev.all_day,
                 timezone: None,
                 recurrence_rule: ev.recurrence_rule.clone(),
-                organizer_email: None,
-                attendees_json: None,
+                organizer_email: ev.organizer_email.clone(),
+                attendees_json: ev.attendees_json.clone(),
                 my_status: None,
                 source_message_id: None,
                 ical_data: None,
@@ -426,6 +428,32 @@ async fn sync_calendars_jmap(
                     e
                 );
             }
+        }
+
+        // Remove local events with remote_id that no longer exist on server
+        let server_ids: std::collections::HashSet<String> =
+            events.iter().map(|e| e.id.clone()).collect();
+        let local_synced: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, remote_id FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id IS NOT NULL AND remote_id != ''",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![account_id, local_cal_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        let mut deleted = 0u32;
+        for (local_id, remote_id) in &local_synced {
+            if !server_ids.contains(remote_id) {
+                conn.execute("DELETE FROM calendar_events WHERE id = ?1", rusqlite::params![local_id]).ok();
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            log::info!("sync_calendars: removed {} server-deleted events from '{}'", deleted, jcal.name);
         }
     }
 
@@ -461,6 +489,8 @@ async fn sync_calendars_jmap(
                     all_day: ev.all_day,
                     recurrence_rule: ev.recurrence_rule.clone(),
                     uid: ev.uid.clone(),
+                    organizer_email: ev.organizer_email.clone(),
+                    attendees_json: ev.attendees_json.clone(),
                 };
 
                 match jmap_conn.create_calendar_event(&jmap_config, &jmap_event).await {
@@ -607,6 +637,32 @@ async fn sync_calendars_caldav(
                     e
                 );
             }
+        }
+
+        // Remove local events with remote_id that no longer exist on server
+        let server_hrefs: std::collections::HashSet<String> =
+            caldav_events.iter().map(|e| e.href.clone()).collect();
+        let local_synced: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, remote_id FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id IS NOT NULL AND remote_id != ''",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![account_id, local_cal_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        let mut deleted = 0u32;
+        for (local_id, remote_id) in &local_synced {
+            if !server_hrefs.contains(remote_id) {
+                conn.execute("DELETE FROM calendar_events WHERE id = ?1", rusqlite::params![local_id]).ok();
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            log::info!("sync_calendars: removed {} server-deleted events from CalDAV calendar '{}'", deleted, cal.name);
         }
     }
 
