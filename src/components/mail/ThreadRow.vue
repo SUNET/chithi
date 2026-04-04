@@ -5,12 +5,13 @@ const props = defineProps<{
   thread: ThreadSummary;
   expanded: boolean;
   active: boolean;
+  selected: boolean;
 }>();
 
 defineEmits<{
   toggle: [];
-  select: [];
   open: [];
+  toggleSelect: [];
 }>();
 
 function formatDate(dateStr: string): string {
@@ -48,12 +49,19 @@ function isReply(): boolean {
 </script>
 
 <template>
-  <button
+  <div
     class="thread-row"
-    :class="{ active, unread: hasUnread() }"
-    @click="$emit('select')"
+    :class="{ active, selected, unread: hasUnread() }"
     @dblclick="$emit('open')"
   >
+    <div class="col col-check">
+      <input
+        type="checkbox"
+        class="row-checkbox"
+        :checked="selected"
+        @click.stop="$emit('toggleSelect')"
+      />
+    </div>
     <div class="col col-icons">
       <span
         class="expand-icon"
@@ -75,7 +83,7 @@ function isReply(): boolean {
     <div class="col col-date">
       {{ formatDate(thread.last_date) }}
     </div>
-  </button>
+  </div>
 </template>
 
 <style scoped>
@@ -88,6 +96,8 @@ function isReply(): boolean {
   border-bottom: 1px solid var(--color-border);
   font-size: 12px;
   transition: background 0.1s;
+  cursor: default;
+  user-select: none;
 }
 
 .thread-row:hover {
@@ -98,11 +108,35 @@ function isReply(): boolean {
   background: var(--color-bg-active);
 }
 
+.thread-row.selected {
+  background: #3b82f633;
+}
+
+.thread-row.selected:hover {
+  background: #3b82f644;
+}
+
 .col {
   padding: 0 6px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.col-check {
+  width: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.row-checkbox {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: var(--color-accent);
 }
 
 .col-icons {

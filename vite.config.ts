@@ -11,6 +11,11 @@ export default defineConfig(async () => ({
       "@": resolve(__dirname, "./src"),
     },
   },
+  test: {
+    environment: "happy-dom",
+    globals: true,
+    exclude: ["e2e-tests/**", "node_modules/**"],
+  },
   clearScreen: false,
   server: {
     port: 1420,

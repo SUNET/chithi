@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
 import type { SortColumn } from "@/stores/messages";
@@ -14,6 +14,35 @@ const emit = defineEmits<{
   openMessage: [messageId: string];
 }>();
 
+// Track modifier keys independently via keydown/keyup since
+// WebKitGTK can lose event.shiftKey on click events.
+const shiftHeld = ref(false);
+const ctrlHeld = ref(false);
+
+function onKeyDown(event: KeyboardEvent) {
+  if (event.key === "Shift") shiftHeld.value = true;
+  if (event.key === "Control" || event.key === "Meta") ctrlHeld.value = true;
+  if (event.key === "Delete" && messagesStore.selectedIds.length > 0) {
+    event.preventDefault();
+    messagesStore.deleteSelected();
+  }
+}
+
+function onKeyUp(event: KeyboardEvent) {
+  if (event.key === "Shift") shiftHeld.value = false;
+  if (event.key === "Control" || event.key === "Meta") ctrlHeld.value = false;
+}
+
+onMounted(() => {
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeyDown);
+  window.removeEventListener("keyup", onKeyUp);
+});
+
 // Right-click context menu
 const contextMenu = ref<{
   x: number;
@@ -22,8 +51,17 @@ const contextMenu = ref<{
   threadId?: string;
 } | null>(null);
 
-function onSelect(messageId: string) {
-  messagesStore.loadMessage(messageId);
+function onSelect(messageId: string, event?: MouseEvent) {
+  closeContextMenu();
+  // Check both keyboard tracker AND MouseEvent for modifier keys.
+  // WebKitGTK may lose one or the other depending on context.
+  const isShift = shiftHeld.value || (event?.shiftKey ?? false);
+  const isCtrl = ctrlHeld.value || (event?.ctrlKey ?? false) || (event?.metaKey ?? false);
+  messagesStore.selectMessage(messageId, {
+    shiftKey: isShift,
+    ctrlKey: isCtrl,
+    metaKey: false,
+  });
 }
 
 function onOpen(messageId: string) {
@@ -31,10 +69,9 @@ function onOpen(messageId: string) {
   emit("openMessage", messageId);
 }
 
-function onThreadSelect(thread: { message_ids: string[] }) {
-  // Select the latest message in the thread
+function onThreadSelect(thread: { message_ids: string[] }, event: MouseEvent) {
   if (thread.message_ids.length > 0) {
-    messagesStore.loadMessage(thread.message_ids[0]);
+    onSelect(thread.message_ids[0], event);
   }
 }
 
@@ -92,6 +129,9 @@ const displayedCount = () => {
 <template>
   <div class="message-list" @click="closeContextMenu">
     <div class="column-headers">
+      <div class="col col-check">
+        <!-- select-all checkbox could go here -->
+      </div>
       <div class="col col-icons">
         <span class="col-icon" title="Read/Star">&#x2606;</span>
       </div>
@@ -134,28 +174,35 @@ const displayedCount = () => {
       @scroll="onScroll"
     >
       <template v-for="thread in messagesStore.threads" :key="thread.thread_id">
-        <ThreadRow
-          :thread="thread"
-          :expanded="messagesStore.expandedThreads.has(thread.thread_id)"
-          :active="thread.message_ids.includes(messagesStore.activeMessageId ?? '')"
-          @toggle="messagesStore.toggleThread(thread.thread_id)"
-          @select="onThreadSelect(thread)"
-          @open="onThreadOpen(thread)"
+        <div
+          @click="onThreadSelect(thread, $event)"
           @contextmenu.prevent="onRowContextMenu($event, thread.message_ids[0])"
-        />
+        >
+          <ThreadRow
+            :thread="thread"
+            :expanded="messagesStore.expandedThreads.includes(thread.thread_id)"
+            :active="thread.message_ids.includes(messagesStore.activeMessageId ?? '')"
+            :selected="thread.message_ids.some((id) => messagesStore.isSelected(id))"
+            @toggle="messagesStore.toggleThread(thread.thread_id)"
+            @toggle-select="messagesStore.toggleSelectMessage(thread.message_ids[0])"
+            @open="onThreadOpen(thread)"
+          />
+        </div>
         <!-- Expanded thread messages -->
-        <template v-if="messagesStore.expandedThreads.has(thread.thread_id)">
+        <template v-if="messagesStore.expandedThreads.includes(thread.thread_id)">
           <div
-            v-for="msg in messagesStore.threadMessages.get(thread.thread_id) ?? []"
+            v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? [])"
             :key="msg.id"
             class="thread-child"
+            @click="onSelect(msg.id, $event)"
+            @contextmenu.prevent="onRowContextMenu($event, msg.id)"
           >
             <MessageListItem
               :message="msg"
               :active="messagesStore.activeMessageId === msg.id"
-              @select="onSelect(msg.id)"
+              :selected="messagesStore.isSelected(msg.id)"
+              @toggle="messagesStore.toggleSelectMessage(msg.id)"
               @open="onOpen(msg.id)"
-              @contextmenu.prevent="onRowContextMenu($event, msg.id)"
             />
           </div>
         </template>
@@ -165,15 +212,20 @@ const displayedCount = () => {
 
     <!-- Flat view -->
     <div v-else ref="scrollContainer" class="message-items" @scroll="onScroll">
-      <MessageListItem
+      <div
         v-for="msg in messagesStore.messages"
         :key="msg.id"
-        :message="msg"
-        :active="messagesStore.activeMessageId === msg.id"
-        @select="onSelect(msg.id)"
-        @open="onOpen(msg.id)"
+        @click="onSelect(msg.id, $event)"
         @contextmenu.prevent="onRowContextMenu($event, msg.id)"
-      />
+      >
+        <MessageListItem
+          :message="msg"
+          :active="messagesStore.activeMessageId === msg.id"
+          :selected="messagesStore.isSelected(msg.id)"
+          @toggle="messagesStore.toggleSelectMessage(msg.id)"
+          @open="onOpen(msg.id)"
+        />
+      </div>
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>
     </div>
 
@@ -223,11 +275,16 @@ const displayedCount = () => {
   text-overflow: ellipsis;
 }
 
+.col-check {
+  width: 24px;
+  flex-shrink: 0;
+}
+
 .col-icons {
   display: flex;
   align-items: center;
   gap: 4px;
-  width: 50px;
+  width: 40px;
   flex-shrink: 0;
   justify-content: center;
 }
@@ -272,6 +329,8 @@ const displayedCount = () => {
 .message-items {
   flex: 1;
   overflow-y: auto;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .thread-child {

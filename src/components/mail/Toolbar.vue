@@ -10,39 +10,23 @@ const accountsStore = useAccountsStore();
 const messagesStore = useMessagesStore();
 const foldersStore = useFoldersStore();
 
-const hasSelection = () => messagesStore.activeMessageId !== null;
+const getSelectedIds = () => [...messagesStore.selectedIds];
+const hasSelection = () => messagesStore.selectedIds.length > 0;
+const selectionCount = () => messagesStore.selectedIds.length;
 
 function compose() {
   router.push("/compose");
 }
 
 async function deleteSelected() {
-  const accountId = accountsStore.activeAccountId;
-  const msgId = messagesStore.activeMessageId;
-  if (!accountId || !msgId) return;
-
-  try {
-    await api.deleteMessages(accountId, [msgId]);
-    messagesStore.activeMessage = null;
-    messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
-  } catch (e) {
-    console.error("Delete failed:", e);
-  }
+  await messagesStore.deleteSelected();
 }
 
 async function toggleRead() {
   const accountId = accountsStore.activeAccountId;
-  const msgId = messagesStore.activeMessageId;
-  if (!accountId || !msgId) return;
-
-  const msg = messagesStore.messages.find((m) => m.id === msgId);
-  if (!msg) return;
-
-  const isSeen = msg.flags.includes("seen");
+  if (!accountId || !hasSelection()) return;
   try {
-    await api.setMessageFlags(accountId, [msgId], ["seen"], !isSeen);
+    await api.setMessageFlags(accountId, getSelectedIds(), ["seen"], true);
     await messagesStore.fetchMessages();
     await foldersStore.fetchFolders();
   } catch (e) {
@@ -52,15 +36,9 @@ async function toggleRead() {
 
 async function toggleStar() {
   const accountId = accountsStore.activeAccountId;
-  const msgId = messagesStore.activeMessageId;
-  if (!accountId || !msgId) return;
-
-  const msg = messagesStore.messages.find((m) => m.id === msgId);
-  if (!msg) return;
-
-  const isFlagged = msg.flags.includes("flagged");
+  if (!accountId || !hasSelection()) return;
   try {
-    await api.setMessageFlags(accountId, [msgId], ["flagged"], !isFlagged);
+    await api.setMessageFlags(accountId, getSelectedIds(), ["flagged"], true);
     await messagesStore.fetchMessages();
   } catch (e) {
     console.error("Flag change failed:", e);
@@ -69,17 +47,12 @@ async function toggleStar() {
 
 async function archiveSelected() {
   const accountId = accountsStore.activeAccountId;
-  const msgId = messagesStore.activeMessageId;
-  if (!accountId || !msgId) return;
-
-  // Find archive folder
-  const archiveFolder = foldersStore.folders.find(
-    (f) => f.folder_type === "archive",
-  );
-  if (!archiveFolder) return;
-
+  if (!accountId || !hasSelection()) return;
+  const folder = foldersStore.folders.find((f) => f.folder_type === "archive");
+  if (!folder) return;
   try {
-    await api.moveMessages(accountId, [msgId], archiveFolder.path);
+    await api.moveMessages(accountId, getSelectedIds(), folder.path);
+    messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
     await messagesStore.fetchMessages();
@@ -91,16 +64,12 @@ async function archiveSelected() {
 
 async function markSpam() {
   const accountId = accountsStore.activeAccountId;
-  const msgId = messagesStore.activeMessageId;
-  if (!accountId || !msgId) return;
-
-  const spamFolder = foldersStore.folders.find(
-    (f) => f.folder_type === "junk",
-  );
-  if (!spamFolder) return;
-
+  if (!accountId || !hasSelection()) return;
+  const folder = foldersStore.folders.find((f) => f.folder_type === "junk");
+  if (!folder) return;
   try {
-    await api.moveMessages(accountId, [msgId], spamFolder.path);
+    await api.moveMessages(accountId, getSelectedIds(), folder.path);
+    messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
     await messagesStore.fetchMessages();
@@ -144,7 +113,7 @@ async function markSpam() {
     <div class="toolbar-separator"></div>
     <button
       class="toolbar-btn"
-      title="Toggle read/unread"
+      title="Mark as read"
       :disabled="!hasSelection()"
       @click="toggleRead"
     >
@@ -152,12 +121,15 @@ async function markSpam() {
     </button>
     <button
       class="toolbar-btn"
-      title="Toggle star"
+      title="Star"
       :disabled="!hasSelection()"
       @click="toggleStar"
     >
       Star
     </button>
+    <span v-if="selectionCount() > 1" class="selection-count">
+      {{ selectionCount() }} selected
+    </span>
   </div>
 </template>
 
@@ -206,5 +178,11 @@ async function markSpam() {
   height: 20px;
   background: var(--color-border);
   margin: 0 4px;
+}
+
+.selection-count {
+  font-size: 11px;
+  color: var(--color-accent);
+  margin-left: 8px;
 }
 </style>

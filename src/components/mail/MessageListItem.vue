@@ -4,10 +4,11 @@ import type { MessageSummary } from "@/lib/types";
 defineProps<{
   message: MessageSummary;
   active: boolean;
+  selected: boolean;
 }>();
 
 defineEmits<{
-  select: [];
+  toggle: [];
   open: [];
 }>();
 
@@ -46,12 +47,19 @@ function isReply(subject: string | null, flags: string[]): boolean {
 </script>
 
 <template>
-  <button
+  <div
     class="message-row"
-    :class="{ active, unread: isUnread(message.flags) }"
-    @click="$emit('select')"
+    :class="{ active, selected, unread: isUnread(message.flags) }"
     @dblclick="$emit('open')"
   >
+    <div class="col col-check">
+      <input
+        type="checkbox"
+        class="row-checkbox"
+        :checked="selected"
+        @click.stop="$emit('toggle')"
+      />
+    </div>
     <div class="col col-icons">
       <span
         class="icon-read"
@@ -72,7 +80,7 @@ function isReply(subject: string | null, flags: string[]): boolean {
     <div class="col col-date">
       {{ formatDate(message.date) }}
     </div>
-  </button>
+  </div>
 </template>
 
 <style scoped>
@@ -85,6 +93,8 @@ function isReply(subject: string | null, flags: string[]): boolean {
   border-bottom: 1px solid var(--color-border);
   font-size: 12px;
   transition: background 0.1s;
+  cursor: default;
+  user-select: none;
 }
 
 .message-row:hover {
@@ -95,6 +105,14 @@ function isReply(subject: string | null, flags: string[]): boolean {
   background: var(--color-bg-active);
 }
 
+.message-row.selected {
+  background: #3b82f633;
+}
+
+.message-row.selected:hover {
+  background: #3b82f644;
+}
+
 .col {
   padding: 0 6px;
   white-space: nowrap;
@@ -102,11 +120,27 @@ function isReply(subject: string | null, flags: string[]): boolean {
   text-overflow: ellipsis;
 }
 
+.col-check {
+  width: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.row-checkbox {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: var(--color-accent);
+}
+
 .col-icons {
   display: flex;
   align-items: center;
   gap: 4px;
-  width: 50px;
+  width: 40px;
   flex-shrink: 0;
   padding: 0 4px;
 }

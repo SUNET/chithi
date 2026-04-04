@@ -20,16 +20,24 @@ export type SortColumn = "subject" | "from" | "date" | "flagged";
 //
 // Both modes support infinite scroll (loadNextPage), sorting, and mark-as-read.
 // Switching between modes triggers a full re-fetch.
+//
+// Selection uses a plain string array (not Set) because Vue's reactivity system
+// reliably tracks array mutations but can miss Set changes.
 export const useMessagesStore = defineStore("messages", () => {
   // Flat mode state
   const messages = ref<MessageSummary[]>([]);
   // Threaded mode state
   const threads = ref<ThreadSummary[]>([]);
-  const expandedThreads = ref<Set<string>>(new Set());
-  const threadMessages = ref<Map<string, MessageSummary[]>>(new Map());
+  const expandedThreads = ref<string[]>([]);
+  const threadMessages = ref<Record<string, MessageSummary[]>>({});
 
   const activeMessage = ref<MessageBody | null>(null);
   const activeMessageId = ref<string | null>(null);
+  // Multi-select: array of selected message IDs.
+  // Uses array instead of Set for Vue reactivity compatibility.
+  const selectedIds = ref<string[]>([]);
+  // Tracks the last clicked message ID for Shift+click range selection.
+  const lastClickedId = ref<string | null>(null);
   const loading = ref(false);
   const loadingMore = ref(false);
   const loadingBody = ref(false);
@@ -51,6 +59,13 @@ export const useMessagesStore = defineStore("messages", () => {
     return messages.value.length < total.value;
   });
 
+  // Computed for quick lookup
+  const selectedSet = computed(() => new Set(selectedIds.value));
+
+  function isSelected(id: string): boolean {
+    return selectedIds.value.includes(id);
+  }
+
   async function fetchMessages(resetPage = true) {
     const accountId = accountsStore.activeAccountId;
     const folderPath = foldersStore.activeFolderPath;
@@ -63,8 +78,8 @@ export const useMessagesStore = defineStore("messages", () => {
       page.value = 0;
       messages.value = [];
       threads.value = [];
-      expandedThreads.value = new Set();
-      threadMessages.value = new Map();
+      expandedThreads.value = [];
+      threadMessages.value = {};
     }
     loading.value = true;
     try {
@@ -144,45 +159,82 @@ export const useMessagesStore = defineStore("messages", () => {
   }
 
   async function toggleThread(threadId: string) {
-    if (expandedThreads.value.has(threadId)) {
-      expandedThreads.value.delete(threadId);
-      expandedThreads.value = new Set(expandedThreads.value);
+    const idx = expandedThreads.value.indexOf(threadId);
+    if (idx !== -1) {
+      expandedThreads.value.splice(idx, 1);
     } else {
-      // Fetch thread messages if not cached
-      if (!threadMessages.value.has(threadId)) {
+      if (!threadMessages.value[threadId]) {
         const accountId = accountsStore.activeAccountId;
         const folderPath = foldersStore.activeFolderPath;
         if (!accountId || !folderPath) return;
         const msgs = await api.getThreadMessages(accountId, folderPath, threadId);
-        threadMessages.value.set(threadId, msgs);
-        threadMessages.value = new Map(threadMessages.value);
+        threadMessages.value = { ...threadMessages.value, [threadId]: msgs };
       }
-      expandedThreads.value.add(threadId);
-      expandedThreads.value = new Set(expandedThreads.value);
+      expandedThreads.value.push(threadId);
     }
   }
 
   async function showAsThread(messageId: string) {
-    // Find thread_id for this message from the flat list
     const msg = messages.value.find((m) => m.id === messageId);
     if (!msg) return;
-    // Fetch thread messages for display
     const accountId = accountsStore.activeAccountId;
     const folderPath = foldersStore.activeFolderPath;
     if (!accountId || !folderPath) return;
     const threadMsgs = await api.getThreadMessages(accountId, folderPath, messageId);
     if (threadMsgs.length > 1) {
-      // Switch to threaded view temporarily for this thread
-      threadMessages.value.set(messageId, threadMsgs);
-      threadMessages.value = new Map(threadMessages.value);
-      expandedThreads.value.add(messageId);
-      expandedThreads.value = new Set(expandedThreads.value);
+      threadMessages.value = { ...threadMessages.value, [messageId]: threadMsgs };
+      if (!expandedThreads.value.includes(messageId)) {
+        expandedThreads.value.push(messageId);
+      }
     }
   }
 
   async function unthreadMessage(messageId: string) {
     await api.unthreadMessage(messageId);
     await fetchMessages();
+  }
+
+  // Find a message in flat list or expanded threads
+  function findMessage(messageId: string): MessageSummary | undefined {
+    let msg = messages.value.find((m) => m.id === messageId);
+    if (!msg) {
+      for (const msgs of Object.values(threadMessages.value)) {
+        msg = msgs.find((m) => m.id === messageId);
+        if (msg) break;
+      }
+    }
+    return msg;
+  }
+
+  // Mark a message as read — updates local state immediately,
+  // then syncs to IMAP in the background.
+  // Handles messages in flat list, expanded threads, AND thread summaries
+  // (where the message object may not be loaded yet).
+  function markAsRead(messageId: string) {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId) return;
+
+    // Try to find and update the message object in flat list or expanded threads
+    const msg = findMessage(messageId);
+    if (msg) {
+      if (msg.flags.includes("seen")) return; // already read
+      msg.flags = [...msg.flags, "seen"];
+    }
+
+    // Update thread summary's unread count (works even if msg not found)
+    const thread = threads.value.find((t) =>
+      t.message_ids.includes(messageId),
+    );
+    if (thread && thread.unread_count > 0) {
+      thread.unread_count--;
+    }
+
+    // Always send IMAP flag update — even if we couldn't find the local
+    // message object (e.g., threading mode with collapsed thread), the
+    // server still needs to be told.
+    api
+      .setMessageFlags(accountId, [messageId], ["seen"], true)
+      .catch((e) => console.error("Failed to mark as read:", e));
   }
 
   async function loadMessage(messageId: string) {
@@ -192,32 +244,93 @@ export const useMessagesStore = defineStore("messages", () => {
     loadingBody.value = true;
     try {
       activeMessage.value = await api.getMessageBody(accountId, messageId);
-
-      // Find the message in flat list or expanded thread messages and mark as read.
-      // In threaded mode, messages live inside threadMessages map, not the flat array.
-      // Also decrement the parent thread's unread_count for instant UI update.
-      let msg = messages.value.find((m) => m.id === messageId);
-      if (!msg) {
-        for (const msgs of threadMessages.value.values()) {
-          msg = msgs.find((m) => m.id === messageId);
-          if (msg) break;
-        }
-      }
-      if (msg && !msg.flags.includes("seen")) {
-        msg.flags = [...msg.flags, "seen"];
-        // Also update the thread summary's unread count
-        const thread = threads.value.find((t) =>
-          t.message_ids.includes(messageId),
-        );
-        if (thread && thread.unread_count > 0) {
-          thread.unread_count--;
-        }
-        api
-          .setMessageFlags(accountId, [messageId], ["seen"], true)
-          .catch((e) => console.error("Failed to mark as read:", e));
-      }
+    } catch (e) {
+      console.error("Failed to load message body:", e);
     } finally {
       loadingBody.value = false;
+    }
+  }
+
+  // Get ordered list of all visible message IDs for Shift+click range.
+  function getVisibleIds(): string[] {
+    if (uiStore.threadingEnabled) {
+      const ids: string[] = [];
+      for (const thread of threads.value) {
+        ids.push(thread.message_ids[0]);
+        if (expandedThreads.value.includes(thread.thread_id)) {
+          const children = threadMessages.value[thread.thread_id] ?? [];
+          for (const msg of children) {
+            ids.push(msg.id);
+          }
+        }
+      }
+      return ids;
+    }
+    return messages.value.map((m) => m.id);
+  }
+
+  function selectMessage(
+    messageId: string,
+    modifiers: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  ) {
+    if (modifiers.shiftKey && lastClickedId.value) {
+      // Range selection
+      const ids = getVisibleIds();
+      const startIdx = ids.indexOf(lastClickedId.value);
+      const endIdx = ids.indexOf(messageId);
+      if (startIdx !== -1 && endIdx !== -1) {
+        const from = Math.min(startIdx, endIdx);
+        const to = Math.max(startIdx, endIdx);
+        selectedIds.value = ids.slice(from, to + 1);
+      }
+    } else if (modifiers.ctrlKey || modifiers.metaKey) {
+      // Toggle selection
+      const idx = selectedIds.value.indexOf(messageId);
+      if (idx !== -1) {
+        selectedIds.value = selectedIds.value.filter((id) => id !== messageId);
+      } else {
+        selectedIds.value = [...selectedIds.value, messageId];
+      }
+      lastClickedId.value = messageId;
+    } else {
+      // Single click: replace selection
+      selectedIds.value = [messageId];
+      lastClickedId.value = messageId;
+    }
+    // Mark as read on single click (synchronous local update)
+    if (!modifiers.shiftKey) {
+      markAsRead(messageId);
+    }
+    // Load the clicked message body in the reader (async)
+    loadMessage(messageId);
+  }
+
+  function toggleSelectMessage(messageId: string) {
+    const idx = selectedIds.value.indexOf(messageId);
+    if (idx !== -1) {
+      selectedIds.value = selectedIds.value.filter((id) => id !== messageId);
+    } else {
+      selectedIds.value = [...selectedIds.value, messageId];
+    }
+  }
+
+  function clearSelection() {
+    selectedIds.value = [];
+  }
+
+  async function deleteSelected() {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId || selectedIds.value.length === 0) return;
+    const ids = [...selectedIds.value];
+    try {
+      await api.deleteMessages(accountId, ids);
+      selectedIds.value = [];
+      activeMessage.value = null;
+      activeMessageId.value = null;
+      await fetchMessages();
+      await foldersStore.fetchFolders();
+    } catch (e) {
+      console.error("Delete failed:", e);
     }
   }
 
@@ -236,11 +349,12 @@ export const useMessagesStore = defineStore("messages", () => {
     () => {
       activeMessage.value = null;
       activeMessageId.value = null;
+      selectedIds.value = [];
+      lastClickedId.value = null;
       fetchMessages();
     },
   );
 
-  // Re-fetch when threading mode changes
   watch(
     () => uiStore.threadingEnabled,
     () => {
@@ -255,6 +369,8 @@ export const useMessagesStore = defineStore("messages", () => {
     threadMessages,
     activeMessage,
     activeMessageId,
+    selectedIds,
+    selectedSet,
     loading,
     loadingMore,
     loadingBody,
@@ -265,12 +381,17 @@ export const useMessagesStore = defineStore("messages", () => {
     sortColumn,
     sortAsc,
     hasMore,
+    isSelected,
     fetchMessages,
     loadMessage,
     loadNextPage,
     toggleThread,
     showAsThread,
     unthreadMessage,
+    selectMessage,
+    toggleSelectMessage,
+    clearSelection,
+    deleteSelected,
     setSort,
   };
 });
