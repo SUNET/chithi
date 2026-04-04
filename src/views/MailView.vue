@@ -97,11 +97,22 @@ onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
     await foldersStore.fetchFolders();
+    // Backfill thread IDs for existing messages (runs once, fast if already done)
+    api.backfillThreads(accountsStore.activeAccountId).catch((e) =>
+      console.error("Thread backfill error:", e),
+    );
   }
 
-  await listen("sync-complete", async () => {
+  await listen("sync-complete", async (event) => {
+    const payload = event.payload as { account_id: string; total_synced: number };
+    console.log("sync-complete:", payload);
+    // Always refresh folders to update counts
     await foldersStore.fetchFolders();
-    if (foldersStore.activeFolderPath) {
+    // Refresh message list if viewing the synced account
+    if (
+      accountsStore.activeAccountId === payload.account_id &&
+      foldersStore.activeFolderPath
+    ) {
       await messagesStore.fetchMessages();
     }
     startBackgroundPrefetch();
@@ -110,8 +121,17 @@ onMounted(async () => {
   let lastRefresh = 0;
   await listen("sync-progress", async (event) => {
     const now = Date.now();
-    const payload = event.payload as { synced: number };
-    if (payload.synced > 0 && now - lastRefresh > 3000) {
+    const payload = event.payload as {
+      account_id: string;
+      synced: number;
+      folder: string;
+    };
+    // Refresh when new messages synced in the folder we're viewing
+    if (
+      payload.synced > 0 &&
+      now - lastRefresh > 2000 &&
+      accountsStore.activeAccountId === payload.account_id
+    ) {
       lastRefresh = now;
       await foldersStore.fetchFolders();
       if (foldersStore.activeFolderPath) {

@@ -1,6 +1,7 @@
 use tauri::State;
 
 use crate::db;
+use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
 use crate::mail::parser;
@@ -143,4 +144,103 @@ pub async fn get_message_body(
         log::error!("Failed to parse message body for {}", message_id);
         Error::MailParse("Failed to parse message".to_string())
     })
+}
+
+#[tauri::command]
+pub async fn get_threaded_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+    page: u32,
+    per_page: u32,
+    sort_column: Option<String>,
+    sort_asc: Option<bool>,
+) -> Result<ThreadedPage> {
+    let col = sort_column.as_deref().unwrap_or("date");
+    let asc = sort_asc.unwrap_or(false);
+    log::debug!(
+        "Getting threaded messages: account={} folder={} page={} per_page={} sort={}:{}",
+        account_id,
+        folder_path,
+        page,
+        per_page,
+        col,
+        if asc { "asc" } else { "desc" }
+    );
+    let conn = state.db.lock().await;
+    let result = db::messages::get_threaded_messages(
+        &conn,
+        &account_id,
+        &folder_path,
+        page,
+        per_page,
+        col,
+        asc,
+    )?;
+    log::debug!(
+        "Returned {} threads (total_threads={}, total_messages={}) for folder {}",
+        result.threads.len(),
+        result.total_threads,
+        result.total_messages,
+        folder_path
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn get_thread_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+    thread_id: String,
+) -> Result<Vec<MessageSummary>> {
+    log::debug!(
+        "Getting thread messages: account={} folder={} thread={}",
+        account_id,
+        folder_path,
+        thread_id
+    );
+    let conn = state.db.lock().await;
+    let messages = db::messages::get_thread_messages(&conn, &account_id, &folder_path, &thread_id)?;
+    log::debug!(
+        "Returned {} messages for thread {}",
+        messages.len(),
+        thread_id
+    );
+    Ok(messages)
+}
+
+#[tauri::command]
+pub async fn unthread_message(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<()> {
+    log::info!("Unthreading message: {}", message_id);
+    let conn = state.db.lock().await;
+    db::messages::unthread_message(&conn, &message_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn backfill_threads(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<u32> {
+    let migration_key = format!("thread_backfill_{}", account_id);
+    let conn = state.db.lock().await;
+
+    if db::schema::has_migration(&conn, &migration_key) {
+        log::debug!("Thread backfill already done for account {}, skipping", account_id);
+        return Ok(0);
+    }
+
+    log::info!("Backfilling thread IDs for account: {}", account_id);
+    let count = db::messages::backfill_thread_ids(&conn, &account_id)?;
+    db::schema::set_migration(&conn, &migration_key)?;
+    log::info!(
+        "Backfilled {} messages for account {}, marked as done",
+        count,
+        account_id
+    );
+    Ok(count)
 }

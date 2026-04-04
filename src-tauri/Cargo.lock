@@ -1005,6 +1005,7 @@ dependencies = [
  "log",
  "mail-parser",
  "maildir",
+ "mailparse 0.16.1",
  "native-tls",
  "regex",
  "rusqlite",
@@ -2517,7 +2518,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879a6ae6743ab8219fdee64a569094485bfe18434e82b78b27fac5cce09e1437"
 dependencies = [
  "gethostname",
- "mailparse",
+ "mailparse 0.14.1",
 ]
 
 [[package]]
@@ -2525,6 +2526,17 @@ name = "mailparse"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d096594926cab442e054e047eb8c1402f7d5b2272573b97ba68aa40629f9757"
+dependencies = [
+ "charset",
+ "data-encoding",
+ "quoted_printable",
+]
+
+[[package]]
+name = "mailparse"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60819a97ddcb831a5614eb3b0174f3620e793e97e09195a395bfa948fd68ed2f"
 dependencies = [
  "charset",
  "data-encoding",

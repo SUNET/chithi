@@ -96,6 +96,7 @@ pub fn parse_envelope(
         uid,
         message_id,
         in_reply_to,
+        thread_id: None, // Thread ID is computed separately during sync
         subject,
         from_name,
         from_email,

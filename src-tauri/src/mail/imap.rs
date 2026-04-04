@@ -444,9 +444,20 @@ fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
     }
 }
 
-/// Decode a potentially MIME-encoded IMAP cow string to a Rust String.
+/// Decode a potentially MIME-encoded IMAP string to a Rust String.
+/// Handles =?charset?encoding?text?= encoded words (RFC 2047).
 fn decode_imap_str(s: &[u8]) -> String {
-    String::from_utf8_lossy(s).to_string()
+    let raw = String::from_utf8_lossy(s);
+    if raw.contains("=?") {
+        // Use mailparse to decode by wrapping in a fake header
+        let fake = format!("Subject: {}\r\n", raw);
+        match mailparse::parse_header(fake.as_bytes()) {
+            Ok((header, _)) => header.get_value(),
+            Err(_) => raw.to_string(),
+        }
+    } else {
+        raw.to_string()
+    }
 }
 
 #[derive(serde::Serialize)]

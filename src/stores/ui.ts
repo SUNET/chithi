@@ -5,6 +5,9 @@ export type MessageViewMode = "right" | "tab";
 export type Theme = "dark" | "light";
 
 export const useUiStore = defineStore("ui", () => {
+  const threadingEnabled = ref(
+    localStorage.getItem("emails-threading") !== "false",
+  );
   const folderPaneWidth = ref(200);
   const messageListWidth = ref(400);
   const readerVisible = ref(true);
@@ -35,12 +38,17 @@ export const useUiStore = defineStore("ui", () => {
     document.documentElement.setAttribute("data-theme", t);
   }
 
-  // Apply saved theme on init
+  function setThreading(enabled: boolean) {
+    threadingEnabled.value = enabled;
+    localStorage.setItem("emails-threading", String(enabled));
+  }
+
   function initTheme() {
     document.documentElement.setAttribute("data-theme", theme.value);
   }
 
   return {
+    threadingEnabled,
     folderPaneWidth,
     messageListWidth,
     readerVisible,
@@ -51,6 +59,7 @@ export const useUiStore = defineStore("ui", () => {
     hideReader,
     setMessageViewMode,
     setTheme,
+    setThreading,
     initTheme,
   };
 });

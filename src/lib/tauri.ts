@@ -100,6 +100,41 @@ export async function copyMessages(
   return invoke("copy_messages", { accountId, messageIds, targetFolder });
 }
 
+// Threading
+export async function getThreadedMessages(
+  accountId: string,
+  folderPath: string,
+  page: number,
+  perPage: number,
+  sortColumn?: string,
+  sortAsc?: boolean,
+): Promise<import("./types").ThreadedPage> {
+  return invoke("get_threaded_messages", {
+    accountId,
+    folderPath,
+    page,
+    perPage,
+    sortColumn,
+    sortAsc,
+  });
+}
+
+export async function getThreadMessages(
+  accountId: string,
+  folderPath: string,
+  threadId: string,
+): Promise<import("./types").MessageSummary[]> {
+  return invoke("get_thread_messages", { accountId, folderPath, threadId });
+}
+
+export async function unthreadMessage(messageId: string): Promise<void> {
+  return invoke("unthread_message", { messageId });
+}
+
+export async function backfillThreads(accountId: string): Promise<number> {
+  return invoke("backfill_threads", { accountId });
+}
+
 // Filter rules
 export async function listFilters(
   accountId?: string,

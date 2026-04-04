@@ -226,6 +226,18 @@ fn sync_folder_envelopes(
 
             let id = format!("{}_{}_{}", account_id, folder_path, env.uid);
 
+            // Compute thread_id before inserting
+            let thread_id = db::messages::compute_thread_id(
+                &conn,
+                account_id,
+                env.message_id.as_deref(),
+                env.in_reply_to.as_deref(),
+                env.subject.as_deref(),
+            );
+            if let Some(ref tid) = thread_id {
+                log::debug!("Assigned thread_id '{}' to message uid={}", tid, env.uid);
+            }
+
             let new_msg = db::messages::NewMessage {
                 id: id.clone(),
                 account_id: account_id.to_string(),
@@ -233,6 +245,7 @@ fn sync_folder_envelopes(
                 uid: env.uid,
                 message_id: env.message_id.clone(),
                 in_reply_to: env.in_reply_to.clone(),
+                thread_id,
                 subject: env.subject.clone(),
                 from_name: env.from_name.clone(),
                 from_email: env.from_email.clone().unwrap_or_else(|| "unknown".to_string()),

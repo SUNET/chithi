@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import type { MessageSummary } from "@/lib/types";
+import type { ThreadSummary } from "@/lib/types";
 
-defineProps<{
-  message: MessageSummary;
+const props = defineProps<{
+  thread: ThreadSummary;
+  expanded: boolean;
   active: boolean;
 }>();
 
 defineEmits<{
+  toggle: [];
   select: [];
   open: [];
 }>();
@@ -29,54 +31,55 @@ function formatDate(dateStr: string): string {
   });
 }
 
-function isUnread(flags: string[]): boolean {
-  return !flags.includes("seen");
+function hasUnread(): boolean {
+  return props.thread.unread_count > 0;
 }
 
-function isStarred(flags: string[]): boolean {
-  return flags.includes("flagged");
+function isStarred(): boolean {
+  return props.thread.flags.includes("flagged");
 }
 
-function isReply(subject: string | null, flags: string[]): boolean {
-  if (flags.includes("answered")) return true;
-  if (!subject) return false;
-  const lower = subject.trimStart().toLowerCase();
+function isReply(): boolean {
+  if (props.thread.flags.includes("answered")) return true;
+  if (!props.thread.subject) return false;
+  const lower = props.thread.subject.trimStart().toLowerCase();
   return lower.startsWith("re:") || lower.startsWith("fwd:") || lower.startsWith("fw:");
 }
 </script>
 
 <template>
   <button
-    class="message-row"
-    :class="{ active, unread: isUnread(message.flags) }"
+    class="thread-row"
+    :class="{ active, unread: hasUnread() }"
     @click="$emit('select')"
     @dblclick="$emit('open')"
   >
     <div class="col col-icons">
       <span
-        class="icon-read"
-        :class="{ unread: isUnread(message.flags) }"
-      >&#x25CF;</span>
+        class="expand-icon"
+        @click.stop="$emit('toggle')"
+      >{{ thread.message_count > 1 ? (expanded ? '\u25BF' : '\u25B9') : '\u00A0' }}</span>
       <span
         class="icon-star"
-        :class="{ starred: isStarred(message.flags) }"
-      >{{ isStarred(message.flags) ? '\u2605' : '\u2606' }}</span>
+        :class="{ starred: isStarred() }"
+      >{{ isStarred() ? '\u2605' : '\u2606' }}</span>
     </div>
-    <div class="col col-subject" :class="{ bold: isUnread(message.flags) }">
-      <span v-if="isReply(message.subject, message.flags)" class="reply-icon">&hookleftarrow;</span>
-      <span class="subject-text">{{ message.subject || "(no subject)" }}</span>
+    <div class="col col-subject" :class="{ bold: hasUnread() }">
+      <span v-if="isReply()" class="reply-icon">&hookleftarrow;</span>
+      <span class="subject-text">{{ thread.subject || "(no subject)" }}</span>
+      <span v-if="thread.message_count > 1" class="thread-count">({{ thread.message_count }})</span>
     </div>
-    <div class="col col-from" :class="{ bold: isUnread(message.flags) }">
-      {{ message.from_name || message.from_email }}
+    <div class="col col-from" :class="{ bold: hasUnread() }">
+      {{ thread.from_name || thread.from_email }}
     </div>
     <div class="col col-date">
-      {{ formatDate(message.date) }}
+      {{ formatDate(thread.last_date) }}
     </div>
   </button>
 </template>
 
 <style scoped>
-.message-row {
+.thread-row {
   display: flex;
   align-items: center;
   width: 100%;
@@ -87,11 +90,11 @@ function isReply(subject: string | null, flags: string[]): boolean {
   transition: background 0.1s;
 }
 
-.message-row:hover {
+.thread-row:hover {
   background: var(--color-bg-hover);
 }
 
-.message-row.active {
+.thread-row.active {
   background: var(--color-bg-active);
 }
 
@@ -111,12 +114,15 @@ function isReply(subject: string | null, flags: string[]): boolean {
   padding: 0 4px;
 }
 
-.icon-read {
-  font-size: 8px;
-  color: transparent;
+.expand-icon {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  width: 14px;
+  text-align: center;
 }
 
-.icon-read.unread {
+.expand-icon:hover {
   color: var(--color-accent);
 }
 
@@ -148,6 +154,12 @@ function isReply(subject: string | null, flags: string[]): boolean {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.thread-count {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 .col-from {

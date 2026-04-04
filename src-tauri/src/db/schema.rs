@@ -128,7 +128,31 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
+    )?;
+    Ok(())
+}
+
+/// Check if a one-time migration has been completed.
+pub fn has_migration(conn: &Connection, key: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM app_metadata WHERE key = ?1",
+        rusqlite::params![key],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Mark a one-time migration as completed.
+pub fn set_migration(conn: &Connection, key: &str) -> crate::error::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
 }

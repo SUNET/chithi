@@ -63,6 +63,28 @@ export interface MessagePage {
   per_page: number;
 }
 
+export interface ThreadSummary {
+  thread_id: string;
+  subject: string | null;
+  last_date: string;
+  message_count: number;
+  unread_count: number;
+  from_name: string | null;
+  from_email: string;
+  has_attachments: boolean;
+  flags: string[];
+  snippet: string | null;
+  message_ids: string[];
+}
+
+export interface ThreadedPage {
+  threads: ThreadSummary[];
+  total_threads: number;
+  total_messages: number;
+  page: number;
+  per_page: number;
+}
+
 export interface SyncStatus {
   account_id: string;
   is_syncing: boolean;

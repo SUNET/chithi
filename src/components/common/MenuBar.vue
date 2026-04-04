@@ -60,6 +60,12 @@ function toggleReader() {
         <button class="menu-action" @click="toggleReader">
           {{ uiStore.readerVisible ? 'Hide' : 'Show' }} Message Pane
         </button>
+        <button
+          class="menu-action"
+          @click="uiStore.setThreading(!uiStore.threadingEnabled); closeMenus()"
+        >
+          {{ uiStore.threadingEnabled ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Threading
+        </button>
         <button class="menu-action" @click="goFilters">Message Filters</button>
         <div class="menu-separator"></div>
         <div class="menu-group-label">Message View Position</div>
