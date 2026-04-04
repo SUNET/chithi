@@ -219,6 +219,21 @@ export async function getEmailInvites(
   return invoke("get_email_invites", { accountId, messageId });
 }
 
+export async function getEventByUid(
+  accountId: string,
+  uid: string,
+): Promise<import("./types").CalendarEvent | null> {
+  return invoke("get_event_by_uid", { accountId, uid });
+}
+
+export async function sendInvites(
+  accountId: string,
+  eventId: string,
+  attendeeEmails: string[],
+): Promise<void> {
+  return invoke("send_invites", { accountId, eventId, attendeeEmails });
+}
+
 export async function respondToInvite(
   accountId: string,
   messageId: string,

@@ -267,7 +267,11 @@ impl JmapConnection {
             let to_addresses = addresses_to_json(e["to"].as_array());
             let cc_addresses = addresses_to_json(e["cc"].as_array());
 
-            let date = e["receivedAt"].as_str().unwrap_or("").to_string();
+            // Normalize date to UTC for consistent sorting
+            let date = e["receivedAt"].as_str()
+                .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+                .unwrap_or_default();
             let size = e["size"].as_u64().unwrap_or(0);
             let message_id = e["messageId"].as_array()
                 .and_then(|a| a.first())
@@ -687,15 +691,22 @@ impl JmapConnection {
                 .and_then(|loc| loc["name"].as_str())
                 .map(|s| s.to_string());
 
-            // Start datetime (ISO 8601 local time in JSCalendar)
-            let start = ev["start"].as_str().unwrap_or("").to_string();
+            // Start datetime — JSCalendar uses local time without timezone.
+            // Stalwart stores in UTC, so append Z to mark as UTC for correct display.
+            let raw_start = ev["start"].as_str().unwrap_or("").to_string();
+            let start = if !raw_start.is_empty() && !raw_start.ends_with('Z') && !raw_start.contains('+') {
+                format!("{}Z", raw_start)
+            } else {
+                raw_start
+            };
 
-            // showWithoutTime indicates an all-day event
             let all_day = ev["showWithoutTime"].as_bool().unwrap_or(false);
 
-            // Duration is an ISO 8601 duration string like "PT1H" or "P1D"
             let duration_str = ev["duration"].as_str().unwrap_or("PT1H");
-            let end = compute_end_from_duration(&start, duration_str);
+            let end = {
+                let e = compute_end_from_duration(&start.trim_end_matches('Z'), duration_str);
+                if start.ends_with('Z') && !e.ends_with('Z') { format!("{}Z", e) } else { e }
+            };
 
             // Recurrence rules: JSCalendar uses an array of recurrence rule objects
             let recurrence_rule = ev["recurrenceRules"]

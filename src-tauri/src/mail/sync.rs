@@ -199,9 +199,47 @@ fn sync_folder_envelopes(
     };
 
     conn_imap.select_folder(folder_path)?;
+
+    // Reconcile deletions: fetch ALL server UIDs and remove local messages
+    // that no longer exist on the server.
+    {
+        let all_server_uids = conn_imap.fetch_uids(0)?;
+        let server_uid_set: std::collections::HashSet<u32> = all_server_uids.into_iter().collect();
+
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+
+        let mut stmt = conn.prepare(
+            "SELECT id, uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0"
+        ).map_err(|e| Error::Database(e))?;
+        let local_msgs: Vec<(String, u32)> = stmt.query_map(
+            rusqlite::params![account_id, folder_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| Error::Database(e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let mut deleted = 0u32;
+        for (local_id, uid) in &local_msgs {
+            if !server_uid_set.contains(uid) {
+                conn.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![local_id]).ok();
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            log::info!("Removed {} server-deleted messages from '{}'", deleted, folder_path);
+        }
+    }
+
     let mut new_uids = conn_imap.fetch_uids(last_uid)?;
 
     if new_uids.is_empty() {
+        // Still update folder counts even if no new messages (deletions may have changed them)
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+        let page = db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false)?;
+        let unread = count_unread(&conn, account_id, folder_path)?;
+        db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         return Ok(0);
     }
 
@@ -696,13 +734,12 @@ fn capitalize_first(s: &str) -> String {
 /// Parse an IMAP date string (from ENVELOPE) into RFC 3339.
 fn parse_imap_date(date_str: &str) -> Option<String> {
     // IMAP dates look like: "Thu, 3 Apr 2026 19:51:23 +0000"
-    // Try chrono parsing with common formats
+    // Always convert to UTC for consistent sorting in SQLite.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_str) {
-        return Some(dt.to_rfc3339());
+        return Some(dt.with_timezone(&chrono::Utc).to_rfc3339());
     }
-    // Try without day-of-week
     if let Ok(dt) = chrono::DateTime::parse_from_str(date_str, "%d %b %Y %H:%M:%S %z") {
-        return Some(dt.to_rfc3339());
+        return Some(dt.with_timezone(&chrono::Utc).to_rfc3339());
     }
     log::debug!("Could not parse IMAP date: {}", date_str);
     None

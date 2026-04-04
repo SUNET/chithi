@@ -25,17 +25,28 @@ const foldersStore = useFoldersStore();
 const showHtml = ref(false);
 const invites = ref<ParsedInvite[]>([]);
 
+// Reset view state when switching messages
 watch(
   () => messagesStore.activeMessageId,
-  async () => {
+  () => {
     showHtml.value = false;
     invites.value = [];
-    // Check for calendar invites in the message
+  },
+);
+
+// Check for calendar invites AFTER body is loaded (body must be on disk for parsing)
+watch(
+  () => messagesStore.activeMessage,
+  async (msg) => {
+    invites.value = [];
+    if (!msg) return;
     const accountId = accountsStore.activeAccountId;
     const msgId = messagesStore.activeMessageId;
     if (accountId && msgId) {
       try {
-        invites.value = await api.getEmailInvites(accountId, msgId);
+        const all = await api.getEmailInvites(accountId, msgId);
+        // Only show invite card for METHOD:REQUEST (new invites), not REPLY/CANCEL
+        invites.value = all.filter((inv) => inv.method.toUpperCase() === "REQUEST");
       } catch {
         // No invites or parse error — silently ignore
       }

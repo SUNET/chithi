@@ -211,6 +211,72 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     lines.join("\r\n")
 }
 
+/// Generate a METHOD:REQUEST iCalendar for inviting attendees to an event.
+pub fn generate_invite(
+    uid: &str,
+    summary: &str,
+    dtstart: &str,
+    dtend: &str,
+    location: Option<&str>,
+    description: Option<&str>,
+    organizer_email: &str,
+    organizer_name: Option<&str>,
+    attendees: &[Attendee],
+    recurrence_rule: Option<&str>,
+) -> String {
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+
+    let mut lines = Vec::new();
+    lines.push("BEGIN:VCALENDAR".to_string());
+    lines.push("VERSION:2.0".to_string());
+    lines.push("PRODID:-//Emails Desktop Client//EN".to_string());
+    lines.push("METHOD:REQUEST".to_string());
+    lines.push("BEGIN:VEVENT".to_string());
+
+    // Organizer
+    if let Some(name) = organizer_name {
+        lines.push(format!("ORGANIZER;CN={}:mailto:{}", name, organizer_email));
+    } else {
+        lines.push(format!("ORGANIZER:mailto:{}", organizer_email));
+    }
+
+    // Attendees
+    for attendee in attendees {
+        let cn = attendee
+            .name
+            .as_ref()
+            .map(|n| format!(";CN={}", n))
+            .unwrap_or_default();
+        lines.push(format!(
+            "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE{}:mailto:{}",
+            cn, attendee.email
+        ));
+    }
+
+    lines.push(format!("UID:{}", uid));
+    lines.push(format!("SUMMARY:{}", summary));
+    lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
+    lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
+
+    if let Some(loc) = location {
+        lines.push(format!("LOCATION:{}", loc));
+    }
+    if let Some(desc) = description {
+        lines.push(format!("DESCRIPTION:{}", desc));
+    }
+    if let Some(rrule) = recurrence_rule {
+        lines.push(format!("RRULE:{}", rrule));
+    }
+
+    lines.push("SEQUENCE:0".to_string());
+    lines.push(format!("DTSTAMP:{}", now));
+    lines.push("STATUS:CONFIRMED".to_string());
+    lines.push("END:VEVENT".to_string());
+    lines.push("END:VCALENDAR".to_string());
+
+    lines.join("\r\n")
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

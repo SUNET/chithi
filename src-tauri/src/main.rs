@@ -62,6 +62,7 @@ fn main() {
             commands::calendar::delete_event,
             commands::calendar::get_email_invites,
             commands::calendar::respond_to_invite,
+            commands::calendar::send_invites,
             commands::calendar::sync_calendars,
         ])
         .run(tauri::generate_context!())

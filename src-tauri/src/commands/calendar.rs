@@ -716,11 +716,13 @@ pub async fn get_email_invites(
         return Ok(vec![]);
     }
 
-    // Read the raw message from disk
-    let raw = std::fs::read(&maildir_path).map_err(|e| {
+    // Read the raw message from disk (maildir_path is relative to data_dir)
+    let full_path = state.data_dir.join(&maildir_path);
+    log::debug!("get_email_invites: reading from {}", full_path.display());
+    let raw = std::fs::read(&full_path).map_err(|e| {
         crate::error::Error::Other(format!(
             "Failed to read message file '{}': {}",
-            maildir_path, e
+            full_path.display(), e
         ))
     })?;
 
@@ -761,10 +763,11 @@ pub async fn respond_to_invite(
             ));
         }
 
-        let raw = std::fs::read(&maildir_path).map_err(|e| {
+        let full_path = state.data_dir.join(&maildir_path);
+        let raw = std::fs::read(&full_path).map_err(|e| {
             crate::error::Error::Other(format!(
                 "Failed to read message file '{}': {}",
-                maildir_path, e
+                full_path.display(), e
             ))
         })?;
 
@@ -1098,4 +1101,134 @@ fn get_unpushed_events(
         .filter_map(|r| r.ok())
         .collect();
     Ok(events)
+}
+
+/// Send meeting invite emails to attendees for a calendar event.
+#[tauri::command]
+pub async fn send_invites(
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+    attendee_emails: Vec<String>,
+) -> Result<()> {
+    log::info!(
+        "send_invites: account={} event={} attendees={:?}",
+        account_id, event_id, attendee_emails
+    );
+
+    let (account, event) = {
+        let conn = state.db.lock().await;
+        let acc = db::accounts::get_account_full(&conn, &account_id)?;
+        let evt = db::calendar::get_event(&conn, &event_id)?;
+        (acc, evt)
+    };
+
+    let attendees: Vec<Attendee> = attendee_emails
+        .iter()
+        .map(|email| Attendee {
+            email: email.clone(),
+            name: None,
+            status: "needs-action".to_string(),
+        })
+        .collect();
+
+    let uid = event.uid.as_deref().unwrap_or(&event_id);
+    let ical = ical::generate_invite(
+        uid,
+        &event.title,
+        &event.start_time,
+        &event.end_time,
+        event.location.as_deref(),
+        event.description.as_deref(),
+        &account.email,
+        Some(&account.display_name),
+        &attendees,
+        event.recurrence_rule.as_deref(),
+    );
+
+    let subject = format!("Invitation: {}", event.title);
+    let body_text = format!(
+        "You have been invited to: {}\nWhen: {} - {}\n{}",
+        event.title,
+        event.start_time,
+        event.end_time,
+        event.location.as_deref().map(|l| format!("Where: {}\n", l)).unwrap_or_default()
+    );
+
+    for attendee_email in &attendee_emails {
+        let raw = build_invite_message(
+            &account.email,
+            attendee_email,
+            &subject,
+            &body_text,
+            &ical,
+        );
+
+        if account.mail_protocol == "jmap" {
+            let jmap_config = crate::mail::jmap::JmapConfig {
+                jmap_url: account.jmap_url.clone(),
+                email: account.email.clone(),
+                username: account.username.clone(),
+                password: account.password.clone(),
+            };
+            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            conn_jmap.send_email(&jmap_config, &raw).await?;
+        } else {
+            send_raw_smtp(
+                &account.smtp_host,
+                account.smtp_port,
+                &account.username,
+                &account.password,
+                account.use_tls,
+                &account.email,
+                attendee_email,
+                &raw,
+            )
+            .await?;
+        }
+        log::info!("send_invites: sent to {}", attendee_email);
+    }
+
+    // Update event's attendees in local DB
+    {
+        let conn = state.db.lock().await;
+        let attendees_json = serde_json::to_string(&attendees).unwrap_or_default();
+        conn.execute(
+            "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+            rusqlite::params![attendees_json, event_id],
+        )
+        .ok();
+    }
+
+    log::info!("send_invites: all invites sent for event {}", event_id);
+    Ok(())
+}
+
+fn build_invite_message(
+    from: &str,
+    to: &str,
+    subject: &str,
+    body_text: &str,
+    ical_data: &str,
+) -> Vec<u8> {
+    let boundary = format!("----=_Part_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    format!(
+        "From: {from}\r\n\
+         To: {to}\r\n\
+         Subject: {subject}\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+         \r\n\
+         --{boundary}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         {body_text}\r\n\
+         --{boundary}\r\n\
+         Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\
+         Content-Disposition: attachment; filename=\"invite.ics\"\r\n\
+         \r\n\
+         {ical_data}\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes()
 }

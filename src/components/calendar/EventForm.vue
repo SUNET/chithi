@@ -2,7 +2,9 @@
 import { ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
+import AttendeeEditor from "./AttendeeEditor.vue";
 
 const props = defineProps<{
   initialStart?: string;
@@ -31,6 +33,7 @@ const location = ref("");
 const description = ref("");
 const calendarId = ref(calendarStore.calendars[0]?.id ?? "");
 const recurrenceRule = ref<string | null>(null);
+const attendeeEmails = ref<string[]>([]);
 const saving = ref(false);
 const error = ref<string | null>(null);
 
@@ -58,7 +61,7 @@ async function save() {
       ? `${endDate.value}T23:59:59`
       : `${endDate.value}T${endTime.value}:00`;
 
-    await calendarStore.createEvent({
+    const eventId = await calendarStore.createEvent({
       account_id: accountId,
       calendar_id: calendarId.value,
       title: title.value,
@@ -69,8 +72,18 @@ async function save() {
       all_day: allDay.value,
       timezone: null,
       recurrence_rule: recurrenceRule.value,
-      attendees: [],
+      attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
     });
+
+    // Send invite emails if attendees were added
+    if (attendeeEmails.value.length > 0) {
+      try {
+        await api.sendInvites(accountId, eventId, attendeeEmails.value);
+      } catch (e) {
+        console.error("Failed to send invites:", e);
+      }
+    }
+
     emit("saved");
     emit("close");
   } catch (e) {
@@ -143,6 +156,14 @@ async function save() {
         </div>
 
         <RecurrenceEditor v-model="recurrenceRule" />
+
+        <div class="form-group">
+          <label>Attendees</label>
+          <AttendeeEditor v-model="attendeeEmails" />
+          <p v-if="attendeeEmails.length > 0" class="hint">
+            Invite emails will be sent when you create the event.
+          </p>
+        </div>
       </div>
 
       <div class="form-footer">
@@ -260,5 +281,11 @@ async function save() {
   padding: 6px 16px;
   border: 1px solid var(--color-border);
   border-radius: 6px;
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
 }
 </style>
