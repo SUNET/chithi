@@ -67,6 +67,7 @@ pub async fn get_account_config(
         smtp_host: full.smtp_host,
         smtp_port: full.smtp_port,
         jmap_url: full.jmap_url,
+        caldav_url: full.caldav_url,
         username: full.username,
         password: full.password,
         use_tls: full.use_tls,

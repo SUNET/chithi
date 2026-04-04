@@ -103,6 +103,7 @@ export interface AccountConfig {
   smtp_host: string;
   smtp_port: number;
   jmap_url: string;
+  caldav_url: string;
   username: string;
   password: string;
   use_tls: boolean;

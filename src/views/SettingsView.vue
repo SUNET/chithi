@@ -22,6 +22,7 @@ const defaultForm = (): AccountConfig => ({
   smtp_host: "",
   smtp_port: 587,
   jmap_url: "",
+  caldav_url: "",
   username: "",
   password: "",
   use_tls: true,
@@ -29,7 +30,7 @@ const defaultForm = (): AccountConfig => ({
 
 const form = ref<AccountConfig>(defaultForm());
 
-type AccountType = "gmail" | "imap" | "jmap";
+type AccountType = "gmail" | "imap" | "jmap" | "caldav";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
@@ -59,6 +60,16 @@ function selectAccountType(type: AccountType) {
       f.mail_protocol = "jmap";
       f.use_tls = true;
       break;
+    case "caldav":
+      f.provider = "generic";
+      f.mail_protocol = "imap"; // CalDAV-only, no email
+      f.imap_host = "";
+      f.imap_port = 0;
+      f.smtp_host = "";
+      f.smtp_port = 0;
+      f.jmap_url = "";
+      f.use_tls = true;
+      break;
   }
 }
 
@@ -82,6 +93,8 @@ async function openEditForm(id: string) {
       accountType.value = "gmail";
     } else if (config.mail_protocol === "jmap") {
       accountType.value = "jmap";
+    } else if (config.caldav_url && !config.imap_host) {
+      accountType.value = "caldav";
     } else {
       accountType.value = "imap";
     }
@@ -169,19 +182,25 @@ function cancelForm() {
             :disabled="!!editingAccountId"
             @click="selectAccountType('jmap')"
           >JMAP</button>
+          <button
+            class="type-btn"
+            :class="{ active: accountType === 'caldav' }"
+            :disabled="!!editingAccountId"
+            @click="selectAccountType('caldav')"
+          >CalDAV</button>
         </div>
 
         <!-- Common fields -->
         <div class="form-group">
           <label>Display Name</label>
-          <input v-model="form.display_name" type="text" placeholder="My Email" />
+          <input v-model="form.display_name" type="text" :placeholder="accountType === 'caldav' ? 'My Calendar' : 'My Email'" />
         </div>
-        <div class="form-group">
+        <div v-if="accountType !== 'caldav'" class="form-group">
           <label>Email Address</label>
           <input v-model="form.email" type="email" placeholder="you@example.com" />
         </div>
         <div class="form-group">
-          <label>Username (usually same as email)</label>
+          <label>Username</label>
           <input v-model="form.username" type="text" placeholder="you@example.com" />
         </div>
         <div class="form-group">
@@ -189,7 +208,7 @@ function cancelForm() {
           <input v-model="form.password" type="password" :placeholder="accountType === 'gmail' ? 'Gmail app password' : 'Password'" />
         </div>
 
-        <!-- IMAP fields -->
+        <!-- IMAP/SMTP fields (not for CalDAV-only or JMAP) -->
         <template v-if="accountType === 'imap' || accountType === 'gmail'">
           <div class="form-row">
             <div class="form-group">
@@ -221,6 +240,18 @@ function cancelForm() {
           </div>
           <p class="hint">If left blank, the app will try to discover the JMAP endpoint from your email domain via <code>.well-known/jmap</code>.</p>
         </template>
+
+        <!-- CalDAV URL for IMAP accounts (optional) and CalDAV-only accounts (required) -->
+        <template v-if="accountType === 'imap' || accountType === 'caldav'">
+          <div class="form-group">
+            <label>CalDAV URL {{ accountType === 'caldav' ? '(required)' : '(optional — for calendar sync)' }}</label>
+            <input v-model="form.caldav_url" type="url" placeholder="https://mail.example.com/dav/cal" />
+          </div>
+          <p v-if="accountType === 'caldav'" class="hint">CalDAV-only account — only calendar data will be synced, no email.</p>
+          <p v-else class="hint">If set, calendars will be synced via CalDAV. Leave blank for email-only.</p>
+        </template>
+
+        <!-- CalDAV-only: hide email field, make it optional -->
 
         <!-- Gmail hint -->
         <template v-if="accountType === 'gmail' && !editingAccountId">

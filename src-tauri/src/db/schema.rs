@@ -153,6 +153,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN jmap_url TEXT NOT NULL DEFAULT '';")?;
     }
 
+    // Add caldav_url column if it doesn't exist (added in CalDAV support)
+    let has_caldav_url: bool = conn
+        .prepare("SELECT caldav_url FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_caldav_url {
+        log::info!("Migration: adding caldav_url column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN caldav_url TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
     Ok(())
 }
 

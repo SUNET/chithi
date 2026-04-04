@@ -24,6 +24,7 @@ pub struct AccountConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub jmap_url: String,
+    pub caldav_url: String,
     pub username: String,
     pub password: String,
     pub use_tls: bool,
@@ -41,6 +42,7 @@ pub struct AccountFull {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub jmap_url: String,
+    pub caldav_url: String,
     pub username: String,
     pub password: String,
     pub use_tls: bool,
@@ -68,7 +70,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, username, password, use_tls, enabled FROM accounts WHERE id = ?1",
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, password, use_tls, enabled FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -82,10 +84,11 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 smtp_host: row.get(7)?,
                 smtp_port: row.get::<_, u32>(8)? as u16,
                 jmap_url: row.get(9)?,
-                username: row.get(10)?,
-                password: row.get(11)?,
-                use_tls: row.get(12)?,
-                enabled: row.get(13)?,
+                caldav_url: row.get(10)?,
+                username: row.get(11)?,
+                password: row.get(12)?,
+                use_tls: row.get(13)?,
+                enabled: row.get(14)?,
             })
         },
     ).map_err(|e| match e {
@@ -97,8 +100,8 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
 
 pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, username, password, use_tls)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, password, use_tls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             config.display_name,
@@ -110,6 +113,7 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.smtp_host,
             config.smtp_port,
             config.jmap_url,
+            config.caldav_url,
             config.username,
             config.password,
             config.use_tls,
@@ -122,8 +126,8 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
-         username=?10, password=?11, use_tls=?12, updated_at=CURRENT_TIMESTAMP
-         WHERE id=?13",
+         caldav_url=?10, username=?11, password=?12, use_tls=?13, updated_at=CURRENT_TIMESTAMP
+         WHERE id=?14",
         params![
             config.display_name,
             config.email,
@@ -134,6 +138,7 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.smtp_host,
             config.smtp_port,
             config.jmap_url,
+            config.caldav_url,
             config.username,
             config.password,
             config.use_tls,

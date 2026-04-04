@@ -308,12 +308,27 @@ pub async fn sync_calendars(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    // Only sync JMAP accounts for now
-    if account.mail_protocol != "jmap" {
-        log::debug!("sync_calendars: skipping non-JMAP account {}", account_id);
-        return Ok(());
+    if account.mail_protocol == "jmap" {
+        sync_calendars_jmap(&state, &account_id, &account).await?;
+    } else if !account.caldav_url.is_empty() {
+        sync_calendars_caldav(&state, &account_id, &account).await?;
+    } else {
+        log::debug!(
+            "sync_calendars: skipping account {} (no JMAP or CalDAV configured)",
+            account_id
+        );
     }
 
+    log::info!("sync_calendars: completed for account {}", account_id);
+    Ok(())
+}
+
+/// Sync calendars and events via JMAP.
+async fn sync_calendars_jmap(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    account: &db::accounts::AccountFull,
+) -> Result<()> {
     let jmap_config = crate::mail::jmap::JmapConfig {
         jmap_url: account.jmap_url.clone(),
         email: account.email.clone(),
@@ -341,7 +356,7 @@ pub async fn sync_calendars(
             let color = jcal.color.as_deref().unwrap_or("#4285f4");
             let local_id = db::calendar::upsert_calendar_by_remote_id(
                 &conn,
-                &account_id,
+                account_id,
                 &jcal.id,
                 &jcal.name,
                 color,
@@ -384,7 +399,7 @@ pub async fn sync_calendars(
             let event_id = uuid::Uuid::new_v4().to_string();
             let cal_event = CalendarEvent {
                 id: event_id,
-                account_id: account_id.clone(),
+                account_id: account_id.to_string(),
                 calendar_id: local_cal_id.clone(),
                 uid: ev.uid.clone(),
                 title: ev.title.clone(),
@@ -417,7 +432,7 @@ pub async fn sync_calendars(
     // Step 3: Push local events (no remote_id) to the JMAP server
     {
         let conn = state.db.lock().await;
-        let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, &account_id)?;
+        let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, account_id)?;
 
         if !local_events.is_empty() {
             log::info!("sync_calendars: pushing {} local events to JMAP", local_events.len());
@@ -463,7 +478,215 @@ pub async fn sync_calendars(
         }
     }
 
-    log::info!("sync_calendars: completed for account {}", account_id);
+    Ok(())
+}
+
+/// Sync calendars and events via CalDAV.
+async fn sync_calendars_caldav(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    account: &db::accounts::AccountFull,
+) -> Result<()> {
+    use crate::mail::caldav::{CalDavClient, CalDavConfig};
+
+    let caldav_config = CalDavConfig {
+        caldav_url: account.caldav_url.clone(),
+        username: account.username.clone(),
+        password: account.password.clone(),
+        email: account.email.clone(),
+    };
+
+    let client = CalDavClient::connect(&caldav_config).await?;
+
+    // Step 1: List calendars from server
+    let caldav_calendars = client.list_calendars().await?;
+    log::info!(
+        "sync_calendars: fetched {} calendars from CalDAV for account {}",
+        caldav_calendars.len(),
+        account_id
+    );
+
+    // Build a mapping from remote calendar href to local calendar ID
+    let mut remote_to_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    {
+        let conn = state.db.lock().await;
+        for (idx, cal) in caldav_calendars.iter().enumerate() {
+            let color = cal.color.as_deref().unwrap_or("#4285f4");
+            let is_default = idx == 0; // First calendar is default
+            let local_id = db::calendar::upsert_calendar_by_remote_id(
+                &conn,
+                account_id,
+                &cal.href,
+                &cal.name,
+                color,
+                is_default,
+            )?;
+            remote_to_local.insert(cal.href.clone(), local_id);
+        }
+    }
+
+    // Step 2: For each calendar, fetch events and upsert into local DB
+    for cal in &caldav_calendars {
+        let caldav_events = match client.fetch_events(&cal.href).await {
+            Ok(evts) => evts,
+            Err(e) => {
+                log::error!(
+                    "sync_calendars: failed to fetch CalDAV events for calendar '{}': {}",
+                    cal.name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        log::info!(
+            "sync_calendars: fetched {} events from CalDAV calendar '{}'",
+            caldav_events.len(),
+            cal.name
+        );
+
+        let local_cal_id = remote_to_local
+            .get(&cal.href)
+            .cloned()
+            .unwrap_or_default();
+
+        let conn = state.db.lock().await;
+        for ev in &caldav_events {
+            // Parse the iCalendar data to extract event details
+            let parsed = ical::parse_ical_data(&ev.ical_data);
+            if parsed.is_empty() {
+                log::debug!(
+                    "sync_calendars: could not parse iCal data for event href={}",
+                    ev.href
+                );
+                continue;
+            }
+            let invite = &parsed[0];
+
+            let attendees_json = if invite.attendees.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&invite.attendees)
+                        .unwrap_or_else(|_| "[]".to_string()),
+                )
+            };
+
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let cal_event = CalendarEvent {
+                id: event_id,
+                account_id: account_id.to_string(),
+                calendar_id: local_cal_id.clone(),
+                uid: Some(ev.uid.clone()),
+                title: invite
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "(No title)".to_string()),
+                description: invite.description.clone(),
+                location: invite.location.clone(),
+                start_time: invite.dtstart.clone(),
+                end_time: invite.dtend.clone(),
+                all_day: invite.all_day,
+                timezone: invite.timezone.clone(),
+                recurrence_rule: invite.recurrence_rule.clone(),
+                organizer_email: invite.organizer_email.clone(),
+                attendees_json,
+                my_status: None,
+                source_message_id: None,
+                ical_data: Some(ev.ical_data.clone()),
+                remote_id: Some(ev.href.clone()),
+                etag: Some(ev.etag.clone()),
+            };
+
+            if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                log::error!(
+                    "sync_calendars: failed to upsert CalDAV event '{}': {}",
+                    invite.summary.as_deref().unwrap_or("?"),
+                    e
+                );
+            }
+        }
+    }
+
+    // Step 3: Push local events with no remote_id to CalDAV
+    {
+        let conn = state.db.lock().await;
+        let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, account_id)?;
+
+        if !local_events.is_empty() {
+            log::info!(
+                "sync_calendars: pushing {} local events to CalDAV",
+                local_events.len()
+            );
+            drop(conn); // Release lock for async calls
+
+            for ev in &local_events {
+                // Find the remote calendar href for this event's local calendar
+                let remote_cal_href = remote_to_local
+                    .iter()
+                    .find(|(_, local_id)| **local_id == ev.calendar_id)
+                    .map(|(remote_href, _)| remote_href.clone())
+                    .unwrap_or_default();
+
+                if remote_cal_href.is_empty() {
+                    log::warn!(
+                        "sync_calendars: no remote CalDAV calendar for local event '{}'",
+                        ev.title
+                    );
+                    continue;
+                }
+
+                let uid = ev
+                    .uid
+                    .clone()
+                    .unwrap_or_else(|| format!("{}@emails-client", uuid::Uuid::new_v4()));
+
+                // Use existing ical_data if available, or generate new
+                let ical_data = ev.ical_data.clone().unwrap_or_else(|| {
+                    crate::mail::caldav::generate_ical_event(
+                        &uid,
+                        &ev.title,
+                        ev.description.as_deref(),
+                        ev.location.as_deref(),
+                        &ev.start_time,
+                        &ev.end_time,
+                        ev.all_day,
+                    )
+                });
+
+                match client.put_event(&remote_cal_href, &uid, &ical_data).await {
+                    Ok(etag) => {
+                        let remote_id = format!(
+                            "{}/{}.ics",
+                            remote_cal_href.trim_end_matches('/'),
+                            uid
+                        );
+                        log::info!(
+                            "sync_calendars: pushed event '{}' to CalDAV, remote_id={}",
+                            ev.title,
+                            remote_id
+                        );
+                        let conn = state.db.lock().await;
+                        conn.execute(
+                            "UPDATE calendar_events SET remote_id = ?1, etag = ?2, uid = ?3, ical_data = ?4 WHERE id = ?5",
+                            rusqlite::params![remote_id, etag, uid, ical_data, ev.id],
+                        )
+                        .ok();
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "sync_calendars: failed to push event '{}' to CalDAV: {}",
+                            ev.title,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
