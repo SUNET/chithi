@@ -127,76 +127,87 @@ onMounted(async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 16px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-secondary);
+  background: var(--color-bg);
   flex-shrink: 0;
 }
 
 .toolbar-left {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .btn-new-event {
-  padding: 4px 12px;
+  padding: 6px 16px;
   background: var(--color-accent);
-  color: var(--color-bg);
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 600;
+  color: white;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  transition: box-shadow 0.15s, transform 0.1s;
 }
 
 .btn-new-event:hover {
-  background: var(--color-accent-hover);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  transform: translateY(-1px);
 }
 
 .btn-today {
-  padding: 4px 12px;
+  padding: 5px 14px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: 20px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--color-text-secondary);
+  margin-left: 8px;
 }
 
 .btn-today:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
 .btn-nav {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   font-size: 18px;
-  color: var(--color-text-secondary);
+  color: var(--color-text-muted);
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: background 0.1s;
 }
 
 .btn-nav:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
 .current-date {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 18px;
+  font-weight: 400;
   color: var(--color-text);
+  margin-left: 4px;
 }
 
 .view-toggle {
   display: flex;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: 20px;
   overflow: hidden;
 }
 
 .view-btn {
-  padding: 4px 12px;
+  padding: 5px 14px;
   font-size: 12px;
-  color: var(--color-text-secondary);
+  font-weight: 500;
+  color: var(--color-text-muted);
   border-right: 1px solid var(--color-border);
+  transition: all 0.15s;
 }
 
 .view-btn:last-child {
@@ -205,11 +216,12 @@ onMounted(async () => {
 
 .view-btn:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
 .view-btn.active {
   background: var(--color-accent);
-  color: var(--color-bg);
+  color: white;
 }
 
 .calendar-content {

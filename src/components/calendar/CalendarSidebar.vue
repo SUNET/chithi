@@ -88,16 +88,18 @@ async function syncThisCalendar() {
   display: flex;
   flex-direction: column;
   background: var(--color-bg-secondary);
-  padding: 8px;
+  padding: 16px 12px;
 }
 
 .sidebar-header {
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 10px;
+  font-weight: 700;
   color: var(--color-text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  padding: 8px 4px;
+  letter-spacing: 1px;
+  padding: 0 4px 12px;
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: 12px;
 }
 
 .calendar-list {
