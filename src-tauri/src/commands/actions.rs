@@ -164,58 +164,77 @@ pub async fn set_message_flags(
         add
     );
 
-    let (imap_config, by_folder, current_flags_map) = {
+    let account = {
         let conn = state.db.lock().await;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-        };
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-
-        // Get current flags for each message so we can update them locally
-        let mut flags_map: HashMap<String, Vec<String>> = HashMap::new();
-        for msg_id in &message_ids {
-            let (_, _, _, _, flags_json, _, _) =
-                db::messages::get_message_metadata(&conn, &account_id, msg_id)?;
-            let current: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
-            flags_map.insert(msg_id.clone(), current);
-        }
-
-        (config, grouped, flags_map)
+        db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if by_folder.is_empty() {
-        log::warn!("No messages found for flag operation");
-        return Ok(());
+    if account.mail_protocol == "jmap" {
+        // JMAP path: extract JMAP email IDs and set flags via JMAP API
+        let jmap_config = crate::mail::jmap::JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+
+        // Extract JMAP email IDs from composite message IDs
+        let jmap_ids: Vec<String> = message_ids.iter().map(|mid| {
+            // Format: {account_id}_{folder}_{jmap_email_id}
+            let parts: Vec<&str> = mid.splitn(3, '_').collect();
+            if parts.len() == 3 { parts[2].to_string() } else { mid.clone() }
+        }).collect();
+
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
+        conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, add).await?;
+    } else {
+        // IMAP path
+        let (imap_config, by_folder) = {
+            let conn = state.db.lock().await;
+            let config = ImapConfig {
+                host: account.imap_host.clone(),
+                port: account.imap_port,
+                username: account.username.clone(),
+                password: account.password.clone(),
+                use_tls: account.use_tls,
+            };
+            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let grouped = group_by_folder(uid_rows);
+            (config, grouped)
+        };
+
+        if !by_folder.is_empty() {
+            let flag_refs: Vec<String> = flags.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = ImapConnection::connect(&imap_config)?;
+                let flag_strs: Vec<&str> = flag_refs.iter().map(|s| s.as_str()).collect();
+                for (folder_path, uids) in &by_folder {
+                    conn.select_folder(folder_path)?;
+                    conn.set_flags(uids, &flag_strs, add)?;
+                }
+                conn.logout();
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Other(format!("Set flags task panicked: {}", e)))??;
+        }
     }
 
-    let flag_refs: Vec<String> = flags.clone();
-
-    // Perform IMAP flag operations in a blocking thread
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = ImapConnection::connect(&imap_config)?;
-        let flag_strs: Vec<&str> = flag_refs.iter().map(|s| s.as_str()).collect();
-
-        for (folder_path, uids) in &by_folder {
-            log::debug!(
-                "Setting flags on {} messages in '{}'",
-                uids.len(),
-                folder_path
-            );
-            conn.select_folder(folder_path)?;
-            conn.set_flags(uids, &flag_strs, add)?;
+    // Build current flags map for local update
+    let current_flags_map: HashMap<String, Vec<String>> = {
+        let conn = state.db.lock().await;
+        let mut map = HashMap::new();
+        for msg_id in &message_ids {
+            if let Ok((_, _, _, _, flags_json, _, _)) =
+                db::messages::get_message_metadata(&conn, &account_id, msg_id)
+            {
+                let current: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+                map.insert(msg_id.clone(), current);
+            }
         }
-
-        conn.logout();
-        Ok(())
-    })
-    .await
-    .map_err(|e| Error::Other(format!("Set flags task panicked: {}", e)))??;
+        map
+    };
 
     // Update flags in local DB
     {

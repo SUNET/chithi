@@ -9,6 +9,7 @@ const route = useRoute();
 const accountsStore = useAccountsStore();
 
 // Prefill from query params (reply/reply-all/forward)
+const replyToMessageId = (route.query.replyTo as string) || "";
 const to = ref((route.query.to as string) || "");
 const cc = ref((route.query.cc as string) || "");
 const bcc = ref("");
@@ -50,6 +51,11 @@ async function send() {
       body_text: bodyText.value,
       body_html: null,
     });
+    // Mark the original message as answered if this is a reply
+    if (replyToMessageId) {
+      api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
+        .catch((e) => console.error("Failed to set answered flag:", e));
+    }
     router.push("/");
   } catch (e) {
     error.value = String(e);

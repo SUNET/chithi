@@ -51,6 +51,11 @@ const contextMenu = ref<{
   threadId?: string;
 } | null>(null);
 
+function onChildSelect(messageId: string) {
+  closeContextMenu();
+  messagesStore.selectMessage(messageId, { shiftKey: false, ctrlKey: false, metaKey: false });
+}
+
 function onSelect(messageId: string, event?: MouseEvent) {
   closeContextMenu();
   // Check both keyboard tracker AND MouseEvent for modifier keys.
@@ -182,7 +187,7 @@ const displayedCount = () => {
             :thread="thread"
             :expanded="messagesStore.expandedThreads.includes(thread.thread_id)"
             :active="thread.message_ids.includes(messagesStore.activeMessageId ?? '')"
-            :selected="thread.message_ids.some((id) => messagesStore.isSelected(id))"
+            :selected="messagesStore.isSelected(thread.message_ids[0])"
             @toggle="messagesStore.toggleThread(thread.thread_id)"
             @toggle-select="messagesStore.toggleSelectMessage(thread.message_ids[0])"
             @open="onThreadOpen(thread)"
@@ -191,11 +196,11 @@ const displayedCount = () => {
         <!-- Expanded thread messages -->
         <template v-if="messagesStore.expandedThreads.includes(thread.thread_id)">
           <div
-            v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? [])"
+            v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? []).slice(1)"
             :key="msg.id"
             class="thread-child"
-            @click="onSelect(msg.id, $event)"
-            @contextmenu.prevent="onRowContextMenu($event, msg.id)"
+            @click.stop="onChildSelect(msg.id)"
+            @contextmenu.prevent.stop="onRowContextMenu($event, msg.id)"
           >
             <MessageListItem
               :message="msg"

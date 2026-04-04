@@ -124,6 +124,7 @@ function reply() {
   router.push({
     path: "/compose",
     query: {
+      replyTo: msg.id,
       to: msg.from.email,
       subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
       body: quoteBody(),
@@ -143,6 +144,7 @@ function replyAll() {
   router.push({
     path: "/compose",
     query: {
+      replyTo: msg.id,
       to: allTo.join(", "),
       cc: allCc.join(", "),
       subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
