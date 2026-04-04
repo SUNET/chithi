@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -44,6 +44,79 @@ pub async fn trigger_sync(
     .await?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn sync_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+) -> Result<u32> {
+    log::info!("Single folder sync: account={} folder={}", account_id, folder_path);
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    let imap_config = ImapConfig {
+        host: account.imap_host,
+        port: account.imap_port,
+        username: account.username,
+        password: account.password,
+        use_tls: account.use_tls,
+    };
+
+    let db = state.db.clone();
+    let account_name = account.display_name.clone();
+
+    app.emit(
+        "sync-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "account_name": account_name,
+        }),
+    ).ok();
+
+    let app_clone = app.clone();
+    let account_id_clone = account_id.clone();
+    let folder_clone = folder_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn_imap = ImapConnection::connect(&imap_config)?;
+        conn_imap.select_folder(&folder_clone)?;
+        let count = mail_sync::sync_folder_envelopes_public(
+            &db, &account_id_clone, &mut conn_imap, &folder_clone,
+        )?;
+        conn_imap.logout();
+        Ok::<u32, Error>(count)
+    })
+    .await
+    .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?;
+
+    match &result {
+        Ok(count) => {
+            app.emit(
+                "sync-complete",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "total_synced": count,
+                }),
+            ).ok();
+            log::info!("Single folder sync done: {} new in {}", count, folder_path);
+        }
+        Err(e) => {
+            app.emit(
+                "sync-error",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "error": e.to_string(),
+                }),
+            ).ok();
+        }
+    }
+
+    result
 }
 
 #[derive(serde::Serialize)]

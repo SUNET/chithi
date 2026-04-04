@@ -1,10 +1,17 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import { useFoldersStore } from "@/stores/folders";
 import { useAccountsStore } from "@/stores/accounts";
+import { useMessagesStore } from "@/stores/messages";
 import type { Folder } from "@/lib/types";
+import * as api from "@/lib/tauri";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
+const messagesStore = useMessagesStore();
+
+const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
+const syncing = ref<string | null>(null);
 
 function folderIcon(folder: Folder): string {
   switch (folder.folder_type) {
@@ -28,10 +35,39 @@ function folderIcon(folder: Folder): string {
 function switchAccount(id: string) {
   accountsStore.setActiveAccount(id);
 }
+
+function onFolderContextMenu(event: MouseEvent, folder: Folder) {
+  event.preventDefault();
+  contextMenu.value = { x: event.clientX, y: event.clientY, folder };
+}
+
+function closeContextMenu() {
+  contextMenu.value = null;
+}
+
+async function syncThisFolder() {
+  const accountId = accountsStore.activeAccountId;
+  const folder = contextMenu.value?.folder;
+  if (!accountId || !folder) return;
+  closeContextMenu();
+
+  syncing.value = folder.path;
+  try {
+    await api.syncFolder(accountId, folder.path);
+    await foldersStore.fetchFolders();
+    if (foldersStore.activeFolderPath === folder.path) {
+      await messagesStore.fetchMessages();
+    }
+  } catch (e) {
+    console.error("Folder sync failed:", e);
+  } finally {
+    syncing.value = null;
+  }
+}
 </script>
 
 <template>
-  <div class="folder-tree">
+  <div class="folder-tree" @click="closeContextMenu">
     <!-- Account selector when multiple accounts -->
     <div v-if="accountsStore.accounts.length > 1" class="account-list">
       <button
@@ -55,14 +91,32 @@ function switchAccount(id: string) {
         v-for="folder in foldersStore.folders"
         :key="folder.path"
         class="folder-item"
-        :class="{ active: foldersStore.activeFolderPath === folder.path }"
+        :class="{
+          active: foldersStore.activeFolderPath === folder.path,
+          syncing: syncing === folder.path,
+        }"
         @click="foldersStore.setActiveFolder(folder.path)"
+        @contextmenu="onFolderContextMenu($event, folder)"
       >
         <span class="folder-icon">{{ folderIcon(folder) }}</span>
         <span class="folder-name">{{ folder.name }}</span>
-        <span v-if="folder.unread_count > 0" class="unread-badge">{{ folder.unread_count }}</span>
+        <span v-if="syncing === folder.path" class="sync-spinner"></span>
+        <span v-else-if="folder.unread_count > 0" class="unread-badge">{{ folder.unread_count }}</span>
       </button>
     </div>
+
+    <!-- Right-click context menu -->
+    <Teleport to="body">
+      <div
+        v-if="contextMenu"
+        class="folder-context-menu"
+        :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+      >
+        <button class="ctx-item" @click="syncThisFolder">
+          Sync "{{ contextMenu.folder.name }}"
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -158,6 +212,10 @@ function switchAccount(id: string) {
   background: var(--color-bg-active);
 }
 
+.folder-item.syncing {
+  opacity: 0.7;
+}
+
 .folder-icon {
   font-size: 14px;
   flex-shrink: 0;
@@ -178,5 +236,48 @@ function switchAccount(id: string) {
   padding: 1px 6px;
   border-radius: 10px;
   flex-shrink: 0;
+}
+
+.sync-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+</style>
+
+<style>
+.folder-context-menu {
+  position: fixed;
+  z-index: 9999;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.folder-context-menu .ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 16px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-text);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.folder-context-menu .ctx-item:hover {
+  background: var(--color-bg-hover);
 }
 </style>

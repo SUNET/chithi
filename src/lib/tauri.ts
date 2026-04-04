@@ -49,6 +49,13 @@ export async function getMessageBody(
   return invoke("get_message_body", { accountId, messageId });
 }
 
+export async function syncFolder(
+  accountId: string,
+  folderPath: string,
+): Promise<number> {
+  return invoke("sync_folder", { accountId, folderPath });
+}
+
 export async function triggerSync(
   accountId: string,
   currentFolder?: string,

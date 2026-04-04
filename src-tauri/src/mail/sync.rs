@@ -176,6 +176,16 @@ fn sync_account_blocking(
 /// Sync a folder by fetching envelopes only (no message bodies).
 /// Bodies are fetched on-demand when the user opens a message.
 /// After syncing, runs filter rules on any newly synced messages.
+/// Public entry point for single-folder sync from commands.
+pub fn sync_folder_envelopes_public(
+    db: &Arc<Mutex<rusqlite::Connection>>,
+    account_id: &str,
+    conn_imap: &mut ImapConnection,
+    folder_path: &str,
+) -> Result<u32> {
+    sync_folder_envelopes(db, account_id, conn_imap, folder_path)
+}
+
 fn sync_folder_envelopes(
     db: &Arc<Mutex<rusqlite::Connection>>,
     account_id: &str,
