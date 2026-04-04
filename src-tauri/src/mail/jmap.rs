@@ -507,17 +507,43 @@ impl JmapConnection {
             return Err(Error::Other(format!("JMAP email import failed: {}", desc)));
         }
 
-        // Check for submission errors
-        if resp["methodResponses"].as_array().map(|a| a.len()).unwrap_or(0) > 1 {
+        // Get the imported email ID for cleanup if submission fails
+        let imported_id = resp["methodResponses"][0][1]["created"]["draft"]["id"]
+            .as_str()
+            .map(|s| s.to_string());
+
+        // Check for submission errors — clean up imported email on failure
+        let submission_failed = if resp["methodResponses"].as_array().map(|a| a.len()).unwrap_or(0) > 1 {
             if resp["methodResponses"][1][0].as_str() == Some("error") {
                 let desc = resp["methodResponses"][1][1]["description"]
                     .as_str().unwrap_or("Unknown error");
-                return Err(Error::Other(format!("JMAP submission failed: {}", desc)));
-            }
-            if let Some(err) = resp["methodResponses"][1][1]["notCreated"]["sub1"].as_object() {
+                Some(format!("JMAP submission failed: {}", desc))
+            } else if let Some(err) = resp["methodResponses"][1][1]["notCreated"]["sub1"].as_object() {
                 let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-                return Err(Error::Other(format!("JMAP submission failed: {}", desc)));
+                Some(format!("JMAP submission failed: {}", desc))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some(error_msg) = submission_failed {
+            // Clean up the imported email that wasn't submitted
+            if let Some(ref email_id) = imported_id {
+                log::warn!("JMAP cleaning up imported email {} after submission failure", email_id);
+                let cleanup = serde_json::json!({
+                    "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                    "methodCalls": [
+                        ["Email/set", {
+                            "accountId": self.account_id,
+                            "destroy": [email_id]
+                        }, "cleanup"]
+                    ]
+                });
+                let _ = self.api_request(&cleanup, config).await;
+            }
+            return Err(Error::Other(error_msg));
         }
 
         log::info!("JMAP email sent successfully");

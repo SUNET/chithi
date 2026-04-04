@@ -273,6 +273,41 @@ async fn sync_jmap_folder(
         }
     }
 
+    // Remove local messages that no longer exist on the server.
+    // Build a set of JMAP email IDs from the server response.
+    let server_ids: std::collections::HashSet<String> = emails.iter().map(|e| e.id.clone()).collect();
+    {
+        let conn = db.lock().await;
+        // Get all local message IDs for this folder
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
+        ).map_err(|e| Error::Database(e))?;
+        let local_ids: Vec<String> = stmt.query_map(
+            rusqlite::params![account_id, mailbox_id],
+            |row| row.get(0),
+        ).map_err(|e| Error::Database(e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let prefix = format!("{}_{}_{}", account_id, mailbox_id, "");
+        let mut deleted = 0u32;
+        for local_id in &local_ids {
+            // Extract the JMAP email ID from the composite local ID
+            let jmap_id = local_id.strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
+                .unwrap_or(local_id);
+            if !server_ids.contains(jmap_id) {
+                conn.execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    rusqlite::params![local_id],
+                ).ok();
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            log::info!("JMAP removed {} locally deleted messages from {}", deleted, folder_name);
+        }
+    }
+
     // Update folder counts
     {
         let conn = db.lock().await;
