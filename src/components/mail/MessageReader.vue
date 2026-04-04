@@ -32,6 +32,32 @@ watch(
 const hasHtml = () => !!messagesStore.activeMessage?.body_html;
 const hasText = () => !!messagesStore.activeMessage?.body_text;
 
+// Defense-in-depth: strip any JS vectors that might survive backend sanitization.
+// The Rust ammonia sanitizer is the primary defense; this is a second layer.
+function sanitizeHtml(html: string): string {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  // Remove script/style/iframe elements
+  for (const tag of ["script", "style", "iframe", "object", "embed"]) {
+    for (const el of Array.from(div.getElementsByTagName(tag))) {
+      el.remove();
+    }
+  }
+  // Remove event handler attributes (on*) and javascript: hrefs
+  for (const el of Array.from(div.querySelectorAll("*"))) {
+    for (const attr of Array.from(el.attributes)) {
+      if (attr.name.startsWith("on") || (attr.name === "href" && attr.value.trim().toLowerCase().startsWith("javascript:"))) {
+        el.removeAttribute(attr.name);
+      }
+    }
+  }
+  return div.innerHTML;
+}
+
+function safeHtml(): string {
+  return sanitizeHtml(messagesStore.activeMessage?.body_html ?? "");
+}
+
 // Toast
 const toast = ref<string | null>(null);
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -264,7 +290,7 @@ async function markSpam() {
           <div class="no-remote-notice">Remote content blocked</div>
           <div
             class="body-html"
-            v-html="messagesStore.activeMessage.body_html"
+            v-html="safeHtml()"
           />
         </div>
         <pre
@@ -281,7 +307,7 @@ async function markSpam() {
           <div class="no-remote-notice">Remote content blocked</div>
           <div
             class="body-html"
-            v-html="messagesStore.activeMessage.body_html"
+            v-html="safeHtml()"
           />
         </div>
         <div v-else class="empty">No message content</div>

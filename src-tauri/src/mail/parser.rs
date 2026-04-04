@@ -146,9 +146,19 @@ pub fn parse_message_body(
         .unwrap_or_default();
 
     let body_html = parsed.body_html(0).map(|s| {
+        // Sanitize HTML to prevent XSS. Ammonia defaults already:
+        // - Strip <script>, <style> tags and their contents
+        // - Remove event handler attributes (onclick, onerror, etc.)
+        // - Only allow safe URL schemes (http, https, mailto — NOT javascript:)
+        // We additionally:
+        // - Remove <img> to block remote content / tracking pixels
+        // - Remove <object>, <embed>, <iframe>, <form> to block interactive content
+        // - Allow inline "style" for basic formatting but it cannot execute JS
+        let url_schemes = std::collections::HashSet::from(["http", "https", "mailto"]);
         ammonia::Builder::default()
             .add_generic_attributes(&["style"])
-            .rm_tags(&["img"])  // Strip all images — no remote content
+            .rm_tags(&["img", "object", "embed", "iframe", "form", "input", "button", "textarea", "select", "video", "audio", "source", "svg", "math"])
+            .url_schemes(url_schemes)
             .clean(&s)
             .to_string()
     });
