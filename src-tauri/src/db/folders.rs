@@ -97,6 +97,30 @@ pub fn get_last_seen_uid(conn: &Connection, account_id: &str, path: &str) -> Res
     Ok(uid)
 }
 
+pub fn get_jmap_state(conn: &Connection, account_id: &str, path: &str) -> Result<Option<String>> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT jmap_state FROM folders WHERE account_id = ?1 AND path = ?2",
+            params![account_id, path],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+    Ok(state)
+}
+
+pub fn update_jmap_state(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+    state: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET jmap_state = ?1 WHERE account_id = ?2 AND path = ?3",
+        params![state, account_id, path],
+    )?;
+    Ok(())
+}
+
 /// Guess folder type from name for common IMAP folder names
 pub fn guess_folder_type(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();

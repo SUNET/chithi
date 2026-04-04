@@ -24,6 +24,14 @@ export const useFoldersStore = defineStore("folders", () => {
         const inbox = folders.value.find((f) => f.folder_type === "inbox");
         activeFolderPath.value = inbox?.path ?? folders.value[0].path;
       }
+
+      // If no folders exist yet (new account), trigger a sync to fetch them
+      if (folders.value.length === 0) {
+        log("No folders for account, triggering initial sync...");
+        api.triggerSync(accountId).catch((e) =>
+          console.error("Initial sync failed:", e),
+        );
+      }
     } finally {
       loading.value = false;
     }
@@ -49,3 +57,7 @@ export const useFoldersStore = defineStore("folders", () => {
     setActiveFolder,
   };
 });
+
+function log(msg: string) {
+  console.log(`[folders] ${msg}`);
+}

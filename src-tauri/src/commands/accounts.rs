@@ -36,6 +36,42 @@ pub async fn add_account(
 }
 
 #[tauri::command]
+pub async fn get_account_config(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<db::accounts::AccountConfig> {
+    log::debug!("Getting config for account {}", account_id);
+    let conn = state.db.lock().await;
+    let full = db::accounts::get_account_full(&conn, &account_id)?;
+    Ok(db::accounts::AccountConfig {
+        display_name: full.display_name,
+        email: full.email,
+        provider: full.provider,
+        mail_protocol: full.mail_protocol,
+        imap_host: full.imap_host,
+        imap_port: full.imap_port,
+        smtp_host: full.smtp_host,
+        smtp_port: full.smtp_port,
+        jmap_url: full.jmap_url,
+        username: full.username,
+        password: full.password,
+        use_tls: full.use_tls,
+    })
+}
+
+#[tauri::command]
+pub async fn update_account(
+    state: State<'_, AppState>,
+    account_id: String,
+    config: db::accounts::AccountConfig,
+) -> Result<()> {
+    log::info!("Updating account {} ({})", account_id, config.email);
+    let conn = state.db.lock().await;
+    db::accounts::update_account(&conn, &account_id, &config)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn delete_account(
     state: State<'_, AppState>,
     account_id: String,

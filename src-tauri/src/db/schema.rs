@@ -13,11 +13,12 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             display_name TEXT NOT NULL,
             email TEXT NOT NULL,
             provider TEXT NOT NULL,
-            mail_protocol TEXT NOT NULL,
-            imap_host TEXT NOT NULL,
-            imap_port INTEGER NOT NULL,
-            smtp_host TEXT NOT NULL,
-            smtp_port INTEGER NOT NULL,
+            mail_protocol TEXT NOT NULL DEFAULT 'imap',
+            imap_host TEXT NOT NULL DEFAULT '',
+            imap_port INTEGER NOT NULL DEFAULT 993,
+            smtp_host TEXT NOT NULL DEFAULT '',
+            smtp_port INTEGER NOT NULL DEFAULT 587,
+            jmap_url TEXT NOT NULL DEFAULT '',
             username TEXT NOT NULL,
             password TEXT NOT NULL,
             use_tls INTEGER NOT NULL DEFAULT 1,
@@ -135,6 +136,23 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // Migrations for existing databases
+    run_migrations(conn)?;
+
+    Ok(())
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    // Add jmap_url column if it doesn't exist (added in JMAP support)
+    let has_jmap_url: bool = conn
+        .prepare("SELECT jmap_url FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_jmap_url {
+        log::info!("Migration: adding jmap_url column to accounts table");
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN jmap_url TEXT NOT NULL DEFAULT '';")?;
+    }
+
     Ok(())
 }
 

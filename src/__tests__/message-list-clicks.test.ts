@@ -45,7 +45,7 @@ function makeSummary(id: string): any {
 function setupStores() {
   const accountsStore = useAccountsStore();
   accountsStore.accounts = [
-    { id: "acc1", display_name: "Test", email: "t@t.com", provider: "generic", enabled: true },
+    { id: "acc1", display_name: "Test", email: "t@t.com", provider: "generic", mail_protocol: "imap" as const, enabled: true },
   ];
   accountsStore.activeAccountId = "acc1";
   useFoldersStore().activeFolderPath = "INBOX";

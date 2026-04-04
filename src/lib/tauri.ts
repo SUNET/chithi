@@ -16,6 +16,19 @@ export async function addAccount(config: AccountConfig): Promise<string> {
   return invoke("add_account", { config });
 }
 
+export async function getAccountConfig(
+  accountId: string,
+): Promise<import("./types").AccountConfig> {
+  return invoke("get_account_config", { accountId });
+}
+
+export async function updateAccount(
+  accountId: string,
+  config: import("./types").AccountConfig,
+): Promise<void> {
+  return invoke("update_account", { accountId, config });
+}
+
 export async function deleteAccount(accountId: string): Promise<void> {
   return invoke("delete_account", { accountId });
 }
@@ -142,10 +155,6 @@ export async function getThreadMessages(
 
 export async function unthreadMessage(messageId: string): Promise<void> {
   return invoke("unthread_message", { messageId });
-}
-
-export async function backfillThreads(accountId: string): Promise<number> {
-  return invoke("backfill_threads", { accountId });
 }
 
 // Filter rules

@@ -3,6 +3,7 @@ use tauri::State;
 
 use crate::db;
 use crate::error::Result;
+use crate::mail::jmap::{JmapConfig, JmapConnection};
 use crate::mail::smtp;
 use crate::state::AppState;
 
@@ -29,35 +30,58 @@ pub async fn send_message(
         message.subject
     );
 
-    // Get the account configuration from the database
     let account = {
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    log::debug!(
-        "Sending via SMTP {}:{} as {}",
-        account.smtp_host,
-        account.smtp_port,
-        account.email
-    );
+    if account.mail_protocol == "jmap" {
+        log::info!("Sending via JMAP for account {}", account.email);
 
-    // Send the message via SMTP
-    smtp::send_message(
-        &account.smtp_host,
-        account.smtp_port,
-        &account.username,
-        &account.password,
-        account.use_tls,
-        &account.email,
-        &message.to,
-        &message.cc,
-        &message.bcc,
-        &message.subject,
-        &message.body_text,
-        message.body_html.as_deref(),
-    )
-    .await?;
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+
+        // Build raw RFC5322 message using lettre's builder, then send via JMAP
+        let raw_message = smtp::build_raw_message(
+            &account.email,
+            &message.to,
+            &message.cc,
+            &message.bcc,
+            &message.subject,
+            &message.body_text,
+            message.body_html.as_deref(),
+        )?;
+
+        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        conn_jmap.send_email(&jmap_config, &raw_message).await?;
+    } else {
+        log::debug!(
+            "Sending via SMTP {}:{} as {}",
+            account.smtp_host,
+            account.smtp_port,
+            account.email
+        );
+
+        smtp::send_message(
+            &account.smtp_host,
+            account.smtp_port,
+            &account.username,
+            &account.password,
+            account.use_tls,
+            &account.email,
+            &message.to,
+            &message.cc,
+            &message.bcc,
+            &message.subject,
+            &message.body_text,
+            message.body_html.as_deref(),
+        )
+        .await?;
+    }
 
     log::info!(
         "Message sent successfully for account {} to {:?}",

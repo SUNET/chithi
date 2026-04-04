@@ -72,6 +72,8 @@ export const useMessagesStore = defineStore("messages", () => {
     if (!accountId || !folderPath) {
       messages.value = [];
       threads.value = [];
+      total.value = 0;
+      totalThreads.value = 0;
       return;
     }
     if (resetPage) {

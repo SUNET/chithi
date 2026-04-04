@@ -3,6 +3,7 @@ export interface Account {
   display_name: string;
   email: string;
   provider: "generic" | "gmail" | "microsoft365";
+  mail_protocol: "imap" | "jmap";
   enabled: boolean;
 }
 
@@ -96,10 +97,12 @@ export interface AccountConfig {
   display_name: string;
   email: string;
   provider: "generic" | "gmail" | "microsoft365";
+  mail_protocol: "imap" | "jmap";
   imap_host: string;
   imap_port: number;
   smtp_host: string;
   smtp_port: number;
+  jmap_url: string;
   username: string;
   password: string;
   use_tls: boolean;

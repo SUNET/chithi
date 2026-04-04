@@ -29,6 +29,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::accounts::list_accounts,
             commands::accounts::add_account,
+            commands::accounts::get_account_config,
+            commands::accounts::update_account,
             commands::accounts::delete_account,
             commands::mail::list_folders,
             commands::mail::get_messages,
@@ -36,7 +38,6 @@ fn main() {
             commands::mail::get_threaded_messages,
             commands::mail::get_thread_messages,
             commands::mail::unthread_message,
-            commands::mail::backfill_threads,
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::sync_folder,
             commands::sync_cmd::get_sync_status,

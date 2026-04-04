@@ -4,6 +4,8 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::mail::jmap::JmapConfig;
+use crate::mail::jmap_sync;
 use crate::mail::sync as mail_sync;
 use crate::state::AppState;
 
@@ -19,29 +21,60 @@ pub async fn trigger_sync(
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)?
     };
-    log::info!(
-        "Syncing account {} ({}) via {}:{}",
-        account.display_name, account.email, account.imap_host, account.imap_port
-    );
 
-    let imap_config = ImapConfig {
-        host: account.imap_host,
-        port: account.imap_port,
-        username: account.username,
-        password: account.password,
-        use_tls: account.use_tls,
-    };
+    if account.mail_protocol == "jmap" {
+        log::info!(
+            "Syncing account {} ({}) via JMAP (url={})",
+            account.display_name,
+            account.email,
+            account.jmap_url
+        );
 
-    mail_sync::sync_account(
-        app,
-        state.db.clone(),
-        state.data_dir.clone(),
-        account_id,
-        account.display_name,
-        imap_config,
-        current_folder,
-    )
-    .await?;
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url,
+            email: account.email,
+            username: account.username,
+            password: account.password,
+        };
+
+        jmap_sync::sync_jmap_account(
+            app,
+            state.db.clone(),
+            state.data_dir.clone(),
+            account_id,
+            account.display_name,
+            jmap_config,
+            current_folder,
+        )
+        .await?;
+    } else {
+        log::info!(
+            "Syncing account {} ({}) via IMAP {}:{}",
+            account.display_name,
+            account.email,
+            account.imap_host,
+            account.imap_port
+        );
+
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password: account.password,
+            use_tls: account.use_tls,
+        };
+
+        mail_sync::sync_account(
+            app,
+            state.db.clone(),
+            state.data_dir.clone(),
+            account_id,
+            account.display_name,
+            imap_config,
+            current_folder,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -59,6 +92,26 @@ pub async fn sync_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    if account.mail_protocol == "jmap" {
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+
+        return jmap_sync::sync_jmap_folder_public(
+            app,
+            state.db.clone(),
+            account_id,
+            account.display_name,
+            folder_path,
+            jmap_config,
+        )
+        .await;
+    }
+
+    // IMAP path
     let imap_config = ImapConfig {
         host: account.imap_host,
         port: account.imap_port,
@@ -150,6 +203,16 @@ pub async fn prefetch_bodies(
     account_id: String,
 ) -> Result<u32> {
     log::info!("Prefetch bodies requested for account {}", account_id);
+
+    // Skip prefetch for JMAP accounts — bodies are fetched on-demand via JMAP API
+    {
+        let conn = state.db.lock().await;
+        let account = db::accounts::get_account_full(&conn, &account_id)?;
+        if account.mail_protocol == "jmap" {
+            log::debug!("Prefetch: skipping JMAP account {}", account_id);
+            return Ok(0);
+        }
+    }
 
     let (imap_config, data_dir) = {
         let conn = state.db.lock().await;

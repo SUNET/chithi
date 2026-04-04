@@ -89,7 +89,7 @@ pub async fn send_message(
             .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
     };
 
-    // Build the SMTP transport
+    // Send via SMTP transport
     let creds = Credentials::new(username.to_string(), password.to_string());
 
     // Use STARTTLS for port 587, implicit TLS for port 465 or when use_tls is set
@@ -130,4 +130,57 @@ pub async fn send_message(
     );
 
     Ok(())
+}
+
+/// Build a raw RFC5322 message (for JMAP submission).
+/// Returns the message as bytes without sending it.
+pub fn build_raw_message(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    body_text: &str,
+    body_html: Option<&str>,
+) -> Result<Vec<u8>> {
+    let from_mailbox: Mailbox = from
+        .parse()
+        .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
+
+    let mut builder = Message::builder().from(from_mailbox).subject(subject);
+
+    for addr in to {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid 'to' address '{}': {}", addr, e)))?;
+        builder = builder.to(mailbox);
+    }
+    for addr in cc {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid 'cc' address '{}': {}", addr, e)))?;
+        builder = builder.cc(mailbox);
+    }
+    for addr in bcc {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid 'bcc' address '{}': {}", addr, e)))?;
+        builder = builder.bcc(mailbox);
+    }
+
+    let message = if let Some(html) = body_html {
+        builder
+            .multipart(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::builder().header(ContentType::TEXT_PLAIN).body(body_text.to_string()))
+                    .singlepart(SinglePart::builder().header(ContentType::TEXT_HTML).body(html.to_string())),
+            )
+            .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
+    } else {
+        builder
+            .body(body_text.to_string())
+            .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
+    };
+
+    Ok(message.formatted())
 }

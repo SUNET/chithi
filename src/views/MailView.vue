@@ -100,10 +100,6 @@ onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
     await foldersStore.fetchFolders();
-    // Backfill thread IDs for existing messages (runs once, fast if already done)
-    api.backfillThreads(accountsStore.activeAccountId).catch((e) =>
-      console.error("Thread backfill error:", e),
-    );
   }
 
   await listen("sync-complete", async (event) => {
