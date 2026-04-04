@@ -436,3 +436,374 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
         etag: row.get(18)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE accounts (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                mail_protocol TEXT NOT NULL DEFAULT 'imap',
+                imap_host TEXT NOT NULL DEFAULT '',
+                imap_port INTEGER NOT NULL DEFAULT 993,
+                smtp_host TEXT NOT NULL DEFAULT '',
+                smtp_port INTEGER NOT NULL DEFAULT 587,
+                jmap_url TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                use_tls INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE calendars (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                color TEXT DEFAULT '#4285f4',
+                is_default INTEGER DEFAULT 0,
+                remote_id TEXT,
+                UNIQUE(account_id, remote_id)
+            );
+            CREATE TABLE calendar_events (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                calendar_id TEXT NOT NULL,
+                uid TEXT,
+                title TEXT NOT NULL,
+                description TEXT,
+                location TEXT,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                all_day INTEGER DEFAULT 0,
+                timezone TEXT,
+                recurrence_rule TEXT,
+                organizer_email TEXT,
+                attendees_json TEXT,
+                my_status TEXT,
+                source_message_id TEXT,
+                ical_data TEXT,
+                remote_id TEXT,
+                etag TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO accounts (id, display_name, email, provider, username, password)
+            VALUES ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn make_event(id: &str, title: &str, remote_id: Option<&str>) -> CalendarEvent {
+        CalendarEvent {
+            id: id.to_string(),
+            account_id: "acc1".to_string(),
+            calendar_id: "cal1".to_string(),
+            uid: Some(format!("{}@test", id)),
+            title: title.to_string(),
+            description: None,
+            location: None,
+            start_time: "2026-04-07T17:00:00Z".to_string(),
+            end_time: "2026-04-07T18:00:00Z".to_string(),
+            all_day: false,
+            timezone: None,
+            recurrence_rule: None,
+            organizer_email: None,
+            attendees_json: None,
+            my_status: None,
+            source_message_id: None,
+            ical_data: None,
+            remote_id: remote_id.map(|s| s.to_string()),
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_event() {
+        let conn = setup_db();
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(fetched.title, "Meeting");
+        assert_eq!(fetched.uid, Some("e1@test".to_string()));
+        assert!(fetched.remote_id.is_none());
+    }
+
+    #[test]
+    fn test_insert_then_update_remote_id() {
+        let conn = setup_db();
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        // Simulate what create_event does: INSERT first, then UPDATE remote_id
+        conn.execute(
+            "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+            params!["remote-abc", "e1"],
+        )
+        .unwrap();
+
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(fetched.remote_id, Some("remote-abc".to_string()));
+    }
+
+    #[test]
+    fn test_update_before_insert_has_no_effect() {
+        let conn = setup_db();
+
+        // UPDATE on non-existent row does nothing (the old bug)
+        let rows = conn
+            .execute(
+                "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+                params!["remote-abc", "e1"],
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "UPDATE on non-existent row should affect 0 rows");
+
+        // INSERT with remote_id = None
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert!(
+            fetched.remote_id.is_none(),
+            "remote_id should be None because UPDATE happened before INSERT"
+        );
+    }
+
+    #[test]
+    fn test_delete_event() {
+        let conn = setup_db();
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        delete_event(&conn, "e1").unwrap();
+
+        let result = get_event(&conn, "e1");
+        assert!(result.is_err(), "Event should not exist after deletion");
+    }
+
+    #[test]
+    fn test_get_event_by_uid() {
+        let conn = setup_db();
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        let found = get_event_by_uid(&conn, "acc1", "e1@test").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().title, "Meeting");
+
+        let not_found = get_event_by_uid(&conn, "acc1", "nonexistent@test").unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_get_event_by_uid_returns_my_status() {
+        let conn = setup_db();
+        let mut event = make_event("e1", "Invite Meeting", None);
+        event.my_status = Some("accepted".to_string());
+        insert_event(&conn, &event).unwrap();
+
+        let found = get_event_by_uid(&conn, "acc1", "e1@test").unwrap().unwrap();
+        assert_eq!(found.my_status, Some("accepted".to_string()));
+    }
+
+    #[test]
+    fn test_upsert_event_by_remote_id_insert() {
+        let conn = setup_db();
+        let event = make_event("e1", "Remote Event", Some("remote-1"));
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(fetched.title, "Remote Event");
+        assert_eq!(fetched.remote_id, Some("remote-1".to_string()));
+    }
+
+    #[test]
+    fn test_upsert_event_by_remote_id_update() {
+        let conn = setup_db();
+        let event = make_event("e1", "Original", Some("remote-1"));
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+
+        // Upsert again with same remote_id but different local ID and title
+        let updated = CalendarEvent {
+            id: "e2".to_string(),
+            title: "Updated".to_string(),
+            remote_id: Some("remote-1".to_string()),
+            ..make_event("e2", "Updated", Some("remote-1"))
+        };
+        upsert_event_by_remote_id(&conn, &updated).unwrap();
+
+        // The original row (id=e1) should be updated, not a new row created
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(fetched.title, "Updated");
+
+        // e2 should not exist as a separate row
+        assert!(get_event(&conn, "e2").is_err());
+    }
+
+    #[test]
+    fn test_upsert_event_no_remote_id_inserts_new() {
+        let conn = setup_db();
+        let event = make_event("e1", "Local Event", None);
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(fetched.title, "Local Event");
+    }
+
+    #[test]
+    fn test_list_events_by_time_range() {
+        let conn = setup_db();
+        let e1 = CalendarEvent {
+            start_time: "2026-04-07T10:00:00Z".to_string(),
+            end_time: "2026-04-07T11:00:00Z".to_string(),
+            ..make_event("e1", "Morning", None)
+        };
+        let e2 = CalendarEvent {
+            start_time: "2026-04-07T20:00:00Z".to_string(),
+            end_time: "2026-04-07T21:00:00Z".to_string(),
+            ..make_event("e2", "Evening", None)
+        };
+        let e3 = CalendarEvent {
+            start_time: "2026-04-08T10:00:00Z".to_string(),
+            end_time: "2026-04-08T11:00:00Z".to_string(),
+            ..make_event("e3", "Tomorrow", None)
+        };
+        insert_event(&conn, &e1).unwrap();
+        insert_event(&conn, &e2).unwrap();
+        insert_event(&conn, &e3).unwrap();
+
+        let events = list_events(
+            &conn,
+            "acc1",
+            None,
+            "2026-04-07T00:00:00Z",
+            "2026-04-07T23:59:59Z",
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].title, "Morning");
+        assert_eq!(events[1].title, "Evening");
+    }
+
+    #[test]
+    fn test_calendar_crud() {
+        let conn = setup_db();
+        let cal = NewCalendar {
+            account_id: "acc1".to_string(),
+            name: "Work".to_string(),
+            color: "#ff0000".to_string(),
+            is_default: true,
+        };
+        insert_calendar(&conn, "cal1", &cal).unwrap();
+
+        let fetched = get_calendar(&conn, "cal1").unwrap();
+        assert_eq!(fetched.name, "Work");
+        assert_eq!(fetched.color, "#ff0000");
+
+        update_calendar(&conn, "cal1", "Personal", "#00ff00").unwrap();
+        let updated = get_calendar(&conn, "cal1").unwrap();
+        assert_eq!(updated.name, "Personal");
+        assert_eq!(updated.color, "#00ff00");
+    }
+
+    #[test]
+    fn test_upsert_calendar_by_remote_id() {
+        let conn = setup_db();
+
+        // First upsert creates a new calendar
+        let id1 = upsert_calendar_by_remote_id(
+            &conn, "acc1", "remote-cal", "Work", "#4285f4", true,
+        )
+        .unwrap();
+
+        let cal = get_calendar(&conn, &id1).unwrap();
+        assert_eq!(cal.name, "Work");
+        assert_eq!(cal.remote_id, Some("remote-cal".to_string()));
+
+        // Second upsert with same remote_id updates
+        let id2 = upsert_calendar_by_remote_id(
+            &conn, "acc1", "remote-cal", "Work Updated", "#ff0000", false,
+        )
+        .unwrap();
+
+        assert_eq!(id1, id2, "Should return same local ID");
+        let updated = get_calendar(&conn, &id2).unwrap();
+        assert_eq!(updated.name, "Work Updated");
+        assert_eq!(updated.color, "#ff0000");
+    }
+
+    #[test]
+    fn test_delete_calendar_cascades_events() {
+        let conn = setup_db();
+        let cal = NewCalendar {
+            account_id: "acc1".to_string(),
+            name: "Work".to_string(),
+            color: "#4285f4".to_string(),
+            is_default: true,
+        };
+        insert_calendar(&conn, "cal1", &cal).unwrap();
+
+        let event = make_event("e1", "Meeting", None);
+        insert_event(&conn, &event).unwrap();
+
+        delete_calendar(&conn, "cal1").unwrap();
+
+        assert!(get_event(&conn, "e1").is_err(), "Events should be deleted with calendar");
+    }
+
+    #[test]
+    fn test_deletion_reconciliation_pattern() {
+        // Simulates the sync deletion reconciliation:
+        // server has events A, B. Local has A, B, C (C was deleted on server).
+        let conn = setup_db();
+        insert_event(&conn, &make_event("e1", "A", Some("remote-a"))).unwrap();
+        insert_event(&conn, &make_event("e2", "B", Some("remote-b"))).unwrap();
+        insert_event(&conn, &make_event("e3", "C", Some("remote-c"))).unwrap();
+
+        // Server only has A and B
+        let server_ids: std::collections::HashSet<String> =
+            ["remote-a", "remote-b"].iter().map(|s| s.to_string()).collect();
+
+        // Find local events with remote_id
+        let local_synced: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, remote_id FROM calendar_events WHERE account_id = ?1 AND remote_id IS NOT NULL",
+            )
+            .unwrap()
+            .query_map(params!["acc1"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut deleted = 0u32;
+        for (local_id, remote_id) in &local_synced {
+            if !server_ids.contains(remote_id) {
+                conn.execute(
+                    "DELETE FROM calendar_events WHERE id = ?1",
+                    params![local_id],
+                )
+                .ok();
+                deleted += 1;
+            }
+        }
+
+        assert_eq!(deleted, 1);
+        assert!(get_event(&conn, "e1").is_ok());
+        assert!(get_event(&conn, "e2").is_ok());
+        assert!(get_event(&conn, "e3").is_err(), "C should be deleted");
+    }
+}

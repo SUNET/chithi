@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, onMounted } from "vue";
 import type { ParsedInvite } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
 import * as api from "@/lib/tauri";
@@ -13,6 +13,19 @@ const accountsStore = useAccountsStore();
 const responding = ref(false);
 const responded = ref<string | null>(null);
 const error = ref<string | null>(null);
+
+onMounted(async () => {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId || !props.invite.uid) return;
+  try {
+    const status = await api.getInviteStatus(accountId, props.invite.uid);
+    if (status) {
+      responded.value = status;
+    }
+  } catch {
+    // ignore — just show buttons if lookup fails
+  }
+});
 
 function formatDateTime(iso: string): string {
   return new Date(iso).toLocaleString(undefined, {

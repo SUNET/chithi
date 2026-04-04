@@ -61,6 +61,7 @@ fn main() {
             commands::calendar::update_event,
             commands::calendar::delete_event,
             commands::calendar::get_email_invites,
+            commands::calendar::get_invite_status,
             commands::calendar::respond_to_invite,
             commands::calendar::send_invites,
             commands::calendar::sync_calendars,

@@ -175,11 +175,19 @@ pub async fn create_event(
         etag: None,
     };
 
-    // If the account is JMAP, also create on the server
+    // Insert locally first, then push to server
     {
         let conn = state.db.lock().await;
+        db::calendar::insert_event(&conn, &cal_event)?;
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
+
         if account.mail_protocol == "jmap" {
+            // Look up the remote calendar ID from local calendar
+            let calendar = db::calendar::get_calendar(&conn, &cal_event.calendar_id)?;
+            let remote_cal_id = calendar.remote_id.clone().unwrap_or_default();
+            if remote_cal_id.is_empty() {
+                log::warn!("create_event: no remote calendar ID for local calendar '{}'", cal_event.calendar_id);
+            }
             drop(conn); // Release lock before async call
             let jmap_config = crate::mail::jmap::JmapConfig {
                 jmap_url: account.jmap_url,
@@ -189,7 +197,7 @@ pub async fn create_event(
             };
             let jmap_event = crate::mail::jmap::JmapCalendarEvent {
                 id: String::new(),
-                calendar_id: cal_event.calendar_id.clone(),
+                calendar_id: remote_cal_id,
                 title: cal_event.title.clone(),
                 description: cal_event.description.clone(),
                 location: cal_event.location.clone(),
@@ -206,7 +214,6 @@ pub async fn create_event(
                     match conn_jmap.create_calendar_event(&jmap_config, &jmap_event).await {
                         Ok(remote_id) => {
                             log::info!("create_event: pushed to JMAP, remote_id={}", remote_id);
-                            // Update local event with remote_id
                             let conn = state.db.lock().await;
                             conn.execute(
                                 "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
@@ -218,11 +225,6 @@ pub async fn create_event(
                 }
                 Err(e) => log::error!("create_event: JMAP connect failed: {}", e),
             }
-            // Re-acquire lock for local insert
-            let conn = state.db.lock().await;
-            db::calendar::insert_event(&conn, &cal_event)?;
-        } else {
-            db::calendar::insert_event(&conn, &cal_event)?;
         }
     }
 
@@ -288,6 +290,52 @@ pub async fn delete_event(
     event_id: String,
 ) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
+
+    // Look up the event and account to delete from server if needed
+    let (event, account) = {
+        let conn = state.db.lock().await;
+        let evt = db::calendar::get_event(&conn, &event_id)?;
+        let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
+        (evt, acc)
+    };
+
+    // Delete from server if event has a remote_id
+    if let Some(ref remote_id) = event.remote_id {
+        if !remote_id.is_empty() {
+            if account.mail_protocol == "jmap" {
+                let jmap_config = crate::mail::jmap::JmapConfig {
+                    jmap_url: account.jmap_url.clone(),
+                    email: account.email.clone(),
+                    username: account.username.clone(),
+                    password: account.password.clone(),
+                };
+                match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+                    Ok(conn_jmap) => {
+                        if let Err(e) = conn_jmap.delete_calendar_event(&jmap_config, remote_id).await {
+                            log::error!("delete_event: JMAP server delete failed: {}", e);
+                        }
+                    }
+                    Err(e) => log::error!("delete_event: JMAP connect failed: {}", e),
+                }
+            } else if !account.caldav_url.is_empty() {
+                let caldav_config = crate::mail::caldav::CalDavConfig {
+                    caldav_url: account.caldav_url.clone(),
+                    username: account.username.clone(),
+                    password: account.password.clone(),
+                    email: account.email.clone(),
+                };
+                match crate::mail::caldav::CalDavClient::connect(&caldav_config).await {
+                    Ok(client) => {
+                        if let Err(e) = client.delete_event(remote_id).await {
+                            log::error!("delete_event: CalDAV server delete failed: {}", e);
+                        }
+                    }
+                    Err(e) => log::error!("delete_event: CalDAV connect failed: {}", e),
+                }
+            }
+        }
+    }
+
     let conn = state.db.lock().await;
     db::calendar::delete_event(&conn, &event_id)?;
     log::info!("delete_event: deleted event {}", event_id);
@@ -792,6 +840,17 @@ pub async fn get_email_invites(
 }
 
 #[tauri::command]
+pub async fn get_invite_status(
+    state: State<'_, AppState>,
+    account_id: String,
+    invite_uid: String,
+) -> Result<Option<String>> {
+    let conn = state.db.lock().await;
+    let event = db::calendar::get_event_by_uid(&conn, &account_id, &invite_uid)?;
+    Ok(event.and_then(|e| e.my_status))
+}
+
+#[tauri::command]
 pub async fn respond_to_invite(
     state: State<'_, AppState>,
     account_id: String,
@@ -1220,6 +1279,11 @@ pub async fn send_invites(
             &ical,
         );
 
+        if raw.is_empty() {
+            log::error!("send_invites: failed to build invite message for {}", attendee_email);
+            continue;
+        }
+
         if account.mail_protocol == "jmap" {
             let jmap_config = crate::mail::jmap::JmapConfig {
                 jmap_url: account.jmap_url.clone(),
@@ -1267,24 +1331,48 @@ fn build_invite_message(
     body_text: &str,
     ical_data: &str,
 ) -> Vec<u8> {
-    let boundary = format!("----=_Part_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    format!(
-        "From: {from}\r\n\
-         To: {to}\r\n\
-         Subject: {subject}\r\n\
-         MIME-Version: 1.0\r\n\
-         Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
-         \r\n\
-         --{boundary}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         \r\n\
-         {body_text}\r\n\
-         --{boundary}\r\n\
-         Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\
-         Content-Disposition: attachment; filename=\"invite.ics\"\r\n\
-         \r\n\
-         {ical_data}\r\n\
-         --{boundary}--\r\n"
-    )
-    .into_bytes()
+    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+    use lettre::Message;
+
+    let from_mailbox: Mailbox = match from.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("build_invite_message: invalid from '{}': {}", from, e);
+            return Vec::new();
+        }
+    };
+    let to_mailbox: Mailbox = match to.parse() {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("build_invite_message: invalid to '{}': {}", to, e);
+            return Vec::new();
+        }
+    };
+
+    match Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(subject)
+        .multipart(
+            MultiPart::mixed()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(body_text.to_string()),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(
+                            ContentType::parse("text/calendar; method=REQUEST; charset=UTF-8")
+                                .unwrap_or(ContentType::TEXT_PLAIN),
+                        )
+                        .body(ical_data.to_string()),
+                ),
+        ) {
+        Ok(msg) => msg.formatted(),
+        Err(e) => {
+            log::error!("build_invite_message: failed to build message: {}", e);
+            Vec::new()
+        }
+    }
 }

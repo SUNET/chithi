@@ -476,6 +476,276 @@ fn extract_mailto(val: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_mailto() {
+        assert_eq!(extract_mailto("mailto:alice@example.com"), Some("alice@example.com".to_string()));
+        assert_eq!(extract_mailto("MAILTO:Bob@Example.com"), Some("Bob@Example.com".to_string()));
+        assert_eq!(extract_mailto("alice@example.com"), Some("alice@example.com".to_string()));
+        assert_eq!(extract_mailto("not-an-email"), None);
+    }
+
+    #[test]
+    fn test_to_ical_datetime_from_rfc3339() {
+        assert_eq!(to_ical_datetime("2026-04-07T17:00:00.000Z"), "20260407T170000Z");
+        assert_eq!(to_ical_datetime("2026-04-07T17:00:00Z"), "20260407T170000Z");
+    }
+
+    #[test]
+    fn test_to_ical_datetime_from_naive() {
+        assert_eq!(to_ical_datetime("2026-04-07T17:00:00"), "20260407T170000Z");
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_utc() {
+        assert_eq!(
+            ical_datetime_to_iso("20260407T170000Z", false, None),
+            "2026-04-07T17:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_local() {
+        assert_eq!(
+            ical_datetime_to_iso("20260407T170000", false, None),
+            "2026-04-07T17:00:00"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_allday() {
+        assert_eq!(
+            ical_datetime_to_iso("20260407", true, None),
+            "2026-04-07"
+        );
+    }
+
+    #[test]
+    fn test_parse_ical_data_request() {
+        let ical = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:test-uid-123\r\n\
+SUMMARY:Team Standup\r\n\
+DTSTART:20260407T170000Z\r\n\
+DTEND:20260407T180000Z\r\n\
+LOCATION:Room 42\r\n\
+DESCRIPTION:Daily standup meeting\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:bob@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1);
+
+        let inv = &invites[0];
+        assert_eq!(inv.method, "REQUEST");
+        assert_eq!(inv.uid, "test-uid-123");
+        assert_eq!(inv.summary, Some("Team Standup".to_string()));
+        assert_eq!(inv.location, Some("Room 42".to_string()));
+        assert_eq!(inv.description, Some("Daily standup meeting".to_string()));
+        assert_eq!(inv.organizer_email, Some("alice@example.com".to_string()));
+        assert_eq!(inv.organizer_name, Some("Alice".to_string()));
+        assert_eq!(inv.attendees.len(), 1);
+        assert_eq!(inv.attendees[0].email, "bob@example.com");
+        assert_eq!(inv.attendees[0].status, "needs-action");
+        assert_eq!(inv.sequence, 0);
+        assert!(!inv.all_day);
+    }
+
+    #[test]
+    fn test_parse_ical_data_with_duration() {
+        let ical = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:dur-test\r\n\
+SUMMARY:Quick Chat\r\n\
+DTSTART:20260407T170000Z\r\n\
+DURATION:PT30M\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1);
+        // dtend should be computed from dtstart + duration
+        assert!(invites[0].dtend.contains("17:30:00"), "dtend should be 30min after dtstart, got: {}", invites[0].dtend);
+    }
+
+    #[test]
+    fn test_parse_ical_data_allday() {
+        let ical = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:allday-test\r\n\
+SUMMARY:Holiday\r\n\
+DTSTART;VALUE=DATE:20260407\r\n\
+DTEND;VALUE=DATE:20260408\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1);
+        assert!(invites[0].all_day);
+        assert_eq!(invites[0].dtstart, "2026-04-07");
+    }
+
+    #[test]
+    fn test_parse_ical_data_skips_missing_uid() {
+        let ical = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+SUMMARY:No UID Event\r\n\
+DTSTART:20260407T170000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 0, "Events without UID should be skipped");
+    }
+
+    #[test]
+    fn test_generate_reply_accepted() {
+        let invite = ParsedInvite {
+            method: "REQUEST".to_string(),
+            uid: "test-uid-123".to_string(),
+            summary: Some("Team Standup".to_string()),
+            description: None,
+            location: None,
+            dtstart: "2026-04-07T17:00:00Z".to_string(),
+            dtend: "2026-04-07T18:00:00Z".to_string(),
+            all_day: false,
+            timezone: None,
+            organizer_email: Some("alice@example.com".to_string()),
+            organizer_name: Some("Alice".to_string()),
+            attendees: vec![],
+            recurrence_rule: None,
+            sequence: 0,
+            ical_raw: String::new(),
+        };
+
+        let reply = generate_reply(&invite, "bob@example.com", "accepted");
+
+        assert!(reply.contains("METHOD:REPLY"), "Should have METHOD:REPLY");
+        assert!(reply.contains("PARTSTAT=ACCEPTED"), "Should have ACCEPTED partstat");
+        assert!(reply.contains("mailto:bob@example.com"), "Should contain attendee email");
+        assert!(reply.contains("UID:test-uid-123"), "Should preserve UID");
+        assert!(reply.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"), "Should preserve organizer");
+        assert!(reply.contains("SUMMARY:Team Standup"), "Should preserve summary");
+    }
+
+    #[test]
+    fn test_generate_reply_declined() {
+        let invite = ParsedInvite {
+            method: "REQUEST".to_string(),
+            uid: "uid-456".to_string(),
+            summary: Some("Meeting".to_string()),
+            description: None,
+            location: None,
+            dtstart: "2026-04-07T17:00:00Z".to_string(),
+            dtend: "2026-04-07T18:00:00Z".to_string(),
+            all_day: false,
+            timezone: None,
+            organizer_email: Some("org@example.com".to_string()),
+            organizer_name: None,
+            attendees: vec![],
+            recurrence_rule: None,
+            sequence: 1,
+            ical_raw: String::new(),
+        };
+
+        let reply = generate_reply(&invite, "user@example.com", "declined");
+        assert!(reply.contains("PARTSTAT=DECLINED"));
+        assert!(reply.contains("SEQUENCE:1"));
+    }
+
+    #[test]
+    fn test_generate_invite_with_attendees() {
+        let attendees = vec![
+            Attendee { email: "bob@example.com".to_string(), name: Some("Bob".to_string()), status: "needs-action".to_string() },
+            Attendee { email: "carol@example.com".to_string(), name: None, status: "needs-action".to_string() },
+        ];
+
+        let ical = generate_invite(
+            "new-uid-789",
+            "Project Review",
+            "2026-04-07T17:00:00Z",
+            "2026-04-07T18:00:00Z",
+            Some("Conference Room"),
+            Some("Quarterly review"),
+            "alice@example.com",
+            Some("Alice"),
+            &attendees,
+            None,
+        );
+
+        assert!(ical.contains("METHOD:REQUEST"));
+        assert!(ical.contains("UID:new-uid-789"));
+        assert!(ical.contains("SUMMARY:Project Review"));
+        assert!(ical.contains("LOCATION:Conference Room"));
+        assert!(ical.contains("DESCRIPTION:Quarterly review"));
+        assert!(ical.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"));
+        assert!(ical.contains("mailto:bob@example.com"));
+        assert!(ical.contains(";CN=Bob"));
+        assert!(ical.contains("mailto:carol@example.com"));
+        assert!(ical.contains("STATUS:CONFIRMED"));
+    }
+
+    #[test]
+    fn test_generate_invite_roundtrip() {
+        // Generate an invite, then parse it back
+        let attendees = vec![
+            Attendee { email: "bob@example.com".to_string(), name: None, status: "needs-action".to_string() },
+        ];
+
+        let ical = generate_invite(
+            "roundtrip-uid",
+            "Roundtrip Test",
+            "2026-04-07T17:00:00Z",
+            "2026-04-07T18:00:00Z",
+            None,
+            None,
+            "alice@example.com",
+            None,
+            &attendees,
+            None,
+        );
+
+        let parsed = parse_ical_data(&ical);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].uid, "roundtrip-uid");
+        assert_eq!(parsed[0].summary, Some("Roundtrip Test".to_string()));
+        assert_eq!(parsed[0].method, "REQUEST");
+        assert_eq!(parsed[0].organizer_email, Some("alice@example.com".to_string()));
+        assert_eq!(parsed[0].attendees.len(), 1);
+        assert_eq!(parsed[0].attendees[0].email, "bob@example.com");
+    }
+
+    #[test]
+    fn test_parse_ical_duration() {
+        assert_eq!(parse_ical_duration("PT1H"), Some(chrono::Duration::hours(1)));
+        assert_eq!(parse_ical_duration("PT30M"), Some(chrono::Duration::minutes(30)));
+        assert_eq!(parse_ical_duration("PT1H30M"), Some(chrono::Duration::minutes(90)));
+        assert_eq!(parse_ical_duration("P1D"), Some(chrono::Duration::days(1)));
+        assert_eq!(parse_ical_duration("P1W"), Some(chrono::Duration::weeks(1)));
+        assert_eq!(parse_ical_duration("invalid"), None);
+    }
+}
+
 /// Compute an end datetime from a start datetime and an iCalendar DURATION.
 ///
 /// Handles simple durations like PT1H, PT30M, P1D, PT1H30M.
@@ -557,140 +827,3 @@ fn parse_ical_duration(duration: &str) -> Option<chrono::Duration> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ical_datetime_to_iso_utc() {
-        assert_eq!(
-            ical_datetime_to_iso("20250415T100000Z", false, None),
-            "2025-04-15T10:00:00Z"
-        );
-    }
-
-    #[test]
-    fn test_ical_datetime_to_iso_local() {
-        assert_eq!(
-            ical_datetime_to_iso("20250415T100000", false, None),
-            "2025-04-15T10:00:00"
-        );
-    }
-
-    #[test]
-    fn test_ical_datetime_to_iso_date() {
-        assert_eq!(
-            ical_datetime_to_iso("20250415", true, None),
-            "2025-04-15"
-        );
-    }
-
-    #[test]
-    fn test_extract_mailto() {
-        assert_eq!(
-            extract_mailto("mailto:user@example.com"),
-            Some("user@example.com".to_string())
-        );
-        assert_eq!(
-            extract_mailto("MAILTO:User@Example.COM"),
-            Some("User@Example.COM".to_string())
-        );
-        assert_eq!(
-            extract_mailto("user@example.com"),
-            Some("user@example.com".to_string())
-        );
-        assert_eq!(extract_mailto("invalid"), None);
-    }
-
-    #[test]
-    fn test_parse_ical_duration() {
-        let dur = parse_ical_duration("PT1H30M").unwrap();
-        assert_eq!(dur.num_minutes(), 90);
-
-        let dur = parse_ical_duration("P1D").unwrap();
-        assert_eq!(dur.num_hours(), 24);
-
-        let dur = parse_ical_duration("PT45M").unwrap();
-        assert_eq!(dur.num_minutes(), 45);
-
-        let dur = parse_ical_duration("P1W").unwrap();
-        assert_eq!(dur.num_days(), 7);
-    }
-
-    #[test]
-    fn test_to_ical_datetime() {
-        assert_eq!(
-            to_ical_datetime("2025-04-15T10:00:00Z"),
-            "20250415T100000Z"
-        );
-    }
-
-    #[test]
-    fn test_parse_basic_ical() {
-        let ical = "BEGIN:VCALENDAR\r\n\
-            VERSION:2.0\r\n\
-            PRODID:-//Test//Test//EN\r\n\
-            METHOD:REQUEST\r\n\
-            BEGIN:VEVENT\r\n\
-            UID:test-uid-123@example.com\r\n\
-            SUMMARY:Team Meeting\r\n\
-            DESCRIPTION:Weekly standup\r\n\
-            LOCATION:Room 42\r\n\
-            DTSTART:20250415T100000Z\r\n\
-            DTEND:20250415T110000Z\r\n\
-            ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
-            ATTENDEE;PARTSTAT=NEEDS-ACTION;CN=Bob:mailto:bob@example.com\r\n\
-            SEQUENCE:0\r\n\
-            END:VEVENT\r\n\
-            END:VCALENDAR\r\n";
-
-        let invites = parse_ical_data(ical);
-        assert_eq!(invites.len(), 1);
-
-        let invite = &invites[0];
-        assert_eq!(invite.method, "REQUEST");
-        assert_eq!(invite.uid, "test-uid-123@example.com");
-        assert_eq!(invite.summary.as_deref(), Some("Team Meeting"));
-        assert_eq!(invite.description.as_deref(), Some("Weekly standup"));
-        assert_eq!(invite.location.as_deref(), Some("Room 42"));
-        assert_eq!(invite.dtstart, "2025-04-15T10:00:00Z");
-        assert_eq!(invite.dtend, "2025-04-15T11:00:00Z");
-        assert!(!invite.all_day);
-        assert_eq!(invite.organizer_email.as_deref(), Some("alice@example.com"));
-        assert_eq!(invite.organizer_name.as_deref(), Some("Alice"));
-        assert_eq!(invite.attendees.len(), 1);
-        assert_eq!(invite.attendees[0].email, "bob@example.com");
-        assert_eq!(invite.attendees[0].name.as_deref(), Some("Bob"));
-        assert_eq!(invite.attendees[0].status, "needs-action");
-        assert_eq!(invite.sequence, 0);
-    }
-
-    #[test]
-    fn test_generate_reply() {
-        let invite = ParsedInvite {
-            method: "REQUEST".to_string(),
-            uid: "test-uid-123@example.com".to_string(),
-            summary: Some("Team Meeting".to_string()),
-            description: None,
-            location: None,
-            dtstart: "2025-04-15T10:00:00Z".to_string(),
-            dtend: "2025-04-15T11:00:00Z".to_string(),
-            all_day: false,
-            timezone: None,
-            organizer_email: Some("alice@example.com".to_string()),
-            organizer_name: Some("Alice".to_string()),
-            attendees: vec![],
-            recurrence_rule: None,
-            sequence: 0,
-            ical_raw: String::new(),
-        };
-
-        let reply = generate_reply(&invite, "bob@example.com", "ACCEPTED");
-
-        assert!(reply.contains("METHOD:REPLY"));
-        assert!(reply.contains("PARTSTAT=ACCEPTED"));
-        assert!(reply.contains("mailto:bob@example.com"));
-        assert!(reply.contains("UID:test-uid-123@example.com"));
-        assert!(reply.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"));
-    }
-}
