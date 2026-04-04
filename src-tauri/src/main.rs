@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calendar;
 mod commands;
 mod db;
 mod error;
@@ -51,6 +52,17 @@ fn main() {
             commands::filters::save_filter,
             commands::filters::delete_filter,
             commands::filters::apply_filters_to_folder,
+            commands::calendar::list_calendars,
+            commands::calendar::create_calendar,
+            commands::calendar::update_calendar,
+            commands::calendar::delete_calendar,
+            commands::calendar::get_events,
+            commands::calendar::create_event,
+            commands::calendar::update_event,
+            commands::calendar::delete_event,
+            commands::calendar::get_email_invites,
+            commands::calendar::respond_to_invite,
+            commands::calendar::sync_calendars,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

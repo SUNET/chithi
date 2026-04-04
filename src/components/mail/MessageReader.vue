@@ -4,6 +4,8 @@ import { useRouter } from "vue-router";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
+import type { ParsedInvite } from "@/lib/types";
+import InviteCard from "@/components/calendar/InviteCard.vue";
 import * as api from "@/lib/tauri";
 
 defineProps<{
@@ -21,11 +23,23 @@ const foldersStore = useFoldersStore();
 
 // View mode: plain text by default
 const showHtml = ref(false);
+const invites = ref<ParsedInvite[]>([]);
 
 watch(
   () => messagesStore.activeMessageId,
-  () => {
+  async () => {
     showHtml.value = false;
+    invites.value = [];
+    // Check for calendar invites in the message
+    const accountId = accountsStore.activeAccountId;
+    const msgId = messagesStore.activeMessageId;
+    if (accountId && msgId) {
+      try {
+        invites.value = await api.getEmailInvites(accountId, msgId);
+      } catch {
+        // No invites or parse error — silently ignore
+      }
+    }
   },
 );
 
@@ -280,6 +294,17 @@ async function markSpam() {
           <span class="header-value list-id">{{ messagesStore.activeMessage.list_id }}</span>
         </div>
       </div>
+
+      <!-- Calendar invites -->
+      <div v-if="invites.length > 0" class="invite-section">
+        <InviteCard
+          v-for="invite in invites"
+          :key="invite.uid"
+          :invite="invite"
+          :message-id="messagesStore.activeMessageId!"
+        />
+      </div>
+
       <div class="message-body">
         <div
           v-if="showHtml && hasHtml()"
@@ -464,6 +489,10 @@ async function markSpam() {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--color-text-muted);
+}
+
+.invite-section {
+  padding: 12px 16px 0;
 }
 
 .message-body {

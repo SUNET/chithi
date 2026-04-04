@@ -1,6 +1,33 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// JMAP Calendar types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JmapCalendar {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JmapCalendarEvent {
+    pub id: String,
+    pub calendar_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub start: String,      // ISO 8601
+    pub end: String,
+    pub all_day: bool,
+    pub recurrence_rule: Option<String>,
+    pub uid: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct JmapConfig {
     pub jmap_url: String,
     pub email: String,
@@ -518,6 +545,326 @@ impl JmapConnection {
         Err(Error::Other("No JMAP identity found for submission".into()))
     }
 
+    // -----------------------------------------------------------------------
+    // JMAP Calendar methods
+    // -----------------------------------------------------------------------
+
+    /// List all JMAP calendars for the account.
+    pub async fn list_jmap_calendars(&self, config: &JmapConfig) -> Result<Vec<JmapCalendar>> {
+        log::debug!("JMAP listing calendars");
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["Calendar/get", {
+                    "accountId": self.account_id,
+                    "properties": ["id", "name", "color", "isDefault"]
+                }, "c1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        let calendars_json = resp["methodResponses"][0][1]["list"]
+            .as_array()
+            .ok_or_else(|| Error::Other("Invalid Calendar/get response".into()))?;
+
+        let mut calendars = Vec::new();
+        for cal in calendars_json {
+            let id = cal["id"].as_str().unwrap_or("").to_string();
+            let name = cal["name"].as_str().unwrap_or("Untitled").to_string();
+            let color = cal["color"].as_str().map(|s| s.to_string());
+            let is_default = cal["isDefault"].as_bool().unwrap_or(false);
+
+            log::debug!("  calendar: {} ({}) default={}", name, id, is_default);
+            calendars.push(JmapCalendar {
+                id,
+                name,
+                color,
+                is_default,
+            });
+        }
+        log::info!("JMAP found {} calendars", calendars.len());
+        Ok(calendars)
+    }
+
+    /// Fetch calendar events, optionally filtered by calendar_id.
+    /// Uses CalendarEvent/query + CalendarEvent/get with JSCalendar format.
+    pub async fn fetch_calendar_events(
+        &self,
+        config: &JmapConfig,
+        calendar_id: Option<&str>,
+    ) -> Result<Vec<JmapCalendarEvent>> {
+        log::debug!("JMAP fetching calendar events (calendar={:?})", calendar_id);
+
+        // Note: Stalwart doesn't support "inCalendars" filter, so we fetch all
+        // events and filter by calendarIds client-side.
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["CalendarEvent/query", {
+                    "accountId": self.account_id,
+                    "limit": 1000
+                }, "q1"],
+                ["CalendarEvent/get", {
+                    "#ids": { "resultOf": "q1", "name": "CalendarEvent/query", "path": "/ids" },
+                    "accountId": self.account_id,
+                    "properties": ["id", "calendarIds", "title", "description",
+                                   "start", "duration", "showWithoutTime",
+                                   "recurrenceRules", "uid", "locations",
+                                   "@type"]
+                }, "g1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+        log::debug!("JMAP CalendarEvent response: {}", serde_json::to_string(&resp).unwrap_or_default());
+
+        // Check if the query returned an error
+        if resp["methodResponses"][0][0].as_str() == Some("error") {
+            let desc = resp["methodResponses"][0][1]["description"].as_str().unwrap_or("Unknown");
+            log::error!("JMAP CalendarEvent/query error: {}", desc);
+            return Ok(vec![]);
+        }
+
+        // The get response might be at index 1 or could be missing if query returned no IDs
+        let events_json = match resp["methodResponses"][1][1]["list"].as_array() {
+            Some(list) => list.clone(),
+            None => {
+                log::debug!("JMAP CalendarEvent/get returned no list, possibly empty");
+                return Ok(vec![]);
+            }
+        };
+
+        let mut events = Vec::new();
+        for ev in events_json {
+            let id = ev["id"].as_str().unwrap_or("").to_string();
+            let title = ev["title"].as_str().unwrap_or("(No title)").to_string();
+            let description = ev["description"].as_str().map(|s| s.to_string());
+            let uid = ev["uid"].as_str().map(|s| s.to_string());
+
+            // calendarIds is a map { "cal-id": true, ... } — pick the first key
+            let cal_id = ev["calendarIds"]
+                .as_object()
+                .and_then(|m| m.keys().next().cloned())
+                .unwrap_or_default();
+
+            // Location: JSCalendar uses "locations" as a map { id: { name: "..." } }
+            let location = ev["locations"]
+                .as_object()
+                .and_then(|m| m.values().next())
+                .and_then(|loc| loc["name"].as_str())
+                .map(|s| s.to_string());
+
+            // Start datetime (ISO 8601 local time in JSCalendar)
+            let start = ev["start"].as_str().unwrap_or("").to_string();
+
+            // showWithoutTime indicates an all-day event
+            let all_day = ev["showWithoutTime"].as_bool().unwrap_or(false);
+
+            // Duration is an ISO 8601 duration string like "PT1H" or "P1D"
+            let duration_str = ev["duration"].as_str().unwrap_or("PT1H");
+            let end = compute_end_from_duration(&start, duration_str);
+
+            // Recurrence rules: JSCalendar uses an array of recurrence rule objects
+            let recurrence_rule = ev["recurrenceRules"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .map(|a| serde_json::to_string(a).unwrap_or_default());
+
+            log::debug!("  event: {} ({}) start={} end={}", title, id, start, end);
+            events.push(JmapCalendarEvent {
+                id,
+                calendar_id: cal_id,
+                title,
+                description,
+                location,
+                start,
+                end,
+                all_day,
+                recurrence_rule,
+                uid,
+            });
+        }
+
+        // Client-side filter by calendar if requested
+        let filtered = if let Some(cal_id) = calendar_id {
+            events.into_iter().filter(|e| e.calendar_id == cal_id).collect()
+        } else {
+            events
+        };
+
+        log::info!("JMAP fetched {} calendar events", filtered.len());
+        Ok(filtered)
+    }
+
+    /// Create a calendar event on the server via CalendarEvent/set.
+    /// Returns the server-assigned event ID.
+    pub async fn create_calendar_event(
+        &self,
+        config: &JmapConfig,
+        event: &JmapCalendarEvent,
+    ) -> Result<String> {
+        log::info!("JMAP creating calendar event: '{}'", event.title);
+
+        let uid = event.uid.clone().unwrap_or_else(|| {
+            format!("{}@emails-client", uuid::Uuid::new_v4())
+        });
+
+        let duration = compute_duration(&event.start, &event.end);
+
+        let mut event_obj = serde_json::json!({
+            "@type": "Event",
+            "calendarIds": { &event.calendar_id: true },
+            "title": event.title,
+            "start": event.start,
+            "duration": duration,
+            "showWithoutTime": event.all_day,
+            "uid": uid,
+        });
+
+        if let Some(ref desc) = event.description {
+            event_obj["description"] = serde_json::json!(desc);
+        }
+        if let Some(ref loc) = event.location {
+            event_obj["locations"] = serde_json::json!({
+                "loc1": { "@type": "Location", "name": loc }
+            });
+        }
+        if let Some(ref rrule) = event.recurrence_rule {
+            if let Ok(rules) = serde_json::from_str::<serde_json::Value>(rrule) {
+                event_obj["recurrenceRules"] = rules;
+            }
+        }
+
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["CalendarEvent/set", {
+                    "accountId": self.account_id,
+                    "create": {
+                        "new1": event_obj
+                    }
+                }, "s1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        // Check for creation errors
+        if let Some(err) = resp["methodResponses"][0][1]["notCreated"]["new1"].as_object() {
+            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP create calendar event failed: {}", desc)));
+        }
+
+        let created_id = resp["methodResponses"][0][1]["created"]["new1"]["id"]
+            .as_str()
+            .ok_or_else(|| Error::Other("No id in CalendarEvent/set create response".into()))?
+            .to_string();
+
+        log::info!("JMAP created calendar event id={}", created_id);
+        Ok(created_id)
+    }
+
+    /// Update a calendar event on the server via CalendarEvent/set.
+    pub async fn update_calendar_event(
+        &self,
+        config: &JmapConfig,
+        event_id: &str,
+        event: &JmapCalendarEvent,
+    ) -> Result<()> {
+        log::info!("JMAP updating calendar event: id={}", event_id);
+
+        let duration = compute_duration(&event.start, &event.end);
+
+        let mut patch = serde_json::json!({
+            "title": event.title,
+            "start": event.start,
+            "duration": duration,
+            "showWithoutTime": event.all_day,
+        });
+
+        if let Some(ref desc) = event.description {
+            patch["description"] = serde_json::json!(desc);
+        }
+        if let Some(ref loc) = event.location {
+            patch["locations"] = serde_json::json!({
+                "loc1": { "@type": "Location", "name": loc }
+            });
+        }
+        if let Some(ref rrule) = event.recurrence_rule {
+            if let Ok(rules) = serde_json::from_str::<serde_json::Value>(rrule) {
+                patch["recurrenceRules"] = rules;
+            }
+        }
+
+        let mut update = serde_json::Map::new();
+        update.insert(event_id.to_string(), patch);
+
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["CalendarEvent/set", {
+                    "accountId": self.account_id,
+                    "update": update
+                }, "u1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][event_id].as_object() {
+            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP update calendar event failed: {}", desc)));
+        }
+
+        log::info!("JMAP updated calendar event id={}", event_id);
+        Ok(())
+    }
+
+    /// Delete a calendar event on the server via CalendarEvent/set.
+    pub async fn delete_calendar_event(
+        &self,
+        config: &JmapConfig,
+        event_id: &str,
+    ) -> Result<()> {
+        log::info!("JMAP deleting calendar event: id={}", event_id);
+
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["CalendarEvent/set", {
+                    "accountId": self.account_id,
+                    "destroy": [event_id]
+                }, "d1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notDestroyed"][event_id].as_object() {
+            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP delete calendar event failed: {}", desc)));
+        }
+
+        log::info!("JMAP deleted calendar event id={}", event_id);
+        Ok(())
+    }
+
     /// Find a mailbox by its JMAP role (inbox, sent, drafts, trash, junk).
     async fn find_mailbox_by_role(&self, config: &JmapConfig, role: &str) -> Result<Option<String>> {
         let request = serde_json::json!({
@@ -573,6 +920,126 @@ fn flag_to_keyword(flag: &str) -> &str {
 struct AddrJson {
     name: Option<String>,
     email: String,
+}
+
+/// Compute end datetime from a start datetime and an ISO 8601 duration string.
+/// Handles simple cases like PT1H, PT30M, P1D, PT1H30M, etc.
+/// Falls back to start + 1 hour if parsing fails.
+fn compute_end_from_duration(start: &str, duration: &str) -> String {
+    use chrono::{NaiveDateTime, NaiveDate, Duration};
+
+    let total_seconds = parse_iso8601_duration_seconds(duration);
+
+    // Try parsing as full datetime first, then as date-only
+    if let Ok(dt) = NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S") {
+        let end = dt + Duration::seconds(total_seconds);
+        return end.format("%Y-%m-%dT%H:%M:%S").to_string();
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(start, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).unwrap();
+        let end = dt + Duration::seconds(total_seconds);
+        if total_seconds % 86400 == 0 {
+            return end.format("%Y-%m-%d").to_string();
+        }
+        return end.format("%Y-%m-%dT%H:%M:%S").to_string();
+    }
+    // Fallback: return start as-is
+    start.to_string()
+}
+
+/// Compute an ISO 8601 duration string from start and end datetimes.
+/// Returns "P1D" for full-day spans, "PT{n}H" / "PT{n}M" for shorter spans.
+fn compute_duration(start: &str, end: &str) -> String {
+    use chrono::NaiveDateTime;
+
+    let start_dt = NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S");
+    let end_dt = NaiveDateTime::parse_from_str(end, "%Y-%m-%dT%H:%M:%S");
+
+    if let (Ok(s), Ok(e)) = (start_dt, end_dt) {
+        let diff = e - s;
+        let total_secs = diff.num_seconds();
+        if total_secs <= 0 {
+            return "PT1H".to_string();
+        }
+        let days = total_secs / 86400;
+        let remaining = total_secs % 86400;
+        let hours = remaining / 3600;
+        let minutes = (remaining % 3600) / 60;
+        let secs = remaining % 60;
+
+        if remaining == 0 && days > 0 {
+            return format!("P{}D", days);
+        }
+        let mut s = String::from("P");
+        if days > 0 {
+            s.push_str(&format!("{}D", days));
+        }
+        s.push('T');
+        if hours > 0 {
+            s.push_str(&format!("{}H", hours));
+        }
+        if minutes > 0 {
+            s.push_str(&format!("{}M", minutes));
+        }
+        if secs > 0 {
+            s.push_str(&format!("{}S", secs));
+        }
+        // Ensure we have at least something after 'T'
+        if s.ends_with('T') {
+            s.push_str("0S");
+        }
+        return s;
+    }
+    // Fallback
+    "PT1H".to_string()
+}
+
+/// Parse a simple ISO 8601 duration like "P1D", "PT1H30M", "PT45M" into total seconds.
+fn parse_iso8601_duration_seconds(dur: &str) -> i64 {
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+    let mut in_time = false;
+
+    for ch in dur.chars() {
+        match ch {
+            'P' => {},
+            'T' => { in_time = true; },
+            '0'..='9' => { num_buf.push(ch); },
+            'D' => {
+                if let Ok(n) = num_buf.parse::<i64>() {
+                    total += n * 86400;
+                }
+                num_buf.clear();
+            },
+            'H' if in_time => {
+                if let Ok(n) = num_buf.parse::<i64>() {
+                    total += n * 3600;
+                }
+                num_buf.clear();
+            },
+            'M' if in_time => {
+                if let Ok(n) = num_buf.parse::<i64>() {
+                    total += n * 60;
+                }
+                num_buf.clear();
+            },
+            'S' if in_time => {
+                if let Ok(n) = num_buf.parse::<i64>() {
+                    total += n;
+                }
+                num_buf.clear();
+            },
+            'W' => {
+                if let Ok(n) = num_buf.parse::<i64>() {
+                    total += n * 604800;
+                }
+                num_buf.clear();
+            },
+            _ => { num_buf.clear(); },
+        }
+    }
+
+    if total == 0 { 3600 } else { total } // default 1 hour
 }
 
 fn addresses_to_json(addrs: Option<&Vec<serde_json::Value>>) -> String {

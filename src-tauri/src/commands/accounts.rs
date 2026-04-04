@@ -1,6 +1,8 @@
 use tauri::State;
 
+use crate::commands::calendar::random_calendar_color;
 use crate::db;
+use crate::db::calendar::NewCalendar;
 use crate::error::Result;
 use crate::state::AppState;
 
@@ -32,6 +34,18 @@ pub async fn add_account(
     let conn = state.db.lock().await;
     db::accounts::insert_account(&conn, &id, &config)?;
     log::info!("Account created with id={}", id);
+
+    // Create a default calendar for the new account
+    let cal_id = uuid::Uuid::new_v4().to_string();
+    let default_calendar = NewCalendar {
+        account_id: id.clone(),
+        name: "Calendar".to_string(),
+        color: random_calendar_color(),
+        is_default: true,
+    };
+    db::calendar::insert_calendar(&conn, &cal_id, &default_calendar)?;
+    log::info!("Default calendar created with id={} for account={}", cal_id, id);
+
     Ok(id)
 }
 

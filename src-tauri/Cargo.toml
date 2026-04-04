@@ -32,6 +32,7 @@ mailparse = "0.16"
 jmap-client = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 url = "2"
+icalendar = "0.16"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

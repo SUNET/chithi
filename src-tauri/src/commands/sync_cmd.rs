@@ -31,22 +31,29 @@ pub async fn trigger_sync(
         );
 
         let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url,
-            email: account.email,
-            username: account.username,
-            password: account.password,
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
         };
 
         jmap_sync::sync_jmap_account(
             app,
             state.db.clone(),
             state.data_dir.clone(),
-            account_id,
-            account.display_name,
-            jmap_config,
+            account_id.clone(),
+            account.display_name.clone(),
+            jmap_config.clone(),
             current_folder,
         )
         .await?;
+
+        // Also sync calendars for JMAP accounts
+        log::info!("Syncing calendars for JMAP account {}", account_id);
+        if let Err(e) = sync_jmap_calendars(state.db.clone(), &account_id, &jmap_config).await {
+            log::error!("Calendar sync failed for account {}: {}", account_id, e);
+            // Don't fail the whole sync if calendar sync fails
+        }
     } else {
         log::info!(
             "Syncing account {} ({}) via IMAP {}:{}",
@@ -170,6 +177,111 @@ pub async fn sync_folder(
     }
 
     result
+}
+
+/// Sync JMAP calendars for an account. Extracted as a standalone async function
+/// so it can be called from `trigger_sync` without needing `State`.
+async fn sync_jmap_calendars(
+    db: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    account_id: &str,
+    jmap_config: &JmapConfig,
+) -> Result<()> {
+    use crate::mail::jmap::JmapConnection;
+
+    let jmap_conn = JmapConnection::connect(jmap_config).await?;
+
+    // Fetch calendars
+    let jmap_calendars = jmap_conn.list_jmap_calendars(jmap_config).await?;
+    log::info!(
+        "Calendar sync: fetched {} calendars for account {}",
+        jmap_calendars.len(),
+        account_id
+    );
+
+    let mut remote_to_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    {
+        let conn = db.lock().await;
+        for jcal in &jmap_calendars {
+            let color = jcal.color.as_deref().unwrap_or("#4285f4");
+            let local_id = crate::db::calendar::upsert_calendar_by_remote_id(
+                &conn,
+                account_id,
+                &jcal.id,
+                &jcal.name,
+                color,
+                jcal.is_default,
+            )?;
+            remote_to_local.insert(jcal.id.clone(), local_id);
+        }
+    }
+
+    // Fetch and upsert events for each calendar
+    for jcal in &jmap_calendars {
+        let events = match jmap_conn
+            .fetch_calendar_events(jmap_config, Some(&jcal.id))
+            .await
+        {
+            Ok(evts) => evts,
+            Err(e) => {
+                log::error!(
+                    "Calendar sync: failed to fetch events for '{}': {}",
+                    jcal.name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        log::info!(
+            "Calendar sync: fetched {} events for calendar '{}'",
+            events.len(),
+            jcal.name
+        );
+
+        let local_cal_id = remote_to_local
+            .get(&jcal.id)
+            .cloned()
+            .unwrap_or_default();
+
+        let conn = db.lock().await;
+        for ev in &events {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let cal_event = crate::db::calendar::CalendarEvent {
+                id: event_id,
+                account_id: account_id.to_string(),
+                calendar_id: local_cal_id.clone(),
+                uid: ev.uid.clone(),
+                title: ev.title.clone(),
+                description: ev.description.clone(),
+                location: ev.location.clone(),
+                start_time: ev.start.clone(),
+                end_time: ev.end.clone(),
+                all_day: ev.all_day,
+                timezone: None,
+                recurrence_rule: ev.recurrence_rule.clone(),
+                organizer_email: None,
+                attendees_json: None,
+                my_status: None,
+                source_message_id: None,
+                ical_data: None,
+                remote_id: Some(ev.id.clone()),
+                etag: None,
+            };
+
+            if let Err(e) = crate::db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                log::error!(
+                    "Calendar sync: failed to upsert event '{}': {}",
+                    ev.title,
+                    e
+                );
+            }
+        }
+    }
+
+    log::info!("Calendar sync: completed for account {}", account_id);
+    Ok(())
 }
 
 #[derive(serde::Serialize)]

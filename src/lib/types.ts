@@ -143,6 +143,72 @@ export type FilterAction =
   | { action: "mark_unread" }
   | { action: "stop" };
 
+// Calendar types
+export interface Calendar {
+  id: string;
+  account_id: string;
+  name: string;
+  color: string;
+  is_default: boolean;
+  remote_id: string | null;
+}
+
+export interface CalendarEvent {
+  id: string;
+  account_id: string;
+  calendar_id: string;
+  uid: string | null;
+  title: string;
+  description: string | null;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  all_day: boolean;
+  timezone: string | null;
+  recurrence_rule: string | null;
+  organizer_email: string | null;
+  attendees_json: string | null;
+  my_status: string | null;
+  source_message_id: string | null;
+}
+
+export interface Attendee {
+  email: string;
+  name: string | null;
+  status: string;
+}
+
+export interface ParsedInvite {
+  method: string;
+  uid: string;
+  summary: string | null;
+  description: string | null;
+  location: string | null;
+  dtstart: string;
+  dtend: string;
+  all_day: boolean;
+  timezone: string | null;
+  organizer_email: string | null;
+  organizer_name: string | null;
+  attendees: Attendee[];
+  recurrence_rule: string | null;
+  sequence: number;
+}
+
+export interface NewEventInput {
+  account_id: string;
+  calendar_id: string;
+  title: string;
+  description: string | null;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  all_day: boolean;
+  timezone: string | null;
+  recurrence_rule: string | null;
+  attendees: Attendee[];
+}
+
 export interface ComposeMessage {
   to: string[];
   cc: string[];

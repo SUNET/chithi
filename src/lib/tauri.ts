@@ -157,6 +157,77 @@ export async function unthreadMessage(messageId: string): Promise<void> {
   return invoke("unthread_message", { messageId });
 }
 
+// Calendar
+export async function listCalendars(
+  accountId: string,
+): Promise<import("./types").Calendar[]> {
+  return invoke("list_calendars", { accountId });
+}
+
+export async function createCalendar(
+  calendar: { account_id: string; name: string; color: string; is_default: boolean },
+): Promise<string> {
+  return invoke("create_calendar", { calendar });
+}
+
+export async function updateCalendar(
+  calendarId: string,
+  name: string,
+  color: string,
+): Promise<void> {
+  return invoke("update_calendar", { calendarId, name, color });
+}
+
+export async function deleteCalendar(calendarId: string): Promise<void> {
+  return invoke("delete_calendar", { calendarId });
+}
+
+export async function getEvents(
+  accountId: string,
+  start: string,
+  end: string,
+  calendarId?: string,
+): Promise<import("./types").CalendarEvent[]> {
+  return invoke("get_events", { accountId, start, end, calendarId: calendarId ?? null });
+}
+
+export async function createEvent(
+  event: import("./types").NewEventInput,
+): Promise<string> {
+  return invoke("create_event", { event });
+}
+
+export async function updateEvent(
+  eventId: string,
+  event: Partial<import("./types").NewEventInput>,
+): Promise<void> {
+  return invoke("update_event", { eventId, event });
+}
+
+export async function deleteEvent(eventId: string): Promise<void> {
+  return invoke("delete_event", { eventId });
+}
+
+export async function syncCalendars(accountId: string): Promise<void> {
+  return invoke("sync_calendars", { accountId });
+}
+
+export async function getEmailInvites(
+  accountId: string,
+  messageId: string,
+): Promise<import("./types").ParsedInvite[]> {
+  return invoke("get_email_invites", { accountId, messageId });
+}
+
+export async function respondToInvite(
+  accountId: string,
+  messageId: string,
+  inviteUid: string,
+  response: string,
+): Promise<void> {
+  return invoke("respond_to_invite", { accountId, messageId, inviteUid, response });
+}
+
 // Filter rules
 export async function listFilters(
   accountId?: string,

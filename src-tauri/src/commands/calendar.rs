@@ -1,0 +1,878 @@
+use serde::Deserialize;
+use tauri::State;
+
+use crate::calendar::ical::{self, ParsedInvite};
+use crate::db;
+use crate::db::calendar::{Attendee, Calendar, CalendarEvent, NewCalendar};
+use crate::error::Result;
+use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Input types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct NewEventInput {
+    pub account_id: String,
+    pub calendar_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub start_time: String,
+    pub end_time: String,
+    pub all_day: bool,
+    pub timezone: Option<String>,
+    pub recurrence_rule: Option<String>,
+    pub attendees: Vec<Attendee>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateEventInput {
+    pub calendar_id: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub all_day: Option<bool>,
+    pub timezone: Option<String>,
+    pub recurrence_rule: Option<String>,
+    pub attendees: Option<Vec<Attendee>>,
+}
+
+// ---------------------------------------------------------------------------
+// Calendar management commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn list_calendars(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<Calendar>> {
+    log::debug!("list_calendars: account={}", account_id);
+    let conn = state.db.lock().await;
+    let calendars = db::calendar::list_calendars(&conn, &account_id)?;
+    log::debug!("list_calendars: found {} calendars", calendars.len());
+    Ok(calendars)
+}
+
+#[tauri::command]
+pub async fn create_calendar(
+    state: State<'_, AppState>,
+    calendar: NewCalendar,
+) -> Result<String> {
+    log::info!(
+        "create_calendar: account={} name='{}'",
+        calendar.account_id,
+        calendar.name
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let conn = state.db.lock().await;
+    db::calendar::insert_calendar(&conn, &id, &calendar)?;
+    log::info!("create_calendar: created calendar id={}", id);
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn update_calendar(
+    state: State<'_, AppState>,
+    calendar_id: String,
+    name: String,
+    color: String,
+) -> Result<()> {
+    log::info!(
+        "update_calendar: id={} name='{}' color='{}'",
+        calendar_id,
+        name,
+        color
+    );
+    let conn = state.db.lock().await;
+    db::calendar::update_calendar(&conn, &calendar_id, &name, &color)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_calendar(
+    state: State<'_, AppState>,
+    calendar_id: String,
+) -> Result<()> {
+    log::info!("delete_calendar: id={}", calendar_id);
+    let conn = state.db.lock().await;
+    db::calendar::delete_calendar(&conn, &calendar_id)?;
+    log::info!("delete_calendar: deleted calendar {}", calendar_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Event management commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn get_events(
+    state: State<'_, AppState>,
+    account_id: String,
+    start: String,
+    end: String,
+    calendar_id: Option<String>,
+) -> Result<Vec<CalendarEvent>> {
+    log::debug!(
+        "get_events: account={} range={}..{} calendar={:?}",
+        account_id,
+        start,
+        end,
+        calendar_id
+    );
+    let conn = state.db.lock().await;
+    let events = db::calendar::list_events(
+        &conn,
+        &account_id,
+        calendar_id.as_deref(),
+        &start,
+        &end,
+    )?;
+    log::debug!("get_events: found {} events", events.len());
+    Ok(events)
+}
+
+#[tauri::command]
+pub async fn create_event(
+    state: State<'_, AppState>,
+    event: NewEventInput,
+) -> Result<String> {
+    log::info!(
+        "create_event: account={} calendar={} title='{}'",
+        event.account_id,
+        event.calendar_id,
+        event.title
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let attendees_json = if event.attendees.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string()))
+    };
+
+    let cal_event = CalendarEvent {
+        id: id.clone(),
+        account_id: event.account_id,
+        calendar_id: event.calendar_id,
+        uid: Some(format!("{}@emails-client", uuid::Uuid::new_v4())),
+        title: event.title,
+        description: event.description,
+        location: event.location,
+        start_time: event.start_time,
+        end_time: event.end_time,
+        all_day: event.all_day,
+        timezone: event.timezone,
+        recurrence_rule: event.recurrence_rule,
+        organizer_email: None,
+        attendees_json,
+        my_status: None,
+        source_message_id: None,
+        ical_data: None,
+        remote_id: None,
+        etag: None,
+    };
+
+    // If the account is JMAP, also create on the server
+    {
+        let conn = state.db.lock().await;
+        let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
+        if account.mail_protocol == "jmap" {
+            drop(conn); // Release lock before async call
+            let jmap_config = crate::mail::jmap::JmapConfig {
+                jmap_url: account.jmap_url,
+                email: account.email,
+                username: account.username,
+                password: account.password,
+            };
+            let jmap_event = crate::mail::jmap::JmapCalendarEvent {
+                id: String::new(),
+                calendar_id: cal_event.calendar_id.clone(),
+                title: cal_event.title.clone(),
+                description: cal_event.description.clone(),
+                location: cal_event.location.clone(),
+                start: cal_event.start_time.clone(),
+                end: cal_event.end_time.clone(),
+                all_day: cal_event.all_day,
+                recurrence_rule: cal_event.recurrence_rule.clone(),
+                uid: cal_event.uid.clone(),
+            };
+            match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+                Ok(conn_jmap) => {
+                    match conn_jmap.create_calendar_event(&jmap_config, &jmap_event).await {
+                        Ok(remote_id) => {
+                            log::info!("create_event: pushed to JMAP, remote_id={}", remote_id);
+                            // Update local event with remote_id
+                            let conn = state.db.lock().await;
+                            conn.execute(
+                                "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+                                rusqlite::params![remote_id, id],
+                            ).ok();
+                        }
+                        Err(e) => log::error!("create_event: JMAP push failed: {}", e),
+                    }
+                }
+                Err(e) => log::error!("create_event: JMAP connect failed: {}", e),
+            }
+            // Re-acquire lock for local insert
+            let conn = state.db.lock().await;
+            db::calendar::insert_event(&conn, &cal_event)?;
+        } else {
+            db::calendar::insert_event(&conn, &cal_event)?;
+        }
+    }
+
+    log::info!("create_event: created event id={}", id);
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn update_event(
+    state: State<'_, AppState>,
+    event_id: String,
+    event: UpdateEventInput,
+) -> Result<()> {
+    log::info!("update_event: id={}", event_id);
+    let conn = state.db.lock().await;
+
+    // Load existing event, apply updates
+    let mut existing = db::calendar::get_event(&conn, &event_id)?;
+
+    if let Some(calendar_id) = event.calendar_id {
+        existing.calendar_id = calendar_id;
+    }
+    if let Some(title) = event.title {
+        existing.title = title;
+    }
+    if let Some(description) = event.description {
+        existing.description = Some(description);
+    }
+    if let Some(location) = event.location {
+        existing.location = Some(location);
+    }
+    if let Some(start_time) = event.start_time {
+        existing.start_time = start_time;
+    }
+    if let Some(end_time) = event.end_time {
+        existing.end_time = end_time;
+    }
+    if let Some(all_day) = event.all_day {
+        existing.all_day = all_day;
+    }
+    if let Some(timezone) = event.timezone {
+        existing.timezone = Some(timezone);
+    }
+    if let Some(recurrence_rule) = event.recurrence_rule {
+        existing.recurrence_rule = Some(recurrence_rule);
+    }
+    if let Some(attendees) = event.attendees {
+        existing.attendees_json = if attendees.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
+        };
+    }
+
+    db::calendar::update_event(&conn, &existing)?;
+    log::info!("update_event: updated event {}", event_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_event(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<()> {
+    log::info!("delete_event: id={}", event_id);
+    let conn = state.db.lock().await;
+    db::calendar::delete_event(&conn, &event_id)?;
+    log::info!("delete_event: deleted event {}", event_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Calendar sync command
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn sync_calendars(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<()> {
+    log::info!("sync_calendars: account={}", account_id);
+
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    // Only sync JMAP accounts for now
+    if account.mail_protocol != "jmap" {
+        log::debug!("sync_calendars: skipping non-JMAP account {}", account_id);
+        return Ok(());
+    }
+
+    let jmap_config = crate::mail::jmap::JmapConfig {
+        jmap_url: account.jmap_url.clone(),
+        email: account.email.clone(),
+        username: account.username.clone(),
+        password: account.password.clone(),
+    };
+
+    let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+
+    // Step 1: Fetch and upsert calendars
+    let jmap_calendars = jmap_conn.list_jmap_calendars(&jmap_config).await?;
+    log::info!(
+        "sync_calendars: fetched {} calendars from JMAP for account {}",
+        jmap_calendars.len(),
+        account_id
+    );
+
+    // Build a mapping from remote calendar ID to local calendar ID
+    let mut remote_to_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    {
+        let conn = state.db.lock().await;
+        for jcal in &jmap_calendars {
+            let color = jcal.color.as_deref().unwrap_or("#4285f4");
+            let local_id = db::calendar::upsert_calendar_by_remote_id(
+                &conn,
+                &account_id,
+                &jcal.id,
+                &jcal.name,
+                color,
+                jcal.is_default,
+            )?;
+            remote_to_local.insert(jcal.id.clone(), local_id);
+        }
+    }
+
+    // Step 2: For each calendar, fetch events and upsert into local DB
+    for jcal in &jmap_calendars {
+        let events = match jmap_conn
+            .fetch_calendar_events(&jmap_config, Some(&jcal.id))
+            .await
+        {
+            Ok(evts) => evts,
+            Err(e) => {
+                log::error!(
+                    "sync_calendars: failed to fetch events for calendar '{}': {}",
+                    jcal.name,
+                    e
+                );
+                continue;
+            }
+        };
+
+        log::info!(
+            "sync_calendars: fetched {} events for calendar '{}'",
+            events.len(),
+            jcal.name
+        );
+
+        let local_cal_id = remote_to_local
+            .get(&jcal.id)
+            .cloned()
+            .unwrap_or_default();
+
+        let conn = state.db.lock().await;
+        for ev in &events {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let cal_event = CalendarEvent {
+                id: event_id,
+                account_id: account_id.clone(),
+                calendar_id: local_cal_id.clone(),
+                uid: ev.uid.clone(),
+                title: ev.title.clone(),
+                description: ev.description.clone(),
+                location: ev.location.clone(),
+                start_time: ev.start.clone(),
+                end_time: ev.end.clone(),
+                all_day: ev.all_day,
+                timezone: None,
+                recurrence_rule: ev.recurrence_rule.clone(),
+                organizer_email: None,
+                attendees_json: None,
+                my_status: None,
+                source_message_id: None,
+                ical_data: None,
+                remote_id: Some(ev.id.clone()),
+                etag: None,
+            };
+
+            if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                log::error!(
+                    "sync_calendars: failed to upsert event '{}': {}",
+                    ev.title,
+                    e
+                );
+            }
+        }
+    }
+
+    // Step 3: Push local events (no remote_id) to the JMAP server
+    {
+        let conn = state.db.lock().await;
+        let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, &account_id)?;
+
+        if !local_events.is_empty() {
+            log::info!("sync_calendars: pushing {} local events to JMAP", local_events.len());
+            drop(conn); // Release lock for async calls
+
+            for ev in &local_events {
+                // Find the remote calendar ID for this event's local calendar
+                let remote_cal_id = remote_to_local.iter()
+                    .find(|(_, local_id)| **local_id == ev.calendar_id)
+                    .map(|(remote_id, _)| remote_id.clone())
+                    .unwrap_or_default();
+
+                if remote_cal_id.is_empty() {
+                    log::warn!("sync_calendars: no remote calendar for local event '{}'", ev.title);
+                    continue;
+                }
+
+                let jmap_event = crate::mail::jmap::JmapCalendarEvent {
+                    id: String::new(),
+                    calendar_id: remote_cal_id,
+                    title: ev.title.clone(),
+                    description: ev.description.clone(),
+                    location: ev.location.clone(),
+                    start: ev.start_time.clone(),
+                    end: ev.end_time.clone(),
+                    all_day: ev.all_day,
+                    recurrence_rule: ev.recurrence_rule.clone(),
+                    uid: ev.uid.clone(),
+                };
+
+                match jmap_conn.create_calendar_event(&jmap_config, &jmap_event).await {
+                    Ok(remote_id) => {
+                        log::info!("sync_calendars: pushed event '{}' to JMAP, remote_id={}", ev.title, remote_id);
+                        let conn = state.db.lock().await;
+                        conn.execute(
+                            "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+                            rusqlite::params![remote_id, ev.id],
+                        ).ok();
+                    }
+                    Err(e) => log::error!("sync_calendars: failed to push event '{}': {}", ev.title, e),
+                }
+            }
+        }
+    }
+
+    log::info!("sync_calendars: completed for account {}", account_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Invite handling commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn get_email_invites(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<Vec<ParsedInvite>> {
+    log::info!(
+        "get_email_invites: account={} message={}",
+        account_id,
+        message_id
+    );
+    let conn = state.db.lock().await;
+
+    // Look up the message to get its maildir path
+    let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
+        db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+
+    if maildir_path.is_empty() {
+        log::debug!("get_email_invites: message body not fetched yet");
+        return Ok(vec![]);
+    }
+
+    // Read the raw message from disk
+    let raw = std::fs::read(&maildir_path).map_err(|e| {
+        crate::error::Error::Other(format!(
+            "Failed to read message file '{}': {}",
+            maildir_path, e
+        ))
+    })?;
+
+    let invites = ical::parse_ical_from_email(&raw);
+    log::info!(
+        "get_email_invites: found {} invites in message {}",
+        invites.len(),
+        message_id
+    );
+    Ok(invites)
+}
+
+#[tauri::command]
+pub async fn respond_to_invite(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+    invite_uid: String,
+    response: String,
+) -> Result<()> {
+    log::info!(
+        "respond_to_invite: account={} message={} uid={} response={}",
+        account_id,
+        message_id,
+        invite_uid,
+        response
+    );
+
+    // Step 1: Parse the invite from the email
+    let (raw, account) = {
+        let conn = state.db.lock().await;
+        let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
+            db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+
+        if maildir_path.is_empty() {
+            return Err(crate::error::Error::Other(
+                "Message body not fetched yet".to_string(),
+            ));
+        }
+
+        let raw = std::fs::read(&maildir_path).map_err(|e| {
+            crate::error::Error::Other(format!(
+                "Failed to read message file '{}': {}",
+                maildir_path, e
+            ))
+        })?;
+
+        let account = db::accounts::get_account_full(&conn, &account_id)?;
+        (raw, account)
+    };
+
+    let invites = ical::parse_ical_from_email(&raw);
+    let invite = invites
+        .iter()
+        .find(|inv| inv.uid == invite_uid)
+        .ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "Invite with UID '{}' not found in message",
+                invite_uid
+            ))
+        })?;
+
+    // Step 2: Generate the iTIP REPLY
+    let reply_ical = ical::generate_reply(invite, &account.email, &response);
+
+    // Step 3: Send the reply to the organizer
+    if let Some(ref organizer_email) = invite.organizer_email {
+        let subject = format!(
+            "Re: {}",
+            invite.summary.as_deref().unwrap_or("Calendar Invite")
+        );
+
+        // Build an email with the iCal reply as a text/calendar attachment
+        let body_text = format!(
+            "This is a {} response to the calendar invitation \"{}\".",
+            response.to_lowercase(),
+            invite.summary.as_deref().unwrap_or("Calendar Invite")
+        );
+
+        if account.mail_protocol == "jmap" {
+            log::info!("respond_to_invite: sending reply via JMAP");
+            let jmap_config = crate::mail::jmap::JmapConfig {
+                jmap_url: account.jmap_url.clone(),
+                email: account.email.clone(),
+                username: account.username.clone(),
+                password: account.password.clone(),
+            };
+
+            let raw_message = build_calendar_reply_message(
+                &account.email,
+                organizer_email,
+                &subject,
+                &body_text,
+                &reply_ical,
+            )?;
+
+            let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            jmap_conn.send_email(&jmap_config, &raw_message).await?;
+        } else {
+            log::info!("respond_to_invite: sending reply via SMTP");
+            let raw_message = build_calendar_reply_message(
+                &account.email,
+                organizer_email,
+                &subject,
+                &body_text,
+                &reply_ical,
+            )?;
+
+            send_raw_smtp(
+                &account.smtp_host,
+                account.smtp_port,
+                &account.username,
+                &account.password,
+                account.use_tls,
+                &account.email,
+                organizer_email,
+                &raw_message,
+            )
+            .await?;
+        }
+    } else {
+        log::info!("respond_to_invite: no organizer email, skipping send");
+    }
+
+    // Step 4: Create/update event in local calendar
+    let my_status = response.to_lowercase();
+    let conn = state.db.lock().await;
+
+    // Find or create the default calendar for this account
+    let calendars = db::calendar::list_calendars(&conn, &account_id)?;
+    let default_calendar = calendars.iter().find(|c| c.is_default);
+    let calendar_id = if let Some(cal) = default_calendar {
+        cal.id.clone()
+    } else {
+        // Create a default calendar
+        let cal_id = uuid::Uuid::new_v4().to_string();
+        let new_cal = NewCalendar {
+            account_id: account_id.clone(),
+            name: "Calendar".to_string(),
+            color: random_calendar_color(),
+            is_default: true,
+        };
+        db::calendar::insert_calendar(&conn, &cal_id, &new_cal)?;
+        log::info!("respond_to_invite: created default calendar id={}", cal_id);
+        cal_id
+    };
+
+    let attendees_json = if invite.attendees.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&invite.attendees).unwrap_or_else(|_| "[]".to_string()))
+    };
+
+    // Check if we already have this event
+    if let Some(mut existing) = db::calendar::get_event_by_uid(&conn, &account_id, &invite_uid)? {
+        existing.my_status = Some(my_status);
+        existing.attendees_json = attendees_json;
+        db::calendar::update_event(&conn, &existing)?;
+        log::info!(
+            "respond_to_invite: updated existing event {} status={}",
+            existing.id,
+            response
+        );
+    } else {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let cal_event = CalendarEvent {
+            id: event_id.clone(),
+            account_id: account_id.clone(),
+            calendar_id,
+            uid: Some(invite.uid.clone()),
+            title: invite.summary.clone().unwrap_or_else(|| "(No title)".to_string()),
+            description: invite.description.clone(),
+            location: invite.location.clone(),
+            start_time: invite.dtstart.clone(),
+            end_time: invite.dtend.clone(),
+            all_day: invite.all_day,
+            timezone: invite.timezone.clone(),
+            recurrence_rule: invite.recurrence_rule.clone(),
+            organizer_email: invite.organizer_email.clone(),
+            attendees_json,
+            my_status: Some(my_status),
+            source_message_id: Some(message_id.clone()),
+            ical_data: Some(invite.ical_raw.clone()),
+            remote_id: None,
+            etag: None,
+        };
+        db::calendar::insert_event(&conn, &cal_event)?;
+        log::info!(
+            "respond_to_invite: created event {} status={}",
+            event_id,
+            response
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Pick a random color from a curated palette for new calendars.
+pub fn random_calendar_color() -> String {
+    let colors = [
+        "#4285f4", // Google Blue
+        "#0b8043", // Green
+        "#8e24aa", // Purple
+        "#d50000", // Red
+        "#f4511e", // Orange
+        "#039be5", // Cyan
+        "#616161", // Grey
+        "#e67c73", // Salmon
+        "#f6bf26", // Yellow
+        "#33b679", // Teal
+    ];
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+    colors[seed % colors.len()].to_string()
+}
+
+/// Build a raw RFC5322 message with a text/calendar MIME part for an iTIP REPLY.
+fn build_calendar_reply_message(
+    from: &str,
+    to: &str,
+    subject: &str,
+    body_text: &str,
+    ical_reply: &str,
+) -> Result<Vec<u8>> {
+    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+    use lettre::Message;
+
+    let from_mailbox: Mailbox = from.parse().map_err(|e| {
+        crate::error::Error::Other(format!("Invalid 'from' address '{}': {}", from, e))
+    })?;
+    let to_mailbox: Mailbox = to.parse().map_err(|e| {
+        crate::error::Error::Other(format!("Invalid 'to' address '{}': {}", to, e))
+    })?;
+
+    let message = Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(subject)
+        .multipart(
+            MultiPart::mixed()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(body_text.to_string()),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(
+                            ContentType::parse("text/calendar; method=REPLY; charset=UTF-8")
+                                .unwrap_or(ContentType::TEXT_PLAIN),
+                        )
+                        .body(ical_reply.to_string()),
+                ),
+        )
+        .map_err(|e| {
+            crate::error::Error::Other(format!("Failed to build calendar reply message: {}", e))
+        })?;
+
+    Ok(message.formatted())
+}
+
+/// Send a pre-built raw message via SMTP.
+async fn send_raw_smtp(
+    smtp_host: &str,
+    smtp_port: u16,
+    username: &str,
+    password: &str,
+    use_tls: bool,
+    from: &str,
+    to: &str,
+    raw_message: &[u8],
+) -> Result<()> {
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+
+    log::info!(
+        "send_raw_smtp: from={} to={} via {}:{}",
+        from,
+        to,
+        smtp_host,
+        smtp_port
+    );
+
+    let creds = Credentials::new(username.to_string(), password.to_string());
+
+    let transport = if smtp_port == 587 {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
+            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
+            .port(smtp_port)
+            .credentials(creds)
+            .build()
+    } else if use_tls || smtp_port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
+            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
+            .port(smtp_port)
+            .credentials(creds)
+            .build()
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
+            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
+            .port(smtp_port)
+            .credentials(creds)
+            .build()
+    };
+
+    // Build an envelope from the from/to addresses
+    let from_addr: lettre::Address = from
+        .parse()
+        .map_err(|e| crate::error::Error::Other(format!("Invalid from address: {}", e)))?;
+    let to_addr: lettre::Address = to
+        .parse()
+        .map_err(|e| crate::error::Error::Other(format!("Invalid to address: {}", e)))?;
+
+    let envelope = lettre::address::Envelope::new(
+        Some(from_addr),
+        vec![to_addr],
+    )
+    .map_err(|e| crate::error::Error::Other(format!("Failed to create envelope: {}", e)))?;
+
+    transport
+        .send_raw(&envelope, raw_message)
+        .await
+        .map_err(|e| {
+            log::error!("SMTP send failed: {}", e);
+            crate::error::Error::Other(format!("SMTP send failed: {}", e))
+        })?;
+
+    log::info!("send_raw_smtp: message sent successfully");
+    Ok(())
+}
+
+fn get_unpushed_events(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<Vec<CalendarEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, calendar_id, uid, title, description, location,
+                start_time, end_time, all_day, timezone, recurrence_rule,
+                organizer_email, attendees_json, my_status, source_message_id,
+                ical_data, remote_id, etag
+         FROM calendar_events
+         WHERE account_id = ?1 AND (remote_id IS NULL OR remote_id = '')",
+    )?;
+    let events = stmt
+        .query_map(rusqlite::params![account_id], |row| {
+            Ok(CalendarEvent {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                calendar_id: row.get(2)?,
+                uid: row.get(3)?,
+                title: row.get(4)?,
+                description: row.get(5)?,
+                location: row.get(6)?,
+                start_time: row.get(7)?,
+                end_time: row.get(8)?,
+                all_day: row.get(9)?,
+                timezone: row.get(10)?,
+                recurrence_rule: row.get(11)?,
+                organizer_email: row.get(12)?,
+                attendees_json: row.get(13)?,
+                my_status: row.get(14)?,
+                source_message_id: row.get(15)?,
+                ical_data: row.get(16)?,
+                remote_id: row.get(17)?,
+                etag: row.get(18)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(events)
+}

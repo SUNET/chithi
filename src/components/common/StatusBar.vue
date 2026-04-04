@@ -1,25 +1,42 @@
 <script setup lang="ts">
+import { useRoute } from "vue-router";
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
+import { useCalendarStore } from "@/stores/calendar";
 import * as api from "@/lib/tauri";
 
+const route = useRoute();
 const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
+const calendarStore = useCalendarStore();
 
 async function syncAll() {
+  const isCalendar = route.name === "calendar";
+
   for (const account of accountsStore.accounts) {
-    if (account.enabled) {
-      try {
+    if (!account.enabled) continue;
+    try {
+      if (isCalendar) {
+        // Sync calendars
+        await api.syncCalendars(account.id);
+      } else {
+        // Sync email
         await api.triggerSync(
           account.id,
           foldersStore.activeFolderPath ?? undefined,
         );
-      } catch (e) {
-        console.error("Sync failed:", e);
       }
+    } catch (e) {
+      console.error("Sync failed:", e);
     }
+  }
+
+  // Refresh calendar view after sync
+  if (isCalendar) {
+    await calendarStore.fetchCalendars();
+    await calendarStore.fetchEvents();
   }
 }
 </script>
@@ -27,7 +44,7 @@ async function syncAll() {
 <template>
   <div class="status-bar">
     <div class="status-left">
-      <button class="status-btn" title="Sync all accounts" @click="syncAll">
+      <button class="status-btn" title="Sync" @click="syncAll">
         <span class="sync-icon" :class="{ spinning: activityStore.hasActiveOperations }">&#x21BB;</span>
         Sync
       </button>
