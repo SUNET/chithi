@@ -118,4 +118,4 @@ See `docs/adr/` for Architecture Decision Records.
 
 ## License
 
-GPL-3.0-or-later
+TBD

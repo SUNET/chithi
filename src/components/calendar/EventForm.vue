@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import * as api from "@/lib/tauri";
@@ -18,16 +18,53 @@ const emit = defineEmits<{
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 
+/** Format a Date to local YYYY-MM-DD */
+function toLocalDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** Format a Date to local HH:MM */
+function toLocalTime(d: Date): string {
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${h}:${min}`;
+}
+
 const defaultStart = props.initialStart
   ? new Date(props.initialStart)
   : new Date();
 const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 
 const title = ref("");
-const startDate = ref(defaultStart.toISOString().slice(0, 10));
-const startTime = ref(defaultStart.toISOString().slice(11, 16));
-const endDate = ref(defaultEnd.toISOString().slice(0, 10));
-const endTime = ref(defaultEnd.toISOString().slice(11, 16));
+const startDate = ref(toLocalDate(defaultStart));
+const startTime = ref(toLocalTime(defaultStart));
+const endDate = ref(toLocalDate(defaultEnd));
+const endTime = ref(toLocalTime(defaultEnd));
+
+/** Minimum end date: cannot be before start date */
+const minEndDate = computed(() => startDate.value);
+
+/** Minimum end time: if same day, cannot be before start time */
+const minEndTime = computed(() => {
+  if (endDate.value === startDate.value) {
+    return startTime.value;
+  }
+  return undefined;
+});
+
+// When start moves past end, push end forward
+watch([startDate, startTime], () => {
+  const s = new Date(`${startDate.value}T${startTime.value}:00`);
+  const e = new Date(`${endDate.value}T${endTime.value}:00`);
+  if (e <= s) {
+    const newEnd = new Date(s.getTime() + 60 * 60 * 1000);
+    endDate.value = toLocalDate(newEnd);
+    endTime.value = toLocalTime(newEnd);
+  }
+});
 const allDay = ref(false);
 const location = ref("");
 const description = ref("");
@@ -45,6 +82,15 @@ async function save() {
   if (!calendarId.value) {
     error.value = "Select a calendar";
     return;
+  }
+
+  if (!allDay.value) {
+    const s = new Date(`${startDate.value}T${startTime.value}:00`);
+    const e = new Date(`${endDate.value}T${endTime.value}:00`);
+    if (e <= s) {
+      error.value = "End time must be after start time";
+      return;
+    }
   }
 
   saving.value = true;
@@ -137,11 +183,11 @@ async function save() {
         <div class="form-row">
           <div class="form-group">
             <label>End date</label>
-            <input v-model="endDate" type="date" />
+            <input v-model="endDate" type="date" :min="minEndDate" />
           </div>
           <div v-if="!allDay" class="form-group">
             <label>End time</label>
-            <input v-model="endTime" type="time" />
+            <input v-model="endTime" type="time" :min="minEndTime" />
           </div>
         </div>
 

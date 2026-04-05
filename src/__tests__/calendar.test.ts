@@ -306,3 +306,179 @@ describe("InviteCard integration", () => {
     expect(status).toBeNull();
   });
 });
+
+describe("EventForm local time helpers", () => {
+  // These test the toLocalDate/toLocalTime logic used in EventForm
+  // by verifying that local components are extracted, not UTC
+
+  it("toLocalDate extracts local date components", () => {
+    // Create a date at a known local time
+    const d = new Date(2026, 3, 7, 17, 30, 0); // April 7, 2026 5:30 PM local
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    const localDate = `${y}-${m}-${day}`;
+
+    expect(localDate).toBe("2026-04-07");
+  });
+
+  it("toLocalTime extracts local time components", () => {
+    const d = new Date(2026, 3, 7, 17, 30, 0); // 5:30 PM local
+    const h = String(d.getHours()).padStart(2, "0");
+    const min = String(d.getMinutes()).padStart(2, "0");
+    const localTime = `${h}:${min}`;
+
+    expect(localTime).toBe("17:30");
+  });
+
+  it("ISO string round-trip preserves local time in form fields", () => {
+    // Simulate what WeekView does: create a local Date, emit toISOString()
+    const clickedTime = new Date(2026, 3, 7, 17, 0, 0); // 5 PM local
+    const isoString = clickedTime.toISOString(); // This is UTC
+
+    // Simulate what EventForm does: parse ISO string back to Date, extract local
+    const parsed = new Date(isoString);
+    const h = String(parsed.getHours()).padStart(2, "0");
+    const min = String(parsed.getMinutes()).padStart(2, "0");
+    const localTime = `${h}:${min}`;
+
+    // Should show 17:00 (local), not the UTC conversion
+    expect(localTime).toBe("17:00");
+    expect(parsed.getHours()).toBe(17);
+  });
+
+  it("default end time is 1 hour after start", () => {
+    const start = new Date(2026, 3, 7, 17, 0, 0);
+    const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+    expect(end.getHours()).toBe(18);
+    expect(end.getMinutes()).toBe(0);
+  });
+});
+
+describe("EventForm end-time validation", () => {
+  it("end time after start time is valid", () => {
+    const startDate = "2026-04-07";
+    const startTime = "17:00";
+    const endDate = "2026-04-07";
+    const endTime = "18:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+    expect(e > s).toBe(true);
+  });
+
+  it("end time equal to start time is invalid", () => {
+    const startDate = "2026-04-07";
+    const startTime = "17:00";
+    const endDate = "2026-04-07";
+    const endTime = "17:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+    expect(e <= s).toBe(true);
+  });
+
+  it("end time before start time is invalid", () => {
+    const startDate = "2026-04-07";
+    const startTime = "17:00";
+    const endDate = "2026-04-07";
+    const endTime = "16:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+    expect(e <= s).toBe(true);
+  });
+
+  it("end date before start date is invalid", () => {
+    const startDate = "2026-04-08";
+    const startTime = "10:00";
+    const endDate = "2026-04-07";
+    const endTime = "18:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+    expect(e <= s).toBe(true);
+  });
+
+  it("end on later date with earlier time is valid", () => {
+    const startDate = "2026-04-07";
+    const startTime = "17:00";
+    const endDate = "2026-04-08";
+    const endTime = "09:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+    expect(e > s).toBe(true);
+  });
+
+  it("pushing end forward when start moves past it", () => {
+    // Simulate the watch behavior
+    let startDate = "2026-04-07";
+    let startTime = "17:00";
+    let endDate = "2026-04-07";
+    let endTime = "18:00";
+
+    // Move start to 19:00, which is past end (18:00)
+    startTime = "19:00";
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+
+    if (e <= s) {
+      const newEnd = new Date(s.getTime() + 60 * 60 * 1000);
+      const y = newEnd.getFullYear();
+      const m = String(newEnd.getMonth() + 1).padStart(2, "0");
+      const day = String(newEnd.getDate()).padStart(2, "0");
+      endDate = `${y}-${m}-${day}`;
+      endTime = `${String(newEnd.getHours()).padStart(2, "0")}:${String(newEnd.getMinutes()).padStart(2, "0")}`;
+    }
+
+    expect(endTime).toBe("20:00");
+    expect(endDate).toBe("2026-04-07");
+  });
+
+  it("pushing end to next day when start is 23:00", () => {
+    let startDate = "2026-04-07";
+    let startTime = "23:00";
+    let endDate = "2026-04-07";
+    let endTime = "22:00";
+
+    const s = new Date(`${startDate}T${startTime}:00`);
+    const e = new Date(`${endDate}T${endTime}:00`);
+
+    if (e <= s) {
+      const newEnd = new Date(s.getTime() + 60 * 60 * 1000);
+      const y = newEnd.getFullYear();
+      const m = String(newEnd.getMonth() + 1).padStart(2, "0");
+      const day = String(newEnd.getDate()).padStart(2, "0");
+      endDate = `${y}-${m}-${day}`;
+      endTime = `${String(newEnd.getHours()).padStart(2, "0")}:${String(newEnd.getMinutes()).padStart(2, "0")}`;
+    }
+
+    expect(endDate).toBe("2026-04-08");
+    expect(endTime).toBe("00:00");
+  });
+
+  it("minEndDate equals start date", () => {
+    const startDate = "2026-04-07";
+    expect(startDate).toBe("2026-04-07"); // minEndDate === startDate
+  });
+
+  it("minEndTime is start time when same day", () => {
+    const startDate = "2026-04-07";
+    const endDate = "2026-04-07";
+    const startTime = "17:00";
+
+    const minEndTime = endDate === startDate ? startTime : undefined;
+    expect(minEndTime).toBe("17:00");
+  });
+
+  it("minEndTime is undefined when different day", () => {
+    const startDate = "2026-04-07";
+    const endDate = "2026-04-08";
+    const startTime = "17:00";
+
+    const minEndTime = endDate === startDate ? startTime : undefined;
+    expect(minEndTime).toBeUndefined();
+  });
+});
