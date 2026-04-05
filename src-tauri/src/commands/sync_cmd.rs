@@ -138,7 +138,7 @@ pub async fn sync_folder(
         }),
     ).ok();
 
-    let app_clone = app.clone();
+    let _app_clone = app.clone();
     let account_id_clone = account_id.clone();
     let folder_clone = folder_path.clone();
 

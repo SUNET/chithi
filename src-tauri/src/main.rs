@@ -1,5 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(dead_code)] // Many functions/fields are API surface for future use
+#![allow(clippy::too_many_arguments)] // SMTP/message building functions need many params
 
 mod calendar;
 mod commands;

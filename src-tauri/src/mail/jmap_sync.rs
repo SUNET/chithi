@@ -281,15 +281,15 @@ async fn sync_jmap_folder(
         // Get all local message IDs for this folder
         let mut stmt = conn.prepare(
             "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
-        ).map_err(|e| Error::Database(e))?;
+        ).map_err(Error::Database)?;
         let local_ids: Vec<String> = stmt.query_map(
             rusqlite::params![account_id, mailbox_id],
             |row| row.get(0),
-        ).map_err(|e| Error::Database(e))?
+        ).map_err(Error::Database)?
         .filter_map(|r| r.ok())
         .collect();
 
-        let prefix = format!("{}_{}_{}", account_id, mailbox_id, "");
+        let _prefix = format!("{}_{}_{}", account_id, mailbox_id, "");
         let mut deleted = 0u32;
         for local_id in &local_ids {
             // Extract the JMAP email ID from the composite local ID
@@ -398,7 +398,7 @@ pub async fn sync_jmap_folder_public(
 /// Called when the user opens a message whose body hasn't been downloaded yet.
 pub async fn fetch_and_store_jmap_body(
     jmap_config: &JmapConfig,
-    data_dir: &PathBuf,
+    data_dir: &std::path::Path,
     account_id: &str,
     folder_path: &str,
     jmap_email_id: &str,

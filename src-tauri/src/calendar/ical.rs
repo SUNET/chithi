@@ -175,11 +175,12 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
     // Build the REPLY iCalendar manually for full control over iTIP format
-    let mut lines = Vec::new();
-    lines.push("BEGIN:VCALENDAR".to_string());
-    lines.push("VERSION:2.0".to_string());
-    lines.push("PRODID:-//Chithi//EN".to_string());
-    lines.push("METHOD:REPLY".to_string());
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".to_string(),
+        "PRODID:-//Chithi//EN".to_string(),
+        "METHOD:REPLY".to_string(),
+    ];
     lines.push("BEGIN:VEVENT".to_string());
 
     // Preserve organizer from original invite
@@ -226,12 +227,13 @@ pub fn generate_invite(
 ) -> String {
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
-    let mut lines = Vec::new();
-    lines.push("BEGIN:VCALENDAR".to_string());
-    lines.push("VERSION:2.0".to_string());
-    lines.push("PRODID:-//Chithi//EN".to_string());
-    lines.push("METHOD:REQUEST".to_string());
-    lines.push("BEGIN:VEVENT".to_string());
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".to_string(),
+        "PRODID:-//Chithi//EN".to_string(),
+        "METHOD:REQUEST".to_string(),
+        "BEGIN:VEVENT".to_string(),
+    ];
 
     // Organizer
     if let Some(name) = organizer_name {
@@ -388,7 +390,7 @@ fn to_ical_datetime(iso: &str) -> String {
         return dt.format("%Y%m%dT%H%M%SZ").to_string();
     }
     // Fallback: just strip dashes/colons
-    iso.replace('-', "").replace(':', "").replace(".000", "")
+    iso.replace(['-', ':'], "").replace(".000", "")
 }
 
 /// Parse the ORGANIZER property from a VEVENT.

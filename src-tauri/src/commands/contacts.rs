@@ -410,7 +410,8 @@ async fn sync_contacts_jmap(
         }
 
         // Push local contacts (no remote_id) to server
-        let unpushed: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>)> = conn
+        type UnpushedRow = (String, String, String, String, Option<String>, Option<String>, Option<String>);
+        let unpushed: Vec<UnpushedRow> = conn
             .prepare(
                 "SELECT id, display_name, emails_json, phones_json, organization, title, notes
                  FROM contacts WHERE book_id = ?1 AND (remote_id IS NULL OR remote_id = '')",

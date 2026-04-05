@@ -765,7 +765,7 @@ impl JmapConnection {
 
             let duration_str = ev["duration"].as_str().unwrap_or("PT1H");
             let end = {
-                let e = compute_end_from_duration(&start.trim_end_matches('Z'), duration_str);
+                let e = compute_end_from_duration(start.trim_end_matches('Z'), duration_str);
                 if start.ends_with('Z') && !e.ends_with('Z') { format!("{}Z", e) } else { e }
             };
 

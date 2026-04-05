@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
@@ -94,7 +94,7 @@ pub async fn sync_account(
 fn sync_account_blocking(
     app: &AppHandle,
     db: Arc<Mutex<rusqlite::Connection>>,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     account_id: &str,
     imap_config: &ImapConfig,
     current_folder: Option<&str>,
@@ -211,11 +211,11 @@ fn sync_folder_envelopes(
 
         let mut stmt = conn.prepare(
             "SELECT id, uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0"
-        ).map_err(|e| Error::Database(e))?;
+        ).map_err(Error::Database)?;
         let local_msgs: Vec<(String, u32)> = stmt.query_map(
             rusqlite::params![account_id, folder_path],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(|e| Error::Database(e))?
+        ).map_err(Error::Database)?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -366,7 +366,7 @@ fn sync_folder_envelopes(
 /// Called when the user opens a message that hasn't been downloaded yet.
 pub fn fetch_and_store_body(
     imap_config: &ImapConfig,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     account_id: &str,
     folder_path: &str,
     uid: u32,
@@ -412,7 +412,7 @@ pub fn fetch_and_store_body(
     Ok(relative_path)
 }
 
-pub(crate) fn create_maildir_dirs(base: &PathBuf) -> Result<()> {
+pub(crate) fn create_maildir_dirs(base: &Path) -> Result<()> {
     std::fs::create_dir_all(base.join("cur"))?;
     std::fs::create_dir_all(base.join("new"))?;
     std::fs::create_dir_all(base.join("tmp"))?;
@@ -420,8 +420,7 @@ pub(crate) fn create_maildir_dirs(base: &PathBuf) -> Result<()> {
 }
 
 pub(crate) fn sanitize_folder_name(name: &str) -> String {
-    name.replace('/', ".")
-        .replace('\\', ".")
+    name.replace(['/', '\\'], ".")
         .replace('\0', "")
 }
 

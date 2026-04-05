@@ -616,8 +616,8 @@ fn parse_events_from_xml(xml: &str) -> Vec<CalDavEvent> {
 fn extract_uid_from_ical(ical: &str) -> Option<String> {
     for line in ical.lines() {
         let line = line.trim();
-        if line.starts_with("UID:") {
-            return Some(line[4..].trim().to_string());
+        if let Some(uid) = line.strip_prefix("UID:") {
+            return Some(uid.trim().to_string());
         }
     }
     None
@@ -683,7 +683,7 @@ pub fn generate_ical_event(
 /// Convert ISO 8601 datetime to iCalendar datetime format.
 /// "2025-04-15T10:00:00Z" -> "20250415T100000Z"
 fn to_ical_datetime(iso: &str) -> String {
-    iso.replace('-', "").replace(':', "")
+    iso.replace(['-', ':'], "")
 }
 
 /// Convert ISO 8601 date to iCalendar date format.
