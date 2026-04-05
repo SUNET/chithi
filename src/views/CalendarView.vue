@@ -14,17 +14,7 @@ const newEventStart = ref("");
 
 function formatCurrentDate(): string {
   const d = new Date(calendarStore.currentDate);
-  if (calendarStore.viewMode === "month") {
-    return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-  }
-  if (calendarStore.viewMode === "week") {
-    const start = new Date(d);
-    start.setDate(d.getDate() - d.getDay());
-    const end = new Date(start);
-    end.setDate(start.getDate() + 6);
-    return `${start.toLocaleDateString(undefined, { month: "short", day: "numeric" })} - ${end.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
-  }
-  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
 function onTimeSlotClick(dateTime: string) {
@@ -52,10 +42,18 @@ onMounted(async () => {
       <!-- Toolbar -->
       <div class="calendar-toolbar">
         <div class="toolbar-left">
-          <button class="btn-new-event" @click="showEventForm = true">+ Event</button>
+          <button class="btn-new-event" @click="showEventForm = true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            Event
+          </button>
+          <div class="toolbar-divider"></div>
           <button class="btn-today" @click="calendarStore.goToday()">Today</button>
-          <button class="btn-nav" @click="calendarStore.goPrev()">&lsaquo;</button>
-          <button class="btn-nav" @click="calendarStore.goNext()">&rsaquo;</button>
+          <button class="btn-nav" @click="calendarStore.goPrev()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
+          </button>
+          <button class="btn-nav" @click="calendarStore.goNext()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+          </button>
           <span class="current-date">{{ formatCurrentDate() }}</span>
         </div>
         <div class="toolbar-right">
@@ -113,7 +111,8 @@ onMounted(async () => {
 .calendar-sidebar-pane {
   width: 200px;
   flex-shrink: 0;
-  border-right: 1px solid var(--color-border);
+  border-right: 0.8px solid var(--color-border);
+  background: var(--color-bg-secondary);
 }
 
 .calendar-main {
@@ -127,54 +126,60 @@ onMounted(async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg);
+  height: 48px;
+  padding: 0 16px;
+  border-bottom: 0.8px solid var(--color-border);
+  background: var(--color-bg-secondary);
   flex-shrink: 0;
 }
 
 .toolbar-left {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--color-border);
+  margin: 0 8px;
 }
 
 .btn-new-event {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   padding: 6px 16px;
   background: var(--color-accent);
   color: white;
-  border-radius: 20px;
-  font-size: 13px;
+  border-radius: 999px;
+  font-size: 14px;
   font-weight: 500;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-  transition: box-shadow 0.15s, transform 0.1s;
+  transition: background 0.12s;
 }
 
 .btn-new-event:hover {
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
-  transform: translateY(-1px);
+  background: var(--color-accent-hover);
 }
 
 .btn-today {
   padding: 5px 14px;
-  border: 1px solid var(--color-border);
-  border-radius: 20px;
-  font-size: 12px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  font-size: 14px;
   font-weight: 500;
-  color: var(--color-text-secondary);
-  margin-left: 8px;
+  color: var(--color-text);
 }
 
 .btn-today:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text);
+  background: var(--color-border);
 }
 
 .btn-nav {
   width: 32px;
   height: 32px;
-  border-radius: 50%;
-  font-size: 18px;
+  border-radius: 4px;
   color: var(--color-text-muted);
   display: flex;
   align-items: center;
@@ -188,35 +193,30 @@ onMounted(async () => {
 }
 
 .current-date {
-  font-size: 18px;
-  font-weight: 400;
+  font-size: 14px;
+  font-weight: 500;
   color: var(--color-text);
   margin-left: 4px;
 }
 
 .view-toggle {
   display: flex;
-  border: 1px solid var(--color-border);
-  border-radius: 20px;
-  overflow: hidden;
+  background: var(--color-bg-tertiary);
+  border-radius: 999px;
+  padding: 2px;
 }
 
 .view-btn {
-  padding: 5px 14px;
-  font-size: 12px;
+  padding: 3px 14px;
+  font-size: 14px;
   font-weight: 500;
-  color: var(--color-text-muted);
-  border-right: 1px solid var(--color-border);
-  transition: all 0.15s;
-}
-
-.view-btn:last-child {
-  border-right: none;
+  color: var(--color-text);
+  border-radius: 999px;
+  transition: all 0.12s;
 }
 
 .view-btn:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text);
+  background: var(--color-border);
 }
 
 .view-btn.active {

@@ -474,8 +474,8 @@ describe("EventForm end-time validation", () => {
   });
 
   it("minEndTime is undefined when different day", () => {
-    const startDate = "2026-04-07";
-    const endDate = "2026-04-08";
+    const startDate: string = "2026-04-07";
+    const endDate: string = "2026-04-08";
     const startTime = "17:00";
 
     const minEndTime = endDate === startDate ? startTime : undefined;

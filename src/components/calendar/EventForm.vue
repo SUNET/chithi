@@ -145,14 +145,16 @@ async function save() {
     <div class="event-form">
       <div class="form-header">
         <h3>New Event</h3>
-        <button class="close-btn" @click="emit('close')">&times;</button>
+        <button class="close-btn" @click="emit('close')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+        </button>
       </div>
 
-      <div v-if="error" class="form-error">{{ error }}</div>
-
       <div class="form-body">
+        <div v-if="error" class="form-error">{{ error }}</div>
+
         <div class="form-group">
-          <label>Title</label>
+          <label>Title *</label>
           <input v-model="title" type="text" placeholder="Event title" autofocus />
         </div>
 
@@ -167,56 +169,55 @@ async function save() {
 
         <label class="checkbox-row">
           <input type="checkbox" v-model="allDay" />
-          All day
+          All day event
         </label>
 
-        <div class="form-row">
+        <div class="form-row-datetime">
           <div class="form-group">
-            <label>Start date</label>
-            <input v-model="startDate" type="date" />
+            <label>Start</label>
+            <div class="datetime-inputs">
+              <input v-model="startDate" type="date" class="date-input" />
+              <input v-if="!allDay" v-model="startTime" type="time" class="time-input" />
+            </div>
           </div>
-          <div v-if="!allDay" class="form-group">
-            <label>Start time</label>
-            <input v-model="startTime" type="time" />
-          </div>
-        </div>
-        <div class="form-row">
           <div class="form-group">
-            <label>End date</label>
-            <input v-model="endDate" type="date" :min="minEndDate" />
-          </div>
-          <div v-if="!allDay" class="form-group">
-            <label>End time</label>
-            <input v-model="endTime" type="time" :min="minEndTime" />
+            <label>End</label>
+            <div class="datetime-inputs">
+              <input v-model="endDate" type="date" class="date-input" :min="minEndDate" />
+              <input v-if="!allDay" v-model="endTime" type="time" class="time-input" :min="minEndTime" />
+            </div>
           </div>
         </div>
 
         <div class="form-group">
           <label>Location</label>
-          <input v-model="location" type="text" placeholder="Location" />
+          <input v-model="location" type="text" placeholder="Add location" />
         </div>
 
         <div class="form-group">
-          <label>Description</label>
-          <textarea v-model="description" rows="3" placeholder="Description"></textarea>
+          <label>Repeat</label>
+          <RecurrenceEditor v-model="recurrenceRule" />
         </div>
-
-        <RecurrenceEditor v-model="recurrenceRule" />
 
         <div class="form-group">
           <label>Attendees</label>
           <AttendeeEditor v-model="attendeeEmails" />
-          <p v-if="attendeeEmails.length > 0" class="hint">
-            Invite emails will be sent when you create the event.
-          </p>
+        </div>
+
+        <div class="form-group">
+          <label>Description</label>
+          <textarea v-model="description" rows="3" placeholder="Add description"></textarea>
         </div>
       </div>
 
       <div class="form-footer">
-        <button class="btn-primary" :disabled="saving" @click="save">
-          {{ saving ? "Saving..." : "Create" }}
-        </button>
-        <button class="btn-secondary" @click="emit('close')">Cancel</button>
+        <div></div>
+        <div class="footer-actions">
+          <button class="btn-cancel" @click="emit('close')">Cancel</button>
+          <button class="btn-create" :disabled="saving" @click="save">
+            {{ saving ? "Saving..." : "Create" }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -226,7 +227,7 @@ async function save() {
 .event-form-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(0, 0, 0, 0.6);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -234,104 +235,169 @@ async function save() {
 }
 
 .event-form {
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  width: 440px;
+  background: white;
+  border-radius: 10px;
+  width: 672px;
   max-height: 85vh;
-  overflow-y: auto;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
 }
 
 .form-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px;
-  border-bottom: 1px solid var(--color-border);
+  padding: 0 16px;
+  height: 64px;
+  border-bottom: 0.8px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.form-header h3 {
+  font-size: 18px;
+  font-weight: 600;
 }
 
 .close-btn {
-  font-size: 20px;
-  color: var(--color-text-muted);
-  width: 28px; height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
+  color: var(--color-text-muted);
 }
 
-.close-btn:hover { background: var(--color-bg-hover); }
+.close-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.form-body {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 
 .form-error {
-  padding: 8px 16px;
-  background: rgba(243, 139, 168, 0.1);
-  color: var(--color-danger);
+  padding: 8px 12px;
+  background: rgba(251, 44, 54, 0.06);
+  color: var(--color-danger-text);
   font-size: 12px;
+  border-radius: 4px;
 }
 
-.form-body { padding: 16px; }
-
-.form-group { margin-bottom: 12px; }
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 
 .form-group label {
-  display: block;
-  margin-bottom: 4px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
 }
 
 .form-group input,
 .form-group select,
 .form-group textarea {
   width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--color-border);
+  height: 36px;
+  padding: 0 12px;
+  border: 0.8px solid var(--color-border);
   border-radius: 4px;
-  background: var(--color-bg);
-  font-size: 13px;
+  background: var(--color-bg-secondary);
+  font-size: 16px;
 }
 
-.form-group textarea { resize: vertical; }
+.form-group textarea {
+  height: 96px;
+  padding: 8px 12px;
+  resize: vertical;
+  line-height: 24px;
+}
 
-.form-row { display: flex; gap: 12px; }
-.form-row .form-group { flex: 1; }
+.form-group select {
+  appearance: auto;
+}
+
+.form-row-datetime {
+  display: flex;
+  gap: 16px;
+}
+
+.form-row-datetime .form-group {
+  flex: 1;
+}
+
+.datetime-inputs {
+  display: flex;
+  gap: 4px;
+}
+
+.datetime-inputs .date-input {
+  flex: 1;
+}
+
+.datetime-inputs .time-input {
+  width: 90px;
+  flex-shrink: 0;
+}
 
 .checkbox-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  margin-bottom: 12px;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
+  color: var(--color-text);
 }
 
 .form-footer {
-  padding: 12px 16px;
-  border-top: 1px solid var(--color-border);
+  padding: 16px;
+  border-top: 0.8px solid var(--color-border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.footer-actions {
   display: flex;
   gap: 8px;
 }
 
-.btn-primary {
-  padding: 6px 16px;
+.btn-cancel {
+  height: 36px;
+  padding: 0 20px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.btn-cancel:hover {
+  background: var(--color-border);
+}
+
+.btn-create {
+  height: 36px;
+  padding: 0 20px;
   background: var(--color-accent);
-  color: var(--color-bg);
-  border-radius: 6px;
-  font-weight: 600;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 500;
+  color: white;
 }
 
-.btn-primary:disabled { opacity: 0.5; }
-
-.btn-secondary {
-  padding: 6px 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-}
-
-.hint {
-  font-size: 11px;
-  color: var(--color-text-muted);
-  margin-top: 4px;
+.btn-create:disabled {
+  opacity: 0.5;
 }
 </style>

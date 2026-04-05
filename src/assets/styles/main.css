@@ -1,5 +1,36 @@
-/* === Dark theme (default) === */
+/* === Light theme (default) === */
 :root,
+[data-theme="light"] {
+  --color-bg: #fafafa;
+  --color-bg-secondary: #f5f5f5;
+  --color-bg-tertiary: #e5e5e5;
+  --color-bg-hover: #e5e5e5;
+  --color-bg-active: #e5e5e5;
+  --color-text: #171717;
+  --color-text-secondary: #525252;
+  --color-text-muted: #737373;
+  --color-border: #d4d4d4;
+  --color-accent: #155dfc;
+  --color-accent-hover: #1250d4;
+  --color-accent-light: rgba(21, 93, 252, 0.08);
+  --color-unread: #171717;
+  --color-danger: #fb2c36;
+  --color-danger-text: #e7000b;
+  --color-success: #00a63e;
+  --color-warning: #e17100;
+  --color-email-body-bg: #ffffff;
+  --color-email-body-text: #1a1a1a;
+  --color-status-dot: #00c950;
+  --color-reader-bg: #ffffff;
+
+  --sidebar-width: 56px;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Oxygen, Ubuntu, sans-serif;
+  --font-mono: "Liberation Mono", "SF Mono", "Fira Code", Menlo, Consolas,
+    monospace;
+}
+
+/* === Dark theme === */
 [data-theme="dark"] {
   --color-bg: #1e1e2e;
   --color-bg-secondary: #252535;
@@ -12,38 +43,16 @@
   --color-border: #313244;
   --color-accent: #89b4fa;
   --color-accent-hover: #74c7ec;
+  --color-accent-light: rgba(137, 180, 250, 0.08);
   --color-unread: #f5e0dc;
   --color-danger: #f38ba8;
+  --color-danger-text: #f38ba8;
   --color-success: #a6e3a1;
   --color-warning: #f9e2af;
   --color-email-body-bg: #ffffff;
   --color-email-body-text: #1a1a1a;
-
-  --sidebar-width: 48px;
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-    Ubuntu, sans-serif;
-  --font-mono: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
-}
-
-/* === Light theme === */
-[data-theme="light"] {
-  --color-bg: #ffffff;
-  --color-bg-secondary: #f5f5f5;
-  --color-bg-tertiary: #eeeeee;
-  --color-bg-hover: #e8e8e8;
-  --color-bg-active: #d8d8e0;
-  --color-text: #1a1a2e;
-  --color-text-secondary: #444466;
-  --color-text-muted: #888899;
-  --color-border: #d0d0d8;
-  --color-accent: #3b6fca;
-  --color-accent-hover: #2a5eb8;
-  --color-unread: #1a1a2e;
-  --color-danger: #d04060;
-  --color-success: #30a060;
-  --color-warning: #b08020;
-  --color-email-body-bg: #ffffff;
-  --color-email-body-text: #1a1a1a;
+  --color-status-dot: #a6e3a1;
+  --color-reader-bg: #1e1e2e;
 }
 
 * {
@@ -54,7 +63,7 @@
 
 body {
   font-family: var(--font-sans);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--color-text);
   background-color: var(--color-bg);
   overflow: hidden;
@@ -62,8 +71,8 @@ body {
 }
 
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
@@ -72,7 +81,7 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--color-border);
-  border-radius: 4px;
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {

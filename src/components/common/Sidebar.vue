@@ -4,25 +4,53 @@ import { useRouter, useRoute } from "vue-router";
 const router = useRouter();
 const route = useRoute();
 
-const navItems = [
-  { path: "/", icon: "\u2709", label: "Mail", name: "mail" },
-  { path: "/calendar", icon: "\uD83D\uDCC5", label: "Calendar", name: "calendar" },
-  { path: "/settings", icon: "\u2699", label: "Settings", name: "settings" },
+const topItems = [
+  { path: "/", label: "Mail", name: "mail" },
+  { path: "/calendar", label: "Calendar", name: "calendar" },
+  { path: "/compose", label: "Compose", name: "compose" },
 ];
 </script>
 
 <template>
   <nav class="sidebar">
-    <button
-      v-for="item in navItems"
-      :key="item.name"
-      class="sidebar-item"
-      :class="{ active: route.name === item.name }"
-      :title="item.label"
-      @click="router.push(item.path)"
-    >
-      <span class="sidebar-icon">{{ item.icon }}</span>
-    </button>
+    <div class="sidebar-top">
+      <button
+        v-for="item in topItems"
+        :key="item.name"
+        class="sidebar-item"
+        :class="{ active: route.name === item.name }"
+        :title="item.label"
+        @click="router.push(item.path)"
+      >
+        <!-- Mail icon -->
+        <svg v-if="item.name === 'mail'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="4" width="20" height="16" rx="2" />
+          <path d="M22 7l-10 6L2 7" />
+        </svg>
+        <!-- Calendar icon -->
+        <svg v-else-if="item.name === 'calendar'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="18" rx="2" />
+          <path d="M16 2v4M8 2v4M3 10h18" />
+        </svg>
+        <!-- Compose icon -->
+        <svg v-else-if="item.name === 'compose'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+      </button>
+    </div>
+    <div class="sidebar-bottom">
+      <button
+        class="sidebar-item"
+        :class="{ active: route.name === 'settings' }"
+        title="Settings"
+        @click="router.push('/settings')"
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
+    </div>
   </nav>
 </template>
 
@@ -30,34 +58,40 @@ const navItems = [
 .sidebar {
   width: var(--sidebar-width);
   background: var(--color-bg-secondary);
-  border-right: 1px solid var(--color-border);
+  border-right: 0.8px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+.sidebar-top,
+.sidebar-bottom {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding-top: 8px;
-  gap: 4px;
-  flex-shrink: 0;
+  padding: 12px 0;
+  gap: 12px;
 }
 
 .sidebar-item {
   width: 36px;
   height: 36px;
-  border-radius: 8px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s;
+  color: var(--color-text-muted);
+  transition: all 0.12s;
 }
 
 .sidebar-item:hover {
+  color: var(--color-text);
   background: var(--color-bg-hover);
 }
 
 .sidebar-item.active {
-  background: var(--color-bg-active);
-}
-
-.sidebar-icon {
-  font-size: 18px;
+  color: white;
+  background: var(--color-accent);
 }
 </style>

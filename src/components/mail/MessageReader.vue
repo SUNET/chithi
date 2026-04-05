@@ -251,31 +251,52 @@ async function markSpam() {
     <div v-else class="message-content">
       <!-- Action bar -->
       <div class="message-actions">
-        <button class="action-btn" title="Reply" @click="reply">
-          <span class="action-icon">&#x21A9;</span> Reply
-        </button>
-        <button class="action-btn" title="Reply All" @click="replyAll">
-          <span class="action-icon">&#x21A9;</span> All
-        </button>
-        <button class="action-btn" title="Forward" @click="forward">
-          <span class="action-icon">&#x21AA;</span> Forward
-        </button>
-        <div class="action-separator"></div>
-        <button class="icon-action" title="Archive" @click="archiveMessage">&#x1F4E6;</button>
-        <button class="icon-action" title="Report spam" @click="markSpam">&#x26A0;</button>
-        <button class="icon-action danger" title="Delete" @click="deleteMessage">&#x1F5D1;</button>
-        <div class="action-spacer"></div>
-        <div v-if="hasHtml()" class="view-toggle">
-          <button
-            class="toggle-btn"
-            :class="{ active: !showHtml }"
-            @click="showHtml = false"
-          >Plain Text</button>
-          <button
-            class="toggle-btn"
-            :class="{ active: showHtml }"
-            @click="showHtml = true"
-          >HTML</button>
+        <div class="actions-left">
+          <button class="pill-btn" title="Reply" @click="reply">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
+            Reply
+          </button>
+          <button class="pill-btn" title="Reply All" @click="replyAll">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
+            Reply All
+          </button>
+          <button class="pill-btn" title="Forward" @click="forward">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7" /><path d="M4 18v-2a4 4 0 0 1 4-4h12" /></svg>
+            Forward
+          </button>
+        </div>
+        <div class="actions-right">
+          <button class="icon-action" title="Archive" @click="archiveMessage">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8" /><rect x="1" y="3" width="22" height="5" /><line x1="10" y1="12" x2="14" y2="12" /></svg>
+          </button>
+          <button class="icon-action" title="Report spam" @click="markSpam">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+          </button>
+          <button class="icon-action danger" title="Delete" @click="deleteMessage">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+          </button>
+          <div v-if="hasHtml()" class="view-toggle">
+            <button
+              class="toggle-btn"
+              :class="{ active: !showHtml }"
+              title="Plain Text"
+              @click="showHtml = false"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="16" y1="13" x2="8" y2="13" /><line x1="16" y1="17" x2="8" y2="17" /><polyline points="10 9 9 9 8 9" />
+              </svg>
+            </button>
+            <button
+              class="toggle-btn"
+              :class="{ active: showHtml }"
+              title="HTML"
+              @click="showHtml = true"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -366,7 +387,7 @@ async function markSpam() {
 .message-reader {
   height: 100%;
   overflow-y: auto;
-  background: var(--color-bg);
+  background: var(--color-reader-bg);
   position: relative;
 }
 
@@ -408,43 +429,51 @@ async function markSpam() {
 .message-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  justify-content: space-between;
   padding: 6px 12px;
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg);
 }
 
-.action-btn {
+.actions-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.actions-right {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 5px 10px;
-  border-radius: 6px;
-  font-size: 12px;
+}
+
+.pill-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-radius: 4px;
+  border: none;
+  font-size: 14px;
   font-weight: 500;
-  color: var(--color-text-secondary);
+  color: var(--color-text);
+  background: var(--color-bg-tertiary);
   transition: all 0.12s;
 }
 
-.action-btn:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text);
-}
-
-.action-icon {
-  font-size: 13px;
+.pill-btn:hover {
+  background: var(--color-border);
 }
 
 .icon-action {
   width: 30px;
   height: 30px;
-  border-radius: 50%;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
-  color: var(--color-text-secondary);
-  transition: background 0.12s;
+  color: var(--color-text-muted);
+  transition: all 0.12s;
 }
 
 .icon-action:hover {
@@ -453,36 +482,27 @@ async function markSpam() {
 }
 
 .icon-action.danger:hover {
-  background: rgba(243, 139, 168, 0.1);
+  background: rgba(220, 53, 69, 0.08);
   color: var(--color-danger);
-}
-
-.action-separator {
-  width: 1px;
-  height: 20px;
-  background: var(--color-border);
-  margin: 0 4px;
-}
-
-.action-spacer {
-  flex: 1;
 }
 
 .view-toggle {
   display: flex;
   border: 1px solid var(--color-border);
-  border-radius: 20px;
+  border-radius: 6px;
   overflow: hidden;
   flex-shrink: 0;
 }
 
 .toggle-btn {
-  padding: 4px 12px;
-  font-size: 11px;
-  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 28px;
   color: var(--color-text-muted);
   border-right: 1px solid var(--color-border);
-  transition: all 0.15s;
+  transition: all 0.12s;
 }
 
 .toggle-btn:last-child {
@@ -497,7 +517,6 @@ async function markSpam() {
 .toggle-btn.active {
   background: var(--color-accent);
   color: white;
-  font-weight: 500;
 }
 
 .message-headers {

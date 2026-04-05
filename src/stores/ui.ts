@@ -13,7 +13,7 @@ export const useUiStore = defineStore("ui", () => {
   const readerVisible = ref(true);
   const messageViewMode = ref<MessageViewMode>("right");
   const theme = ref<Theme>(
-    (localStorage.getItem("chithi-theme") as Theme) || "dark",
+    (localStorage.getItem("chithi-theme") as Theme) || "light",
   );
 
   function toggleReader() {

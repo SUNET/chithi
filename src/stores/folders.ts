@@ -6,6 +6,7 @@ import { useAccountsStore } from "./accounts";
 
 export const useFoldersStore = defineStore("folders", () => {
   const folders = ref<Folder[]>([]);
+  const foldersByAccount = ref<Record<string, Folder[]>>({});
   const activeFolderPath = ref<string | null>(null);
   const loading = ref(false);
 
@@ -20,14 +21,13 @@ export const useFoldersStore = defineStore("folders", () => {
     loading.value = true;
     try {
       folders.value = await api.listFolders(accountId);
+      foldersByAccount.value = { ...foldersByAccount.value, [accountId]: folders.value };
       if (folders.value.length > 0 && !activeFolderPath.value) {
         const inbox = folders.value.find((f) => f.folder_type === "inbox");
         activeFolderPath.value = inbox?.path ?? folders.value[0].path;
       }
 
-      // If no folders exist yet (new account), trigger a sync to fetch them
       if (folders.value.length === 0) {
-        log("No folders for account, triggering initial sync...");
         api.triggerSync(accountId).catch((e) =>
           console.error("Initial sync failed:", e),
         );
@@ -37,8 +37,30 @@ export const useFoldersStore = defineStore("folders", () => {
     }
   }
 
+  async function fetchAllAccountFolders() {
+    for (const account of accountsStore.accounts) {
+      try {
+        const accountFolders = await api.listFolders(account.id);
+        foldersByAccount.value = {
+          ...foldersByAccount.value,
+          [account.id]: accountFolders,
+        };
+        // Keep the active account's folders in sync
+        if (account.id === accountsStore.activeAccountId) {
+          folders.value = accountFolders;
+        }
+      } catch (e) {
+        console.error("Failed to fetch folders for", account.id, e);
+      }
+    }
+  }
+
   function setActiveFolder(path: string) {
     activeFolderPath.value = path;
+  }
+
+  function getAccountFolders(accountId: string): Folder[] {
+    return foldersByAccount.value[accountId] ?? [];
   }
 
   watch(
@@ -51,13 +73,12 @@ export const useFoldersStore = defineStore("folders", () => {
 
   return {
     folders,
+    foldersByAccount,
     activeFolderPath,
     loading,
     fetchFolders,
+    fetchAllAccountFolders,
     setActiveFolder,
+    getAccountFolders,
   };
 });
-
-function log(msg: string) {
-  console.log(`[folders] ${msg}`);
-}

@@ -8,9 +8,23 @@ import * as api from "@/lib/tauri";
 const router = useRouter();
 const accountsStore = useAccountsStore();
 const showForm = ref(false);
+const showDeleteConfirm = ref(false);
+const deletingAccountId = ref<string | null>(null);
 const saving = ref(false);
 const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
+
+const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
+
+function getAvatarColor(index: number): string {
+  return avatarColors[index % avatarColors.length];
+}
+
+function getInitials(name: string): string {
+  const words = name.split(/\s+/);
+  if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
+  return name.slice(0, 2).toUpperCase();
+}
 
 const defaultForm = (): AccountConfig => ({
   display_name: "",
@@ -62,7 +76,7 @@ function selectAccountType(type: AccountType) {
       break;
     case "caldav":
       f.provider = "generic";
-      f.mail_protocol = "imap"; // CalDAV-only, no email
+      f.mail_protocol = "imap";
       f.imap_host = "";
       f.imap_port = 0;
       f.smtp_host = "";
@@ -88,7 +102,6 @@ async function openEditForm(id: string) {
   try {
     const config = await api.getAccountConfig(id);
     form.value = config;
-    // Determine account type from config
     if (config.provider === "gmail") {
       accountType.value = "gmail";
     } else if (config.mail_protocol === "jmap") {
@@ -129,143 +142,171 @@ function cancelForm() {
   editingAccountId.value = null;
   error.value = null;
 }
+
+function confirmDelete(id: string) {
+  deletingAccountId.value = id;
+  showDeleteConfirm.value = true;
+}
+
+async function doDelete() {
+  if (deletingAccountId.value) {
+    await accountsStore.deleteAccount(deletingAccountId.value);
+  }
+  showDeleteConfirm.value = false;
+  deletingAccountId.value = null;
+}
 </script>
 
 <template>
   <div class="settings-view">
     <div class="settings-content">
-      <h2>Accounts</h2>
-      <div class="account-list">
-        <div
-          v-for="account in accountsStore.accounts"
-          :key="account.id"
-          class="account-item"
-        >
-          <div class="account-info">
-            <span class="account-name">{{ account.display_name }}</span>
-            <span class="account-email">{{ account.email }}</span>
-            <span class="account-protocol">{{ account.mail_protocol.toUpperCase() }}</span>
-          </div>
-          <div class="account-actions">
-            <button class="btn-edit" @click="openEditForm(account.id)">Edit</button>
-            <button class="btn-danger" @click="accountsStore.deleteAccount(account.id)">Remove</button>
-          </div>
-        </div>
-        <div v-if="accountsStore.accounts.length === 0" class="empty">
-          No accounts configured
-        </div>
+      <h1 class="settings-title">Settings</h1>
+
+      <div class="section-header">
+        <h2 class="section-title">Email Accounts</h2>
+        <button class="btn-add" @click="openNewForm">
+          + Add Account
+        </button>
       </div>
 
-      <button class="btn-primary" @click="openNewForm">Add Account</button>
-
-      <div v-if="showForm" class="account-form">
-        <h3>{{ editingAccountId ? 'Edit Account' : 'Add Email Account' }}</h3>
-        <div v-if="error" class="error">{{ error }}</div>
-
-        <!-- Account type selector (disabled when editing) -->
-        <div class="type-selector">
-          <button
-            class="type-btn"
-            :class="{ active: accountType === 'gmail' }"
-            :disabled="!!editingAccountId"
-            @click="selectAccountType('gmail')"
-          >Gmail</button>
-          <button
-            class="type-btn"
-            :class="{ active: accountType === 'imap' }"
-            :disabled="!!editingAccountId"
-            @click="selectAccountType('imap')"
-          >IMAP</button>
-          <button
-            class="type-btn"
-            :class="{ active: accountType === 'jmap' }"
-            :disabled="!!editingAccountId"
-            @click="selectAccountType('jmap')"
-          >JMAP</button>
-          <button
-            class="type-btn"
-            :class="{ active: accountType === 'caldav' }"
-            :disabled="!!editingAccountId"
-            @click="selectAccountType('caldav')"
-          >CalDAV</button>
-        </div>
-
-        <!-- Common fields -->
-        <div class="form-group">
-          <label>Display Name</label>
-          <input v-model="form.display_name" type="text" :placeholder="accountType === 'caldav' ? 'My Calendar' : 'My Email'" />
-        </div>
-        <div v-if="accountType !== 'caldav'" class="form-group">
-          <label>Email Address</label>
-          <input v-model="form.email" type="email" placeholder="you@example.com" />
-        </div>
-        <div class="form-group">
-          <label>Username</label>
-          <input v-model="form.username" type="text" placeholder="you@example.com" />
-        </div>
-        <div class="form-group">
-          <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
-          <input v-model="form.password" type="password" :placeholder="accountType === 'gmail' ? 'Gmail app password' : 'Password'" />
-        </div>
-
-        <!-- IMAP/SMTP fields (not for CalDAV-only or JMAP) -->
-        <template v-if="accountType === 'imap' || accountType === 'gmail'">
-          <div class="form-row">
-            <div class="form-group">
-              <label>IMAP Host</label>
-              <input v-model="form.imap_host" type="text" placeholder="imap.example.com" :disabled="accountType === 'gmail'" />
-            </div>
-            <div class="form-group">
-              <label>IMAP Port</label>
-              <input v-model.number="form.imap_port" type="number" :disabled="accountType === 'gmail'" />
+      <div class="account-list">
+        <div
+          v-for="(account, idx) in accountsStore.accounts"
+          :key="account.id"
+          class="account-card"
+        >
+          <div class="account-card-left">
+            <span class="account-avatar" :style="{ background: getAvatarColor(idx) }">
+              {{ getInitials(account.display_name) }}
+            </span>
+            <div class="account-card-info">
+              <span class="account-card-name">{{ account.display_name }}</span>
+              <span class="account-card-email">{{ account.email }}</span>
+              <span class="account-card-type">{{ account.provider === 'gmail' ? 'Gmail' : account.mail_protocol.toUpperCase() }}</span>
             </div>
           </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>SMTP Host</label>
-              <input v-model="form.smtp_host" type="text" placeholder="smtp.example.com" :disabled="accountType === 'gmail'" />
-            </div>
-            <div class="form-group">
-              <label>SMTP Port</label>
-              <input v-model.number="form.smtp_port" type="number" :disabled="accountType === 'gmail'" />
-            </div>
+          <div class="account-card-actions">
+            <button class="icon-btn-sm" title="Edit" @click="openEditForm(account.id)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+              </svg>
+            </button>
+            <button class="icon-btn-sm danger" title="Delete" @click="confirmDelete(account.id)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              </svg>
+            </button>
           </div>
-        </template>
-
-        <!-- JMAP fields -->
-        <template v-if="accountType === 'jmap'">
-          <div class="form-group">
-            <label>JMAP URL (leave blank for auto-discovery from email domain)</label>
-            <input v-model="form.jmap_url" type="url" placeholder="https://mail.example.com" />
-          </div>
-          <p class="hint">If left blank, the app will try to discover the JMAP endpoint from your email domain via <code>.well-known/jmap</code>.</p>
-        </template>
-
-        <!-- CalDAV URL for IMAP accounts (optional) and CalDAV-only accounts (required) -->
-        <template v-if="accountType === 'imap' || accountType === 'caldav'">
-          <div class="form-group">
-            <label>CalDAV URL {{ accountType === 'caldav' ? '(required)' : '(optional — for calendar sync)' }}</label>
-            <input v-model="form.caldav_url" type="url" placeholder="https://mail.example.com/dav/cal" />
-          </div>
-          <p v-if="accountType === 'caldav'" class="hint">CalDAV-only account — only calendar data will be synced, no email.</p>
-          <p v-else class="hint">If set, calendars will be synced via CalDAV. Leave blank for email-only.</p>
-        </template>
-
-        <!-- CalDAV-only: hide email field, make it optional -->
-
-        <!-- Gmail hint -->
-        <template v-if="accountType === 'gmail' && !editingAccountId">
-          <p class="hint">Gmail uses IMAP (imap.gmail.com:993) and SMTP (smtp.gmail.com:587). You need a <a href="https://myaccount.google.com/apppasswords" class="link">Gmail App Password</a>.</p>
-        </template>
-
-        <div class="form-actions">
-          <button class="btn-primary" :disabled="saving" @click="saveAccount">
-            {{ saving ? "Saving..." : (editingAccountId ? "Update" : "Save") }}
-          </button>
-          <button class="btn-secondary" @click="cancelForm">Cancel</button>
         </div>
       </div>
     </div>
+
+    <!-- Add/Edit Account Modal -->
+    <Teleport to="body">
+      <div v-if="showForm" class="modal-overlay" @click.self="cancelForm">
+        <div class="modal">
+          <div class="modal-header">
+            <h3>{{ editingAccountId ? 'Edit Account' : 'Add Account' }}</h3>
+            <button class="modal-close" @click="cancelForm">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div v-if="error" class="form-error">{{ error }}</div>
+
+            <div class="form-group">
+              <label>Account Type</label>
+              <div class="type-selector">
+                <button
+                  v-for="t in (['gmail', 'imap', 'jmap', 'caldav'] as AccountType[])"
+                  :key="t"
+                  class="type-btn"
+                  :class="{ active: accountType === t }"
+                  :disabled="!!editingAccountId"
+                  @click="selectAccountType(t)"
+                >{{ t === 'gmail' ? 'Gmail' : t.toUpperCase() }}</button>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Account Name</label>
+              <input v-model="form.display_name" type="text" :placeholder="accountType === 'caldav' ? 'My Calendar' : 'e.g., Personal, Work'" />
+            </div>
+            <div v-if="accountType !== 'caldav'" class="form-group">
+              <label>Email Address</label>
+              <input v-model="form.email" type="email" placeholder="user@example.com" />
+            </div>
+            <div class="form-group">
+              <label>Password</label>
+              <input v-model="form.password" type="password" placeholder="••••••••" />
+              <span class="field-hint">Passwords are stored securely in your OS keyring</span>
+            </div>
+
+            <template v-if="accountType === 'imap'">
+              <div class="form-row">
+                <div class="form-group">
+                  <label>IMAP Server</label>
+                  <input v-model="form.imap_host" type="text" placeholder="imap.example.com" />
+                </div>
+                <div class="form-group port">
+                  <label>Port</label>
+                  <input v-model.number="form.imap_port" type="number" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>SMTP Server</label>
+                  <input v-model="form.smtp_host" type="text" placeholder="smtp.example.com" />
+                </div>
+                <div class="form-group port">
+                  <label>Port</label>
+                  <input v-model.number="form.smtp_port" type="number" />
+                </div>
+              </div>
+            </template>
+
+            <template v-if="accountType === 'jmap'">
+              <div class="form-group">
+                <label>JMAP URL</label>
+                <input v-model="form.jmap_url" type="url" placeholder="https://mail.example.com" />
+                <span class="field-hint">Leave blank for auto-discovery via .well-known/jmap</span>
+              </div>
+            </template>
+
+            <template v-if="accountType === 'imap' || accountType === 'caldav'">
+              <div class="form-group">
+                <label>CalDAV URL {{ accountType === 'caldav' ? '' : '(optional)' }}</label>
+                <input v-model="form.caldav_url" type="url" placeholder="https://mail.example.com/dav/cal" />
+              </div>
+            </template>
+
+            <template v-if="accountType === 'gmail' && !editingAccountId">
+              <div class="info-box">Gmail settings will be configured automatically</div>
+            </template>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-secondary" @click="cancelForm">Cancel</button>
+            <button class="btn-primary" :disabled="saving" @click="saveAccount">
+              {{ saving ? "Saving..." : (editingAccountId ? "Save" : "Add Account") }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Delete Confirmation Modal -->
+    <Teleport to="body">
+      <div v-if="showDeleteConfirm" class="modal-overlay" @click.self="showDeleteConfirm = false">
+        <div class="modal modal-sm">
+          <div class="modal-body">
+            <h3 class="confirm-title">Delete Account</h3>
+            <p class="confirm-text">Are you sure you want to delete this account? This action cannot be undone.</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-secondary" @click="showDeleteConfirm = false">Cancel</button>
+            <button class="btn-danger" @click="doDelete">Delete</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -273,129 +314,252 @@ function cancelForm() {
 .settings-view {
   height: 100%;
   overflow-y: auto;
-  padding: 24px;
+  padding: 32px;
+  background: var(--color-bg);
 }
 
 .settings-content {
-  max-width: 600px;
+  max-width: 640px;
+  margin: 0 auto;
 }
 
-h2 {
-  margin-bottom: 16px;
+.settings-title {
+  font-size: 24px;
+  font-weight: 600;
+  margin-bottom: 24px;
 }
 
-h3 {
-  margin-bottom: 12px;
-}
-
-.account-list {
-  margin-bottom: 16px;
-}
-
-.account-item {
+.section-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 12px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  margin-bottom: 8px;
+  margin-bottom: 16px;
 }
 
-.account-info {
+.section-title {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.btn-add {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  padding: 0 16px;
+  background: var(--color-accent);
+  color: white;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background 0.12s;
+}
+
+.btn-add:hover {
+  background: var(--color-accent-hover);
+}
+
+.account-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 8px;
 }
 
-.account-name {
-  font-weight: 600;
+.account-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 10px;
+  background: white;
+  min-height: 100px;
 }
 
-.account-email {
+.account-card-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.account-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.account-card-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.account-card-name {
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.account-card-email {
   font-size: 12px;
-  color: var(--color-text-secondary);
+  color: var(--color-text-muted);
 }
 
-.account-protocol {
+.account-card-type {
   font-size: 10px;
   color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  margin-top: 1px;
 }
 
-.account-actions {
+.account-card-actions {
   display: flex;
-  gap: 6px;
+  gap: 8px;
 }
 
-.account-form {
-  margin-top: 16px;
-  padding: 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  background: var(--color-bg-secondary);
-}
-
-.type-selector {
-  display: flex;
-  gap: 0;
-  margin-bottom: 16px;
-  border: 1px solid var(--color-border);
+.icon-btn-sm {
+  width: 32px;
+  height: 32px;
   border-radius: 6px;
-  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  transition: all 0.12s;
 }
 
-.type-btn {
-  flex: 1;
-  padding: 8px 16px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
-  background: var(--color-bg);
-  border-right: 1px solid var(--color-border);
-}
-
-.type-btn:last-child {
-  border-right: none;
-}
-
-.type-btn:hover:not(:disabled) {
+.icon-btn-sm:hover {
   background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
-.type-btn.active {
-  background: var(--color-accent);
-  color: var(--color-bg);
+.icon-btn-sm.danger {
+  color: var(--color-danger);
+}
+
+.icon-btn-sm.danger:hover {
+  background: rgba(220, 53, 69, 0.08);
+}
+
+/* Modal */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  width: 480px;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+}
+
+.modal-sm {
+  width: 400px;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.modal-header h3 {
+  font-size: 16px;
   font-weight: 600;
 }
 
-.type-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
+.modal-close {
+  font-size: 20px;
+  color: var(--color-text-muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-close:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.modal-body {
+  padding: 20px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--color-border);
+}
+
+.form-error {
+  padding: 8px 12px;
+  background: rgba(220, 53, 69, 0.06);
+  color: var(--color-danger);
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 12px;
 }
 
 .form-group {
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 .form-group label {
   display: block;
   margin-bottom: 4px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--color-text-secondary);
 }
 
 .form-group input {
   width: 100%;
-  padding: 6px 10px;
-  border: 1px solid var(--color-border);
+  height: 40px;
+  padding: 0 12px;
+  border: 0.8px solid var(--color-border);
   border-radius: 4px;
-  background: var(--color-bg);
+  background: var(--color-bg-secondary);
+  font-size: 16px;
+}
+
+.form-group input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-accent-light);
 }
 
 .form-group input:disabled {
   opacity: 0.5;
+}
+
+.field-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
 }
 
 .form-row {
@@ -407,18 +571,64 @@ h3 {
   flex: 1;
 }
 
-.form-actions {
+.form-row .form-group.port {
+  flex: 1;
+}
+
+.type-selector {
   display: flex;
   gap: 8px;
-  margin-top: 16px;
+}
+
+.type-btn {
+  flex: 1;
+  height: 40px;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--color-text);
+  background: transparent;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  transition: all 0.12s;
+}
+
+.type-btn:hover:not(:disabled) {
+  border-color: var(--color-text-muted);
+}
+
+.type-btn.active {
+  background: rgba(43, 127, 255, 0.1);
+  border-color: #2b7fff;
+  color: var(--color-accent);
+}
+
+.type-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.info-box {
+  padding: 10px 12px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--color-text-muted);
 }
 
 .btn-primary {
-  padding: 6px 16px;
+  height: 40px;
+  padding: 0 20px;
   background: var(--color-accent);
-  color: var(--color-bg);
-  border-radius: 6px;
-  font-weight: 600;
+  color: white;
+  border-radius: 4px;
+  font-weight: 500;
+  font-size: 16px;
+  transition: background 0.12s;
+}
+
+.btn-primary:hover {
+  background: var(--color-accent-hover);
 }
 
 .btn-primary:disabled {
@@ -426,62 +636,39 @@ h3 {
 }
 
 .btn-secondary {
-  padding: 6px 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-}
-
-.btn-edit {
-  padding: 4px 10px;
-  font-size: 12px;
-  color: var(--color-accent);
-  border: 1px solid var(--color-border);
+  height: 40px;
+  padding: 0 20px;
+  background: var(--color-bg-tertiary);
   border-radius: 4px;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--color-text);
+  transition: background 0.12s;
 }
 
-.btn-edit:hover {
-  background: var(--color-bg-hover);
+.btn-secondary:hover {
+  background: var(--color-border);
 }
 
 .btn-danger {
-  padding: 4px 10px;
-  color: var(--color-danger);
-  font-size: 12px;
-}
-
-.btn-danger:hover {
-  background: rgba(243, 139, 168, 0.1);
+  height: 40px;
+  padding: 0 20px;
+  background: var(--color-danger);
+  color: white;
   border-radius: 4px;
+  font-weight: 500;
+  font-size: 16px;
 }
 
-.error {
-  padding: 8px 12px;
-  background: rgba(243, 139, 168, 0.1);
-  color: var(--color-danger);
-  border-radius: 6px;
-  margin-bottom: 12px;
+.confirm-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
 }
 
-.empty {
-  color: var(--color-text-muted);
-  padding: 12px;
-}
-
-.hint {
-  font-size: 12px;
-  color: var(--color-text-muted);
-  margin-bottom: 12px;
-  line-height: 1.4;
-}
-
-.hint code {
-  font-family: var(--font-mono);
-  background: var(--color-bg-tertiary);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
-
-.link {
-  color: var(--color-accent);
+.confirm-text {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
 }
 </style>

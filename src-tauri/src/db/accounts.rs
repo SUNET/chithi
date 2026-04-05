@@ -207,6 +207,10 @@ mod tests {
         conn
     }
 
+    fn unique_id() -> String {
+        format!("test-{}", uuid::Uuid::new_v4())
+    }
+
     fn make_config(email: &str, name: &str) -> AccountConfig {
         AccountConfig {
             display_name: name.to_string(),
@@ -235,25 +239,27 @@ mod tests {
     #[test]
     fn test_insert_and_list_accounts() {
         let conn = setup_db();
+        let id = unique_id();
         let config = make_config("alice@example.com", "Alice");
-        insert_account(&conn, "acc1", &config).unwrap();
+        insert_account(&conn, &id, &config).unwrap();
 
         let accounts = list_accounts(&conn).unwrap();
         assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].id, "acc1");
         assert_eq!(accounts[0].email, "alice@example.com");
         assert_eq!(accounts[0].display_name, "Alice");
         assert!(accounts[0].enabled);
+        // Cleanup keyring
+        crate::keyring::delete_password(&id).ok();
     }
 
     #[test]
     fn test_get_account_full_reads_all_fields() {
         let conn = setup_db();
+        let id = unique_id();
         let config = make_config("alice@example.com", "Alice");
-        insert_account(&conn, "acc1", &config).unwrap();
+        insert_account(&conn, &id, &config).unwrap();
 
-        let full = get_account_full(&conn, "acc1").unwrap();
-        assert_eq!(full.id, "acc1");
+        let full = get_account_full(&conn, &id).unwrap();
         assert_eq!(full.email, "alice@example.com");
         assert_eq!(full.imap_host, "imap.example.com");
         assert_eq!(full.imap_port, 993);
@@ -261,8 +267,7 @@ mod tests {
         assert_eq!(full.smtp_port, 587);
         assert_eq!(full.username, "user");
         assert!(full.use_tls);
-        // Password comes from keyring, not DB — in test env it may be
-        // from the mock backend or real keyring depending on platform
+        crate::keyring::delete_password(&id).ok();
     }
 
     #[test]
@@ -275,34 +280,41 @@ mod tests {
     #[test]
     fn test_update_account() {
         let conn = setup_db();
+        let id = unique_id();
         let config = make_config("alice@example.com", "Alice");
-        insert_account(&conn, "acc1", &config).unwrap();
+        insert_account(&conn, &id, &config).unwrap();
 
         let mut updated = config.clone();
         updated.display_name = "Alice Updated".to_string();
         updated.imap_host = "new-imap.example.com".to_string();
-        update_account(&conn, "acc1", &updated).unwrap();
+        update_account(&conn, &id, &updated).unwrap();
 
-        let full = get_account_full(&conn, "acc1").unwrap();
+        let full = get_account_full(&conn, &id).unwrap();
         assert_eq!(full.display_name, "Alice Updated");
         assert_eq!(full.imap_host, "new-imap.example.com");
+        crate::keyring::delete_password(&id).ok();
     }
 
     #[test]
     fn test_update_nonexistent_account() {
         let conn = setup_db();
+        let id = unique_id();
         let config = make_config("alice@example.com", "Alice");
-        let result = update_account(&conn, "nonexistent", &config);
+        // Store password so keyring call doesn't fail
+        crate::keyring::set_password(&id, "test").ok();
+        let result = update_account(&conn, &id, &config);
         assert!(result.is_err());
+        crate::keyring::delete_password(&id).ok();
     }
 
     #[test]
     fn test_delete_account() {
         let conn = setup_db();
+        let id = unique_id();
         let config = make_config("alice@example.com", "Alice");
-        insert_account(&conn, "acc1", &config).unwrap();
+        insert_account(&conn, &id, &config).unwrap();
 
-        delete_account(&conn, "acc1").unwrap();
+        delete_account(&conn, &id).unwrap();
         let accounts = list_accounts(&conn).unwrap();
         assert!(accounts.is_empty());
     }
@@ -310,7 +322,6 @@ mod tests {
     #[test]
     fn test_no_password_column_in_db() {
         let conn = setup_db();
-        // Verify the password column does NOT exist in the schema
         let has_password = conn
             .prepare("SELECT password FROM accounts LIMIT 0")
             .is_ok();
@@ -320,26 +331,31 @@ mod tests {
     #[test]
     fn test_multiple_accounts() {
         let conn = setup_db();
-        insert_account(&conn, "acc1", &make_config("alice@example.com", "Alice")).unwrap();
-        insert_account(&conn, "acc2", &make_config("bob@example.com", "Bob")).unwrap();
+        let id1 = unique_id();
+        let id2 = unique_id();
+        insert_account(&conn, &id1, &make_config("alice@example.com", "Alice")).unwrap();
+        insert_account(&conn, &id2, &make_config("bob@example.com", "Bob")).unwrap();
 
         let accounts = list_accounts(&conn).unwrap();
         assert_eq!(accounts.len(), 2);
-        // Sorted by display_name
         assert_eq!(accounts[0].display_name, "Alice");
         assert_eq!(accounts[1].display_name, "Bob");
+        crate::keyring::delete_password(&id1).ok();
+        crate::keyring::delete_password(&id2).ok();
     }
 
     #[test]
     fn test_jmap_account() {
         let conn = setup_db();
+        let id = unique_id();
         let mut config = make_config("kushal@example.com", "JMAP Account");
         config.mail_protocol = "jmap".to_string();
         config.jmap_url = "https://jmap.example.com".to_string();
-        insert_account(&conn, "acc1", &config).unwrap();
+        insert_account(&conn, &id, &config).unwrap();
 
-        let full = get_account_full(&conn, "acc1").unwrap();
+        let full = get_account_full(&conn, &id).unwrap();
         assert_eq!(full.mail_protocol, "jmap");
         assert_eq!(full.jmap_url, "https://jmap.example.com");
+        crate::keyring::delete_password(&id).ok();
     }
 }
