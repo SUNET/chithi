@@ -204,6 +204,53 @@ describe("Compose dirty tracking", () => {
   });
 });
 
+describe("Attachment mention detection", () => {
+  function mentionsAttachment(body: string, subject = ""): boolean {
+    const text = (body + "\n" + subject).toLowerCase();
+    return /\battach(ed|ment|ments|ing)?\b/.test(text);
+  }
+
+  it("detects 'attached' in body", () => {
+    expect(mentionsAttachment("Please see the attached file.")).toBe(true);
+  });
+
+  it("detects 'attachment' in body", () => {
+    expect(mentionsAttachment("I've included an attachment.")).toBe(true);
+  });
+
+  it("detects 'attachments' in body", () => {
+    expect(mentionsAttachment("See the attachments below.")).toBe(true);
+  });
+
+  it("detects 'attaching' in body", () => {
+    expect(mentionsAttachment("I'm attaching the report.")).toBe(true);
+  });
+
+  it("detects 'attach' in body", () => {
+    expect(mentionsAttachment("Let me attach the file.")).toBe(true);
+  });
+
+  it("detects mention in subject", () => {
+    expect(mentionsAttachment("Hello", "Report attached")).toBe(true);
+  });
+
+  it("does not false-positive on unrelated words", () => {
+    expect(mentionsAttachment("Hello, how are you?")).toBe(false);
+  });
+
+  it("does not match partial words", () => {
+    expect(mentionsAttachment("The detachment was noted.")).toBe(false);
+  });
+
+  it("handles empty body", () => {
+    expect(mentionsAttachment("")).toBe(false);
+  });
+
+  it("case insensitive", () => {
+    expect(mentionsAttachment("PLEASE SEE ATTACHED")).toBe(true);
+  });
+});
+
 describe("saveDraft API", () => {
   beforeEach(() => {
     vi.clearAllMocks();

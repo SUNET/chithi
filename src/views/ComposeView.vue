@@ -152,6 +152,11 @@ function parseAddresses(input: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+function mentionsAttachment(): boolean {
+  const text = (bodyText.value + "\n" + subject.value).toLowerCase();
+  return /\battach(ed|ment|ments|ing)?\b/.test(text);
+}
+
 async function send() {
   const accountId = selectedAccountId.value;
   if (!accountId) {
@@ -163,6 +168,26 @@ async function send() {
   if (toAddrs.length === 0) {
     error.value = "At least one recipient is required";
     return;
+  }
+
+  // Check for missing attachments
+  if (attachments.value.length === 0 && mentionsAttachment()) {
+    const result = await tauriMessage(
+      'Your message mentions an attachment, but no files are attached. Send anyway?',
+      {
+        title: "No Attachments",
+        kind: "warning",
+        buttons: { yes: "Send Anyway", no: "Attach Files", cancel: "Cancel" },
+      },
+    );
+    if (result === "Attach Files" || result === "No") {
+      await addAttachment();
+      return;
+    }
+    if (result === "Cancel") {
+      return;
+    }
+    // "Send Anyway" / "Yes" — proceed
   }
 
   sending.value = true;
