@@ -95,6 +95,16 @@ pub async fn send_message(
         .await?;
     }
 
+    // Auto-collect recipients to "Collected Contacts"
+    {
+        let conn = state.db.lock().await;
+        for addr in message.to.iter().chain(message.cc.iter()) {
+            if let Err(e) = db::contacts::collect_contact(&conn, &account_id, addr, None) {
+                log::warn!("Failed to collect contact '{}': {}", addr, e);
+            }
+        }
+    }
+
     log::info!(
         "Message sent successfully for account {} to {:?}",
         account_id,

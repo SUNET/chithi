@@ -280,3 +280,61 @@ export async function applyFiltersToFolder(
 ): Promise<number> {
   return invoke("apply_filters_to_folder", { accountId, folderPath });
 }
+
+// Contacts
+export async function listContactBooks(
+  accountId: string,
+): Promise<import("./types").ContactBook[]> {
+  return invoke("list_contact_books", { accountId });
+}
+
+export async function listContacts(
+  bookId: string,
+): Promise<import("./types").Contact[]> {
+  return invoke("list_contacts", { bookId });
+}
+
+export async function getContact(
+  contactId: string,
+): Promise<import("./types").Contact> {
+  return invoke("get_contact", { contactId });
+}
+
+export async function createContact(contact: {
+  book_id: string;
+  display_name: string;
+  emails_json: string;
+  phones_json: string;
+  addresses_json: string;
+  organization?: string | null;
+  title?: string | null;
+  notes?: string | null;
+}): Promise<string> {
+  return invoke("create_contact", { contact });
+}
+
+export async function updateContact(
+  contact: import("./types").Contact,
+): Promise<void> {
+  return invoke("update_contact", { contact });
+}
+
+export async function deleteContact(contactId: string): Promise<void> {
+  return invoke("delete_contact", { contactId });
+}
+
+export async function searchContacts(
+  query: string,
+): Promise<import("./types").Contact[]> {
+  return invoke("search_contacts", { query });
+}
+
+export async function syncContacts(accountId: string): Promise<void> {
+  return invoke("sync_contacts", { accountId });
+}
+
+export async function searchCollectedContacts(
+  query: string,
+): Promise<import("./types").CollectedContact[]> {
+  return invoke("search_collected_contacts", { query });
+}

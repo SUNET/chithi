@@ -129,6 +129,46 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
 
+        CREATE TABLE IF NOT EXISTS contact_books (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            remote_id TEXT,
+            sync_type TEXT NOT NULL DEFAULT 'local',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL REFERENCES contact_books(id) ON DELETE CASCADE,
+            uid TEXT,
+            display_name TEXT NOT NULL,
+            emails_json TEXT DEFAULT '[]',
+            phones_json TEXT DEFAULT '[]',
+            addresses_json TEXT DEFAULT '[]',
+            organization TEXT,
+            title TEXT,
+            notes TEXT,
+            vcard_data TEXT,
+            remote_id TEXT,
+            etag TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_contacts_book ON contacts(book_id);
+        CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(display_name);
+
+        CREATE TABLE IF NOT EXISTS collected_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            email TEXT NOT NULL,
+            name TEXT,
+            last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            use_count INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(account_id, email)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collected_email ON collected_contacts(email);
+
         CREATE TABLE IF NOT EXISTS app_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL

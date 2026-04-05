@@ -224,3 +224,37 @@ export interface ComposeAttachment {
   path: string;
   name: string;
 }
+
+// Contacts types
+export interface ContactBook {
+  id: string;
+  account_id: string;
+  name: string;
+  remote_id: string | null;
+  sync_type: string;
+}
+
+export interface Contact {
+  id: string;
+  book_id: string;
+  uid: string | null;
+  display_name: string;
+  emails_json: string;
+  phones_json: string;
+  addresses_json: string;
+  organization: string | null;
+  title: string | null;
+  notes: string | null;
+  vcard_data: string | null;
+  remote_id: string | null;
+  etag: string | null;
+}
+
+export interface CollectedContact {
+  id: number;
+  account_id: string;
+  email: string;
+  name: string | null;
+  last_used: string;
+  use_count: number;
+}
