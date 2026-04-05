@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from "vue-router";
+import { useAccountsStore } from "@/stores/accounts";
 import { openComposeWindow } from "@/lib/compose-window";
 
 const router = useRouter();
 const route = useRoute();
+const accountsStore = useAccountsStore();
 
 const topItems = [
   { path: "/", label: "Mail", name: "mail" },
@@ -13,7 +15,7 @@ const topItems = [
 
 function handleNavClick(item: typeof topItems[0]) {
   if (item.name === "compose") {
-    openComposeWindow();
+    openComposeWindow({ accountId: accountsStore.activeAccountId ?? undefined });
   } else {
     router.push(item.path);
   }

@@ -1,16 +1,43 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { Account } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
 const currentWindow = getCurrentWindow();
 
+// Compose window has its own Vue instance — stores are empty.
+// Fetch accounts directly and manage locally.
+const accounts = ref<Account[]>([]);
+const initialAccountId = (route.query.accountId as string) || "";
+
+onMounted(async () => {
+  // Try store first (works if opened in same window context)
+  if (accountsStore.accounts.length > 0) {
+    accounts.value = accountsStore.accounts;
+  } else {
+    // Separate window — fetch accounts via IPC
+    try {
+      accounts.value = await api.listAccounts();
+    } catch (e) {
+      console.error("Failed to fetch accounts:", e);
+    }
+  }
+  // Set selected account from query param or first account
+  if (initialAccountId && accounts.value.some(a => a.id === initialAccountId)) {
+    selectedAccountId.value = initialAccountId;
+  } else if (accounts.value.length > 0) {
+    selectedAccountId.value = accounts.value[0].id;
+  }
+});
+
 // Prefill from query params (reply/reply-all/forward)
 const replyToMessageId = (route.query.replyTo as string) || "";
+const selectedAccountId = ref("");
 const to = ref((route.query.to as string) || "");
 const cc = ref((route.query.cc as string) || "");
 const bcc = ref("");
@@ -18,7 +45,10 @@ const subject = ref((route.query.subject as string) || "");
 const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
 const error = ref<string | null>(null);
-const showCcBcc = ref(!!cc.value);
+const showCc = ref(!!cc.value);
+const showBcc = ref(false);
+
+const canSend = computed(() => to.value.trim().length > 0 && !sending.value);
 
 function parseAddresses(input: string): string[] {
   return input
@@ -28,7 +58,7 @@ function parseAddresses(input: string): string[] {
 }
 
 async function send() {
-  const accountId = accountsStore.activeAccountId;
+  const accountId = selectedAccountId.value;
   if (!accountId) {
     error.value = "No account selected";
     return;
@@ -64,55 +94,105 @@ async function send() {
   }
 }
 
-function discard() {
-  currentWindow.close();
-}
 </script>
 
 <template>
   <div class="compose-view">
+    <!-- Menu Bar -->
+    <div class="compose-menubar">
+      <span class="menu-item">File</span>
+      <span class="menu-item">Edit</span>
+      <span class="menu-item">View</span>
+      <span class="menu-item">Options</span>
+      <span class="menu-item">Tools</span>
+      <span class="menu-item">Help</span>
+    </div>
+
+    <!-- Toolbar -->
     <div class="compose-toolbar">
-      <button class="btn-send" :disabled="sending" @click="send">
+      <button class="toolbar-btn" :class="{ disabled: !canSend }" :disabled="!canSend" @click="send">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
         </svg>
         {{ sending ? "Sending..." : "Send" }}
       </button>
-      <button class="btn-discard" @click="discard">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+      <button class="toolbar-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
         </svg>
-        Discard
+        Encrypt
+      </button>
+      <button class="toolbar-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+        Spelling
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+      </button>
+      <button class="toolbar-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" />
+        </svg>
+        Save
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+      </button>
+      <button class="toolbar-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+        Contacts
+      </button>
+      <div class="toolbar-spacer"></div>
+      <button class="toolbar-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+        </svg>
+        Attach
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
       </button>
     </div>
 
     <div v-if="error" class="compose-error">{{ error }}</div>
 
-    <div class="compose-content">
+    <!-- Fields & Body -->
+    <div class="compose-body-area">
       <div class="compose-fields">
         <div class="field-row">
-          <label>To:</label>
-          <input v-model="to" type="text" placeholder="recipient@example.com" />
-          <button v-if="!showCcBcc" class="btn-cc" @click="showCcBcc = true">Cc Bcc</button>
-        </div>
-        <div v-if="showCcBcc" class="field-row">
-          <label>Cc:</label>
-          <input v-model="cc" type="text" placeholder="cc@example.com" />
-        </div>
-        <div v-if="showCcBcc" class="field-row">
-          <label>Bcc:</label>
-          <input v-model="bcc" type="text" placeholder="bcc@example.com" />
+          <label class="field-label">From</label>
+          <select v-model="selectedAccountId" class="field-select">
+            <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
+              {{ acc.display_name }} &lt;{{ acc.email }}&gt;
+            </option>
+          </select>
         </div>
         <div class="field-row">
-          <label>Subject:</label>
-          <input v-model="subject" type="text" placeholder="Email subject" />
+          <label class="field-label">To</label>
+          <div class="field-input-group">
+            <input v-model="to" type="text" class="field-input" />
+            <button v-if="!showCc" class="cc-btn" @click="showCc = true">Cc</button>
+            <button v-if="!showBcc" class="cc-btn" @click="showBcc = true">Bcc</button>
+          </div>
+        </div>
+        <div v-if="showCc" class="field-row">
+          <label class="field-label">Cc</label>
+          <input v-model="cc" type="text" class="field-input" />
+        </div>
+        <div v-if="showBcc" class="field-row">
+          <label class="field-label">Bcc</label>
+          <input v-model="bcc" type="text" class="field-input" />
+        </div>
+        <div class="field-row">
+          <label class="field-label">Subject</label>
+          <input v-model="subject" type="text" class="field-input" />
         </div>
       </div>
 
+      <div class="compose-divider"></div>
+
       <textarea
         v-model="bodyText"
-        class="compose-body"
-        placeholder="Write your message..."
+        class="compose-textarea"
+        autofocus
       ></textarea>
     </div>
   </div>
@@ -122,133 +202,188 @@ function discard() {
 .compose-view {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  background: var(--color-bg);
+  height: 100vh;
+  background: white;
 }
 
-.compose-toolbar {
-  display: flex;
-  gap: 8px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--color-border);
-  flex-shrink: 0;
-}
-
-.btn-send {
+/* Menu Bar */
+.compose-menubar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 16px;
-  background: var(--color-accent);
-  color: white;
-  border-radius: 18px;
+  height: 32px;
+  padding: 0 8px;
+  background: var(--color-bg-secondary);
+  border-bottom: 0.8px solid var(--color-border);
+  flex-shrink: 0;
+  gap: 0;
+}
+
+.menu-item {
+  padding: 4px 12px;
+  font-size: 16px;
   font-weight: 500;
-  font-size: 13px;
-  transition: background 0.12s;
+  color: var(--color-text);
+  cursor: pointer;
+  border-radius: 4px;
 }
 
-.btn-send:hover {
-  background: var(--color-accent-hover);
+.menu-item:hover {
+  background: var(--color-bg-hover);
 }
 
-.btn-send:disabled {
-  opacity: 0.5;
-}
-
-.btn-discard {
+/* Toolbar */
+.compose-toolbar {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 6px 14px;
-  border: 1px solid var(--color-border);
-  border-radius: 18px;
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  transition: all 0.12s;
+  height: 48px;
+  padding: 0 12px;
+  background: var(--color-bg-secondary);
+  border-bottom: 0.8px solid var(--color-border);
+  flex-shrink: 0;
 }
 
-.btn-discard:hover {
-  background: var(--color-bg-hover);
+.toolbar-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  transition: background 0.12s;
+  white-space: nowrap;
+}
+
+.toolbar-btn:hover:not(:disabled) {
+  background: var(--color-border);
+}
+
+.toolbar-btn.disabled,
+.toolbar-btn:disabled {
+  opacity: 0.5;
+}
+
+.toolbar-spacer {
+  flex: 1;
 }
 
 .compose-error {
   padding: 8px 16px;
-  background: rgba(220, 53, 69, 0.06);
-  color: var(--color-danger);
+  background: rgba(251, 44, 54, 0.06);
+  color: var(--color-danger-text);
   font-size: 12px;
+  flex-shrink: 0;
 }
 
-.compose-content {
+/* Body area */
+.compose-body-area {
   flex: 1;
   display: flex;
   flex-direction: column;
-  max-width: 700px;
-  margin: 0 auto;
-  width: 100%;
-  padding: 0 16px;
+  overflow: hidden;
 }
 
 .compose-fields {
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-border);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   flex-shrink: 0;
 }
 
 .field-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 0;
+  gap: 12px;
+  height: 32px;
 }
 
-.field-row label {
-  width: 50px;
+.field-label {
+  width: 80px;
   flex-shrink: 0;
-  font-size: 13px;
-  color: var(--color-text-muted);
-  text-align: right;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
 }
 
-.field-row input {
+.field-input {
   flex: 1;
-  padding: 6px 0;
-  border: none;
-  border-bottom: 1px solid var(--color-border);
-  background: transparent;
-  font-size: 13px;
+  height: 32px;
+  padding: 0 8px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  background: white;
+  font-size: 14px;
 }
 
-.field-row input:focus {
+.field-input:focus {
   outline: none;
-  border-bottom-color: var(--color-accent);
+  border-color: var(--color-accent);
 }
 
-.btn-cc {
-  padding: 2px 8px;
-  font-size: 11px;
-  color: var(--color-text-muted);
-  white-space: nowrap;
+.field-select {
+  width: 306px;
+  height: 32px;
+  padding: 0 8px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  background: white;
+  font-size: 14px;
+  appearance: auto;
 }
 
-.btn-cc:hover {
-  color: var(--color-text);
-}
-
-.compose-body {
+.field-input-group {
   flex: 1;
-  padding: 16px 0;
-  border: none;
-  background: var(--color-bg-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-input-group .field-input {
+  flex: 1;
+}
+
+.cc-btn {
+  height: 24px;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  border-radius: 4px;
+  transition: all 0.12s;
+}
+
+.cc-btn:hover {
+  background: var(--color-bg-hover);
   color: var(--color-text);
-  font-size: 13px;
+}
+
+.compose-divider {
+  height: 1px;
+  margin: 0 16px;
+  background: var(--color-border);
+  flex-shrink: 0;
+}
+
+.compose-textarea {
+  flex: 1;
+  margin: 13px 16px 16px;
+  padding: 12px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  background: white;
+  font-size: 14px;
   line-height: 1.6;
   resize: none;
-  border-radius: 6px;
-  margin-top: 12px;
-  padding: 16px;
+  color: var(--color-text);
 }
 
-.compose-body:focus {
+.compose-textarea:focus {
   outline: none;
+  border-color: var(--color-accent);
 }
 </style>

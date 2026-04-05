@@ -37,9 +37,9 @@ describe("openComposeWindow", () => {
     const [label, options] = mockWebviewWindow.mock.calls[0];
     expect(label).toMatch(/^compose-\d+$/);
     expect(options.url).toBe("/compose");
-    expect(options.title).toBe("Compose");
-    expect(options.width).toBe(720);
-    expect(options.height).toBe(640);
+    expect(options.title).toBe("Write (no subject) - Chithi");
+    expect(options.width).toBe(1024);
+    expect(options.height).toBe(700);
     expect(options.center).toBe(true);
     expect(options.focus).toBe(true);
     expect(options.resizable).toBe(true);
@@ -94,10 +94,17 @@ describe("openComposeWindow", () => {
 
     expect(mockWebviewWindow).toHaveBeenCalledTimes(3);
     const labels = mockWebviewWindow.mock.calls.map(
-      (c: [string, unknown]) => c[0],
+      (c: unknown[]) => c[0] as string,
     );
     const uniqueLabels = new Set(labels);
     expect(uniqueLabels.size).toBe(3);
+  });
+
+  it("should set title with subject when provided", () => {
+    openComposeWindow({ subject: "Re: Hello" });
+
+    const [, options] = mockWebviewWindow.mock.calls[0];
+    expect(options.title).toBe("Write Re: Hello - Chithi");
   });
 
   it("should handle forward with no to/cc", () => {

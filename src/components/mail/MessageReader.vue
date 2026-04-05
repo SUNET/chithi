@@ -132,6 +132,7 @@ function reply() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
   openComposeWindow({
+    accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: msg.from.email,
     subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
@@ -149,6 +150,7 @@ function replyAll() {
   ];
   const allCc = msg.cc.map((a) => a.email).filter((e) => e !== myEmail);
   openComposeWindow({
+    accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: allTo.join(", "),
     cc: allCc.join(", "),
@@ -168,6 +170,7 @@ function forward() {
   const toStr = msg.to.map((a) => a.name || a.email).join(", ");
   const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${msg.subject || ""}\nTo: ${toStr}\n\n`;
   openComposeWindow({
+    accountId: accountsStore.activeAccountId ?? undefined,
     subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
     body: `\n\n${fwdHeader}${text}`,
   });
