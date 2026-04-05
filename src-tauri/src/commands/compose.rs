@@ -15,6 +15,14 @@ pub struct ComposeMessage {
     pub subject: String,
     pub body_text: String,
     pub body_html: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<FileAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileAttachment {
+    pub path: String,
+    pub name: String,
 }
 
 #[tauri::command]
@@ -46,6 +54,7 @@ pub async fn send_message(
         };
 
         // Build raw RFC5322 message using lettre's builder, then send via JMAP
+        let attachment_data = read_attachments(&message.attachments)?;
         let raw_message = smtp::build_raw_message(
             &account.email,
             &message.to,
@@ -54,6 +63,7 @@ pub async fn send_message(
             &message.subject,
             &message.body_text,
             message.body_html.as_deref(),
+            &attachment_data,
         )?;
 
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
@@ -66,6 +76,7 @@ pub async fn send_message(
             account.email
         );
 
+        let attachment_data = read_attachments(&message.attachments)?;
         smtp::send_message(
             &account.smtp_host,
             account.smtp_port,
@@ -79,6 +90,7 @@ pub async fn send_message(
             &message.subject,
             &message.body_text,
             message.body_html.as_deref(),
+            &attachment_data,
         )
         .await?;
     }
@@ -90,4 +102,22 @@ pub async fn send_message(
     );
 
     Ok(())
+}
+
+fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::AttachmentData>> {
+    let mut result = Vec::new();
+    for att in attachments {
+        let data = std::fs::read(&att.path)
+            .map_err(|e| crate::error::Error::Other(format!("Failed to read attachment '{}': {}", att.path, e)))?;
+        let content_type = mime_guess::from_path(&att.name)
+            .first_or_octet_stream()
+            .to_string();
+        log::info!("Attachment: {} ({}, {} bytes)", att.name, content_type, data.len());
+        result.push(smtp::AttachmentData {
+            name: att.name.clone(),
+            content_type,
+            data,
+        });
+    }
+    Ok(result)
 }

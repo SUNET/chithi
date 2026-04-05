@@ -9,6 +9,7 @@
     "core:window:allow-close",
     "core:window:allow-set-focus",
     "notification:default",
-    "shell:default"
+    "shell:default",
+    "dialog:default"
   ]
 }

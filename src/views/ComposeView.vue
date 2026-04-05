@@ -3,7 +3,8 @@ import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { Account } from "@/lib/types";
+import { open } from "@tauri-apps/plugin-dialog";
+import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
 const route = useRoute();
@@ -47,8 +48,29 @@ const sending = ref(false);
 const error = ref<string | null>(null);
 const showCc = ref(!!cc.value);
 const showBcc = ref(false);
+const attachments = ref<ComposeAttachment[]>([]);
 
 const canSend = computed(() => to.value.trim().length > 0 && !sending.value);
+
+async function addAttachment() {
+  const selected = await open({
+    multiple: true,
+    title: "Attach Files",
+  });
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  for (const filePath of paths) {
+    const name = filePath.split(/[/\\]/).pop() ?? filePath;
+    if (!attachments.value.some(a => a.path === filePath)) {
+      attachments.value.push({ path: filePath, name });
+    }
+  }
+}
+
+function removeAttachment(index: number) {
+  attachments.value.splice(index, 1);
+}
+
 
 function parseAddresses(input: string): string[] {
   return input
@@ -81,6 +103,7 @@ async function send() {
       subject: subject.value,
       body_text: bodyText.value,
       body_html: null,
+      attachments: attachments.value,
     });
     if (replyToMessageId) {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
@@ -143,12 +166,11 @@ async function send() {
         Contacts
       </button>
       <div class="toolbar-spacer"></div>
-      <button class="toolbar-btn">
+      <button class="toolbar-btn" @click="addAttachment">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
         </svg>
         Attach
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
       </button>
     </div>
 
@@ -194,6 +216,29 @@ async function send() {
         class="compose-textarea"
         autofocus
       ></textarea>
+
+      <!-- Attachment list -->
+      <div v-if="attachments.length > 0" class="attachment-bar">
+        <div class="attachment-header">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+          </svg>
+          <span>{{ attachments.length }} attachment{{ attachments.length !== 1 ? 's' : '' }}</span>
+        </div>
+        <div class="attachment-list">
+          <div v-for="(att, idx) in attachments" :key="att.path" class="attachment-chip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
+            </svg>
+            <span class="attachment-name">{{ att.name }}</span>
+            <button class="attachment-remove" title="Remove" @click="removeAttachment(idx)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -385,5 +430,66 @@ async function send() {
 .compose-textarea:focus {
   outline: none;
   border-color: var(--color-accent);
+}
+
+/* Attachment bar */
+.attachment-bar {
+  border-top: 0.8px solid var(--color-border);
+  padding: 12px 16px;
+  flex-shrink: 0;
+}
+
+.attachment-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px 0 10px;
+  background: var(--color-bg-secondary);
+  border: 0.8px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--color-text);
+  max-width: 250px;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.attachment-remove {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+  transition: all 0.12s;
+}
+
+.attachment-remove:hover {
+  background: rgba(251, 44, 54, 0.1);
+  color: var(--color-danger-text);
 }
 </style>

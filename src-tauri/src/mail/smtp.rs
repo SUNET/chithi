@@ -1,13 +1,60 @@
-use lettre::message::{header::ContentType, MultiPart, SinglePart, Mailbox};
+use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart, Mailbox};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::error::{Error, Result};
 
+/// Attachment data ready to embed in a message.
+pub struct AttachmentData {
+    pub name: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Build the message body, optionally wrapping in multipart/mixed if there are attachments.
+fn build_body(
+    body_text: &str,
+    body_html: Option<&str>,
+    attachments: &[AttachmentData],
+) -> std::result::Result<MultiPart, String> {
+    // Text body (or text+html alternative)
+    let text_part = if let Some(html) = body_html {
+        MultiPart::alternative()
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_PLAIN)
+                    .body(body_text.to_string()),
+            )
+            .singlepart(
+                SinglePart::builder()
+                    .header(ContentType::TEXT_HTML)
+                    .body(html.to_string()),
+            )
+    } else {
+        MultiPart::alternative().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(body_text.to_string()),
+        )
+    };
+
+    if attachments.is_empty() {
+        return Ok(text_part);
+    }
+
+    // Wrap in multipart/mixed with attachments
+    let mut mixed = MultiPart::mixed().multipart(text_part);
+    for att in attachments {
+        let ct = ContentType::parse(&att.content_type).unwrap_or(ContentType::TEXT_PLAIN);
+        let attachment = Attachment::new(att.name.clone())
+            .body(att.data.clone(), ct);
+        mixed = mixed.singlepart(attachment);
+    }
+
+    Ok(mixed)
+}
+
 /// Send an email message via SMTP.
-///
-/// Connects to the given SMTP server, authenticates, and sends a message
-/// constructed from the provided headers and body parts.
 pub async fn send_message(
     smtp_host: &str,
     smtp_port: u16,
@@ -21,42 +68,33 @@ pub async fn send_message(
     subject: &str,
     body_text: &str,
     body_html: Option<&str>,
+    attachments: &[AttachmentData],
 ) -> Result<()> {
     log::info!(
-        "SMTP sending message from {} to {:?} via {}:{}",
-        from,
-        to,
-        smtp_host,
-        smtp_port
+        "SMTP sending message from {} to {:?} via {}:{} ({} attachments)",
+        from, to, smtp_host, smtp_port, attachments.len()
     );
 
-    // Parse the "from" address
     let from_mailbox: Mailbox = from
         .parse()
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
-    // Start building the message
     let mut builder = Message::builder()
         .from(from_mailbox)
         .subject(subject);
 
-    // Add To recipients
     for addr in to {
         let mailbox: Mailbox = addr
             .parse()
             .map_err(|e| Error::Other(format!("Invalid 'to' address '{}': {}", addr, e)))?;
         builder = builder.to(mailbox);
     }
-
-    // Add CC recipients
     for addr in cc {
         let mailbox: Mailbox = addr
             .parse()
             .map_err(|e| Error::Other(format!("Invalid 'cc' address '{}': {}", addr, e)))?;
         builder = builder.cc(mailbox);
     }
-
-    // Add BCC recipients
     for addr in bcc {
         let mailbox: Mailbox = addr
             .parse()
@@ -64,36 +102,15 @@ pub async fn send_message(
         builder = builder.bcc(mailbox);
     }
 
-    // Build the message body
-    let message = if let Some(html) = body_html {
-        log::debug!("SMTP building multipart/alternative message (text + html)");
-        builder
-            .multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(body_text.to_string()),
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(html.to_string()),
-                    ),
-            )
-            .map_err(|e| Error::Other(format!("Failed to build multipart message: {}", e)))?
-    } else {
-        log::debug!("SMTP building plain text message");
-        builder
-            .body(body_text.to_string())
-            .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
-    };
+    let body = build_body(body_text, body_html, attachments)
+        .map_err(|e| Error::Other(format!("Failed to build body: {}", e)))?;
 
-    // Send via SMTP transport
+    let message = builder
+        .multipart(body)
+        .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
+
     let creds = Credentials::new(username.to_string(), password.to_string());
 
-    // Use STARTTLS for port 587, implicit TLS for port 465 or when use_tls is set
-    // with a non-587 port, and relay (opportunistic) otherwise.
     let transport = if smtp_port == 587 {
         log::debug!("SMTP using STARTTLS on port 587");
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
@@ -117,7 +134,6 @@ pub async fn send_message(
             .build()
     };
 
-    // Send the message
     let response = transport.send(message).await.map_err(|e| {
         log::error!("SMTP send failed: {}", e);
         Error::Other(format!("SMTP send failed: {}", e))
@@ -133,7 +149,6 @@ pub async fn send_message(
 }
 
 /// Build a raw RFC5322 message (for JMAP submission).
-/// Returns the message as bytes without sending it.
 pub fn build_raw_message(
     from: &str,
     to: &[String],
@@ -142,6 +157,7 @@ pub fn build_raw_message(
     subject: &str,
     body_text: &str,
     body_html: Option<&str>,
+    attachments: &[AttachmentData],
 ) -> Result<Vec<u8>> {
     let from_mailbox: Mailbox = from
         .parse()
@@ -168,19 +184,12 @@ pub fn build_raw_message(
         builder = builder.bcc(mailbox);
     }
 
-    let message = if let Some(html) = body_html {
-        builder
-            .multipart(
-                MultiPart::alternative()
-                    .singlepart(SinglePart::builder().header(ContentType::TEXT_PLAIN).body(body_text.to_string()))
-                    .singlepart(SinglePart::builder().header(ContentType::TEXT_HTML).body(html.to_string())),
-            )
-            .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
-    } else {
-        builder
-            .body(body_text.to_string())
-            .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?
-    };
+    let body = build_body(body_text, body_html, attachments)
+        .map_err(|e| Error::Other(format!("Failed to build body: {}", e)))?;
+
+    let message = builder
+        .multipart(body)
+        .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
 
     Ok(message.formatted())
 }

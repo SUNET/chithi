@@ -217,4 +217,10 @@ export interface ComposeMessage {
   subject: string;
   body_text: string;
   body_html: string | null;
+  attachments: ComposeAttachment[];
+}
+
+export interface ComposeAttachment {
+  path: string;
+  name: string;
 }
