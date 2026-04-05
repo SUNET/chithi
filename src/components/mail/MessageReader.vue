@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { useRouter } from "vue-router";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import type { ParsedInvite } from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
+import { openComposeWindow } from "@/lib/compose-window";
 import * as api from "@/lib/tauri";
 
 defineProps<{
@@ -16,7 +16,6 @@ const emit = defineEmits<{
   close: [];
 }>();
 
-const router = useRouter();
 const messagesStore = useMessagesStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
@@ -132,14 +131,11 @@ function quoteBody(): string {
 function reply() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
-  router.push({
-    path: "/compose",
-    query: {
-      replyTo: msg.id,
-      to: msg.from.email,
-      subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
-      body: quoteBody(),
-    },
+  openComposeWindow({
+    replyTo: msg.id,
+    to: msg.from.email,
+    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    body: quoteBody(),
   });
 }
 
@@ -152,15 +148,12 @@ function replyAll() {
     ...msg.to.map((a) => a.email).filter((e) => e !== myEmail),
   ];
   const allCc = msg.cc.map((a) => a.email).filter((e) => e !== myEmail);
-  router.push({
-    path: "/compose",
-    query: {
-      replyTo: msg.id,
-      to: allTo.join(", "),
-      cc: allCc.join(", "),
-      subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
-      body: quoteBody(),
-    },
+  openComposeWindow({
+    replyTo: msg.id,
+    to: allTo.join(", "),
+    cc: allCc.join(", "),
+    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    body: quoteBody(),
   });
 }
 
@@ -174,12 +167,9 @@ function forward() {
     : msg.from.email;
   const toStr = msg.to.map((a) => a.name || a.email).join(", ");
   const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${msg.subject || ""}\nTo: ${toStr}\n\n`;
-  router.push({
-    path: "/compose",
-    query: {
-      subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
-      body: `\n\n${fwdHeader}${text}`,
-    },
+  openComposeWindow({
+    subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
+    body: `\n\n${fwdHeader}${text}`,
   });
 }
 

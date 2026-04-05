@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from "vue-router";
+import { openComposeWindow } from "@/lib/compose-window";
 
 const router = useRouter();
 const route = useRoute();
@@ -7,8 +8,16 @@ const route = useRoute();
 const topItems = [
   { path: "/", label: "Mail", name: "mail" },
   { path: "/calendar", label: "Calendar", name: "calendar" },
-  { path: "/compose", label: "Compose", name: "compose" },
+  { path: "", label: "Compose", name: "compose" },
 ];
+
+function handleNavClick(item: typeof topItems[0]) {
+  if (item.name === "compose") {
+    openComposeWindow();
+  } else {
+    router.push(item.path);
+  }
+}
 </script>
 
 <template>
@@ -18,9 +27,9 @@ const topItems = [
         v-for="item in topItems"
         :key="item.name"
         class="sidebar-item"
-        :class="{ active: route.name === item.name }"
+        :class="{ active: item.name !== 'compose' && route.name === item.name }"
         :title="item.label"
-        @click="router.push(item.path)"
+        @click="handleNavClick(item)"
       >
         <!-- Mail icon -->
         <svg v-if="item.name === 'mail'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

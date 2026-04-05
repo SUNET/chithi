@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { useRouter, useRoute } from "vue-router";
+import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "@/lib/tauri";
 
-const router = useRouter();
 const route = useRoute();
 const accountsStore = useAccountsStore();
+const currentWindow = getCurrentWindow();
 
 // Prefill from query params (reply/reply-all/forward)
 const replyToMessageId = (route.query.replyTo as string) || "";
@@ -55,7 +56,7 @@ async function send() {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
         .catch((e) => console.error("Failed to set answered flag:", e));
     }
-    router.push("/");
+    currentWindow.close();
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -64,7 +65,7 @@ async function send() {
 }
 
 function discard() {
-  router.push("/");
+  currentWindow.close();
 }
 </script>
 
