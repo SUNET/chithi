@@ -23,7 +23,16 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+// Mock tauri API
+vi.mock("@/lib/tauri", () => ({
+  listAccounts: vi.fn().mockResolvedValue([]),
+  sendMessage: vi.fn().mockResolvedValue(undefined),
+  saveDraft: vi.fn().mockResolvedValue(undefined),
+  setMessageFlags: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { openComposeWindow } from "@/lib/compose-window";
+import * as api from "@/lib/tauri";
 
 describe("openComposeWindow", () => {
   beforeEach(() => {
@@ -118,5 +127,123 @@ describe("openComposeWindow", () => {
     expect(url).toContain("subject=Fwd");
     expect(url).toContain("body=");
     expect(url).not.toContain("to=");
+  });
+
+  it("should pass accountId in URL when provided", () => {
+    openComposeWindow({ accountId: "acc-123" });
+
+    const [, options] = mockWebviewWindow.mock.calls[0];
+    const url = options.url as string;
+    expect(url).toContain("accountId=acc-123");
+  });
+});
+
+describe("Compose dirty tracking", () => {
+  it("empty compose is not dirty", () => {
+    const initial = { to: "", cc: "", subject: "", body: "" };
+    const current = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(false);
+  });
+
+  it("typing in To makes it dirty", () => {
+    const initial = { to: "", cc: "", subject: "", body: "" };
+    const current = { to: "alice@example.com", cc: "", bcc: "", subject: "", body: "", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(true);
+  });
+
+  it("typing in Subject makes it dirty", () => {
+    const initial = { to: "", cc: "", subject: "", body: "" };
+    const current = { to: "", cc: "", bcc: "", subject: "Hello", body: "", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(true);
+  });
+
+  it("typing in Body makes it dirty", () => {
+    const initial = { to: "", cc: "", subject: "", body: "" };
+    const current = { to: "", cc: "", bcc: "", subject: "", body: "Hello world", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(true);
+  });
+
+  it("adding attachment makes it dirty", () => {
+    const initial = { to: "", cc: "", subject: "", body: "" };
+    const current = { to: "", cc: "", bcc: "", subject: "", body: "",
+      attachments: [{ path: "/tmp/file.pdf", name: "file.pdf" }] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(true);
+  });
+
+  it("reply prefill is not dirty when unchanged", () => {
+    const initial = { to: "alice@example.com", cc: "", subject: "Re: Hello", body: "> original" };
+    const current = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "> original", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(false);
+  });
+
+  it("editing reply body makes it dirty", () => {
+    const initial = { to: "alice@example.com", cc: "", subject: "Re: Hello", body: "> original" };
+    const current = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "My reply\n\n> original", attachments: [] };
+    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
+      current.bcc !== "" || current.subject !== initial.subject ||
+      current.body !== initial.body || current.attachments.length > 0;
+    expect(dirty).toBe(true);
+  });
+});
+
+describe("saveDraft API", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should call saveDraft with correct params", async () => {
+    await api.saveDraft("acc-1", {
+      to: ["alice@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Draft subject",
+      body_text: "Draft body",
+      body_html: null,
+      attachments: [],
+    });
+
+    expect(api.saveDraft).toHaveBeenCalledWith("acc-1", {
+      to: ["alice@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Draft subject",
+      body_text: "Draft body",
+      body_html: null,
+      attachments: [],
+    });
+  });
+
+  it("should call saveDraft with attachments", async () => {
+    await api.saveDraft("acc-1", {
+      to: [],
+      cc: [],
+      bcc: [],
+      subject: "",
+      body_text: "",
+      body_html: null,
+      attachments: [{ path: "/tmp/doc.pdf", name: "doc.pdf" }],
+    });
+
+    expect(api.saveDraft).toHaveBeenCalledWith("acc-1", expect.objectContaining({
+      attachments: [{ path: "/tmp/doc.pdf", name: "doc.pdf" }],
+    }));
   });
 });

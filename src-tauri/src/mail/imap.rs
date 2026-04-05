@@ -417,6 +417,16 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Append a raw RFC5322 message to a folder (used for saving drafts).
+    pub fn append_message(&mut self, folder: &str, message: &[u8]) -> Result<()> {
+        log::info!("IMAP appending message ({} bytes) to folder '{}'", message.len(), folder);
+        self.session
+            .append_with_flags(folder, message, &[imap::types::Flag::Seen, imap::types::Flag::Draft])
+            .map_err(|e| Error::Imap(format!("IMAP APPEND failed: {}", e)))?;
+        log::info!("IMAP message appended to '{}'", folder);
+        Ok(())
+    }
+
     pub fn logout(mut self) {
         log::debug!("IMAP logging out");
         self.session.logout().ok();

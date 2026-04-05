@@ -556,6 +556,65 @@ impl JmapConnection {
         Ok(())
     }
 
+    /// Save a draft email to the Drafts mailbox via JMAP Email/import.
+    pub async fn save_draft(&self, config: &JmapConfig, raw_message: &[u8]) -> Result<()> {
+        log::info!("JMAP saving draft ({} bytes)", raw_message.len());
+
+        // Upload the raw message as a blob
+        let upload_url = self.upload_url_template
+            .replace("{accountId}", &self.account_id);
+
+        let resp = self.http.post(&upload_url)
+            .basic_auth(&config.username, Some(&config.password))
+            .header("Content-Type", "message/rfc822")
+            .body(raw_message.to_vec())
+            .send().await
+            .map_err(|e| Error::Other(format!("JMAP draft upload failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Other(format!("JMAP draft upload error {}: {}", status, body)));
+        }
+
+        let upload_resp: serde_json::Value = resp.json().await
+            .map_err(|e| Error::Other(format!("JMAP draft upload parse error: {}", e)))?;
+        let blob_id = upload_resp["blobId"].as_str()
+            .ok_or_else(|| Error::Other("No blobId in draft upload response".into()))?
+            .to_string();
+
+        // Find the Drafts mailbox
+        let drafts_mailbox_id = self.find_mailbox_by_role(config, "drafts").await?
+            .ok_or_else(|| Error::Other("No Drafts mailbox found".into()))?;
+
+        // Import into Drafts with $draft keyword
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Email/import", {
+                    "accountId": self.account_id,
+                    "emails": {
+                        "draft": {
+                            "blobId": blob_id,
+                            "mailboxIds": { drafts_mailbox_id: true },
+                            "keywords": { "$seen": true, "$draft": true }
+                        }
+                    }
+                }, "i1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notImported"]["draft"].as_object() {
+            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP draft import failed: {}", desc)));
+        }
+
+        log::info!("JMAP draft saved successfully");
+        Ok(())
+    }
+
     /// Find the identity ID for email submission.
     async fn find_identity_id(&self, config: &JmapConfig) -> Result<String> {
         let request = serde_json::json!({

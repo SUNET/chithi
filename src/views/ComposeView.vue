@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
@@ -45,12 +45,85 @@ const bcc = ref("");
 const subject = ref((route.query.subject as string) || "");
 const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
+const savingDraft = ref(false);
 const error = ref<string | null>(null);
 const showCc = ref(!!cc.value);
 const showBcc = ref(false);
 const attachments = ref<ComposeAttachment[]>([]);
+const sentSuccessfully = ref(false);
+
+// Track initial values to detect changes
+const initialTo = (route.query.to as string) || "";
+const initialCc = (route.query.cc as string) || "";
+const initialSubject = (route.query.subject as string) || "";
+const initialBody = (route.query.body as string) || "";
+
+const isDirty = computed(() =>
+  to.value !== initialTo ||
+  cc.value !== initialCc ||
+  bcc.value !== "" ||
+  subject.value !== initialSubject ||
+  bodyText.value !== initialBody ||
+  attachments.value.length > 0
+);
 
 const canSend = computed(() => to.value.trim().length > 0 && !sending.value);
+
+// Intercept window close to prompt for draft save
+onMounted(() => {
+  currentWindow.onCloseRequested(async (event) => {
+    if (sentSuccessfully.value || !isDirty.value) return; // Allow close
+
+    event.preventDefault();
+
+    try {
+      const result = await tauriMessage(
+        "You have unsaved changes. What would you like to do?",
+        {
+          title: "Unsaved Changes",
+          kind: "warning",
+          buttons: { yes: "Save Draft", no: "Discard", cancel: "Cancel" },
+        },
+      );
+
+      if (result === "Save Draft" || result === "Yes") {
+        await saveDraft();
+        await currentWindow.destroy();
+      } else if (result === "Discard" || result === "No") {
+        await currentWindow.destroy();
+      }
+      // "Cancel" — do nothing, return to compose
+    } catch (e) {
+      console.error("Close dialog error:", e);
+      await currentWindow.destroy();
+    }
+  });
+});
+
+async function saveDraft() {
+  const accountId = selectedAccountId.value;
+  if (!accountId) return;
+
+  savingDraft.value = true;
+  error.value = null;
+  try {
+    await api.saveDraft(accountId, {
+      to: parseAddresses(to.value),
+      cc: parseAddresses(cc.value),
+      bcc: parseAddresses(bcc.value),
+      subject: subject.value,
+      body_text: bodyText.value,
+      body_html: null,
+      attachments: attachments.value,
+    });
+    // Trigger a sync so the draft appears in the local mailbox
+    api.triggerSync(accountId).catch(() => {});
+  } catch (e) {
+    error.value = `Draft save failed: ${e}`;
+  } finally {
+    savingDraft.value = false;
+  }
+}
 
 async function addAttachment() {
   const selected = await open({
@@ -109,6 +182,7 @@ async function send() {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
         .catch((e) => console.error("Failed to set answered flag:", e));
     }
+    sentSuccessfully.value = true;
     currentWindow.close();
   } catch (e) {
     error.value = String(e);
@@ -152,12 +226,11 @@ async function send() {
         Spelling
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
       </button>
-      <button class="toolbar-btn">
+      <button class="toolbar-btn" :disabled="savingDraft" @click="saveDraft">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" />
         </svg>
-        Save
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+        {{ savingDraft ? "Saving..." : "Save" }}
       </button>
       <button class="toolbar-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

@@ -94,6 +94,13 @@ export async function sendMessage(
   return invoke("send_message", { accountId, message });
 }
 
+export async function saveDraft(
+  accountId: string,
+  message: import("./types").ComposeMessage,
+): Promise<void> {
+  return invoke("save_draft", { accountId, message });
+}
+
 export async function moveMessages(
   accountId: string,
   messageIds: string[],

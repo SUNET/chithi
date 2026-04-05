@@ -104,6 +104,91 @@ pub async fn send_message(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn save_draft(
+    state: State<'_, AppState>,
+    account_id: String,
+    message: ComposeMessage,
+) -> Result<()> {
+    log::info!(
+        "Save draft command: account={} subject='{}'",
+        account_id,
+        message.subject
+    );
+
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    let attachment_data = read_attachments(&message.attachments)?;
+
+    // Drafts may have no recipients — use sender as placeholder To for valid RFC5322
+    let draft_to = if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
+        vec![account.email.clone()]
+    } else {
+        message.to.clone()
+    };
+
+    let raw_message = smtp::build_raw_message(
+        &account.email,
+        &draft_to,
+        &message.cc,
+        &message.bcc,
+        &message.subject,
+        &message.body_text,
+        message.body_html.as_deref(),
+        &attachment_data,
+    )?;
+
+    if account.mail_protocol == "jmap" {
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        conn_jmap.save_draft(&jmap_config, &raw_message).await?;
+    } else {
+        // IMAP: append to Drafts folder
+        tokio::task::spawn_blocking(move || {
+            let imap_config = crate::mail::imap::ImapConfig {
+                host: account.imap_host,
+                port: account.imap_port,
+                username: account.username,
+                password: account.password,
+                use_tls: account.use_tls,
+            };
+            let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
+            // Try common Drafts folder names
+            let draft_folders = ["Drafts", "INBOX.Drafts", "[Gmail]/Drafts"];
+            let mut saved = false;
+            for folder in &draft_folders {
+                match conn.append_message(folder, &raw_message) {
+                    Ok(()) => {
+                        saved = true;
+                        break;
+                    }
+                    Err(e) => {
+                        log::debug!("Draft folder '{}' failed: {}", folder, e);
+                    }
+                }
+            }
+            if !saved {
+                return Err(crate::error::Error::Other("Could not find Drafts folder".into()));
+            }
+            conn.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("Draft save task failed: {}", e)))??;
+    }
+
+    log::info!("Draft saved successfully for account {}", account_id);
+    Ok(())
+}
+
 fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::AttachmentData>> {
     let mut result = Vec::new();
     for att in attachments {
