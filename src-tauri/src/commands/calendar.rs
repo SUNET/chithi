@@ -140,10 +140,11 @@ pub async fn create_event(
     event: NewEventInput,
 ) -> Result<String> {
     log::info!(
-        "create_event: account={} calendar={} title='{}'",
+        "create_event: account={} calendar={} title='{}' attendees={}",
         event.account_id,
         event.calendar_id,
-        event.title
+        event.title,
+        event.attendees.len()
     );
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -151,6 +152,14 @@ pub async fn create_event(
         None
     } else {
         Some(serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string()))
+    };
+
+    // Get organizer email from account
+    let organizer_email = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &event.account_id)
+            .ok()
+            .map(|a| a.email)
     };
 
     let cal_event = CalendarEvent {
@@ -166,7 +175,7 @@ pub async fn create_event(
         all_day: event.all_day,
         timezone: event.timezone,
         recurrence_rule: event.recurrence_rule,
-        organizer_email: None,
+        organizer_email,
         attendees_json,
         my_status: None,
         source_message_id: None,
@@ -206,8 +215,8 @@ pub async fn create_event(
                 all_day: cal_event.all_day,
                 recurrence_rule: cal_event.recurrence_rule.clone(),
                 uid: cal_event.uid.clone(),
-                organizer_email: None,
-                attendees_json: None,
+                organizer_email: cal_event.organizer_email.clone(),
+                attendees_json: cal_event.attendees_json.clone(),
             };
             match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                 Ok(conn_jmap) => {
@@ -302,7 +311,29 @@ pub async fn delete_event(
     // Delete from server if event has a remote_id
     if let Some(ref remote_id) = event.remote_id {
         if !remote_id.is_empty() {
-            if account.mail_protocol == "jmap" {
+            if account.provider == "gmail" {
+                // Delete via Google Calendar API
+                match get_google_token(&event.account_id).await {
+                    Ok(token) => {
+                        let http = reqwest::Client::new();
+                        let url = format!(
+                            "https://www.googleapis.com/calendar/v3/calendars/primary/events/{}",
+                            urlencoding::encode(remote_id)
+                        );
+                        match http.delete(&url).bearer_auth(&token).send().await {
+                            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 204 || resp.status().as_u16() == 410 => {
+                                log::info!("delete_event: deleted from Google Calendar");
+                            }
+                            Ok(resp) => {
+                                let body = resp.text().await.unwrap_or_default();
+                                log::error!("delete_event: Google Calendar delete failed: {}", body);
+                            }
+                            Err(e) => log::error!("delete_event: Google Calendar request failed: {}", e),
+                        }
+                    }
+                    Err(e) => log::warn!("delete_event: no Google OAuth token, skipping server delete: {}", e),
+                }
+            } else if account.mail_protocol == "jmap" {
                 let jmap_config = crate::mail::jmap::JmapConfig {
                     jmap_url: account.jmap_url.clone(),
                     email: account.email.clone(),
@@ -1442,7 +1473,7 @@ pub async fn send_invites(
         event.location.as_deref(),
         event.description.as_deref(),
         &account.email,
-        Some(&account.display_name),
+        None, // Use email as organizer name — display_name is the account label, not a person's name
         &attendees,
         event.recurrence_rule.as_deref(),
     );
@@ -1507,6 +1538,114 @@ pub async fn send_invites(
     }
 
     log::info!("send_invites: all invites sent for event {}", event_id);
+    Ok(())
+}
+
+/// Process an incoming iTIP REPLY to update attendee status on the organizer's event.
+/// Called when the organizer receives a METHOD:REPLY email.
+#[tauri::command]
+pub async fn process_invite_reply(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<()> {
+    log::info!("process_invite_reply: account={} message={}", account_id, message_id);
+
+    let raw = {
+        let conn = state.db.lock().await;
+        let (maildir_path, _, _, _, _, _, _) = db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        let data_dir = state.data_dir.clone();
+        std::fs::read(data_dir.join(maildir_path))
+            .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
+    };
+
+    let replies = ical::parse_ical_from_email(&raw);
+    let reply_invites: Vec<_> = replies.iter()
+        .filter(|inv| inv.method.to_uppercase() == "REPLY")
+        .collect();
+
+    if reply_invites.is_empty() {
+        log::debug!("process_invite_reply: no METHOD:REPLY found in message");
+        return Ok(());
+    }
+
+    let conn = state.db.lock().await;
+    let account = db::accounts::get_account_full(&conn, &account_id)?;
+
+    for reply in &reply_invites {
+        // Find the local event by UID
+        let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
+        let Some(event) = event else {
+            log::debug!("process_invite_reply: no local event for UID {}", reply.uid);
+            continue;
+        };
+
+        // Extract the respondent's email and status from the REPLY
+        for attendee in &reply.attendees {
+            let status = &attendee.status;
+            log::info!(
+                "process_invite_reply: {} responded '{}' to event '{}'",
+                attendee.email, status, event.title
+            );
+
+            // Update local attendees_json
+            if let Some(ref att_json) = event.attendees_json {
+                if let Ok(mut attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+                    for att in attendees.iter_mut() {
+                        if att["email"].as_str() == Some(&attendee.email) {
+                            att["status"] = serde_json::json!(status);
+                        }
+                    }
+                    let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
+                    conn.execute(
+                        "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+                        rusqlite::params![updated_json, event.id],
+                    ).ok();
+                }
+            }
+
+            // Update on JMAP server if applicable
+            if account.mail_protocol == "jmap" {
+                if let Some(ref remote_id) = event.remote_id {
+                    let jmap_config = crate::mail::jmap::JmapConfig {
+                        jmap_url: account.jmap_url.clone(),
+                        email: account.email.clone(),
+                        username: account.username.clone(),
+                        password: account.password.clone(),
+                    };
+                    // Find participant key by matching email
+                    // We need to fetch the event to find the right participant key
+                    drop(conn);
+                    if let Ok(jmap_conn) = crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+                        // Fetch current event to find participant key
+                        if let Ok(events) = jmap_conn.fetch_calendar_events(&jmap_config, None).await {
+                            for ev in &events {
+                                if ev.id == *remote_id {
+                                    // Parse attendees to find the key
+                                    if let Some(ref aj) = ev.attendees_json {
+                                        if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) {
+                                            for (i, a) in atts.iter().enumerate() {
+                                                if a["email"].as_str() == Some(&attendee.email) {
+                                                    let key = format!("att{}", i);
+                                                    jmap_conn.update_participant_status(
+                                                        &jmap_config, remote_id, &key, status,
+                                                    ).await.ok();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    log::info!("process_invite_reply: completed for account {}", account_id);
     Ok(())
 }
 

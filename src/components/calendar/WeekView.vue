@@ -80,17 +80,22 @@ function getEventsForDayHour(date: Date, hour: number) {
   return calendarStore.visibleEvents.filter((e) => {
     const eStart = new Date(e.start_time);
     const eEnd = new Date(e.end_time);
-    return eStart < slotEnd && eEnd > slotStart && !e.all_day;
+    // Treat multi-day events (>24h) as all-day for display
+    if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) return false;
+    return eStart < slotEnd && eEnd > slotStart;
   });
 }
 
 function getAllDayEvents(date: Date) {
   const dayStr = date.toISOString().split("T")[0];
   return calendarStore.visibleEvents.filter((e) => {
-    if (!e.all_day) return false;
-    const eStart = e.start_time.split("T")[0];
-    const eEnd = e.end_time.split("T")[0];
-    return eStart <= dayStr && eEnd >= dayStr;
+    const eStart = new Date(e.start_time);
+    const eEnd = new Date(e.end_time);
+    const isMultiDay = eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000;
+    if (!e.all_day && !isMultiDay) return false;
+    const startDate = e.start_time.split("T")[0];
+    const endDate = e.end_time.split("T")[0];
+    return startDate <= dayStr && endDate >= dayStr;
   });
 }
 

@@ -83,6 +83,7 @@ fn main() {
             commands::calendar::get_invite_status,
             commands::calendar::respond_to_invite,
             commands::calendar::send_invites,
+            commands::calendar::process_invite_reply,
             commands::calendar::sync_calendars,
         ])
         .run(tauri::generate_context!())

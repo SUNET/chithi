@@ -708,7 +708,7 @@ impl JmapConnection {
                     "properties": ["id", "calendarIds", "title", "description",
                                    "start", "duration", "showWithoutTime",
                                    "recurrenceRules", "uid", "locations",
-                                   "participants", "replyTo", "@type"]
+                                   "participants", "@type"]
                 }, "g1"]
             ]
         });
@@ -775,23 +775,30 @@ impl JmapConnection {
                 .filter(|a| !a.is_empty())
                 .map(|a| serde_json::to_string(a).unwrap_or_default());
 
-            // Participants: JSCalendar uses { "id": { "name": "...", "email": "...", "kind": "individual", "roles": {...}, "participationStatus": "accepted" } }
+            // Participants: supports both JSCalendar-bis (calendarAddress) and old format (sendTo.imip)
             let mut organizer_email = None;
             let mut attendees: Vec<serde_json::Value> = Vec::new();
             if let Some(participants) = ev["participants"].as_object() {
                 for (_pid, p) in participants {
-                    let email = p["sendTo"].as_object()
-                        .and_then(|s| s.get("imip"))
-                        .and_then(|v| v.as_str())
+                    // Try calendarAddress (JSCalendar-bis), then sendTo.imip (old), then email
+                    let email = p["calendarAddress"].as_str()
                         .map(|s| s.trim_start_matches("mailto:").to_string())
+                        .or_else(|| p["sendTo"].as_object()
+                            .and_then(|s| s.get("imip"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim_start_matches("mailto:").to_string()))
                         .or_else(|| p["email"].as_str().map(|s| s.to_string()));
                     let name = p["name"].as_str().map(|s| s.to_string());
-                    let status = p["participationStatus"].as_str().unwrap_or("needs-action").to_string();
+                    let mut status = p["participationStatus"].as_str().unwrap_or("needs-action").to_string();
                     let roles = p["roles"].as_object();
                     let is_owner = roles.map(|r| r.contains_key("owner")).unwrap_or(false);
 
                     if is_owner {
                         organizer_email = email.clone();
+                        // Organizer is implicitly "accepted" — they created the event
+                        if status == "needs-action" {
+                            status = "accepted".to_string();
+                        }
                     }
                     if let Some(ref em) = email {
                         attendees.push(serde_json::json!({
@@ -841,7 +848,8 @@ impl JmapConnection {
         config: &JmapConfig,
         event: &JmapCalendarEvent,
     ) -> Result<String> {
-        log::info!("JMAP creating calendar event: '{}'", event.title);
+        log::info!("JMAP creating calendar event: '{}' organizer={:?} attendees={:?}",
+            event.title, event.organizer_email, event.attendees_json);
 
         let uid = event.uid.clone().unwrap_or_else(|| {
             format!("{}@chithi", uuid::Uuid::new_v4())
@@ -871,6 +879,43 @@ impl JmapConnection {
             if let Ok(rules) = serde_json::from_str::<serde_json::Value>(rrule) {
                 event_obj["recurrenceRules"] = rules;
             }
+        }
+
+        // Add participants (organizer + attendees)
+        // Uses JSCalendar-bis format (draft-ietf-calext-jscalendarbis-14):
+        // - "calendarAddress" instead of "sendTo"
+        // - No "replyTo" on the event
+        let mut participants = serde_json::Map::new();
+        if let Some(ref org_email) = event.organizer_email {
+            if !org_email.is_empty() {
+                participants.insert("organizer".to_string(), serde_json::json!({
+                    "@type": "Participant",
+                    "calendarAddress": format!("mailto:{}", org_email),
+                    "roles": {"owner": true, "attendee": true},
+                    "participationStatus": "accepted",
+                    "expectReply": false,
+                }));
+            }
+        }
+        if let Some(ref att_json) = event.attendees_json {
+            if let Ok(attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+                for (i, att) in attendees.iter().enumerate() {
+                    let email = att["email"].as_str().unwrap_or_default();
+                    if !email.is_empty() {
+                        let status = att["status"].as_str().unwrap_or("needs-action");
+                        participants.insert(format!("att{}", i), serde_json::json!({
+                            "@type": "Participant",
+                            "calendarAddress": format!("mailto:{}", email),
+                            "roles": {"attendee": true},
+                            "participationStatus": status,
+                            "expectReply": true,
+                        }));
+                    }
+                }
+            }
+        }
+        if !participants.is_empty() {
+            event_obj["participants"] = serde_json::Value::Object(participants);
         }
 
         let request = serde_json::json!({
@@ -961,6 +1006,45 @@ impl JmapConnection {
         }
 
         log::info!("JMAP updated calendar event id={}", event_id);
+        Ok(())
+    }
+
+    /// Update a participant's status on a calendar event via JMAP patch.
+    /// Uses the JSCalendar-bis path syntax: participants/<id>/participationStatus
+    pub async fn update_participant_status(
+        &self,
+        config: &JmapConfig,
+        event_id: &str,
+        participant_key: &str,
+        status: &str,
+    ) -> Result<()> {
+        log::info!("JMAP updating participant {} status to {} on event {}", participant_key, status, event_id);
+
+        let patch_key = format!("participants/{}/participationStatus", participant_key);
+        let mut patch = serde_json::Map::new();
+        patch.insert(patch_key, serde_json::json!(status));
+
+        let mut update = serde_json::Map::new();
+        update.insert(event_id.to_string(), serde_json::Value::Object(patch));
+
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+            "methodCalls": [
+                ["CalendarEvent/set", {
+                    "accountId": self.account_id,
+                    "update": update
+                }, "u1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][event_id].as_object() {
+            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP update participant failed: {}", desc)));
+        }
+
+        log::info!("JMAP updated participant status on event {}", event_id);
         Ok(())
     }
 

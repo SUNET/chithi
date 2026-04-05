@@ -345,7 +345,7 @@ async function save() {
 }
 
 .datetime-inputs .time-input {
-  width: 90px;
+  width: 120px;
   flex-shrink: 0;
 }
 

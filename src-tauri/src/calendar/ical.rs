@@ -738,6 +738,43 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn test_generate_invite_organizer_no_cn() {
+        // BUG: organizer CN was set to account display_name ("jMAP")
+        // which confused recipients. When organizer_name is None,
+        // ORGANIZER should use mailto: without CN parameter.
+        let ical = generate_invite(
+            "uid-no-cn",
+            "Test Meeting",
+            "2026-04-07T17:00:00Z",
+            "2026-04-07T18:00:00Z",
+            None, None,
+            "kushal@civilized.systems",
+            None, // No organizer name
+            &[],
+            None,
+        );
+        assert!(ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
+            "Should have ORGANIZER without CN, got: {}", ical);
+        assert!(!ical.contains("CN="), "Should NOT have CN parameter");
+    }
+
+    #[test]
+    fn test_generate_invite_organizer_with_cn() {
+        let ical = generate_invite(
+            "uid-cn",
+            "Test Meeting",
+            "2026-04-07T17:00:00Z",
+            "2026-04-07T18:00:00Z",
+            None, None,
+            "kushal@civilized.systems",
+            Some("Kushal Das"),
+            &[],
+            None,
+        );
+        assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@civilized.systems"));
+    }
+
+    #[test]
     fn test_parse_ical_duration() {
         assert_eq!(parse_ical_duration("PT1H"), Some(chrono::Duration::hours(1)));
         assert_eq!(parse_ical_duration("PT30M"), Some(chrono::Duration::minutes(30)));

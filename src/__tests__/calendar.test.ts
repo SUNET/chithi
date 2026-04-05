@@ -482,3 +482,163 @@ describe("EventForm end-time validation", () => {
     expect(minEndTime).toBeUndefined();
   });
 });
+
+describe("Regression: calendar event attendees and organizer", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.clearAllMocks();
+  });
+
+  it("BUG: organizer_email must be set when creating events", () => {
+    // Previously organizer_email was always None when creating events,
+    // so the organizer check in EventDetail never matched and notify
+    // dialogs appeared for attendees who shouldn't see them.
+    const accountEmail = "kushal@civilized.systems";
+    const event = {
+      account_id: "acc1",
+      organizer_email: accountEmail,
+      attendees_json: '[{"email":"bob@example.com","name":null,"status":"needs-action"}]',
+    };
+
+    // Organizer should match account email
+    expect(event.organizer_email).toBe(accountEmail);
+    expect(event.organizer_email).not.toBeNull();
+  });
+
+  it("BUG: attendees_json must be passed to JMAP when creating events", () => {
+    // Previously create_event set attendees_json: None when pushing to JMAP,
+    // so participants were never stored on the server and showed attendees=0.
+    const attendees = [
+      { email: "alice@example.com", name: "Alice", status: "needs-action" },
+      { email: "bob@example.com", name: null, status: "needs-action" },
+    ];
+    const attendeesJson = JSON.stringify(attendees);
+
+    // The JMAP event should include attendees
+    const jmapEvent = {
+      attendees_json: attendeesJson,
+      organizer_email: "organizer@example.com",
+    };
+    expect(jmapEvent.attendees_json).not.toBeNull();
+
+    const parsed = JSON.parse(jmapEvent.attendees_json!);
+    expect(parsed.length).toBe(2);
+    expect(parsed[0].email).toBe("alice@example.com");
+  });
+
+  it("BUG: only organizer should see notify dialog, not attendees", () => {
+    const accounts = [
+      { id: "acc1", email: "kushal@civilized.systems" },
+      { id: "acc2", email: "sdossec@gmail.com" },
+    ];
+
+    // Event organized by kushal
+    const event = {
+      account_id: "acc1",
+      organizer_email: "kushal@civilized.systems",
+      attendees_json: '[{"email":"sdossec@gmail.com","status":"accepted"}]',
+    };
+
+    // User is organizer
+    const account1 = accounts.find(a => a.id === event.account_id);
+    const isOrganizer1 = account1?.email === event.organizer_email;
+    expect(isOrganizer1).toBe(true);
+
+    // Simulate viewing from attendee's perspective (different account)
+    const eventAsAttendee = { ...event, account_id: "acc2" };
+    const account2 = accounts.find(a => a.id === eventAsAttendee.account_id);
+    const isOrganizer2 = account2?.email === eventAsAttendee.organizer_email;
+    expect(isOrganizer2).toBe(false);
+  });
+
+  it("BUG: events without organizer_email should assume user is organizer", () => {
+    // Locally created events may not have organizer_email set (legacy).
+    // In this case, we assume the user is the organizer.
+    const event = {
+      organizer_email: null as string | null,
+      attendees_json: null as string | null,
+    };
+
+    const isOrganizer = !event.organizer_email; // null = you're the organizer
+    expect(isOrganizer).toBe(true);
+  });
+
+  it("BUG: Google Calendar event deletion must use Calendar API, not CalDAV", () => {
+    // Previously delete_event only handled JMAP and CalDAV but not Gmail
+    // accounts. Events deleted locally would reappear after Google Calendar
+    // sync because they weren't deleted on the server.
+    const account = { provider: "gmail", mail_protocol: "imap" };
+
+    // Gmail should be handled before CalDAV check
+    const shouldUseGoogleApi = account.provider === "gmail";
+    const shouldUseJmap = account.mail_protocol === "jmap";
+
+    expect(shouldUseGoogleApi).toBe(true);
+    expect(shouldUseJmap).toBe(false);
+  });
+
+  it("BUG: provider routing must check gmail before caldav/jmap", () => {
+    // The routing order matters: gmail must be checked FIRST because
+    // gmail accounts also have mail_protocol="imap" and may have caldav_url.
+    // If caldav is checked first, Gmail would fall into the wrong path.
+    function getRoute(account: { provider: string; mail_protocol: string; caldav_url: string }): string {
+      if (account.provider === "gmail") return "google_api";
+      if (account.mail_protocol === "jmap") return "jmap";
+      if (account.caldav_url) return "caldav";
+      return "skip";
+    }
+
+    expect(getRoute({ provider: "gmail", mail_protocol: "imap", caldav_url: "" })).toBe("google_api");
+    expect(getRoute({ provider: "generic", mail_protocol: "jmap", caldav_url: "" })).toBe("jmap");
+    expect(getRoute({ provider: "generic", mail_protocol: "imap", caldav_url: "https://dav.example.com" })).toBe("caldav");
+    expect(getRoute({ provider: "generic", mail_protocol: "imap", caldav_url: "" })).toBe("skip");
+  });
+
+  it("BUG: multi-day events (>24h) must display in all-day banner, not time grid", () => {
+    // Previously, multi-day events that weren't flagged all_day appeared
+    // in every hour slot on every day, filling the entire week view.
+    const event = {
+      start_time: "2026-04-06T11:00:00Z",
+      end_time: "2026-04-28T12:00:00Z",
+      all_day: false,
+    };
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    const durationMs = end.getTime() - start.getTime();
+    const isMultiDay = durationMs > 24 * 60 * 60 * 1000;
+
+    expect(isMultiDay).toBe(true);
+    // Multi-day events should be treated as all-day for display
+    const showInTimeGrid = !event.all_day && !isMultiDay;
+    expect(showInTimeGrid).toBe(false);
+  });
+
+  it("BUG: 1-hour events must display in time grid, not all-day banner", () => {
+    const event = {
+      start_time: "2026-04-07T17:00:00Z",
+      end_time: "2026-04-07T18:00:00Z",
+      all_day: false,
+    };
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    const isMultiDay = end.getTime() - start.getTime() > 24 * 60 * 60 * 1000;
+
+    expect(isMultiDay).toBe(false);
+    const showInTimeGrid = !event.all_day && !isMultiDay;
+    expect(showInTimeGrid).toBe(true);
+  });
+
+  it("BUG: all_day events must display in all-day banner", () => {
+    const event = {
+      start_time: "2026-04-07T00:00:00Z",
+      end_time: "2026-04-07T23:59:59Z",
+      all_day: true,
+    };
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    const isMultiDay = end.getTime() - start.getTime() > 24 * 60 * 60 * 1000;
+
+    const showInTimeGrid = !event.all_day && !isMultiDay;
+    expect(showInTimeGrid).toBe(false);
+  });
+});

@@ -46,6 +46,13 @@ watch(
         const all = await api.getEmailInvites(accountId, msgId);
         // Only show invite card for METHOD:REQUEST (new invites), not REPLY/CANCEL
         invites.value = all.filter((inv) => inv.method.toUpperCase() === "REQUEST");
+
+        // Auto-process METHOD:REPLY emails (attendee responses) to update participant status
+        const replies = all.filter((inv) => inv.method.toUpperCase() === "REPLY");
+        if (replies.length > 0) {
+          api.processInviteReply(accountId, msgId).catch((e) =>
+            console.error("Failed to process invite reply:", e));
+        }
       } catch {
         // No invites or parse error — silently ignore
       }

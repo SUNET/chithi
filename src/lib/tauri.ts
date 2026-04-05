@@ -241,6 +241,13 @@ export async function sendInvites(
   return invoke("send_invites", { accountId, eventId, attendeeEmails });
 }
 
+export async function processInviteReply(
+  accountId: string,
+  messageId: string,
+): Promise<void> {
+  return invoke("process_invite_reply", { accountId, messageId });
+}
+
 export async function getInviteStatus(
   accountId: string,
   inviteUid: string,

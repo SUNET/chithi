@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import { useAccountsStore } from "@/stores/accounts";
+import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 
 const emit = defineEmits<{
@@ -8,11 +10,31 @@ const emit = defineEmits<{
 }>();
 
 const calendarStore = useCalendarStore();
+const accountsStore = useAccountsStore();
 const event = calendarStore.selectedEvent!;
 
 const editing = ref(false);
 const saving = ref(false);
 const error = ref<string | null>(null);
+
+interface Attendee {
+  email: string;
+  name: string | null;
+  status: string;
+}
+
+const attendees = computed<Attendee[]>(() => {
+  if (!event.attendees_json) return [];
+  try { return JSON.parse(event.attendees_json); } catch { return []; }
+});
+
+const hasAttendees = computed(() => attendees.value.length > 0);
+
+const isOrganizer = computed(() => {
+  if (!event.organizer_email) return true; // No organizer set = you created it
+  const account = accountsStore.accounts.find(a => a.id === event.account_id);
+  return account?.email === event.organizer_email;
+});
 
 // Edit form state
 const editTitle = ref(event.title);
@@ -97,6 +119,31 @@ async function saveEdit() {
       attendees: [],
     });
 
+    // Notify attendees if organizer and event has attendees
+    if (hasAttendees.value && isOrganizer.value) {
+      const result = await tauriMessage(
+        "This event has attendees. Send an update notification?",
+        {
+          title: "Notify Attendees",
+          kind: "info",
+          buttons: { yes: "Send Update", no: "Don't Notify", cancel: "Cancel" },
+        },
+      );
+      if (result === "Cancel") {
+        saving.value = false;
+        return;
+      }
+      if (result === "Send Update" || result === "Yes") {
+        const accountId = event.account_id || accountsStore.activeAccountId || "";
+        const emails = attendees.value.map(a => a.email);
+        try {
+          await api.sendInvites(accountId, realId, emails);
+        } catch (e) {
+          console.error("Failed to notify attendees:", e);
+        }
+      }
+    }
+
     editing.value = false;
     await calendarStore.fetchEvents();
     emit("close");
@@ -108,6 +155,29 @@ async function saveEdit() {
 }
 
 async function handleDelete() {
+  if (hasAttendees.value && isOrganizer.value) {
+    const result = await tauriMessage(
+      "This event has attendees. Send a cancellation notification?",
+      {
+        title: "Notify Attendees",
+        kind: "warning",
+        buttons: { yes: "Send Cancellation", no: "Delete Only", cancel: "Cancel" },
+      },
+    );
+    if (result === "Cancel") return;
+    if (result === "Send Cancellation" || result === "Yes") {
+      // TODO: Send METHOD:CANCEL iCalendar to attendees
+      // For now, just log — full cancel flow requires generating CANCEL ical
+      const accountId = event.account_id || accountsStore.activeAccountId || "";
+      const emails = attendees.value.map(a => a.email);
+      try {
+        await api.sendInvites(accountId, event.id, emails);
+      } catch (e) {
+        console.error("Failed to send cancellation:", e);
+      }
+    }
+  }
+
   await calendarStore.deleteEvent(event.id);
   emit("close");
 }
