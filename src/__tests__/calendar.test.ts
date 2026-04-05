@@ -71,7 +71,7 @@ function makeEvent(
 ) {
   return {
     id, account_id: "acc1", calendar_id: opts.calendar_id ?? "cal1",
-    uid: opts.uid ?? `${id}@emails-client`,
+    uid: opts.uid ?? `${id}@chithi`,
     title, description: null, location: null,
     start_time: startTime, end_time: endTime,
     all_day: false, timezone: null,

@@ -625,7 +625,7 @@ pub fn generate_ical_event(
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
-        "PRODID:-//Emails Desktop Client//EN".to_string(),
+        "PRODID:-//Chithi//EN".to_string(),
         "BEGIN:VEVENT".to_string(),
         format!("UID:{}", uid),
         format!("DTSTAMP:{}", now),

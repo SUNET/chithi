@@ -19,7 +19,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        let db_path = data_dir.join("emails.db");
+        let db_path = data_dir.join("chithi.db");
         let conn = rusqlite::Connection::open(&db_path)?;
         db::schema::initialize(&conn)?;
 

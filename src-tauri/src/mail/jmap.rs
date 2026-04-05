@@ -785,7 +785,7 @@ impl JmapConnection {
         log::info!("JMAP creating calendar event: '{}'", event.title);
 
         let uid = event.uid.clone().unwrap_or_else(|| {
-            format!("{}@emails-client", uuid::Uuid::new_v4())
+            format!("{}@chithi", uuid::Uuid::new_v4())
         });
 
         let duration = compute_duration(&event.start, &event.end);

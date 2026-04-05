@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 
 /// Application service name used as the "service" parameter in keyring entries.
-const SERVICE: &str = "com.emails.desktop";
+const SERVICE: &str = "in.kushaldas.chithi";
 
 /// Store a password for the given account ID in the system keyring.
 pub fn set_password(account_id: &str, password: &str) -> Result<()> {

@@ -157,7 +157,7 @@ pub async fn create_event(
         id: id.clone(),
         account_id: event.account_id,
         calendar_id: event.calendar_id,
-        uid: Some(format!("{}@emails-client", uuid::Uuid::new_v4())),
+        uid: Some(format!("{}@chithi", uuid::Uuid::new_v4())),
         title: event.title,
         description: event.description,
         location: event.location,
@@ -745,7 +745,7 @@ async fn sync_calendars_caldav(
                 let uid = ev
                     .uid
                     .clone()
-                    .unwrap_or_else(|| format!("{}@emails-client", uuid::Uuid::new_v4()));
+                    .unwrap_or_else(|| format!("{}@chithi", uuid::Uuid::new_v4()));
 
                 // Use existing ical_data if available, or generate new
                 let ical_data = ev.ical_data.clone().unwrap_or_else(|| {

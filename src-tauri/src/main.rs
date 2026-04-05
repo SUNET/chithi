@@ -14,7 +14,7 @@ mod state;
 use state::AppState;
 
 fn main() {
-    let data_dir = dirs_data_dir().join("emails");
+    let data_dir = dirs_data_dir().join("chithi");
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
     logging::init(&data_dir).expect("Failed to initialize logging");

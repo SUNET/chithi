@@ -4,7 +4,7 @@
 Accepted
 
 ## Context
-Account passwords (IMAP, JMAP, SMTP, CalDAV) were stored as plaintext in the SQLite `accounts` table. This is a security risk — anyone with read access to `~/.local/share/emails/emails.db` could extract all credentials.
+Account passwords (IMAP, JMAP, SMTP, CalDAV) were stored as plaintext in the SQLite `accounts` table. This is a security risk — anyone with read access to `~/.local/share/chithi/chithi.db` could extract all credentials.
 
 ## Decision
 Store passwords in the operating system's native credential manager instead of SQLite:
@@ -15,7 +15,7 @@ Store passwords in the operating system's native credential manager instead of S
 We use the `keyring` crate (v3) with platform-specific features (`sync-secret-service`, `apple-native`, `windows-native`).
 
 ### Design
-- **Service name**: `com.emails.desktop` (groups all entries in the credential store)
+- **Service name**: `in.kushaldas.chithi` (groups all entries in the credential store)
 - **Key**: Account UUID (unique per account)
 - A thin `keyring.rs` module wraps `set_password`, `get_password`, `delete_password`
 - `insert_account()` and `update_account()` write to the keyring; the DB has no password column

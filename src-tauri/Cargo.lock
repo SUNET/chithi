@@ -560,6 +560,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "chithi"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "fern",
+ "futures",
+ "icalendar",
+ "imap",
+ "imap-proto",
+ "jmap-client",
+ "keyring",
+ "lettre",
+ "log",
+ "mail-parser",
+ "maildir",
+ "mailparse 0.16.1",
+ "native-tls",
+ "regex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-notification",
+ "tauri-plugin-shell",
+ "thiserror 2.0.18",
+ "tokio",
+ "uppsala",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1049,44 +1087,6 @@ name = "email_address"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
-
-[[package]]
-name = "emails"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "async-trait",
- "chrono",
- "dirs",
- "fern",
- "futures",
- "icalendar",
- "imap",
- "imap-proto",
- "jmap-client",
- "keyring",
- "lettre",
- "log",
- "mail-parser",
- "maildir",
- "mailparse 0.16.1",
- "native-tls",
- "regex",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "tantivy",
- "tauri",
- "tauri-build",
- "tauri-plugin-notification",
- "tauri-plugin-shell",
- "thiserror 2.0.18",
- "tokio",
- "uppsala",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "embed-resource"

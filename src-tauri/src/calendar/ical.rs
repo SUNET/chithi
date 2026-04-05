@@ -178,7 +178,7 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     let mut lines = Vec::new();
     lines.push("BEGIN:VCALENDAR".to_string());
     lines.push("VERSION:2.0".to_string());
-    lines.push("PRODID:-//Emails Desktop Client//EN".to_string());
+    lines.push("PRODID:-//Chithi//EN".to_string());
     lines.push("METHOD:REPLY".to_string());
     lines.push("BEGIN:VEVENT".to_string());
 
@@ -229,7 +229,7 @@ pub fn generate_invite(
     let mut lines = Vec::new();
     lines.push("BEGIN:VCALENDAR".to_string());
     lines.push("VERSION:2.0".to_string());
-    lines.push("PRODID:-//Emails Desktop Client//EN".to_string());
+    lines.push("PRODID:-//Chithi//EN".to_string());
     lines.push("METHOD:REQUEST".to_string());
     lines.push("BEGIN:VEVENT".to_string());
 
