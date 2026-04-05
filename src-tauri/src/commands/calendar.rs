@@ -360,6 +360,18 @@ pub async fn sync_calendars(
 
     if account.mail_protocol == "jmap" {
         sync_calendars_jmap(&state, &account_id, &account).await?;
+    } else if account.provider == "gmail" {
+        // Gmail: use Google CalDAV with OAuth2 bearer token
+        match sync_calendars_google(&state, &account_id, &account).await {
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!("sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}", e);
+                // Fall back to configured CalDAV URL if available
+                if !account.caldav_url.is_empty() {
+                    sync_calendars_caldav(&state, &account_id, &account).await?;
+                }
+            }
+        }
     } else if !account.caldav_url.is_empty() {
         sync_calendars_caldav(&state, &account_id, &account).await?;
     } else {
@@ -557,6 +569,180 @@ async fn sync_calendars_jmap(
     }
 
     Ok(())
+}
+
+/// Sync calendars and events via Google Calendar API with OAuth2.
+async fn sync_calendars_google(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    _account: &db::accounts::AccountFull,
+) -> Result<()> {
+    let access_token = get_google_token(account_id).await?;
+    let http = reqwest::Client::new();
+
+    // Step 1: List calendars via Google Calendar API
+    let resp = http
+        .get("https://www.googleapis.com/calendar/v3/users/me/calendarList")
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("Google Calendar API failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(crate::error::Error::Other(format!("Google Calendar API error: {}", body)));
+    }
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| crate::error::Error::Other(format!("Google Calendar API parse error: {}", e)))?;
+
+    let items = data["items"].as_array();
+    log::info!("sync_calendars_google: fetched {} calendars", items.map(|i| i.len()).unwrap_or(0));
+
+    let mut remote_to_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    {
+        let conn = state.db.lock().await;
+        if let Some(calendars) = items {
+            for cal in calendars {
+                let cal_id = cal["id"].as_str().unwrap_or_default();
+                let name = cal["summary"].as_str().unwrap_or("Calendar");
+                let color = cal["backgroundColor"].as_str().unwrap_or("#4285f4");
+                let is_primary = cal["primary"].as_bool().unwrap_or(false);
+
+                let local_id = db::calendar::upsert_calendar_by_remote_id(
+                    &conn, account_id, cal_id, name, color, is_primary,
+                )?;
+                remote_to_local.insert(cal_id.to_string(), local_id);
+            }
+        }
+    }
+
+    // Step 2: Fetch events for each calendar
+    for (remote_cal_id, local_cal_id) in &remote_to_local {
+        let now = chrono::Utc::now();
+        let time_min = (now - chrono::Duration::days(30)).to_rfc3339();
+        let time_max = (now + chrono::Duration::days(180)).to_rfc3339();
+
+        let resp = http
+            .get(format!(
+                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+                urlencoding::encode(remote_cal_id)
+            ))
+            .bearer_auth(&access_token)
+            .query(&[
+                ("timeMin", time_min.as_str()),
+                ("timeMax", time_max.as_str()),
+                ("singleEvents", "true"),
+                ("maxResults", "500"),
+            ])
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("sync_calendars_google: events fetch failed for {}: {}", remote_cal_id, e);
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            log::error!("sync_calendars_google: events error for {}: {}", remote_cal_id, body);
+            continue;
+        }
+
+        let events_data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("sync_calendars_google: events parse error: {}", e);
+                continue;
+            }
+        };
+
+        let events = events_data["items"].as_array();
+        let count = events.map(|e| e.len()).unwrap_or(0);
+        log::info!("sync_calendars_google: fetched {} events for calendar {}", count, remote_cal_id);
+
+        let conn = state.db.lock().await;
+        if let Some(events) = events {
+            for ev in events {
+                let event_id_remote = ev["id"].as_str().unwrap_or_default();
+                let title = ev["summary"].as_str().unwrap_or("(No title)");
+                let description = ev["description"].as_str().map(|s| s.to_string());
+                let location = ev["location"].as_str().map(|s| s.to_string());
+
+                // Parse start/end — can be date (all-day) or dateTime
+                let (start_time, all_day) = if let Some(dt) = ev["start"]["dateTime"].as_str() {
+                    (dt.to_string(), false)
+                } else if let Some(d) = ev["start"]["date"].as_str() {
+                    (format!("{}T00:00:00Z", d), true)
+                } else {
+                    continue;
+                };
+
+                let end_time = if let Some(dt) = ev["end"]["dateTime"].as_str() {
+                    dt.to_string()
+                } else if let Some(d) = ev["end"]["date"].as_str() {
+                    format!("{}T23:59:59Z", d)
+                } else {
+                    start_time.clone()
+                };
+
+                let organizer_email = ev["organizer"]["email"].as_str().map(|s| s.to_string());
+                let uid = ev["iCalUID"].as_str().map(|s| s.to_string());
+
+                let cal_event = CalendarEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    account_id: account_id.to_string(),
+                    calendar_id: local_cal_id.clone(),
+                    uid,
+                    title: title.to_string(),
+                    description,
+                    location,
+                    start_time,
+                    end_time,
+                    all_day,
+                    timezone: None,
+                    recurrence_rule: None,
+                    organizer_email,
+                    attendees_json: None,
+                    my_status: None,
+                    source_message_id: None,
+                    ical_data: None,
+                    remote_id: Some(event_id_remote.to_string()),
+                    etag: ev["etag"].as_str().map(|s| s.to_string()),
+                };
+
+                if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                    log::error!("sync_calendars_google: upsert event failed: {}", e);
+                }
+            }
+        }
+    }
+
+    log::info!("sync_calendars_google: completed for account {}", account_id);
+    Ok(())
+}
+
+/// Get a valid Google OAuth2 access token, refreshing if expired.
+async fn get_google_token(account_id: &str) -> Result<String> {
+    let tokens = crate::oauth::load_tokens(account_id)?
+        .ok_or_else(|| crate::error::Error::Other(
+            "No Google OAuth tokens. Please sign in with Google in Settings.".into(),
+        ))?;
+
+    if !tokens.is_expired() {
+        return Ok(tokens.access_token);
+    }
+
+    let refresh_token = tokens.refresh_token
+        .ok_or_else(|| crate::error::Error::Other("No refresh token".into()))?;
+    let new_tokens = crate::oauth::refresh_access_token(&crate::oauth::GOOGLE, &refresh_token).await?;
+    crate::oauth::store_tokens(account_id, &new_tokens)?;
+    Ok(new_tokens.access_token)
 }
 
 /// Sync calendars and events via CalDAV.

@@ -333,6 +333,34 @@ export async function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }
 
+// OAuth
+export async function oauthStart(
+  provider: string,
+): Promise<{ url: string; port: number }> {
+  return invoke("oauth_start", { provider });
+}
+
+export async function oauthComplete(
+  provider: string,
+  port: number,
+  accountId: string,
+): Promise<void> {
+  return invoke("oauth_complete", { provider, port, accountId });
+}
+
+export async function oauthGetToken(
+  provider: string,
+  accountId: string,
+): Promise<string> {
+  return invoke("oauth_get_token", { provider, accountId });
+}
+
+export async function oauthHasTokens(
+  accountId: string,
+): Promise<boolean> {
+  return invoke("oauth_has_tokens", { accountId });
+}
+
 export async function searchCollectedContacts(
   query: string,
 ): Promise<import("./types").CollectedContact[]> {

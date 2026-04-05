@@ -37,6 +37,7 @@ icalendar = "0.16"
 uppsala = "0.3"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 mime_guess = "2"
+urlencoding = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

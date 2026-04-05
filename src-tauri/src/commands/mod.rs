@@ -5,4 +5,5 @@ pub mod compose;
 pub mod contacts;
 pub mod filters;
 pub mod mail;
+pub mod oauth;
 pub mod sync_cmd;

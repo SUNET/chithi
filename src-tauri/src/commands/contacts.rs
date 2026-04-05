@@ -120,11 +120,174 @@ pub async fn sync_contacts(
 
     if account.mail_protocol == "jmap" {
         sync_contacts_jmap(&state, &account_id, &account).await?;
+    } else if account.provider == "gmail" {
+        match sync_contacts_google(&state, &account_id, &account).await {
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!("sync_contacts: Gmail CardDAV failed (OAuth may not be set up): {}", e);
+            }
+        }
     } else {
-        log::debug!("sync_contacts: skipping non-JMAP account {}", account_id);
+        log::debug!("sync_contacts: skipping account {} (no supported sync)", account_id);
     }
 
     log::info!("sync_contacts: completed for account {}", account_id);
+    Ok(())
+}
+
+async fn get_google_token(account_id: &str) -> Result<String> {
+    let tokens = crate::oauth::load_tokens(account_id)?
+        .ok_or_else(|| crate::error::Error::Other(
+            "No Google OAuth tokens. Please sign in with Google in Settings.".into(),
+        ))?;
+
+    if !tokens.is_expired() {
+        return Ok(tokens.access_token);
+    }
+
+    let refresh_token = tokens.refresh_token
+        .ok_or_else(|| crate::error::Error::Other("No refresh token".into()))?;
+    let new_tokens = crate::oauth::refresh_access_token(&crate::oauth::GOOGLE, &refresh_token).await?;
+    crate::oauth::store_tokens(account_id, &new_tokens)?;
+    Ok(new_tokens.access_token)
+}
+
+async fn sync_contacts_google(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    _account: &db::accounts::AccountFull,
+) -> Result<()> {
+    // Get a valid OAuth2 access token
+    let access_token = get_google_token(account_id).await?;
+
+    let conn = state.db.lock().await;
+    let book_id = {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'google'",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing {
+            id
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO contact_books (id, account_id, name, sync_type) VALUES (?1, ?2, 'Google Contacts', 'google')",
+                rusqlite::params![id, account_id],
+            )?;
+            id
+        }
+    };
+    drop(conn);
+
+    // Fetch contacts using Google People API (more reliable than CardDAV for Google)
+    let http = reqwest::Client::new();
+    let resp = http
+        .get("https://people.googleapis.com/v1/people/me/connections")
+        .bearer_auth(&access_token)
+        .query(&[
+            ("personFields", "names,emailAddresses,phoneNumbers,organizations"),
+            ("pageSize", "1000"),
+        ])
+        .send()
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("Google People API failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(crate::error::Error::Other(format!("Google People API error {}: {}", status, body)));
+    }
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| crate::error::Error::Other(format!("Google People API parse error: {}", e)))?;
+
+    let connections = data["connections"].as_array();
+    let count = connections.map(|c| c.len()).unwrap_or(0);
+    log::info!("sync_contacts_google: fetched {} contacts", count);
+
+    let conn = state.db.lock().await;
+
+    if let Some(people) = connections {
+        for person in people {
+            let resource_name = person["resourceName"].as_str().unwrap_or_default();
+
+            // Parse name
+            let display_name = person["names"]
+                .as_array()
+                .and_then(|names| names.first())
+                .and_then(|n| n["displayName"].as_str())
+                .unwrap_or("(No name)")
+                .to_string();
+
+            // Parse emails
+            let mut emails = Vec::new();
+            if let Some(email_list) = person["emailAddresses"].as_array() {
+                for em in email_list {
+                    let addr = em["value"].as_str().unwrap_or_default();
+                    let label = em["type"].as_str().unwrap_or("other");
+                    if !addr.is_empty() {
+                        emails.push(serde_json::json!({"email": addr, "label": label}));
+                    }
+                }
+            }
+
+            // Parse phones
+            let mut phones = Vec::new();
+            if let Some(phone_list) = person["phoneNumbers"].as_array() {
+                for ph in phone_list {
+                    let number = ph["value"].as_str().unwrap_or_default();
+                    let label = ph["type"].as_str().unwrap_or("mobile");
+                    if !number.is_empty() {
+                        phones.push(serde_json::json!({"number": number, "label": label}));
+                    }
+                }
+            }
+
+            // Parse organization
+            let organization = person["organizations"]
+                .as_array()
+                .and_then(|orgs| orgs.first())
+                .and_then(|o| o["name"].as_str())
+                .map(|s| s.to_string());
+
+            let title = person["organizations"]
+                .as_array()
+                .and_then(|orgs| orgs.first())
+                .and_then(|o| o["title"].as_str())
+                .map(|s| s.to_string());
+
+            // Upsert by remote_id
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM contacts WHERE book_id = ?1 AND remote_id = ?2",
+                    rusqlite::params![book_id, resource_name],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string());
+            let phones_json = serde_json::to_string(&phones).unwrap_or_else(|_| "[]".to_string());
+
+            if let Some(id) = existing {
+                conn.execute(
+                    "UPDATE contacts SET display_name=?1, emails_json=?2, phones_json=?3, organization=?4, title=?5, updated_at=CURRENT_TIMESTAMP WHERE id=?6",
+                    rusqlite::params![display_name, emails_json, phones_json, organization, title, id],
+                )?;
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO contacts (id, book_id, display_name, emails_json, phones_json, addresses_json, organization, title, remote_id) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8)",
+                    rusqlite::params![id, book_id, display_name, emails_json, phones_json, organization, title, resource_name],
+                )?;
+            }
+        }
+    }
+
+    log::info!("sync_contacts_google: completed for account {}", account_id);
     Ok(())
 }
 

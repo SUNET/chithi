@@ -38,7 +38,9 @@ const error = ref<string | null>(null);
 const syncing = ref(false);
 
 onMounted(async () => {
-  await syncAllContacts();
+  // Load local data first, then sync in background
+  await fetchBooks();
+  syncAllContacts();
 });
 
 async function syncAllContacts() {

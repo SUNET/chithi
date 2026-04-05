@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import type { AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 const router = useRouter();
 const accountsStore = useAccountsStore();
@@ -13,6 +14,8 @@ const deletingAccountId = ref<string | null>(null);
 const saving = ref(false);
 const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
+const oauthStatus = ref<string | null>(null);
+const oauthInProgress = ref(false);
 
 const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
 
@@ -104,6 +107,15 @@ async function openEditForm(id: string) {
     form.value = config;
     if (config.provider === "gmail") {
       accountType.value = "gmail";
+      // Check if OAuth tokens exist
+      try {
+        const hasTokens = await api.oauthHasTokens(id);
+        if (hasTokens) {
+          oauthStatus.value = "Signed in with Google";
+        } else {
+          oauthStatus.value = null;
+        }
+      } catch { oauthStatus.value = null; }
     } else if (config.mail_protocol === "jmap") {
       accountType.value = "jmap";
     } else if (config.caldav_url && !config.imap_host) {
@@ -146,6 +158,34 @@ function cancelForm() {
 function confirmDelete(id: string) {
   deletingAccountId.value = id;
   showDeleteConfirm.value = true;
+}
+
+async function startGoogleOAuth() {
+  oauthInProgress.value = true;
+  oauthStatus.value = null;
+  error.value = null;
+
+  try {
+    // Generate a temporary account ID if creating new
+    const tempAccountId = editingAccountId.value ?? `gmail-pending-${Date.now()}`;
+
+    // Start OAuth flow — get auth URL
+    const { url, port } = await api.oauthStart("google");
+
+    // Open browser
+    await shellOpen(url);
+
+    // Wait for callback (this blocks until user completes in browser)
+    await api.oauthComplete("google", port, tempAccountId);
+
+    // Store the temp ID so saveAccount can use it
+    form.value.password = `oauth2:${tempAccountId}`;
+    oauthStatus.value = "Signed in with Google";
+  } catch (e) {
+    error.value = `Google sign-in failed: ${e}`;
+  } finally {
+    oauthInProgress.value = false;
+  }
 }
 
 async function doDelete() {
@@ -235,10 +275,38 @@ async function doDelete() {
               <input v-model="form.email" type="email" placeholder="user@example.com" />
             </div>
             <div class="form-group">
-              <label>Password</label>
-              <input v-model="form.password" type="password" placeholder="••••••••" />
+              <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
+              <input v-model="form.password" type="password" :placeholder="accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••'" />
               <span class="field-hint">Passwords are stored securely in your OS keyring</span>
             </div>
+
+            <template v-if="accountType === 'gmail'">
+              <div class="form-group">
+                <label>Calendar &amp; Contacts Sync</label>
+                <div v-if="oauthStatus" class="oauth-row">
+                  <div class="oauth-status">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                    {{ oauthStatus }}
+                  </div>
+                  <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
+                </div>
+                <button
+                  v-else
+                  class="btn-oauth"
+                  :disabled="oauthInProgress"
+                  @click="startGoogleOAuth"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
+                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18A10.96 10.96 0 0 0 1 12c0 1.77.42 3.45 1.18 4.93l3.66-2.84z" fill="#FBBC05"/>
+                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                  </svg>
+                  {{ oauthInProgress ? "Waiting for browser..." : "Sign in with Google" }}
+                </button>
+                <span class="field-hint">Sign in to sync Google Calendar and Contacts. IMAP/SMTP uses app password above.</span>
+              </div>
+            </template>
 
             <template v-if="accountType === 'imap'">
               <div class="form-row">
@@ -279,7 +347,7 @@ async function doDelete() {
             </template>
 
             <template v-if="accountType === 'gmail' && !editingAccountId">
-              <div class="info-box">Gmail settings will be configured automatically</div>
+              <div class="info-box">Gmail uses IMAP (imap.gmail.com:993) and SMTP (smtp.gmail.com:587). Sign in with Google above to authorize access.</div>
             </template>
           </div>
           <div class="modal-footer">
@@ -658,6 +726,69 @@ async function doDelete() {
   border-radius: 4px;
   font-weight: 500;
   font-size: 16px;
+}
+
+.btn-oauth {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 20px;
+  background: white;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  transition: all 0.12s;
+  width: 100%;
+  justify-content: center;
+}
+
+.btn-oauth:hover {
+  background: var(--color-bg-secondary);
+  border-color: var(--color-text-muted);
+}
+
+.btn-oauth:disabled {
+  opacity: 0.6;
+}
+
+.oauth-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.oauth-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 12px;
+  background: rgba(0, 166, 62, 0.06);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #00a63e;
+  flex: 1;
+}
+
+.btn-reauth {
+  height: 40px;
+  padding: 0 12px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  transition: all 0.12s;
+}
+
+.btn-reauth:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
 }
 
 .confirm-title {

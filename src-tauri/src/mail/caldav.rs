@@ -10,6 +10,13 @@ use crate::error::{Error, Result};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Authentication method for CalDAV/CardDAV.
+#[derive(Clone)]
+pub enum DavAuth {
+    Basic { username: String, password: String },
+    Bearer { token: String },
+}
+
 /// Configuration needed to connect to a CalDAV server.
 pub struct CalDavConfig {
     pub caldav_url: String, // e.g., "https://mail.example.com/dav/cal"
@@ -22,8 +29,7 @@ pub struct CalDavConfig {
 pub struct CalDavClient {
     http: reqwest::Client,
     base_url: String,
-    username: String,
-    password: String,
+    auth: DavAuth,
 }
 
 /// A calendar collection discovered from the CalDAV server.
@@ -75,29 +81,60 @@ impl CalDavClient {
             .build()
             .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
 
+        let auth = DavAuth::Basic {
+            username: config.username.clone(),
+            password: config.password.clone(),
+        };
+
         let base_url = if config.caldav_url.is_empty() {
             log::info!("caldav: no URL configured, attempting auto-discovery");
-            Self::auto_discover(&http, &config.username, &config.password, &config.email)
-                .await?
+            Self::auto_discover(&http, &auth, &config.email).await?
         } else {
             config.caldav_url.clone()
         };
 
         log::info!("caldav: connected to {}", base_url);
 
+        Ok(Self { http, base_url, auth })
+    }
+
+    /// Create a CalDAV client with OAuth2 bearer token authentication.
+    pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
+
+        let auth = DavAuth::Bearer { token: token.to_string() };
+
+        log::info!("caldav: connected with OAuth to {}", caldav_url);
+
         Ok(Self {
             http,
-            base_url,
-            username: config.username.clone(),
-            password: config.password.clone(),
+            base_url: caldav_url.to_string(),
+            auth,
         })
+    }
+
+    /// Apply authentication to a request builder.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
+            DavAuth::Bearer { token } => req.bearer_auth(token),
+        }
+    }
+
+    fn apply_auth_static(req: reqwest::RequestBuilder, auth: &DavAuth) -> reqwest::RequestBuilder {
+        match auth {
+            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
+            DavAuth::Bearer { token } => req.bearer_auth(token),
+        }
     }
 
     /// Auto-discover CalDAV URL by trying `.well-known/caldav` on the email domain.
     async fn auto_discover(
         http: &reqwest::Client,
-        username: &str,
-        password: &str,
+        auth: &DavAuth,
         email: &str,
     ) -> Result<String> {
         let domain = email
@@ -113,9 +150,10 @@ impl CalDavClient {
 
         for url in &candidates {
             log::debug!("caldav: trying auto-discovery at {}", url);
-            match http
-                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
-                .basic_auth(username, Some(password))
+            match Self::apply_auth_static(
+                http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url),
+                auth,
+            )
                 .header("Depth", "0")
                 .header("Content-Type", "application/xml; charset=utf-8")
                 .body(PROPFIND_CURRENT_USER_PRINCIPAL)
@@ -225,10 +263,9 @@ impl CalDavClient {
         let url = self.resolve_url(calendar_href);
         log::debug!("caldav: fetching events from {}", url);
 
-        let resp = self
-            .http
-            .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), &url)
-            .basic_auth(&self.username, Some(&self.password))
+        let resp = self.apply_auth(
+            self.http
+                .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), &url))
             .header("Depth", "1")
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(REPORT_CALENDAR_QUERY)
@@ -273,10 +310,7 @@ impl CalDavClient {
         );
         log::info!("caldav: PUT event to {}", event_url);
 
-        let resp = self
-            .http
-            .put(&event_url)
-            .basic_auth(&self.username, Some(&self.password))
+        let resp = self.apply_auth(self.http.put(&event_url))
             .header("Content-Type", "text/calendar; charset=utf-8")
             .body(ical_data.to_string())
             .send()
@@ -313,10 +347,7 @@ impl CalDavClient {
         let url = self.resolve_url(event_href);
         log::info!("caldav: DELETE event at {}", url);
 
-        let resp = self
-            .http
-            .delete(&url)
-            .basic_auth(&self.username, Some(&self.password))
+        let resp = self.apply_auth(self.http.delete(&url))
             .send()
             .await
             .map_err(|e| Error::Other(format!("CalDAV DELETE failed: {}", e)))?;
@@ -344,10 +375,8 @@ impl CalDavClient {
 
     /// Send a PROPFIND request and return the response body.
     async fn propfind(&self, url: &str, depth: &str, body: &str) -> Result<String> {
-        let resp = self
-            .http
-            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
-            .basic_auth(&self.username, Some(&self.password))
+        let resp = self.apply_auth(
+            self.http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url))
             .header("Depth", depth)
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(body.to_string())

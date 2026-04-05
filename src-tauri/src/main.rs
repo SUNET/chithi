@@ -9,6 +9,7 @@ mod filters;
 mod keyring;
 mod logging;
 mod mail;
+mod oauth;
 mod state;
 
 use state::AppState;
@@ -56,6 +57,10 @@ fn main() {
             commands::contacts::search_contacts,
             commands::contacts::search_collected_contacts,
             commands::contacts::sync_contacts,
+            commands::oauth::oauth_start,
+            commands::oauth::oauth_complete,
+            commands::oauth::oauth_get_token,
+            commands::oauth::oauth_has_tokens,
             commands::actions::move_messages,
             commands::actions::delete_messages,
             commands::actions::set_message_flags,
