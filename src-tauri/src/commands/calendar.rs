@@ -190,7 +190,66 @@ pub async fn create_event(
         db::calendar::insert_event(&conn, &cal_event)?;
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
 
-        if account.mail_protocol == "jmap" {
+        if account.provider == "gmail" {
+            // Create on Google Calendar via REST API
+            drop(conn);
+            if let Ok(token) = get_google_token(&cal_event.account_id).await {
+                let http = reqwest::Client::new();
+                let mut google_event = serde_json::json!({
+                    "summary": cal_event.title,
+                    "start": if cal_event.all_day {
+                        serde_json::json!({"date": cal_event.start_time.split('T').next().unwrap_or_default()})
+                    } else {
+                        serde_json::json!({"dateTime": cal_event.start_time})
+                    },
+                    "end": if cal_event.all_day {
+                        serde_json::json!({"date": cal_event.end_time.split('T').next().unwrap_or_default()})
+                    } else {
+                        serde_json::json!({"dateTime": cal_event.end_time})
+                    },
+                    "iCalUID": cal_event.uid,
+                });
+                if let Some(ref desc) = cal_event.description {
+                    google_event["description"] = serde_json::json!(desc);
+                }
+                if let Some(ref loc) = cal_event.location {
+                    google_event["location"] = serde_json::json!(loc);
+                }
+                if let Some(ref att_json) = cal_event.attendees_json {
+                    if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+                        let google_attendees: Vec<serde_json::Value> = atts.iter()
+                            .filter_map(|a| a["email"].as_str().map(|e| serde_json::json!({"email": e})))
+                            .collect();
+                        if !google_attendees.is_empty() {
+                            google_event["attendees"] = serde_json::json!(google_attendees);
+                        }
+                    }
+                }
+                let send_updates = if cal_event.attendees_json.is_some() { "all" } else { "none" };
+                let url = format!(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates={}",
+                    send_updates
+                );
+                match http.post(&url).bearer_auth(&token).json(&google_event).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            let remote_id = data["id"].as_str().unwrap_or_default().to_string();
+                            log::info!("create_event: pushed to Google Calendar, id={}", remote_id);
+                            let conn = state.db.lock().await;
+                            conn.execute(
+                                "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+                                rusqlite::params![remote_id, id],
+                            ).ok();
+                        }
+                    }
+                    Ok(resp) => {
+                        let body = resp.text().await.unwrap_or_default();
+                        log::error!("create_event: Google Calendar insert failed: {}", body);
+                    }
+                    Err(e) => log::error!("create_event: Google Calendar request failed: {}", e),
+                }
+            }
+        } else if account.mail_protocol == "jmap" {
             // Look up the remote calendar ID from local calendar
             let calendar = db::calendar::get_calendar(&conn, &cal_event.calendar_id)?;
             let remote_cal_id = calendar.remote_id.clone().unwrap_or_default();
@@ -290,6 +349,53 @@ pub async fn update_event(
 
     db::calendar::update_event(&conn, &existing)?;
     log::info!("update_event: updated event {}", event_id);
+
+    // Push update to server
+    let account = db::accounts::get_account_full(&conn, &existing.account_id)?;
+    if let Some(ref remote_id) = existing.remote_id.filter(|r| !r.is_empty()) {
+            if account.provider == "gmail" {
+                drop(conn);
+                if let Ok(token) = get_google_token(&existing.account_id).await {
+                    let http = reqwest::Client::new();
+                    let mut patch = serde_json::json!({
+                        "summary": existing.title,
+                        "start": if existing.all_day {
+                            serde_json::json!({"date": existing.start_time.split('T').next().unwrap_or_default()})
+                        } else {
+                            serde_json::json!({"dateTime": existing.start_time})
+                        },
+                        "end": if existing.all_day {
+                            serde_json::json!({"date": existing.end_time.split('T').next().unwrap_or_default()})
+                        } else {
+                            serde_json::json!({"dateTime": existing.end_time})
+                        },
+                    });
+                    if let Some(ref desc) = existing.description {
+                        patch["description"] = serde_json::json!(desc);
+                    }
+                    if let Some(ref loc) = existing.location {
+                        patch["location"] = serde_json::json!(loc);
+                    }
+                    let send_updates = if existing.attendees_json.is_some() { "all" } else { "none" };
+                    let url = format!(
+                        "https://www.googleapis.com/calendar/v3/calendars/primary/events/{}?sendUpdates={}",
+                        urlencoding::encode(remote_id), send_updates
+                    );
+                    match http.patch(&url).bearer_auth(&token).json(&patch).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            log::info!("update_event: updated on Google Calendar");
+                        }
+                        Ok(resp) => {
+                            let body = resp.text().await.unwrap_or_default();
+                            log::error!("update_event: Google Calendar PATCH failed: {}", body);
+                        }
+                        Err(e) => log::error!("update_event: Google Calendar request failed: {}", e),
+                    }
+                }
+            }
+            // JMAP update is handled by existing code path via update_calendar_event
+    }
+
     Ok(())
 }
 
@@ -300,12 +406,14 @@ pub async fn delete_event(
 ) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
-    // Look up the event and account to delete from server if needed
-    let (event, account) = {
+    // Look up the event, account, and calendar remote_id
+    let (event, account, cal_remote_id) = {
         let conn = state.db.lock().await;
         let evt = db::calendar::get_event(&conn, &event_id)?;
         let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
-        (evt, acc)
+        let cal = db::calendar::get_calendar(&conn, &evt.calendar_id).ok();
+        let cal_rid = cal.and_then(|c| c.remote_id).unwrap_or_else(|| "primary".to_string());
+        (evt, acc, cal_rid)
     };
 
     // Delete from server if event has a remote_id
@@ -317,7 +425,8 @@ pub async fn delete_event(
                     Ok(token) => {
                         let http = reqwest::Client::new();
                         let url = format!(
-                            "https://www.googleapis.com/calendar/v3/calendars/primary/events/{}",
+                            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}?sendUpdates=all",
+                            urlencoding::encode(&cal_remote_id),
                             urlencoding::encode(remote_id)
                         );
                         match http.delete(&url).bearer_auth(&token).send().await {
@@ -650,26 +759,50 @@ async fn sync_calendars_google(
         }
     }
 
-    // Step 2: Fetch events for each calendar
+    // Step 2: Fetch events for each calendar (with syncToken for incremental sync)
     for (remote_cal_id, local_cal_id) in &remote_to_local {
-        let now = chrono::Utc::now();
-        let time_min = (now - chrono::Duration::days(30)).to_rfc3339();
-        let time_max = (now + chrono::Duration::days(180)).to_rfc3339();
+        let sync_key = format!("google_sync_token_{}_{}", account_id, remote_cal_id);
 
-        let resp = http
-            .get(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-                urlencoding::encode(remote_cal_id)
-            ))
-            .bearer_auth(&access_token)
-            .query(&[
-                ("timeMin", time_min.as_str()),
-                ("timeMax", time_max.as_str()),
-                ("singleEvents", "true"),
-                ("maxResults", "500"),
-            ])
-            .send()
-            .await;
+        // Check for existing syncToken
+        let existing_token: Option<String> = {
+            let conn = state.db.lock().await;
+            conn.query_row(
+                "SELECT value FROM app_metadata WHERE key = ?1",
+                rusqlite::params![sync_key],
+                |row| row.get(0),
+            ).ok()
+        };
+
+        let resp = if let Some(ref token) = existing_token {
+            // Incremental sync
+            log::debug!("sync_calendars_google: incremental sync for calendar {}", remote_cal_id);
+            http.get(format!(
+                    "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+                    urlencoding::encode(remote_cal_id)
+                ))
+                .bearer_auth(&access_token)
+                .query(&[("syncToken", token.as_str())])
+                .send()
+                .await
+        } else {
+            // Full sync
+            let now = chrono::Utc::now();
+            let time_min = (now - chrono::Duration::days(30)).to_rfc3339();
+            let time_max = (now + chrono::Duration::days(180)).to_rfc3339();
+            http.get(format!(
+                    "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+                    urlencoding::encode(remote_cal_id)
+                ))
+                .bearer_auth(&access_token)
+                .query(&[
+                    ("timeMin", time_min.as_str()),
+                    ("timeMax", time_max.as_str()),
+                    ("singleEvents", "true"),
+                    ("maxResults", "500"),
+                ])
+                .send()
+                .await
+        };
 
         let resp = match resp {
             Ok(r) => r,
@@ -679,6 +812,13 @@ async fn sync_calendars_google(
             }
         };
 
+        if resp.status().as_u16() == 410 {
+            // syncToken expired — clear it and retry with full sync on next cycle
+            log::info!("sync_calendars_google: syncToken expired for {}, will full sync next time", remote_cal_id);
+            let conn = state.db.lock().await;
+            conn.execute("DELETE FROM app_metadata WHERE key = ?1", rusqlite::params![sync_key]).ok();
+            continue;
+        }
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             log::error!("sync_calendars_google: events error for {}: {}", remote_cal_id, body);
@@ -751,6 +891,16 @@ async fn sync_calendars_google(
                     log::error!("sync_calendars_google: upsert event failed: {}", e);
                 }
             }
+        }
+
+        // Save nextSyncToken for incremental sync next time
+        if let Some(next_token) = events_data["nextSyncToken"].as_str() {
+            let conn = state.db.lock().await;
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params![sync_key, next_token],
+            ).ok();
+            log::debug!("sync_calendars_google: saved syncToken for calendar {}", remote_cal_id);
         }
     }
 
@@ -1248,6 +1398,105 @@ pub async fn respond_to_invite(
             event_id,
             response
         );
+    }
+
+    // Step 5: Update Google Calendar if this is a Gmail account with OAuth
+    if account.provider == "gmail" {
+        drop(conn); // Release DB lock before async
+        if let Ok(token) = get_google_token(&account_id).await {
+            let google_status = match response.to_lowercase().as_str() {
+                "accepted" => "accepted",
+                "tentative" => "tentative",
+                "declined" => "declined",
+                _ => "needsAction",
+            };
+            // Find event on Google Calendar by iCalUID, import if not found
+            let http = reqwest::Client::new();
+            let search_url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events?iCalUID={}",
+                urlencoding::encode(&invite_uid)
+            );
+            let mut google_event_id_found = None;
+            if let Ok(resp) = http.get(&search_url).bearer_auth(&token).send().await {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    if let Some(items) = data["items"].as_array() {
+                        google_event_id_found = items.first()
+                            .and_then(|e| e["id"].as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+            // If not on Google Calendar yet, import it
+            if google_event_id_found.is_none() {
+                let import_event = serde_json::json!({
+                    "iCalUID": invite_uid,
+                    "summary": invite.summary,
+                    "start": if invite.all_day {
+                        serde_json::json!({"date": invite.dtstart.split('T').next().unwrap_or_default()})
+                    } else {
+                        serde_json::json!({"dateTime": invite.dtstart})
+                    },
+                    "end": if invite.all_day {
+                        serde_json::json!({"date": invite.dtend.split('T').next().unwrap_or_default()})
+                    } else {
+                        serde_json::json!({"dateTime": invite.dtend})
+                    },
+                    "description": invite.description,
+                    "location": invite.location,
+                    "organizer": {"email": invite.organizer_email},
+                    "attendees": [{
+                        "email": account.email,
+                        "responseStatus": google_status,
+                        "self": true,
+                    }],
+                });
+                match http.post("https://www.googleapis.com/calendar/v3/calendars/primary/events/import")
+                    .bearer_auth(&token).json(&import_event).send().await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            google_event_id_found = data["id"].as_str().map(|s| s.to_string());
+                            log::info!("respond_to_invite: imported event to Google Calendar");
+                        }
+                    }
+                    Ok(resp) => {
+                        let body = resp.text().await.unwrap_or_default();
+                        log::warn!("respond_to_invite: Google Calendar import failed: {}", body);
+                    }
+                    Err(e) => log::warn!("respond_to_invite: Google Calendar import request failed: {}", e),
+                }
+            }
+            // PATCH the attendee status on Google
+            if let Some(ref geid) = google_event_id_found {
+                if !geid.is_empty() {
+                    let patch_url = format!(
+                        "https://www.googleapis.com/calendar/v3/calendars/primary/events/{}?sendUpdates=none",
+                        urlencoding::encode(geid)
+                    );
+                    let attendees_patch = serde_json::json!({
+                        "attendees": [{
+                            "email": account.email,
+                            "responseStatus": google_status,
+                            "self": true,
+                        }]
+                    });
+                    match http.patch(&patch_url)
+                        .bearer_auth(&token)
+                        .json(&attendees_patch)
+                        .send().await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            log::info!("respond_to_invite: updated Google Calendar response to {}", google_status);
+                        }
+                        Ok(r) => {
+                            let body = r.text().await.unwrap_or_default();
+                            log::warn!("respond_to_invite: Google Calendar PATCH failed: {}", body);
+                        }
+                        Err(e) => log::warn!("respond_to_invite: Google Calendar request failed: {}", e),
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

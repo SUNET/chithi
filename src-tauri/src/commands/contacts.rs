@@ -77,6 +77,58 @@ pub async fn create_contact(
     let conn = state.db.lock().await;
     db::contacts::insert_contact(&conn, &c)?;
     log::info!("Created contact {} '{}'", id, c.display_name);
+
+    // Push to Google People API if applicable
+    let book = conn.query_row(
+        "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
+        rusqlite::params![c.book_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ).ok();
+    drop(conn);
+
+    if let Some((sync_type, account_id)) = book {
+        if sync_type == "google" {
+            if let Ok(token) = get_google_token(&account_id).await {
+                let http = reqwest::Client::new();
+                let mut person = serde_json::json!({
+                    "names": [{"givenName": c.display_name}],
+                });
+                if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json) {
+                    let ge: Vec<_> = emails.iter()
+                        .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"value": addr})))
+                        .collect();
+                    if !ge.is_empty() { person["emailAddresses"] = serde_json::json!(ge); }
+                }
+                if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json) {
+                    let gp: Vec<_> = phones.iter()
+                        .filter_map(|p| p["number"].as_str().map(|n| serde_json::json!({"value": n})))
+                        .collect();
+                    if !gp.is_empty() { person["phoneNumbers"] = serde_json::json!(gp); }
+                }
+                match http.post("https://people.googleapis.com/v1/people:createContact")
+                    .bearer_auth(&token)
+                    .json(&person)
+                    .send().await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            if let Some(rn) = data["resourceName"].as_str() {
+                                let conn = state.db.lock().await;
+                                conn.execute(
+                                    "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
+                                    rusqlite::params![rn, id],
+                                ).ok();
+                                log::info!("Created contact on Google: {}", rn);
+                            }
+                        }
+                    }
+                    Ok(resp) => { let b = resp.text().await.unwrap_or_default(); log::error!("Google create contact failed: {}", b); }
+                    Err(e) => log::error!("Google create contact request failed: {}", e),
+                }
+            }
+        }
+    }
+
     Ok(id)
 }
 
@@ -88,6 +140,52 @@ pub async fn update_contact(
     let conn = state.db.lock().await;
     db::contacts::update_contact(&conn, &contact)?;
     log::info!("Updated contact {}", contact.id);
+
+    // Push to Google People API if applicable
+    if let Some(ref remote_id) = contact.remote_id {
+        if !remote_id.is_empty() {
+            let book_info = conn.query_row(
+                "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
+                rusqlite::params![contact.book_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).ok();
+            drop(conn);
+
+            if let Some((sync_type, account_id)) = book_info {
+                if sync_type == "google" {
+                    if let Ok(token) = get_google_token(&account_id).await {
+                        let http = reqwest::Client::new();
+                        let mut person = serde_json::json!({
+                            "names": [{"givenName": contact.display_name}],
+                        });
+                        if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json) {
+                            let ge: Vec<_> = emails.iter()
+                                .filter_map(|e| e["email"].as_str().map(|a| serde_json::json!({"value": a})))
+                                .collect();
+                            if !ge.is_empty() { person["emailAddresses"] = serde_json::json!(ge); }
+                        }
+                        if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json) {
+                            let gp: Vec<_> = phones.iter()
+                                .filter_map(|p| p["number"].as_str().map(|n| serde_json::json!({"value": n})))
+                                .collect();
+                            if !gp.is_empty() { person["phoneNumbers"] = serde_json::json!(gp); }
+                        }
+                        let url = format!(
+                            "https://people.googleapis.com/v1/{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
+                            remote_id
+                        );
+                        match http.patch(&url).bearer_auth(&token).json(&person).send().await {
+                            Ok(r) if r.status().is_success() => log::info!("Updated contact on Google: {}", remote_id),
+                            Ok(r) => { let b = r.text().await.unwrap_or_default(); log::warn!("Google update contact failed: {}", b); }
+                            Err(e) => log::warn!("Google update contact request failed: {}", e),
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+
     Ok(())
 }
 
@@ -96,9 +194,34 @@ pub async fn delete_contact(
     state: State<'_, AppState>,
     contact_id: String,
 ) -> Result<()> {
+    // Check if this contact has a Google remote_id before deleting
     let conn = state.db.lock().await;
+    let remote_info = conn.query_row(
+        "SELECT c.remote_id, cb.sync_type, cb.account_id FROM contacts c JOIN contact_books cb ON c.book_id = cb.id WHERE c.id = ?1",
+        rusqlite::params![contact_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    ).ok();
     db::contacts::delete_contact(&conn, &contact_id)?;
     log::info!("Deleted contact {}", contact_id);
+    drop(conn);
+
+    // Delete from Google People API if applicable
+    if let Some((Some(remote_id), sync_type, account_id)) = remote_info {
+        if sync_type == "google" && !remote_id.is_empty() {
+            if let Ok(token) = get_google_token(&account_id).await {
+                let http = reqwest::Client::new();
+                let url = format!("https://people.googleapis.com/v1/{}:deleteContact", remote_id);
+                match http.delete(&url).bearer_auth(&token).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        log::info!("Deleted contact from Google: {}", remote_id);
+                    }
+                    Ok(resp) => { let b = resp.text().await.unwrap_or_default(); log::warn!("Google delete contact failed: {}", b); }
+                    Err(e) => log::warn!("Google delete contact request failed: {}", e),
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

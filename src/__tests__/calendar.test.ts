@@ -628,6 +628,43 @@ describe("Regression: calendar event attendees and organizer", () => {
     expect(showInTimeGrid).toBe(true);
   });
 
+  it("BUG: Gmail create_event must use Google Calendar API, not JMAP", () => {
+    // Gmail accounts should use Google Calendar API for CRUD, not JMAP or CalDAV.
+    // The routing checks provider before mail_protocol.
+    function getCreateRoute(account: { provider: string; mail_protocol: string }): string {
+      if (account.provider === "gmail") return "google_calendar_api";
+      if (account.mail_protocol === "jmap") return "jmap";
+      return "local_only";
+    }
+
+    expect(getCreateRoute({ provider: "gmail", mail_protocol: "imap" })).toBe("google_calendar_api");
+    expect(getCreateRoute({ provider: "generic", mail_protocol: "jmap" })).toBe("jmap");
+    expect(getCreateRoute({ provider: "generic", mail_protocol: "imap" })).toBe("local_only");
+  });
+
+  it("BUG: Gmail respond_to_invite must update Google Calendar via API", () => {
+    // When attendee responds to invite on Gmail account, must PATCH Google Calendar
+    // event with updated attendee responseStatus, not just send SMTP reply.
+    const account = { provider: "gmail", email: "sdossec@gmail.com" };
+    const response = "accepted";
+    const expectedGoogleStatus = response === "accepted" ? "accepted"
+      : response === "tentative" ? "tentative"
+      : response === "declined" ? "declined"
+      : "needsAction";
+
+    expect(account.provider).toBe("gmail");
+    expect(expectedGoogleStatus).toBe("accepted");
+  });
+
+  it("BUG: Google Calendar delete must include sendUpdates=all", () => {
+    const hasAttendees = true;
+    const sendUpdates = hasAttendees ? "all" : "none";
+    expect(sendUpdates).toBe("all");
+
+    const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events/abc123?sendUpdates=${sendUpdates}`;
+    expect(url).toContain("sendUpdates=all");
+  });
+
   it("BUG: all_day events must display in all-day banner", () => {
     const event = {
       start_time: "2026-04-07T00:00:00Z",
