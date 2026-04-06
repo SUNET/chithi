@@ -481,3 +481,86 @@ pub async fn prefetch_bodies(
 
     Ok(fetched_count)
 }
+
+/// Start IMAP IDLE for all IMAP accounts. Call on app startup.
+#[tauri::command]
+pub async fn start_idle(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let accounts = {
+        let conn = state.db.lock().await;
+        db::accounts::list_accounts(&conn)?
+    };
+
+    for account in &accounts {
+        if account.mail_protocol != "imap" { continue; }
+        if !account.enabled { continue; }
+
+        // Check if already running
+        {
+            let handles = state.idle_handles.lock().unwrap();
+            if handles.contains_key(&account.id) {
+                log::debug!("IDLE already running for account {}", account.id);
+                continue;
+            }
+        }
+
+        let full_account = {
+            let conn = state.db.lock().await;
+            db::accounts::get_account_full(&conn, &account.id)?
+        };
+
+        let config = ImapConfig {
+            host: full_account.imap_host.clone(),
+            port: full_account.imap_port,
+            username: full_account.username.clone(),
+            password: full_account.password.clone(),
+            use_tls: full_account.use_tls,
+        };
+
+        let account_id = account.id.clone();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let app_clone = app.clone();
+
+        let thread = std::thread::spawn(move || {
+            crate::mail::idle::run_idle_loop(
+                config,
+                account_id.clone(),
+                stop_clone,
+                Box::new(move |_aid| {
+                    // Emit event to frontend to trigger sync
+                    app_clone.emit("idle-new-mail", &account_id).ok();
+                }),
+            );
+        });
+
+        let handle = crate::state::IdleHandle {
+            stop_flag,
+            thread: Some(thread),
+        };
+
+        state.idle_handles.lock().unwrap().insert(account.id.clone(), handle);
+        log::info!("Started IDLE loop for account {}", account.id);
+    }
+
+    Ok(())
+}
+
+/// Stop all IMAP IDLE loops.
+#[tauri::command]
+pub async fn stop_idle(
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let mut handles = state.idle_handles.lock().unwrap();
+    for (account_id, handle) in handles.drain() {
+        log::info!("Stopping IDLE loop for account {}", account_id);
+        handle.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = handle.thread {
+            // Don't join — let it finish on its own (IDLE may take up to timeout)
+            drop(thread);
+        }
+    }
+    Ok(())
+}

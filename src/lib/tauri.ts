@@ -340,6 +340,15 @@ export async function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }
 
+// IDLE
+export async function startIdle(): Promise<void> {
+  return invoke("start_idle");
+}
+
+export async function stopIdle(): Promise<void> {
+  return invoke("stop_idle");
+}
+
 // OAuth
 export async function oauthStart(
   provider: string,

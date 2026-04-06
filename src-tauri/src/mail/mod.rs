@@ -1,4 +1,5 @@
 pub mod caldav;
+pub mod idle;
 pub mod imap;
 pub mod jmap;
 pub mod jmap_sync;

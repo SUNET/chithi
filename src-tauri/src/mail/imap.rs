@@ -427,6 +427,23 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Enter IMAP IDLE on the currently selected folder.
+    /// Blocks until the server sends a notification (new mail, expunge, etc.)
+    /// or the timeout expires. Returns true if there was a server notification.
+    pub fn idle_wait(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        log::debug!("IMAP entering IDLE (timeout={}s)", timeout.as_secs());
+        let mut idle = self.session.idle().map_err(|e| Error::Imap(format!("IDLE setup failed: {}", e)))?;
+        idle.set_keepalive(std::time::Duration::from_secs(300)); // 5 min keepalive
+        let result = idle.wait_with_timeout(timeout);
+        let had_notification = result.is_ok();
+        if had_notification {
+            log::info!("IMAP IDLE: server notification received");
+        } else {
+            log::debug!("IMAP IDLE: timeout reached, no notification");
+        }
+        Ok(had_notification)
+    }
+
     pub fn logout(mut self) {
         log::debug!("IMAP logging out");
         self.session.logout().ok();

@@ -59,6 +59,8 @@ fn main() {
             commands::contacts::search_contacts,
             commands::contacts::search_collected_contacts,
             commands::contacts::sync_contacts,
+            commands::sync_cmd::start_idle,
+            commands::sync_cmd::stop_idle,
             commands::oauth::oauth_start,
             commands::oauth::oauth_complete,
             commands::oauth::oauth_get_token,

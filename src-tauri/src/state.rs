@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -10,9 +11,16 @@ pub struct SyncHandle {
     pub abort_handle: tokio::task::AbortHandle,
 }
 
+/// Handle for a running IMAP IDLE loop thread.
+pub struct IdleHandle {
+    pub stop_flag: Arc<AtomicBool>,
+    pub thread: Option<std::thread::JoinHandle<()>>,
+}
+
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
+    pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub data_dir: PathBuf,
 }
 
@@ -26,6 +34,7 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             sync_handles: RwLock::new(HashMap::new()),
+            idle_handles: std::sync::Mutex::new(HashMap::new()),
             data_dir,
         })
     }
