@@ -121,6 +121,28 @@ pub fn update_jmap_state(
     Ok(())
 }
 
+/// Recalculate folder counts from the messages table for all folders of an account.
+pub fn recalculate_folder_counts(conn: &Connection, account_id: &str) -> Result<()> {
+    log::debug!("Recalculating folder counts for account {}", account_id);
+    conn.execute(
+        "UPDATE folders SET
+            total_count = (
+                SELECT COUNT(*) FROM messages
+                WHERE messages.account_id = folders.account_id
+                  AND messages.folder_path = folders.path
+            ),
+            unread_count = (
+                SELECT COUNT(*) FROM messages
+                WHERE messages.account_id = folders.account_id
+                  AND messages.folder_path = folders.path
+                  AND messages.flags NOT LIKE '%seen%'
+            )
+         WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    Ok(())
+}
+
 /// Guess folder type from name for common IMAP folder names
 pub fn guess_folder_type(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();

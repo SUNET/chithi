@@ -235,6 +235,32 @@ function ctxUnthread() {
   closeContextMenu();
 }
 
+const isJunkFolder = () => {
+  const active = foldersStore.activeFolderPath;
+  if (!active) return false;
+  const folder = foldersStore.folders.find((f) => f.path === active);
+  return folder?.folder_type === "junk";
+};
+
+async function ctxNotSpam() {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId) return;
+  const inboxFolder = foldersStore.folders.find((f) => f.folder_type === "inbox");
+  if (!inboxFolder) return;
+  const ids = [...messagesStore.selectedIds];
+  closeContextMenu();
+  try {
+    await api.moveMessages(accountId, ids, inboxFolder.path);
+    messagesStore.clearSelection();
+    messagesStore.activeMessage = null;
+    messagesStore.activeMessageId = null;
+    await messagesStore.fetchMessages();
+    await foldersStore.fetchFolders();
+  } catch (e) {
+    console.error("Not Spam failed:", e);
+  }
+}
+
 const displayedCount = () => {
   if (uiStore.threadingEnabled) {
     return `${messagesStore.threads.length} of ${messagesStore.totalThreads} threads (${messagesStore.total} messages)`;
@@ -408,6 +434,12 @@ const displayedCount = () => {
         </div>
 
         <div class="ctx-separator"></div>
+
+        <button v-if="isJunkFolder()" class="ctx-item" @click="ctxNotSpam">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
+          Not Spam
+        </button>
+
         <button class="ctx-item danger" @click="ctxDelete">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
           Delete

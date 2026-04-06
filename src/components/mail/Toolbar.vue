@@ -1,10 +1,41 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
+import { useFoldersStore } from "@/stores/folders";
 import { openComposeWindow } from "@/lib/compose-window";
+import * as api from "@/lib/tauri";
 
 const messagesStore = useMessagesStore();
 const accountsStore = useAccountsStore();
+const foldersStore = useFoldersStore();
+
+const isJunkFolder = computed(() => {
+  const active = foldersStore.activeFolderPath;
+  if (!active) return false;
+  const folder = foldersStore.folders.find((f) => f.path === active);
+  return folder?.folder_type === "junk";
+});
+
+const hasSelection = computed(() => messagesStore.selectedIds.length > 0);
+
+async function markNotSpam() {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId || !hasSelection.value) return;
+  const inboxFolder = foldersStore.folders.find((f) => f.folder_type === "inbox");
+  if (!inboxFolder) return;
+  const ids = [...messagesStore.selectedIds];
+  try {
+    await api.moveMessages(accountId, ids, inboxFolder.path);
+    messagesStore.clearSelection();
+    messagesStore.activeMessage = null;
+    messagesStore.activeMessageId = null;
+    await messagesStore.fetchMessages();
+    await foldersStore.fetchFolders();
+  } catch (e) {
+    console.error("Not Spam failed:", e);
+  }
+}
 </script>
 
 <template>
@@ -15,6 +46,20 @@ const accountsStore = useAccountsStore();
       </svg>
       Compose
     </button>
+
+    <button
+      v-if="isJunkFolder && hasSelection"
+      class="not-spam-btn"
+      title="Move to Inbox"
+      @click="markNotSpam"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+        <polyline points="22 4 12 14.01 9 11.01" />
+      </svg>
+      Not Spam
+    </button>
+
     <span v-if="messagesStore.selectedIds.length > 1" class="selection-count">
       {{ messagesStore.selectedIds.length }} selected
     </span>
@@ -47,6 +92,24 @@ const accountsStore = useAccountsStore();
 
 .compose-btn:hover {
   background: var(--color-accent-hover);
+}
+
+.not-spam-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+  font-weight: 500;
+  font-size: 13px;
+  border-radius: 18px;
+  padding: 6px 16px;
+  transition: all 0.15s;
+}
+
+.not-spam-btn:hover {
+  background: var(--color-status-dot);
+  color: white;
 }
 
 .selection-count {

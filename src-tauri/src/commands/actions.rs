@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::state::AppState;
 
-/// Move messages to a target folder on the IMAP server and update local DB.
+/// Move messages to a target folder on the IMAP/JMAP server and update local DB.
 #[tauri::command]
 pub async fn move_messages(
     state: State<'_, AppState>,
@@ -21,54 +21,86 @@ pub async fn move_messages(
         target_folder
     );
 
-    // Get account config and message UIDs from DB
-    let (imap_config, by_folder) = {
+    let account = {
         let conn = state.db.lock().await;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-        };
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-        (config, grouped)
+        db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if by_folder.is_empty() {
-        log::warn!("No messages found for move operation");
-        return Ok(());
-    }
+    if account.mail_protocol == "jmap" {
+        // JMAP path: extract JMAP email IDs and source mailbox, then move via JMAP API
+        let jmap_config = crate::mail::jmap::JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
 
-    let target = target_folder.clone();
-
-    // Perform IMAP operations in a blocking thread
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = ImapConnection::connect(&imap_config)?;
-
-        for (folder_path, uids) in &by_folder {
-            log::debug!(
-                "Moving {} messages from '{}' to '{}'",
-                uids.len(),
-                folder_path,
-                target
-            );
-            conn.select_folder(folder_path)?;
-            conn.move_messages(uids, &target)?;
+        // Extract JMAP IDs and group by source folder
+        let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
+        for mid in &message_ids {
+            // Format: {account_id}_{folder}_{jmap_email_id}
+            let parts: Vec<&str> = mid.splitn(3, '_').collect();
+            if parts.len() == 3 {
+                by_folder.entry(parts[1].to_string()).or_default().push(parts[2].to_string());
+            }
         }
 
-        conn.logout();
-        Ok(())
-    })
-    .await
-    .map_err(|e| Error::Other(format!("Move task panicked: {}", e)))??;
+        // Find the JMAP mailbox ID for the target folder
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        let target_mailbox = target_folder.clone();
 
-    // Remove moved messages from local DB
+        for (source_mailbox, jmap_ids) in &by_folder {
+            conn_jmap.move_emails(&jmap_config, jmap_ids, source_mailbox, &target_mailbox).await?;
+        }
+    } else {
+        // IMAP path
+        let (imap_config, by_folder) = {
+            let conn = state.db.lock().await;
+            let config = ImapConfig {
+                host: account.imap_host,
+                port: account.imap_port,
+                username: account.username,
+                password: account.password,
+                use_tls: account.use_tls,
+            };
+            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let grouped = group_by_folder(uid_rows);
+            (config, grouped)
+        };
+
+        if by_folder.is_empty() {
+            log::warn!("No messages found for move operation");
+            return Ok(());
+        }
+
+        let target = target_folder.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = ImapConnection::connect(&imap_config)?;
+
+            for (folder_path, uids) in &by_folder {
+                log::debug!(
+                    "Moving {} messages from '{}' to '{}'",
+                    uids.len(),
+                    folder_path,
+                    target
+                );
+                conn.select_folder(folder_path)?;
+                conn.move_messages(uids, &target)?;
+            }
+
+            conn.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Move task panicked: {}", e)))??;
+    }
+
+    // Remove moved messages from local DB and recalculate folder counts
     {
         let conn = state.db.lock().await;
         db::messages::delete_messages_by_ids(&conn, &message_ids)?;
+        db::folders::recalculate_folder_counts(&conn, &account_id)?;
     }
 
     log::info!(
@@ -133,10 +165,11 @@ pub async fn delete_messages(
     .await
     .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
 
-    // Remove from local DB
+    // Remove from local DB and recalculate folder counts
     {
         let conn = state.db.lock().await;
         db::messages::delete_messages_by_ids(&conn, &message_ids)?;
+        db::folders::recalculate_folder_counts(&conn, &account_id)?;
     }
 
     log::info!(
