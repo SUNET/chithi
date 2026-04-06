@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -74,18 +74,62 @@ const showBcc = ref(false);
 const attachments = ref<ComposeAttachment[]>([]);
 const sentSuccessfully = ref(false);
 
-// Track initial values to detect changes
+// Signature management — track current signature so we can swap it
+// when the user switches accounts in the From dropdown.
+const currentSignature = ref("");
+const signatureSuffix = ref("");
+
+function buildSignatureBlock(sig: string, hasBody: boolean): string {
+  if (!sig) return "";
+  // 5 blank lines before signature for new/empty messages,
+  // 2 blank lines when appending to existing text (reply/forward)
+  const gap = hasBody ? "\n\n" : "\n\n\n\n\n";
+  return gap + sig;
+}
+
+async function applySignature(accountId: string) {
+  try {
+    const config = await api.getAccountConfig(accountId);
+    const oldBlock = signatureSuffix.value;
+    const newSig = config.signature || "";
+    const queryBody = (route.query.body as string) || "";
+    const hasBody = queryBody.length > 0;
+    const newBlock = buildSignatureBlock(newSig, hasBody);
+
+    if (oldBlock && bodyText.value.endsWith(oldBlock)) {
+      bodyText.value = bodyText.value.slice(0, -oldBlock.length) + newBlock;
+    } else if (newBlock) {
+      bodyText.value += newBlock;
+    }
+
+    currentSignature.value = newSig;
+    signatureSuffix.value = newBlock;
+    // Update baseline so signature alone doesn't count as dirty
+    baselineBody.value = bodyText.value;
+  } catch (e) {
+    console.error("Failed to load signature:", e);
+  }
+}
+
+// Apply signature on initial account selection and when switching accounts
+watch(selectedAccountId, (newId) => {
+  if (newId) applySignature(newId);
+});
+
+// Track initial values to detect changes.
+// baselineBody is updated after signature is applied so that
+// a new message with only a signature is not considered dirty.
 const initialTo = (route.query.to as string) || "";
 const initialCc = (route.query.cc as string) || "";
 const initialSubject = (route.query.subject as string) || "";
-const initialBody = (route.query.body as string) || "";
+const baselineBody = ref((route.query.body as string) || "");
 
 const isDirty = computed(() =>
   to.value !== initialTo ||
   cc.value !== initialCc ||
   bcc.value !== "" ||
   subject.value !== initialSubject ||
-  bodyText.value !== initialBody ||
+  bodyText.value !== baselineBody.value ||
   attachments.value.length > 0
 );
 

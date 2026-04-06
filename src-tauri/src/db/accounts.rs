@@ -28,6 +28,8 @@ pub struct AccountConfig {
     pub username: String,
     pub password: String,
     pub use_tls: bool,
+    #[serde(default)]
+    pub signature: String,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,7 @@ pub struct AccountFull {
     pub password: String,
     pub use_tls: bool,
     pub enabled: bool,
+    pub signature: String,
 }
 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
@@ -70,7 +73,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled FROM accounts WHERE id = ?1",
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -89,6 +92,7 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 password: String::new(),
                 use_tls: row.get(12)?,
                 enabled: row.get(13)?,
+                signature: row.get(14)?,
             })
         },
     ).map_err(|e| match e {
@@ -112,8 +116,8 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
     crate::keyring::set_password(id, &config.password)?;
 
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             config.display_name,
@@ -128,6 +132,7 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.caldav_url,
             config.username,
             config.use_tls,
+            config.signature,
         ],
     )?;
     Ok(())
@@ -140,8 +145,8 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
-         caldav_url=?10, username=?11, use_tls=?12, updated_at=CURRENT_TIMESTAMP
-         WHERE id=?13",
+         caldav_url=?10, username=?11, use_tls=?12, signature=?13, updated_at=CURRENT_TIMESTAMP
+         WHERE id=?14",
         params![
             config.display_name,
             config.email,
@@ -155,6 +160,7 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.caldav_url,
             config.username,
             config.use_tls,
+            config.signature,
             id,
         ],
     )?;
@@ -198,6 +204,7 @@ mod tests {
                 username TEXT NOT NULL,
                 use_tls INTEGER NOT NULL DEFAULT 1,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                signature TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -226,6 +233,7 @@ mod tests {
             username: "user".to_string(),
             password: "secret123".to_string(),
             use_tls: true,
+            signature: String::new(),
         }
     }
 
@@ -342,6 +350,27 @@ mod tests {
         assert_eq!(accounts[1].display_name, "Bob");
         crate::keyring::delete_password(&id1).ok();
         crate::keyring::delete_password(&id2).ok();
+    }
+
+    #[test]
+    fn test_signature_persists() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("alice@example.com", "Alice");
+        config.signature = "-- \nAlice Smith\nSenior Engineer".to_string();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(full.signature, "-- \nAlice Smith\nSenior Engineer");
+
+        // Update signature
+        let mut updated = config.clone();
+        updated.signature = "-- \nAlice S.".to_string();
+        update_account(&conn, &id, &updated).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(full.signature, "-- \nAlice S.");
+        crate::keyring::delete_password(&id).ok();
     }
 
     #[test]

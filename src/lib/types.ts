@@ -107,6 +107,7 @@ export interface AccountConfig {
   username: string;
   password: string;
   use_tls: boolean;
+  signature: string;
 }
 
 export interface FilterRule {

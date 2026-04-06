@@ -43,6 +43,7 @@ const defaultForm = (): AccountConfig => ({
   username: "",
   password: "",
   use_tls: true,
+  signature: "",
 });
 
 const form = ref<AccountConfig>(defaultForm());
@@ -349,6 +350,16 @@ async function doDelete() {
             <template v-if="accountType === 'gmail' && !editingAccountId">
               <div class="info-box">Gmail uses IMAP (imap.gmail.com:993) and SMTP (smtp.gmail.com:587). Sign in with Google above to authorize access.</div>
             </template>
+
+            <div class="form-group">
+              <label>Email Signature</label>
+              <textarea
+                v-model="form.signature"
+                class="signature-textarea"
+                rows="4"
+                placeholder="-- &#10;Your Name&#10;Your Title"
+              ></textarea>
+            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-secondary" @click="cancelForm">Cancel</button>
@@ -673,6 +684,23 @@ async function doDelete() {
 .type-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.signature-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: 'Liberation Mono', monospace;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  resize: vertical;
+}
+
+.signature-textarea:focus {
+  outline: none;
+  border-color: var(--color-accent);
 }
 
 .info-box {

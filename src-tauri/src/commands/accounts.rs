@@ -71,6 +71,7 @@ pub async fn get_account_config(
         username: full.username,
         password: full.password,
         use_tls: full.use_tls,
+        signature: full.signature,
     })
 }
 

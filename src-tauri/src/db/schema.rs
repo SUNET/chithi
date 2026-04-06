@@ -203,6 +203,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add signature column if it doesn't exist
+    let has_signature: bool = conn
+        .prepare("SELECT signature FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_signature {
+        log::info!("Migration: adding signature column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
     Ok(())
 }
 

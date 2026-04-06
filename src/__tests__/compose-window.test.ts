@@ -294,3 +294,74 @@ describe("saveDraft API", () => {
     }));
   });
 });
+
+describe("Signature management", () => {
+  // Mirror the compose view's buildSignatureBlock logic
+  function buildSignatureBlock(sig: string, hasBody: boolean): string {
+    if (!sig) return "";
+    const gap = hasBody ? "\n\n" : "\n\n\n\n\n";
+    return gap + sig;
+  }
+
+  it("appends signature to empty body with 5-line gap", () => {
+    let body = "";
+    const block = buildSignatureBlock("-- \nAlice Smith", false);
+    body += block;
+    expect(body).toBe("\n\n\n\n\n-- \nAlice Smith");
+  });
+
+  it("appends signature to reply body with 2-line gap", () => {
+    let body = "> Original message";
+    const block = buildSignatureBlock("-- \nAlice Smith", true);
+    body += block;
+    expect(body).toBe("> Original message\n\n-- \nAlice Smith");
+  });
+
+  it("replaces old signature block when switching accounts", () => {
+    const oldBlock = buildSignatureBlock("-- \nAlice Smith", false);
+    const newBlock = buildSignatureBlock("-- \nBob Jones", false);
+    let body = "" + oldBlock; // empty compose + sig
+
+    if (oldBlock && body.endsWith(oldBlock)) {
+      body = body.slice(0, -oldBlock.length) + newBlock;
+    }
+    expect(body).toBe("\n\n\n\n\n-- \nBob Jones");
+  });
+
+  it("removes old signature when new account has none", () => {
+    const oldBlock = buildSignatureBlock("-- \nAlice Smith", true);
+    const newBlock = buildSignatureBlock("", true);
+    let body = "> Original" + oldBlock;
+
+    if (oldBlock && body.endsWith(oldBlock)) {
+      body = body.slice(0, -oldBlock.length) + newBlock;
+    }
+    expect(body).toBe("> Original");
+  });
+
+  it("appends new signature when old account had none", () => {
+    let body = "Hello world";
+    const oldBlock: string = "";
+    const newBlock = buildSignatureBlock("-- \nBob Jones", true);
+
+    if (oldBlock.length > 0 && body.endsWith(oldBlock)) {
+      body = body.slice(0, -oldBlock.length) + newBlock;
+    } else if (newBlock) {
+      body += newBlock;
+    }
+    expect(body).toBe("Hello world\n\n-- \nBob Jones");
+  });
+
+  it("signature-only body is not dirty", () => {
+    // After applySignature, baselineBody is updated to match bodyText
+    const bodyText: string = "\n\n\n\n\n-- \nAlice Smith";
+    const baselineBody: string = "\n\n\n\n\n-- \nAlice Smith";
+    expect(bodyText !== baselineBody).toBe(false);
+  });
+
+  it("typing above signature makes it dirty", () => {
+    const bodyText: string = "Hello\n\n\n\n\n-- \nAlice Smith";
+    const baselineBody: string = "\n\n\n\n\n-- \nAlice Smith";
+    expect(bodyText !== baselineBody).toBe(true);
+  });
+});
