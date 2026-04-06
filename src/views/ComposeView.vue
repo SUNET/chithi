@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -35,6 +35,28 @@ onMounted(async () => {
     selectedAccountId.value = accounts.value[0].id;
   }
 });
+
+// WebKitGTK on Linux doesn't forward standard editing shortcuts (Ctrl+Z,
+// Ctrl+Shift+Z, Ctrl+A, Ctrl+X/C/V) to secondary WebviewWindows.
+// Intercept them and delegate to document.execCommand.
+function onEditShortcut(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const tag = (e.target as HTMLElement)?.tagName;
+  if (tag !== "INPUT" && tag !== "TEXTAREA") return;
+
+  let cmd: string | null = null;
+  if (e.key === "z" && e.shiftKey) cmd = "redo";
+  else if (e.key === "z") cmd = "undo";
+  else if (e.key === "a") cmd = "selectAll";
+  else if (e.key === "x") cmd = "cut";
+  else if (e.key === "c") cmd = "copy";
+  else if (e.key === "v") cmd = "paste";
+  if (cmd) {
+    document.execCommand(cmd);
+  }
+}
+window.addEventListener("keydown", onEditShortcut);
+onUnmounted(() => window.removeEventListener("keydown", onEditShortcut));
 
 // Prefill from query params (reply/reply-all/forward)
 const replyToMessageId = (route.query.replyTo as string) || "";
