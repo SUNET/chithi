@@ -365,3 +365,55 @@ describe("Signature management", () => {
     expect(bodyText !== baselineBody).toBe(true);
   });
 });
+
+describe("Contact lookup from email address", () => {
+  // Mirrors the exact-match logic in MessageReader.onAddrRightClick
+  function findExactContact(
+    results: { emails_json: string }[],
+    email: string,
+  ): { emails_json: string } | undefined {
+    return results.find((c) => {
+      try {
+        const emails: { email: string }[] = JSON.parse(c.emails_json);
+        return emails.some((e) => e.email.toLowerCase() === email.toLowerCase());
+      } catch { return false; }
+    });
+  }
+
+  it("finds exact email match in contacts", () => {
+    const results = [
+      { emails_json: JSON.stringify([{ email: "alice@example.com", label: "work" }]) },
+      { emails_json: JSON.stringify([{ email: "bob@example.com", label: "home" }]) },
+    ];
+    expect(findExactContact(results, "alice@example.com")).toBe(results[0]);
+  });
+
+  it("matches case-insensitively", () => {
+    const results = [
+      { emails_json: JSON.stringify([{ email: "Alice@Example.COM", label: "work" }]) },
+    ];
+    expect(findExactContact(results, "alice@example.com")).toBe(results[0]);
+  });
+
+  it("returns undefined when no match", () => {
+    const results = [
+      { emails_json: JSON.stringify([{ email: "bob@example.com", label: "work" }]) },
+    ];
+    expect(findExactContact(results, "alice@example.com")).toBeUndefined();
+  });
+
+  it("handles multiple emails per contact", () => {
+    const results = [
+      { emails_json: JSON.stringify([
+        { email: "alice-work@co.com", label: "work" },
+        { email: "alice@personal.com", label: "home" },
+      ]) },
+    ];
+    expect(findExactContact(results, "alice@personal.com")).toBe(results[0]);
+  });
+
+  it("handles malformed emails_json gracefully", () => {
+    const results = [{ emails_json: "not json" }];
+    expect(findExactContact(results, "alice@example.com")).toBeUndefined();
+  });
+});
