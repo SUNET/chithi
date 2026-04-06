@@ -62,6 +62,7 @@ pub struct JmapConnection {
     api_url: String,
     download_url_template: String,
     upload_url_template: String,
+    event_source_url_template: Option<String>,
     account_id: String,
 }
 
@@ -73,6 +74,8 @@ struct JmapSession {
     download_url: String,
     #[serde(rename = "uploadUrl")]
     upload_url: String,
+    #[serde(rename = "eventSourceUrl", default)]
+    event_source_url: Option<String>,
     #[serde(rename = "primaryAccounts")]
     primary_accounts: std::collections::HashMap<String, String>,
 }
@@ -141,20 +144,35 @@ impl JmapConnection {
         let api_url = rewrite_url(&session.api_url, &base_url);
         let download_url = rewrite_url(&session.download_url, &base_url);
         let upload_url = rewrite_url(&session.upload_url, &base_url);
+        let event_source_url = session.event_source_url
+            .as_deref()
+            .map(|u| rewrite_url(u, &base_url));
 
-        log::info!("JMAP connected: account={}, api={}", account_id, api_url);
+        log::info!("JMAP connected: account={}, api={}, eventSource={:?}", account_id, api_url, event_source_url);
 
         Ok(Self {
             http,
             api_url,
             download_url_template: download_url,
             upload_url_template: upload_url,
+            event_source_url_template: event_source_url,
             account_id,
         })
     }
 
     pub fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    /// Build the EventSource URL for push notifications.
+    /// The template uses `{types}`, `{closeafter}`, and `{ping}` placeholders
+    /// per RFC 8620 §7.3.
+    pub fn event_source_url(&self, types: &str, ping: u32) -> Option<String> {
+        self.event_source_url_template.as_ref().map(|tpl| {
+            tpl.replace("{types}", types)
+                .replace("{closeafter}", "no")
+                .replace("{ping}", &ping.to_string())
+        })
     }
 
     /// Send a JMAP API request and return the response JSON.

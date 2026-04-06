@@ -17,10 +17,11 @@ pub async fn trigger_sync(
     current_folder: Option<String>,
 ) -> Result<()> {
     log::info!("Sync requested for account {}", account_id);
-    let account = match {
+    let account_result = {
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)
-    } {
+    };
+    let account = match account_result {
         Ok(a) => a,
         Err(e) => {
             app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
@@ -494,7 +495,7 @@ pub async fn prefetch_bodies(
     Ok(fetched_count)
 }
 
-/// Start IMAP IDLE for all IMAP accounts. Call on app startup.
+/// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
 #[tauri::command]
 pub async fn start_idle(
     app: AppHandle,
@@ -506,82 +507,167 @@ pub async fn start_idle(
     };
 
     for account in &accounts {
-        if account.mail_protocol != "imap" { continue; }
         if !account.enabled { continue; }
 
-        // Check if already running
-        {
-            let handles = state.idle_handles.lock().unwrap();
-            if handles.contains_key(&account.id) {
-                log::debug!("IDLE already running for account {}", account.id);
-                continue;
-            }
+        if account.mail_protocol == "imap" {
+            start_imap_idle(&app, &state, account).await?;
+        } else if account.mail_protocol == "jmap" {
+            start_jmap_push(&app, &state, account).await?;
         }
-
-        let full_account = {
-            let conn = state.db.lock().await;
-            db::accounts::get_account_full(&conn, &account.id)?
-        };
-
-        let config = ImapConfig {
-            host: full_account.imap_host.clone(),
-            port: full_account.imap_port,
-            username: full_account.username.clone(),
-            password: full_account.password.clone(),
-            use_tls: full_account.use_tls,
-        };
-
-        let account_id = account.id.clone();
-        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_clone = stop_flag.clone();
-        let app_clone = app.clone();
-
-        let thread = std::thread::spawn(move || {
-            crate::mail::idle::run_idle_loop(
-                config,
-                account_id.clone(),
-                stop_clone,
-                Box::new(move |event| {
-                    match event {
-                        crate::mail::idle::IdleEvent::NewMail(aid) => {
-                            app_clone.emit("idle-new-mail", aid).ok();
-                        }
-                        crate::mail::idle::IdleEvent::Disconnected(aid) => {
-                            app_clone.emit("idle-disconnected", aid).ok();
-                        }
-                        crate::mail::idle::IdleEvent::Reconnected(aid) => {
-                            app_clone.emit("idle-reconnected", aid).ok();
-                        }
-                    }
-                }),
-            );
-        });
-
-        let handle = crate::state::IdleHandle {
-            stop_flag,
-            thread: Some(thread),
-        };
-
-        state.idle_handles.lock().unwrap().insert(account.id.clone(), handle);
-        log::info!("Started IDLE loop for account {}", account.id);
     }
 
     Ok(())
 }
 
-/// Stop all IMAP IDLE loops.
+async fn start_imap_idle(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account: &db::accounts::Account,
+) -> Result<()> {
+    // Check if already running
+    {
+        let handles = state.idle_handles.lock().unwrap();
+        if handles.contains_key(&account.id) {
+            log::debug!("IDLE already running for account {}", account.id);
+            return Ok(());
+        }
+    }
+
+    let full_account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account.id)?
+    };
+
+    let config = ImapConfig {
+        host: full_account.imap_host.clone(),
+        port: full_account.imap_port,
+        username: full_account.username.clone(),
+        password: full_account.password.clone(),
+        use_tls: full_account.use_tls,
+    };
+
+    let account_id = account.id.clone();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let app_clone = app.clone();
+
+    let thread = std::thread::spawn(move || {
+        crate::mail::idle::run_idle_loop(
+            config,
+            account_id.clone(),
+            stop_clone,
+            Box::new(move |event| {
+                match event {
+                    crate::mail::idle::IdleEvent::NewMail(aid) => {
+                        app_clone.emit("idle-new-mail", aid).ok();
+                    }
+                    crate::mail::idle::IdleEvent::Disconnected(aid) => {
+                        app_clone.emit("idle-disconnected", aid).ok();
+                    }
+                    crate::mail::idle::IdleEvent::Reconnected(aid) => {
+                        app_clone.emit("idle-reconnected", aid).ok();
+                    }
+                }
+            }),
+        );
+    });
+
+    let handle = crate::state::IdleHandle {
+        stop_flag,
+        thread: Some(thread),
+    };
+
+    state.idle_handles.lock().unwrap().insert(account.id.clone(), handle);
+    log::info!("Started IDLE loop for account {}", account.id);
+    Ok(())
+}
+
+async fn start_jmap_push(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account: &db::accounts::Account,
+) -> Result<()> {
+    // Check if already running
+    {
+        let handles = state.jmap_push_handles.lock().unwrap();
+        if handles.contains_key(&account.id) {
+            log::debug!("JMAP push already running for account {}", account.id);
+            return Ok(());
+        }
+    }
+
+    let full_account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account.id)?
+    };
+
+    let jmap_config = JmapConfig {
+        jmap_url: full_account.jmap_url.clone(),
+        email: full_account.email.clone(),
+        username: full_account.username.clone(),
+        password: full_account.password.clone(),
+    };
+
+    let account_id = account.id.clone();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let app_clone = app.clone();
+
+    let task = tokio::spawn(async move {
+        crate::mail::jmap_push::run_push_loop(
+            jmap_config,
+            account_id.clone(),
+            stop_clone,
+            std::sync::Arc::new(move |event| {
+                match event {
+                    crate::mail::jmap_push::PushEvent::StateChange(aid) => {
+                        app_clone.emit("idle-new-mail", &aid).ok();
+                    }
+                    crate::mail::jmap_push::PushEvent::Disconnected(aid) => {
+                        app_clone.emit("idle-disconnected", &aid).ok();
+                    }
+                    crate::mail::jmap_push::PushEvent::Reconnected(aid) => {
+                        app_clone.emit("idle-reconnected", &aid).ok();
+                    }
+                }
+            }),
+        )
+        .await;
+    });
+
+    let handle = crate::state::JmapPushHandle {
+        stop_flag,
+        task,
+    };
+
+    state.jmap_push_handles.lock().unwrap().insert(account.id.clone(), handle);
+    log::info!("Started JMAP push for account {}", account.id);
+    Ok(())
+}
+
+/// Stop all IMAP IDLE loops and JMAP push tasks.
 #[tauri::command]
 pub async fn stop_idle(
     state: State<'_, AppState>,
 ) -> Result<()> {
+    // Stop IMAP IDLE threads
     let mut handles = state.idle_handles.lock().unwrap();
     for (account_id, handle) in handles.drain() {
         log::info!("Stopping IDLE loop for account {}", account_id);
         handle.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = handle.thread {
-            // Don't join — let it finish on its own (IDLE may take up to timeout)
             drop(thread);
         }
     }
+    drop(handles);
+
+    // Stop JMAP push tasks
+    let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
+    for (account_id, handle) in jmap_handles.drain() {
+        log::info!("Stopping JMAP push for account {}", account_id);
+        handle.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.task.abort();
+    }
+
     Ok(())
 }

@@ -17,10 +17,17 @@ pub struct IdleHandle {
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Handle for a running JMAP EventSource push task.
+pub struct JmapPushHandle {
+    pub stop_flag: Arc<AtomicBool>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
+    pub jmap_push_handles: std::sync::Mutex<HashMap<String, JmapPushHandle>>,
     pub data_dir: PathBuf,
 }
 
@@ -35,6 +42,7 @@ impl AppState {
             db: Arc::new(Mutex::new(conn)),
             sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
+            jmap_push_handles: std::sync::Mutex::new(HashMap::new()),
             data_dir,
         })
     }
