@@ -145,7 +145,7 @@ onMounted(async () => {
   // Start IMAP IDLE for push notifications
   api.startIdle().catch((e) => console.error("Failed to start IDLE:", e));
 
-  // Listen for IDLE new-mail events
+  // Listen for IDLE events
   await listen("idle-new-mail", async (event) => {
     const accountId = event.payload as string;
     console.log("IDLE new mail for account", accountId);
@@ -154,6 +154,14 @@ onMounted(async () => {
     } catch (e) {
       console.error("IDLE sync trigger failed:", e);
     }
+  });
+
+  await listen("idle-disconnected", (event) => {
+    console.warn("IDLE disconnected for account", event.payload);
+  });
+
+  await listen("idle-reconnected", (event) => {
+    console.log("IDLE reconnected for account", event.payload);
   });
 });
 

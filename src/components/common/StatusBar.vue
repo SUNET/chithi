@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
+import { listen } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -13,6 +14,26 @@ const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const calendarStore = useCalendarStore();
 const lastSyncTime = ref<Date | null>(null);
+const connectionStatus = ref<"connected" | "disconnected" | "reconnecting">("connected");
+const syncError = ref<string | null>(null);
+
+onMounted(async () => {
+  await listen("idle-disconnected", () => {
+    connectionStatus.value = "disconnected";
+  });
+  await listen("idle-reconnected", () => {
+    connectionStatus.value = "connected";
+    syncError.value = null;
+  });
+  await listen<{ error: string }>("sync-error", (event) => {
+    connectionStatus.value = "disconnected";
+    syncError.value = event.payload.error;
+  });
+  await listen("sync-complete", () => {
+    connectionStatus.value = "connected";
+    syncError.value = null;
+  });
+});
 
 const lastSyncLabel = computed(() => {
   if (!lastSyncTime.value) return "";
@@ -62,8 +83,10 @@ async function syncAll() {
         Sync
       </button>
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
-      <span class="status-dot"></span>
-      <span class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
+      <span class="status-dot" :class="connectionStatus"></span>
+      <span v-if="syncError" class="sync-error-msg">{{ syncError }}</span>
+      <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
+      <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>
     <div class="status-right">
       <span v-if="lastSyncLabel" class="last-sync">{{ lastSyncLabel }}</span>
@@ -138,6 +161,27 @@ async function syncAll() {
   border-radius: 50%;
   background: var(--color-status-dot);
   flex-shrink: 0;
+}
+
+.status-dot.disconnected {
+  background: var(--color-danger);
+}
+
+.status-dot.reconnecting {
+  background: var(--color-warning);
+}
+
+.sync-error-msg {
+  color: var(--color-danger-text);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.disconnect-msg {
+  color: var(--color-warning);
+  font-size: 11px;
 }
 
 .op-spinner {

@@ -17,9 +17,15 @@ pub async fn trigger_sync(
     current_folder: Option<String>,
 ) -> Result<()> {
     log::info!("Sync requested for account {}", account_id);
-    let account = {
+    let account = match {
         let conn = state.db.lock().await;
-        db::accounts::get_account_full(&conn, &account_id)?
+        db::accounts::get_account_full(&conn, &account_id)
+    } {
+        Ok(a) => a,
+        Err(e) => {
+            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
+            return Err(e);
+        }
     };
 
     if account.mail_protocol == "jmap" {
@@ -37,8 +43,8 @@ pub async fn trigger_sync(
             password: account.password.clone(),
         };
 
-        jmap_sync::sync_jmap_account(
-            app,
+        if let Err(e) = jmap_sync::sync_jmap_account(
+            app.clone(),
             state.db.clone(),
             state.data_dir.clone(),
             account_id.clone(),
@@ -46,7 +52,10 @@ pub async fn trigger_sync(
             jmap_config.clone(),
             current_folder,
         )
-        .await?;
+        .await {
+            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
+            return Err(e);
+        }
 
         // Also sync calendars for JMAP accounts
         log::info!("Syncing calendars for JMAP account {}", account_id);
@@ -71,16 +80,19 @@ pub async fn trigger_sync(
             use_tls: account.use_tls,
         };
 
-        mail_sync::sync_account(
-            app,
+        if let Err(e) = mail_sync::sync_account(
+            app.clone(),
             state.db.clone(),
             state.data_dir.clone(),
-            account_id,
+            account_id.clone(),
             account.display_name,
             imap_config,
             current_folder,
         )
-        .await?;
+        .await {
+            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
+            return Err(e);
+        }
     }
 
     Ok(())
@@ -529,9 +541,18 @@ pub async fn start_idle(
                 config,
                 account_id.clone(),
                 stop_clone,
-                Box::new(move |_aid| {
-                    // Emit event to frontend to trigger sync
-                    app_clone.emit("idle-new-mail", &account_id).ok();
+                Box::new(move |event| {
+                    match event {
+                        crate::mail::idle::IdleEvent::NewMail(aid) => {
+                            app_clone.emit("idle-new-mail", aid).ok();
+                        }
+                        crate::mail::idle::IdleEvent::Disconnected(aid) => {
+                            app_clone.emit("idle-disconnected", aid).ok();
+                        }
+                        crate::mail::idle::IdleEvent::Reconnected(aid) => {
+                            app_clone.emit("idle-reconnected", aid).ok();
+                        }
+                    }
                 }),
             );
         });
