@@ -22,9 +22,15 @@ export const useFoldersStore = defineStore("folders", () => {
     try {
       folders.value = await api.listFolders(accountId);
       foldersByAccount.value = { ...foldersByAccount.value, [accountId]: folders.value };
-      if (folders.value.length > 0 && !activeFolderPath.value) {
-        const inbox = folders.value.find((f) => f.folder_type === "inbox");
-        activeFolderPath.value = inbox?.path ?? folders.value[0].path;
+      if (folders.value.length > 0) {
+        // If no folder is selected, or the selected folder doesn't exist
+        // in this account, default to Inbox.
+        const currentValid = activeFolderPath.value &&
+          folders.value.some((f) => f.path === activeFolderPath.value);
+        if (!currentValid) {
+          const inbox = folders.value.find((f) => f.folder_type === "inbox");
+          activeFolderPath.value = inbox?.path ?? folders.value[0].path;
+        }
       }
 
       if (folders.value.length === 0) {
@@ -66,7 +72,6 @@ export const useFoldersStore = defineStore("folders", () => {
   watch(
     () => accountsStore.activeAccountId,
     () => {
-      activeFolderPath.value = null;
       fetchFolders();
     },
   );

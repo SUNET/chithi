@@ -51,10 +51,12 @@ function toggleAccountCollapse(accountId: string) {
 }
 
 function selectFolder(accountId: string, folderPath: string) {
+  // Set the folder path BEFORE switching accounts so the watcher
+  // in the folders store doesn't reset it to Inbox.
+  foldersStore.setActiveFolder(folderPath);
   if (accountsStore.activeAccountId !== accountId) {
     accountsStore.setActiveAccount(accountId);
   }
-  foldersStore.setActiveFolder(folderPath);
 }
 
 onMounted(() => {
