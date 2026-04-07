@@ -893,6 +893,9 @@ async fn sync_calendars_google(
             }
         }
 
+        // Drop the conn lock before acquiring again for syncToken
+        drop(conn);
+
         // Save nextSyncToken for incremental sync next time
         if let Some(next_token) = events_data["nextSyncToken"].as_str() {
             let conn = state.db.lock().await;

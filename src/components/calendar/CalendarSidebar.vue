@@ -1,9 +1,16 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import { useAccountsStore } from "@/stores/accounts";
 import * as api from "@/lib/tauri";
 
 const calendarStore = useCalendarStore();
+const accountsStore = useAccountsStore();
+
+function getAccountName(accountId: string): string {
+  const acc = accountsStore.accounts.find((a) => a.id === accountId);
+  return acc ? `${acc.display_name} (${acc.email})` : "";
+}
 
 const contextMenu = ref<{ x: number; y: number; calendarId: string; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
@@ -60,7 +67,7 @@ async function syncThisCalendar() {
             class="calendar-color"
             :style="{ backgroundColor: getCalendarColor(cal.color) }"
           ></span>
-          <span class="calendar-name">{{ cal.name }}</span>
+          <span class="calendar-name" :title="getAccountName(cal.account_id)">{{ cal.name }}</span>
           <span v-if="syncing === cal.id" class="sync-spinner"></span>
         </label>
       </div>

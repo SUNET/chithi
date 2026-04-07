@@ -421,19 +421,41 @@ pub async fn prefetch_bodies(
         }
     }
 
-    let (imap_config, data_dir) = {
+    let account = {
         let conn = state.db.lock().await;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-            use_xoauth2: false,
-        };
-        (config, state.data_dir.clone())
+        db::accounts::get_account_full(&conn, &account_id)?
     };
+
+    // For O365: get IMAP-scoped OAuth token
+    let (password, use_xoauth2) = if account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account_id)?
+            .ok_or_else(|| Error::Other("No O365 tokens for prefetch".into()))?;
+        let refresh_token = tokens.refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token for prefetch".into()))?;
+        let imap_tokens = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT,
+            &refresh_token,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
+            access_token: imap_tokens.access_token.clone(),
+            refresh_token: imap_tokens.refresh_token,
+            expires_at: imap_tokens.expires_at,
+        })?;
+        (imap_tokens.access_token, true)
+    } else {
+        (account.password.clone(), false)
+    };
+
+    let imap_config = ImapConfig {
+        host: account.imap_host,
+        port: account.imap_port,
+        username: account.username,
+        password,
+        use_tls: account.use_tls,
+        use_xoauth2,
+    };
+    let data_dir = state.data_dir.clone();
 
     // Fetch the list of unfetched messages (up to 1000 per cycle)
     let unfetched = {

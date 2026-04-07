@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import { useAccountsStore } from "@/stores/accounts";
 import type { CalendarViewMode } from "@/stores/calendar";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
@@ -9,6 +10,7 @@ import EventDetail from "@/components/calendar/EventDetail.vue";
 import EventForm from "@/components/calendar/EventForm.vue";
 
 const calendarStore = useCalendarStore();
+const accountsStore = useAccountsStore();
 const showEventForm = ref(false);
 const newEventStart = ref("");
 
@@ -28,8 +30,19 @@ function onEventClick(eventId: string) {
 }
 
 onMounted(async () => {
+  // Ensure accounts are loaded — App.vue loads them but it may not be done yet
+  if (accountsStore.accounts.length === 0) {
+    await accountsStore.fetchAccounts();
+  }
   // Sync calendars from server, then fetch local data
-  await calendarStore.syncCalendars();
+  try {
+    await calendarStore.syncCalendars();
+  } catch (e) {
+    console.error("Calendar sync error:", e);
+  }
+  // Always fetch local calendars even if sync fails
+  await calendarStore.fetchCalendars();
+  await calendarStore.fetchEvents();
 });
 </script>
 

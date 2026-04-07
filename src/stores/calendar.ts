@@ -85,6 +85,9 @@ export const useCalendarStore = defineStore("calendar", () => {
   }
 
   async function syncCalendars() {
+    if (accountsStore.accounts.length === 0) {
+      await accountsStore.fetchAccounts();
+    }
     for (const account of accountsStore.accounts) {
       try {
         await api.syncCalendars(account.id);
@@ -97,8 +100,11 @@ export const useCalendarStore = defineStore("calendar", () => {
   }
 
   async function fetchCalendars() {
-    const accountId = accountsStore.activeAccountId;
-    if (!accountId) {
+    // Ensure accounts are loaded
+    if (accountsStore.accounts.length === 0) {
+      await accountsStore.fetchAccounts();
+    }
+    if (accountsStore.accounts.length === 0) {
       calendars.value = [];
       return;
     }

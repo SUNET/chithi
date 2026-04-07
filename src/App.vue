@@ -5,18 +5,22 @@ import Sidebar from "@/components/common/Sidebar.vue";
 import MenuBar from "@/components/common/MenuBar.vue";
 import StatusBar from "@/components/common/StatusBar.vue";
 import { useActivityStore } from "@/stores/activity";
+import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 
 const route = useRoute();
 const activityStore = useActivityStore();
+const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 
 // Compose opens in a separate window — hide app chrome
 const isComposeWindow = computed(() => route.name === "compose");
 
-onMounted(() => {
+onMounted(async () => {
   uiStore.initTheme();
   activityStore.initEventListeners();
+  // Load accounts globally so all views (Calendar, Contacts, etc.) have them
+  await accountsStore.fetchAccounts();
 });
 </script>
 

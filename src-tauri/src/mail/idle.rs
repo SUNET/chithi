@@ -50,7 +50,7 @@ pub fn run_idle_loop(
             Ok(c) => c,
             Err(e) => {
                 if !was_disconnected {
-                    log::error!("IDLE: connection failed for {}: {}", account_id, e);
+                    log::error!("IDLE: connection failed for {} ({}): {}", account_id, config.username, e);
                     on_event(IdleEvent::Disconnected(&account_id));
                     was_disconnected = true;
                 }
@@ -65,7 +65,7 @@ pub fn run_idle_loop(
 
         // Select INBOX
         if let Err(e) = conn.select_folder("INBOX") {
-            log::error!("IDLE: failed to select INBOX for {}: {}", account_id, e);
+            log::error!("IDLE: failed to select INBOX for {} ({}): {}", account_id, config.username, e);
             sleep_interruptible(&stop, backoff);
             backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
             continue;

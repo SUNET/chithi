@@ -122,20 +122,42 @@ impl GraphClient {
         log::info!("Graph /me: displayName={}, login_email={}", display_name, login_email);
 
         // For personal Microsoft accounts, the login email (e.g., gmail.com) may differ
-        // from the actual Outlook mailbox address. Try to find the real mailbox email
-        // from a sent message's From address.
-        if let Ok(sent_resp) = self.get(
-            "/me/mailFolders('SentItems')/messages",
-            &[("$top", "1"), ("$select", "from")],
+        // from the actual Outlook mailbox address. Try multiple sources:
+
+        // 1. Check To address of inbox messages (catches user-configured aliases like chithiapp@outlook.com)
+        if let Ok(inbox_resp) = self.get(
+            "/me/mailFolders('Inbox')/messages",
+            &[("$top", "1"), ("$select", "toRecipients")],
         ).await {
-            if let Some(from_addr) = sent_resp["value"]
+            if let Some(to_addr) = inbox_resp["value"]
                 .as_array()
                 .and_then(|a| a.first())
-                .and_then(|m| m["from"]["emailAddress"]["address"].as_str())
+                .and_then(|m| m["toRecipients"].as_array())
+                .and_then(|r| r.first())
+                .and_then(|r| r["emailAddress"]["address"].as_str())
             {
-                if from_addr != email {
-                    log::info!("Graph: actual mailbox email from Sent: {}", from_addr);
-                    email = from_addr.to_string();
+                if to_addr != email && (to_addr.contains("outlook.") || to_addr.contains("hotmail.") || to_addr.contains("live.")) {
+                    log::info!("Graph: mailbox email from Inbox To: {}", to_addr);
+                    email = to_addr.to_string();
+                }
+            }
+        }
+
+        // 2. Fallback: check From address of sent messages
+        if email == login_email {
+            if let Ok(sent_resp) = self.get(
+                "/me/mailFolders('SentItems')/messages",
+                &[("$top", "1"), ("$select", "from")],
+            ).await {
+                if let Some(from_addr) = sent_resp["value"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|m| m["from"]["emailAddress"]["address"].as_str())
+                {
+                    if from_addr != email {
+                        log::info!("Graph: mailbox email from Sent: {}", from_addr);
+                        email = from_addr.to_string();
+                    }
                 }
             }
         }

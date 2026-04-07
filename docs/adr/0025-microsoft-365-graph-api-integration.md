@@ -70,19 +70,20 @@ The `imap` crate's `Authenticator` trait is implemented for XOAUTH2. `lettre` us
 **Critical**: The `user=` field MUST be the Microsoft login identity (e.g., `kushaldas@gmail.com`), NOT the Outlook mailbox alias. The mailbox alias is used as the display `email` field.
 
 ### Account identity for personal Microsoft accounts
-Personal Microsoft accounts created with an external email (e.g., `kushaldas@gmail.com`) have a quirk:
+Personal Microsoft accounts created with an external email (e.g., `kushaldas@gmail.com`) have three different email addresses:
 
-- `GET /me` returns `mail: kushaldas@gmail.com` and `userPrincipalName: kushaldas@gmail.com`
-- The actual Outlook mailbox address (`outlook_A634C77E51D17412@outlook.com`) is only visible in Outlook settings, not via Graph API
-- `POST /me/sendMail` sends with `From: kushaldas@gmail.com` but `Sender: outlook_...@outlook.com`
-- This causes **DMARC failure** because `gmail.com` has a DMARC policy and the email was sent from `outlook.com` infrastructure:
-  ```
-  dmarc=fail action=none header.from=gmail.com
-  ```
-- SPF and DKIM pass for `outlook.com`, but DMARC checks the `From` domain (`gmail.com`) against the sending domain
-- The email still gets delivered because Gmail's DMARC policy action is `none` (monitor, don't reject)
-- **This is a Microsoft account configuration limitation**, not a Chithi bug
-- Work/school O365 accounts with proper domains do not have this issue
+- **Login identity**: `kushaldas@gmail.com` — returned by Graph `/me` as `mail` and `userPrincipalName`. Used for IMAP XOAUTH2 `user=` field.
+- **Internal alias**: `outlook_A634C77E51D17412@outlook.com` — the auto-generated mailbox address. Found in Sent Items From header.
+- **User alias**: `chithiapp@outlook.com` — a user-configured alias set in Microsoft account settings. This is the address others send to.
+
+### Email address auto-discovery
+The profile fetch tries multiple sources in priority order:
+
+1. **Inbox To address** — checks the most recent inbox message's `toRecipients[0]`. Finds user-configured aliases (e.g., `chithiapp@outlook.com`). This is the most user-facing address.
+2. **Sent Items From** — checks the most recent sent message's `from.emailAddress.address`. Finds the internal alias (e.g., `outlook_A634...@outlook.com`). Used as fallback when inbox is empty.
+3. **Graph /me** — returns the login identity (e.g., `kushaldas@gmail.com`). Last resort.
+
+The discovered email goes into `account.email` (display/From). The login identity stays in `account.username` (for IMAP XOAUTH2 auth).
 
 ### Routing
 ```
