@@ -22,6 +22,20 @@ Supports IMAP, JMAP, CalDAV, and JMAP Calendar with a Thunderbird-style three-pa
 
 ## System Dependencies
 
+### Arch
+```bash
+  sudo pacman -S --needed \
+    base-devel \
+    openssl \
+    dbus \
+    gtk3 \
+    webkit2gtk-4.1 \
+    libayatana-appindicator \
+    librsvg \
+    curl \
+    wget
+```
+
 ### Debian / Ubuntu
 
 ```bash
