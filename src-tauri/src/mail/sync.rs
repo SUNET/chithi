@@ -91,6 +91,9 @@ pub async fn sync_account(
     result.map(|_| ())
 }
 
+/// Maximum number of concurrent IMAP connections for parallel folder sync.
+const MAX_PARALLEL_CONNECTIONS: usize = 4;
+
 fn sync_account_blocking(
     app: &AppHandle,
     db: Arc<Mutex<rusqlite::Connection>>,
@@ -114,29 +117,45 @@ fn sync_account_blocking(
         }
     }
 
-    // Sync order: current folder first, then INBOX, then the rest
-    let mut priority: Vec<&str> = Vec::new();
-    let mut others: Vec<&str> = Vec::new();
+    // Gmail virtual folders that duplicate content — skip envelope sync
+    // but keep them in the DB (they're needed for move/delete operations).
+    // [Gmail]/All Mail contains every email, [Gmail]/Important is a virtual view.
+    // [Gmail] itself is not a selectable mailbox.
+    let skip_sync_folders: &[&str] = &[
+        "[Gmail]/All Mail",
+        "[Gmail]/Important",
+        "[Gmail]",
+    ];
+
+    // Sync order: priority folders first (current, INBOX), then rest in parallel.
+    // Folders in skip_sync_folders are registered in DB (above) but not synced.
+    let mut priority: Vec<String> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
     for (_, path) in &imap_folders {
+        if skip_sync_folders.iter().any(|skip| path.eq_ignore_ascii_case(skip)) {
+            log::debug!("Skipping envelope sync for Gmail virtual folder: {}", path);
+            continue;
+        }
         if current_folder.map(|cf| cf == path.as_str()).unwrap_or(false) {
-            priority.insert(0, path.as_str());
+            priority.insert(0, path.clone());
         } else if path.to_uppercase() == "INBOX" {
-            priority.push(path.as_str());
+            priority.push(path.clone());
         } else {
-            others.push(path.as_str());
+            others.push(path.clone());
         }
     }
-    let all_folders: Vec<&str> = priority.into_iter().chain(others).collect();
 
-    let total_folders = all_folders.len();
+    let total_folders = priority.len() + others.len();
     let mut grand_total = 0u32;
 
-    for (i, folder) in all_folders.iter().enumerate() {
+    // Phase 1: Sync priority folders sequentially on the existing connection
+    // (current folder + INBOX first so the UI is usable quickly)
+    for (i, folder) in priority.iter().enumerate() {
         app.emit(
             "sync-progress",
             SyncProgress {
                 account_id: account_id.to_string(),
-                folder: folder.to_string(),
+                folder: folder.clone(),
                 synced: 0,
                 total_folders,
                 current_folder: i + 1,
@@ -149,27 +168,103 @@ fn sync_account_blocking(
                 grand_total += count;
                 if count > 0 {
                     log::info!("Synced {} envelopes in {}", count, folder);
-                    app.emit(
-                        "sync-progress",
-                        SyncProgress {
-                            account_id: account_id.to_string(),
-                            folder: folder.to_string(),
-                            synced: count,
-                            total_folders,
-                            current_folder: i + 1,
-                        },
-                    )
-                    .ok();
                 }
+                app.emit(
+                    "sync-progress",
+                    SyncProgress {
+                        account_id: account_id.to_string(),
+                        folder: folder.clone(),
+                        synced: count,
+                        total_folders,
+                        current_folder: i + 1,
+                    },
+                )
+                .ok();
             }
             Err(e) => log::error!("Error syncing {}: {}", folder, e),
+        }
+    }
+
+    conn_imap.logout();
+
+    // Phase 2: Sync remaining folders in parallel with multiple connections.
+    // Capture the Tokio runtime handle so spawned threads can block_on the async DB mutex.
+    if !others.is_empty() {
+        let parallel_count = MAX_PARALLEL_CONNECTIONS.min(others.len());
+        log::info!(
+            "Parallel sync: {} remaining folders with {} connections",
+            others.len(),
+            parallel_count
+        );
+
+        let mut thread_folders: Vec<Vec<String>> = (0..parallel_count).map(|_| Vec::new()).collect();
+        for (i, folder) in others.iter().enumerate() {
+            thread_folders[i % parallel_count].push(folder.clone());
+        }
+
+        let rt_handle = tokio::runtime::Handle::current();
+        let priority_count = priority.len();
+        let results: Vec<Result<u32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = thread_folders
+                .into_iter()
+                .enumerate()
+                .map(|(thread_idx, folders)| {
+                    let db = db.clone();
+                    let imap_config = imap_config.clone();
+                    let account_id = account_id.to_string();
+                    let app = app.clone();
+                    let rt = rt_handle.clone();
+                    s.spawn(move || {
+                        // Enter the Tokio runtime context so block_on(db.lock()) works
+                        let _guard = rt.enter();
+                        let mut conn = match ImapConnection::connect(&imap_config) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log::error!("Parallel sync thread {}: connect failed: {}", thread_idx, e);
+                                return Err(e);
+                            }
+                        };
+                        let mut thread_total = 0u32;
+                        for folder in &folders {
+                            let folder_idx = priority_count + thread_idx + (folders.iter().position(|f| f == folder).unwrap_or(0) * parallel_count);
+                            app.emit(
+                                "sync-progress",
+                                SyncProgress {
+                                    account_id: account_id.clone(),
+                                    folder: folder.clone(),
+                                    synced: 0,
+                                    total_folders,
+                                    current_folder: folder_idx + 1,
+                                },
+                            )
+                            .ok();
+                            match sync_folder_envelopes(&db, &account_id, &mut conn, folder) {
+                                Ok(count) => {
+                                    thread_total += count;
+                                    if count > 0 {
+                                        log::info!("Parallel sync: {} envelopes in {}", count, folder);
+                                    }
+                                }
+                                Err(e) => log::error!("Parallel sync error in {}: {}", folder, e),
+                            }
+                        }
+                        conn.logout();
+                        Ok(thread_total)
+                    })
+                })
+                .collect();
+
+            handles.into_iter().map(|h| h.join().unwrap_or(Err(Error::Sync("Thread panicked".into())))).collect()
+        });
+
+        for count in results.into_iter().flatten() {
+            grand_total += count;
         }
     }
 
     // Ensure maildir base dirs exist for on-demand body fetching later
     let _ = std::fs::create_dir_all(data_dir.join(account_id));
 
-    conn_imap.logout();
     Ok(grand_total)
 }
 
@@ -200,50 +295,60 @@ fn sync_folder_envelopes(
 
     conn_imap.select_folder(folder_path)?;
 
-    // Reconcile deletions: fetch ALL server UIDs and remove local messages
-    // that no longer exist on the server.
-    {
+    // Reconcile deletions — skip on first sync (last_uid == 0) since the local DB is empty.
+    if last_uid > 0 {
         let all_server_uids = conn_imap.fetch_uids(0)?;
-        let server_uid_set: std::collections::HashSet<u32> = all_server_uids.into_iter().collect();
+        let server_uid_set: std::collections::HashSet<u32> =
+            all_server_uids.into_iter().collect();
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.lock());
 
-        let mut stmt = conn.prepare(
-            "SELECT id, uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0"
-        ).map_err(Error::Database)?;
-        let local_msgs: Vec<(String, u32)> = stmt.query_map(
-            rusqlite::params![account_id, folder_path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(Error::Database)?
-        .filter_map(|r| r.ok())
-        .collect();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0",
+            )
+            .map_err(Error::Database)?;
+        let local_msgs: Vec<(String, u32)> = stmt
+            .query_map(rusqlite::params![account_id, folder_path], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(Error::Database)?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let mut deleted = 0u32;
         for (local_id, uid) in &local_msgs {
             if !server_uid_set.contains(uid) {
-                conn.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![local_id]).ok();
+                conn.execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    rusqlite::params![local_id],
+                )
+                .ok();
                 deleted += 1;
             }
         }
         if deleted > 0 {
-            log::info!("Removed {} server-deleted messages from '{}'", deleted, folder_path);
+            log::info!(
+                "Removed {} server-deleted messages from '{}'",
+                deleted,
+                folder_path
+            );
         }
     }
 
     let mut new_uids = conn_imap.fetch_uids(last_uid)?;
 
     if new_uids.is_empty() {
-        // Still update folder counts even if no new messages (deletions may have changed them)
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.lock());
-        let page = db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false)?;
+        let page =
+            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false)?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         return Ok(0);
     }
 
-    // Sort descending so newest messages are fetched first
     new_uids.sort_unstable_by(|a, b| b.cmp(a));
 
     log::info!(
@@ -253,33 +358,46 @@ fn sync_folder_envelopes(
         account_id
     );
 
+    // Pre-load existing UIDs for this folder into a HashSet for fast existence check.
+    // This replaces 1 SELECT per message with 1 bulk query.
+    let existing_uids = {
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.lock());
+        db::messages::get_existing_uids(&conn, account_id, folder_path)?
+    };
+
     let mut total_synced = 0u32;
     let mut new_message_ids: Vec<String> = Vec::new();
 
-    // Fetch envelopes in batches of 500 (envelopes are tiny, ~200 bytes each)
-    for chunk in new_uids.chunks(500) {
+    for chunk in new_uids.chunks(1000) {
         let envelopes = conn_imap.fetch_envelopes_batch(chunk)?;
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.lock());
 
+        conn.execute_batch("BEGIN")?;
+
         for env in &envelopes {
-            if db::messages::message_exists(&conn, account_id, folder_path, env.uid)? {
+            // In-memory existence check instead of per-message DB query
+            if existing_uids.contains(&env.uid) {
                 continue;
             }
 
-            // Parse the envelope date or fallback to now
             let date = env
                 .date
                 .as_ref()
                 .and_then(|d| parse_imap_date(d))
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-            let snippet = env.subject.as_deref().map(|s| s.chars().take(200).collect());
+            let snippet = env
+                .subject
+                .as_deref()
+                .map(|s| s.chars().take(200).collect());
 
             let id = format!("{}_{}_{}", account_id, folder_path, env.uid);
 
-            // Compute thread_id before inserting
+            // Thread computation still needs DB queries for cross-references,
+            // but the in_reply_to lookup is fast with index.
             let thread_id = db::messages::compute_thread_id(
                 &conn,
                 account_id,
@@ -287,9 +405,6 @@ fn sync_folder_envelopes(
                 env.in_reply_to.as_deref(),
                 env.subject.as_deref(),
             );
-            if let Some(ref tid) = thread_id {
-                log::debug!("Assigned thread_id '{}' to message uid={}", tid, env.uid);
-            }
 
             let new_msg = db::messages::NewMessage {
                 id: id.clone(),
@@ -301,7 +416,10 @@ fn sync_folder_envelopes(
                 thread_id,
                 subject: env.subject.clone(),
                 from_name: env.from_name.clone(),
-                from_email: env.from_email.clone().unwrap_or_else(|| "unknown".to_string()),
+                from_email: env
+                    .from_email
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 to_addresses: env.to_addresses.clone(),
                 cc_addresses: env.cc_addresses.clone(),
                 date,
@@ -310,7 +428,7 @@ fn sync_folder_envelopes(
                 is_encrypted: false,
                 is_signed: false,
                 flags: serde_json::to_string(&env.flags).unwrap_or_default(),
-                maildir_path: String::new(), // Body not downloaded yet
+                maildir_path: String::new(),
                 snippet,
             };
             db::messages::insert_message(&conn, &new_msg)?;
@@ -318,10 +436,11 @@ fn sync_folder_envelopes(
             total_synced += 1;
         }
 
-        // Update last seen UID (use max of all UIDs in this chunk)
         if let Some(&max_uid) = chunk.iter().max() {
             db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
         }
+
+        conn.execute_batch("COMMIT")?;
     }
 
     // Run filter rules on newly synced messages

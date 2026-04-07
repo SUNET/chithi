@@ -231,6 +231,9 @@ impl JmapConnection {
         Ok(folders)
     }
 
+    /// Fetch page size for JMAP Email/query.
+    const JMAP_PAGE_SIZE: u64 = 500;
+
     pub async fn fetch_emails(
         &self,
         config: &JmapConfig,
@@ -239,90 +242,116 @@ impl JmapConnection {
     ) -> Result<(Vec<JmapEmail>, String)> {
         log::debug!("JMAP fetching emails from mailbox {}", mailbox_id);
 
-        // Query emails in this mailbox, sorted by receivedAt descending
-        let request = serde_json::json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                ["Email/query", {
-                    "accountId": self.account_id,
-                    "filter": { "inMailbox": mailbox_id },
-                    "sort": [{ "property": "receivedAt", "isAscending": false }],
-                    "limit": 500
-                }, "q1"],
-                ["Email/get", {
-                    "#ids": { "resultOf": "q1", "name": "Email/query", "path": "/ids" },
-                    "accountId": self.account_id,
-                    "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
-                                   "size", "keywords", "messageId", "inReplyTo",
-                                   "hasAttachment", "preview"]
-                }, "g1"]
-            ]
-        });
+        let mut all_emails = Vec::new();
+        let mut position: u64 = 0;
+        let mut state = String::new();
 
-        let resp = self.api_request(&request, config).await?;
+        loop {
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/query", {
+                        "accountId": self.account_id,
+                        "filter": { "inMailbox": mailbox_id },
+                        "sort": [{ "property": "receivedAt", "isAscending": false }],
+                        "position": position,
+                        "limit": Self::JMAP_PAGE_SIZE
+                    }, "q1"],
+                    ["Email/get", {
+                        "#ids": { "resultOf": "q1", "name": "Email/query", "path": "/ids" },
+                        "accountId": self.account_id,
+                        "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
+                                       "size", "keywords", "messageId", "inReplyTo",
+                                       "hasAttachment", "preview"]
+                    }, "g1"]
+                ]
+            });
 
-        // Get the state from Email/query
-        let state = resp["methodResponses"][0][1]["queryState"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+            let resp = self.api_request(&request, config).await?;
 
-        let emails_json = resp["methodResponses"][1][1]["list"]
-            .as_array()
-            .ok_or_else(|| Error::Other("Invalid Email/get response".into()))?;
-
-        let mut emails = Vec::new();
-        for e in emails_json {
-            let id = e["id"].as_str().unwrap_or("").to_string();
-            let subject = e["subject"].as_str().map(|s| s.to_string());
-
-            let (from_name, from_email) = e["from"].as_array()
-                .and_then(|a| a.first())
-                .map(|f| (
-                    f["name"].as_str().map(|s| s.to_string()),
-                    f["email"].as_str().map(|s| s.to_string()),
-                ))
-                .unwrap_or((None, None));
-
-            let to_addresses = addresses_to_json(e["to"].as_array());
-            let cc_addresses = addresses_to_json(e["cc"].as_array());
-
-            // Normalize date to UTC for consistent sorting
-            let date = e["receivedAt"].as_str()
-                .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-                .unwrap_or_default();
-            let size = e["size"].as_u64().unwrap_or(0);
-            let message_id = e["messageId"].as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(|s| format!("<{}>", s));
-            let in_reply_to = e["inReplyTo"].as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(|s| format!("<{}>", s));
-            let has_attachments = e["hasAttachment"].as_bool().unwrap_or(false);
-            let preview = e["preview"].as_str().map(|s| s.to_string());
-
-            // Convert JMAP keywords to flags
-            let keywords = e["keywords"].as_object();
-            let mut flags = Vec::new();
-            if let Some(kw) = keywords {
-                if kw.contains_key("$seen") { flags.push("seen".to_string()); }
-                if kw.contains_key("$flagged") { flags.push("flagged".to_string()); }
-                if kw.contains_key("$answered") { flags.push("answered".to_string()); }
-                if kw.contains_key("$draft") { flags.push("draft".to_string()); }
+            // Capture state from the first page
+            if state.is_empty() {
+                state = resp["methodResponses"][0][1]["queryState"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
             }
 
-            emails.push(JmapEmail {
-                id, subject, from_name, from_email,
-                to_addresses, cc_addresses, date, message_id,
-                in_reply_to, size, has_attachments, flags, preview,
-            });
+            let emails_json = resp["methodResponses"][1][1]["list"]
+                .as_array()
+                .ok_or_else(|| Error::Other("Invalid Email/get response".into()))?;
+
+            let page_count = emails_json.len() as u64;
+
+            for e in emails_json {
+                let email = self.parse_jmap_email(e);
+                all_emails.push(email);
+            }
+
+            log::debug!(
+                "JMAP fetched page at position {}: {} emails (total so far: {})",
+                position,
+                page_count,
+                all_emails.len()
+            );
+
+            // If we got fewer than the page size, we've reached the end
+            if page_count < Self::JMAP_PAGE_SIZE {
+                break;
+            }
+            position += page_count;
         }
 
-        log::info!("JMAP fetched {} emails from mailbox {}", emails.len(), mailbox_id);
-        Ok((emails, state))
+        log::info!("JMAP fetched {} emails from mailbox {}", all_emails.len(), mailbox_id);
+        Ok((all_emails, state))
+    }
+
+    /// Parse a single JMAP email JSON object into a JmapEmail struct.
+    fn parse_jmap_email(&self, e: &serde_json::Value) -> JmapEmail {
+        let id = e["id"].as_str().unwrap_or("").to_string();
+        let subject = e["subject"].as_str().map(|s| s.to_string());
+
+        let (from_name, from_email) = e["from"].as_array()
+            .and_then(|a| a.first())
+            .map(|f| (
+                f["name"].as_str().map(|s| s.to_string()),
+                f["email"].as_str().map(|s| s.to_string()),
+            ))
+            .unwrap_or((None, None));
+
+        let to_addresses = addresses_to_json(e["to"].as_array());
+        let cc_addresses = addresses_to_json(e["cc"].as_array());
+
+        let date = e["receivedAt"].as_str()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+            .unwrap_or_default();
+        let size = e["size"].as_u64().unwrap_or(0);
+        let message_id = e["messageId"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(|s| format!("<{}>", s));
+        let in_reply_to = e["inReplyTo"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(|s| format!("<{}>", s));
+        let has_attachments = e["hasAttachment"].as_bool().unwrap_or(false);
+        let preview = e["preview"].as_str().map(|s| s.to_string());
+
+        let keywords = e["keywords"].as_object();
+        let mut flags = Vec::new();
+        if let Some(kw) = keywords {
+            if kw.contains_key("$seen") { flags.push("seen".to_string()); }
+            if kw.contains_key("$flagged") { flags.push("flagged".to_string()); }
+            if kw.contains_key("$answered") { flags.push("answered".to_string()); }
+            if kw.contains_key("$draft") { flags.push("draft".to_string()); }
+        }
+
+        JmapEmail {
+            id, subject, from_name, from_email,
+            to_addresses, cc_addresses, date, message_id,
+            in_reply_to, size, has_attachments, flags, preview,
+        }
     }
 
     pub async fn fetch_email_body(

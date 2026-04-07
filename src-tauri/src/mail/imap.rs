@@ -4,6 +4,7 @@ use std::net::TcpStream;
 
 use crate::error::{Error, Result};
 
+#[derive(Clone)]
 pub struct ImapConfig {
     pub host: String,
     pub port: u16,
@@ -35,7 +36,7 @@ pub struct ImapConnection {
 impl ImapConnection {
     /// Connect and authenticate. Must be called from a blocking context.
     pub fn connect(config: &ImapConfig) -> Result<Self> {
-        log::info!("IMAP connecting to {}:{}", config.host, config.port);
+        log::info!("IMAP connecting to {}:{} (tls={})", config.host, config.port, config.use_tls);
 
         let tls = native_tls::TlsConnector::builder()
             .build()
@@ -44,16 +45,23 @@ impl ImapConnection {
                 Error::Imap(e.to_string())
             })?;
 
-        let client = imap::connect((&*config.host, config.port), &config.host, &tls)
-            .map_err(|e| {
-                log::error!(
-                    "IMAP connection failed to {}:{}: {}",
-                    config.host,
-                    config.port,
-                    e
-                );
-                Error::Imap(e.to_string())
-            })?;
+        // Port 993 = implicit TLS (entire connection wrapped in TLS from start)
+        // Port 143 = STARTTLS (connect plain, send STARTTLS command, upgrade to TLS)
+        let client = if config.port == 993 {
+            log::debug!("IMAP using implicit TLS");
+            imap::connect((&*config.host, config.port), &config.host, &tls)
+                .map_err(|e| {
+                    log::error!("IMAP TLS connection failed to {}:{}: {}", config.host, config.port, e);
+                    Error::Imap(e.to_string())
+                })?
+        } else {
+            log::debug!("IMAP using STARTTLS");
+            imap::connect_starttls((&*config.host, config.port), &config.host, &tls)
+                .map_err(|e| {
+                    log::error!("IMAP STARTTLS failed for {}:{}: {}", config.host, config.port, e);
+                    Error::Imap(e.to_string())
+                })?
+        };
 
         log::debug!("IMAP connected, authenticating as {}", config.username);
 
@@ -163,7 +171,7 @@ impl ImapConnection {
 
         let fetches = self
             .session
-            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE BODYSTRUCTURE)")
+            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
             .map_err(|e| {
                 log::error!("IMAP FETCH envelopes failed: {}", e);
                 Error::Imap(e.to_string())
@@ -268,6 +276,36 @@ impl ImapConnection {
         }
         log::warn!("IMAP no body returned for UID {}", uid);
         Ok(None)
+    }
+
+    /// Fetch bodies for multiple UIDs in a single IMAP command.
+    /// Returns a map of UID → body bytes.
+    pub fn fetch_bodies_batch(&mut self, uids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<u8>>> {
+        if uids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let uid_set: String = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+
+        log::debug!("IMAP batch fetching {} bodies", uids.len());
+
+        let fetches = self
+            .session
+            .uid_fetch(&uid_set, "BODY[]")
+            .map_err(|e| {
+                log::error!("IMAP batch FETCH bodies failed: {}", e);
+                Error::Imap(e.to_string())
+            })?;
+
+        let mut results = std::collections::HashMap::new();
+        for msg in fetches.iter() {
+            if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
+                results.insert(uid, body.to_vec());
+            }
+        }
+
+        log::debug!("IMAP batch fetched {} bodies", results.len());
+        Ok(results)
     }
 
     /// Move messages to a destination folder.

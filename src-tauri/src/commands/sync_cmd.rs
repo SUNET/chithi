@@ -1,5 +1,18 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+
+/// (message_id, uid, flags_json) tuple for prefetch grouping.
+type PrefetchMsg = (String, u32, String);
+
+/// RAII guard that clears the sync-in-progress flag on drop.
+struct SyncGuard(Arc<AtomicBool>);
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -16,6 +29,30 @@ pub async fn trigger_sync(
     account_id: String,
     current_folder: Option<String>,
 ) -> Result<()> {
+    // Check if a sync is already running for this account — skip if so
+    {
+        let flags = state.sync_in_progress.lock().unwrap();
+        if let Some(flag) = flags.get(&account_id) {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                log::debug!("Sync already in progress for account {}, skipping", account_id);
+                return Ok(());
+            }
+        }
+    }
+
+    // Set the sync-in-progress flag
+    let sync_flag = {
+        let mut flags = state.sync_in_progress.lock().unwrap();
+        let flag = flags
+            .entry(account_id.clone())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        flag.clone()
+    };
+
+    // Ensure flag is cleared when sync completes (success or error)
+    let _guard = SyncGuard(sync_flag);
+
     log::info!("Sync requested for account {}", account_id);
     let account_result = {
         let conn = state.db.lock().await;
@@ -327,6 +364,27 @@ pub async fn prefetch_bodies(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<u32> {
+    // Skip if a prefetch is already running for this account
+    let prefetch_key = format!("prefetch_{}", account_id);
+    {
+        let flags = state.sync_in_progress.lock().unwrap();
+        if let Some(flag) = flags.get(&prefetch_key) {
+            if flag.load(Ordering::Relaxed) {
+                log::debug!("Prefetch already in progress for account {}, skipping", account_id);
+                return Ok(0);
+            }
+        }
+    }
+    let prefetch_flag = {
+        let mut flags = state.sync_in_progress.lock().unwrap();
+        let flag = flags
+            .entry(prefetch_key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(true, Ordering::Relaxed);
+        flag.clone()
+    };
+    let _guard = SyncGuard(prefetch_flag);
+
     log::info!("Prefetch bodies requested for account {}", account_id);
 
     // Skip prefetch for JMAP accounts — bodies are fetched on-demand via JMAP API
@@ -352,10 +410,10 @@ pub async fn prefetch_bodies(
         (config, state.data_dir.clone())
     };
 
-    // Fetch the list of unfetched messages (up to 100)
+    // Fetch the list of unfetched messages (up to 1000 per cycle)
     let unfetched = {
         let conn = state.db.lock().await;
-        db::messages::get_unfetched_messages(&conn, &account_id, 100)?
+        db::messages::get_unfetched_messages(&conn, &account_id, 1000)?
     };
 
     if unfetched.is_empty() {
@@ -371,7 +429,7 @@ pub async fn prefetch_bodies(
 
     // Group messages by folder to minimize IMAP SELECT commands.
     // BTreeMap keeps folders sorted for deterministic ordering.
-    let mut by_folder: BTreeMap<String, Vec<(String, u32, String)>> = BTreeMap::new();
+    let mut by_folder: BTreeMap<String, Vec<PrefetchMsg>> = BTreeMap::new();
     for (message_id, folder_path, uid, flags_json) in unfetched {
         by_folder
             .entry(folder_path)
@@ -380,114 +438,123 @@ pub async fn prefetch_bodies(
     }
 
     let db = state.db.clone();
+    let folder_count = by_folder.len();
+    let max_connections = 3.min(folder_count);
+
+    log::info!(
+        "Prefetch: {} folders with {} parallel connections",
+        folder_count,
+        max_connections
+    );
 
     let fetched_count = tokio::task::spawn_blocking(move || -> Result<u32> {
-        let mut conn_imap = ImapConnection::connect(&imap_config)?;
-        let mut count = 0u32;
+        let rt = tokio::runtime::Handle::current();
+        let _guard = rt.enter();
 
-        for (folder_path, messages) in &by_folder {
-            log::info!(
-                "Prefetch: selecting folder '{}' ({} messages)",
-                folder_path,
-                messages.len()
-            );
-            if let Err(e) = conn_imap.select_folder(folder_path) {
-                log::error!("Prefetch: failed to select folder '{}': {}", folder_path, e);
-                continue;
-            }
-
-            for (message_id, uid, flags_json) in messages {
-                log::debug!(
-                    "Prefetch: fetching body for message_id={} uid={} folder={}",
-                    message_id,
-                    uid,
-                    folder_path
-                );
-
-                let body = match conn_imap.fetch_message_body(*uid) {
-                    Ok(Some(b)) => b,
-                    Ok(None) => {
-                        log::warn!(
-                            "Prefetch: no body returned for uid={} in folder '{}'",
-                            uid,
-                            folder_path
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Prefetch: failed to fetch body for uid={} in folder '{}': {}",
-                            uid,
-                            folder_path,
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                // Parse flags from JSON to compute Maildir suffix
-                let flags: Vec<String> =
-                    serde_json::from_str(flags_json).unwrap_or_default();
-
-                // Write body to Maildir
-                let sanitized_folder = mail_sync::sanitize_folder_name(folder_path);
-                let maildir_base = data_dir.join(&account_id).join(&sanitized_folder);
-                if let Err(e) = mail_sync::create_maildir_dirs(&maildir_base) {
-                    log::error!(
-                        "Prefetch: failed to create maildir dirs for '{}': {}",
-                        maildir_base.display(),
-                        e
-                    );
-                    continue;
-                }
-
-                let suffix = mail_sync::flags_to_maildir_suffix(&flags);
-                let filename = format!("{}:2,{}", uid, suffix);
-                let msg_path = maildir_base.join("cur").join(&filename);
-
-                if let Err(e) = std::fs::write(&msg_path, &body) {
-                    log::error!(
-                        "Prefetch: failed to write body to '{}': {}",
-                        msg_path.display(),
-                        e
-                    );
-                    continue;
-                }
-
-                let relative_path = format!(
-                    "{}/{}/cur/{}",
-                    account_id, sanitized_folder, filename
-                );
-
-                log::debug!(
-                    "Prefetch: body saved {} ({} bytes)",
-                    relative_path,
-                    body.len()
-                );
-
-                // Update DB with the maildir path
-                let rt = tokio::runtime::Handle::current();
-                let conn = rt.block_on(db.lock());
-                if let Err(e) = db::messages::update_maildir_path(&conn, message_id, &relative_path) {
-                    log::error!(
-                        "Prefetch: failed to update maildir_path for message_id={}: {}",
-                        message_id,
-                        e
-                    );
-                    continue;
-                }
-
-                count += 1;
-            }
+        // Distribute folders across threads
+        let folder_list: Vec<(String, Vec<PrefetchMsg>)> = by_folder.into_iter().collect();
+        let mut thread_work: Vec<Vec<(String, Vec<PrefetchMsg>)>> =
+            (0..max_connections).map(|_| Vec::new()).collect();
+        for (i, item) in folder_list.into_iter().enumerate() {
+            thread_work[i % max_connections].push(item);
         }
 
-        conn_imap.logout();
+        let rt_handle = tokio::runtime::Handle::current();
+        let results: Vec<Result<u32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = thread_work
+                .into_iter()
+                .enumerate()
+                .map(|(thread_idx, folders)| {
+                    let imap_config = imap_config.clone();
+                    let account_id = account_id.clone();
+                    let data_dir = data_dir.clone();
+                    let db = db.clone();
+                    let rt = rt_handle.clone();
+                    s.spawn(move || {
+                        let _guard = rt.enter();
+                        let mut conn = match ImapConnection::connect(&imap_config) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log::error!("Prefetch thread {}: connect failed: {}", thread_idx, e);
+                                return Err(e);
+                            }
+                        };
+                        let mut count = 0u32;
+
+                        for (folder_path, messages) in &folders {
+                            log::info!(
+                                "Prefetch[{}]: folder '{}' ({} messages)",
+                                thread_idx, folder_path, messages.len()
+                            );
+                            if let Err(e) = conn.select_folder(folder_path) {
+                                log::error!("Prefetch[{}]: select '{}' failed: {}", thread_idx, folder_path, e);
+                                continue;
+                            }
+
+                            let sanitized = mail_sync::sanitize_folder_name(folder_path);
+                            let maildir_base = data_dir.join(&account_id).join(&sanitized);
+                            if let Err(e) = mail_sync::create_maildir_dirs(&maildir_base) {
+                                log::error!("Prefetch[{}]: maildir dirs failed: {}", thread_idx, e);
+                                continue;
+                            }
+
+                            for chunk in messages.chunks(100) {
+                                let batch_uids: Vec<u32> = chunk.iter().map(|(_, uid, _)| *uid).collect();
+                                let bodies = match conn.fetch_bodies_batch(&batch_uids) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        log::error!("Prefetch[{}]: batch fetch failed: {}", thread_idx, e);
+                                        continue;
+                                    }
+                                };
+
+                                let mut db_updates: Vec<(String, String)> = Vec::new();
+                                for (message_id, uid, flags_json) in chunk {
+                                    let body = match bodies.get(uid) {
+                                        Some(b) => b,
+                                        None => continue,
+                                    };
+                                    let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
+                                    let suffix = mail_sync::flags_to_maildir_suffix(&flags);
+                                    let filename = format!("{}:2,{}", uid, suffix);
+                                    let msg_path = maildir_base.join("cur").join(&filename);
+                                    if std::fs::write(&msg_path, body).is_err() { continue; }
+                                    let relative_path = format!("{}/{}/cur/{}", account_id, sanitized, filename);
+                                    db_updates.push((message_id.clone(), relative_path));
+                                    count += 1;
+                                }
+
+                                if !db_updates.is_empty() {
+                                    let conn = rt.block_on(db.lock());
+                                    conn.execute_batch("BEGIN").ok();
+                                    for (msg_id, path) in &db_updates {
+                                        db::messages::update_maildir_path(&conn, msg_id, path).ok();
+                                    }
+                                    conn.execute_batch("COMMIT").ok();
+                                    log::info!("Prefetch[{}]: saved {} bodies in '{}'", thread_idx, db_updates.len(), folder_path);
+                                }
+                            }
+                        }
+
+                        conn.logout();
+                        Ok(count)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(Err(Error::Sync("Prefetch thread panicked".into()))))
+                .collect()
+        });
+
+        let total: u32 = results.into_iter().flatten().sum();
         log::info!(
             "Prefetch: completed for account {}, {} bodies fetched",
             account_id,
-            count
+            total
         );
-        Ok(count)
+        Ok(total)
     })
     .await
     .map_err(|e| Error::Sync(format!("Prefetch task panicked: {}", e)))??;

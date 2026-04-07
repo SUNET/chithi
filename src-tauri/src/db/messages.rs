@@ -216,6 +216,22 @@ pub fn message_exists(conn: &Connection, account_id: &str, folder_path: &str, ui
     Ok(count > 0)
 }
 
+/// Load all UIDs for a folder into a HashSet for fast batch existence checks.
+pub fn get_existing_uids(
+    conn: &Connection,
+    account_id: &str,
+    folder_path: &str,
+) -> Result<std::collections::HashSet<u32>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0",
+    )?;
+    let uids = stmt
+        .query_map(params![account_id, folder_path], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(uids)
+}
+
 pub fn get_folder_and_uid(conn: &Connection, message_id: &str) -> Result<(String, u32)> {
     conn.query_row(
         "SELECT folder_path, uid FROM messages WHERE id = ?1",

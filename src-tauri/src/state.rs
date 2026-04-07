@@ -28,6 +28,9 @@ pub struct AppState {
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub jmap_push_handles: std::sync::Mutex<HashMap<String, JmapPushHandle>>,
+    /// Per-account sync-in-progress flags. If true, a sync is running and
+    /// new sync requests for that account should be skipped.
+    pub sync_in_progress: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub data_dir: PathBuf,
 }
 
@@ -43,6 +46,7 @@ impl AppState {
             sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
             jmap_push_handles: std::sync::Mutex::new(HashMap::new()),
+            sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             data_dir,
         })
     }

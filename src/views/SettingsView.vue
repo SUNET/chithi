@@ -134,6 +134,10 @@ async function saveAccount() {
   saving.value = true;
   error.value = null;
   try {
+    // Default username to email if not set (Gmail and most IMAP servers use email as username)
+    if (!form.value.username.trim()) {
+      form.value.username = form.value.email;
+    }
     if (editingAccountId.value) {
       await api.updateAccount(editingAccountId.value, form.value);
       await accountsStore.fetchAccounts();
