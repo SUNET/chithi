@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 
 /// Authentication method for CalDAV/CardDAV.
 #[derive(Clone)]
-pub enum DavAuth {
+pub(crate) enum DavAuth {
     Basic { username: String, password: String },
     Bearer { token: String },
 }
@@ -477,7 +477,7 @@ const REPORT_CALENDAR_QUERY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 use uppsala::{Document, NodeId, NodeKind};
 
 /// Find text content of a descendant element by local name.
-fn find_text_in(doc: &Document, node_id: NodeId, local_name: &str) -> Option<String> {
+pub(crate) fn find_text_in(doc: &Document, node_id: NodeId, local_name: &str) -> Option<String> {
     for child_id in doc.children(node_id) {
         if let Some(NodeKind::Element(el)) = doc.node_kind(child_id) {
             let qname = &el.name;
@@ -497,7 +497,7 @@ fn find_text_in(doc: &Document, node_id: NodeId, local_name: &str) -> Option<Str
 }
 
 /// Check if a node has a descendant element with the given local name.
-fn has_descendant(doc: &Document, node_id: NodeId, local_name: &str) -> bool {
+pub(crate) fn has_descendant(doc: &Document, node_id: NodeId, local_name: &str) -> bool {
     for child_id in doc.children(node_id) {
         if let Some(NodeKind::Element(el)) = doc.node_kind(child_id) {
             if el.name.local_name.as_ref() == local_name {
@@ -512,7 +512,7 @@ fn has_descendant(doc: &Document, node_id: NodeId, local_name: &str) -> bool {
 }
 
 /// Find all descendant element NodeIds with a given local name.
-fn find_elements(doc: &Document, node_id: NodeId, local_name: &str) -> Vec<NodeId> {
+pub(crate) fn find_elements(doc: &Document, node_id: NodeId, local_name: &str) -> Vec<NodeId> {
     let mut result = Vec::new();
     for child_id in doc.children(node_id) {
         if let Some(NodeKind::Element(el)) = doc.node_kind(child_id) {
@@ -526,7 +526,7 @@ fn find_elements(doc: &Document, node_id: NodeId, local_name: &str) -> Vec<NodeI
 }
 
 /// Parse an `<href>` value nested inside a specific parent element.
-fn parse_href_from_xml(xml: &str, parent_local_name: &str) -> Option<String> {
+pub(crate) fn parse_href_from_xml(xml: &str, parent_local_name: &str) -> Option<String> {
     let doc = uppsala::parse(xml).ok()?;
     let root = doc.root();
     let parents = find_elements(&doc, root, parent_local_name);

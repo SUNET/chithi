@@ -1,4 +1,5 @@
 pub mod caldav;
+pub mod carddav;
 pub mod idle;
 pub mod imap;
 pub mod jmap;
