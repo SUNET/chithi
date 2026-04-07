@@ -44,6 +44,7 @@ fn main() {
             commands::mail::get_threaded_messages,
             commands::mail::get_thread_messages,
             commands::mail::unthread_message,
+            commands::mail::create_folder,
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::sync_folder,
             commands::sync_cmd::get_sync_status,

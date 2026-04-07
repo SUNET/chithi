@@ -1148,6 +1148,38 @@ impl JmapConnection {
         }
         Ok(None)
     }
+    /// Create a new mailbox on the JMAP server.
+    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str) -> Result<String> {
+        log::info!("JMAP creating mailbox: {}", name);
+        let create_id = "new-folder";
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Mailbox/set", {
+                    "accountId": self.account_id,
+                    "create": {
+                        create_id: {
+                            "name": name
+                        }
+                    }
+                }, "c1"]
+            ]
+        });
+        let resp = self.api_request(&request, config).await?;
+        let created_id = resp["methodResponses"][0][1]["created"][create_id]["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if created_id.is_empty() {
+            let err = resp["methodResponses"][0][1]["notCreated"][create_id]["description"]
+                .as_str()
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP Mailbox/set create failed: {}", err)));
+        }
+        log::info!("JMAP mailbox created: id={}", created_id);
+        Ok(created_id)
+    }
+
     // -----------------------------------------------------------------------
     // Contacts (JSContact / JMAP Contacts)
     // -----------------------------------------------------------------------

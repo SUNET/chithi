@@ -62,6 +62,13 @@ export async function getMessageBody(
   return invoke("get_message_body", { accountId, messageId });
 }
 
+export async function createFolder(
+  accountId: string,
+  folderPath: string,
+): Promise<void> {
+  return invoke("create_folder", { accountId, folderPath });
+}
+
 export async function syncFolder(
   accountId: string,
   folderPath: string,

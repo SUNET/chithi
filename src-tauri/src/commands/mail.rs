@@ -249,3 +249,54 @@ pub async fn unthread_message(
     db::messages::unthread_message(&conn, &message_id)?;
     Ok(())
 }
+
+/// Create a new folder on the mail server and register it locally.
+#[tauri::command]
+pub async fn create_folder(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+) -> Result<()> {
+    log::info!("Creating folder '{}' for account {}", folder_path, account_id);
+
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.mail_protocol == "jmap" {
+        // JMAP: Mailbox/set create
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap.create_mailbox(&jmap_config, &folder_path).await?;
+    } else {
+        // IMAP: CREATE
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password: account.password,
+            use_tls: account.use_tls,
+        };
+        let folder_for_imap = folder_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
+            conn.create_folder(&folder_for_imap)?;
+            conn.logout();
+            Ok::<(), crate::error::Error>(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Create folder panicked: {}", e)))??;
+    }
+
+    // Don't insert into local DB here — the next sync will discover the folder
+    // with the correct server-side path/ID and register it properly.
+
+    log::info!("Folder '{}' created on server, will appear after sync", folder_path);
+    Ok(())
+}

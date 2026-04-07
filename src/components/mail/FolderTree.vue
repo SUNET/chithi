@@ -11,8 +11,14 @@ const accountsStore = useAccountsStore();
 const messagesStore = useMessagesStore();
 
 const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
+const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
+const showNewFolderModal = ref(false);
+const newFolderName = ref("");
+const newFolderParent = ref("");
+const newFolderSaving = ref(false);
+const newFolderError = ref<string | null>(null);
 
 // Predefined avatar colors for accounts
 const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
@@ -78,11 +84,27 @@ function onFolderContextMenu(event: MouseEvent, folder: Folder) {
 
 function closeContextMenu() {
   contextMenu.value = null;
+  accountMenu.value = null;
+}
+
+function onAccountContextMenu(event: MouseEvent, accountId: string) {
+  event.preventDefault();
+  contextMenu.value = null;
+  accountMenu.value = { x: event.clientX, y: event.clientY, accountId };
+}
+
+function openNewFolderFromAccount() {
+  const accountId = accountMenu.value?.accountId;
+  newFolderParent.value = accountId ? `${accountId}|` : "";
+  newFolderName.value = "";
+  newFolderError.value = null;
+  closeContextMenu();
+  showNewFolderModal.value = true;
 }
 
 async function syncThisFolder() {
-  const accountId = accountsStore.activeAccountId;
   const folder = contextMenu.value?.folder;
+  const accountId = findAccountForFolder(folder);
   if (!accountId || !folder) return;
   closeContextMenu();
 
@@ -99,6 +121,93 @@ async function syncThisFolder() {
     syncing.value = null;
   }
 }
+
+function findAccountForFolder(folder: Folder | undefined): string | null {
+  if (!folder) return null;
+  for (const acc of accountsStore.accounts) {
+    const folders = foldersStore.getAccountFolders(acc.id);
+    if (folders.some(f => f.path === folder.path)) return acc.id;
+  }
+  return accountsStore.activeAccountId;
+}
+
+function openNewFolderModal() {
+  const folder = contextMenu.value?.folder;
+  const accountId = findAccountForFolder(folder);
+  // Default parent to the right-clicked folder's path
+  newFolderParent.value = folder ? `${accountId}|${folder.path}` : "";
+  newFolderName.value = "";
+  newFolderError.value = null;
+  closeContextMenu();
+  showNewFolderModal.value = true;
+}
+
+function buildParentOptions(): { label: string; value: string }[] {
+  const options: { label: string; value: string }[] = [];
+  for (const acc of accountsStore.accounts) {
+    // Account root level
+    options.push({ label: `${acc.display_name} (root)`, value: `${acc.id}|` });
+    for (const folder of foldersStore.getAccountFolders(acc.id)) {
+      options.push({ label: `${folder.name} on ${acc.email}`, value: `${acc.id}|${folder.path}` });
+    }
+  }
+  return options;
+}
+
+async function createNewFolder() {
+  if (!newFolderName.value.trim()) {
+    newFolderError.value = "Folder name is required";
+    return;
+  }
+  const [accountId, parentPath] = newFolderParent.value.split("|", 2);
+  if (!accountId) {
+    newFolderError.value = "Select a location";
+    return;
+  }
+  // Build full path: parent/name or just name if root
+  const folderPath = parentPath
+    ? `${parentPath}/${newFolderName.value.trim()}`
+    : newFolderName.value.trim();
+
+  newFolderSaving.value = true;
+  newFolderError.value = null;
+  try {
+    await api.createFolder(accountId, folderPath);
+    showNewFolderModal.value = false;
+    // Trigger sync so the server-assigned folder ID/path gets registered locally
+    await api.triggerSync(accountId);
+    await foldersStore.fetchAllAccountFolders();
+  } catch (e) {
+    newFolderError.value = String(e);
+  } finally {
+    newFolderSaving.value = false;
+  }
+}
+
+async function markFolderRead() {
+  const folder = contextMenu.value?.folder;
+  const accountId = findAccountForFolder(folder);
+  if (!accountId || !folder) return;
+  closeContextMenu();
+
+  try {
+    // Get all messages in the folder (large page to capture all)
+    const result = await api.getMessages(accountId, folder.path, 0, 10000, "date", false);
+    const unreadIds = result.messages
+      .filter((m: { flags: string[] }) => !m.flags.includes("seen"))
+      .map((m: { id: string }) => m.id);
+
+    if (unreadIds.length > 0) {
+      await api.setMessageFlags(accountId, unreadIds, ["seen"], true);
+      await foldersStore.fetchFolders();
+      if (foldersStore.activeFolderPath === folder.path) {
+        await messagesStore.fetchMessages();
+      }
+    }
+  } catch (e) {
+    console.error("Mark folder read failed:", e);
+  }
+}
 </script>
 
 <template>
@@ -111,6 +220,7 @@ async function syncThisFolder() {
       <button
         class="account-header"
         @click="toggleAccountCollapse(account.id)"
+        @contextmenu="onAccountContextMenu($event, account.id)"
       >
         <span class="account-avatar" :style="{ background: getAvatarColor(idx) }">
           {{ getInitials(account.display_name) }}
@@ -177,14 +287,74 @@ async function syncThisFolder() {
 
     <!-- Right-click context menu -->
     <Teleport to="body">
+      <div v-if="contextMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
       <div
         v-if="contextMenu"
         class="folder-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
+        <button class="ctx-item disabled">Open in New Tab</button>
+        <button class="ctx-item disabled">Open in New Window</button>
+        <button class="ctx-item disabled">Search Messages...</button>
+        <div class="ctx-separator"></div>
+        <button class="ctx-item" @click="openNewFolderModal">New Folder...</button>
+        <div class="ctx-separator"></div>
+        <button class="ctx-item" @click="markFolderRead">Mark Folder Read</button>
+        <div class="ctx-separator"></div>
+        <button class="ctx-item disabled">Properties</button>
         <button class="ctx-item" @click="syncThisFolder">
           Sync "{{ contextMenu.folder.name }}"
         </button>
+      </div>
+    </Teleport>
+    <!-- Account right-click context menu -->
+    <Teleport to="body">
+      <div v-if="accountMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
+      <div
+        v-if="accountMenu"
+        class="folder-context-menu"
+        :style="{ left: accountMenu.x + 'px', top: accountMenu.y + 'px' }"
+      >
+        <button class="ctx-item" @click="openNewFolderFromAccount">New Folder...</button>
+      </div>
+    </Teleport>
+
+    <!-- New Folder Modal -->
+    <Teleport to="body">
+      <div v-if="showNewFolderModal" class="modal-overlay" @click.self="showNewFolderModal = false">
+        <div class="new-folder-modal">
+          <div class="nf-header">
+            <h3>New Folder</h3>
+            <button class="nf-close" @click="showNewFolderModal = false">&times;</button>
+          </div>
+          <div class="nf-body">
+            <div v-if="newFolderError" class="nf-error">{{ newFolderError }}</div>
+            <div class="nf-field">
+              <label>Name:</label>
+              <input
+                v-model="newFolderName"
+                type="text"
+                class="nf-input"
+                placeholder="Folder name"
+                @keydown.enter="createNewFolder"
+              />
+            </div>
+            <div class="nf-field">
+              <label>Create as a subfolder of:</label>
+              <select v-model="newFolderParent" class="nf-select">
+                <option v-for="opt in buildParentOptions()" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+          </div>
+          <div class="nf-footer">
+            <button class="nf-btn-cancel" @click="showNewFolderModal = false">Cancel</button>
+            <button class="nf-btn-create" :disabled="newFolderSaving" @click="createNewFolder">
+              {{ newFolderSaving ? "Creating..." : "Create Folder" }}
+            </button>
+          </div>
+        </div>
       </div>
     </Teleport>
   </div>
@@ -339,30 +509,172 @@ async function syncThisFolder() {
 </style>
 
 <style>
+.folder-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+}
+
 .folder-context-menu {
   position: fixed;
   z-index: 9999;
   background: var(--color-bg);
-  border: 1px solid var(--color-border);
+  border: 0.8px solid var(--color-border);
   border-radius: 8px;
   padding: 4px 0;
-  min-width: 160px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  min-width: 200px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
 }
 
 .folder-context-menu .ctx-item {
   display: block;
   width: 100%;
-  padding: 6px 16px;
+  padding: 7px 16px;
   text-align: left;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--color-text);
   background: none;
   border: none;
   cursor: pointer;
 }
 
-.folder-context-menu .ctx-item:hover {
+.folder-context-menu .ctx-item:hover:not(.disabled) {
   background: var(--color-bg-hover);
+}
+
+.folder-context-menu .ctx-item.disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.folder-context-menu .ctx-separator {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 0;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+
+.new-folder-modal {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  width: 380px;
+}
+
+.nf-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.nf-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.nf-close {
+  font-size: 20px;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+
+.nf-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.nf-error {
+  color: var(--color-danger-text, #dc2626);
+  font-size: 12px;
+  padding: 6px 8px;
+  background: rgba(251, 44, 54, 0.06);
+  border-radius: 4px;
+}
+
+.nf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nf-field label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.nf-input,
+.nf-select {
+  width: 100%;
+  box-sizing: border-box;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 14px;
+}
+
+.nf-input:focus,
+.nf-select:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+.nf-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.nf-btn-cancel {
+  height: 34px;
+  padding: 0 16px;
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.nf-btn-create {
+  height: 34px;
+  padding: 0 16px;
+  background: var(--color-accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.nf-btn-create:hover {
+  background: var(--color-accent-hover);
+}
+
+.nf-btn-create:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>
