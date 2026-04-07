@@ -68,6 +68,56 @@ pub async fn get_message_body(
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
+    // Graph API messages: fetch body directly from Graph, not from disk
+    if let Some(graph_msg_id) = maildir_path.strip_prefix("graph:") {
+        log::debug!("Fetching Graph message body for {}", graph_msg_id);
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        let body = client.get_message_body(graph_msg_id).await?;
+
+        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+        let (body_html, body_text) = if body.content_type == "html" {
+            let sanitized = ammonia::clean(&body.content);
+            // Simple HTML-to-text: strip tags for plain text view
+            let text = body.content
+                .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                .replace("</p>", "\n").replace("</div>", "\n");
+            let text = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&text, "").to_string();
+            (Some(sanitized), text)
+        } else {
+            (None, body.content)
+        };
+
+        // Mark as read on the server if not already
+        if !flags.contains(&"seen".to_string()) {
+            let graph_ids = vec![graph_msg_id.to_string()];
+            client.set_read_status(&graph_ids, true).await.ok();
+            let conn = state.db.lock().await;
+            let mut new_flags = flags.clone();
+            new_flags.push("seen".to_string());
+            db::messages::update_flags(&conn, &message_id, &serde_json::to_string(&new_flags).unwrap_or_default())?;
+        }
+
+        let to: Vec<db::messages::Address> = serde_json::from_str(&to_json).unwrap_or_default();
+        let cc: Vec<db::messages::Address> = serde_json::from_str(&cc_json).unwrap_or_default();
+
+        return Ok(db::messages::MessageBody {
+            id: message_id,
+            subject: None,
+            from: db::messages::Address { name: None, email: from_email },
+            to,
+            cc,
+            date: String::new(),
+            flags,
+            body_html,
+            body_text: Some(body_text),
+            attachments: vec![],
+            is_encrypted,
+            is_signed,
+            list_id: None,
+        });
+    }
+
     // If body hasn't been downloaded yet, fetch it on-demand
     let actual_maildir_path = if maildir_path.is_empty() {
         // Get account config and message details
@@ -115,6 +165,7 @@ pub async fn get_message_body(
                 username: account.username,
                 password: account.password,
                 use_tls: account.use_tls,
+            use_xoauth2: false,
             };
 
             let account_id_clone = account_id.clone();
@@ -282,6 +333,7 @@ pub async fn create_folder(
             username: account.username,
             password: account.password,
             use_tls: account.use_tls,
+            use_xoauth2: false,
         };
         let folder_for_imap = folder_path.clone();
         tokio::task::spawn_blocking(move || {

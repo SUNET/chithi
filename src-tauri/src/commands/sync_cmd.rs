@@ -110,12 +110,35 @@ pub async fn trigger_sync(
             account.imap_port
         );
 
+        // For O365 accounts, get an IMAP-scoped OAuth token
+        let (password, use_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into()))?;
+            let refresh_token = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token.".into()))?;
+            let imap_tokens = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT,
+                &refresh_token,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            // Save the potentially rotated refresh token
+            crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
+                access_token: imap_tokens.access_token.clone(),
+                refresh_token: imap_tokens.refresh_token,
+                expires_at: imap_tokens.expires_at,
+            })?;
+            (imap_tokens.access_token, true)
+        } else {
+            (account.password.clone(), false)
+        };
+
         let imap_config = ImapConfig {
             host: account.imap_host,
             port: account.imap_port,
-            username: account.username,
-            password: account.password,
+            username: account.username.clone(),
+            password,
             use_tls: account.use_tls,
+            use_xoauth2,
         };
 
         if let Err(e) = mail_sync::sync_account(
@@ -175,6 +198,7 @@ pub async fn sync_folder(
         username: account.username,
         password: account.password,
         use_tls: account.use_tls,
+            use_xoauth2: false,
     };
 
     let db = state.db.clone();
@@ -406,6 +430,7 @@ pub async fn prefetch_bodies(
             username: account.username,
             password: account.password,
             use_tls: account.use_tls,
+            use_xoauth2: false,
         };
         (config, state.data_dir.clone())
     };
@@ -562,6 +587,110 @@ pub async fn prefetch_bodies(
     Ok(fetched_count)
 }
 
+/// Sync an O365 account via Microsoft Graph API.
+async fn sync_graph_account(
+    app: AppHandle,
+    db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    account_id: &str,
+) -> Result<()> {
+    use crate::mail::graph::{self, GraphClient};
+
+    let token = graph::get_graph_token(account_id).await?;
+    let client = GraphClient::new(&token);
+
+    // Sync mail folders
+    let graph_folders = client.list_mail_folders().await?;
+    log::info!("Graph sync: {} mail folders for account {}", graph_folders.len(), account_id);
+
+    {
+        let conn = db_arc.lock().await;
+        for gf in &graph_folders {
+            let folder_type = graph::guess_folder_type(&gf.display_name);
+            db::folders::upsert_folder(&conn, account_id, &gf.display_name, &gf.id, folder_type)?;
+            db::folders::update_folder_counts(&conn, account_id, &gf.id, gf.unread_count, gf.total_count)?;
+        }
+    }
+
+    // Sync messages for each folder
+    let mut grand_total = 0u32;
+    for gf in &graph_folders {
+        // Fetch messages (Graph uses skip-based pagination, not UIDs)
+        let (messages, _total) = client.list_messages(&gf.id, 200, 0).await?;
+
+        if messages.is_empty() {
+            continue;
+        }
+
+        let existing_ids = {
+            let conn = db_arc.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
+            ).map_err(Error::Database)?;
+            let ids: std::collections::HashSet<String> = stmt
+                .query_map(rusqlite::params![account_id, gf.id], |row| row.get(0))
+                .map_err(Error::Database)?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
+        let conn = db_arc.lock().await;
+        conn.execute_batch("BEGIN")?;
+
+        let mut synced = 0u32;
+        for msg in &messages {
+            let id = format!("{}_{}", account_id, msg.id);
+            if existing_ids.contains(&id) {
+                continue;
+            }
+
+            let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
+            let thread_id = msg.conversation_id.clone();
+
+            let new_msg = db::messages::NewMessage {
+                id: id.clone(),
+                account_id: account_id.to_string(),
+                folder_path: gf.id.clone(),
+                uid: 0, // Graph doesn't use UIDs
+                message_id: msg.internet_message_id.clone(),
+                in_reply_to: None,
+                thread_id,
+                subject: msg.subject.clone(),
+                from_name: msg.from_name.clone(),
+                from_email: msg.from_email.clone().unwrap_or_else(|| "unknown".to_string()),
+                to_addresses: msg.to_addresses.clone(),
+                cc_addresses: msg.cc_addresses.clone(),
+                date: msg.date.clone(),
+                size: 0,
+                has_attachments: msg.has_attachments,
+                is_encrypted: false,
+                is_signed: false,
+                flags: serde_json::to_string(&flags).unwrap_or_default(),
+                maildir_path: format!("graph:{}", msg.id), // Special marker for Graph bodies
+                snippet: msg.preview.clone(),
+            };
+            db::messages::insert_message(&conn, &new_msg)?;
+            synced += 1;
+        }
+
+        conn.execute_batch("COMMIT")?;
+        drop(conn);
+
+        if synced > 0 {
+            log::info!("Graph sync: {} new messages in '{}'", synced, gf.display_name);
+            grand_total += synced;
+        }
+    }
+
+    app.emit("sync-complete", serde_json::json!({
+        "account_id": account_id,
+        "total_synced": grand_total,
+    })).ok();
+
+    log::info!("Graph sync: completed for account {}, {} new messages", account_id, grand_total);
+    Ok(())
+}
+
 /// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
 #[tauri::command]
 pub async fn start_idle(
@@ -605,12 +734,34 @@ async fn start_imap_idle(
         db::accounts::get_account_full(&conn, &account.id)?
     };
 
+    // For O365: get IMAP-scoped OAuth token
+    let (password, use_xoauth2) = if full_account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account.id)?
+            .ok_or_else(|| crate::error::Error::Other("No O365 tokens for IDLE".into()))?;
+        let refresh_token = tokens.refresh_token
+            .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for IDLE".into()))?;
+        let imap_tokens = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT,
+            &refresh_token,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account.id, &crate::oauth::OAuthTokens {
+            access_token: imap_tokens.access_token.clone(),
+            refresh_token: imap_tokens.refresh_token,
+            expires_at: imap_tokens.expires_at,
+        })?;
+        (imap_tokens.access_token, true)
+    } else {
+        (full_account.password.clone(), false)
+    };
+
     let config = ImapConfig {
         host: full_account.imap_host.clone(),
         port: full_account.imap_port,
         username: full_account.username.clone(),
-        password: full_account.password.clone(),
+        password,
         use_tls: full_account.use_tls,
+        use_xoauth2,
     };
 
     let account_id = account.id.clone();

@@ -43,7 +43,19 @@ pub async fn send_message(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "graph" {
+        log::info!("Sending via Microsoft Graph for account {}", account.email);
+
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.send_mail(&crate::mail::graph::GraphSendMessage {
+            to: message.to.clone(),
+            cc: message.cc.clone(),
+            bcc: message.bcc.clone(),
+            subject: message.subject.clone(),
+            body_text: message.body_text.clone(),
+        }).await?;
+    } else if account.mail_protocol == "jmap" {
         log::info!("Sending via JMAP for account {}", account.email);
 
         let jmap_config = JmapConfig {
@@ -76,13 +88,35 @@ pub async fn send_message(
             account.email
         );
 
+        // For O365: get SMTP-scoped OAuth token
+        let (smtp_username, smtp_password, use_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
+            let refresh_token = tokens.refresh_token
+                .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for SMTP".into()))?;
+            let smtp_tokens = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT,
+                &refresh_token,
+                crate::oauth::MICROSOFT_IMAP_SCOPES, // SMTP.Send is in the same scope set
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
+                access_token: smtp_tokens.access_token.clone(),
+                refresh_token: smtp_tokens.refresh_token,
+                expires_at: smtp_tokens.expires_at,
+            })?;
+            (account.username.clone(), smtp_tokens.access_token, true)
+        } else {
+            (account.username.clone(), account.password.clone(), false)
+        };
+
         let attachment_data = read_attachments(&message.attachments)?;
         smtp::send_message(
             &account.smtp_host,
             account.smtp_port,
-            &account.username,
-            &account.password,
+            &smtp_username,
+            &smtp_password,
             account.use_tls,
+            use_xoauth2,
             &account.email,
             &message.to,
             &message.cc,
@@ -169,6 +203,7 @@ pub async fn save_draft(
                 username: account.username,
                 password: account.password,
                 use_tls: account.use_tls,
+                use_xoauth2: false,
             };
             let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
             // Try common Drafts folder names

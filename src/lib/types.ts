@@ -2,8 +2,8 @@ export interface Account {
   id: string;
   display_name: string;
   email: string;
-  provider: "generic" | "gmail" | "microsoft365";
-  mail_protocol: "imap" | "jmap";
+  provider: "generic" | "gmail" | "microsoft365" | "o365";
+  mail_protocol: "imap" | "jmap" | "graph";
   enabled: boolean;
 }
 
@@ -96,8 +96,8 @@ export interface SyncStatus {
 export interface AccountConfig {
   display_name: string;
   email: string;
-  provider: "generic" | "gmail" | "microsoft365";
-  mail_protocol: "imap" | "jmap";
+  provider: "generic" | "gmail" | "microsoft365" | "o365";
+  mail_protocol: "imap" | "jmap" | "graph";
   imap_host: string;
   imap_port: number;
   smtp_host: string;

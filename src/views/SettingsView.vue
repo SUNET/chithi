@@ -48,7 +48,7 @@ const defaultForm = (): AccountConfig => ({
 
 const form = ref<AccountConfig>(defaultForm());
 
-type AccountType = "gmail" | "imap" | "jmap" | "caldav";
+type AccountType = "gmail" | "imap" | "jmap" | "caldav" | "o365";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
@@ -62,6 +62,18 @@ function selectAccountType(type: AccountType) {
         f.imap_host = "imap.gmail.com";
         f.imap_port = 993;
         f.smtp_host = "smtp.gmail.com";
+        f.smtp_port = 587;
+      }
+      f.jmap_url = "";
+      f.use_tls = true;
+      break;
+    case "o365":
+      f.provider = "o365";
+      f.mail_protocol = "imap";
+      if (!editingAccountId.value) {
+        f.imap_host = "outlook.office365.com";
+        f.imap_port = 993;
+        f.smtp_host = "smtp.office365.com";
         f.smtp_port = 587;
       }
       f.jmap_url = "";
@@ -106,9 +118,18 @@ async function openEditForm(id: string) {
   try {
     const config = await api.getAccountConfig(id);
     form.value = config;
-    if (config.provider === "gmail") {
+    if (config.provider === "o365") {
+      accountType.value = "o365";
+      try {
+        const hasTokens = await api.oauthHasTokens(id);
+        if (hasTokens) {
+          oauthStatus.value = "Signed in with Microsoft";
+        } else {
+          oauthStatus.value = null;
+        }
+      } catch { oauthStatus.value = null; }
+    } else if (config.provider === "gmail") {
       accountType.value = "gmail";
-      // Check if OAuth tokens exist
       try {
         const hasTokens = await api.oauthHasTokens(id);
         if (hasTokens) {
@@ -193,6 +214,38 @@ async function startGoogleOAuth() {
   }
 }
 
+async function startMicrosoftOAuth() {
+  oauthInProgress.value = true;
+  oauthStatus.value = null;
+  error.value = null;
+
+  try {
+    const tempAccountId = editingAccountId.value ?? `o365-pending-${Date.now()}`;
+
+    const { url, port } = await api.oauthStart("microsoft");
+    await shellOpen(url);
+    await api.oauthComplete("microsoft", port, tempAccountId);
+
+    // Auto-fill display name and email from Microsoft Graph /me
+    try {
+      const profile = await api.oauthGetMsProfile(tempAccountId) as { display_name: string; email: string; login_email: string };
+      if (profile.display_name) form.value.display_name = profile.display_name;
+      if (profile.email) form.value.email = profile.email;
+      // Set username to the Microsoft login identity (needed for IMAP XOAUTH2)
+      if (profile.login_email) form.value.username = profile.login_email;
+    } catch (e) {
+      console.error("Failed to fetch Microsoft profile:", e);
+    }
+
+    form.value.password = `oauth2:${tempAccountId}`;
+    oauthStatus.value = "Signed in with Microsoft";
+  } catch (e) {
+    error.value = `Microsoft sign-in failed: ${e}`;
+  } finally {
+    oauthInProgress.value = false;
+  }
+}
+
 async function doDelete() {
   if (deletingAccountId.value) {
     await accountsStore.deleteAccount(deletingAccountId.value);
@@ -227,7 +280,7 @@ async function doDelete() {
             <div class="account-card-info">
               <span class="account-card-name">{{ account.display_name }}</span>
               <span class="account-card-email">{{ account.email }}</span>
-              <span class="account-card-type">{{ account.provider === 'gmail' ? 'Gmail' : account.mail_protocol.toUpperCase() }}</span>
+              <span class="account-card-type">{{ account.provider === 'gmail' ? 'Gmail' : account.provider === 'o365' ? 'Microsoft 365' : account.mail_protocol.toUpperCase() }}</span>
             </div>
           </div>
           <div class="account-card-actions">
@@ -261,13 +314,13 @@ async function doDelete() {
               <label>Account Type</label>
               <div class="type-selector">
                 <button
-                  v-for="t in (['gmail', 'imap', 'jmap', 'caldav'] as AccountType[])"
+                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav'] as AccountType[])"
                   :key="t"
                   class="type-btn"
                   :class="{ active: accountType === t }"
                   :disabled="!!editingAccountId"
                   @click="selectAccountType(t)"
-                >{{ t === 'gmail' ? 'Gmail' : t.toUpperCase() }}</button>
+                >{{ t === 'gmail' ? 'Gmail' : t === 'o365' ? 'Microsoft 365' : t.toUpperCase() }}</button>
               </div>
             </div>
 
@@ -279,7 +332,7 @@ async function doDelete() {
               <label>Email Address</label>
               <input v-model="form.email" type="email" placeholder="user@example.com" />
             </div>
-            <div class="form-group">
+            <div v-if="accountType !== 'o365'" class="form-group">
               <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
               <input v-model="form.password" type="password" :placeholder="accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••'" />
               <span class="field-hint">Passwords are stored securely in your OS keyring</span>
@@ -310,6 +363,34 @@ async function doDelete() {
                   {{ oauthInProgress ? "Waiting for browser..." : "Sign in with Google" }}
                 </button>
                 <span class="field-hint">Sign in to sync Google Calendar and Contacts. IMAP/SMTP uses app password above.</span>
+              </div>
+            </template>
+
+            <template v-if="accountType === 'o365'">
+              <div class="form-group">
+                <label>Microsoft 365 Sign In</label>
+                <div v-if="oauthStatus" class="oauth-row">
+                  <div class="oauth-status">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                    {{ oauthStatus }}
+                  </div>
+                  <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
+                </div>
+                <button
+                  v-else
+                  class="btn-oauth"
+                  :disabled="oauthInProgress"
+                  @click="startMicrosoftOAuth"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <rect x="1" y="1" width="10" height="10" fill="#F25022"/>
+                    <rect x="13" y="1" width="10" height="10" fill="#7FBA00"/>
+                    <rect x="1" y="13" width="10" height="10" fill="#00A4EF"/>
+                    <rect x="13" y="13" width="10" height="10" fill="#FFB900"/>
+                  </svg>
+                  {{ oauthInProgress ? "Waiting for browser..." : "Sign in with Microsoft" }}
+                </button>
+                <span class="field-hint">Sign in to access mail, calendar, and contacts via Microsoft Graph API.</span>
               </div>
             </template>
 

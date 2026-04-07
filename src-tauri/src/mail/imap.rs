@@ -11,6 +11,37 @@ pub struct ImapConfig {
     pub username: String,
     pub password: String,
     pub use_tls: bool,
+    /// If true, use XOAUTH2 authentication (password field contains the access token).
+    pub use_xoauth2: bool,
+}
+
+impl ImapConfig {
+    /// Build an ImapConfig from an account. For O365 accounts, fetches an
+    /// IMAP-scoped OAuth token and sets use_xoauth2=true.
+    pub fn from_account(account: &crate::db::accounts::AccountFull) -> ImapConfig {
+        ImapConfig {
+            host: account.imap_host.clone(),
+            port: account.imap_port,
+            username: account.username.clone(),
+            password: account.password.clone(),
+            use_tls: account.use_tls,
+            use_xoauth2: account.provider == "o365",
+        }
+    }
+}
+
+/// XOAUTH2 SASL authenticator for IMAP (used by O365).
+/// Format: base64("user={email}\x01auth=Bearer {token}\x01\x01")
+struct XOAuth2 {
+    user: String,
+    token: String,
+}
+
+impl imap::Authenticator for XOAuth2 {
+    type Response = String;
+    fn process(&self, _challenge: &[u8]) -> Self::Response {
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+    }
 }
 
 /// Lightweight envelope data extracted from IMAP FETCH.
@@ -65,12 +96,26 @@ impl ImapConnection {
 
         log::debug!("IMAP connected, authenticating as {}", config.username);
 
-        let session = client
-            .login(&config.username, &config.password)
-            .map_err(|e| {
-                log::error!("IMAP login failed for {}: {}", config.username, e.0);
-                Error::Imap(e.0.to_string())
-            })?;
+        let session = if config.use_xoauth2 {
+            log::debug!("IMAP using XOAUTH2 authentication");
+            let auth = XOAuth2 {
+                user: config.username.clone(),
+                token: config.password.clone(),
+            };
+            client
+                .authenticate("XOAUTH2", &auth)
+                .map_err(|e| {
+                    log::error!("IMAP XOAUTH2 auth failed for {}: {}", config.username, e.0);
+                    Error::Imap(format!("XOAUTH2 auth failed: {}", e.0))
+                })?
+        } else {
+            client
+                .login(&config.username, &config.password)
+                .map_err(|e| {
+                    log::error!("IMAP login failed for {}: {}", config.username, e.0);
+                    Error::Imap(e.0.to_string())
+                })?
+        };
 
         log::info!("IMAP authenticated as {}", config.username);
         Ok(Self { session })

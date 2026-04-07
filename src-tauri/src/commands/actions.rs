@@ -26,7 +26,18 @@ pub async fn move_messages(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "graph" {
+        // Graph path: extract Graph message IDs and move via Graph API
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        for mid in &message_ids {
+            // Format: {account_id}_{graph_message_id}
+            let graph_id = mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid);
+            if let Err(e) = client.move_message(graph_id, &target_folder).await {
+                log::error!("Graph move failed for {}: {}", graph_id, e);
+            }
+        }
+    } else if account.mail_protocol == "jmap" {
         // JMAP path: extract JMAP email IDs and source mailbox, then move via JMAP API
         let jmap_config = crate::mail::jmap::JmapConfig {
             jmap_url: account.jmap_url.clone(),
@@ -62,6 +73,7 @@ pub async fn move_messages(
                 username: account.username,
                 password: account.password,
                 use_tls: account.use_tls,
+            use_xoauth2: false,
             };
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
             let grouped = group_by_folder(uid_rows);
@@ -125,15 +137,30 @@ pub async fn delete_messages(
         message_ids.len()
     );
 
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.mail_protocol == "graph" {
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        for mid in &message_ids {
+            let graph_id = mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid);
+            if let Err(e) = client.delete_message(graph_id).await {
+                log::error!("Graph delete failed for {}: {}", graph_id, e);
+            }
+        }
+    } else {
     let (imap_config, by_folder) = {
         let conn = state.db.lock().await;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
         let config = ImapConfig {
             host: account.imap_host,
             port: account.imap_port,
             username: account.username,
             password: account.password,
             use_tls: account.use_tls,
+            use_xoauth2: false,
         };
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
         let grouped = group_by_folder(uid_rows);
@@ -145,7 +172,6 @@ pub async fn delete_messages(
         return Ok(());
     }
 
-    // Perform IMAP deletions in a blocking thread
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = ImapConnection::connect(&imap_config)?;
 
@@ -164,6 +190,7 @@ pub async fn delete_messages(
     })
     .await
     .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
+    } // end else (IMAP path)
 
     // Remove from local DB and recalculate folder counts
     {
@@ -202,7 +229,18 @@ pub async fn set_message_flags(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "graph" {
+        // Graph path: use PATCH to update isRead
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        let is_seen_flag = flags.iter().any(|f| f == "seen" || f == "\\Seen");
+        if is_seen_flag {
+            let graph_ids: Vec<String> = message_ids.iter().map(|mid| {
+                mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid).to_string()
+            }).collect();
+            client.set_read_status(&graph_ids, add).await?;
+        }
+    } else if account.mail_protocol == "jmap" {
         // JMAP path: extract JMAP email IDs and set flags via JMAP API
         let jmap_config = crate::mail::jmap::JmapConfig {
             jmap_url: account.jmap_url.clone(),
@@ -231,6 +269,7 @@ pub async fn set_message_flags(
                 username: account.username.clone(),
                 password: account.password.clone(),
                 use_tls: account.use_tls,
+            use_xoauth2: false,
             };
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
             let grouped = group_by_folder(uid_rows);
@@ -329,6 +368,7 @@ pub async fn copy_messages(
             username: account.username,
             password: account.password,
             use_tls: account.use_tls,
+            use_xoauth2: false,
         };
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
         let grouped = group_by_folder(uid_rows);

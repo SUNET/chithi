@@ -97,6 +97,7 @@ pub async fn apply_filters_to_folder(
             username: account.username,
             password: account.password,
             use_tls: account.use_tls,
+            use_xoauth2: false,
         };
 
         (enabled_rules, messages, config)

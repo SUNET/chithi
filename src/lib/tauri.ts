@@ -384,6 +384,12 @@ export async function oauthHasTokens(
   return invoke("oauth_has_tokens", { accountId });
 }
 
+export async function oauthGetMsProfile(
+  accountId: string,
+): Promise<{ display_name: string; email: string }> {
+  return invoke("oauth_get_ms_profile", { accountId });
+}
+
 export async function searchCollectedContacts(
   query: string,
 ): Promise<import("./types").CollectedContact[]> {

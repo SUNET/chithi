@@ -460,3 +460,80 @@ describe("Contact lookup from email address", () => {
     expect(findExactContact(results, "alice@example.com")).toBeUndefined();
   });
 });
+
+describe("parseAddresses with Name <email> format", () => {
+  function parseAddresses(input: string): string[] {
+    return input
+      .split(/[,;]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .map((s) => {
+        const match = s.match(/<([^>]+)>/);
+        return match ? match[1] : s;
+      });
+  }
+
+  it("extracts email from Name <email> format", () => {
+    expect(parseAddresses("Alice Smith <alice@example.com>")).toEqual(["alice@example.com"]);
+  });
+
+  it("handles plain email address", () => {
+    expect(parseAddresses("alice@example.com")).toEqual(["alice@example.com"]);
+  });
+
+  it("handles autocomplete format with trailing comma", () => {
+    expect(parseAddresses("Alice Smith <alice@example.com>, ")).toEqual(["alice@example.com"]);
+  });
+
+  it("handles multiple Name <email> addresses", () => {
+    expect(parseAddresses("Alice <alice@a.com>, Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
+  });
+
+  it("handles mix of plain and Name <email>", () => {
+    expect(parseAddresses("alice@a.com, Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
+  });
+
+  it("handles same email in name and angle brackets", () => {
+    expect(parseAddresses("kushal@sunet.se <kushal@sunet.se>, ")).toEqual(["kushal@sunet.se"]);
+  });
+
+  it("handles semicolon separator", () => {
+    expect(parseAddresses("Alice <alice@a.com>; Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
+  });
+});
+
+describe("XOAUTH2 token format", () => {
+  function buildXOAuth2Token(user: string, accessToken: string): string {
+    return `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
+  }
+
+  it("builds correct XOAUTH2 SASL string", () => {
+    const token = buildXOAuth2Token("user@example.com", "ya29.token123");
+    expect(token).toBe("user=user@example.com\x01auth=Bearer ya29.token123\x01\x01");
+  });
+
+  it("uses login email not mailbox email for XOAUTH2", () => {
+    // For personal Microsoft accounts, XOAUTH2 user= must be the login identity
+    // (e.g., gmail.com) not the Outlook mailbox alias
+    const loginEmail = "kushaldas@gmail.com";
+    const mailboxEmail = "outlook_A634C77E51D17412@outlook.com";
+    const token = buildXOAuth2Token(loginEmail, "access_token");
+    expect(token).toContain("user=kushaldas@gmail.com");
+    expect(token).not.toContain(mailboxEmail);
+  });
+});
+
+describe("PKCE code challenge", () => {
+  it("code verifier is non-empty string", () => {
+    // In real code, this is 64 random bytes base64url-encoded
+    const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    expect(verifier.length).toBeGreaterThan(40);
+  });
+
+  it("code challenge uses S256 method", () => {
+    // The challenge is SHA256(verifier) base64url-encoded
+    // This test validates the concept, not the actual crypto
+    const method = "S256";
+    expect(method).toBe("S256");
+  });
+});

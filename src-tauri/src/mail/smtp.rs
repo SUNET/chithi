@@ -1,5 +1,5 @@
 use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart, Mailbox};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::error::{Error, Result};
@@ -61,6 +61,7 @@ pub async fn send_message(
     username: &str,
     password: &str,
     use_tls: bool,
+    use_xoauth2: bool,
     from: &str,
     to: &[String],
     cc: &[String],
@@ -110,13 +111,19 @@ pub async fn send_message(
         .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
 
     let creds = Credentials::new(username.to_string(), password.to_string());
+    let auth_mechanisms = if use_xoauth2 {
+        vec![Mechanism::Xoauth2]
+    } else {
+        vec![Mechanism::Plain, Mechanism::Login]
+    };
 
     let transport = if smtp_port == 587 {
-        log::debug!("SMTP using STARTTLS on port 587");
+        log::debug!("SMTP using STARTTLS on port 587 (xoauth2={})", use_xoauth2);
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
             .map_err(|e| Error::Other(format!("SMTP STARTTLS relay setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     } else if use_tls || smtp_port == 465 {
         log::debug!("SMTP using implicit TLS on port {}", smtp_port);
@@ -124,6 +131,7 @@ pub async fn send_message(
             .map_err(|e| Error::Other(format!("SMTP TLS relay setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     } else {
         log::debug!("SMTP using STARTTLS (default) on port {}", smtp_port);
@@ -131,6 +139,7 @@ pub async fn send_message(
             .map_err(|e| Error::Other(format!("SMTP relay setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     };
 

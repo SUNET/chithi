@@ -334,7 +334,12 @@ function parseAddresses(input: string): string[] {
   return input
     .split(/[,;]/)
     .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+    .filter((s) => s.length > 0)
+    .map((s) => {
+      // Extract email from "Name <email>" format
+      const match = s.match(/<([^>]+)>/);
+      return match ? match[1] : s;
+    });
 }
 
 function mentionsAttachment(): boolean {
