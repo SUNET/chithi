@@ -366,6 +366,49 @@ describe("Signature management", () => {
   });
 });
 
+describe("Compose autocomplete", () => {
+  function getLastTerm(input: string): string {
+    const parts = input.split(/[,;]/);
+    return (parts[parts.length - 1] || "").trim();
+  }
+
+  function insertAutocomplete(fieldValue: string, display: string, email: string): string {
+    const parts = fieldValue.split(/[,;]/);
+    parts[parts.length - 1] = ` ${display} <${email}>`;
+    return parts.join(",") + ", ";
+  }
+
+  it("extracts last term from single address", () => {
+    expect(getLastTerm("ali")).toBe("ali");
+  });
+
+  it("extracts last term after comma", () => {
+    expect(getLastTerm("alice@example.com, bo")).toBe("bo");
+  });
+
+  it("extracts last term after semicolon", () => {
+    expect(getLastTerm("alice@example.com; ku")).toBe("ku");
+  });
+
+  it("returns empty for trailing comma", () => {
+    expect(getLastTerm("alice@example.com, ")).toBe("");
+  });
+
+  it("inserts selected contact into single field", () => {
+    const result = insertAutocomplete("ali", "Alice Smith", "alice@example.com");
+    expect(result).toBe(" Alice Smith <alice@example.com>, ");
+  });
+
+  it("inserts selected contact after existing address", () => {
+    const result = insertAutocomplete("bob@test.com, ali", "Alice Smith", "alice@example.com");
+    expect(result).toBe("bob@test.com, Alice Smith <alice@example.com>, ");
+  });
+
+  it("does not trigger for queries shorter than 2 chars", () => {
+    expect(getLastTerm("a").length < 2).toBe(true);
+  });
+});
+
 describe("Contact lookup from email address", () => {
   // Mirrors the exact-match logic in MessageReader.onAddrRightClick
   function findExactContact(

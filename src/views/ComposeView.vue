@@ -74,6 +74,125 @@ const showBcc = ref(false);
 const attachments = ref<ComposeAttachment[]>([]);
 const sentSuccessfully = ref(false);
 
+// --- Autocomplete ---
+interface AutocompleteItem {
+  display: string;  // "Alice Smith"
+  email: string;    // "alice@example.com"
+  source: string;   // "Contacts" or "Recent"
+}
+
+const acResults = ref<AutocompleteItem[]>([]);
+const acVisible = ref(false);
+const acField = ref<"to" | "cc" | "bcc" | null>(null);
+const acSelected = ref(0);
+let acDebounce: ReturnType<typeof setTimeout> | null = null;
+
+function getLastTerm(input: string): string {
+  // Get the text after the last comma/semicolon (the part being typed)
+  const parts = input.split(/[,;]/);
+  return (parts[parts.length - 1] || "").trim();
+}
+
+function onAddrInput(field: "to" | "cc" | "bcc") {
+  acField.value = field;
+  const fieldRef = field === "to" ? to : field === "cc" ? cc : bcc;
+  const query = getLastTerm(fieldRef.value);
+
+  if (query.length < 2) {
+    acVisible.value = false;
+    acResults.value = [];
+    return;
+  }
+
+  if (acDebounce) clearTimeout(acDebounce);
+  acDebounce = setTimeout(() => searchAutocomplete(query), 150);
+}
+
+async function searchAutocomplete(query: string) {
+  try {
+    const [contacts, collected] = await Promise.all([
+      api.searchContacts(query),
+      api.searchCollectedContacts(query),
+    ]);
+
+    const items: AutocompleteItem[] = [];
+    const seen = new Set<string>();
+
+    // Contacts first (full contacts take priority)
+    for (const c of contacts) {
+      let emails: { email: string; label: string }[] = [];
+      try { emails = JSON.parse(c.emails_json); } catch { continue; }
+      for (const e of emails) {
+        const key = e.email.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          items.push({
+            display: c.display_name,
+            email: e.email,
+            source: "Contacts",
+          });
+        }
+      }
+    }
+
+    // Then collected contacts (recently used)
+    for (const c of collected) {
+      const key = c.email.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        items.push({
+          display: c.name || c.email,
+          email: c.email,
+          source: "Recent",
+        });
+      }
+    }
+
+    acResults.value = items.slice(0, 8);
+    acVisible.value = items.length > 0;
+    acSelected.value = 0;
+  } catch {
+    acVisible.value = false;
+  }
+}
+
+function selectAutocomplete(item: AutocompleteItem) {
+  if (!acField.value) return;
+  const fieldRef = acField.value === "to" ? to : acField.value === "cc" ? cc : bcc;
+  const parts = fieldRef.value.split(/[,;]/);
+  // Replace the last (incomplete) part with the selected email
+  parts[parts.length - 1] = ` ${item.display} <${item.email}>`;
+  fieldRef.value = parts.join(",") + ", ";
+  acVisible.value = false;
+  acResults.value = [];
+}
+
+function onAddrKeydown(event: KeyboardEvent) {
+  if (!acVisible.value || acResults.value.length === 0) return;
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    acSelected.value = (acSelected.value + 1) % acResults.value.length;
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    acSelected.value = (acSelected.value - 1 + acResults.value.length) % acResults.value.length;
+  } else if (event.key === "Enter" || event.key === "Tab") {
+    if (acVisible.value) {
+      event.preventDefault();
+      selectAutocomplete(acResults.value[acSelected.value]);
+    }
+  } else if (event.key === "Escape") {
+    acVisible.value = false;
+  }
+}
+
+function onAddrBlur() {
+  // Delay to allow click on dropdown item
+  setTimeout(() => {
+    acVisible.value = false;
+  }, 200);
+}
+
 // Signature management — track current signature so we can swap it
 // when the user switches accounts in the From dropdown.
 const currentSignature = ref("");
@@ -351,21 +470,90 @@ async function send() {
             </option>
           </select>
         </div>
-        <div class="field-row">
+        <div class="field-row addr-field-row">
           <label class="field-label">To</label>
           <div class="field-input-group">
-            <input v-model="to" type="text" class="field-input" />
+            <div class="addr-input-wrap">
+              <input
+                v-model="to"
+                type="text"
+                class="field-input"
+                @input="onAddrInput('to')"
+                @keydown="onAddrKeydown"
+                @blur="onAddrBlur"
+                @focus="onAddrInput('to')"
+              />
+              <div v-if="acVisible && acField === 'to'" class="ac-dropdown">
+                <button
+                  v-for="(item, i) in acResults"
+                  :key="item.email"
+                  class="ac-item"
+                  :class="{ selected: i === acSelected }"
+                  @mousedown.prevent="selectAutocomplete(item)"
+                >
+                  <span class="ac-name">{{ item.display }}</span>
+                  <span class="ac-email">&lt;{{ item.email }}&gt;</span>
+                  <span class="ac-source">{{ item.source }}</span>
+                </button>
+              </div>
+            </div>
             <button v-if="!showCc" class="cc-btn" @click="showCc = true">Cc</button>
             <button v-if="!showBcc" class="cc-btn" @click="showBcc = true">Bcc</button>
           </div>
         </div>
-        <div v-if="showCc" class="field-row">
+        <div v-if="showCc" class="field-row addr-field-row">
           <label class="field-label">Cc</label>
-          <input v-model="cc" type="text" class="field-input" />
+          <div class="addr-input-wrap">
+            <input
+              v-model="cc"
+              type="text"
+              class="field-input"
+              @input="onAddrInput('cc')"
+              @keydown="onAddrKeydown"
+              @blur="onAddrBlur"
+              @focus="onAddrInput('cc')"
+            />
+            <div v-if="acVisible && acField === 'cc'" class="ac-dropdown">
+              <button
+                v-for="(item, i) in acResults"
+                :key="item.email"
+                class="ac-item"
+                :class="{ selected: i === acSelected }"
+                @mousedown.prevent="selectAutocomplete(item)"
+              >
+                <span class="ac-name">{{ item.display }}</span>
+                <span class="ac-email">&lt;{{ item.email }}&gt;</span>
+                <span class="ac-source">{{ item.source }}</span>
+              </button>
+            </div>
+          </div>
         </div>
-        <div v-if="showBcc" class="field-row">
+        <div v-if="showBcc" class="field-row addr-field-row">
           <label class="field-label">Bcc</label>
-          <input v-model="bcc" type="text" class="field-input" />
+          <div class="addr-input-wrap">
+            <input
+              v-model="bcc"
+              type="text"
+              class="field-input"
+              @input="onAddrInput('bcc')"
+              @keydown="onAddrKeydown"
+              @blur="onAddrBlur"
+              @focus="onAddrInput('bcc')"
+            />
+            <div v-if="acVisible && acField === 'bcc'" class="ac-dropdown">
+              <button
+                v-for="(item, i) in acResults"
+                :key="item.email"
+                class="ac-item"
+                :class="{ selected: i === acSelected }"
+                @mousedown.prevent="selectAutocomplete(item)"
+              >
+                <span class="ac-name">{{ item.display }}</span>
+                <span class="ac-email">&lt;{{ item.email }}&gt;</span>
+                <span class="ac-source">{{ item.source }}</span>
+              </button>
+            </div>
+          </div>
         </div>
         <div class="field-row">
           <label class="field-label">Subject</label>
@@ -554,6 +742,75 @@ async function send() {
 
 .field-input-group .field-input {
   flex: 1;
+}
+
+.addr-input-wrap {
+  position: relative;
+  flex: 1;
+}
+
+.addr-input-wrap .field-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.ac-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  margin-top: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.ac-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  text-align: left;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--color-text);
+}
+
+.ac-item:hover,
+.ac-item.selected {
+  background: var(--color-bg-hover);
+}
+
+.ac-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ac-email {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ac-source {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  background: var(--color-bg-secondary);
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
 }
 
 .cc-btn {
