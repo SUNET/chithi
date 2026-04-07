@@ -78,8 +78,8 @@ export const useMessagesStore = defineStore("messages", () => {
     }
     if (resetPage) {
       page.value = 0;
-      messages.value = [];
-      threads.value = [];
+      // Don't clear messages/threads here — causes UI flicker.
+      // They get replaced atomically after the API call returns.
       expandedThreads.value = [];
       threadMessages.value = {};
     }
