@@ -2,6 +2,7 @@
 name = "chithi"
 version = "0.1.0"
 edition = "2021"
+authors = ["Kushal Das"]
 
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
