@@ -21,6 +21,25 @@ onMounted(async () => {
   activityStore.initEventListeners();
   // Load accounts globally so all views (Calendar, Contacts, etc.) have them
   await accountsStore.fetchAccounts();
+
+  // Zoom with Ctrl+/Ctrl- (WebKitGTK doesn't support zoomHotkeysEnabled)
+  let zoomLevel = 1.0;
+  window.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (e.key === "=" || e.key === "+") {
+      e.preventDefault();
+      zoomLevel = Math.min(zoomLevel + 0.1, 2.0);
+      document.documentElement.style.zoom = String(zoomLevel);
+    } else if (e.key === "-") {
+      e.preventDefault();
+      zoomLevel = Math.max(zoomLevel - 0.1, 0.5);
+      document.documentElement.style.zoom = String(zoomLevel);
+    } else if (e.key === "0") {
+      e.preventDefault();
+      zoomLevel = 1.0;
+      document.documentElement.style.zoom = "1";
+    }
+  });
 });
 </script>
 
