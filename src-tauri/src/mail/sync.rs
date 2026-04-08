@@ -245,7 +245,7 @@ fn sync_account_blocking(
                                         log::info!("Parallel sync: {} envelopes in {}", count, folder);
                                     }
                                 }
-                                Err(e) => log::error!("Parallel sync error in {}: {}", folder, e),
+                                Err(e) => log::warn!("Parallel sync: skipping folder '{}': {}", folder, e),
                             }
                         }
                         conn.logout();

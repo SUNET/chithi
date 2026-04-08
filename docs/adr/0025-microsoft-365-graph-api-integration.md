@@ -107,6 +107,17 @@ provider == "o365" && mail_protocol == "imap"
 
 **TODO**: Test with a work/school account to verify scope URLs and token behavior.
 
+### Known issue: error 12 on first account add
+
+When an O365 account is first added, `triggerSync` and `startIdle` both fire simultaneously. Both attempt XOAUTH2 authentication with the same access token. Outlook may reject the second concurrent session's `SELECT INBOX` with "Command Error. 12".
+
+This is a race condition, not a persistent failure:
+- The IDLE loop retries with exponential backoff and succeeds within seconds
+- Parallel sync threads may also see error 12 on some folders (`Deleted`, `Outbox`)
+- On subsequent syncs or app restart, all connections work cleanly
+
+These errors are logged at `warn` level (not `error`) to avoid false-positive red dots in the StatusBar. A proper fix would be to defer IDLE start until the first sync completes, or use separate token refreshes per connection.
+
 ## Consequences
 - O365 accounts use IMAP+SMTP like Gmail — consistent architecture
 - IMAP IDLE provides push notifications

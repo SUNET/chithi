@@ -65,7 +65,7 @@ pub fn run_idle_loop(
 
         // Select INBOX
         if let Err(e) = conn.select_folder("INBOX") {
-            log::error!("IDLE: failed to select INBOX for {} ({}): {}", account_id, config.username, e);
+            log::warn!("IDLE: failed to select INBOX for {} ({}): {}, will retry", account_id, config.username, e);
             sleep_interruptible(&stop, backoff);
             backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
             continue;
