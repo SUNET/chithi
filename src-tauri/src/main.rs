@@ -41,6 +41,7 @@ fn main() {
             commands::mail::list_folders,
             commands::mail::get_messages,
             commands::mail::get_message_body,
+            commands::mail::get_message_html_with_images,
             commands::mail::get_threaded_messages,
             commands::mail::get_thread_messages,
             commands::mail::unthread_message,

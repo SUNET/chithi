@@ -24,12 +24,18 @@ const foldersStore = useFoldersStore();
 const showHtml = ref(false);
 const invites = ref<ParsedInvite[]>([]);
 
+// Remote images: per-message, not persisted
+const imagesHtml = ref<string | null>(null);
+const loadingImages = ref(false);
+
 // Reset view state when switching messages
 watch(
   () => messagesStore.activeMessageId,
   () => {
     showHtml.value = false;
     invites.value = [];
+    imagesHtml.value = null;
+    loadingImages.value = false;
   },
 );
 
@@ -67,7 +73,7 @@ const hasText = () => !!messagesStore.activeMessage?.body_text;
 // The iframe has no access to window.__TAURI__ or any IPC commands.
 // Links inside the iframe send a postMessage to the parent for clipboard copy.
 function iframeSrcdoc(): string {
-  const html = messagesStore.activeMessage?.body_html ?? "";
+  const html = imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
   // Strict CSP inside the iframe: no scripts, no external resources except inline styles
   return `<!DOCTYPE html>
 <html>
@@ -186,6 +192,22 @@ function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + " B";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// --- Remote image loading ---
+async function loadRemoteImages() {
+  const accountId = accountsStore.activeAccountId;
+  const messageId = messagesStore.activeMessageId;
+  if (!accountId || !messageId) return;
+
+  loadingImages.value = true;
+  try {
+    imagesHtml.value = await api.getMessageHtmlWithImages(accountId, messageId);
+  } catch (e) {
+    showToast("Failed to load images: " + String(e));
+  } finally {
+    loadingImages.value = false;
+  }
 }
 
 // --- Address right-click → Add/Edit Contact ---
@@ -591,7 +613,12 @@ async function markSpam() {
           v-if="showHtml && hasHtml()"
           class="body-html-wrapper"
         >
-          <div class="no-remote-notice">Remote content blocked</div>
+          <div v-if="!imagesHtml" class="no-remote-notice">
+            Remote content blocked
+            <button class="load-images-btn" :disabled="loadingImages" @click="loadRemoteImages">
+              {{ loadingImages ? 'Loading...' : 'Load images' }}
+            </button>
+          </div>
           <iframe
             class="email-sandbox"
             :srcdoc="iframeSrcdoc()"
@@ -608,7 +635,12 @@ async function markSpam() {
           v-else-if="hasHtml()"
           class="body-html-wrapper"
         >
-          <div class="no-remote-notice">Remote content blocked</div>
+          <div v-if="!imagesHtml" class="no-remote-notice">
+            Remote content blocked
+            <button class="load-images-btn" :disabled="loadingImages" @click="loadRemoteImages">
+              {{ loadingImages ? 'Loading...' : 'Load images' }}
+            </button>
+          </div>
           <iframe
             class="email-sandbox"
             :srcdoc="iframeSrcdoc()"
@@ -966,12 +998,34 @@ async function markSpam() {
 }
 
 .no-remote-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 11px;
   color: var(--color-text-muted);
-  background: #f0f0f0;
+  background: var(--color-bg-tertiary);
   padding: 4px 8px;
   border-radius: 3px;
   margin-bottom: 8px;
+}
+
+.load-images-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-bg-secondary);
+  color: var(--color-accent);
+  cursor: pointer;
+}
+
+.load-images-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.load-images-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
 }
 
 .body-html-wrapper {

@@ -226,6 +226,100 @@ pub async fn get_message_body(
     })
 }
 
+/// Re-parse the message body allowing <img> tags, then download each image
+/// and embed as base64 data URIs so the sandboxed iframe needs no network access.
+/// Returns just the HTML string. Per-message, not persisted.
+#[tauri::command]
+pub async fn get_message_html_with_images(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<String> {
+    let maildir_path = {
+        let conn = state.db.lock().await;
+        let (mp, _, _, _, _, _, _) =
+            db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        mp
+    };
+
+    if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+        return Err(Error::Other(
+            "Remote images not supported for messages without local body".to_string(),
+        ));
+    }
+
+    let full_path = state.data_dir.join(&maildir_path);
+    let raw = std::fs::read(&full_path).map_err(|e| {
+        Error::Other(format!("Failed to read message file: {}", e))
+    })?;
+
+    let html = parser::parse_html_with_images(&raw).ok_or_else(|| {
+        Error::MailParse("Failed to parse message HTML".to_string())
+    })?;
+
+    // Find all img src URLs and download them, replacing with data URIs.
+    // This keeps the iframe sandbox at allow-scripts only (no allow-same-origin).
+    let re = regex::Regex::new(r#"src="(https://[^"]+)""#)
+        .map_err(|e| Error::Other(format!("Regex error: {}", e)))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+
+    // Collect all unique URLs
+    let urls: Vec<String> = re
+        .captures_iter(&html)
+        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Download images in parallel (max 20 to avoid abuse)
+    use base64::Engine;
+    let mut url_to_data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let futures: Vec<_> = urls.iter().take(20).map(|url| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let resp = client.get(&url).send().await.ok()?;
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/png")
+                .to_string();
+            // Only allow image content types, max 5MB
+            if !content_type.starts_with("image/") {
+                return None;
+            }
+            let bytes = resp.bytes().await.ok()?;
+            if bytes.len() > 5 * 1024 * 1024 {
+                return None;
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some((url, format!("data:{};base64,{}", content_type, b64)))
+        }
+    }).collect();
+
+    let results = futures::future::join_all(futures).await;
+    for result in results.into_iter().flatten() {
+        url_to_data.insert(result.0, result.1);
+    }
+
+    // Replace URLs with data URIs in the HTML
+    let result = re.replace_all(&html, |caps: &regex::Captures| {
+        let url = caps.get(1).unwrap().as_str();
+        if let Some(data_uri) = url_to_data.get(url) {
+            format!("src=\"{}\"", data_uri)
+        } else {
+            caps[0].to_string()
+        }
+    });
+
+    Ok(result.into_owned())
+}
+
 #[tauri::command]
 pub async fn get_threaded_messages(
     state: State<'_, AppState>,

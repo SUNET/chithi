@@ -209,3 +209,22 @@ pub fn parse_message_body(
         list_id,
     })
 }
+
+/// Re-parse a raw message body allowing `<img>` tags.
+/// All other dangerous tags remain stripped. Used for the "Load remote images" feature.
+/// The sandboxed iframe's CSP (`img-src https: data:`) is the enforcement layer
+/// that blocks non-HTTPS image loads at the browser level.
+pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
+    let parsed = MessageParser::default().parse(raw)?;
+    parsed.body_html(0).map(|s| {
+        let url_schemes = std::collections::HashSet::from(["https", "mailto"]);
+        ammonia::Builder::default()
+            .add_generic_attributes(&["style"])
+            .add_tags(&["img"])
+            .add_tag_attributes("img", &["src", "alt", "width", "height", "style"])
+            .rm_tags(&["object", "embed", "iframe", "form", "input", "button", "textarea", "select", "video", "audio", "source", "svg", "math"])
+            .url_schemes(url_schemes)
+            .clean(&s)
+            .to_string()
+    })
+}
