@@ -69,6 +69,20 @@ export async function createFolder(
   return invoke("create_folder", { accountId, folderPath });
 }
 
+export async function saveAttachment(
+  accountId: string,
+  messageId: string,
+  attachmentIndex: number,
+  suggestedFilename: string,
+): Promise<void> {
+  return invoke("save_attachment", {
+    accountId,
+    messageId,
+    attachmentIndex,
+    suggestedFilename,
+  });
+}
+
 export async function syncFolder(
   accountId: string,
   folderPath: string,

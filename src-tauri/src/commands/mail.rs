@@ -352,3 +352,82 @@ pub async fn create_folder(
     log::info!("Folder '{}' created on server, will appear after sync", folder_path);
     Ok(())
 }
+
+/// Extract an attachment from a message and save it.
+/// The save dialog is opened by the backend — the renderer never supplies a path.
+#[tauri::command]
+pub async fn save_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+    attachment_index: u32,
+    suggested_filename: String,
+) -> Result<()> {
+    log::info!(
+        "Saving attachment {} from message {}",
+        attachment_index,
+        message_id,
+    );
+
+    let maildir_path = {
+        let conn = state.db.lock().await;
+        let (mp, _, _, _, _, _, _) =
+            db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        mp
+    };
+
+    if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+        return Err(Error::Other(
+            "Attachment save not supported for messages without local body".to_string(),
+        ));
+    }
+
+    // Extract attachment bytes first, before showing dialog
+    let full_path = state.data_dir.join(&maildir_path);
+    let raw = std::fs::read(&full_path).map_err(|e| {
+        Error::Other(format!("Failed to read message file: {}", e))
+    })?;
+
+    let parsed = mail_parser::MessageParser::default()
+        .parse(&raw)
+        .ok_or_else(|| Error::MailParse("Failed to parse message".to_string()))?;
+
+    let attachment = parsed
+        .attachments()
+        .nth(attachment_index as usize)
+        .ok_or_else(|| Error::Other(format!("Attachment index {} not found", attachment_index)))?;
+
+    let contents = attachment.contents().to_vec();
+
+    // Open the native save dialog from the backend — renderer cannot bypass this
+    use tauri_plugin_dialog::DialogExt;
+    let dest = app
+        .dialog()
+        .file()
+        .set_file_name(&suggested_filename)
+        .blocking_save_file();
+
+    let dest = match dest {
+        Some(path) => path,
+        None => return Ok(()), // user cancelled
+    };
+
+    let dest_path = dest.as_path().ok_or_else(|| {
+        Error::Other("Invalid save path".to_string())
+    })?;
+
+    // Refuse to follow symlinks — prevents clobbering arbitrary files
+    if dest_path.is_symlink() {
+        return Err(Error::Other(
+            "Refusing to write to a symlink target".to_string(),
+        ));
+    }
+
+    std::fs::write(dest_path, &contents).map_err(|e| {
+        Error::Other(format!("Failed to write attachment: {}", e))
+    })?;
+
+    log::info!("Attachment saved to {}", dest_path.display());
+    Ok(())
+}

@@ -160,6 +160,34 @@ function handleContextMenu(event: MouseEvent) {
   event.preventDefault();
 }
 
+// --- Attachment save ---
+const savingAttachment = ref<number | null>(null);
+
+async function saveAttachment(index: number, filename: string | null) {
+  const accountId = accountsStore.activeAccountId;
+  const messageId = messagesStore.activeMessageId;
+  if (!accountId || !messageId) return;
+
+  savingAttachment.value = index;
+  try {
+    // The save dialog is opened by the backend — the renderer only sends
+    // a suggested filename, never a path.
+    await api.saveAttachment(accountId, messageId, index, filename || "attachment");
+    showToast("Attachment saved");
+  } catch (e) {
+    const msg = String(e);
+    if (!msg.includes("cancelled")) showToast("Failed to save: " + msg);
+  } finally {
+    savingAttachment.value = null;
+  }
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
 // --- Address right-click → Add/Edit Contact ---
 
 const addrMenu = ref<{ x: number; y: number; email: string; name: string } | null>(null);
@@ -537,6 +565,27 @@ async function markSpam() {
         />
       </div>
 
+      <!-- Attachments -->
+      <div v-if="messagesStore.activeMessage.attachments.length > 0" class="attachments-section">
+        <div class="attachments-header">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          {{ messagesStore.activeMessage.attachments.length }} attachment{{ messagesStore.activeMessage.attachments.length > 1 ? 's' : '' }}
+        </div>
+        <div class="attachments-list">
+          <button
+            v-for="att in messagesStore.activeMessage.attachments"
+            :key="att.index"
+            class="attachment-chip"
+            :disabled="savingAttachment === att.index"
+            @click="saveAttachment(att.index, att.filename)"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span class="att-name">{{ att.filename || 'attachment' }}</span>
+            <span class="att-size">{{ formatSize(att.size) }}</span>
+          </button>
+        </div>
+      </div>
+
       <div class="message-body">
         <div
           v-if="showHtml && hasHtml()"
@@ -853,6 +902,62 @@ async function markSpam() {
 
 .invite-section {
   padding: 12px 16px 0;
+}
+
+.attachments-section {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.attachments-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin-bottom: 6px;
+}
+
+.attachments-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.attachment-chip:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-accent);
+}
+
+.attachment-chip:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.att-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-size {
+  color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 .message-body {
