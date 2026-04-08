@@ -4,6 +4,10 @@ A desktop email client built with Tauri v2 (Rust) and Vue 3 (TypeScript).
 
 Supports IMAP, JMAP, CalDAV, and JMAP Calendar with a Thunderbird-style three-pane layout. Passwords are stored in the system keyring (GNOME Keyring, KDE Wallet, macOS Keychain, or Windows Credential Manager).
 
+## Why?
+
+Need a client with first class support for OpenPGP. Also allowing doing Calendar in the application without a plugin :)
+
 ## Features
 
 - Multi-account support (Gmail app password, IMAP, JMAP, CalDAV-only)
