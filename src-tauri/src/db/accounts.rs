@@ -139,8 +139,11 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 }
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
-    // Update password in system keyring
-    crate::keyring::set_password(id, &config.password)?;
+    // Only update keyring if a new password was provided (non-empty).
+    // Empty means "keep existing" — the frontend never receives the stored password.
+    if !config.password.is_empty() {
+        crate::keyring::set_password(id, &config.password)?;
+    }
 
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,

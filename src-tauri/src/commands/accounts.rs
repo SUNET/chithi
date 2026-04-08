@@ -69,6 +69,8 @@ pub async fn get_account_config(
     log::debug!("Getting config for account {}", account_id);
     let conn = state.db.lock().await;
     let full = db::accounts::get_account_full(&conn, &account_id)?;
+    // Never return the actual password to the frontend.
+    // The edit form shows a placeholder; empty on save means "keep existing".
     Ok(db::accounts::AccountConfig {
         display_name: full.display_name,
         email: full.email,
@@ -81,7 +83,7 @@ pub async fn get_account_config(
         jmap_url: full.jmap_url,
         caldav_url: full.caldav_url,
         username: full.username,
-        password: full.password,
+        password: String::new(),
         use_tls: full.use_tls,
         signature: full.signature,
     })

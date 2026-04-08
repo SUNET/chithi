@@ -5,6 +5,7 @@ import { useAccountsStore } from "@/stores/accounts";
 import type { AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import PasswordInput from "@/components/common/PasswordInput.vue";
 
 const router = useRouter();
 const accountsStore = useAccountsStore();
@@ -334,7 +335,10 @@ async function doDelete() {
             </div>
             <div v-if="accountType !== 'o365'" class="form-group">
               <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
-              <input v-model="form.password" type="password" :placeholder="accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••'" />
+              <PasswordInput
+                v-model="form.password"
+                :placeholder="editingAccountId ? 'Leave empty to keep current password' : (accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••')"
+              />
               <span class="field-hint">Passwords are stored securely in your OS keyring</span>
             </div>
 
