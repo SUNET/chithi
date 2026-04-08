@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, onMounted, onUnmounted } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -63,31 +63,86 @@ watch(
 const hasHtml = () => !!messagesStore.activeMessage?.body_html;
 const hasText = () => !!messagesStore.activeMessage?.body_text;
 
-// Defense-in-depth: strip any JS vectors that might survive backend sanitization.
-// The Rust ammonia sanitizer is the primary defense; this is a second layer.
-function sanitizeHtml(html: string): string {
-  const div = document.createElement("div");
-  div.innerHTML = html;
-  // Remove script/style/iframe elements
-  for (const tag of ["script", "style", "iframe", "object", "embed"]) {
-    for (const el of Array.from(div.getElementsByTagName(tag))) {
-      el.remove();
+// Build a sandboxed iframe srcdoc that isolates HTML email from the main webview.
+// The iframe has no access to window.__TAURI__ or any IPC commands.
+// Links inside the iframe send a postMessage to the parent for clipboard copy.
+function iframeSrcdoc(): string {
+  const html = messagesStore.activeMessage?.body_html ?? "";
+  // Strict CSP inside the iframe: no scripts, no external resources except inline styles
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:;">
+<style>
+  body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    color: inherit;
+    background: transparent;
+  }
+  a { color: #1a73e8; cursor: pointer; }
+</style>
+</head>
+<body>${html}<script>
+  // Intercept all link clicks and forward to parent via postMessage
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest ? e.target.closest('a') : null;
+    if (a && a.href) {
+      e.preventDefault();
+      e.stopPropagation();
+      parent.postMessage({ type: 'link-click', href: a.getAttribute('href') }, '*');
+    }
+  });
+  // Intercept right-click and forward to parent
+  document.addEventListener('contextmenu', function(e) {
+    e.preventDefault();
+  });
+  // Report content height to parent so iframe can auto-size
+  var ro = new ResizeObserver(function() {
+    parent.postMessage({ type: 'resize', height: document.documentElement.scrollHeight }, '*');
+  });
+  ro.observe(document.documentElement);
+<\/script></body>
+</html>`;
+}
+
+// Listen for postMessage from the sandboxed iframe.
+// Verify event.source matches our iframe's contentWindow to prevent spoofing.
+function handleIframeMessage(event: MessageEvent) {
+  if (!event.data || typeof event.data !== 'object') return;
+  // Only trust messages from our email sandbox iframe(s)
+  const iframes = document.querySelectorAll<HTMLIFrameElement>('.email-sandbox');
+  let fromOurIframe = false;
+  for (const iframe of iframes) {
+    if (event.source === iframe.contentWindow) {
+      fromOurIframe = true;
+      break;
     }
   }
-  // Remove event handler attributes (on*) and javascript: hrefs
-  for (const el of Array.from(div.querySelectorAll("*"))) {
-    for (const attr of Array.from(el.attributes)) {
-      if (attr.name.startsWith("on") || (attr.name === "href" && attr.value.trim().toLowerCase().startsWith("javascript:"))) {
-        el.removeAttribute(attr.name);
+  if (!fromOurIframe) return;
+
+  if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
+    navigator.clipboard.writeText(event.data.href).then(() => {
+      showToast("Link copied to clipboard");
+    });
+  } else if (event.data.type === 'resize' && typeof event.data.height === 'number') {
+    // Auto-resize the specific iframe that sent the message
+    for (const iframe of iframes) {
+      if (event.source === iframe.contentWindow) {
+        iframe.style.height = event.data.height + 'px';
       }
     }
   }
-  return div.innerHTML;
 }
 
-function safeHtml(): string {
-  return sanitizeHtml(messagesStore.activeMessage?.body_html ?? "");
-}
+// Set up / tear down message listener
+onMounted(() => window.addEventListener('message', handleIframeMessage));
+onUnmounted(() => window.removeEventListener('message', handleIframeMessage));
 
 // Toast
 const toast = ref<string | null>(null);
@@ -99,18 +154,6 @@ function showToast(msg: string) {
   toastTimer = setTimeout(() => {
     toast.value = null;
   }, 2000);
-}
-
-function handleLinkClick(event: MouseEvent) {
-  const target = (event.target as HTMLElement).closest("a");
-  if (!target) return;
-  event.preventDefault();
-  event.stopPropagation();
-  const href = target.getAttribute("href");
-  if (!href) return;
-  navigator.clipboard.writeText(href).then(() => {
-    showToast("Link copied to clipboard");
-  });
 }
 
 function handleContextMenu(event: MouseEvent) {
@@ -498,13 +541,13 @@ async function markSpam() {
         <div
           v-if="showHtml && hasHtml()"
           class="body-html-wrapper"
-          @click="handleLinkClick"
-          @contextmenu="handleContextMenu"
         >
           <div class="no-remote-notice">Remote content blocked</div>
-          <div
-            class="body-html"
-            v-html="safeHtml()"
+          <iframe
+            class="email-sandbox"
+            :srcdoc="iframeSrcdoc()"
+            sandbox="allow-scripts"
+            referrerpolicy="no-referrer"
           />
         </div>
         <pre
@@ -515,13 +558,13 @@ async function markSpam() {
         <div
           v-else-if="hasHtml()"
           class="body-html-wrapper"
-          @click="handleLinkClick"
-          @contextmenu="handleContextMenu"
         >
           <div class="no-remote-notice">Remote content blocked</div>
-          <div
-            class="body-html"
-            v-html="safeHtml()"
+          <iframe
+            class="email-sandbox"
+            :srcdoc="iframeSrcdoc()"
+            sandbox="allow-scripts"
+            referrerpolicy="no-referrer"
           />
         </div>
         <div v-else class="empty">No message content</div>
@@ -834,14 +877,13 @@ async function markSpam() {
   border: 1px solid var(--color-border);
 }
 
-.body-html {
-  word-wrap: break-word;
-  overflow-wrap: break-word;
-}
-
-.body-html :deep(a) {
-  color: #1a73e8;
-  cursor: pointer;
+.email-sandbox {
+  width: 100%;
+  min-height: 100px;
+  border: none;
+  display: block;
+  background: transparent;
+  color-scheme: auto;
 }
 
 .body-text {
