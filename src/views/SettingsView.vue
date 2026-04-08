@@ -541,7 +541,7 @@ async function doDelete() {
   padding: 16px;
   border: 0.8px solid var(--color-border);
   border-radius: 10px;
-  background: white;
+  background: var(--color-bg-secondary);
   min-height: 100px;
 }
 
@@ -851,7 +851,7 @@ async function doDelete() {
   gap: 8px;
   height: 40px;
   padding: 0 20px;
-  background: white;
+  background: var(--color-bg-secondary);
   border: 0.8px solid var(--color-border);
   border-radius: 4px;
   font-size: 14px;

@@ -380,7 +380,7 @@ const opLabels: Record<string, string> = {
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--color-border);
-  background: white;
+  background: var(--color-bg-secondary);
 }
 
 .left-header {
@@ -604,7 +604,7 @@ const opLabels: Record<string, string> = {
 .filters-right {
   flex: 1;
   overflow-y: auto;
-  background: white;
+  background: var(--color-bg-secondary);
 }
 
 .editor-empty {

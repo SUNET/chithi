@@ -726,7 +726,7 @@ function getAccountName(accountId: string): string {
 }
 
 .modal {
-  background: white;
+  background: var(--color-bg-secondary);
   border-radius: 10px;
   width: 540px;
   max-height: 85vh;

@@ -235,7 +235,7 @@ async function save() {
 }
 
 .event-form {
-  background: white;
+  background: var(--color-bg-secondary);
   border-radius: 10px;
   width: 672px;
   max-height: 85vh;

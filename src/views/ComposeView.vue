@@ -605,7 +605,7 @@ async function send() {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: white;
+  background: var(--color-bg);
 }
 
 /* Menu Bar */
@@ -718,7 +718,8 @@ async function send() {
   padding: 0 8px;
   border: 0.8px solid var(--color-border);
   border-radius: 4px;
-  background: white;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
   font-size: 14px;
 }
 
@@ -733,7 +734,8 @@ async function send() {
   padding: 0 8px;
   border: 0.8px solid var(--color-border);
   border-radius: 4px;
-  background: white;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
   font-size: 14px;
   appearance: auto;
 }
@@ -846,7 +848,7 @@ async function send() {
   padding: 12px;
   border: 0.8px solid var(--color-border);
   border-radius: 4px;
-  background: white;
+  background: var(--color-bg-secondary);
   font-size: 14px;
   line-height: 1.6;
   resize: none;

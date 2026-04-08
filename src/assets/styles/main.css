@@ -63,29 +63,30 @@
     monospace;
 }
 
-/* === Dark theme === */
+/* === Dark theme (from Figma design tokens) === */
 [data-theme="dark"] {
-  --color-bg: #1e1e2e;
-  --color-bg-secondary: #252535;
-  --color-bg-tertiary: #2a2a3c;
-  --color-bg-hover: #313145;
-  --color-bg-active: #3a3a50;
-  --color-text: #cdd6f4;
-  --color-text-secondary: #a6adc8;
-  --color-text-muted: #6c7086;
-  --color-border: #313244;
-  --color-accent: #89b4fa;
-  --color-accent-hover: #74c7ec;
-  --color-accent-light: rgba(137, 180, 250, 0.08);
-  --color-unread: #f5e0dc;
-  --color-danger: #f38ba8;
-  --color-danger-text: #f38ba8;
-  --color-success: #a6e3a1;
-  --color-warning: #f9e2af;
-  --color-email-body-bg: #ffffff;
-  --color-email-body-text: #1a1a1a;
-  --color-status-dot: #a6e3a1;
-  --color-reader-bg: #1e1e2e;
+  --color-bg: #0a0a0a;
+  --color-bg-secondary: #171717;
+  --color-bg-tertiary: #262626;
+  --color-bg-hover: #262626;
+  --color-bg-active: #262626;
+  --color-text: #e5e5e5;
+  --color-text-secondary: #a1a1a1;
+  --color-text-muted: #737373;
+  --color-border: #262626;
+  --color-accent: #155dfc;
+  --color-accent-hover: #2b7fff;
+  --color-accent-light: rgba(21, 93, 252, 0.12);
+  --color-unread: #f5f5f5;
+  --color-danger: #fb2c36;
+  --color-danger-text: #e7000b;
+  --color-success: #00a63e;
+  --color-warning: #e17100;
+  --color-email-body-bg: #171717;
+  --color-email-body-text: #e5e5e5;
+  --color-status-dot: #00c950;
+  --color-reader-bg: #171717;
+  color-scheme: dark;
 }
 
 * {
