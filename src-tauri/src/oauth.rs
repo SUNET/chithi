@@ -24,14 +24,14 @@ pub struct OAuthProvider {
 pub const GOOGLE: OAuthProvider = OAuthProvider {
     name: "google",
     client_id: "96507156934-tb0mgeovj7dhpaabjc4ipm5lukhmebmg.apps.googleusercontent.com",
-    client_secret: "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",
+    client_secret: "", // Desktop app — public client, uses PKCE instead
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
     token_url: "https://oauth2.googleapis.com/token",
     scopes: &[
         "https://www.googleapis.com/auth/calendar",
         "https://www.googleapis.com/auth/contacts",
     ],
-    use_pkce: false,
+    use_pkce: true,
 };
 
 pub const MICROSOFT: OAuthProvider = OAuthProvider {
@@ -478,10 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn test_google_provider_no_pkce() {
+    fn test_google_provider_pkce() {
         assert_eq!(GOOGLE.name, "google");
-        assert!(!GOOGLE.use_pkce);
-        assert!(!GOOGLE.client_secret.is_empty());
+        assert!(GOOGLE.use_pkce);
+        assert!(GOOGLE.client_secret.is_empty());
     }
 
     #[test]
