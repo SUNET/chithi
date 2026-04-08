@@ -134,6 +134,32 @@ pnpm exec vue-tsc --noEmit
 
 See `docs/adr/` for Architecture Decision Records.
 
+## To enable usage in your work/school O365
+
+Ask the admin to allow the application for permissions.
+
+```
+App details:
+- Name: chithi
+- Type: Public desktop client
+- Auth flow: OAuth 2.0 Authorization Code with PKCE
+- Redirect URI: http://localhost
+
+- Client Application ID: b5941cd4-0385-40f1-953a-2c3b36f2a331
+
+Access model:
+- Delegated permissions only
+- Access is limited to the signed-in user’s own mailbox, calendars, shared calendars, and contacts
+- No client secret is stored on the device
+- OAuth tokens are stored locally in the OS keyring
+
+Requested permissions:
+
+- Microsoft Graph: User.Read, Calendars.ReadWrite, Calendars.Read.Shared Contacts.ReadWrite, IMAP.AccessAsUser.All, SMTP.Send, Mail.ReadWrite, Mail.Send, offline_access, openid, profile, email
+```
+
+
+
 ## License
 
 GPL-3.0-or-later
