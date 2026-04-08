@@ -7,6 +7,15 @@ export interface Account {
   enabled: boolean;
 }
 
+export interface QuickFilter {
+  unread?: boolean;
+  starred?: boolean;
+  has_attachment?: boolean;
+  contact?: boolean;
+  text?: string;
+  text_fields?: string[];
+}
+
 export interface Folder {
   name: string;
   path: string;

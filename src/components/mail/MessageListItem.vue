@@ -121,7 +121,7 @@ function isReply(subject: string | null, flags: string[]): boolean {
 }
 
 .col-check {
-  width: 24px;
+  width: 20px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -130,8 +130,8 @@ function isReply(subject: string | null, flags: string[]): boolean {
 }
 
 .row-checkbox {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
   cursor: pointer;
   accent-color: var(--color-accent);
 }
@@ -139,8 +139,8 @@ function isReply(subject: string | null, flags: string[]): boolean {
 .col-icons {
   display: flex;
   align-items: center;
-  gap: 4px;
-  width: 40px;
+  gap: 2px;
+  width: 28px;
   flex-shrink: 0;
   padding: 0 4px;
 }

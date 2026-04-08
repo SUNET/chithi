@@ -173,6 +173,36 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- FTS5 virtual table for fast message text search (quick filter)
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            subject,
+            from_name,
+            from_email,
+            to_addresses,
+            cc_addresses,
+            snippet,
+            content=messages,
+            content_rowid=rowid
+        );
+
+        -- Triggers to keep FTS index in sync with messages table
+        CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet)
+            VALUES (new.rowid, new.subject, new.from_name, new.from_email, new.to_addresses, new.cc_addresses, new.snippet);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet)
+            VALUES ('delete', old.rowid, old.subject, old.from_name, old.from_email, old.to_addresses, old.cc_addresses, old.snippet);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet)
+            VALUES ('delete', old.rowid, old.subject, old.from_name, old.from_email, old.to_addresses, old.cc_addresses, old.snippet);
+            INSERT INTO messages_fts(rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet)
+            VALUES (new.rowid, new.subject, new.from_name, new.from_email, new.to_addresses, new.cc_addresses, new.snippet);
+        END;
         ",
     )?;
 
@@ -212,6 +242,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';",
         )?;
+    }
+
+    // Populate FTS index for existing messages (one-time migration)
+    if !has_migration(conn, "fts5_initial_populate") {
+        log::info!("Migration: populating FTS5 index for existing messages");
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO messages_fts(rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet)
+             SELECT rowid, subject, from_name, from_email, to_addresses, cc_addresses, snippet FROM messages;"
+        )?;
+        set_migration(conn, "fts5_initial_populate")?;
+        log::info!("Migration: FTS5 index populated");
     }
 
     Ok(())

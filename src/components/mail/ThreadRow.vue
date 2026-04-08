@@ -124,7 +124,7 @@ function isReply(): boolean {
 }
 
 .col-check {
-  width: 24px;
+  width: 20px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -133,8 +133,8 @@ function isReply(): boolean {
 }
 
 .row-checkbox {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
   cursor: pointer;
   accent-color: var(--color-accent);
 }
@@ -142,10 +142,10 @@ function isReply(): boolean {
 .col-icons {
   display: flex;
   align-items: center;
-  gap: 4px;
-  width: 50px;
+  gap: 2px;
+  width: 38px;
   flex-shrink: 0;
-  padding: 0 4px;
+  padding: 0 2px;
 }
 
 .expand-icon {

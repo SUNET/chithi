@@ -482,6 +482,29 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Fetch current flags for all messages in the selected folder.
+    /// Returns a map of UID → flags vec. Uses `1:*` to get everything.
+    pub fn fetch_all_flags(&mut self) -> Result<Vec<(u32, Vec<String>)>> {
+        let fetches = self
+            .session
+            .uid_fetch("1:*", "(UID FLAGS)")
+            .map_err(|e| {
+                log::error!("IMAP UID FETCH FLAGS failed: {}", e);
+                Error::Imap(format!("FETCH FLAGS failed: {}", e))
+            })?;
+
+        let mut results = Vec::new();
+        for fetch in fetches.iter() {
+            let uid = match fetch.uid {
+                Some(u) => u,
+                None => continue,
+            };
+            let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
+            results.push((uid, flags));
+        }
+        Ok(results)
+    }
+
     /// Copy messages to a destination folder without removing originals.
     pub fn copy_messages(&mut self, uids: &[u32], dest_folder: &str) -> Result<()> {
         if uids.is_empty() {

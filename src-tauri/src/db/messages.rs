@@ -3,6 +3,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+/// Quick filter options for the message list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuickFilter {
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub has_attachment: bool,
+    #[serde(default)]
+    pub contact: bool,
+    /// Text search term (SQL LIKE on selected fields)
+    #[serde(default)]
+    pub text: String,
+    /// Which fields to search: "sender", "recipients", "subject", "body"
+    #[serde(default)]
+    pub text_fields: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSummary {
     pub id: String,
@@ -112,6 +131,81 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<()> {
     Ok(())
 }
 
+/// Build extra SQL WHERE clauses for quick filter options.
+/// All clauses are safe (no user-supplied strings injected into SQL).
+fn build_filter_clauses(filter: &QuickFilter, account_id: &str) -> String {
+    let mut clauses = Vec::new();
+    if filter.unread {
+        clauses.push("flags NOT LIKE '%seen%'".to_string());
+    }
+    if filter.starred {
+        clauses.push("flags LIKE '%flagged%'".to_string());
+    }
+    if filter.has_attachment {
+        clauses.push("has_attachments = 1".to_string());
+    }
+    if filter.contact {
+        clauses.push(format!(
+            "from_email IN (
+                SELECT json_extract(je.value, '$.email')
+                FROM contacts, json_each(contacts.emails_json) AS je
+                WHERE contacts.book_id IN (
+                    SELECT id FROM contact_books WHERE account_id = '{acct}'
+                )
+                UNION
+                SELECT email FROM collected_contacts WHERE account_id = '{acct}'
+            )",
+            acct = account_id.replace('\'', "''")
+        ));
+    }
+    // Text search via FTS5 for fast full-text matching
+    let text = filter.text.trim();
+    if !text.is_empty() {
+        // Escape FTS5 special characters: quotes and *
+        let escaped = text
+            .replace('"', "\"\"")
+            .replace('\'', "''");
+
+        // Determine which FTS5 columns to search (default: all)
+        let fields = &filter.text_fields;
+        let search_sender = fields.is_empty() || fields.iter().any(|f| f == "sender");
+        let search_recipients = fields.is_empty() || fields.iter().any(|f| f == "recipients");
+        let search_subject = fields.is_empty() || fields.iter().any(|f| f == "subject");
+        let search_body = fields.is_empty() || fields.iter().any(|f| f == "body");
+
+        let mut fts_columns = Vec::new();
+        if search_sender {
+            fts_columns.push("from_name");
+            fts_columns.push("from_email");
+        }
+        if search_recipients {
+            fts_columns.push("to_addresses");
+            fts_columns.push("cc_addresses");
+        }
+        if search_subject {
+            fts_columns.push("subject");
+        }
+        if search_body {
+            fts_columns.push("snippet");
+        }
+
+        if !fts_columns.is_empty() {
+            // Build FTS5 column filter: {col1 col2 col3} : "term"
+            let col_filter = format!("{{{}}}", fts_columns.join(" "));
+            // Use prefix matching with * for partial word search
+            clauses.push(format!(
+                "rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH '{} : \"{}\"*')",
+                col_filter, escaped
+            ));
+        }
+    }
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", clauses.join(" AND "))
+    }
+}
+
 pub fn get_messages(
     conn: &Connection,
     account_id: &str,
@@ -120,9 +214,15 @@ pub fn get_messages(
     per_page: u32,
     sort_column: &str,
     sort_asc: bool,
+    filter: &QuickFilter,
 ) -> Result<MessagePage> {
+    let filter_sql = build_filter_clauses(filter, account_id);
+
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+        &format!(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2{}",
+            filter_sql
+        ),
         params![account_id, folder_path],
         |row| row.get(0),
     )?;
@@ -142,10 +242,10 @@ pub fn get_messages(
         "SELECT id, subject, from_name, from_email, date, flags,
                 has_attachments, is_encrypted, is_signed, snippet
          FROM messages
-         WHERE account_id = ?1 AND folder_path = ?2
+         WHERE account_id = ?1 AND folder_path = ?2{}
          ORDER BY {} {}
          LIMIT ?3 OFFSET ?4",
-        order_col, order_dir
+        filter_sql, order_col, order_dir
     );
     let mut stmt = conn.prepare(&query)?;
 
@@ -333,6 +433,36 @@ pub fn update_flags(conn: &Connection, message_id: &str, flags: &str) -> Result<
     Ok(())
 }
 
+/// Bulk-update flags for messages by UID within a folder.
+/// Returns the number of messages whose flags actually changed.
+pub fn sync_flags_by_uid(
+    conn: &Connection,
+    account_id: &str,
+    folder_path: &str,
+    uid_flags: &[(u32, String)],
+) -> Result<u32> {
+    let mut changed = 0u32;
+    let mut stmt = conn.prepare(
+        "SELECT id, flags FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+    )?;
+    for (uid, new_flags_json) in uid_flags {
+        let row: std::result::Result<(String, String), _> = stmt.query_row(
+            params![account_id, folder_path, uid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        if let Ok((msg_id, current_flags)) = row {
+            if current_flags != *new_flags_json {
+                conn.execute(
+                    "UPDATE messages SET flags = ?1 WHERE id = ?2",
+                    params![new_flags_json, msg_id],
+                )?;
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 pub fn get_unfetched_messages(
     conn: &Connection,
     account_id: &str,
@@ -512,18 +642,27 @@ pub fn get_threaded_messages(
     per_page: u32,
     sort_column: &str,
     sort_asc: bool,
+    filter: &QuickFilter,
 ) -> Result<ThreadedPage> {
-    // Count total messages in this folder
+    let filter_sql = build_filter_clauses(filter, account_id);
+
+    // Count total messages in this folder (with filters)
     let total_messages: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+        &format!(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2{}",
+            filter_sql
+        ),
         params![account_id, folder_path],
         |row| row.get(0),
     )?;
 
-    // Find distinct thread_ids that have at least one message in this folder
+    // Find distinct thread_ids (with filters)
     let total_threads: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT CASE WHEN thread_id != '' AND thread_id IS NOT NULL THEN thread_id ELSE id END)
-         FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+        &format!(
+            "SELECT COUNT(DISTINCT CASE WHEN thread_id != '' AND thread_id IS NOT NULL THEN thread_id ELSE id END)
+             FROM messages WHERE account_id = ?1 AND folder_path = ?2{}",
+            filter_sql
+        ),
         params![account_id, folder_path],
         |row| row.get(0),
     )?;
@@ -553,10 +692,11 @@ pub fn get_threaded_messages(
             MAX(snippet) AS latest_snippet,
             GROUP_CONCAT(id, '||') AS all_ids
          FROM messages
-         WHERE account_id = ?1 AND folder_path = ?2
+         WHERE account_id = ?1 AND folder_path = ?2{filter}
          GROUP BY tid
          ORDER BY {order} {dir}
          LIMIT ?3 OFFSET ?4",
+        filter = filter_sql,
         tid = tid_expr,
         order = order_col,
         dir = order_dir,

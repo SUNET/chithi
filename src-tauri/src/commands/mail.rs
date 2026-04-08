@@ -31,9 +31,11 @@ pub async fn get_messages(
     per_page: u32,
     sort_column: Option<String>,
     sort_asc: Option<bool>,
+    filter: Option<db::messages::QuickFilter>,
 ) -> Result<db::messages::MessagePage> {
     let col = sort_column.as_deref().unwrap_or("date");
     let asc = sort_asc.unwrap_or(false);
+    let qf = filter.unwrap_or_default();
     log::debug!(
         "Getting messages: account={} folder={} page={} per_page={} sort={}:{}",
         account_id,
@@ -45,7 +47,7 @@ pub async fn get_messages(
     );
     let conn = state.db.lock().await;
     let result =
-        db::messages::get_messages(&conn, &account_id, &folder_path, page, per_page, col, asc)?;
+        db::messages::get_messages(&conn, &account_id, &folder_path, page, per_page, col, asc, &qf)?;
     log::debug!(
         "Returned {} messages (total={}) for folder {}",
         result.messages.len(),
@@ -329,9 +331,11 @@ pub async fn get_threaded_messages(
     per_page: u32,
     sort_column: Option<String>,
     sort_asc: Option<bool>,
+    filter: Option<db::messages::QuickFilter>,
 ) -> Result<ThreadedPage> {
     let col = sort_column.as_deref().unwrap_or("date");
     let asc = sort_asc.unwrap_or(false);
+    let qf = filter.unwrap_or_default();
     log::debug!(
         "Getting threaded messages: account={} folder={} page={} per_page={} sort={}:{}",
         account_id,
@@ -350,6 +354,7 @@ pub async fn get_threaded_messages(
         per_page,
         col,
         asc,
+        &qf,
     )?;
     log::debug!(
         "Returned {} threads (total_threads={}, total_messages={}) for folder {}",

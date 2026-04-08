@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { ref, computed, watch } from "vue";
-import type { MessageSummary, MessageBody, ThreadSummary } from "@/lib/types";
+import type { MessageSummary, MessageBody, ThreadSummary, QuickFilter } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useFoldersStore } from "./folders";
@@ -47,6 +47,10 @@ export const useMessagesStore = defineStore("messages", () => {
   const perPage = 100;
   const sortColumn = ref<SortColumn>("date");
   const sortAsc = ref(false);
+  const quickFilter = ref<QuickFilter>({});
+  const quickFilterText = ref("");
+  const quickFilterVisible = ref(false);
+  const quickFilterFields = ref<string[]>([]); // empty = all fields
 
   const accountsStore = useAccountsStore();
   const foldersStore = useFoldersStore();
@@ -58,6 +62,60 @@ export const useMessagesStore = defineStore("messages", () => {
     }
     return messages.value.length < total.value;
   });
+
+  const hasActiveFilter = computed(() => {
+    const f = quickFilter.value;
+    return !!(f.unread || f.starred || f.has_attachment || f.contact || quickFilterText.value.trim());
+  });
+
+  const activeFilterForApi = computed((): QuickFilter | undefined => {
+    if (!hasActiveFilter.value) return undefined;
+    const f = { ...quickFilter.value };
+    const text = quickFilterText.value.trim();
+    if (text) {
+      f.text = text;
+      if (quickFilterFields.value.length > 0) {
+        f.text_fields = quickFilterFields.value;
+      }
+    }
+    return f;
+  });
+
+  function toggleQuickFilter(key: "unread" | "starred" | "has_attachment" | "contact") {
+    quickFilter.value = { ...quickFilter.value, [key]: !quickFilter.value[key] };
+    fetchMessages(true);
+  }
+
+  function toggleTextField(field: string) {
+    const fields = [...quickFilterFields.value];
+    const idx = fields.indexOf(field);
+    if (idx !== -1) {
+      fields.splice(idx, 1);
+    } else {
+      fields.push(field);
+    }
+    quickFilterFields.value = fields;
+    if (quickFilterText.value.trim()) {
+      fetchMessages(true);
+    }
+  }
+
+  // Debounced text search — fetch from backend after 300ms of no typing
+  let textSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  function onFilterTextChange() {
+    if (textSearchTimer) clearTimeout(textSearchTimer);
+    textSearchTimer = setTimeout(() => {
+      fetchMessages(true);
+    }, 300);
+  }
+
+  function clearQuickFilters() {
+    quickFilter.value = {};
+    quickFilterText.value = "";
+    quickFilterFields.value = [];
+    if (textSearchTimer) clearTimeout(textSearchTimer);
+    fetchMessages(true);
+  }
 
   // Computed for quick lookup
   const selectedSet = computed(() => new Set(selectedIds.value));
@@ -93,6 +151,7 @@ export const useMessagesStore = defineStore("messages", () => {
           perPage,
           sortColumn.value,
           sortAsc.value,
+          activeFilterForApi.value,
         );
         if (resetPage) {
           threads.value = result.threads;
@@ -109,6 +168,7 @@ export const useMessagesStore = defineStore("messages", () => {
           perPage,
           sortColumn.value,
           sortAsc.value,
+          activeFilterForApi.value,
         );
         if (resetPage) {
           messages.value = result.messages;
@@ -139,6 +199,7 @@ export const useMessagesStore = defineStore("messages", () => {
           perPage,
           sortColumn.value,
           sortAsc.value,
+          activeFilterForApi.value,
         );
         threads.value = [...threads.value, ...result.threads];
         totalThreads.value = result.total_threads;
@@ -151,6 +212,7 @@ export const useMessagesStore = defineStore("messages", () => {
           perPage,
           sortColumn.value,
           sortAsc.value,
+          activeFilterForApi.value,
         );
         messages.value = [...messages.value, ...result.messages];
         total.value = result.total;
@@ -395,5 +457,14 @@ export const useMessagesStore = defineStore("messages", () => {
     clearSelection,
     deleteSelected,
     setSort,
+    quickFilter,
+    quickFilterText,
+    quickFilterVisible,
+    quickFilterFields,
+    hasActiveFilter,
+    toggleQuickFilter,
+    toggleTextField,
+    onFilterTextChange,
+    clearQuickFilters,
   };
 });

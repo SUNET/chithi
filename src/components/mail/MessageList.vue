@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -9,6 +9,7 @@ import { openComposeWindow } from "@/lib/compose-window";
 import * as api from "@/lib/tauri";
 import MessageListItem from "./MessageListItem.vue";
 import ThreadRow from "./ThreadRow.vue";
+import QuickFilterBar from "./QuickFilterBar.vue";
 
 const messagesStore = useMessagesStore();
 const accountsStore = useAccountsStore();
@@ -31,6 +32,17 @@ function onKeyDown(event: KeyboardEvent) {
   if (event.key === "Delete" && messagesStore.selectedIds.length > 0) {
     event.preventDefault();
     messagesStore.deleteSelected();
+  }
+  if (event.key === "/" && !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)) {
+    event.preventDefault();
+    messagesStore.quickFilterVisible = !messagesStore.quickFilterVisible;
+    if (!messagesStore.quickFilterVisible) {
+      messagesStore.clearQuickFilters();
+    }
+  }
+  if (event.key === "Escape" && messagesStore.quickFilterVisible) {
+    messagesStore.quickFilterVisible = false;
+    messagesStore.clearQuickFilters();
   }
 }
 
@@ -261,6 +273,34 @@ async function ctxNotSpam() {
   }
 }
 
+const allSelected = computed(() => {
+  if (uiStore.threadingEnabled) {
+    return messagesStore.threads.length > 0 &&
+      messagesStore.threads.every(t => messagesStore.isSelected(t.message_ids[0]));
+  }
+  return messagesStore.messages.length > 0 &&
+    messagesStore.messages.every(m => messagesStore.isSelected(m.id));
+});
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    messagesStore.clearSelection();
+  } else {
+    if (uiStore.threadingEnabled) {
+      messagesStore.selectedIds = messagesStore.threads.map(t => t.message_ids[0]);
+    } else {
+      messagesStore.selectedIds = messagesStore.messages.map(m => m.id);
+    }
+  }
+}
+
+function toggleQuickFilter() {
+  messagesStore.quickFilterVisible = !messagesStore.quickFilterVisible;
+  if (!messagesStore.quickFilterVisible) {
+    messagesStore.clearQuickFilters();
+  }
+}
+
 const displayedCount = () => {
   if (uiStore.threadingEnabled) {
     return `${messagesStore.threads.length} of ${messagesStore.totalThreads} threads (${messagesStore.total} messages)`;
@@ -271,9 +311,15 @@ const displayedCount = () => {
 
 <template>
   <div class="message-list" @click="closeContextMenu">
+    <QuickFilterBar v-if="messagesStore.quickFilterVisible" />
     <div class="column-headers">
       <div class="col col-check">
-        <!-- select-all checkbox could go here -->
+        <input
+          type="checkbox"
+          class="row-checkbox"
+          :checked="allSelected"
+          @click.stop="toggleSelectAll"
+        />
       </div>
       <div class="col col-icons">
         <span class="col-icon" title="Read/Star">&#x2606;</span>
@@ -374,6 +420,14 @@ const displayedCount = () => {
 
     <div class="list-footer">
       <span class="message-count">{{ displayedCount() }}</span>
+      <button
+        class="quick-filter-toggle"
+        :class="{ active: messagesStore.quickFilterVisible }"
+        @click.stop="toggleQuickFilter"
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        Quick Filter
+      </button>
     </div>
 
     <!-- Right-click context menu -->
@@ -482,15 +536,25 @@ const displayedCount = () => {
 }
 
 .col-check {
-  width: 24px;
+  width: 20px;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.row-checkbox {
+  width: 13px;
+  height: 13px;
+  cursor: pointer;
+  accent-color: var(--color-accent);
 }
 
 .col-icons {
   display: flex;
   align-items: center;
-  gap: 4px;
-  width: 40px;
+  gap: 2px;
+  width: 28px;
   flex-shrink: 0;
   justify-content: center;
 }
@@ -552,11 +616,37 @@ const displayedCount = () => {
 }
 
 .list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 4px 8px;
   border-top: 1px solid var(--color-border);
   font-size: 11px;
   color: var(--color-text-muted);
   flex-shrink: 0;
+}
+
+.quick-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.quick-filter-toggle:hover {
+  color: var(--color-text);
+  background: var(--color-bg-hover);
+}
+
+.quick-filter-toggle.active {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
 }
 
 .loading,

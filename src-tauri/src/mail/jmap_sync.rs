@@ -213,6 +213,10 @@ async fn sync_jmap_folder(
 
             // Check if this message already exists (by JMAP ID in the folder)
             if jmap_message_exists(&conn, account_id, mailbox_id, &email.id)? {
+                // Update flags in case they changed on the server (read/unread, flagged, etc.)
+                let new_flags = serde_json::to_string(&email.flags).unwrap_or_default();
+                let msg_id = format!("{}_{}_{}", account_id, mailbox_id, email.id);
+                let _ = db::messages::update_flags(&conn, &msg_id, &new_flags);
                 continue;
             }
 
@@ -312,7 +316,7 @@ async fn sync_jmap_folder(
     {
         let conn = db.lock().await;
         let page =
-            db::messages::get_messages(&conn, account_id, mailbox_id, 0, 1, "date", false)?;
+            db::messages::get_messages(&conn, account_id, mailbox_id, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, mailbox_id)?;
         db::folders::update_folder_counts(&conn, account_id, mailbox_id, unread, page.total)?;
     }

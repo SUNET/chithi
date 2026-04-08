@@ -6,6 +6,7 @@ import type {
   MessagePage,
   MessageBody,
   SyncStatus,
+  QuickFilter,
 } from "./types";
 
 export async function listAccounts(): Promise<Account[]> {
@@ -44,6 +45,7 @@ export async function getMessages(
   perPage: number,
   sortColumn?: string,
   sortAsc?: boolean,
+  filter?: QuickFilter,
 ): Promise<MessagePage> {
   return invoke("get_messages", {
     accountId,
@@ -52,6 +54,7 @@ export async function getMessages(
     perPage,
     sortColumn,
     sortAsc,
+    filter,
   });
 }
 
@@ -169,6 +172,7 @@ export async function getThreadedMessages(
   perPage: number,
   sortColumn?: string,
   sortAsc?: boolean,
+  filter?: QuickFilter,
 ): Promise<import("./types").ThreadedPage> {
   return invoke("get_threaded_messages", {
     accountId,
@@ -177,6 +181,7 @@ export async function getThreadedMessages(
     perPage,
     sortColumn,
     sortAsc,
+    filter,
   });
 }
 

@@ -337,13 +337,39 @@ fn sync_folder_envelopes(
         }
     }
 
+    // Sync flag changes from server (e.g., read/unread toggled on webmail)
+    if last_uid > 0 {
+        match conn_imap.fetch_all_flags() {
+            Ok(server_flags) => {
+                let uid_flags: Vec<(u32, String)> = server_flags
+                    .into_iter()
+                    .map(|(uid, flags)| (uid, serde_json::to_string(&flags).unwrap_or_default()))
+                    .collect();
+                let rt = tokio::runtime::Handle::current();
+                let conn = rt.block_on(db.lock());
+                match db::messages::sync_flags_by_uid(&conn, account_id, folder_path, &uid_flags) {
+                    Ok(changed) if changed > 0 => {
+                        log::info!("Updated flags on {} messages in '{}'", changed, folder_path);
+                    }
+                    Err(e) => {
+                        log::warn!("Flag sync failed for '{}': {}", folder_path, e);
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch flags for '{}': {}", folder_path, e);
+            }
+        }
+    }
+
     let mut new_uids = conn_imap.fetch_uids(last_uid)?;
 
     if new_uids.is_empty() {
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.lock());
         let page =
-            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false)?;
+            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         return Ok(0);
@@ -473,7 +499,7 @@ fn sync_folder_envelopes(
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.lock());
         let page =
-            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false)?;
+            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
     }
