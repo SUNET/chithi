@@ -36,12 +36,20 @@ const isOrganizer = computed(() => {
   return account?.email === event.organizer_email;
 });
 
-// Edit form state
+// Edit form state — convert UTC to local timezone
 const editTitle = ref(event.title);
-const editStartDate = ref(event.start_time.slice(0, 10));
-const editStartTime = ref(event.start_time.slice(11, 16) || "00:00");
-const editEndDate = ref(event.end_time.slice(0, 10));
-const editEndTime = ref(event.end_time.slice(11, 16) || "01:00");
+const _startLocal = new Date(event.start_time);
+const _endLocal = new Date(event.end_time);
+function _padD(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function _padT(d: Date): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+const editStartDate = ref(_padD(_startLocal));
+const editStartTime = ref(_padT(_startLocal));
+const editEndDate = ref(_padD(_endLocal));
+const editEndTime = ref(_padT(_endLocal));
 const editAllDay = ref(event.all_day);
 const editLocation = ref(event.location || "");
 const editDescription = ref(event.description || "");

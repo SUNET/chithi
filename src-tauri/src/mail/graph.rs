@@ -334,6 +334,119 @@ impl GraphClient {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Calendar
+    // -----------------------------------------------------------------------
+
+    /// List all calendars for the signed-in user.
+    pub async fn list_calendars(&self) -> Result<Vec<GraphCalendar>> {
+        let resp = self.get("/me/calendars", &[("$select", "id,name,color,isDefaultCalendar")]).await?;
+        let items = resp["value"].as_array().cloned().unwrap_or_default();
+        Ok(items.iter().map(|c| GraphCalendar {
+            id: c["id"].as_str().unwrap_or("").to_string(),
+            name: c["name"].as_str().unwrap_or("Calendar").to_string(),
+            color: graph_color_to_hex(c["color"].as_str().unwrap_or("")),
+            is_default: c["isDefaultCalendar"].as_bool().unwrap_or(false),
+        }).collect())
+    }
+
+    /// Fetch events in a time range via calendarView.
+    /// Uses `Prefer: outlook.timezone="UTC"` so all times come back in UTC.
+    pub async fn list_events(&self, start: &str, end: &str) -> Result<Vec<GraphCalendarEvent>> {
+        let mut events = Vec::new();
+        let mut next_path: Option<String> = None;
+        loop {
+            let resp: serde_json::Value = match next_path.take() {
+                Some(path) => {
+                    // Pagination: next link is a full URL, fetch directly with UTC preference
+                    let resp = self.http
+                        .get(&path)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .send()
+                        .await
+                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(Error::Other(format!("Graph GET returned {}: {}", status, truncate(&body, 500))));
+                    }
+                    serde_json::from_str(&body)
+                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
+                }
+                None => {
+                    let url = format!("{}/me/calendarView", GRAPH_BASE);
+                    let resp = self.http
+                        .get(&url)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .query(&[
+                            ("startDateTime", start),
+                            ("endDateTime", end),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence"),
+                            ("$top", "100"),
+                            ("$orderby", "start/dateTime"),
+                        ])
+                        .send()
+                        .await
+                        .map_err(|e| Error::Other(format!("Graph GET /me/calendarView failed: {}", e)))?;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(Error::Other(format!("Graph GET /me/calendarView returned {}: {}", status, truncate(&body, 500))));
+                    }
+                    serde_json::from_str(&body)
+                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
+                }
+            };
+            if let Some(items) = resp["value"].as_array() {
+                for e in items {
+                    events.push(parse_graph_event(e));
+                }
+            }
+            let next_link = resp["@odata.nextLink"].as_str().map(|s: &str| s.to_string());
+            match next_link {
+                Some(next) => {
+                    next_path = Some(next);
+                }
+                None => break,
+            }
+        }
+        Ok(events)
+    }
+
+    /// Create a calendar event.
+    pub async fn create_event(&self, event: &serde_json::Value) -> Result<String> {
+        let resp = self.post_json("/me/events", event).await?;
+        Ok(resp["id"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Update a calendar event.
+    pub async fn update_event(&self, event_id: &str, updates: &serde_json::Value) -> Result<()> {
+        self.patch_json(&format!("/me/events/{}", event_id), updates).await
+    }
+
+    /// Delete a calendar event.
+    pub async fn delete_event(&self, event_id: &str) -> Result<()> {
+        self.delete(&format!("/me/events/{}", event_id)).await
+    }
+
+    /// RSVP to an event (accept, tentativelyAccept, or decline).
+    pub async fn rsvp_event(&self, event_id: &str, response: &str, comment: &str) -> Result<()> {
+        let action = match response {
+            "accepted" => "accept",
+            "tentative" => "tentativelyAccept",
+            "declined" => "decline",
+            other => other,
+        };
+        let body = serde_json::json!({
+            "comment": comment,
+            "sendResponse": true,
+        });
+        self.post_json(&format!("/me/events/{}/{}", event_id, action), &body).await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +499,29 @@ pub struct GraphSendMessage {
     pub bcc: Vec<String>,
     pub subject: String,
     pub body_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphCalendar {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphCalendarEvent {
+    pub id: String,
+    pub subject: String,
+    pub body_preview: Option<String>,
+    pub start: String,
+    pub end: String,
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub organizer_email: Option<String>,
+    pub attendees_json: Option<String>,
+    pub ical_uid: Option<String>,
+    pub is_recurring: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,20 +586,112 @@ pub fn guess_folder_type(display_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Get a valid Graph API access token for an O365 account, refreshing if needed.
+fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
+    let start_obj = &e["start"];
+    let end_obj = &e["end"];
+    let all_day = e["isAllDay"].as_bool().unwrap_or(false);
+
+    // Graph returns {dateTime, timeZone} — normalize to ISO 8601
+    let start = if all_day {
+        start_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
+    } else {
+        let dt = start_obj["dateTime"].as_str().unwrap_or("");
+        let tz = start_obj["timeZone"].as_str().unwrap_or("UTC");
+        if tz == "UTC" && !dt.ends_with('Z') {
+            format!("{}Z", dt)
+        } else {
+            dt.to_string()
+        }
+    };
+
+    let end = if all_day {
+        end_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
+    } else {
+        let dt = end_obj["dateTime"].as_str().unwrap_or("");
+        let tz = end_obj["timeZone"].as_str().unwrap_or("UTC");
+        if tz == "UTC" && !dt.ends_with('Z') {
+            format!("{}Z", dt)
+        } else {
+            dt.to_string()
+        }
+    };
+
+    let location = e["location"]["displayName"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let organizer_email = e["organizer"]["emailAddress"]["address"]
+        .as_str()
+        .map(|s| s.to_string());
+
+    let attendees_json = e["attendees"].as_array().map(|atts| {
+        let parsed: Vec<serde_json::Value> = atts.iter().map(|a| {
+            serde_json::json!({
+                "name": a["emailAddress"]["name"].as_str().unwrap_or(""),
+                "email": a["emailAddress"]["address"].as_str().unwrap_or(""),
+                "status": a["status"]["response"].as_str().unwrap_or("none"),
+            })
+        }).collect();
+        serde_json::to_string(&parsed).unwrap_or_else(|_| "[]".to_string())
+    });
+
+    GraphCalendarEvent {
+        id: e["id"].as_str().unwrap_or("").to_string(),
+        subject: e["subject"].as_str().unwrap_or("(No title)").to_string(),
+        body_preview: e["bodyPreview"].as_str().map(|s| s.to_string()),
+        start,
+        end,
+        all_day,
+        location,
+        organizer_email,
+        attendees_json,
+        ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
+        is_recurring: e["recurrence"].is_object(),
+    }
+}
+
+fn graph_color_to_hex(color: &str) -> String {
+    match color {
+        "auto" | "lightBlue" => "#4285f4",
+        "lightGreen" => "#10b981",
+        "lightOrange" => "#f59e0b",
+        "lightGray" => "#6b7280",
+        "lightYellow" => "#eab308",
+        "lightTeal" => "#14b8a6",
+        "lightPink" => "#ec4899",
+        "lightBrown" => "#a16207",
+        "lightRed" => "#ef4444",
+        "maxColor" => "#8b5cf6",
+        _ => "#4285f4",
+    }
+    .to_string()
+}
+
+/// Get a valid Graph API access token for an O365 account.
+/// Always refreshes with Graph-specific scopes because the stored token
+/// may be IMAP-scoped (both share the same keyring entry and refresh token).
 pub async fn get_graph_token(account_id: &str) -> Result<String> {
     let tokens = crate::oauth::load_tokens(account_id)?
         .ok_or_else(|| Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into()))?;
 
-    if !tokens.is_expired() {
-        return Ok(tokens.access_token);
-    }
-
     let refresh_token = tokens.refresh_token
         .ok_or_else(|| Error::Other("No refresh token for O365. Please sign in again.".into()))?;
 
-    let new_tokens = crate::oauth::refresh_access_token(&crate::oauth::MICROSOFT, &refresh_token).await?;
-    crate::oauth::store_tokens(account_id, &new_tokens)?;
+    // Always refresh with Graph scopes — the cached token is likely IMAP-scoped
+    let new_tokens = crate::oauth::refresh_with_scopes(
+        &crate::oauth::MICROSOFT,
+        &refresh_token,
+        crate::oauth::MICROSOFT_GRAPH_SCOPES,
+    ).await?;
+    // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
+    // The refresh_token may rotate, so save that part only.
+    if new_tokens.refresh_token.is_some() {
+        crate::oauth::store_tokens(account_id, &crate::oauth::OAuthTokens {
+            access_token: tokens.access_token, // Keep the IMAP token as stored
+            refresh_token: new_tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })?;
+    }
 
     Ok(new_tokens.access_token)
 }
