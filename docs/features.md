@@ -176,7 +176,7 @@ security.
 - [x] Folder right-click context menu (New Folder, Mark Folder Read, Sync)
 - [x] Zoom in/out with Ctrl+/Ctrl-/Ctrl+0
 - [x] File logging to `~/.local/share/chithi/chithi.log`
-- [ ] Desktop notifications on new mail
+- [x] Desktop notifications on new mail (only when window not focused)
 - [ ] Keyboard shortcuts beyond Delete key
 - [ ] App packaging (deb, AppImage, DMG, MSI)
 

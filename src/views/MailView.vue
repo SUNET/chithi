@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useMessagesStore } from "@/stores/messages";
@@ -79,6 +80,32 @@ async function startBackgroundPrefetch() {
   }
 }
 
+// Desktop notifications for new mail
+let notificationsAllowed = false;
+
+async function initNotifications() {
+  let granted = await isPermissionGranted();
+  if (!granted) {
+    const permission = await requestPermission();
+    granted = permission === "granted";
+  }
+  notificationsAllowed = granted;
+}
+
+function notifyNewMail(accountId: string, count: number) {
+  if (!notificationsAllowed || count === 0) return;
+  // Don't notify if the window is focused — the user is already looking at it
+  if (document.hasFocus()) return;
+
+  const account = accountsStore.accounts.find(a => a.id === accountId);
+  const accountName = account?.display_name || account?.email || "Account";
+  const body = count === 1
+    ? `1 new message in ${accountName}`
+    : `${count} new messages in ${accountName}`;
+
+  sendNotification({ title: "Chithi", body });
+}
+
 // Periodic sync every 2 minutes
 let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 
@@ -102,9 +129,12 @@ onMounted(async () => {
     await foldersStore.fetchFolders();
   }
 
+  initNotifications();
+
   await listen("sync-complete", async (event) => {
     const payload = event.payload as { account_id: string; total_synced: number };
     console.log("sync-complete:", payload);
+    notifyNewMail(payload.account_id, payload.total_synced);
     // Always refresh folders to update counts
     await foldersStore.fetchFolders();
     // Refresh message list if viewing the synced account
