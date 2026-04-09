@@ -161,7 +161,7 @@ fn build_filter_clauses(filter: &QuickFilter, account_id: &str) -> String {
     // Text search via FTS5 for fast full-text matching
     let text = filter.text.trim();
     if !text.is_empty() {
-        // Escape FTS5 special characters: quotes and *
+        // Escape FTS5 special characters: quotes and single quotes
         let escaped = text
             .replace('"', "\"\"")
             .replace('\'', "''");

@@ -10,6 +10,27 @@ use crate::mail::parser;
 use crate::mail::sync as mail_sync;
 use crate::state::AppState;
 
+/// Check if an IP address is in a private/reserved range (SSRF protection).
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()            // 127.0.0.0/8
+            || v4.is_private()          // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()       // 169.254.0.0/16
+            || v4.is_broadcast()        // 255.255.255.255
+            || v4.is_unspecified()      // 0.0.0.0
+            || v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127 // 100.64.0.0/10 (CGNAT)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()            // ::1
+            || v6.is_unspecified()      // ::
+            // ULA (fc00::/7) and link-local (fe80::/10)
+            || v6.segments()[0] & 0xfe00 == 0xfc00
+            || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn list_folders(
     state: State<'_, AppState>,
@@ -284,6 +305,28 @@ pub async fn get_message_html_with_images(
         let client = client.clone();
         let url = url.clone();
         async move {
+            // SSRF protection: resolve hostname and reject private/internal IPs
+            if let Ok(parsed) = reqwest::Url::parse(&url) {
+                if let Some(host) = parsed.host_str() {
+                    // Block obvious private hostnames
+                    let h = host.to_lowercase();
+                    if h == "localhost" || h.ends_with(".local") || h.ends_with(".internal") {
+                        log::debug!("Image proxy: blocked private host {}", host);
+                        return None;
+                    }
+                    // Resolve DNS and check for private IPs
+                    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:{}", host, parsed.port_or_known_default().unwrap_or(443))).await {
+                        for addr in addrs {
+                            let ip = addr.ip();
+                            if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                                log::debug!("Image proxy: blocked private IP {} for {}", ip, host);
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+
             let resp = client.get(&url).send().await.ok()?;
             let content_type = resp
                 .headers()
