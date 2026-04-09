@@ -126,6 +126,43 @@ pub async fn create_contact(
                     Err(e) => log::error!("Google create contact request failed: {}", e),
                 }
             }
+        } else if sync_type == "o365" {
+            if let Ok(token) = crate::mail::graph::get_graph_token(&account_id).await {
+                let graph = crate::mail::graph::GraphClient::new(&token);
+                let mut gc = serde_json::json!({
+                    "displayName": c.display_name,
+                });
+                if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json) {
+                    let ge: Vec<_> = emails.iter()
+                        .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"address": addr, "name": ""})))
+                        .collect();
+                    if !ge.is_empty() { gc["emailAddresses"] = serde_json::json!(ge); }
+                }
+                if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json) {
+                    let mobile = phones.iter().find(|p| p["label"].as_str() == Some("mobile"));
+                    if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
+                        gc["mobilePhone"] = serde_json::json!(m);
+                    }
+                    let biz: Vec<&str> = phones.iter()
+                        .filter(|p| p["label"].as_str() == Some("work"))
+                        .filter_map(|p| p["number"].as_str())
+                        .collect();
+                    if !biz.is_empty() { gc["businessPhones"] = serde_json::json!(biz); }
+                }
+                if let Some(ref org) = c.organization { gc["companyName"] = serde_json::json!(org); }
+                if let Some(ref t) = c.title { gc["jobTitle"] = serde_json::json!(t); }
+                match graph.create_contact(&gc).await {
+                    Ok(remote_id) => {
+                        let conn = state.db.lock().await;
+                        conn.execute(
+                            "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
+                            rusqlite::params![remote_id, id],
+                        ).ok();
+                        log::info!("Created contact on Graph: {}", remote_id);
+                    }
+                    Err(e) => log::error!("Graph create contact failed: {}", e),
+                }
+            }
         }
     }
 
@@ -180,6 +217,36 @@ pub async fn update_contact(
                             Err(e) => log::warn!("Google update contact request failed: {}", e),
                         }
                     }
+                } else if sync_type == "o365" {
+                    if let Ok(token) = crate::mail::graph::get_graph_token(&account_id).await {
+                        let graph = crate::mail::graph::GraphClient::new(&token);
+                        let mut gc = serde_json::json!({
+                            "displayName": contact.display_name,
+                        });
+                        if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json) {
+                            let ge: Vec<_> = emails.iter()
+                                .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"address": addr, "name": ""})))
+                                .collect();
+                            if !ge.is_empty() { gc["emailAddresses"] = serde_json::json!(ge); }
+                        }
+                        if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json) {
+                            let mobile = phones.iter().find(|p| p["label"].as_str() == Some("mobile"));
+                            if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
+                                gc["mobilePhone"] = serde_json::json!(m);
+                            }
+                            let biz: Vec<&str> = phones.iter()
+                                .filter(|p| p["label"].as_str() == Some("work"))
+                                .filter_map(|p| p["number"].as_str())
+                                .collect();
+                            if !biz.is_empty() { gc["businessPhones"] = serde_json::json!(biz); }
+                        }
+                        if let Some(ref org) = contact.organization { gc["companyName"] = serde_json::json!(org); }
+                        if let Some(ref t) = contact.title { gc["jobTitle"] = serde_json::json!(t); }
+                        match graph.update_contact(remote_id, &gc).await {
+                            Ok(()) => log::info!("Updated contact on Graph: {}", remote_id),
+                            Err(e) => log::warn!("Graph update contact failed: {}", e),
+                        }
+                    }
                 }
             }
             return Ok(());
@@ -219,6 +286,14 @@ pub async fn delete_contact(
                     Err(e) => log::warn!("Google delete contact request failed: {}", e),
                 }
             }
+        } else if sync_type == "o365" && !remote_id.is_empty() {
+            if let Ok(token) = crate::mail::graph::get_graph_token(&account_id).await {
+                let graph = crate::mail::graph::GraphClient::new(&token);
+                match graph.delete_contact(&remote_id).await {
+                    Ok(()) => log::info!("Deleted contact from Graph: {}", remote_id),
+                    Err(e) => log::warn!("Graph delete contact failed: {}", e),
+                }
+            }
         }
     }
 
@@ -250,6 +325,8 @@ pub async fn sync_contacts(
                 log::warn!("sync_contacts: Gmail CardDAV failed (OAuth may not be set up): {}", e);
             }
         }
+    } else if account.provider == "o365" {
+        sync_contacts_graph(&state, &account_id).await?;
     } else if account.mail_protocol == "imap" {
         // Generic IMAP account — try CardDAV sync
         match sync_contacts_carddav(&state, &account_id, &account).await {
@@ -762,4 +839,134 @@ pub async fn search_collected_contacts(
 ) -> Result<Vec<CollectedContact>> {
     let conn = state.db.lock().await;
     db::contacts::search_collected_contacts(&conn, &query)
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft Graph contacts sync
+// ---------------------------------------------------------------------------
+
+async fn sync_contacts_graph(
+    state: &State<'_, AppState>,
+    account_id: &str,
+) -> Result<()> {
+    log::info!("sync_contacts_graph: starting for account {}", account_id);
+
+    let token = match crate::mail::graph::get_graph_token(account_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("sync_contacts_graph: failed to get token: {}", e);
+            return Err(e);
+        }
+    };
+    let client = crate::mail::graph::GraphClient::new(&token);
+
+    // 1. Ensure contact book exists
+    let book_id = {
+        let conn = state.db.lock().await;
+        let existing: Option<String> = conn.query_row(
+            "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
+            rusqlite::params![account_id],
+            |row| row.get(0),
+        ).ok();
+
+        match existing {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO contact_books (id, account_id, name, sync_type) VALUES (?1, ?2, 'Outlook Contacts', 'o365')",
+                    rusqlite::params![id, account_id],
+                )?;
+                log::info!("sync_contacts_graph: created contact book 'Outlook Contacts'");
+                id
+            }
+        }
+    };
+
+    // 2. Fetch contacts from Graph
+    let graph_contacts = match client.list_contacts().await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("sync_contacts_graph: list_contacts failed: {}", e);
+            return Err(e);
+        }
+    };
+    log::info!("sync_contacts_graph: fetched {} contacts", graph_contacts.len());
+
+    let conn = state.db.lock().await;
+
+    // Build set of server IDs for reconciliation
+    let server_ids: std::collections::HashSet<String> =
+        graph_contacts.iter().map(|c| c.id.clone()).collect();
+
+    // 3. Upsert contacts
+    for gc in &graph_contacts {
+        let existing: Option<String> = conn.query_row(
+            "SELECT id FROM contacts WHERE book_id = ?1 AND remote_id = ?2",
+            rusqlite::params![book_id, gc.id],
+            |row| row.get(0),
+        ).ok();
+
+        match existing {
+            Some(local_id) => {
+                // Update existing contact
+                conn.execute(
+                    "UPDATE contacts SET display_name = ?1, emails_json = ?2, phones_json = ?3,
+                     organization = ?4, title = ?5, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?6",
+                    rusqlite::params![
+                        gc.display_name,
+                        gc.emails_json,
+                        gc.phones_json,
+                        gc.organization,
+                        gc.title,
+                        local_id,
+                    ],
+                ).ok();
+            }
+            None => {
+                // Insert new contact
+                let id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO contacts (id, book_id, display_name, emails_json, phones_json, organization, title, remote_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        id,
+                        book_id,
+                        gc.display_name,
+                        gc.emails_json,
+                        gc.phones_json,
+                        gc.organization,
+                        gc.title,
+                        gc.id,
+                    ],
+                )?;
+            }
+        }
+    }
+
+    // 4. Remove contacts deleted on server
+    let local_contacts: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT id, remote_id FROM contacts WHERE book_id = ?1 AND remote_id IS NOT NULL AND remote_id != ''",
+        )?
+        .query_map(rusqlite::params![book_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut deleted = 0;
+    for (local_id, remote_id) in &local_contacts {
+        if !server_ids.contains(remote_id) {
+            conn.execute("DELETE FROM contacts WHERE id = ?1", rusqlite::params![local_id]).ok();
+            deleted += 1;
+        }
+    }
+    if deleted > 0 {
+        log::info!("sync_contacts_graph: removed {} server-deleted contacts", deleted);
+    }
+
+    log::info!("sync_contacts_graph: completed for account {}", account_id);
+    Ok(())
 }

@@ -447,11 +447,89 @@ impl GraphClient {
         self.post_json(&format!("/me/events/{}/{}", event_id, action), &body).await?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Contacts
+    // -----------------------------------------------------------------------
+
+    /// List all contacts for the signed-in user.
+    pub async fn list_contacts(&self) -> Result<Vec<GraphContact>> {
+        let mut contacts = Vec::new();
+        let mut next_path: Option<String> = None;
+        loop {
+            let resp: serde_json::Value = match next_path.take() {
+                Some(path) => {
+                    let r = self.http
+                        .get(&path)
+                        .bearer_auth(&self.access_token)
+                        .send()
+                        .await
+                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(Error::Other(format!("Graph contacts returned {}: {}", status, truncate(&body, 500))));
+                    }
+                    serde_json::from_str(&body)
+                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
+                }
+                None => {
+                    self.get(
+                        "/me/contacts",
+                        &[
+                            ("$select", "id,displayName,givenName,surname,middleName,emailAddresses,mobilePhone,businessPhones,homePhones,companyName,jobTitle"),
+                            ("$top", "500"),
+                            ("$orderby", "displayName"),
+                        ],
+                    ).await?
+                }
+            };
+            if let Some(items) = resp["value"].as_array() {
+                for c in items {
+                    contacts.push(parse_graph_contact(c));
+                }
+            }
+            let next_link = resp["@odata.nextLink"].as_str().map(|s: &str| s.to_string());
+            match next_link {
+                Some(next) => { next_path = Some(next); }
+                None => break,
+            }
+        }
+        Ok(contacts)
+    }
+
+    /// Create a contact.
+    pub async fn create_contact(&self, contact: &serde_json::Value) -> Result<String> {
+        let resp = self.post_json("/me/contacts", contact).await?;
+        Ok(resp["id"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Update a contact.
+    pub async fn update_contact(&self, contact_id: &str, updates: &serde_json::Value) -> Result<()> {
+        self.patch_json(&format!("/me/contacts/{}", contact_id), updates).await
+    }
+
+    /// Delete a contact.
+    pub async fn delete_contact(&self, contact_id: &str) -> Result<()> {
+        self.delete(&format!("/me/contacts/{}", contact_id)).await
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct GraphContact {
+    pub id: String,
+    pub display_name: String,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub emails_json: String,
+    pub phones_json: String,
+    pub organization: Option<String>,
+    pub title: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct GraphUser {
@@ -647,6 +725,62 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         attendees_json,
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
         is_recurring: e["recurrence"].is_object(),
+    }
+}
+
+fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
+    let display_name = c["displayName"].as_str().unwrap_or("").to_string();
+    let given_name = c["givenName"].as_str().map(|s| s.to_string());
+    let surname = c["surname"].as_str().map(|s| s.to_string());
+    let organization = c["companyName"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let title = c["jobTitle"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Parse emails — Graph's "name" field is a display label, not work/home.
+    // Use index-based labeling: first = "work", rest = "other".
+    let emails: Vec<serde_json::Value> = c["emailAddresses"].as_array()
+        .map(|arr| arr.iter().enumerate().filter_map(|(i, e)| {
+            let addr = e["address"].as_str()?;
+            if addr.is_empty() { return None; }
+            let label = if i == 0 { "work" } else { "other" };
+            Some(serde_json::json!({"email": addr, "label": label}))
+        }).collect())
+        .unwrap_or_default();
+    let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string());
+
+    // Parse phones: Graph has mobilePhone (string), businessPhones (array), homePhones (array)
+    let mut phones: Vec<serde_json::Value> = Vec::new();
+    if let Some(mobile) = c["mobilePhone"].as_str().filter(|s| !s.is_empty()) {
+        phones.push(serde_json::json!({"number": mobile, "label": "mobile"}));
+    }
+    if let Some(biz) = c["businessPhones"].as_array() {
+        for p in biz {
+            if let Some(num) = p.as_str().filter(|s| !s.is_empty()) {
+                phones.push(serde_json::json!({"number": num, "label": "work"}));
+            }
+        }
+    }
+    if let Some(home) = c["homePhones"].as_array() {
+        for p in home {
+            if let Some(num) = p.as_str().filter(|s| !s.is_empty()) {
+                phones.push(serde_json::json!({"number": num, "label": "home"}));
+            }
+        }
+    }
+    let phones_json = serde_json::to_string(&phones).unwrap_or_else(|_| "[]".to_string());
+
+    GraphContact {
+        id: c["id"].as_str().unwrap_or("").to_string(),
+        display_name,
+        given_name,
+        surname,
+        emails_json,
+        phones_json,
+        organization,
+        title,
     }
 }
 
