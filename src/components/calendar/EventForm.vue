@@ -162,7 +162,7 @@ async function save() {
           <label>Calendar</label>
           <select v-model="calendarId">
             <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
-              {{ cal.name }}
+              {{ cal.name }} ({{ accountsStore.accounts.find(a => a.id === cal.account_id)?.display_name || cal.account_id }})
             </option>
           </select>
         </div>
