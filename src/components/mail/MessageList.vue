@@ -201,7 +201,7 @@ async function ctxForward() {
 async function ctxMoveTo(folderPath: string) {
   const accountId = accountsStore.activeAccountId;
   if (!accountId) return;
-  const ids = [...messagesStore.selectedIds];
+  const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
   try {
     await api.moveMessages(accountId, ids, folderPath);
@@ -218,7 +218,7 @@ async function ctxMoveTo(folderPath: string) {
 async function ctxCopyTo(folderPath: string) {
   const accountId = accountsStore.activeAccountId;
   if (!accountId) return;
-  const ids = [...messagesStore.selectedIds];
+  const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
   try {
     await api.copyMessages(accountId, ids, folderPath);
@@ -259,7 +259,7 @@ async function ctxNotSpam() {
   if (!accountId) return;
   const inboxFolder = foldersStore.folders.find((f) => f.folder_type === "inbox");
   if (!inboxFolder) return;
-  const ids = [...messagesStore.selectedIds];
+  const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
   try {
     await api.moveMessages(accountId, ids, inboxFolder.path);

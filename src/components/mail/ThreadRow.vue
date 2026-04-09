@@ -72,12 +72,12 @@ function isReply(): boolean {
         :class="{ starred: isStarred() }"
       >{{ isStarred() ? '\u2605' : '\u2606' }}</span>
     </div>
-    <div class="col col-subject" :class="{ bold: hasUnread() }">
+    <div class="col col-subject" :class="{ bold: hasUnread() && !expanded }">
       <span v-if="isReply()" class="reply-icon">&hookleftarrow;</span>
       <span class="subject-text">{{ thread.subject || "(no subject)" }}</span>
       <span v-if="thread.message_count > 1" class="thread-count">({{ thread.message_count }})</span>
     </div>
-    <div class="col col-from" :class="{ bold: hasUnread() }">
+    <div class="col col-from" :class="{ bold: hasUnread() && !expanded }">
       {{ thread.from_name || thread.from_email }}
     </div>
     <div class="col col-date">

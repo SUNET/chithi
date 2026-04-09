@@ -24,7 +24,7 @@ async function markNotSpam() {
   if (!accountId || !hasSelection.value) return;
   const inboxFolder = foldersStore.folders.find((f) => f.folder_type === "inbox");
   if (!inboxFolder) return;
-  const ids = [...messagesStore.selectedIds];
+  const ids = messagesStore.resolveSelectedIds();
   try {
     await api.moveMessages(accountId, ids, inboxFolder.path);
     messagesStore.clearSelection();

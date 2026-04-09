@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mount } from "@vue/test-utils";
 import { setActivePinia, createPinia } from "pinia";
 import { createRouter, createWebHistory } from "vue-router";
+import ThreadRow from "@/components/mail/ThreadRow.vue";
 
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
@@ -168,5 +169,82 @@ describe("Regression: selection", () => {
     const wrapper = mount(MessageList, { global: { plugins: [router] } });
     const row = wrapper.find(".message-row");
     expect(row.element.tagName).toBe("DIV");
+  });
+
+  it("BUG: thread move/delete must include all message IDs, not just the first", () => {
+    // Previously, selecting a thread and clicking Delete/Move only sent
+    // the first message ID (used for selection), leaving the rest of the
+    // thread behind. resolveSelectedIds() expands thread selections.
+    const store = setupStores();
+    const uiStore = useUiStore();
+    uiStore.threadingEnabled = true;
+
+    store.threads = [
+      {
+        thread_id: "thread-1",
+        subject: "A thread",
+        last_date: "2026-04-09T00:00:00Z",
+        message_count: 4,
+        unread_count: 0,
+        from_name: "Test",
+        from_email: "test@test.com",
+        has_attachments: false,
+        flags: ["seen"],
+        snippet: "hello",
+        message_ids: ["msg-a", "msg-b", "msg-c", "msg-d"],
+      },
+    ];
+
+    // Selecting the thread only adds the first message ID
+    store.selectedIds = ["msg-a"];
+
+    // resolveSelectedIds must expand to all 4 message IDs
+    const resolved = store.resolveSelectedIds();
+    expect(resolved).toEqual(["msg-a", "msg-b", "msg-c", "msg-d"]);
+  });
+
+  it("BUG: resolveSelectedIds in flat mode returns selected IDs unchanged", () => {
+    const store = setupStores();
+    const uiStore = useUiStore();
+    uiStore.threadingEnabled = false;
+
+    store.selectedIds = ["msg-1", "msg-2"];
+    const resolved = store.resolveSelectedIds();
+    expect(resolved).toEqual(["msg-1", "msg-2"]);
+  });
+
+  it("BUG: expanded thread header should not show bold when children are visible", () => {
+    // When a thread is expanded, the individual child messages show their own
+    // read/unread status. The thread header showing bold made it look like an
+    // extra unread message, causing the visual count to mismatch the badge.
+    const thread = {
+      thread_id: "t1",
+      subject: "Test thread",
+      last_date: "2026-04-09T00:00:00Z",
+      message_count: 3,
+      unread_count: 2,
+      from_name: "Alice",
+      from_email: "alice@test.com",
+      has_attachments: false,
+      flags: ["seen"],
+      snippet: "hello",
+      message_ids: ["m1", "m2", "m3"],
+    };
+
+    // Expanded: subject should NOT be bold even though unread_count > 0
+    const expanded = mount(ThreadRow, {
+      props: { thread, expanded: true, active: false, selected: false },
+      global: { plugins: [router] },
+    });
+    const subjectExpanded = expanded.find(".col-subject");
+    expect(subjectExpanded.classes()).not.toContain("bold");
+
+    // Collapsed: subject SHOULD be bold when thread has unread children
+    const collapsed = mount(ThreadRow, {
+      props: { thread, expanded: false, active: false, selected: false },
+      global: { plugins: [router] },
+    });
+    const subjectCollapsed = collapsed.find(".col-subject");
+    expect(subjectCollapsed.classes()).toContain("bold");
   });
 });

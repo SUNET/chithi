@@ -151,46 +151,70 @@ pub async fn delete_messages(
                 log::error!("Graph delete failed for {}: {}", graph_id, e);
             }
         }
-    } else {
-    let (imap_config, by_folder) = {
-        let conn = state.db.lock().await;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-            use_xoauth2: false,
+    } else if account.mail_protocol == "jmap" {
+        // JMAP path: extract JMAP email IDs and delete via Email/set destroy
+        let jmap_config = crate::mail::jmap::JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
         };
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-        (config, grouped)
-    };
 
-    if by_folder.is_empty() {
-        log::warn!("No messages found for delete operation");
-        return Ok(());
-    }
+        // Extract JMAP email IDs from composite message IDs
+        // Format: {account_id}_{folder}_{jmap_email_id}
+        let jmap_ids: Vec<String> = message_ids
+            .iter()
+            .filter_map(|mid| {
+                let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                if parts.len() == 3 { Some(parts[2].to_string()) } else { None }
+            })
+            .collect();
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = ImapConnection::connect(&imap_config)?;
+        if !jmap_ids.is_empty() {
+            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            conn_jmap.delete_emails(&jmap_config, &jmap_ids).await?;
+        }
+    } else {
+        // IMAP path
+        let (imap_config, by_folder) = {
+            let conn = state.db.lock().await;
+            let config = ImapConfig {
+                host: account.imap_host,
+                port: account.imap_port,
+                username: account.username,
+                password: account.password,
+                use_tls: account.use_tls,
+                use_xoauth2: false,
+            };
+            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let grouped = group_by_folder(uid_rows);
+            (config, grouped)
+        };
 
-        for (folder_path, uids) in &by_folder {
-            log::debug!(
-                "Deleting {} messages from '{}'",
-                uids.len(),
-                folder_path
-            );
-            conn.select_folder(folder_path)?;
-            conn.delete_messages(uids)?;
+        if by_folder.is_empty() {
+            log::warn!("No messages found for delete operation");
+            return Ok(());
         }
 
-        conn.logout();
-        Ok(())
-    })
-    .await
-    .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
-    } // end else (IMAP path)
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = ImapConnection::connect(&imap_config)?;
+
+            for (folder_path, uids) in &by_folder {
+                log::debug!(
+                    "Deleting {} messages from '{}'",
+                    uids.len(),
+                    folder_path
+                );
+                conn.select_folder(folder_path)?;
+                conn.delete_messages(uids)?;
+            }
+
+            conn.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
+    }
 
     // Remove from local DB and recalculate folder counts
     {

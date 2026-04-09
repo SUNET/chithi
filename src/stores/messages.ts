@@ -382,10 +382,29 @@ export const useMessagesStore = defineStore("messages", () => {
     selectedIds.value = [];
   }
 
+  /** Expand selected IDs to include all message IDs in their threads.
+   *  In threaded mode, selectedIds contains only the first message ID of each thread.
+   *  This resolves them to the full set of message IDs for move/delete/copy operations. */
+  function resolveSelectedIds(): string[] {
+    if (!uiStore.threadingEnabled) return [...selectedIds.value];
+    const allIds: string[] = [];
+    for (const id of selectedIds.value) {
+      const thread = threads.value.find(t => t.message_ids.includes(id));
+      if (thread) {
+        for (const mid of thread.message_ids) {
+          if (!allIds.includes(mid)) allIds.push(mid);
+        }
+      } else {
+        if (!allIds.includes(id)) allIds.push(id);
+      }
+    }
+    return allIds;
+  }
+
   async function deleteSelected() {
     const accountId = accountsStore.activeAccountId;
     if (!accountId || selectedIds.value.length === 0) return;
-    const ids = [...selectedIds.value];
+    const ids = resolveSelectedIds();
     try {
       await api.deleteMessages(accountId, ids);
       selectedIds.value = [];
@@ -466,5 +485,6 @@ export const useMessagesStore = defineStore("messages", () => {
     toggleTextField,
     onFilterTextChange,
     clearQuickFilters,
+    resolveSelectedIds,
   };
 });
