@@ -191,6 +191,11 @@ async function saveContact() {
     showForm.value = false;
     if (selectedBookId.value) {
       contacts.value = await api.listContacts(selectedBookId.value);
+      // Refresh the detail panel with the updated contact
+      if (editingContactId.value && selectedContact.value) {
+        const updated = contacts.value.find(c => c.id === editingContactId.value);
+        if (updated) selectedContact.value = updated;
+      }
     }
   } catch (e) {
     error.value = String(e);

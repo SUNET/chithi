@@ -247,6 +247,35 @@ pub async fn update_contact(
                             Err(e) => log::warn!("Graph update contact failed: {}", e),
                         }
                     }
+                } else if sync_type == "jmap" {
+                    let account = {
+                        let conn = state.db.lock().await;
+                        db::accounts::get_account_full(&conn, &account_id)?
+                    };
+                    let jmap_config = crate::mail::jmap::JmapConfig {
+                        jmap_url: account.jmap_url,
+                        email: account.email,
+                        username: account.username,
+                        password: account.password,
+                    };
+                    match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+                        Ok(conn_jmap) => {
+                            match conn_jmap.update_contact_card(
+                                &jmap_config,
+                                remote_id,
+                                &contact.display_name,
+                                &contact.emails_json,
+                                &contact.phones_json,
+                                contact.organization.as_deref(),
+                                contact.title.as_deref(),
+                                contact.notes.as_deref(),
+                            ).await {
+                                Ok(()) => log::info!("Updated contact on JMAP: {}", remote_id),
+                                Err(e) => log::warn!("JMAP update contact failed: {}", e),
+                            }
+                        }
+                        Err(e) => log::warn!("JMAP connect failed for contact update: {}", e),
+                    }
                 }
             }
             return Ok(());
@@ -293,6 +322,26 @@ pub async fn delete_contact(
                     Ok(()) => log::info!("Deleted contact from Graph: {}", remote_id),
                     Err(e) => log::warn!("Graph delete contact failed: {}", e),
                 }
+            }
+        } else if sync_type == "jmap" && !remote_id.is_empty() {
+            let account = {
+                let conn = state.db.lock().await;
+                db::accounts::get_account_full(&conn, &account_id)?
+            };
+            let jmap_config = crate::mail::jmap::JmapConfig {
+                jmap_url: account.jmap_url,
+                email: account.email,
+                username: account.username,
+                password: account.password,
+            };
+            match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+                Ok(conn_jmap) => {
+                    match conn_jmap.delete_contact_card(&jmap_config, &remote_id).await {
+                        Ok(()) => log::info!("Deleted contact from JMAP: {}", remote_id),
+                        Err(e) => log::warn!("JMAP delete contact failed: {}", e),
+                    }
+                }
+                Err(e) => log::warn!("JMAP connect failed for contact delete: {}", e),
             }
         }
     }
