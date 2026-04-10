@@ -101,11 +101,17 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
     // For IMAP (path-based), use '/' count as depth proxy.
     let mut parent_paths: Vec<String> = children_map.keys().cloned().collect();
     if has_parent_ids {
-        // Compute depth for each folder by following parent_id chain
+        // Compute depth for each folder by following parent_id chain.
+        // Guard against cycles with a visited set.
         let depth_of = |path: &str| -> usize {
             let mut depth = 0usize;
             let mut current = path.to_string();
+            let mut visited = std::collections::HashSet::new();
             while let Some(idx) = by_path.get(&current) {
+                if !visited.insert(current.clone()) {
+                    log::warn!("Cycle detected in folder parent_id chain at {}", current);
+                    break;
+                }
                 if let Some(ref pid) = folders[*idx].parent_id {
                     depth += 1;
                     current = pid.clone();

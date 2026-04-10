@@ -34,8 +34,9 @@ export const useFoldersStore = defineStore("folders", () => {
       if (folders.value.length > 0) {
         // If no folder is selected, or the selected folder doesn't exist
         // in this account, default to Inbox.
-        const currentValid = activeFolderPath.value &&
-          findFolderInTree(folders.value, activeFolderPath.value);
+        const active = activeFolderPath.value;
+        const currentValid = active !== null &&
+          findFolderInTree(folders.value, active) !== undefined;
         if (!currentValid) {
           const inbox = folders.value.find((f) => f.folder_type === "inbox");
           activeFolderPath.value = inbox?.path ?? folders.value[0].path;
@@ -78,6 +79,23 @@ export const useFoldersStore = defineStore("folders", () => {
     return foldersByAccount.value[accountId] ?? [];
   }
 
+  /** Flatten a folder tree into a flat list (for dropdowns, filters, move targets). */
+  function flattenFolders(tree: Folder[]): Folder[] {
+    const result: Folder[] = [];
+    for (const f of tree) {
+      result.push(f);
+      if (f.children.length > 0) {
+        result.push(...flattenFolders(f.children));
+      }
+    }
+    return result;
+  }
+
+  /** All folders for the active account as a flat list (for dropdowns/selects). */
+  function getFlatFolders(): Folder[] {
+    return flattenFolders(folders.value);
+  }
+
   watch(
     () => accountsStore.activeAccountId,
     () => {
@@ -94,5 +112,6 @@ export const useFoldersStore = defineStore("folders", () => {
     fetchAllAccountFolders,
     setActiveFolder,
     getAccountFolders,
+    getFlatFolders,
   };
 });

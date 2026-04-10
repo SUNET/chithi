@@ -21,7 +21,14 @@ const collapsedFolders = ref<Record<string, string[]>>(loadCollapsedFolders());
 function loadCollapsedFolders(): Record<string, string[]> {
   try {
     const stored = localStorage.getItem("chithi-collapsed-folders");
-    return stored ? JSON.parse(stored) : {};
+    if (!stored) return {};
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    // Validate all values are string arrays
+    for (const v of Object.values(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(v) || !v.every((item) => typeof item === "string")) return {};
+    }
+    return parsed as Record<string, string[]>;
   } catch {
     return {};
   }
@@ -323,7 +330,12 @@ async function markFolderRead() {
           <span
             v-if="item.hasChildren"
             class="folder-toggle"
+            role="button"
+            tabindex="0"
+            :aria-expanded="!isFolderCollapsed(account.id, item.folder.path)"
             @click.stop="toggleFolderCollapse(account.id, item.folder.path)"
+            @keydown.enter.stop="toggleFolderCollapse(account.id, item.folder.path)"
+            @keydown.space.stop.prevent="toggleFolderCollapse(account.id, item.folder.path)"
           >
             <svg
               width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
