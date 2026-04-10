@@ -6,6 +6,7 @@ import { useMessagesStore } from "@/stores/messages";
 import type { Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
+import { showToast, dismissToast } from "@/lib/toast";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
@@ -246,10 +247,13 @@ async function createNewFolder() {
   newFolderSaving.value = true;
   newFolderError.value = null;
   try {
+    const toastId = showToast(`Creating folder...`, "info", 0);
     await api.createFolder(accountId, folderPath);
     showNewFolderModal.value = false;
     // Trigger sync so the server-assigned folder ID/path gets registered locally
     await api.triggerSync(accountId);
+    await foldersStore.fetchAllAccountFolders();
+    dismissToast(toastId);
   } catch (e) {
     newFolderError.value = String(e);
   } finally {
@@ -289,10 +293,12 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
 
   const messageIds = [...dragMessageIds.value];
   try {
+    const toastId = showToast(`Moving ${messageIds.length} message(s)...`, "info", 0);
     await api.moveMessages(accountId, messageIds, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
+    dismissToast(toastId);
   } catch (e) {
     console.error("Drag-and-drop move failed:", e);
   }
@@ -332,7 +338,9 @@ async function doDeleteFolder() {
   deletingFolder.value = null;
 
   try {
+    const toastId = showToast(`Deleting "${folder.name}"...`, "info", 0);
     await api.deleteFolder(accountId, folder.path);
+    await foldersStore.fetchAllAccountFolders();
     // If the deleted folder was active on this account, switch to inbox
     if (
       accountsStore.activeAccountId === accountId &&
@@ -342,6 +350,7 @@ async function doDeleteFolder() {
       const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
       foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
     }
+    dismissToast(toastId);
   } catch (e) {
     console.error("Delete folder failed:", e);
   }

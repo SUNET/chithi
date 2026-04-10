@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
+import { showToast, dismissToast } from "@/lib/toast";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -275,10 +276,12 @@ async function ctxMoveTo(folderPath: string) {
   const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
   try {
+    const toastId = showToast(`Moving ${ids.length} message(s)...`, "info", 0);
     await api.moveMessages(accountId, ids, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
+    dismissToast(toastId);
   } catch (e) {
     console.error("Move failed:", e);
   }
