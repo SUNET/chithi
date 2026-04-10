@@ -246,18 +246,17 @@ async function createNewFolder() {
 
   newFolderSaving.value = true;
   newFolderError.value = null;
+  const createToastId = showToast(`Creating folder...`, "info", 0);
   try {
-    const toastId = showToast(`Creating folder...`, "info", 0);
     await api.createFolder(accountId, folderPath);
     showNewFolderModal.value = false;
-    // Trigger sync so the server-assigned folder ID/path gets registered locally
     await api.triggerSync(accountId);
     await foldersStore.fetchAllAccountFolders();
-    dismissToast(toastId);
   } catch (e) {
     newFolderError.value = String(e);
   } finally {
     newFolderSaving.value = false;
+    dismissToast(createToastId);
   }
 }
 
@@ -292,15 +291,16 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
   if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
 
   const messageIds = [...dragMessageIds.value];
+  const moveToastId = showToast(`Moving ${messageIds.length} message(s)...`, "info", 0);
   try {
-    const toastId = showToast(`Moving ${messageIds.length} message(s)...`, "info", 0);
     await api.moveMessages(accountId, messageIds, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    dismissToast(toastId);
   } catch (e) {
     console.error("Drag-and-drop move failed:", e);
+  } finally {
+    dismissToast(moveToastId);
   }
 }
 
@@ -337,11 +337,10 @@ async function doDeleteFolder() {
   const { accountId, folder } = deletingFolder.value;
   deletingFolder.value = null;
 
+  const deleteToastId = showToast(`Deleting "${folder.name}"...`, "info", 0);
   try {
-    const toastId = showToast(`Deleting "${folder.name}"...`, "info", 0);
     await api.deleteFolder(accountId, folder.path);
     await foldersStore.fetchAllAccountFolders();
-    // If the deleted folder was active on this account, switch to inbox
     if (
       accountsStore.activeAccountId === accountId &&
       foldersStore.activeFolderPath === folder.path
@@ -350,9 +349,10 @@ async function doDeleteFolder() {
       const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
       foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
     }
-    dismissToast(toastId);
   } catch (e) {
     console.error("Delete folder failed:", e);
+  } finally {
+    dismissToast(deleteToastId);
   }
 }
 </script>

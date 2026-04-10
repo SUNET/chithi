@@ -275,15 +275,16 @@ async function ctxMoveTo(folderPath: string) {
   if (!accountId) return;
   const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
+  const toastId = showToast(`Moving ${ids.length} message(s)...`, "info", 0);
   try {
-    const toastId = showToast(`Moving ${ids.length} message(s)...`, "info", 0);
     await api.moveMessages(accountId, ids, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    dismissToast(toastId);
   } catch (e) {
     console.error("Move failed:", e);
+  } finally {
+    dismissToast(toastId);
   }
 }
 
