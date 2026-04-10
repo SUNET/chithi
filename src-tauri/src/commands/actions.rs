@@ -448,3 +448,28 @@ fn group_by_folder(rows: Vec<(String, String, u32)>) -> HashMap<String, Vec<u32>
 fn normalize_flag_name(flag: &str) -> String {
     flag.trim_start_matches('\\').to_lowercase()
 }
+
+/// Mark all messages in all folders of an account as read (local DB only).
+/// This is a bulk operation — much faster than marking individual messages.
+#[tauri::command]
+pub async fn mark_account_read(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<u64> {
+    log::info!("Marking all messages as read for account {}", account_id);
+
+    let conn = state.db.lock().await;
+
+    // Update all unread messages to include "seen" flag
+    let updated = conn.execute(
+        "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
+         WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+        rusqlite::params![account_id],
+    ).map_err(crate::error::Error::Database)?;
+
+    // Recalculate folder counts
+    db::folders::recalculate_folder_counts(&conn, &account_id)?;
+
+    log::info!("Marked {} messages as read for account {}", updated, account_id);
+    Ok(updated as u64)
+}

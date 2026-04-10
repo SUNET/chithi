@@ -208,6 +208,23 @@ async function markFolderRead() {
     console.error("Mark folder read failed:", e);
   }
 }
+
+async function markAccountRead() {
+  const accountId = accountMenu.value?.accountId;
+  if (!accountId) return;
+  closeContextMenu();
+
+  try {
+    await api.markAccountRead(accountId);
+    await foldersStore.fetchFolders();
+    await foldersStore.fetchAllAccountFolders();
+    if (accountsStore.activeAccountId === accountId) {
+      await messagesStore.fetchMessages();
+    }
+  } catch (e) {
+    console.error("Mark account read failed:", e);
+  }
+}
 </script>
 
 <template>
@@ -316,6 +333,8 @@ async function markFolderRead() {
         :style="{ left: accountMenu.x + 'px', top: accountMenu.y + 'px' }"
       >
         <button class="ctx-item" @click="openNewFolderFromAccount">New Folder...</button>
+        <div class="ctx-separator"></div>
+        <button class="ctx-item" @click="markAccountRead">Mark All Read</button>
       </div>
     </Teleport>
 

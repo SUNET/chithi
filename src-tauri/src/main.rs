@@ -73,6 +73,7 @@ fn main() {
             commands::actions::delete_messages,
             commands::actions::set_message_flags,
             commands::actions::copy_messages,
+            commands::actions::mark_account_read,
             commands::filters::list_filters,
             commands::filters::save_filter,
             commands::filters::delete_filter,
