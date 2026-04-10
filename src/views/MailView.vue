@@ -145,6 +145,8 @@ onMounted(async () => {
       await messagesStore.fetchMessages();
     }
     startBackgroundPrefetch();
+    // Sync calendars in background after mail sync (keeps O365/Google events up to date)
+    api.syncCalendars(payload.account_id).catch(() => {});
   });
 
   let lastRefresh = 0;

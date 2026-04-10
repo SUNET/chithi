@@ -2,7 +2,7 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::db;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mail::jmap::{JmapConfig, JmapConnection};
 use crate::mail::smtp;
 use crate::state::AppState;
@@ -195,15 +195,28 @@ pub async fn save_draft(
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
         conn_jmap.save_draft(&jmap_config, &raw_message).await?;
     } else {
-        // IMAP: append to Drafts folder
+        // IMAP: append to Drafts folder (O365 uses XOAUTH2)
+        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account.id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account.id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password.clone(), false)
+        };
         tokio::task::spawn_blocking(move || {
             let imap_config = crate::mail::imap::ImapConfig {
                 host: account.imap_host,
                 port: account.imap_port,
                 username: account.username,
-                password: account.password,
+                password: imap_password,
                 use_tls: account.use_tls,
-                use_xoauth2: false,
+                use_xoauth2: imap_xoauth2,
             };
             let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
             // Try common Drafts folder names

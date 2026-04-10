@@ -124,5 +124,11 @@ These errors are logged at `warn` level (not `error`) to avoid false-positive re
 - Maildir storage enables offline reading
 - SMTP sends from the actual mailbox address (no DMARC issues)
 - Two-resource token management adds complexity but is handled transparently
-- Graph API client (`graph.rs`) is available for future calendar/contacts integration
+- Graph API calendar sync implemented (ADR 0034) — list/create/update/delete events
+- Graph API contacts sync implemented — list/create/update/delete contacts
 - Personal accounts with external login emails need `username` ≠ `email` (login vs mailbox)
+
+### Token pitfalls (discovered during implementation)
+- **On-demand body fetch**: `get_message_body` IMAP path had `use_xoauth2: false` hardcoded. O365 IMAP requires XOAUTH2 — basic auth returns `BasicAuthBlocked`. Fixed by refreshing IMAP-scoped token for O365 accounts.
+- **Graph token vs IMAP token**: Both share one keyring entry. `get_graph_token()` must always refresh with Graph scopes since the stored token is IMAP-scoped. Cannot check expiry — must always refresh.
+- **Calendar auto-sync**: Calendar sync now runs after every mail `sync-complete` event, not just on manual sync button. Ensures O365 calendar events stay current.

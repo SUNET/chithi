@@ -70,7 +70,7 @@ pub async fn apply_filters_to_folder(
     );
 
     // 1. Load filters from DB
-    let (rules, messages, imap_config) = {
+    let (rules, messages, account) = {
         let conn = state.db.lock().await;
 
         let rules = db::filters::list_filters(&conn, Some(&account_id))?;
@@ -89,18 +89,31 @@ pub async fn apply_filters_to_folder(
             return Ok(0);
         }
 
-        // Get IMAP config
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-            use_xoauth2: false,
-        };
+        (enabled_rules, messages, account)
+    };
 
-        (enabled_rules, messages, config)
+    // Build IMAP config — O365 needs XOAUTH2 token refresh
+    let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account_id)?
+            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+        let refresh = tokens.refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+        let new = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account_id, &new)?;
+        (new.access_token, true)
+    } else {
+        (account.password, false)
+    };
+    let imap_config = ImapConfig {
+        host: account.imap_host,
+        port: account.imap_port,
+        username: account.username,
+        password: imap_password,
+        use_tls: account.use_tls,
+        use_xoauth2: imap_xoauth2,
     };
 
     log::info!(

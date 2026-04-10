@@ -182,13 +182,28 @@ pub async fn get_message_body(
         } else {
             log::info!("Body not on disk for {}, fetching from IMAP", message_id);
 
+            // For O365, refresh IMAP-scoped token for XOAUTH2
+            let (password, use_xoauth2) = if account.provider == "o365" {
+                let tokens = crate::oauth::load_tokens(&account_id)?
+                    .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+                let refresh = tokens.refresh_token
+                    .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+                let new = crate::oauth::refresh_with_scopes(
+                    &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+                ).await?;
+                crate::oauth::store_tokens(&account_id, &new)?;
+                (new.access_token, true)
+            } else {
+                (account.password, false)
+            };
+
             let imap_config = ImapConfig {
                 host: account.imap_host,
                 port: account.imap_port,
                 username: account.username,
-                password: account.password,
+                password,
                 use_tls: account.use_tls,
-            use_xoauth2: false,
+                use_xoauth2,
             };
 
             let account_id_clone = account_id.clone();
@@ -468,14 +483,27 @@ pub async fn create_folder(
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap.create_mailbox(&jmap_config, &folder_path).await?;
     } else {
-        // IMAP: CREATE
+        // IMAP: CREATE (O365 uses XOAUTH2)
+        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
         let imap_config = ImapConfig {
             host: account.imap_host,
             port: account.imap_port,
             username: account.username,
-            password: account.password,
+            password: imap_password,
             use_tls: account.use_tls,
-            use_xoauth2: false,
+            use_xoauth2: imap_xoauth2,
         };
         let folder_for_imap = folder_path.clone();
         tokio::task::spawn_blocking(move || {

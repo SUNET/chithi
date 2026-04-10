@@ -6,6 +6,31 @@ use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::state::AppState;
 
+/// Build an ImapConfig for an account, handling O365 XOAUTH2 token refresh.
+async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapConfig> {
+    let (password, use_xoauth2) = if account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account.id)?
+            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+        let refresh = tokens.refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+        let new = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account.id, &new)?;
+        (new.access_token, true)
+    } else {
+        (account.password.clone(), false)
+    };
+    Ok(ImapConfig {
+        host: account.imap_host.clone(),
+        port: account.imap_port,
+        username: account.username.clone(),
+        password,
+        use_tls: account.use_tls,
+        use_xoauth2,
+    })
+}
+
 /// Move messages to a target folder on the IMAP/JMAP server and update local DB.
 #[tauri::command]
 pub async fn move_messages(
@@ -64,20 +89,12 @@ pub async fn move_messages(
             conn_jmap.move_emails(&jmap_config, jmap_ids, source_mailbox, &target_mailbox).await?;
         }
     } else {
-        // IMAP path
-        let (imap_config, by_folder) = {
+        // IMAP path (includes O365 with XOAUTH2)
+        let imap_config = build_imap_config(&account).await?;
+        let by_folder = {
             let conn = state.db.lock().await;
-            let config = ImapConfig {
-                host: account.imap_host,
-                port: account.imap_port,
-                username: account.username,
-                password: account.password,
-                use_tls: account.use_tls,
-            use_xoauth2: false,
-            };
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-            let grouped = group_by_folder(uid_rows);
-            (config, grouped)
+            group_by_folder(uid_rows)
         };
 
         if by_folder.is_empty() {
@@ -175,20 +192,12 @@ pub async fn delete_messages(
             conn_jmap.delete_emails(&jmap_config, &jmap_ids).await?;
         }
     } else {
-        // IMAP path
-        let (imap_config, by_folder) = {
+        // IMAP path (includes O365 with XOAUTH2)
+        let imap_config = build_imap_config(&account).await?;
+        let by_folder = {
             let conn = state.db.lock().await;
-            let config = ImapConfig {
-                host: account.imap_host,
-                port: account.imap_port,
-                username: account.username,
-                password: account.password,
-                use_tls: account.use_tls,
-                use_xoauth2: false,
-            };
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-            let grouped = group_by_folder(uid_rows);
-            (config, grouped)
+            group_by_folder(uid_rows)
         };
 
         if by_folder.is_empty() {
@@ -284,20 +293,12 @@ pub async fn set_message_flags(
         let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
         conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, add).await?;
     } else {
-        // IMAP path
-        let (imap_config, by_folder) = {
+        // IMAP path (includes O365 with XOAUTH2)
+        let imap_config = build_imap_config(&account).await?;
+        let by_folder = {
             let conn = state.db.lock().await;
-            let config = ImapConfig {
-                host: account.imap_host.clone(),
-                port: account.imap_port,
-                username: account.username.clone(),
-                password: account.password.clone(),
-                use_tls: account.use_tls,
-            use_xoauth2: false,
-            };
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-            let grouped = group_by_folder(uid_rows);
-            (config, grouped)
+            group_by_folder(uid_rows)
         };
 
         if !by_folder.is_empty() {
@@ -383,20 +384,15 @@ pub async fn copy_messages(
         target_folder
     );
 
-    let (imap_config, by_folder) = {
+    let account = {
         let conn = state.db.lock().await;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password: account.password,
-            use_tls: account.use_tls,
-            use_xoauth2: false,
-        };
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+    let imap_config = build_imap_config(&account).await?;
+    let by_folder = {
+        let conn = state.db.lock().await;
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-        (config, grouped)
+        group_by_folder(uid_rows)
     };
 
     if by_folder.is_empty() {

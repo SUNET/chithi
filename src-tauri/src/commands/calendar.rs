@@ -275,17 +275,28 @@ pub async fn create_event(
                 }
                 if let Some(ref att_json) = cal_event.attendees_json {
                     if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
-                        let graph_atts: Vec<serde_json::Value> = atts.iter()
+                        let mut graph_atts: Vec<serde_json::Value> = atts.iter()
                             .filter_map(|a| a["email"].as_str().map(|e| serde_json::json!({
                                 "emailAddress": {"address": e, "name": a["name"].as_str().unwrap_or("")},
                                 "type": "required",
                             })))
                             .collect();
+                        // Add the organizer as an attendee with isOrganizer=true
+                        if let Some(ref org_email) = cal_event.organizer_email {
+                            graph_atts.push(serde_json::json!({
+                                "emailAddress": {"address": org_email, "name": ""},
+                                "type": "required",
+                                "status": {"response": "organizer"},
+                            }));
+                        }
                         if !graph_atts.is_empty() {
                             graph_event["attendees"] = serde_json::json!(graph_atts);
                         }
+                        log::info!("create_event: O365 event with {} attendees", graph_atts.len());
                     }
                 }
+                // Graph sends invite emails automatically when attendees are present
+                log::debug!("create_event: O365 graph_event JSON: {}", serde_json::to_string_pretty(&graph_event).unwrap_or_default());
                 match client.create_event(&graph_event).await {
                     Ok(remote_id) => {
                         log::info!("create_event: pushed to Graph Calendar, id={}", remote_id);

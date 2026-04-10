@@ -191,14 +191,28 @@ pub async fn sync_folder(
         .await;
     }
 
-    // IMAP path
+    // IMAP path — for O365, refresh IMAP-scoped token
+    let (password, use_xoauth2) = if account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account_id)?
+            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+        let refresh = tokens.refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+        let new = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account_id, &new)?;
+        (new.access_token, true)
+    } else {
+        (account.password, false)
+    };
+
     let imap_config = ImapConfig {
         host: account.imap_host,
         port: account.imap_port,
         username: account.username,
-        password: account.password,
+        password,
         use_tls: account.use_tls,
-            use_xoauth2: false,
+        use_xoauth2,
     };
 
     let db = state.db.clone();
