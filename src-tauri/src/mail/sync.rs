@@ -113,7 +113,7 @@ fn sync_account_blocking(
         for (display_name, path) in &imap_folders {
             let folder_type = db::folders::guess_folder_type(display_name)
                 .or_else(|| db::folders::guess_folder_type(path));
-            db::folders::upsert_folder(&conn, account_id, display_name, path, folder_type)?;
+            db::folders::upsert_folder(&conn, account_id, display_name, path, folder_type, None)?;
         }
     }
 

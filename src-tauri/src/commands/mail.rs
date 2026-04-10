@@ -38,9 +38,10 @@ pub async fn list_folders(
 ) -> Result<Vec<db::folders::Folder>> {
     log::debug!("Listing folders for account {}", account_id);
     let conn = state.db.lock().await;
-    let folders = db::folders::list_folders(&conn, &account_id)?;
-    log::debug!("Found {} folders for account {}", folders.len(), account_id);
-    Ok(folders)
+    let flat_folders = db::folders::list_folders(&conn, &account_id)?;
+    log::debug!("Found {} folders for account {}", flat_folders.len(), account_id);
+    let tree = db::folders::build_folder_tree(flat_folders);
+    Ok(tree)
 }
 
 #[tauri::command]

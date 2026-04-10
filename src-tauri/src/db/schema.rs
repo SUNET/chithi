@@ -244,6 +244,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add parent_id column to folders if it doesn't exist (for JMAP hierarchy)
+    let has_parent_id: bool = conn
+        .prepare("SELECT parent_id FROM folders LIMIT 0")
+        .is_ok();
+    if !has_parent_id {
+        log::info!("Migration: adding parent_id column to folders table");
+        conn.execute_batch(
+            "ALTER TABLE folders ADD COLUMN parent_id TEXT;",
+        )?;
+    }
+
     // Populate FTS index for existing messages (one-time migration)
     if !has_migration(conn, "fts5_initial_populate") {
         log::info!("Migration: populating FTS5 index for existing messages");

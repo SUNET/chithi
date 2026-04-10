@@ -12,6 +12,15 @@ export const useFoldersStore = defineStore("folders", () => {
 
   const accountsStore = useAccountsStore();
 
+  function findFolderInTree(folders: Folder[], path: string): Folder | undefined {
+    for (const f of folders) {
+      if (f.path === path) return f;
+      const found = findFolderInTree(f.children, path);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
   async function fetchFolders() {
     const accountId = accountsStore.activeAccountId;
     if (!accountId) {
@@ -26,7 +35,7 @@ export const useFoldersStore = defineStore("folders", () => {
         // If no folder is selected, or the selected folder doesn't exist
         // in this account, default to Inbox.
         const currentValid = activeFolderPath.value &&
-          folders.value.some((f) => f.path === activeFolderPath.value);
+          findFolderInTree(folders.value, activeFolderPath.value);
         if (!currentValid) {
           const inbox = folders.value.find((f) => f.folder_type === "inbox");
           activeFolderPath.value = inbox?.path ?? folders.value[0].path;
