@@ -163,6 +163,47 @@ pub async fn create_contact(
                     Err(e) => log::error!("Graph create contact failed: {}", e),
                 }
             }
+        } else if sync_type == "carddav" {
+            let book_href = {
+                let conn = state.db.lock().await;
+                conn.query_row(
+                    "SELECT remote_id FROM contact_books WHERE id = ?1",
+                    rusqlite::params![c.book_id],
+                    |row| row.get::<_, Option<String>>(0),
+                ).ok().flatten()
+            };
+            if let Some(href) = book_href {
+                let account = {
+                    let conn = state.db.lock().await;
+                    db::accounts::get_account_full(&conn, &account_id)?
+                };
+                match crate::mail::carddav::CardDavClient::connect(
+                    &account.caldav_url, &account.username, &account.password, &account.email,
+                ).await {
+                    Ok(client) => {
+                        let uid = c.uid.as_deref().unwrap_or(&id);
+                        let emails: Vec<crate::mail::carddav::VCardEmail> = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json)
+                            .unwrap_or_default().iter()
+                            .filter_map(|e| Some(crate::mail::carddav::VCardEmail { email: e["email"].as_str()?.to_string(), label: e["label"].as_str().unwrap_or("work").to_string() }))
+                            .collect();
+                        let phones: Vec<crate::mail::carddav::VCardPhone> = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json)
+                            .unwrap_or_default().iter()
+                            .filter_map(|p| Some(crate::mail::carddav::VCardPhone { number: p["number"].as_str()?.to_string(), label: p["label"].as_str().unwrap_or("work").to_string() }))
+                            .collect();
+                        let vcard = crate::mail::carddav::generate_vcard(uid, &c.display_name, &emails, &phones, c.organization.as_deref(), c.title.as_deref(), c.notes.as_deref());
+                        match client.put_contact(&href, uid, &vcard).await {
+                            Ok(etag) => {
+                                let remote_id = format!("{}/{}.vcf", href.trim_end_matches('/'), uid);
+                                let conn = state.db.lock().await;
+                                conn.execute("UPDATE contacts SET remote_id = ?1, etag = ?2, vcard_data = ?3 WHERE id = ?4", rusqlite::params![remote_id, etag, vcard, id]).ok();
+                                log::info!("Created contact on CardDAV: {}", remote_id);
+                            }
+                            Err(e) => log::error!("CardDAV create contact failed: {}", e),
+                        }
+                    }
+                    Err(e) => log::error!("CardDAV connect failed: {}", e),
+                }
+            }
         }
     }
 
@@ -276,6 +317,40 @@ pub async fn update_contact(
                         }
                         Err(e) => log::warn!("JMAP connect failed for contact update: {}", e),
                     }
+                } else if sync_type == "carddav" {
+                    let account = {
+                        let conn = state.db.lock().await;
+                        db::accounts::get_account_full(&conn, &account_id)?
+                    };
+                    match crate::mail::carddav::CardDavClient::connect(
+                        &account.caldav_url, &account.username, &account.password, &account.email,
+                    ).await {
+                        Ok(client) => {
+                            let uid = contact.uid.as_deref().unwrap_or(&contact.id);
+                            let book_href = {
+                                let conn = state.db.lock().await;
+                                conn.query_row("SELECT remote_id FROM contact_books WHERE id = ?1", rusqlite::params![contact.book_id], |row| row.get::<_, Option<String>>(0)).ok().flatten().unwrap_or_default()
+                            };
+                            let emails: Vec<crate::mail::carddav::VCardEmail> = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
+                                .unwrap_or_default().iter()
+                                .filter_map(|e| Some(crate::mail::carddav::VCardEmail { email: e["email"].as_str()?.to_string(), label: e["label"].as_str().unwrap_or("work").to_string() }))
+                                .collect();
+                            let phones: Vec<crate::mail::carddav::VCardPhone> = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json)
+                                .unwrap_or_default().iter()
+                                .filter_map(|p| Some(crate::mail::carddav::VCardPhone { number: p["number"].as_str()?.to_string(), label: p["label"].as_str().unwrap_or("work").to_string() }))
+                                .collect();
+                            let vcard = crate::mail::carddav::generate_vcard(uid, &contact.display_name, &emails, &phones, contact.organization.as_deref(), contact.title.as_deref(), contact.notes.as_deref());
+                            match client.put_contact(&book_href, uid, &vcard).await {
+                                Ok(etag) => {
+                                    let conn = state.db.lock().await;
+                                    conn.execute("UPDATE contacts SET etag = ?1, vcard_data = ?2 WHERE id = ?3", rusqlite::params![etag, vcard, contact.id]).ok();
+                                    log::info!("Updated contact on CardDAV: {}", remote_id);
+                                }
+                                Err(e) => log::warn!("CardDAV update contact failed: {}", e),
+                            }
+                        }
+                        Err(e) => log::warn!("CardDAV connect failed for contact update: {}", e),
+                    }
                 }
             }
             return Ok(());
@@ -342,6 +417,22 @@ pub async fn delete_contact(
                     }
                 }
                 Err(e) => log::warn!("JMAP connect failed for contact delete: {}", e),
+            }
+        } else if sync_type == "carddav" && !remote_id.is_empty() {
+            let account = {
+                let conn = state.db.lock().await;
+                db::accounts::get_account_full(&conn, &account_id)?
+            };
+            match crate::mail::carddav::CardDavClient::connect(
+                &account.caldav_url, &account.username, &account.password, &account.email,
+            ).await {
+                Ok(client) => {
+                    match client.delete_contact(&remote_id).await {
+                        Ok(()) => log::info!("Deleted contact from CardDAV: {}", remote_id),
+                        Err(e) => log::warn!("CardDAV delete contact failed: {}", e),
+                    }
+                }
+                Err(e) => log::warn!("CardDAV connect failed for contact delete: {}", e),
             }
         }
     }
