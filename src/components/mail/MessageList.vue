@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
+import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -88,6 +89,76 @@ function onSelect(messageId: string, event?: MouseEvent) {
     ctrlKey: isCtrl,
     metaKey: false,
   });
+}
+
+// Custom drag-and-drop via mouse events (WebKitGTK doesn't support HTML5 DnD)
+const dragStartPos = ref<{ x: number; y: number } | null>(null);
+const dragSourceId = ref<string | null>(null);
+const dragGhost = ref<HTMLElement | null>(null);
+const DRAG_THRESHOLD = 5; // pixels before drag starts
+
+function onDragMouseDown(event: MouseEvent, messageId: string) {
+  if (event.button !== 0) return;
+  if ((event.target as HTMLElement).closest(".row-checkbox")) return;
+  dragStartPos.value = { x: event.clientX, y: event.clientY };
+  dragSourceId.value = messageId;
+
+  const handleMove = (e: MouseEvent) => {
+    if (!dragStartPos.value || !dragSourceId.value) return;
+
+    const dx = e.clientX - dragStartPos.value.x;
+    const dy = e.clientY - dragStartPos.value.y;
+    if (!isDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
+
+    if (!isDragging.value) {
+      // Select for drag without triggering read/open side effects
+      if (!messagesStore.isSelected(dragSourceId.value)) {
+        messagesStore.selectedIds = [dragSourceId.value];
+      }
+      dragMessageIds.value = messagesStore.resolveSelectedIds();
+      dragSourceAccountId.value = accountsStore.activeAccountId;
+      isDragging.value = true;
+
+      // Ghost badge showing drag count — positioned away from cursor
+      // so it doesn't intercept mouse events on drop targets
+      const ghost = document.createElement("div");
+      ghost.textContent = `${dragMessageIds.value.length} message(s)`;
+      ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
+      document.body.appendChild(ghost);
+      dragGhost.value = ghost;
+      // Test: also change body cursor
+      document.body.style.cursor = "grabbing";
+      document.body.classList.add("dragging-messages");
+    }
+
+    if (dragGhost.value) {
+      dragGhost.value.style.left = e.clientX + 12 + "px";
+      dragGhost.value.style.top = e.clientY + 12 + "px";
+    }
+  };
+
+  const handleUp = () => {
+    document.body.style.cursor = "";
+    document.body.classList.remove("dragging-messages");
+    if (isDragging.value) {
+      setTimeout(() => {
+        isDragging.value = false;
+        dragMessageIds.value = [];
+        dragSourceAccountId.value = null;
+        if (dragGhost.value) {
+          dragGhost.value.remove();
+          dragGhost.value = null;
+        }
+      }, 0);
+    }
+    dragStartPos.value = null;
+    dragSourceId.value = null;
+    document.removeEventListener("mousemove", handleMove);
+    document.removeEventListener("mouseup", handleUp);
+  };
+
+  document.addEventListener("mousemove", handleMove);
+  document.addEventListener("mouseup", handleUp);
 }
 
 function onOpen(messageId: string) {
@@ -366,6 +437,7 @@ const displayedCount = () => {
         <div
           @click="onThreadSelect(thread, $event)"
           @contextmenu.prevent="onRowRightClick($event,thread.message_ids[0])"
+          @mousedown="onDragMouseDown($event, thread.message_ids[0])"
         >
           <ThreadRow
             :thread="thread"
@@ -385,6 +457,7 @@ const displayedCount = () => {
             class="thread-child"
             @click.stop="onChildSelect(msg.id)"
             @contextmenu.prevent.stop="onRowRightClick($event, msg.id)"
+            @mousedown="onDragMouseDown($event, msg.id)"
           >
             <MessageListItem
               :message="msg"
@@ -406,6 +479,7 @@ const displayedCount = () => {
         :key="msg.id"
         @click="onSelect(msg.id, $event)"
         @contextmenu.prevent="onRowRightClick($event,msg.id)"
+        @mousedown="onDragMouseDown($event, msg.id)"
       >
         <MessageListItem
           :message="msg"

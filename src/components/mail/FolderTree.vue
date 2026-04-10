@@ -5,6 +5,7 @@ import { useAccountsStore } from "@/stores/accounts";
 import { useMessagesStore } from "@/stores/messages";
 import type { Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
@@ -14,6 +15,7 @@ const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
 const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
+const dropTarget = ref<string | null>(null);
 
 // Folder expand/collapse state, persisted per account in localStorage
 const collapsedFolders = ref<Record<string, string[]>>(loadCollapsedFolders());
@@ -259,6 +261,49 @@ async function createNewFolder() {
   }
 }
 
+let dragExpandTimer: ReturnType<typeof setTimeout> | null = null;
+
+function onFolderMouseEnter(accountId: string, folderPath: string) {
+  if (!isDragging.value) return;
+  if (dragSourceAccountId.value !== accountId) return;
+  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+  dropTarget.value = `${accountId}:${folderPath}`;
+  if (isFolderCollapsed(accountId, folderPath)) {
+    dragExpandTimer = setTimeout(() => {
+      toggleFolderCollapse(accountId, folderPath);
+    }, 600);
+  }
+}
+
+function onFolderMouseLeave(accountId: string, folderPath: string) {
+  if (dropTarget.value === `${accountId}:${folderPath}`) {
+    dropTarget.value = null;
+  }
+  if (dragExpandTimer) {
+    clearTimeout(dragExpandTimer);
+    dragExpandTimer = null;
+  }
+}
+
+async function onFolderMouseUp(accountId: string, folderPath: string) {
+  if (!isDragging.value || dragMessageIds.value.length === 0) return;
+  dropTarget.value = null;
+  if (dragSourceAccountId.value !== accountId) return;
+  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+
+  const messageIds = [...dragMessageIds.value];
+  try {
+    await api.moveMessages(accountId, messageIds, folderPath);
+    messagesStore.clearSelection();
+    messagesStore.activeMessage = null;
+    messagesStore.activeMessageId = null;
+    await messagesStore.fetchMessages();
+    await foldersStore.fetchAllAccountFolders();
+  } catch (e) {
+    console.error("Drag-and-drop move failed:", e);
+  }
+}
+
 async function markFolderRead() {
   const folder = contextMenu.value?.folder;
   const accountId = findAccountForFolder(folder);
@@ -322,10 +367,14 @@ async function markFolderRead() {
           :class="{
             active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === item.folder.path,
             syncing: syncing === item.folder.path,
+            'drop-target': dropTarget === `${account.id}:${item.folder.path}`,
           }"
           :style="{ paddingLeft: (12 + item.depth * 16) + 'px' }"
           @click.stop="selectFolder(account.id, item.folder.path)"
           @contextmenu="onFolderContextMenu($event, item.folder)"
+          @mouseenter="onFolderMouseEnter(account.id, item.folder.path)"
+          @mouseleave="onFolderMouseLeave(account.id, item.folder.path)"
+          @mouseup="onFolderMouseUp(account.id, item.folder.path)"
         >
           <span
             v-if="item.hasChildren"
@@ -563,6 +612,12 @@ async function markFolderRead() {
 
 .folder-item.syncing {
   opacity: 0.6;
+}
+
+.folder-item.drop-target {
+  background: var(--color-accent-light);
+  outline: 1.5px solid var(--color-accent);
+  outline-offset: -1.5px;
 }
 
 .folder-toggle {
