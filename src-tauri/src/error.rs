@@ -33,6 +33,12 @@ pub enum Error {
     Other(String),
 }
 
+// NOTE: The Serialize impl below sends the full error message to the frontend.
+// For a desktop app where the user is the data owner this is acceptable — the
+// user already has full access to logs and the local database.  In a
+// client-server context you would want to strip file paths and internal details
+// here and only expose user-friendly messages, while keeping the full error in
+// server-side logs.
 impl Serialize for Error {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where

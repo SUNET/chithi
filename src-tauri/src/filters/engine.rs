@@ -1,4 +1,4 @@
-use regex::Regex;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::rules::{
@@ -115,10 +115,13 @@ fn eval_string_op(op: &ConditionOp, haystack: &str, needle: &str) -> bool {
         ConditionOp::NotContains => !h.contains(&n),
         ConditionOp::Equals => h == n,
         ConditionOp::NotEquals => h != n,
-        ConditionOp::MatchesRegex => match Regex::new(needle) {
+        ConditionOp::MatchesRegex => match RegexBuilder::new(needle)
+            .size_limit(1_000_000)
+            .build()
+        {
             Ok(re) => re.is_match(haystack),
             Err(e) => {
-                log::warn!("Invalid regex '{}': {}", needle, e);
+                log::warn!("Invalid or too complex regex '{}': {}", needle, e);
                 false
             }
         },

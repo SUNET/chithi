@@ -165,15 +165,40 @@ pub struct CallbackResult {
 /// Listen on the given listener for the OAuth2 redirect callback.
 /// The listener is passed in from `get_auth_url` to prevent TOCTOU port hijacking.
 /// Returns the authorization code and the state parameter (if present).
+/// Times out after 5 minutes if no callback is received.
 pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
+    use std::time::{Duration, Instant};
+
     let port = listener.local_addr()
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
 
-    log::info!("OAuth2: waiting for callback on port {}", port);
+    log::info!("OAuth2: waiting for callback on port {} (5 min timeout)", port);
 
-    let (mut stream, _) = listener.accept()
-        .map_err(|e| Error::Other(format!("Failed to accept connection: {}", e)))?;
+    let deadline = Instant::now() + Duration::from_secs(300); // 5 minutes
+    listener.set_nonblocking(true)
+        .map_err(|e| Error::Other(format!("Failed to set non-blocking: {}", e)))?;
+
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(conn) => break conn,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Other(
+                        "OAuth callback timed out after 5 minutes".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "Failed to accept connection: {}",
+                    e
+                )));
+            }
+        }
+    };
 
     let mut reader = BufReader::new(stream.try_clone()
         .map_err(|e| Error::Other(format!("Stream clone failed: {}", e)))?);

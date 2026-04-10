@@ -595,16 +595,37 @@ pub async fn save_attachment(
         Error::Other("Invalid save path".to_string())
     })?;
 
-    // Refuse to follow symlinks — prevents clobbering arbitrary files
-    if dest_path.is_symlink() {
-        return Err(Error::Other(
-            "Refusing to write to a symlink target".to_string(),
-        ));
+    // Write atomically, refusing to follow symlinks to prevent TOCTOU attacks.
+    // On Unix, O_NOFOLLOW rejects symlinks at the kernel level.
+    // On other platforms, fall back to a best-effort symlink check.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dest_path)
+            .map_err(|e| {
+                Error::Other(format!("Failed to open file for writing (symlink or permission error): {}", e))
+            })?;
+        file.write_all(&contents).map_err(|e| {
+            Error::Other(format!("Failed to write attachment: {}", e))
+        })?;
     }
-
-    std::fs::write(dest_path, &contents).map_err(|e| {
-        Error::Other(format!("Failed to write attachment: {}", e))
-    })?;
+    #[cfg(not(unix))]
+    {
+        if dest_path.is_symlink() {
+            return Err(Error::Other(
+                "Refusing to write to a symlink target".to_string(),
+            ));
+        }
+        std::fs::write(dest_path, &contents).map_err(|e| {
+            Error::Other(format!("Failed to write attachment: {}", e))
+        })?;
+    }
 
     log::info!("Attachment saved to {}", dest_path.display());
     Ok(())

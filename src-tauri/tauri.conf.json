@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/niceda/releases/devtools/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "Chithi",
   "version": "0.1.0",
   "identifier": "in.kushaldas.chithi",

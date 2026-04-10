@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -41,6 +41,13 @@ urlencoding = "2"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+devtools = ["tauri/devtools"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
