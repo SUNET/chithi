@@ -658,7 +658,9 @@ pub async fn save_attachment(
         }
 
         if let Ok(dir) = std::fs::File::open(dest_dir) {
-            let _ = dir.sync_all();
+            if let Err(e) = dir.sync_all() {
+                log::warn!("Failed to fsync parent directory after atomic rename: {}", e);
+            }
         }
     }
     #[cfg(not(unix))]

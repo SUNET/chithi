@@ -159,6 +159,10 @@ function getEmailHtml(): string {
 function pushHtmlToIframes() {
   const iframes = document.querySelectorAll<HTMLIFrameElement>('.email-sandbox');
   for (const iframe of iframes) {
+    // '*' is intentional: srcdoc iframes have a null/opaque origin so a specific
+    // targetOrigin would never match.  The message payload is non-sensitive (it is
+    // the email HTML that is already visible) and inbound messages are verified by
+    // checking event.source against our known iframe elements.
     iframe.contentWindow?.postMessage({ type: 'set-html', html: getEmailHtml() }, '*');
   }
 }
@@ -183,7 +187,8 @@ function handleIframeMessage(event: MessageEvent) {
   if (!fromOurIframe) return;
 
   if (event.data.type === 'iframe-ready') {
-    // The iframe is ready to receive HTML content — post it via message
+    // The iframe is ready to receive HTML content — post it via message.
+    // '*' is required because srcdoc iframes have a null/opaque origin.
     for (const iframe of iframes) {
       if (event.source === iframe.contentWindow) {
         iframe.contentWindow!.postMessage({ type: 'set-html', html: getEmailHtml() }, '*');

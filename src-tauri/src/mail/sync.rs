@@ -608,7 +608,7 @@ pub(crate) fn sanitize_folder_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(".");
 
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+    if sanitized.is_empty() {
         "_".to_string()
     } else {
         sanitized

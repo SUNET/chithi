@@ -271,9 +271,11 @@ fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::Attachme
         // Warn about unusual paths (not under typical user directories)
         let path_str = att.path.as_str();
         let is_typical = if cfg!(windows) {
-            path_str.starts_with("C:\\Users\\")
-                || path_str.starts_with("C:\\Temp\\")
-                || path_str.starts_with("C:\\Windows\\Temp\\")
+            // Case-insensitive comparison; the system drive may not always be C:
+            let lower = path_str.to_lowercase();
+            lower.contains("\\users\\")
+                || lower.contains("\\temp\\")
+                || lower.contains("\\appdata\\")
         } else {
             path_str.starts_with("/home/")
                 || path_str.starts_with("/tmp/")
