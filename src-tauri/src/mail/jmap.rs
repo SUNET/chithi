@@ -1150,18 +1150,20 @@ impl JmapConnection {
         Ok(None)
     }
     /// Create a new mailbox on the JMAP server.
-    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str) -> Result<String> {
-        log::info!("JMAP creating mailbox: {}", name);
+    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str, parent_id: Option<&str>) -> Result<String> {
+        log::info!("JMAP creating mailbox: {} (parent={:?})", name, parent_id);
         let create_id = "new-folder";
+        let mut mailbox = serde_json::json!({ "name": name });
+        if let Some(pid) = parent_id {
+            mailbox["parentId"] = serde_json::json!(pid);
+        }
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             "methodCalls": [
                 ["Mailbox/set", {
                     "accountId": self.account_id,
                     "create": {
-                        create_id: {
-                            "name": name
-                        }
+                        create_id: mailbox
                     }
                 }, "c1"]
             ]

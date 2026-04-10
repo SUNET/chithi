@@ -467,7 +467,14 @@ pub async fn create_folder(
             password: account.password.clone(),
         };
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.create_mailbox(&jmap_config, &folder_path).await?;
+        // For JMAP, folder_path is "parentId/name" (built by the frontend).
+        // Split to get the parent mailbox ID and the new folder name.
+        let (parent_id, mailbox_name) = if let Some((parent, name)) = folder_path.rsplit_once('/') {
+            (if parent.is_empty() { None } else { Some(parent) }, name)
+        } else {
+            (None, folder_path.as_str())
+        };
+        conn_jmap.create_mailbox(&jmap_config, mailbox_name, parent_id).await?;
     } else {
         // IMAP: CREATE
         let imap_config = ImapConfig {
