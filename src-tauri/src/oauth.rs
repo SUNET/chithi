@@ -411,13 +411,35 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
         .ok_or_else(|| Error::Other("OIDC: no token_endpoint in discovery".into()))?
         .to_string();
 
+    if !token_endpoint.starts_with("https://") {
+        return Err(Error::Other(format!(
+            "OIDC: token_endpoint must use HTTPS, got: {}", token_endpoint
+        )));
+    }
+
     let device_authorization_endpoint = config["device_authorization_endpoint"]
         .as_str()
         .map(|s| s.to_string());
 
+    if let Some(ref ep) = device_authorization_endpoint {
+        if !ep.starts_with("https://") {
+            return Err(Error::Other(format!(
+                "OIDC: device_authorization_endpoint must use HTTPS, got: {}", ep
+            )));
+        }
+    }
+
     let registration_endpoint = config["registration_endpoint"]
         .as_str()
         .map(|s| s.to_string());
+
+    if let Some(ref ep) = registration_endpoint {
+        if !ep.starts_with("https://") {
+            return Err(Error::Other(format!(
+                "OIDC: registration_endpoint must use HTTPS, got: {}", ep
+            )));
+        }
+    }
 
     log::info!("OIDC: discovered token={}, device_auth={:?}, registration={:?}",
         token_endpoint, device_authorization_endpoint, registration_endpoint);
