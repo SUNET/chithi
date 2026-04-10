@@ -1183,6 +1183,35 @@ impl JmapConnection {
         Ok(created_id)
     }
 
+    /// Delete a mailbox on the JMAP server.
+    /// `on_destroy_remove_messages` controls whether messages in the mailbox are deleted too.
+    pub async fn destroy_mailbox(&self, config: &JmapConfig, mailbox_id: &str, remove_messages: bool) -> Result<()> {
+        log::info!("JMAP destroying mailbox: {} (remove_messages={})", mailbox_id, remove_messages);
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Mailbox/set", {
+                    "accountId": self.account_id,
+                    "onDestroyRemoveMessages": remove_messages,
+                    "destroy": [mailbox_id]
+                }, "d1"]
+            ]
+        });
+        let resp = self.api_request(&request, config).await?;
+        let destroyed = resp["methodResponses"][0][1]["destroyed"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v.as_str() == Some(mailbox_id)))
+            .unwrap_or(false);
+        if !destroyed {
+            let err = resp["methodResponses"][0][1]["notDestroyed"][mailbox_id]["description"]
+                .as_str()
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!("JMAP Mailbox/set destroy failed: {}", err)));
+        }
+        log::info!("JMAP mailbox destroyed: {}", mailbox_id);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Contacts (JSContact / JMAP Contacts)
     // -----------------------------------------------------------------------

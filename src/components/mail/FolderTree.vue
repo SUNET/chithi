@@ -82,6 +82,7 @@ const newFolderName = ref("");
 const newFolderParent = ref("");
 const newFolderSaving = ref(false);
 const newFolderError = ref<string | null>(null);
+const deletingFolder = ref<{ accountId: string; folder: Folder } | null>(null);
 
 // Predefined avatar colors for accounts
 const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
@@ -328,6 +329,31 @@ async function markFolderRead() {
     console.error("Mark folder read failed:", e);
   }
 }
+
+function confirmDeleteFolder() {
+  const folder = contextMenu.value?.folder;
+  const accountId = findAccountForFolder(folder);
+  if (!accountId || !folder) return;
+  closeContextMenu();
+  deletingFolder.value = { accountId, folder };
+}
+
+async function doDeleteFolder() {
+  if (!deletingFolder.value) return;
+  const { accountId, folder } = deletingFolder.value;
+  deletingFolder.value = null;
+
+  try {
+    await api.deleteFolder(accountId, folder.path);
+    await foldersStore.fetchAllAccountFolders();
+    // If the deleted folder was active, switch to inbox
+    if (foldersStore.activeFolderPath === folder.path) {
+      await foldersStore.fetchFolders();
+    }
+  } catch (e) {
+    console.error("Delete folder failed:", e);
+  }
+}
 </script>
 
 <template>
@@ -446,6 +472,8 @@ async function markFolderRead() {
         <div class="ctx-separator"></div>
         <button class="ctx-item" @click="markFolderRead">Mark Folder Read</button>
         <div class="ctx-separator"></div>
+        <button class="ctx-item danger" @click="confirmDeleteFolder">Delete Folder</button>
+        <div class="ctx-separator"></div>
         <button class="ctx-item disabled">Properties</button>
         <button class="ctx-item" @click="syncThisFolder">
           Sync "{{ contextMenu.folder.name }}"
@@ -498,6 +526,27 @@ async function markFolderRead() {
             <button class="nf-btn-create" :disabled="newFolderSaving" @click="createNewFolder">
               {{ newFolderSaving ? "Creating..." : "Create Folder" }}
             </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Delete Folder Confirmation -->
+    <Teleport to="body">
+      <div v-if="deletingFolder" class="modal-overlay" @click.self="deletingFolder = null">
+        <div class="new-folder-modal">
+          <div class="nf-body" style="padding: 20px">
+            <h3 style="margin: 0 0 8px">Delete Folder</h3>
+            <p style="font-size: 13px; color: var(--color-text-secondary); line-height: 1.5; margin: 0 0 4px">
+              Are you sure you want to delete "{{ deletingFolder.folder.name }}"?
+            </p>
+            <p style="font-size: 12px; color: var(--color-text-muted); margin: 0">
+              All messages in this folder will be permanently deleted.
+            </p>
+          </div>
+          <div class="nf-footer">
+            <button class="nf-btn-cancel" @click="deletingFolder = null">Cancel</button>
+            <button class="nf-btn-create" style="background: var(--color-danger, #dc2626)" @click="doDeleteFolder">Delete</button>
           </div>
         </div>
       </div>
@@ -717,6 +766,14 @@ async function markFolderRead() {
 .folder-context-menu .ctx-item.disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+.folder-context-menu .ctx-item.danger {
+  color: var(--color-danger, #dc2626);
+}
+
+.folder-context-menu .ctx-item.danger:hover {
+  background: rgba(220, 53, 69, 0.08);
 }
 
 .folder-context-menu .ctx-separator {

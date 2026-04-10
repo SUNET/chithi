@@ -144,6 +144,20 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
         .collect()
 }
 
+pub fn delete_folder(conn: &Connection, account_id: &str, path: &str) -> Result<()> {
+    // Delete messages in this folder first (foreign key)
+    conn.execute(
+        "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+        params![account_id, path],
+    )?;
+    conn.execute(
+        "DELETE FROM folders WHERE account_id = ?1 AND path = ?2",
+        params![account_id, path],
+    )?;
+    log::info!("Deleted folder '{}' from local DB for account {}", path, account_id);
+    Ok(())
+}
+
 pub fn update_folder_counts(
     conn: &Connection,
     account_id: &str,

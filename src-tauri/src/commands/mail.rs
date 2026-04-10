@@ -531,6 +531,74 @@ pub async fn create_folder(
     Ok(())
 }
 
+/// Delete a folder on the mail server and remove it from local DB.
+#[tauri::command]
+pub async fn delete_folder(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+) -> Result<()> {
+    log::info!("Deleting folder '{}' for account {}", folder_path, account_id);
+
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.mail_protocol == "jmap" {
+        // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
+        let jmap_config = JmapConfig {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+        };
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await?;
+    } else {
+        // IMAP: DELETE
+        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password: imap_password,
+            use_tls: account.use_tls,
+            use_xoauth2: imap_xoauth2,
+        };
+        let folder_for_imap = folder_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
+            conn.delete_folder(&folder_for_imap)?;
+            conn.logout();
+            Ok::<(), crate::error::Error>(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Delete folder panicked: {}", e)))??;
+    }
+
+    // Remove from local DB
+    {
+        let conn = state.db.lock().await;
+        db::folders::delete_folder(&conn, &account_id, &folder_path)?;
+    }
+
+    log::info!("Folder '{}' deleted", folder_path);
+    Ok(())
+}
+
 /// Extract an attachment from a message and save it.
 /// The save dialog is opened by the backend — the renderer never supplies a path.
 #[tauri::command]
