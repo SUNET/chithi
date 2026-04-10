@@ -595,25 +595,71 @@ pub async fn save_attachment(
         Error::Other("Invalid save path".to_string())
     })?;
 
-    // Write atomically, refusing to follow symlinks to prevent TOCTOU attacks.
-    // On Unix, O_NOFOLLOW rejects symlinks at the kernel level.
-    // On other platforms, fall back to a best-effort symlink check.
+    // Write atomically by saving to a temporary file in the destination directory,
+    // fsyncing it, and then renaming it into place. Refuse symlink destinations.
+    let dest_dir = dest_path.parent().ok_or_else(|| {
+        Error::Other("Save path must have a parent directory".to_string())
+    })?;
+    let dest_name = dest_path.file_name().ok_or_else(|| {
+        Error::Other("Save path must include a file name".to_string())
+    })?;
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Other(format!("Failed to get current time: {}", e)))?
+            .as_nanos()
+    );
+    let temp_path = dest_dir.join(format!(
+        ".{}.{}.tmp",
+        dest_name.to_string_lossy(),
+        unique_suffix
+    ));
+
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(dest_path)
+            .open(&temp_path)
             .map_err(|e| {
-                Error::Other(format!("Failed to open file for writing (symlink or permission error): {}", e))
+                Error::Other(format!(
+                    "Failed to create temporary file for atomic write: {}",
+                    e
+                ))
             })?;
-        file.write_all(&contents).map_err(|e| {
-            Error::Other(format!("Failed to write attachment: {}", e))
-        })?;
+
+        if let Err(e) = file.write_all(&contents) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+        }
+
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!(
+                "Failed to flush attachment to disk: {}",
+                e
+            )));
+        }
+
+        drop(file);
+
+        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!(
+                "Failed to atomically replace destination file: {}",
+                e
+            )));
+        }
+
+        if let Ok(dir) = std::fs::File::open(dest_dir) {
+            let _ = dir.sync_all();
+        }
     }
     #[cfg(not(unix))]
     {
@@ -622,9 +668,41 @@ pub async fn save_attachment(
                 "Refusing to write to a symlink target".to_string(),
             ));
         }
-        std::fs::write(dest_path, &contents).map_err(|e| {
-            Error::Other(format!("Failed to write attachment: {}", e))
-        })?;
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| {
+                Error::Other(format!(
+                    "Failed to create temporary file for atomic write: {}",
+                    e
+                ))
+            })?;
+
+        if let Err(e) = file.write_all(&contents) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+        }
+
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!(
+                "Failed to flush attachment to disk: {}",
+                e
+            )));
+        }
+
+        drop(file);
+
+        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!(
+                "Failed to atomically replace destination file: {}",
+                e
+            )));
+        }
     }
 
     log::info!("Attachment saved to {}", dest_path.display());

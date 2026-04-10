@@ -1,16 +1,22 @@
 use std::net::TcpListener;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::State;
 
 use crate::error::{Error, Result};
 use crate::oauth;
 use crate::state::AppState;
 
+/// Maximum lifetime of an OAuth session before it is evicted as abandoned.
+const SESSION_TTL: Duration = Duration::from_secs(300); // 5 minutes (matches callback timeout)
+
 /// Stored OAuth session data between start and complete phases.
 struct OAuthSession {
     verifier: Option<String>,
     state: String,
     listener: TcpListener,
+    /// Timestamp at which this session was created, used to evict abandoned sessions.
+    created_at: Instant,
 }
 
 /// Temporary storage for OAuth sessions (needed between start and complete).
@@ -19,6 +25,10 @@ static OAUTH_SESSIONS: Mutex<Option<std::collections::HashMap<u16, OAuthSession>
 fn store_session(port: u16, session: OAuthSession) {
     let mut guard = OAUTH_SESSIONS.lock().unwrap();
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    // Evict any sessions that have exceeded the TTL to prevent resource leaks
+    // from flows the user abandoned without completing.
+    let now = Instant::now();
+    map.retain(|_, s| now.duration_since(s.created_at) < SESSION_TTL);
     map.insert(port, session);
 }
 
@@ -53,6 +63,7 @@ pub async fn oauth_start(
         verifier: code_verifier,
         state,
         listener,
+        created_at: Instant::now(),
     });
 
     log::info!("OAuth2: started {} flow on port {}", provider, port);
@@ -90,7 +101,9 @@ pub async fn oauth_complete(
     .await
     .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
-    // Verify the state parameter to prevent CSRF attacks
+    // Verify the state parameter to prevent CSRF attacks.
+    // A missing state is treated as an error: get_auth_url always includes state,
+    // so its absence indicates either a parsing issue or a non-compliant response.
     match &result.state {
         Some(returned_state) if returned_state == &expected_state => {}
         Some(_) => {
@@ -99,7 +112,9 @@ pub async fn oauth_complete(
             ));
         }
         None => {
-            log::warn!("OAuth2: no state parameter in callback (provider may not support it)");
+            return Err(Error::Other(
+                "OAuth2 callback missing required state parameter".into(),
+            ));
         }
     }
 

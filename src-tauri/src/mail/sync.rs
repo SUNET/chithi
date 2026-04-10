@@ -545,8 +545,9 @@ pub fn fetch_and_store_body(
     let canonical_maildir = std::fs::canonicalize(&maildir_base)
         .map_err(|e| Error::Other(format!("Failed to resolve maildir path: {}", e)))?;
     if !canonical_maildir.starts_with(&canonical_data_dir) {
-        // Clean up the created dirs before returning error
-        let _ = std::fs::remove_dir_all(&maildir_base);
+        // Use the canonicalized path for cleanup to avoid following any remaining
+        // ".." components that may still be present in maildir_base.
+        let _ = std::fs::remove_dir_all(&canonical_maildir);
         return Err(Error::Other(format!(
             "Path traversal detected: maildir path '{}' escapes data directory",
             maildir_base.display()
@@ -581,14 +582,37 @@ pub(crate) fn create_maildir_dirs(base: &Path) -> Result<()> {
 }
 
 pub(crate) fn sanitize_folder_name(name: &str) -> String {
-    let sanitized = name.replace(['/', '\\'], ".")
-        .replace('\0', "");
-    // Filter out ".." path traversal components
-    sanitized
-        .split('.')
-        .filter(|component| *component != "..")
+    // Normalise path separators so Path::components() can parse them.
+    let normalized = name.replace('\\', "/").replace('\0', "");
+
+    // Use Path::components() to strip any CurDir ("."), ParentDir (".."),
+    // RootDir ("/"), and Prefix components, keeping only Normal segments.
+    // Dots inside each Normal segment are replaced with underscores so that
+    // the joined result (using "." as separator) has unambiguous components.
+    let sanitized = Path::new(&normalized)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy().replace('.', "_");
+                if part.is_empty() {
+                    None
+                } else {
+                    Some(part)
+                }
+            }
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => None,
+        })
         .collect::<Vec<_>>()
-        .join(".")
+        .join(".");
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 pub(crate) fn flags_to_maildir_suffix(flags: &[String]) -> String {

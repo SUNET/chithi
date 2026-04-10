@@ -80,7 +80,7 @@ function generateNonce(): string {
 // The iframe has no access to window.__TAURI__ or any IPC commands.
 // HTML content is delivered via postMessage to avoid template literal injection.
 // CSP uses a nonce instead of 'unsafe-inline' for script-src.
-function iframeSrcdoc(): string {
+function buildSrcdoc(): string {
   const nonce = generateNonce();
   // The iframe loads with an empty body. A nonce-gated script listens for
   // a postMessage containing the sanitized HTML and inserts it into the body.
@@ -136,10 +136,36 @@ function iframeSrcdoc(): string {
 </html>`;
 }
 
+// Memoized srcdoc: regenerated only when the active message changes, not on every render.
+// This prevents the iframe from reloading (and losing scroll/selection) during unrelated
+// reactive updates.
+const currentSrcdoc = ref(buildSrcdoc());
+watch(
+  () => messagesStore.activeMessageId,
+  () => {
+    currentSrcdoc.value = buildSrcdoc();
+  },
+);
+
 // Post the HTML content to the iframe after it signals readiness.
 function getEmailHtml(): string {
   return imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
 }
+
+// Re-post updated HTML to all active sandbox iframes when the content changes
+// (e.g., after the user clicks "Load images").  Without this the iframe only
+// receives HTML in response to its initial 'iframe-ready' message and would
+// never reflect the image-loaded version unless it happened to reload.
+function pushHtmlToIframes() {
+  const iframes = document.querySelectorAll<HTMLIFrameElement>('.email-sandbox');
+  for (const iframe of iframes) {
+    iframe.contentWindow?.postMessage({ type: 'set-html', html: getEmailHtml() }, '*');
+  }
+}
+
+watch(imagesHtml, () => {
+  pushHtmlToIframes();
+});
 
 // Listen for postMessage from the sandboxed iframe.
 // Verify event.source matches our iframe's contentWindow to prevent spoofing.
@@ -652,7 +678,7 @@ async function markSpam() {
           </div>
           <iframe
             class="email-sandbox"
-            :srcdoc="iframeSrcdoc()"
+            :srcdoc="currentSrcdoc"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
           />
@@ -674,7 +700,7 @@ async function markSpam() {
           </div>
           <iframe
             class="email-sandbox"
-            :srcdoc="iframeSrcdoc()"
+            :srcdoc="currentSrcdoc"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
           />

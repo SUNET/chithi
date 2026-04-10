@@ -208,6 +208,7 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         .map_err(|e| Error::Other(format!("Failed to read request: {}", e)))?;
 
     // Parse query parameters from: GET /?code=xxx&state=yyy&scope=zzz HTTP/1.1
+    // Values are percent-decoded so that encoded authorization codes are forwarded correctly.
     let query_params: HashMap<String, String> = request_line
         .split_whitespace()
         .nth(1) // The path
@@ -218,7 +219,10 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
                     let mut parts = param.splitn(2, '=');
                     let key = parts.next()?;
                     let value = parts.next().unwrap_or("");
-                    Some((key.to_string(), value.to_string()))
+                    let decoded_value = urlencoding::decode(value)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| value.to_string());
+                    Some((key.to_string(), decoded_value))
                 })
                 .collect()
         })

@@ -207,6 +207,7 @@ fn build_filter_clauses(filter: &QuickFilter, account_id: &str, use_fts: bool) -
         } else {
             // LIKE fallback: slower but tolerant of all characters
             let like_escaped = text
+                .replace('\\', "\\\\") // must come first so later replacements don't double-escape
                 .replace('\'', "''")
                 .replace('%', "\\%")
                 .replace('_', "\\_");
