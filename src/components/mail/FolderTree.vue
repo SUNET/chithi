@@ -11,7 +11,7 @@ const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
 const messagesStore = useMessagesStore();
 
-const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
+const contextMenu = ref<{ x: number; y: number; folder: Folder; accountId: string } | null>(null);
 const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
@@ -141,9 +141,9 @@ watch(
   },
 );
 
-function onFolderContextMenu(event: MouseEvent, folder: Folder) {
+function onFolderContextMenu(event: MouseEvent, folder: Folder, accountId: string) {
   event.preventDefault();
-  contextMenu.value = { x: event.clientX, y: event.clientY, folder };
+  contextMenu.value = { x: event.clientX, y: event.clientY, folder, accountId };
 }
 
 function closeContextMenu() {
@@ -331,9 +331,8 @@ async function markFolderRead() {
 }
 
 function confirmDeleteFolder() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
-  if (!accountId || !folder) return;
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   closeContextMenu();
   deletingFolder.value = { accountId, folder };
 }
@@ -346,9 +345,15 @@ async function doDeleteFolder() {
   try {
     await api.deleteFolder(accountId, folder.path);
     await foldersStore.fetchAllAccountFolders();
-    // If the deleted folder was active, switch to inbox
-    if (foldersStore.activeFolderPath === folder.path) {
-      await foldersStore.fetchFolders();
+    await foldersStore.fetchFolders();
+    // If the deleted folder was active on this account, switch to inbox
+    if (
+      accountsStore.activeAccountId === accountId &&
+      foldersStore.activeFolderPath === folder.path
+    ) {
+      const folders = foldersStore.getAccountFolders(accountId);
+      const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
+      foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
     }
   } catch (e) {
     console.error("Delete folder failed:", e);
@@ -397,7 +402,7 @@ async function doDeleteFolder() {
           }"
           :style="{ paddingLeft: (12 + item.depth * 16) + 'px' }"
           @click.stop="selectFolder(account.id, item.folder.path)"
-          @contextmenu="onFolderContextMenu($event, item.folder)"
+          @contextmenu="onFolderContextMenu($event, item.folder, account.id)"
           @mouseenter="onFolderMouseEnter(account.id, item.folder.path)"
           @mouseleave="onFolderMouseLeave(account.id, item.folder.path)"
           @mouseup="onFolderMouseUp(account.id, item.folder.path)"

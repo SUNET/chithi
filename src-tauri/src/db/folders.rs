@@ -145,7 +145,7 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
 }
 
 pub fn delete_folder(conn: &Connection, account_id: &str, path: &str) -> Result<()> {
-    // Delete messages in this folder first (foreign key)
+    // Remove orphaned messages in this folder to keep the local DB consistent
     conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
         params![account_id, path],
