@@ -42,7 +42,7 @@ pub enum PushEvent {
 /// This function runs indefinitely in an async task — cancel it via
 /// the `stop` flag or by aborting the task.
 pub async fn run_push_loop(
-    config: JmapConfig,
+    mut config: JmapConfig,
     account_id: String,
     stop: Arc<AtomicBool>,
     on_event: Arc<dyn Fn(PushEvent) + Send + Sync>,
@@ -53,6 +53,20 @@ pub async fn run_push_loop(
     let mut was_disconnected = false;
 
     while !stop.load(Ordering::Relaxed) {
+        // For OIDC accounts, refresh the access token before each connect attempt
+        // so reconnects after token expiry don't keep using a stale token.
+        if config.access_token.is_some() {
+            match crate::commands::sync_cmd::refresh_jmap_oidc_token(
+                &account_id,
+                &config.oidc_token_endpoint,
+                &config.oidc_client_id,
+            ).await {
+                Ok(Some(new_token)) => config.access_token = Some(new_token),
+                Ok(None) => {}
+                Err(e) => log::warn!("JMAP push: token refresh failed for {}: {}", account_id, e),
+            }
+        }
+
         // Connect and get the EventSource URL
         let (event_source_url, http_auth) = match connect_and_get_url(&config).await {
             Ok(v) => v,

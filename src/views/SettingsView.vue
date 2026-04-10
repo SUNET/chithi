@@ -17,7 +17,6 @@ const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
 const oauthStatus = ref<string | null>(null);
 const oauthInProgress = ref(false);
-const jmapOidcTokenEndpoint = ref("");
 
 const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
 
@@ -286,6 +285,9 @@ async function startJmapOidc() {
     // Show the user code and open browser to verification URL
     oidcUserCode.value = result.user_code;
     const openUrl = result.verification_uri_complete ?? result.verification_uri;
+    if (!openUrl.startsWith("https://") && !openUrl.startsWith("http://")) {
+      throw new Error(`Unexpected verification URL scheme: ${openUrl}`);
+    }
     await shellOpen(openUrl);
 
     // Poll until user completes authorization (this blocks)
@@ -298,8 +300,11 @@ async function startJmapOidc() {
       result.client_id,
     );
 
-    // Mark password field so add_account migrates the tokens
-    form.value.password = `oauth2:${tempAccountId}`;
+    // Only set oauth2: marker for new accounts (triggers token migration in add_account).
+    // On re-auth of existing accounts, keep password empty so save doesn't overwrite keyring.
+    if (!editingAccountId.value) {
+      form.value.password = `oauth2:${tempAccountId}`;
+    }
     form.value.jmap_auth_method = "oidc";
     oidcUserCode.value = null;
     oauthStatus.value = "Signed in via OIDC";

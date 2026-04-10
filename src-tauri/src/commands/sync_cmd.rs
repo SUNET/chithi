@@ -65,6 +65,41 @@ pub async fn get_jmap_oidc_token(account: &crate::db::accounts::AccountFull) -> 
     Ok(Some(new_tokens.access_token))
 }
 
+/// Refresh an OIDC access token using the account_id and OIDC metadata.
+/// Used by the push loop to refresh tokens on reconnect without DB access.
+pub async fn refresh_jmap_oidc_token(
+    account_id: &str,
+    oidc_token_endpoint: &str,
+    oidc_client_id: &str,
+) -> crate::error::Result<Option<String>> {
+    let tokens = match crate::oauth::load_tokens(account_id)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    if !tokens.is_expired() {
+        return Ok(Some(tokens.access_token));
+    }
+
+    let refresh_token = match tokens.refresh_token {
+        Some(rt) => rt,
+        None => return Ok(Some(tokens.access_token)), // can't refresh, return stale
+    };
+
+    if oidc_token_endpoint.is_empty() || oidc_client_id.is_empty() {
+        return Ok(Some(tokens.access_token)); // can't refresh without metadata
+    }
+
+    let new_tokens = crate::oauth::refresh_token_dynamic(
+        oidc_token_endpoint,
+        &refresh_token,
+        oidc_client_id,
+    ).await?;
+    crate::oauth::store_tokens(account_id, &new_tokens)?;
+
+    Ok(Some(new_tokens.access_token))
+}
+
 /// Build a JmapConfig from an AccountFull, with OIDC token if applicable.
 pub async fn build_jmap_config(account: &crate::db::accounts::AccountFull) -> crate::error::Result<crate::mail::jmap::JmapConfig> {
     let access_token = get_jmap_oidc_token(account).await?;
@@ -74,6 +109,8 @@ pub async fn build_jmap_config(account: &crate::db::accounts::AccountFull) -> cr
         username: account.username.clone(),
         password: account.password.clone(),
         access_token,
+        oidc_token_endpoint: account.oidc_token_endpoint.clone(),
+        oidc_client_id: account.oidc_client_id.clone(),
     })
 }
 

@@ -36,6 +36,9 @@ pub struct JmapConfig {
     pub username: String,
     pub password: String,
     pub access_token: Option<String>,
+    /// OIDC metadata for token refresh (used by push loop on reconnect)
+    pub oidc_token_endpoint: String,
+    pub oidc_client_id: String,
 }
 
 impl JmapConfig {

@@ -163,9 +163,11 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 }
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
-    // Only update keyring if a new password was provided (non-empty).
-    // Empty means "keep existing" — the frontend never receives the stored password.
-    if !config.password.is_empty() {
+    // Only update keyring if a real password was provided; skip OIDC accounts and oauth2 markers.
+    if !config.password.is_empty()
+        && config.jmap_auth_method != "oidc"
+        && !config.password.starts_with("oauth2:")
+    {
         crate::keyring::set_password(id, &config.password)?;
     }
 

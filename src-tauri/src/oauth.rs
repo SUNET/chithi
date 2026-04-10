@@ -551,16 +551,26 @@ pub async fn device_auth_poll(
     expires_in: u64,
     client_id: &str,
 ) -> Result<OAuthTokens> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
-    let poll_interval = std::time::Duration::from_secs(interval);
+    let mut current_interval = std::time::Duration::from_secs(interval);
+    let mut first_poll = true;
 
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(Error::Other("Device authorization timed out — user did not complete sign-in".into()));
         }
 
-        tokio::time::sleep(poll_interval).await;
+        // Sleep before polling (skip on first attempt per RFC 8628 §3.5)
+        if first_poll {
+            first_poll = false;
+        } else {
+            tokio::time::sleep(current_interval).await;
+        }
 
         let mut params = HashMap::new();
         params.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code".to_string());
@@ -611,8 +621,9 @@ pub async fn device_auth_poll(
                 continue;
             }
             "slow_down" => {
-                log::debug!("OIDC device flow: slow_down, increasing interval");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // RFC 8628 §3.5: increase interval by 5 seconds
+                current_interval += std::time::Duration::from_secs(5);
+                log::debug!("OIDC device flow: slow_down, interval now {}s", current_interval.as_secs());
                 continue;
             }
             "access_denied" => {
@@ -641,7 +652,10 @@ pub async fn refresh_token_dynamic(
     params.insert("refresh_token", refresh_token.to_string());
     params.insert("grant_type", "refresh_token".to_string());
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
     let resp = client
         .post(token_url)
         .form(&params)
