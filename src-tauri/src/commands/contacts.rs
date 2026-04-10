@@ -293,12 +293,7 @@ pub async fn update_contact(
                         let conn = state.db.lock().await;
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
-                    let jmap_config = crate::mail::jmap::JmapConfig {
-                        jmap_url: account.jmap_url,
-                        email: account.email,
-                        username: account.username,
-                        password: account.password,
-                    };
+                    let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                         Ok(conn_jmap) => {
                             match conn_jmap.update_contact_card(
@@ -403,12 +398,7 @@ pub async fn delete_contact(
                 let conn = state.db.lock().await;
                 db::accounts::get_account_full(&conn, &account_id)?
             };
-            let jmap_config = crate::mail::jmap::JmapConfig {
-                jmap_url: account.jmap_url,
-                email: account.email,
-                username: account.username,
-                password: account.password,
-            };
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                 Ok(conn_jmap) => {
                     match conn_jmap.delete_contact_card(&jmap_config, &remote_id).await {
@@ -644,14 +634,9 @@ async fn sync_contacts_jmap(
     account_id: &str,
     account: &db::accounts::AccountFull,
 ) -> Result<()> {
-    use crate::mail::jmap::{JmapConfig, JmapConnection};
+    use crate::mail::jmap::JmapConnection;
 
-    let jmap_config = JmapConfig {
-        jmap_url: account.jmap_url.clone(),
-        email: account.email.clone(),
-        username: account.username.clone(),
-        password: account.password.clone(),
-    };
+    let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
 
     let jmap_conn = JmapConnection::connect(&jmap_config).await?;
 

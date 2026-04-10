@@ -126,10 +126,22 @@ pub async fn run_push_loop(
     log::info!("JMAP push loop stopped for account {}", account_id);
 }
 
-/// Holds Basic Auth credentials for the SSE connection.
+/// Holds auth credentials for the SSE connection.
 struct HttpAuth {
     username: String,
     password: String,
+    access_token: Option<String>,
+}
+
+impl HttpAuth {
+    /// Apply authentication to a reqwest RequestBuilder.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref token) = self.access_token {
+            req.bearer_auth(token)
+        } else {
+            req.basic_auth(&self.username, Some(&self.password))
+        }
+    }
 }
 
 /// Connect to the JMAP server, fetch session, and return the EventSource URL.
@@ -138,7 +150,6 @@ async fn connect_and_get_url(config: &JmapConfig) -> Result<(String, HttpAuth), 
         .await
         .map_err(|e| format!("JMAP connect failed: {}", e))?;
 
-    // Request all state change types: *, which covers Email, Mailbox, etc.
     let url = conn
         .event_source_url("*", PING_INTERVAL_SECS)
         .ok_or_else(|| "Server does not advertise eventSourceUrl".to_string())?;
@@ -148,6 +159,7 @@ async fn connect_and_get_url(config: &JmapConfig) -> Result<(String, HttpAuth), 
         HttpAuth {
             username: config.username.clone(),
             password: config.password.clone(),
+            access_token: config.access_token.clone(),
         },
     ))
 }
@@ -171,9 +183,7 @@ async fn stream_events(
         .build()
         .map_err(|e| format!("HTTP client build error: {}", e))?;
 
-    let response = client
-        .get(url)
-        .basic_auth(&auth.username, Some(&auth.password))
+    let response = auth.apply_auth(client.get(url))
         .header("Accept", "text/event-stream")
         // Prevent reverse proxies (nginx) from buffering SSE responses.
         .header("Cache-Control", "no-cache")

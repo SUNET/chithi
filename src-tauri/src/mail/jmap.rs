@@ -35,6 +35,19 @@ pub struct JmapConfig {
     pub email: String,
     pub username: String,
     pub password: String,
+    pub access_token: Option<String>,
+}
+
+impl JmapConfig {
+    /// Apply authentication to a reqwest RequestBuilder.
+    /// Uses Bearer auth if access_token is set, otherwise Basic auth.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref token) = self.access_token {
+            req.bearer_auth(token)
+        } else {
+            req.basic_auth(&self.username, Some(&self.password))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +132,7 @@ impl JmapConnection {
 
         // Fetch session with authentication
         let well_known = format!("{}/.well-known/jmap", base_url);
-        let resp = http.get(&well_known)
-            .basic_auth(&config.username, Some(&config.password))
+        let resp = config.apply_auth(http.get(&well_known))
             .send().await
             .map_err(|e| Error::Other(format!("JMAP session fetch failed: {}", e)))?;
 
@@ -177,8 +189,7 @@ impl JmapConnection {
 
     /// Send a JMAP API request and return the response JSON.
     async fn api_request(&self, body: &serde_json::Value, config: &JmapConfig) -> Result<serde_json::Value> {
-        let resp = self.http.post(&self.api_url)
-            .basic_auth(&config.username, Some(&config.password))
+        let resp = config.apply_auth(self.http.post(&self.api_url))
             .json(body)
             .send().await
             .map_err(|e| Error::Other(format!("JMAP request failed: {}", e)))?;
@@ -387,8 +398,7 @@ impl JmapConnection {
             .replace("{type}", "application/octet-stream");
 
         log::debug!("JMAP downloading blob from {}", download_url);
-        let resp = self.http.get(&download_url)
-            .basic_auth(&config.username, Some(&config.password))
+        let resp = config.apply_auth(self.http.get(&download_url))
             .send().await
             .map_err(|e| Error::Other(format!("JMAP download failed: {}", e)))?;
 
@@ -486,8 +496,7 @@ impl JmapConnection {
             .replace("{accountId}", &self.account_id);
         log::debug!("JMAP uploading blob to {}", upload_url);
 
-        let resp = self.http.post(&upload_url)
-            .basic_auth(&config.username, Some(&config.password))
+        let resp = config.apply_auth(self.http.post(&upload_url))
             .header("Content-Type", "message/rfc822")
             .body(raw_message.to_vec())
             .send().await
@@ -612,8 +621,7 @@ impl JmapConnection {
         let upload_url = self.upload_url_template
             .replace("{accountId}", &self.account_id);
 
-        let resp = self.http.post(&upload_url)
-            .basic_auth(&config.username, Some(&config.password))
+        let resp = config.apply_auth(self.http.post(&upload_url))
             .header("Content-Type", "message/rfc822")
             .body(raw_message.to_vec())
             .send().await

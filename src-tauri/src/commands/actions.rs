@@ -64,12 +64,7 @@ pub async fn move_messages(
         }
     } else if account.mail_protocol == "jmap" {
         // JMAP path: extract JMAP email IDs and source mailbox, then move via JMAP API
-        let jmap_config = crate::mail::jmap::JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
         // Extract JMAP IDs and group by source folder
         let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
@@ -170,12 +165,7 @@ pub async fn delete_messages(
         }
     } else if account.mail_protocol == "jmap" {
         // JMAP path: extract JMAP email IDs and delete via Email/set destroy
-        let jmap_config = crate::mail::jmap::JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
         // Extract JMAP email IDs from composite message IDs
         // Format: {account_id}_{folder}_{jmap_email_id}
@@ -275,12 +265,7 @@ pub async fn set_message_flags(
         }
     } else if account.mail_protocol == "jmap" {
         // JMAP path: extract JMAP email IDs and set flags via JMAP API
-        let jmap_config = crate::mail::jmap::JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
         // Extract JMAP email IDs from composite message IDs
         let jmap_ids: Vec<String> = message_ids.iter().map(|mid| {

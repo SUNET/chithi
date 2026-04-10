@@ -69,6 +69,8 @@ fn main() {
             commands::oauth::oauth_get_token,
             commands::oauth::oauth_has_tokens,
             commands::oauth::oauth_get_ms_profile,
+            commands::oauth::jmap_oidc_start,
+            commands::oauth::jmap_oidc_complete,
             commands::actions::move_messages,
             commands::actions::delete_messages,
             commands::actions::set_message_flags,

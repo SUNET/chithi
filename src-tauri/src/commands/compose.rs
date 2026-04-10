@@ -3,7 +3,7 @@ use tauri::State;
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::mail::jmap::{JmapConfig, JmapConnection};
+use crate::mail::jmap::JmapConnection;
 use crate::mail::smtp;
 use crate::state::AppState;
 
@@ -58,12 +58,7 @@ pub async fn send_message(
     } else if account.mail_protocol == "jmap" {
         log::info!("Sending via JMAP for account {}", account.email);
 
-        let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
         // Build raw RFC5322 message using lettre's builder, then send via JMAP
         let attachment_data = read_attachments(&message.attachments)?;
@@ -186,12 +181,7 @@ pub async fn save_draft(
     )?;
 
     if account.mail_protocol == "jmap" {
-        let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
         conn_jmap.save_draft(&jmap_config, &raw_message).await?;
     } else {

@@ -117,6 +117,9 @@ export interface AccountConfig {
   password: string;
   use_tls: boolean;
   signature: string;
+  jmap_auth_method: "basic" | "oidc";
+  oidc_token_endpoint: string;
+  oidc_client_id: string;
 }
 
 export interface FilterRule {
