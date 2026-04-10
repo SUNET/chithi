@@ -153,6 +153,8 @@ async function openEditForm(id: string) {
             oauthStatus.value = null;
           }
         } catch { oauthStatus.value = null; }
+      } else {
+        oauthStatus.value = null;
       }
     } else if (config.caldav_url && !config.imap_host) {
       accountType.value = "caldav";
@@ -498,7 +500,7 @@ async function doDelete() {
                     class="type-btn"
                     :class="{ active: form.jmap_auth_method === 'basic' }"
                     :disabled="!!editingAccountId"
-                    @click="form.jmap_auth_method = 'basic'; oauthStatus = null"
+                    @click="form.jmap_auth_method = 'basic'; oauthStatus.value = null"
                   >Password</button>
                   <button
                     class="type-btn"
@@ -521,7 +523,7 @@ async function doDelete() {
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
                       {{ oauthStatus }}
                     </div>
-                    <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
+                    <button class="btn-reauth" @click="oauthStatus.value = null">Sign in again</button>
                   </div>
                   <div v-else-if="oidcUserCode" class="oidc-device-code">
                     <p class="device-code-label">Enter this code in your browser:</p>
