@@ -1,3 +1,4 @@
+use std::net::TcpListener;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -5,17 +6,24 @@ use crate::error::{Error, Result};
 use crate::oauth;
 use crate::state::AppState;
 
-/// Temporary storage for PKCE code verifiers (needed between start and complete).
-static PKCE_VERIFIERS: Mutex<Option<std::collections::HashMap<u16, String>>> = Mutex::new(None);
-
-fn store_verifier(port: u16, verifier: String) {
-    let mut guard = PKCE_VERIFIERS.lock().unwrap();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    map.insert(port, verifier);
+/// Stored OAuth session data between start and complete phases.
+struct OAuthSession {
+    verifier: Option<String>,
+    state: String,
+    listener: TcpListener,
 }
 
-fn take_verifier(port: u16) -> Option<String> {
-    let mut guard = PKCE_VERIFIERS.lock().unwrap();
+/// Temporary storage for OAuth sessions (needed between start and complete).
+static OAUTH_SESSIONS: Mutex<Option<std::collections::HashMap<u16, OAuthSession>>> = Mutex::new(None);
+
+fn store_session(port: u16, session: OAuthSession) {
+    let mut guard = OAUTH_SESSIONS.lock().unwrap();
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.insert(port, session);
+}
+
+fn take_session(port: u16) -> Option<OAuthSession> {
+    let mut guard = OAUTH_SESSIONS.lock().unwrap();
     guard.as_mut().and_then(|map| map.remove(&port))
 }
 
@@ -34,12 +42,18 @@ pub async fn oauth_start(
 ) -> Result<OAuthStartResult> {
     let prov = get_provider(&provider)?;
 
-    let (url, port, code_verifier) = oauth::get_auth_url(prov)?;
+    let (url, listener, code_verifier, state) = oauth::get_auth_url(prov)?;
 
-    // Store the PKCE verifier for use in oauth_complete
-    if let Some(verifier) = code_verifier {
-        store_verifier(port, verifier);
-    }
+    let port = listener.local_addr()
+        .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
+        .port();
+
+    // Store the session (listener, PKCE verifier, state) for use in oauth_complete
+    store_session(port, OAuthSession {
+        verifier: code_verifier,
+        state,
+        listener,
+    });
 
     log::info!("OAuth2: started {} flow on port {}", provider, port);
     Ok(OAuthStartResult { url, port })
@@ -62,18 +76,35 @@ pub async fn oauth_complete(
 ) -> Result<()> {
     let prov = get_provider(&provider)?;
 
-    // Retrieve the PKCE verifier if this provider uses PKCE
-    let code_verifier = take_verifier(port);
+    // Retrieve the full session (listener, verifier, state)
+    let session = take_session(port)
+        .ok_or_else(|| Error::Other(format!("No OAuth session found for port {}", port)))?;
+
+    let expected_state = session.state.clone();
+    let code_verifier = session.verifier.clone();
 
     // Wait for callback in a blocking thread (TcpListener::accept blocks)
-    let code = tokio::task::spawn_blocking(move || {
-        oauth::wait_for_callback(port)
+    let result = tokio::task::spawn_blocking(move || {
+        oauth::wait_for_callback(session.listener)
     })
     .await
     .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
+    // Verify the state parameter to prevent CSRF attacks
+    match &result.state {
+        Some(returned_state) if returned_state == &expected_state => {}
+        Some(_) => {
+            return Err(Error::Other(
+                "OAuth2 state mismatch: possible CSRF attack".into(),
+            ));
+        }
+        None => {
+            log::warn!("OAuth2: no state parameter in callback (provider may not support it)");
+        }
+    }
+
     // Exchange code for tokens
-    let tokens = oauth::exchange_code(prov, &code, port, code_verifier.as_deref()).await?;
+    let tokens = oauth::exchange_code(prov, &result.code, port, code_verifier.as_deref()).await?;
 
     // Store tokens in keyring
     oauth::store_tokens(&account_id, &tokens)?;

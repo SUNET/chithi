@@ -69,16 +69,25 @@ watch(
 const hasHtml = () => !!messagesStore.activeMessage?.body_html;
 const hasText = () => !!messagesStore.activeMessage?.body_text;
 
+// Generate a random nonce for the iframe CSP
+function generateNonce(): string {
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  return Array.from(array, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // Build a sandboxed iframe srcdoc that isolates HTML email from the main webview.
 // The iframe has no access to window.__TAURI__ or any IPC commands.
-// Links inside the iframe send a postMessage to the parent for clipboard copy.
+// HTML content is delivered via postMessage to avoid template literal injection.
+// CSP uses a nonce instead of 'unsafe-inline' for script-src.
 function iframeSrcdoc(): string {
-  const html = imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
-  // Strict CSP inside the iframe: no scripts, no external resources except inline styles
+  const nonce = generateNonce();
+  // The iframe loads with an empty body. A nonce-gated script listens for
+  // a postMessage containing the sanitized HTML and inserts it into the body.
   return `<!DOCTYPE html>
 <html>
 <head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src https: data:;">
 <style>
   body {
     margin: 0;
@@ -94,7 +103,15 @@ function iframeSrcdoc(): string {
   a { color: #1a73e8; cursor: pointer; }
 </style>
 </head>
-<body>${html}<script>
+<body><script nonce="${nonce}">
+  // Listen for HTML content from the parent frame
+  window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'set-html') {
+      document.body.innerHTML = e.data.html;
+      // Report initial height after content is set
+      parent.postMessage({ type: 'resize', height: document.documentElement.scrollHeight }, '*');
+    }
+  });
   // Intercept all link clicks and forward to parent via postMessage
   document.addEventListener('click', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
@@ -113,8 +130,15 @@ function iframeSrcdoc(): string {
     parent.postMessage({ type: 'resize', height: document.documentElement.scrollHeight }, '*');
   });
   ro.observe(document.documentElement);
+  // Signal to parent that we are ready to receive content
+  parent.postMessage({ type: 'iframe-ready' }, '*');
 <\/script></body>
 </html>`;
+}
+
+// Post the HTML content to the iframe after it signals readiness.
+function getEmailHtml(): string {
+  return imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
 }
 
 // Listen for postMessage from the sandboxed iframe.
@@ -132,7 +156,14 @@ function handleIframeMessage(event: MessageEvent) {
   }
   if (!fromOurIframe) return;
 
-  if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
+  if (event.data.type === 'iframe-ready') {
+    // The iframe is ready to receive HTML content — post it via message
+    for (const iframe of iframes) {
+      if (event.source === iframe.contentWindow) {
+        iframe.contentWindow!.postMessage({ type: 'set-html', html: getEmailHtml() }, '*');
+      }
+    }
+  } else if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
     navigator.clipboard.writeText(event.data.href).then(() => {
       showToast("Link copied to clipboard");
     });
