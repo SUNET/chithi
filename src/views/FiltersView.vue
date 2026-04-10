@@ -224,7 +224,7 @@ const opLabels: Record<string, string> = {
         <label class="apply-label">Apply filters to folder</label>
         <select v-model="applyingFolder" class="apply-select">
           <option :value="null" disabled>Select folder...</option>
-          <option v-for="f in foldersStore.folders" :key="f.path" :value="f.path">
+          <option v-for="f in foldersStore.getFlatFolders()" :key="f.path" :value="f.path">
             {{ f.name }}
           </option>
         </select>
@@ -331,7 +331,7 @@ const opLabels: Record<string, string> = {
             @change="setActionTarget(i, ($event.target as HTMLSelectElement).value)"
           >
             <option value="" disabled>Select folder...</option>
-            <option v-for="f in foldersStore.folders" :key="f.path" :value="f.path">
+            <option v-for="f in foldersStore.getFlatFolders()" :key="f.path" :value="f.path">
               {{ f.name }}
             </option>
           </select>

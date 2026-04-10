@@ -642,7 +642,7 @@ async fn sync_graph_account(
         let conn = db_arc.lock().await;
         for gf in &graph_folders {
             let folder_type = graph::guess_folder_type(&gf.display_name);
-            db::folders::upsert_folder(&conn, account_id, &gf.display_name, &gf.id, folder_type)?;
+            db::folders::upsert_folder(&conn, account_id, &gf.display_name, &gf.id, folder_type, None)?;
             db::folders::update_folder_counts(&conn, account_id, &gf.id, gf.unread_count, gf.total_count)?;
         }
     }

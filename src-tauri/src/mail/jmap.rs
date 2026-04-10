@@ -192,14 +192,14 @@ impl JmapConnection {
         resp.json().await.map_err(|e| Error::Other(format!("JMAP response parse error: {}", e)))
     }
 
-    pub async fn list_folders(&self, config: &JmapConfig) -> Result<Vec<(String, String, Option<&'static str>)>> {
+    pub async fn list_folders(&self, config: &JmapConfig) -> Result<Vec<(String, String, Option<&'static str>, Option<String>)>> {
         log::debug!("JMAP listing mailboxes");
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             "methodCalls": [
                 ["Mailbox/get", {
                     "accountId": self.account_id,
-                    "properties": ["id", "name", "role", "totalEmails", "unreadEmails"]
+                    "properties": ["id", "name", "role", "totalEmails", "unreadEmails", "parentId"]
                 }, "m1"]
             ]
         });
@@ -224,8 +224,9 @@ impl JmapConnection {
                 Some("archive") => Some("archive"),
                 _ => None,
             };
-            log::debug!("  mailbox: {} ({}) role={:?}", name, id, role);
-            folders.push((name, id, folder_type));
+            let parent_id = mb["parentId"].as_str().map(|s| s.to_string());
+            log::debug!("  mailbox: {} ({}) role={:?} parentId={:?}", name, id, role, parent_id);
+            folders.push((name, id, folder_type, parent_id));
         }
         log::info!("JMAP found {} mailboxes", folders.len());
         Ok(folders)
@@ -1149,18 +1150,20 @@ impl JmapConnection {
         Ok(None)
     }
     /// Create a new mailbox on the JMAP server.
-    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str) -> Result<String> {
-        log::info!("JMAP creating mailbox: {}", name);
+    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str, parent_id: Option<&str>) -> Result<String> {
+        log::info!("JMAP creating mailbox: {} (parent={:?})", name, parent_id);
         let create_id = "new-folder";
+        let mut mailbox = serde_json::json!({ "name": name });
+        if let Some(pid) = parent_id {
+            mailbox["parentId"] = serde_json::json!(pid);
+        }
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             "methodCalls": [
                 ["Mailbox/set", {
                     "accountId": self.account_id,
                     "create": {
-                        create_id: {
-                            "name": name
-                        }
+                        create_id: mailbox
                     }
                 }, "c1"]
             ]

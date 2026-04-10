@@ -462,7 +462,7 @@ const displayedCount = () => {
           </button>
           <div v-if="subMenu === 'move'" class="ctx-submenu">
             <button
-              v-for="folder in foldersStore.folders"
+              v-for="folder in foldersStore.getFlatFolders()"
               :key="folder.path"
               class="ctx-item"
               :class="{ disabled: folder.path === foldersStore.activeFolderPath }"
@@ -479,7 +479,7 @@ const displayedCount = () => {
           </button>
           <div v-if="subMenu === 'copy'" class="ctx-submenu">
             <button
-              v-for="folder in foldersStore.folders"
+              v-for="folder in foldersStore.getFlatFolders()"
               :key="folder.path"
               class="ctx-item"
               @click="ctxCopyTo(folder.path)"

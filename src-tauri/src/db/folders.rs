@@ -11,6 +11,8 @@ pub struct Folder {
     pub unread_count: i64,
     pub total_count: i64,
     pub children: Vec<Folder>,
+    #[serde(skip_serializing)]
+    pub parent_id: Option<String>,
 }
 
 pub fn upsert_folder(
@@ -19,19 +21,20 @@ pub fn upsert_folder(
     name: &str,
     path: &str,
     folder_type: Option<&str>,
+    parent_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO folders (account_id, name, path, folder_type)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(account_id, path) DO UPDATE SET name = ?2, folder_type = ?4",
-        params![account_id, name, path, folder_type],
+        "INSERT INTO folders (account_id, name, path, folder_type, parent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(account_id, path) DO UPDATE SET name = ?2, folder_type = ?4, parent_id = ?5",
+        params![account_id, name, path, folder_type, parent_id],
     )?;
     Ok(())
 }
 
 pub fn list_folders(conn: &Connection, account_id: &str) -> Result<Vec<Folder>> {
     let mut stmt = conn.prepare(
-        "SELECT name, path, folder_type, unread_count, total_count
+        "SELECT name, path, folder_type, unread_count, total_count, parent_id
          FROM folders WHERE account_id = ?1 ORDER BY
          CASE folder_type
            WHEN 'inbox' THEN 0
@@ -52,10 +55,93 @@ pub fn list_folders(conn: &Connection, account_id: &str) -> Result<Vec<Folder>> 
                 unread_count: row.get(3)?,
                 total_count: row.get(4)?,
                 children: vec![],
+                parent_id: row.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(folders)
+}
+
+/// Build a nested folder tree from a flat list of folders.
+/// IMAP folders use `/` in their path to denote hierarchy (e.g., "INBOX/IETF/123").
+/// JMAP folders use `parent_id` to reference the parent mailbox's path/id.
+/// Top-level folders (no parent, or parent not in list) become roots.
+pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
+    use std::collections::HashMap;
+
+    let has_parent_ids = folders.iter().any(|f| f.parent_id.is_some());
+
+    let mut by_path: HashMap<String, usize> = HashMap::new();
+    for (i, f) in folders.iter().enumerate() {
+        by_path.insert(f.path.clone(), i);
+    }
+
+    let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut is_child = vec![false; folders.len()];
+
+    for i in 0..folders.len() {
+        let parent_path = if has_parent_ids {
+            // JMAP: parent_id references another mailbox's path/id
+            folders[i].parent_id.clone()
+        } else {
+            // IMAP: derive parent from path hierarchy
+            folders[i].path.rsplit_once('/').map(|(p, _)| p.to_string())
+        };
+
+        if let Some(pp) = parent_path {
+            if by_path.contains_key(&pp) {
+                children_map.entry(pp).or_default().push(i);
+                is_child[i] = true;
+            }
+        }
+    }
+
+    // Process deepest parents first so children are fully built before attaching.
+    // For JMAP (parent_id), compute depth by counting hops to root.
+    // For IMAP (path-based), use '/' count as depth proxy.
+    let mut parent_paths: Vec<String> = children_map.keys().cloned().collect();
+    if has_parent_ids {
+        // Compute depth for each folder by following parent_id chain.
+        // Guard against cycles with a visited set.
+        let depth_of = |path: &str| -> usize {
+            let mut depth = 0usize;
+            let mut current = path.to_string();
+            let mut visited = std::collections::HashSet::new();
+            while let Some(idx) = by_path.get(&current) {
+                if !visited.insert(current.clone()) {
+                    log::warn!("Cycle detected in folder parent_id chain at {}", current);
+                    break;
+                }
+                if let Some(ref pid) = folders[*idx].parent_id {
+                    depth += 1;
+                    current = pid.clone();
+                } else {
+                    break;
+                }
+            }
+            depth
+        };
+        parent_paths.sort_by(|a, b| depth_of(b).cmp(&depth_of(a)));
+    } else {
+        parent_paths.sort_by(|a, b| b.matches('/').count().cmp(&a.matches('/').count()));
+    }
+
+    for parent_path in parent_paths {
+        if let Some(child_indices) = children_map.remove(&parent_path) {
+            let children: Vec<Folder> = child_indices.iter()
+                .map(|&i| folders[i].clone())
+                .collect();
+            if let Some(&parent_idx) = by_path.get(&parent_path) {
+                folders[parent_idx].children = children;
+            }
+        }
+    }
+
+    folders.into_iter()
+        .enumerate()
+        .filter(|(i, _)| !is_child[*i])
+        .map(|(_, f)| f)
+        .collect()
 }
 
 pub fn update_folder_counts(
@@ -158,5 +244,142 @@ pub fn guess_folder_type(name: &str) -> Option<&'static str> {
         "junk" | "spam" | "bulk mail" => Some("junk"),
         "archive" | "all mail" | "all" => Some("archive"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_folder(name: &str, path: &str, folder_type: Option<&str>) -> Folder {
+        Folder {
+            name: name.to_string(),
+            path: path.to_string(),
+            folder_type: folder_type.map(|s| s.to_string()),
+            unread_count: 0,
+            total_count: 0,
+            children: vec![],
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn test_flat_folders_stay_flat() {
+        let folders = vec![
+            make_folder("Inbox", "INBOX", Some("inbox")),
+            make_folder("Sent", "Sent", Some("sent")),
+            make_folder("Drafts", "Drafts", Some("drafts")),
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 3);
+        assert!(tree.iter().all(|f| f.children.is_empty()));
+    }
+
+    #[test]
+    fn test_one_level_nesting() {
+        let folders = vec![
+            make_folder("Inbox", "INBOX", Some("inbox")),
+            make_folder("IETF", "INBOX/IETF", None),
+            make_folder("Infra", "INBOX/Infra", None),
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].children.len(), 2);
+    }
+
+    #[test]
+    fn test_deep_nesting() {
+        let folders = vec![
+            make_folder("Inbox", "INBOX", Some("inbox")),
+            make_folder("IETF", "INBOX/IETF", None),
+            make_folder("123", "INBOX/IETF/123", None),
+            make_folder("456", "INBOX/IETF/456", None),
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(tree[0].children[0].children.len(), 2);
+    }
+
+    #[test]
+    fn test_orphan_stays_at_root() {
+        let folders = vec![
+            make_folder("123", "INBOX/IETF/123", None),
+            make_folder("Sent", "Sent", Some("sent")),
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn test_jmap_parent_id_nesting() {
+        let folders = vec![
+            Folder {
+                name: "Inbox".to_string(),
+                path: "m1".to_string(),
+                folder_type: Some("inbox".to_string()),
+                unread_count: 3,
+                total_count: 10,
+                children: vec![],
+                parent_id: None,
+            },
+            Folder {
+                name: "IETF".to_string(),
+                path: "m2".to_string(),
+                folder_type: None,
+                unread_count: 0,
+                total_count: 5,
+                children: vec![],
+                parent_id: Some("m1".to_string()),
+            },
+            Folder {
+                name: "123".to_string(),
+                path: "m3".to_string(),
+                folder_type: None,
+                unread_count: 0,
+                total_count: 2,
+                children: vec![],
+                parent_id: Some("m2".to_string()),
+            },
+            Folder {
+                name: "Sent".to_string(),
+                path: "m4".to_string(),
+                folder_type: Some("sent".to_string()),
+                unread_count: 0,
+                total_count: 0,
+                children: vec![],
+                parent_id: None,
+            },
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 2); // Inbox, Sent
+
+        let inbox = tree.iter().find(|f| f.path == "m1").unwrap();
+        assert_eq!(inbox.children.len(), 1); // IETF
+        assert_eq!(inbox.children[0].children.len(), 1); // 123
+    }
+
+    #[test]
+    fn test_mixed_hierarchy() {
+        let folders = vec![
+            make_folder("Inbox", "INBOX", Some("inbox")),
+            make_folder("IETF", "INBOX/IETF", None),
+            make_folder("123", "INBOX/IETF/123", None),
+            make_folder("Infra", "INBOX/Infra", None),
+            make_folder("Mastodon", "INBOX/Infra/Mastodon", None),
+            make_folder("Sent", "Sent", Some("sent")),
+            make_folder("Drafts", "Drafts", Some("drafts")),
+        ];
+        let tree = build_folder_tree(folders);
+        assert_eq!(tree.len(), 3);
+
+        let inbox = tree.iter().find(|f| f.path == "INBOX").unwrap();
+        assert_eq!(inbox.children.len(), 2);
+
+        let ietf = inbox.children.iter().find(|f| f.path == "INBOX/IETF").unwrap();
+        assert_eq!(ietf.children.len(), 1);
+
+        let infra = inbox.children.iter().find(|f| f.path == "INBOX/Infra").unwrap();
+        assert_eq!(infra.children.len(), 1);
     }
 }

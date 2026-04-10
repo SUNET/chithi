@@ -38,9 +38,10 @@ pub async fn list_folders(
 ) -> Result<Vec<db::folders::Folder>> {
     log::debug!("Listing folders for account {}", account_id);
     let conn = state.db.lock().await;
-    let folders = db::folders::list_folders(&conn, &account_id)?;
-    log::debug!("Found {} folders for account {}", folders.len(), account_id);
-    Ok(folders)
+    let flat_folders = db::folders::list_folders(&conn, &account_id)?;
+    log::debug!("Found {} folders for account {}", flat_folders.len(), account_id);
+    let tree = db::folders::build_folder_tree(flat_folders);
+    Ok(tree)
 }
 
 #[tauri::command]
@@ -481,7 +482,14 @@ pub async fn create_folder(
             password: account.password.clone(),
         };
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.create_mailbox(&jmap_config, &folder_path).await?;
+        // For JMAP, folder_path is "parentId/name" (built by the frontend).
+        // Split to get the parent mailbox ID and the new folder name.
+        let (parent_id, mailbox_name) = if let Some((parent, name)) = folder_path.rsplit_once('/') {
+            (if parent.is_empty() { None } else { Some(parent) }, name)
+        } else {
+            (None, folder_path.as_str())
+        };
+        conn_jmap.create_mailbox(&jmap_config, mailbox_name, parent_id).await?;
     } else {
         // IMAP: CREATE (O365 uses XOAUTH2)
         let (imap_password, imap_xoauth2) = if account.provider == "o365" {

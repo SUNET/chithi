@@ -97,7 +97,7 @@ async fn sync_jmap_account_inner(
     let jmap_folders = conn_jmap.list_folders(jmap_config).await?;
     {
         let conn = db.lock().await;
-        for (display_name, mailbox_id, folder_type) in &jmap_folders {
+        for (display_name, mailbox_id, folder_type, parent_id) in &jmap_folders {
             // For JMAP, we store the mailbox_id in the `path` column
             db::folders::upsert_folder(
                 &conn,
@@ -105,6 +105,7 @@ async fn sync_jmap_account_inner(
                 display_name,
                 mailbox_id,
                 *folder_type,
+                parent_id.as_deref(),
             )?;
         }
     }
@@ -112,7 +113,7 @@ async fn sync_jmap_account_inner(
     // Determine sync order: current folder first, then Inbox, then rest
     let mut priority: Vec<(&str, &str)> = Vec::new();
     let mut others: Vec<(&str, &str)> = Vec::new();
-    for (name, mailbox_id, folder_type) in &jmap_folders {
+    for (name, mailbox_id, folder_type, _parent_id) in &jmap_folders {
         if current_folder
             .map(|cf| cf == mailbox_id.as_str())
             .unwrap_or(false)

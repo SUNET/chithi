@@ -14,6 +14,67 @@ const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
 const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
+
+// Folder expand/collapse state, persisted per account in localStorage
+const collapsedFolders = ref<Record<string, string[]>>(loadCollapsedFolders());
+
+function loadCollapsedFolders(): Record<string, string[]> {
+  try {
+    const stored = localStorage.getItem("chithi-collapsed-folders");
+    if (!stored) return {};
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    // Validate all values are string arrays
+    for (const v of Object.values(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(v) || !v.every((item) => typeof item === "string")) return {};
+    }
+    return parsed as Record<string, string[]>;
+  } catch {
+    return {};
+  }
+}
+
+function saveCollapsedFolders() {
+  localStorage.setItem("chithi-collapsed-folders", JSON.stringify(collapsedFolders.value));
+}
+
+function isFolderCollapsed(accountId: string, folderPath: string): boolean {
+  return collapsedFolders.value[accountId]?.includes(folderPath) ?? false;
+}
+
+function toggleFolderCollapse(accountId: string, folderPath: string) {
+  const current = collapsedFolders.value[accountId] ?? [];
+  if (current.includes(folderPath)) {
+    collapsedFolders.value = {
+      ...collapsedFolders.value,
+      [accountId]: current.filter(p => p !== folderPath),
+    };
+  } else {
+    collapsedFolders.value = {
+      ...collapsedFolders.value,
+      [accountId]: [...current, folderPath],
+    };
+  }
+  saveCollapsedFolders();
+}
+
+interface FlatFolder {
+  folder: Folder;
+  depth: number;
+  hasChildren: boolean;
+}
+
+function flattenTree(folders: Folder[], depth: number, accountId: string): FlatFolder[] {
+  const result: FlatFolder[] = [];
+  for (const folder of folders) {
+    result.push({ folder, depth, hasChildren: folder.children.length > 0 });
+    if (folder.children.length > 0 && !isFolderCollapsed(accountId, folder.path)) {
+      result.push(...flattenTree(folder.children, depth + 1, accountId));
+    }
+  }
+  return result;
+}
+
 const showNewFolderModal = ref(false);
 const newFolderName = ref("");
 const newFolderParent = ref("");
@@ -122,11 +183,19 @@ async function syncThisFolder() {
   }
 }
 
+function findFolderInTree(folders: Folder[], path: string): boolean {
+  for (const f of folders) {
+    if (f.path === path) return true;
+    if (findFolderInTree(f.children, path)) return true;
+  }
+  return false;
+}
+
 function findAccountForFolder(folder: Folder | undefined): string | null {
   if (!folder) return null;
   for (const acc of accountsStore.accounts) {
     const folders = foldersStore.getAccountFolders(acc.id);
-    if (folders.some(f => f.path === folder.path)) return acc.id;
+    if (findFolderInTree(folders, folder.path)) return acc.id;
   }
   return accountsStore.activeAccountId;
 }
@@ -144,12 +213,18 @@ function openNewFolderModal() {
 
 function buildParentOptions(): { label: string; value: string }[] {
   const options: { label: string; value: string }[] = [];
-  for (const acc of accountsStore.accounts) {
-    // Account root level
-    options.push({ label: `${acc.display_name} (root)`, value: `${acc.id}|` });
-    for (const folder of foldersStore.getAccountFolders(acc.id)) {
-      options.push({ label: `${folder.name} on ${acc.email}`, value: `${acc.id}|${folder.path}` });
+
+  function addFolders(folders: Folder[], accountId: string, accountEmail: string, prefix: string) {
+    for (const folder of folders) {
+      const label = prefix ? `${prefix}/${folder.name}` : folder.name;
+      options.push({ label: `${label} on ${accountEmail}`, value: `${accountId}|${folder.path}` });
+      addFolders(folder.children, accountId, accountEmail, label);
     }
+  }
+
+  for (const acc of accountsStore.accounts) {
+    options.push({ label: `${acc.display_name} (root)`, value: `${acc.id}|` });
+    addFolders(foldersStore.getAccountFolders(acc.id), acc.id, acc.email, "");
   }
   return options;
 }
@@ -241,46 +316,67 @@ async function markFolderRead() {
 
       <div v-if="!collapsedAccounts.includes(account.id)" class="folder-list">
         <button
-          v-for="folder in foldersStore.getAccountFolders(account.id)"
-          :key="account.id + '/' + folder.path"
+          v-for="item in flattenTree(foldersStore.getAccountFolders(account.id), 0, account.id)"
+          :key="account.id + '/' + item.folder.path"
           class="folder-item"
           :class="{
-            active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === folder.path,
-            syncing: syncing === folder.path,
+            active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === item.folder.path,
+            syncing: syncing === item.folder.path,
           }"
-          @click.stop="selectFolder(account.id, folder.path)"
-          @contextmenu="onFolderContextMenu($event, folder)"
+          :style="{ paddingLeft: (12 + item.depth * 16) + 'px' }"
+          @click.stop="selectFolder(account.id, item.folder.path)"
+          @contextmenu="onFolderContextMenu($event, item.folder)"
         >
+          <span
+            v-if="item.hasChildren"
+            class="folder-toggle"
+            role="button"
+            tabindex="0"
+            :aria-expanded="!isFolderCollapsed(account.id, item.folder.path)"
+            @click.stop="toggleFolderCollapse(account.id, item.folder.path)"
+            @keydown.enter.stop="toggleFolderCollapse(account.id, item.folder.path)"
+            @keydown.space.stop.prevent="toggleFolderCollapse(account.id, item.folder.path)"
+          >
+            <svg
+              width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+              :style="{ transform: isFolderCollapsed(account.id, item.folder.path) ? 'rotate(-90deg)' : '', transition: 'transform 0.15s' }"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </span>
+          <span v-else class="folder-toggle-spacer"></span>
+
           <!-- Folder icons as SVG -->
-          <svg v-if="folderIcon(folder) === 'inbox'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-if="folderIcon(item.folder) === 'inbox'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
             <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'sent'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'sent'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M9 18l6-6-6-6" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'drafts'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'drafts'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'trash'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'trash'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'spam'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'spam'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'archive'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'archive'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="21 8 21 21 3 21 3 8" /><rect x="1" y="3" width="22" height="5" /><line x1="10" y1="12" x2="14" y2="12" />
           </svg>
-          <svg v-else-if="folderIcon(folder) === 'starred'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else-if="folderIcon(item.folder) === 'starred'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
           </svg>
           <svg v-else class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
           </svg>
 
-          <span class="folder-name">{{ folder.name }}</span>
-          <span v-if="syncing === folder.path" class="sync-spinner"></span>
-          <span v-else-if="folder.unread_count > 0" class="unread-badge">{{ folder.unread_count }}</span>
+          <span class="folder-name">{{ item.folder.name }}</span>
+          <span v-if="syncing === item.folder.path" class="sync-spinner"></span>
+          <span v-else-if="item.folder.unread_count > 0" class="unread-badge">{{ item.folder.unread_count }}</span>
         </button>
       </div>
     </div>
@@ -467,6 +563,27 @@ async function markFolderRead() {
 
 .folder-item.syncing {
   opacity: 0.6;
+}
+
+.folder-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.folder-toggle:hover {
+  background: var(--color-bg-hover);
+}
+
+.folder-toggle-spacer {
+  width: 16px;
+  flex-shrink: 0;
 }
 
 .folder-svg {
