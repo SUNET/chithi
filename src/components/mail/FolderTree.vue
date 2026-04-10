@@ -216,7 +216,6 @@ async function markAccountRead() {
 
   try {
     await api.markAccountRead(accountId);
-    await foldersStore.fetchFolders();
     await foldersStore.fetchAllAccountFolders();
     if (accountsStore.activeAccountId === accountId) {
       await messagesStore.fetchMessages();

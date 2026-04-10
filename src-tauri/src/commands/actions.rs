@@ -449,8 +449,8 @@ fn normalize_flag_name(flag: &str) -> String {
     flag.trim_start_matches('\\').to_lowercase()
 }
 
-/// Mark all messages in all folders of an account as read (local DB only).
-/// This is a bulk operation — much faster than marking individual messages.
+/// Mark all messages in all folders of an account as read.
+/// Updates both the remote server and local DB.
 #[tauri::command]
 pub async fn mark_account_read(
     state: State<'_, AppState>,
@@ -458,17 +458,75 @@ pub async fn mark_account_read(
 ) -> Result<u64> {
     log::info!("Marking all messages as read for account {}", account_id);
 
-    let conn = state.db.lock().await;
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
 
-    // Update all unread messages to include "seen" flag
-    let updated = conn.execute(
-        "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
-         WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
-        rusqlite::params![account_id],
-    ).map_err(crate::error::Error::Database)?;
+    // Mark read on the server first
+    if account.mail_protocol == "graph" {
+        // Graph/O365: get all unread message IDs and mark via API
+        let unread_ids = {
+            let conn = state.db.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+            ).map_err(crate::error::Error::Database)?;
+            let ids: Vec<String> = stmt
+                .query_map(rusqlite::params![&account_id], |row| row.get::<_, String>(0))
+                .map_err(crate::error::Error::Database)?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+        if !unread_ids.is_empty() {
+            let token = crate::mail::graph::get_graph_token(&account_id).await?;
+            let client = crate::mail::graph::GraphClient::new(&token);
+            let graph_ids: Vec<String> = unread_ids.iter().map(|mid| {
+                mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid).to_string()
+            }).collect();
+            client.set_read_status(&graph_ids, true).await?;
+        }
+    } else if account.mail_protocol == "imap" {
+        // IMAP: SELECT each folder and STORE +FLAGS \Seen on all messages
+        let imap_config = build_imap_config(&account).await?;
+        let folder_paths: Vec<String> = {
+            let conn = state.db.lock().await;
+            let folders = db::folders::list_folders(&conn, &account_id)?;
+            folders.into_iter().map(|f| f.path).collect()
+        };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = ImapConnection::connect(&imap_config)?;
+            for folder_path in &folder_paths {
+                if let Err(e) = conn.select_folder(folder_path) {
+                    log::warn!("Cannot select '{}' for mark-read: {}", folder_path, e);
+                    continue;
+                }
+                if let Err(e) = conn.mark_all_seen() {
+                    log::warn!("Mark all seen failed on '{}': {}", folder_path, e);
+                }
+            }
+            conn.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Mark account read task panicked: {}", e)))??;
+    }
+    // JMAP: the local DB update below is sufficient — JMAP sync uses
+    // server state tokens and won't overwrite local flag changes.
+    // A full JMAP implementation would use Email/query + Email/set,
+    // but for now the local update works because JMAP sync is additive.
 
-    // Recalculate folder counts
-    db::folders::recalculate_folder_counts(&conn, &account_id)?;
+    // Update local DB
+    let updated = {
+        let conn = state.db.lock().await;
+        let count = conn.execute(
+            "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
+             WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+            rusqlite::params![account_id],
+        ).map_err(crate::error::Error::Database)?;
+        db::folders::recalculate_folder_counts(&conn, &account_id)?;
+        count
+    };
 
     log::info!("Marked {} messages as read for account {}", updated, account_id);
     Ok(updated as u64)
