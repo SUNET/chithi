@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::commands::events::emit_folders_changed;
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
@@ -462,6 +463,7 @@ pub async fn unthread_message(
 /// Create a new folder on the mail server and register it locally.
 #[tauri::command]
 pub async fn create_folder(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     folder_path: String,
@@ -528,12 +530,14 @@ pub async fn create_folder(
     // with the correct server-side path/ID and register it properly.
 
     log::info!("Folder '{}' created on server, will appear after sync", folder_path);
+    emit_folders_changed(&app, &account_id);
     Ok(())
 }
 
 /// Delete a folder on the mail server and remove it from local DB.
 #[tauri::command]
 pub async fn delete_folder(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     folder_path: String,
@@ -596,6 +600,7 @@ pub async fn delete_folder(
     }
 
     log::info!("Folder '{}' deleted", folder_path);
+    emit_folders_changed(&app, &account_id);
     Ok(())
 }
 

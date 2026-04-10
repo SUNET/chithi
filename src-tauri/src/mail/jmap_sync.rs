@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::jmap::{JmapConfig, JmapConnection};
@@ -68,6 +69,8 @@ pub async fn sync_jmap_account(
                 },
             )
             .ok();
+            emit_folders_changed(&app, &account_id);
+            emit_messages_changed(&app, &account_id);
         }
         Err(e) => {
             app.emit(
@@ -383,6 +386,8 @@ pub async fn sync_jmap_folder_public(
                 }),
             )
             .ok();
+            emit_folders_changed(&app, &account_id);
+            emit_messages_changed(&app, &account_id);
         }
         Err(e) => {
             app.emit(

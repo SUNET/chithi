@@ -3,6 +3,7 @@ pub mod actions;
 pub mod calendar;
 pub mod compose;
 pub mod contacts;
+pub mod events;
 pub mod filters;
 pub mod mail;
 pub mod oauth;

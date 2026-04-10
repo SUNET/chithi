@@ -279,8 +279,6 @@ async function ctxMoveTo(folderPath: string) {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Move failed:", e);
   }
@@ -293,7 +291,6 @@ async function ctxCopyTo(folderPath: string) {
   closeContextMenu();
   try {
     await api.copyMessages(accountId, ids, folderPath);
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Copy failed:", e);
   }
@@ -337,8 +334,6 @@ async function ctxNotSpam() {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Not Spam failed:", e);
   }

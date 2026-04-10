@@ -175,10 +175,6 @@ async function syncThisFolder() {
   syncing.value = folder.path;
   try {
     await api.syncFolder(accountId, folder.path);
-    await foldersStore.fetchFolders();
-    if (foldersStore.activeFolderPath === folder.path) {
-      await messagesStore.fetchMessages();
-    }
   } catch (e) {
     console.error("Folder sync failed:", e);
   } finally {
@@ -254,7 +250,6 @@ async function createNewFolder() {
     showNewFolderModal.value = false;
     // Trigger sync so the server-assigned folder ID/path gets registered locally
     await api.triggerSync(accountId);
-    await foldersStore.fetchAllAccountFolders();
   } catch (e) {
     newFolderError.value = String(e);
   } finally {
@@ -298,8 +293,6 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchAllAccountFolders();
   } catch (e) {
     console.error("Drag-and-drop move failed:", e);
   }
@@ -320,10 +313,6 @@ async function markFolderRead() {
 
     if (unreadIds.length > 0) {
       await api.setMessageFlags(accountId, unreadIds, ["seen"], true);
-      await foldersStore.fetchFolders();
-      if (foldersStore.activeFolderPath === folder.path) {
-        await messagesStore.fetchMessages();
-      }
     }
   } catch (e) {
     console.error("Mark folder read failed:", e);
@@ -344,8 +333,6 @@ async function doDeleteFolder() {
 
   try {
     await api.deleteFolder(accountId, folder.path);
-    await foldersStore.fetchAllAccountFolders();
-    await foldersStore.fetchFolders();
     // If the deleted folder was active on this account, switch to inbox
     if (
       accountsStore.activeAccountId === accountId &&

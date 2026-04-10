@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
+
 /// (message_id, uid, flags_json) tuple for prefetch grouping.
 type PrefetchMsg = (String, u32, String);
 
@@ -251,6 +253,8 @@ pub async fn sync_folder(
                     "total_synced": count,
                 }),
             ).ok();
+            emit_folders_changed(&app, &account_id);
+            emit_messages_changed(&app, &account_id);
             log::info!("Single folder sync done: {} new in {}", count, folder_path);
         }
         Err(e) => {
@@ -722,6 +726,8 @@ async fn sync_graph_account(
         "account_id": account_id,
         "total_synced": grand_total,
     })).ok();
+    emit_folders_changed(&app, account_id);
+    emit_messages_changed(&app, account_id);
 
     log::info!("Graph sync: completed for account {}, {} new messages", account_id, grand_total);
     Ok(())

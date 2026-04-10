@@ -431,8 +431,6 @@ async function deleteMessage() {
     await api.deleteMessages(accountId, [msgId]);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Delete failed:", e);
   }
@@ -451,8 +449,6 @@ async function archiveMessage() {
     await api.moveMessages(accountId, [msgId], folder.path);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Archive failed:", e);
   }
@@ -471,8 +467,6 @@ async function markSpam() {
     await api.moveMessages(accountId, [msgId], folder.path);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Spam move failed:", e);
   }

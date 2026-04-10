@@ -30,8 +30,6 @@ async function markNotSpam() {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Not Spam failed:", e);
   }

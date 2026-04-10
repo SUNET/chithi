@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use tauri::State;
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
@@ -34,6 +35,7 @@ async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapCo
 /// Move messages to a target folder on the IMAP/JMAP server and update local DB.
 #[tauri::command]
 pub async fn move_messages(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -138,12 +140,16 @@ pub async fn move_messages(
         target_folder
     );
 
+    emit_messages_changed(&app, &account_id);
+    emit_folders_changed(&app, &account_id);
+
     Ok(())
 }
 
 /// Delete messages on the IMAP server and remove from local DB.
 #[tauri::command]
 pub async fn delete_messages(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -237,12 +243,16 @@ pub async fn delete_messages(
         message_ids.len()
     );
 
+    emit_messages_changed(&app, &account_id);
+    emit_folders_changed(&app, &account_id);
+
     Ok(())
 }
 
 /// Set or remove flags on messages (e.g., \Seen, \Flagged).
 #[tauri::command]
 pub async fn set_message_flags(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -365,6 +375,8 @@ pub async fn set_message_flags(
         flags.join(", "),
         message_ids.len()
     );
+
+    emit_messages_changed(&app, &account_id);
 
     Ok(())
 }
