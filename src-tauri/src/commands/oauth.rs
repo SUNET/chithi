@@ -108,11 +108,20 @@ pub async fn oauth_get_token(
 }
 
 /// Check if an account has OAuth tokens stored.
+///
+/// `oauth::load_tokens` is a synchronous keyring/Secret Service call that
+/// can block for a noticeable amount of time on some Linux desktops. Run
+/// it on the blocking pool so we don't stall the tokio runtime (which
+/// would also delay the UI waiting for the result).
 #[tauri::command]
 pub async fn oauth_has_tokens(
     account_id: String,
 ) -> Result<bool> {
-    Ok(oauth::load_tokens(&account_id)?.is_some())
+    tokio::task::spawn_blocking(move || {
+        Ok(oauth::load_tokens(&account_id)?.is_some())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("keyring task panicked: {}", e)))?
 }
 
 /// Fetch the user's profile (display name + email) from Microsoft Graph.

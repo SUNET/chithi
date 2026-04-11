@@ -119,51 +119,59 @@ function openNewForm() {
 async function openEditForm(id: string) {
   editingAccountId.value = id;
   error.value = null;
+  oauthStatus.value = null;
   try {
     const config = await api.getAccountConfig(id);
     form.value = config;
     if (config.provider === "o365") {
       accountType.value = "o365";
-      try {
-        const hasTokens = await api.oauthHasTokens(id);
-        if (hasTokens) {
-          oauthStatus.value = "Signed in with Microsoft";
-        } else {
-          oauthStatus.value = null;
-        }
-      } catch { oauthStatus.value = null; }
     } else if (config.provider === "gmail") {
       accountType.value = "gmail";
-      try {
-        const hasTokens = await api.oauthHasTokens(id);
-        if (hasTokens) {
-          oauthStatus.value = "Signed in with Google";
-        } else {
-          oauthStatus.value = null;
-        }
-      } catch { oauthStatus.value = null; }
     } else if (config.mail_protocol === "jmap") {
       accountType.value = "jmap";
-      if (config.jmap_auth_method === "oidc") {
-        try {
-          const hasTokens = await api.oauthHasTokens(id);
-          if (hasTokens) {
-            oauthStatus.value = "Signed in via OIDC";
-          } else {
-            oauthStatus.value = null;
-          }
-        } catch { oauthStatus.value = null; }
-      } else {
-        oauthStatus.value = null;
-      }
     } else if (config.caldav_url && !config.imap_host) {
       accountType.value = "caldav";
     } else {
       accountType.value = "imap";
     }
+    // Open the form immediately. oauthHasTokens hits the OS keyring
+    // (blocking Secret Service call) which can take a second or two on
+    // some desktops, so we populate the status asynchronously rather
+    // than blocking the form open on it.
     showForm.value = true;
+    refreshOauthStatus(id, config);
   } catch (e) {
     error.value = String(e);
+  }
+}
+
+async function refreshOauthStatus(
+  id: string,
+  config: import("@/lib/types").AccountConfig,
+) {
+  const needsCheck =
+    config.provider === "o365" ||
+    config.provider === "gmail" ||
+    (config.mail_protocol === "jmap" && config.jmap_auth_method === "oidc");
+  if (!needsCheck) {
+    oauthStatus.value = null;
+    return;
+  }
+  try {
+    const hasTokens = await api.oauthHasTokens(id);
+    if (!hasTokens) {
+      oauthStatus.value = null;
+      return;
+    }
+    if (config.provider === "o365") {
+      oauthStatus.value = "Signed in with Microsoft";
+    } else if (config.provider === "gmail") {
+      oauthStatus.value = "Signed in with Google";
+    } else {
+      oauthStatus.value = "Signed in via OIDC";
+    }
+  } catch {
+    oauthStatus.value = null;
   }
 }
 
