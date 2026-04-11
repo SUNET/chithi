@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	pnpm install --frozen-lockfile
+	pnpm tauri build --bundles none
+
+override_dh_auto_install:
+	install -Dm755 src-tauri/target/release/chithi debian/chithi/usr/bin/chithi
+	install -Dm644 src-tauri/icons/icon.png debian/chithi/usr/share/icons/hicolor/128x128/apps/chithi.png
+	install -Dm644 debian/chithi.desktop debian/chithi/usr/share/applications/chithi.desktop
+
+override_dh_auto_test:
+	# Tests require network access and running services
+	true
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
