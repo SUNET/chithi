@@ -18,7 +18,9 @@ const isComposeWindow = computed(() => route.name === "compose");
 
 onMounted(async () => {
   uiStore.initTheme();
-  uiStore.initDecorations();
+  if (!isComposeWindow.value) {
+    uiStore.initDecorations();
+  }
   activityStore.initEventListeners();
   // Load accounts globally so all views (Calendar, Contacts, etc.) have them
   await accountsStore.fetchAccounts();
