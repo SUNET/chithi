@@ -271,6 +271,16 @@ export const useMessagesStore = defineStore("messages", () => {
     return msg;
   }
 
+  // Get a subject for a message id, searching flat messages, expanded thread
+  // messages, and thread summaries (when threading is enabled the flat list
+  // may be empty and the subject lives on the thread).
+  function subjectForMessage(messageId: string): string | null {
+    const msg = findMessage(messageId);
+    if (msg?.subject) return msg.subject;
+    const thread = threads.value.find((t) => t.message_ids.includes(messageId));
+    return thread?.subject ?? null;
+  }
+
   // Mark a message as read — updates local state immediately,
   // then syncs to IMAP in the background.
   // Handles messages in flat list, expanded threads, AND thread summaries
@@ -587,5 +597,6 @@ export const useMessagesStore = defineStore("messages", () => {
     toggleStar,
     markAsUnread,
     setReadStatus,
+    subjectForMessage,
   };
 });

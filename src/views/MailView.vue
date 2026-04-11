@@ -104,10 +104,9 @@ function onOpenMessage(messageId: string) {
   }
   const existing = messageTabs.value.find((t) => t.messageId === messageId);
   if (!existing) {
-    const msg = messagesStore.messages.find((m) => m.id === messageId);
     messageTabs.value.push({
       messageId,
-      subject: msg?.subject ?? "(no subject)",
+      subject: messagesStore.subjectForMessage(messageId) ?? "(no subject)",
     });
   }
   activateMessageTab(messageId);
