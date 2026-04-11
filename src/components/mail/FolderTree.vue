@@ -265,8 +265,14 @@ let dragExpandTimer: ReturnType<typeof setTimeout> | null = null;
 
 function onFolderMouseEnter(accountId: string, folderPath: string) {
   if (!isDragging.value) return;
-  if (dragSourceAccountId.value !== accountId) return;
-  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+  // Same-account source folder is not a valid drop target
+  if (
+    dragSourceAccountId.value === accountId &&
+    foldersStore.activeFolderPath === folderPath &&
+    accountsStore.activeAccountId === accountId
+  ) {
+    return;
+  }
   dropTarget.value = `${accountId}:${folderPath}`;
   if (isFolderCollapsed(accountId, folderPath)) {
     dragExpandTimer = setTimeout(() => {
@@ -288,12 +294,29 @@ function onFolderMouseLeave(accountId: string, folderPath: string) {
 async function onFolderMouseUp(accountId: string, folderPath: string) {
   if (!isDragging.value || dragMessageIds.value.length === 0) return;
   dropTarget.value = null;
-  if (dragSourceAccountId.value !== accountId) return;
-  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+  const sourceAccountId = dragSourceAccountId.value;
+  if (!sourceAccountId) return;
+  // Dropping onto the source's current folder is a no-op
+  if (
+    sourceAccountId === accountId &&
+    foldersStore.activeFolderPath === folderPath &&
+    accountsStore.activeAccountId === accountId
+  ) {
+    return;
+  }
 
   const messageIds = [...dragMessageIds.value];
   try {
-    await api.moveMessages(accountId, messageIds, folderPath);
+    if (sourceAccountId === accountId) {
+      await api.moveMessages(accountId, messageIds, folderPath);
+    } else {
+      await api.moveMessagesCrossAccount(
+        sourceAccountId,
+        messageIds,
+        accountId,
+        folderPath,
+      );
+    }
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;

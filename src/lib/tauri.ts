@@ -140,6 +140,20 @@ export async function moveMessages(
   return invoke("move_messages", { accountId, messageIds, targetFolder });
 }
 
+export async function moveMessagesCrossAccount(
+  sourceAccountId: string,
+  messageIds: string[],
+  targetAccountId: string,
+  targetFolder: string,
+): Promise<void> {
+  return invoke("move_messages_cross_account", {
+    sourceAccountId,
+    messageIds,
+    targetAccountId,
+    targetFolder,
+  });
+}
+
 export async function deleteMessages(
   accountId: string,
   messageIds: string[],

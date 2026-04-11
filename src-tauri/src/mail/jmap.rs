@@ -491,6 +491,69 @@ impl JmapConnection {
         self.api_request(&request, config).await?;
         Ok(())
     }
+    /// Import a raw RFC822 email into a specific mailbox on this account.
+    ///
+    /// Uploads the message as a blob, then issues Email/import so the server
+    /// stores it with the given mailbox membership and keywords. Used by
+    /// cross-account move — the caller reads the source bytes from maildir
+    /// and asks this account to accept them.
+    pub async fn import_email_to_mailbox(
+        &self,
+        config: &JmapConfig,
+        raw_message: &[u8],
+        mailbox_id: &str,
+        seen: bool,
+    ) -> Result<()> {
+        log::debug!(
+            "JMAP importing {} bytes into mailbox {}",
+            raw_message.len(),
+            mailbox_id
+        );
+
+        let upload_url = self.upload_url_template
+            .replace("{accountId}", &self.account_id);
+        let resp = config.apply_auth(self.http.post(&upload_url))
+            .header("Content-Type", "message/rfc822")
+            .body(raw_message.to_vec())
+            .send().await
+            .map_err(|e| Error::Other(format!("JMAP upload failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Other(format!("JMAP upload error {}: {}", status, body)));
+        }
+
+        let upload_resp: serde_json::Value = resp.json().await
+            .map_err(|e| Error::Other(format!("JMAP upload response parse error: {}", e)))?;
+        let blob_id = upload_resp["blobId"].as_str()
+            .ok_or_else(|| Error::Other("No blobId in upload response".into()))?
+            .to_string();
+
+        let mut keywords = serde_json::Map::new();
+        if seen {
+            keywords.insert("$seen".to_string(), serde_json::json!(true));
+        }
+
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Email/import", {
+                    "accountId": self.account_id,
+                    "emails": {
+                        "e1": {
+                            "blobId": blob_id,
+                            "mailboxIds": { mailbox_id: true },
+                            "keywords": keywords
+                        }
+                    }
+                }, "i1"]
+            ]
+        });
+        self.api_request(&request, config).await?;
+        Ok(())
+    }
+
     pub async fn send_email(&self, config: &JmapConfig, raw_message: &[u8]) -> Result<()> {
         log::info!("JMAP sending email ({} bytes)", raw_message.len());
 

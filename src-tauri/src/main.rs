@@ -72,6 +72,7 @@ fn main() {
             commands::oauth::jmap_oidc_start,
             commands::oauth::jmap_oidc_complete,
             commands::actions::move_messages,
+            commands::actions::move_messages_cross_account,
             commands::actions::delete_messages,
             commands::actions::set_message_flags,
             commands::actions::copy_messages,

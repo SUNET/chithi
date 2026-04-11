@@ -400,6 +400,45 @@ pub fn get_message_uids(
     Ok(rows)
 }
 
+/// Returns (message_id, maildir_path) pairs for each of the given IDs.
+/// Rows with empty maildir_path are omitted.
+pub fn get_maildir_paths(
+    conn: &Connection,
+    message_ids: &[String],
+) -> Result<Vec<(String, String)>> {
+    if message_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!(
+        "SELECT id, maildir_path FROM messages
+         WHERE id IN ({}) AND maildir_path != ''",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(rows)
+}
+
 /// Delete messages from the local database by their IDs.
 pub fn delete_messages_by_ids(conn: &Connection, message_ids: &[String]) -> Result<()> {
     if message_ids.is_empty() {
@@ -842,4 +881,89 @@ pub fn unthread_message(conn: &Connection, message_id: &str) -> Result<()> {
         new_thread_id
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                uid INTEGER,
+                message_id TEXT,
+                in_reply_to TEXT,
+                thread_id TEXT,
+                subject TEXT,
+                from_name TEXT,
+                from_email TEXT,
+                to_addresses TEXT,
+                cc_addresses TEXT,
+                date TEXT NOT NULL,
+                size INTEGER,
+                has_attachments INTEGER DEFAULT 0,
+                is_encrypted INTEGER DEFAULT 0,
+                is_signed INTEGER DEFAULT 0,
+                flags TEXT DEFAULT '[]',
+                maildir_path TEXT,
+                snippet TEXT
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_row(conn: &Connection, id: &str, account_id: &str, maildir_path: &str) {
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path, date, maildir_path)
+             VALUES (?1, ?2, 'INBOX', '2026-04-11T00:00:00Z', ?3)",
+            params![id, account_id, maildir_path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_get_maildir_paths_returns_matching_rows() {
+        let conn = setup_db();
+        insert_row(&conn, "msg1", "acc1", "acc1/INBOX/cur/1:2,S");
+        insert_row(&conn, "msg2", "acc1", "acc1/INBOX/cur/2:2,S");
+        insert_row(&conn, "msg3", "acc1", "acc1/INBOX/cur/3:2,S");
+
+        let ids = vec!["msg1".to_string(), "msg3".to_string()];
+        let paths = get_maildir_paths(&conn, &ids).unwrap();
+
+        assert_eq!(paths.len(), 2);
+        let map: std::collections::HashMap<_, _> = paths.into_iter().collect();
+        assert_eq!(map.get("msg1").map(String::as_str), Some("acc1/INBOX/cur/1:2,S"));
+        assert_eq!(map.get("msg3").map(String::as_str), Some("acc1/INBOX/cur/3:2,S"));
+    }
+
+    #[test]
+    fn test_get_maildir_paths_skips_empty_paths() {
+        // Regression: cross-account move requires a non-empty maildir path so
+        // the caller knows the message body has been synced. Rows with an
+        // empty path (not-yet-fetched bodies) must be filtered out so the
+        // caller can detect the mismatch.
+        let conn = setup_db();
+        insert_row(&conn, "msg1", "acc1", "acc1/INBOX/cur/1:2,S");
+        insert_row(&conn, "msg2", "acc1", "");
+
+        let ids = vec!["msg1".to_string(), "msg2".to_string()];
+        let paths = get_maildir_paths(&conn, &ids).unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "msg1");
+    }
+
+    #[test]
+    fn test_get_maildir_paths_empty_input() {
+        let conn = setup_db();
+        let paths = get_maildir_paths(&conn, &[]).unwrap();
+        assert!(paths.is_empty());
+    }
 }

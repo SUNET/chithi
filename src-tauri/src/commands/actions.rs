@@ -230,6 +230,122 @@ pub async fn delete_messages(
     Ok(())
 }
 
+/// Move messages from one account to a folder in a *different* account.
+///
+/// Reads the raw RFC822 bytes from the source account's maildir, appends
+/// them to the destination folder via the destination protocol, and then
+/// deletes the source messages (on the server and in the local DB).
+///
+/// A destination of IMAP or JMAP is supported. Graph (O365) is not yet
+/// supported as a destination.
+#[tauri::command]
+pub async fn move_messages_cross_account(
+    state: State<'_, AppState>,
+    source_account_id: String,
+    message_ids: Vec<String>,
+    target_account_id: String,
+    target_folder: String,
+) -> Result<()> {
+    log::info!(
+        "Cross-account move: {} -> {}/{} ({} messages)",
+        source_account_id,
+        target_account_id,
+        target_folder,
+        message_ids.len()
+    );
+
+    if source_account_id == target_account_id {
+        return Err(Error::Other(
+            "Use move_messages for same-account moves".into(),
+        ));
+    }
+
+    // Load both accounts and the maildir paths in a single DB lock
+    let (target_account, maildir_paths) = {
+        let conn = state.db.lock().await;
+        let target = db::accounts::get_account_full(&conn, &target_account_id)?;
+        let paths = db::messages::get_maildir_paths(&conn, &message_ids)?;
+        (target, paths)
+    };
+
+    if maildir_paths.len() != message_ids.len() {
+        return Err(Error::Other(format!(
+            "Cross-account move requires all messages to be synced locally \
+             (found {}/{} maildir files). Sync the source folder first.",
+            maildir_paths.len(),
+            message_ids.len()
+        )));
+    }
+
+    // Read raw bytes from disk (ordered the same as message_ids for logging)
+    let mut raw_messages: Vec<Vec<u8>> = Vec::with_capacity(maildir_paths.len());
+    for (_, maildir_path) in &maildir_paths {
+        let full_path = state.data_dir.join(maildir_path);
+        let bytes = std::fs::read(&full_path).map_err(|e| {
+            Error::Other(format!(
+                "Failed to read maildir file {}: {}",
+                full_path.display(),
+                e
+            ))
+        })?;
+        raw_messages.push(bytes);
+    }
+
+    // Append to destination
+    match target_account.mail_protocol.as_str() {
+        "imap" => {
+            let imap_config = build_imap_config(&target_account).await?;
+            let target_folder_clone = target_folder.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = ImapConnection::connect(&imap_config)?;
+                for bytes in &raw_messages {
+                    conn.append_message(&target_folder_clone, bytes)?;
+                }
+                conn.logout();
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Other(format!("IMAP append task panicked: {}", e)))??;
+        }
+        "jmap" => {
+            let jmap_config =
+                crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
+            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            // In Chithi's JMAP store, the folder path IS the mailbox id.
+            for bytes in &raw_messages {
+                conn_jmap
+                    .import_email_to_mailbox(&jmap_config, bytes, &target_folder, true)
+                    .await?;
+            }
+        }
+        "graph" => {
+            return Err(Error::Other(
+                "Cross-account move to Microsoft 365 (Graph) is not yet supported. \
+                 Use the same-account move or export/reimport manually."
+                    .into(),
+            ));
+        }
+        other => {
+            return Err(Error::Other(format!(
+                "Unknown mail protocol for destination account: {}",
+                other
+            )));
+        }
+    }
+
+    // Append succeeded — now delete from source (server-side + local DB).
+    // Delegating to delete_messages keeps protocol routing in one place.
+    delete_messages(state, source_account_id.clone(), message_ids.clone()).await?;
+
+    log::info!(
+        "Cross-account move complete: {} messages moved to {}/{}",
+        message_ids.len(),
+        target_account_id,
+        target_folder
+    );
+    Ok(())
+}
+
 /// Set or remove flags on messages (e.g., \Seen, \Flagged).
 #[tauri::command]
 pub async fn set_message_flags(
