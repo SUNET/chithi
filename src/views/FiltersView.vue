@@ -179,7 +179,7 @@ const opLabels: Record<string, string> = {
             {{ acc.display_name }}
           </option>
         </select>
-        <button class="btn-new-filter" :disabled="!accountsStore.activeAccountId" @click="newFilter">
+        <button class="btn-new-filter" :disabled="!accountsStore.activeAccountId" data-testid="filter-new-btn" @click="newFilter">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
           New Filter
         </button>
@@ -191,6 +191,7 @@ const opLabels: Record<string, string> = {
           :key="rule.id"
           class="filter-item"
           :class="{ active: editingRule?.id === rule.id, disabled: !rule.enabled }"
+          :data-testid="`filter-rule-${rule.id}`"
           @click="editFilter(rule)"
         >
           <div class="filter-drag">
@@ -228,7 +229,7 @@ const opLabels: Record<string, string> = {
             {{ f.name }}
           </option>
         </select>
-        <button class="btn-apply" :disabled="!applyingFolder" @click="applyToFolder">
+        <button class="btn-apply" :disabled="!applyingFolder" data-testid="filter-apply-btn" @click="applyToFolder">
           Apply Filters to Folder
         </button>
         <span v-if="applyResult" class="apply-result">{{ applyResult }}</span>
@@ -352,13 +353,13 @@ const opLabels: Record<string, string> = {
 
         <!-- Footer -->
         <div class="editor-footer">
-          <button v-if="editingRule.id && filtersStore.filters.some(f => f.id === editingRule?.id)" class="btn-delete" @click="deleteFilter(editingRule.id)">
+          <button v-if="editingRule.id && filtersStore.filters.some(f => f.id === editingRule?.id)" class="btn-delete" data-testid="filter-delete-btn" @click="deleteFilter(editingRule.id)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
             Delete
           </button>
           <div class="footer-right">
             <button class="btn-cancel" @click="editingRule = null">Cancel</button>
-            <button class="btn-save" @click="saveFilter">Save Filter</button>
+            <button class="btn-save" data-testid="filter-save-btn" @click="saveFilter">Save Filter</button>
           </div>
         </div>
       </div>

@@ -61,7 +61,7 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 </script>
 
 <template>
-  <div class="month-view">
+  <div class="month-view" data-testid="cal-month-view">
     <div class="month-header">
       <div v-for="name in dayNames" :key="name" class="month-day-name">{{ name }}</div>
     </div>
@@ -83,6 +83,7 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
               v-for="event in getEventsForDay(day).slice(0, 3)"
               :key="event.id"
               class="month-event"
+              :data-testid="`cal-event-${event.id}`"
               :style="{ backgroundColor: getEventColor(event) }"
               @click.stop="emit('eventClick', event.id)"
             >

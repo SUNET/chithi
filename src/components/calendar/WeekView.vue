@@ -133,7 +133,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="week-view">
+  <div class="week-view" :data-testid="singleDay ? 'cal-day-view' : 'cal-week-view'">
     <!-- All-day events banner -->
     <div class="all-day-row">
       <div class="time-gutter all-day-label">all-day</div>
@@ -147,6 +147,7 @@ onMounted(async () => {
           v-for="event in getAllDayEvents(day)"
           :key="event.id"
           class="all-day-event"
+          :data-testid="`cal-event-${event.id}`"
           :style="{ backgroundColor: getEventColor(event), ...getEventStyle(event) }"
           @click="emit('eventClick', event.id)"
         >
@@ -192,6 +193,7 @@ onMounted(async () => {
             v-for="event in getEventsForDayHour(day, hour)"
             :key="event.id"
             class="event-block"
+            :data-testid="`cal-event-${event.id}`"
             :style="{ backgroundColor: getEventColor(event), ...getEventStyle(event) }"
             @click.stop="emit('eventClick', event.id)"
           >

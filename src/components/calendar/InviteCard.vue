@@ -95,6 +95,7 @@ async function respond(response: string) {
     <div v-else class="invite-actions">
       <button
         class="btn-accept"
+        data-testid="invite-accept"
         :disabled="responding"
         @click="respond('accepted')"
       >
@@ -105,6 +106,7 @@ async function respond(response: string) {
       </button>
       <button
         class="btn-maybe"
+        data-testid="invite-tentative"
         :disabled="responding"
         @click="respond('tentative')"
       >
@@ -115,6 +117,7 @@ async function respond(response: string) {
       </button>
       <button
         class="btn-decline"
+        data-testid="invite-decline"
         :disabled="responding"
         @click="respond('declined')"
       >

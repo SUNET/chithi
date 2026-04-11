@@ -431,8 +431,6 @@ async function deleteMessage() {
     await api.deleteMessages(accountId, [msgId]);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Delete failed:", e);
   }
@@ -451,8 +449,6 @@ async function archiveMessage() {
     await api.moveMessages(accountId, [msgId], folder.path);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Archive failed:", e);
   }
@@ -471,8 +467,6 @@ async function markSpam() {
     await api.moveMessages(accountId, [msgId], folder.path);
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Spam move failed:", e);
   }
@@ -530,6 +524,7 @@ async function markSpam() {
               class="toggle-btn"
               :class="{ active: showHtml }"
               title="HTML"
+              data-testid="reader-html-toggle"
               @click="showHtml = true"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -541,8 +536,8 @@ async function markSpam() {
       </div>
 
       <div class="message-headers">
-        <h2 class="message-subject">{{ messagesStore.activeMessage.subject || "(no subject)" }}</h2>
-        <div class="header-row">
+        <h2 class="message-subject" data-testid="reader-subject">{{ messagesStore.activeMessage.subject || "(no subject)" }}</h2>
+        <div class="header-row" data-testid="reader-from">
           <span class="header-label">From:</span>
           <span class="header-value">
             <span class="addr-clickable" @contextmenu="onAddrRightClick($event, messagesStore.activeMessage.from.email, messagesStore.activeMessage.from.name)">
@@ -551,7 +546,7 @@ async function markSpam() {
             </span>
           </span>
         </div>
-        <div class="header-row">
+        <div class="header-row" data-testid="reader-to">
           <span class="header-label">To:</span>
           <span class="header-value">
             <span v-for="(addr, i) in messagesStore.activeMessage.to" :key="i" class="addr-clickable" @contextmenu="onAddrRightClick($event, addr.email, addr.name)">
@@ -567,7 +562,7 @@ async function markSpam() {
             </span>
           </span>
         </div>
-        <div class="header-row">
+        <div class="header-row" data-testid="reader-date">
           <span class="header-label">Date:</span>
           <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString() }}</span>
         </div>
@@ -598,6 +593,7 @@ async function markSpam() {
             v-for="att in messagesStore.activeMessage.attachments"
             :key="att.index"
             class="attachment-chip"
+            :data-testid="`attachment-${att.index}`"
             :disabled="savingAttachment === att.index"
             @click="saveAttachment(att.index, att.filename)"
           >
@@ -615,12 +611,13 @@ async function markSpam() {
         >
           <div v-if="!imagesHtml" class="no-remote-notice">
             Remote content blocked
-            <button class="load-images-btn" :disabled="loadingImages" @click="loadRemoteImages">
+            <button class="load-images-btn" data-testid="reader-load-images" :disabled="loadingImages" @click="loadRemoteImages">
               {{ loadingImages ? 'Loading...' : 'Load images' }}
             </button>
           </div>
           <iframe
             class="email-sandbox"
+            data-testid="reader-body-iframe"
             :srcdoc="iframeSrcdoc()"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
@@ -637,12 +634,13 @@ async function markSpam() {
         >
           <div v-if="!imagesHtml" class="no-remote-notice">
             Remote content blocked
-            <button class="load-images-btn" :disabled="loadingImages" @click="loadRemoteImages">
+            <button class="load-images-btn" data-testid="reader-load-images" :disabled="loadingImages" @click="loadRemoteImages">
               {{ loadingImages ? 'Loading...' : 'Load images' }}
             </button>
           </div>
           <iframe
             class="email-sandbox"
+            data-testid="reader-body-iframe"
             :srcdoc="iframeSrcdoc()"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"

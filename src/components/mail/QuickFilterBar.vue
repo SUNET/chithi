@@ -17,12 +17,14 @@ function onTextInput() {
             v-model="messagesStore.quickFilterText"
             type="text"
             class="filter-input"
+            data-testid="filter-text-input"
             placeholder="Filter messages... (/)"
             @input="onTextInput"
           />
           <button
             v-if="messagesStore.hasActiveFilter"
             class="clear-icon"
+            data-testid="filter-clear"
             @click="messagesStore.clearQuickFilters()"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
@@ -32,6 +34,7 @@ function onTextInput() {
       <div class="filter-right">
         <button
           class="filter-btn"
+          data-testid="filter-unread"
           :class="{ active: messagesStore.quickFilter.unread }"
           @click="messagesStore.toggleQuickFilter('unread')"
         >
@@ -40,6 +43,7 @@ function onTextInput() {
         </button>
         <button
           class="filter-btn"
+          data-testid="filter-starred"
           :class="{ active: messagesStore.quickFilter.starred }"
           @click="messagesStore.toggleQuickFilter('starred')"
         >
@@ -48,6 +52,7 @@ function onTextInput() {
         </button>
         <button
           class="filter-btn"
+          data-testid="filter-contact"
           :class="{ active: messagesStore.quickFilter.contact }"
           @click="messagesStore.toggleQuickFilter('contact')"
         >
@@ -56,6 +61,7 @@ function onTextInput() {
         </button>
         <button
           class="filter-btn"
+          data-testid="filter-attachment"
           :class="{ active: messagesStore.quickFilter.has_attachment }"
           @click="messagesStore.toggleQuickFilter('has_attachment')"
         >
@@ -69,21 +75,25 @@ function onTextInput() {
       <button
         class="field-btn"
         :class="{ active: messagesStore.quickFilterFields.length === 0 || messagesStore.quickFilterFields.includes('sender') }"
+        data-testid="filter-field-sender"
         @click="messagesStore.toggleTextField('sender')"
       >Sender</button>
       <button
         class="field-btn"
         :class="{ active: messagesStore.quickFilterFields.length === 0 || messagesStore.quickFilterFields.includes('recipients') }"
+        data-testid="filter-field-recipients"
         @click="messagesStore.toggleTextField('recipients')"
       >Recipients</button>
       <button
         class="field-btn"
         :class="{ active: messagesStore.quickFilterFields.length === 0 || messagesStore.quickFilterFields.includes('subject') }"
+        data-testid="filter-field-subject"
         @click="messagesStore.toggleTextField('subject')"
       >Subject</button>
       <button
         class="field-btn"
         :class="{ active: messagesStore.quickFilterFields.length === 0 || messagesStore.quickFilterFields.includes('body') }"
+        data-testid="filter-field-body"
         @click="messagesStore.toggleTextField('body')"
       >Body</button>
     </div>

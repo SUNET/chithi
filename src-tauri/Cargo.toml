@@ -38,10 +38,10 @@ uppsala = "0.3"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 mime_guess = "2"
 urlencoding = "2"
+utf7-imap = "0.3"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
-utf7-imap = "0.3.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

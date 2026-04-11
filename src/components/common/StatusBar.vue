@@ -83,8 +83,8 @@ async function syncAll() {
         Sync
       </button>
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
-      <span class="status-dot" :class="connectionStatus"></span>
-      <span v-if="syncError" class="sync-error-msg">{{ syncError }}</span>
+      <span class="status-dot" :class="connectionStatus" data-testid="sync-status"></span>
+      <span v-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
       <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
       <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>

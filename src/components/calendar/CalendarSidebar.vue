@@ -62,6 +62,7 @@ async function syncThisCalendar() {
             type="checkbox"
             :checked="!calendarStore.hiddenCalendarIds.includes(cal.id)"
             @change="calendarStore.toggleCalendarVisibility(cal.id)"
+            data-testid="calendar-toggle"
           />
           <span
             class="calendar-color"
@@ -83,7 +84,7 @@ async function syncThisCalendar() {
         class="cal-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
-        <button class="ctx-item" @click="syncThisCalendar">Sync this calendar</button>
+        <button class="ctx-item" @click="syncThisCalendar" data-testid="calendar-sync">Sync this calendar</button>
       </div>
     </Teleport>
   </div>

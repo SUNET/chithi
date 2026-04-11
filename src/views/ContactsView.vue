@@ -227,7 +227,7 @@ function getAccountName(accountId: string): string {
   <div class="contacts-view">
     <!-- Toolbar -->
     <div class="contacts-toolbar">
-      <button class="btn-new" @click="openNewForm">
+      <button class="btn-new" data-testid="contacts-new-btn" @click="openNewForm">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><line x1="20" y1="8" x2="20" y2="14" /><line x1="23" y1="11" x2="17" y2="11" /></svg>
         New Contact
       </button>
@@ -240,7 +240,7 @@ function getAccountName(accountId: string): string {
 
     <div class="contacts-body">
       <!-- Left: Contact Books -->
-      <div class="books-sidebar">
+      <div class="books-sidebar" data-testid="contacts-book-select">
         <div
           v-for="(book, idx) in contactBooks"
           :key="book.id"
@@ -264,7 +264,7 @@ function getAccountName(accountId: string): string {
       <div class="contact-list-panel">
         <div class="search-bar">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input v-model="searchQuery" type="text" placeholder="Search contacts..." />
+          <input v-model="searchQuery" type="text" placeholder="Search contacts..." data-testid="contacts-search" />
         </div>
         <div class="contact-list">
           <div
@@ -272,6 +272,7 @@ function getAccountName(accountId: string): string {
             :key="contact.id"
             class="contact-row"
             :class="{ active: selectedContact?.id === contact.id }"
+            :data-testid="`contact-${contact.id}`"
             @click="selectContact(contact)"
           >
             <div class="contact-avatar">{{ contact.display_name.charAt(0).toUpperCase() }}</div>
@@ -293,18 +294,18 @@ function getAccountName(accountId: string): string {
           <div class="detail-header">
             <div class="detail-avatar">{{ selectedContact.display_name.charAt(0).toUpperCase() }}</div>
             <div class="detail-info">
-              <h2>{{ selectedContact.display_name }}</h2>
+              <h2 data-testid="contact-detail-name">{{ selectedContact.display_name }}</h2>
               <span v-if="selectedContact.organization" class="detail-org">
                 {{ selectedContact.title ? `${selectedContact.title}, ` : "" }}{{ selectedContact.organization }}
               </span>
             </div>
           </div>
           <div class="detail-actions">
-            <button class="action-btn" @click="openEditForm(selectedContact!)">
+            <button class="action-btn" data-testid="contact-edit-btn" @click="openEditForm(selectedContact!)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
               Edit
             </button>
-            <button class="action-btn danger" @click="confirmDelete(selectedContact!.id)">
+            <button class="action-btn danger" data-testid="contact-delete-btn" @click="confirmDelete(selectedContact!.id)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
               Delete
             </button>
@@ -312,11 +313,11 @@ function getAccountName(accountId: string): string {
           <div class="detail-fields">
             <div v-for="em in parseEmails(selectedContact.emails_json)" :key="em.email" class="field-row">
               <span class="field-label">{{ em.label }}</span>
-              <span class="field-value">{{ em.email }}</span>
+              <span class="field-value" data-testid="contact-detail-email">{{ em.email }}</span>
             </div>
             <div v-for="ph in parsePhones(selectedContact.phones_json)" :key="ph.number" class="field-row">
               <span class="field-label">{{ ph.label }}</span>
-              <span class="field-value">{{ ph.number }}</span>
+              <span class="field-value" data-testid="contact-detail-phone">{{ ph.number }}</span>
             </div>
             <div v-if="selectedContact.notes" class="field-row">
               <span class="field-label">Notes</span>
@@ -410,7 +411,7 @@ function getAccountName(accountId: string): string {
           </div>
           <div class="modal-footer">
             <button class="btn-cancel" @click="showForm = false">Cancel</button>
-            <button class="btn-save" :disabled="saving" @click="saveContact">
+            <button class="btn-save" :disabled="saving" data-testid="contact-save-btn" @click="saveContact">
               {{ saving ? "Saving..." : editingContactId ? "Save" : "Add Contact" }}
             </button>
           </div>

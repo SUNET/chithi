@@ -64,20 +64,22 @@ function isReply(subject: string | null, flags: string[]): boolean {
       <span
         class="icon-read"
         :class="{ unread: isUnread(message.flags) }"
+        data-testid="msg-unread-dot"
       >&#x25CF;</span>
       <span
         class="icon-star"
         :class="{ starred: isStarred(message.flags) }"
+        data-testid="msg-star"
       >{{ isStarred(message.flags) ? '\u2605' : '\u2606' }}</span>
     </div>
     <div class="col col-subject" :class="{ bold: isUnread(message.flags) }">
       <span v-if="isReply(message.subject, message.flags)" class="reply-icon">&hookleftarrow;</span>
-      <span class="subject-text">{{ message.subject || "(no subject)" }}</span>
+      <span class="subject-text" data-testid="msg-subject">{{ message.subject || "(no subject)" }}</span>
     </div>
-    <div class="col col-from" :class="{ bold: isUnread(message.flags) }">
+    <div class="col col-from" :class="{ bold: isUnread(message.flags) }" data-testid="msg-from">
       {{ message.from_name || message.from_email }}
     </div>
-    <div class="col col-date">
+    <div class="col col-date" data-testid="msg-date">
       {{ formatDate(message.date) }}
     </div>
   </div>

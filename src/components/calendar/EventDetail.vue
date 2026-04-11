@@ -196,7 +196,7 @@ async function handleDelete() {
     <div class="event-detail">
       <div class="detail-header">
         <h3 v-if="!editing">{{ event.title }}</h3>
-        <input v-else v-model="editTitle" class="edit-title" type="text" />
+        <input v-else v-model="editTitle" class="edit-title" type="text" data-testid="event-form-title" />
         <button class="close-btn" @click="emit('close')">&times;</button>
       </div>
 
@@ -258,32 +258,32 @@ async function handleDelete() {
       <!-- Edit mode -->
       <div v-else class="detail-body edit-mode">
         <label class="checkbox-row">
-          <input type="checkbox" v-model="editAllDay" />
+          <input type="checkbox" v-model="editAllDay" data-testid="event-form-allday" />
           All day
         </label>
         <div class="edit-row">
           <div class="edit-group">
             <label>Start date</label>
-            <input v-model="editStartDate" type="date" />
+            <input v-model="editStartDate" type="date" data-testid="event-form-start" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>Start time</label>
-            <input v-model="editStartTime" type="time" />
+            <input v-model="editStartTime" type="time" data-testid="event-form-start-time" />
           </div>
         </div>
         <div class="edit-row">
           <div class="edit-group">
             <label>End date</label>
-            <input v-model="editEndDate" type="date" />
+            <input v-model="editEndDate" type="date" data-testid="event-form-end" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>End time</label>
-            <input v-model="editEndTime" type="time" />
+            <input v-model="editEndTime" type="time" data-testid="event-form-end-time" />
           </div>
         </div>
         <div class="edit-group">
           <label>Location</label>
-          <input v-model="editLocation" type="text" placeholder="Location" />
+          <input v-model="editLocation" type="text" placeholder="Location" data-testid="event-form-location" />
         </div>
         <div class="edit-group">
           <label>Description</label>
@@ -294,10 +294,10 @@ async function handleDelete() {
       <div class="detail-footer">
         <template v-if="!editing">
           <button class="btn-edit" @click="startEditing">Edit</button>
-          <button class="btn-danger" @click="handleDelete">Delete</button>
+          <button class="btn-danger" @click="handleDelete" data-testid="event-form-delete">Delete</button>
         </template>
         <template v-else>
-          <button class="btn-save" :disabled="saving" @click="saveEdit">
+          <button class="btn-save" :disabled="saving" @click="saveEdit" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Save" }}
           </button>
           <button class="btn-cancel" @click="editing = false">Cancel</button>
