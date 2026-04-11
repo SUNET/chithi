@@ -36,10 +36,15 @@ export const useCalendarStore = defineStore("calendar", () => {
   }
 
   function saveHiddenCalendarIds() {
-    localStorage.setItem(
-      HIDDEN_CALENDARS_KEY,
-      JSON.stringify(hiddenCalendarIds.value),
-    );
+    try {
+      localStorage.setItem(
+        HIDDEN_CALENDARS_KEY,
+        JSON.stringify(hiddenCalendarIds.value),
+      );
+    } catch {
+      // Swallow quota / disabled-storage errors so toggling visibility
+      // never breaks the calendar UI.
+    }
   }
 
   // Expand recurring events into individual occurrences for display

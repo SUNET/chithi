@@ -81,11 +81,17 @@ function makeEvent(
   };
 }
 
+// Applies to every describe/test in this file so localStorage state doesn't
+// leak from the Calendar store suite (which persists hidden calendar IDs)
+// into InviteCard / EventForm / regression suites below.
+beforeEach(() => {
+  localStorage.clear();
+});
+
 describe("Calendar store", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
-    localStorage.clear();
   });
 
   describe("createEvent", () => {
