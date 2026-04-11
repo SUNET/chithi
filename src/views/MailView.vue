@@ -7,6 +7,7 @@ import { useFoldersStore } from "@/stores/folders";
 import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/tauri";
+import { openReaderWindow } from "@/lib/reader-window";
 import Toolbar from "@/components/mail/Toolbar.vue";
 import FolderTree from "@/components/mail/FolderTree.vue";
 import MessageList from "@/components/mail/MessageList.vue";
@@ -22,13 +23,13 @@ const showRightReader = computed(() =>
   uiStore.messageViewMode === "right" && uiStore.readerVisible,
 );
 
-// Bottom mode: show tab bar + reader under the list once a tab is opened
+// Bottom mode: reader pane stacked below the list (single message)
 const showBottomReader = computed(() =>
-  uiStore.messageViewMode === "bottom" && messageTabs.value.length > 0,
+  uiStore.messageViewMode === "bottom" && uiStore.readerVisible,
 );
 
-// Shared state for bottom and tab modes: open message tabs and the active one.
-// activeTabId === null means the "Messages" list tab (used in tab mode).
+// Tab mode state: open message tabs. activeTabId === null means the
+// pinned "Messages" list tab.
 interface MessageTab {
   messageId: string;
   subject: string;
@@ -95,13 +96,23 @@ function stopResize() {
   document.body.style.userSelect = "";
 }
 
-// Double-click opens the message — inline reader in right mode,
-// or a new tab in bottom/tab modes.
+// Double-click behavior depends on view mode:
+//  - right:  ensure the inline reader pane is visible
+//  - bottom: open the message in a new standalone window
+//  - tab:    open the message in a new tab (or focus existing)
 function onOpenMessage(messageId: string) {
   if (uiStore.messageViewMode === "right") {
     uiStore.showReader();
     return;
   }
+  if (uiStore.messageViewMode === "bottom") {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId) return;
+    const subject = messagesStore.subjectForMessage(messageId) ?? undefined;
+    openReaderWindow(accountId, messageId, subject);
+    return;
+  }
+  // Tab mode
   const existing = messageTabs.value.find((t) => t.messageId === messageId);
   if (!existing) {
     messageTabs.value.push({
@@ -279,29 +290,15 @@ onUnmounted(() => {
         </div>
       </template>
 
-      <!-- Bottom mode: list on top, tab bar + reader below when any tabs open -->
+      <!-- Bottom mode: message list on top, single-message reader below -->
       <template v-else-if="uiStore.messageViewMode === 'bottom'">
         <div class="stacked-content">
           <div class="message-list-pane expanded">
             <MessageList @open-message="onOpenMessage" />
           </div>
-          <template v-if="showBottomReader">
-            <div class="tab-bar">
-              <button
-                v-for="tab in messageTabs"
-                :key="tab.messageId"
-                class="tab"
-                :class="{ active: activeTabId === tab.messageId }"
-                @click="activateMessageTab(tab.messageId)"
-              >
-                <span class="tab-label">{{ tab.subject }}</span>
-                <span class="tab-close" @click.stop="closeTab(tab.messageId)">&times;</span>
-              </button>
-            </div>
-            <div class="tab-reader-pane">
-              <MessageReader @close="closeTab(activeTabId!)" />
-            </div>
-          </template>
+          <div v-if="showBottomReader" class="bottom-reader-pane">
+            <MessageReader @close="uiStore.hideReader()" />
+          </div>
         </div>
       </template>
 
@@ -420,12 +417,6 @@ onUnmounted(() => {
   gap: 2px;
 }
 
-/* In bottom mode the tab bar appears between the list and the reader,
-   so it needs a top border to visually separate it from the list above. */
-.stacked-content > .message-list-pane + .tab-bar {
-  border-top: 1px solid var(--color-border);
-}
-
 .tab {
   display: flex;
   align-items: center;
@@ -490,9 +481,10 @@ onUnmounted(() => {
   color: var(--color-text);
 }
 
-.tab-reader-pane {
+.bottom-reader-pane {
   flex: 1;
   min-height: 200px;
   overflow: auto;
+  border-top: 1px solid var(--color-border);
 }
 </style>
