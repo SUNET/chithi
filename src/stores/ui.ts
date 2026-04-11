@@ -12,7 +12,9 @@ export const useUiStore = defineStore("ui", () => {
   const folderPaneWidth = ref(200);
   const messageListWidth = ref(400);
   const readerVisible = ref(true);
-  const messageViewMode = ref<MessageViewMode>("right");
+  const messageViewMode = ref<MessageViewMode>(
+    (localStorage.getItem("chithi-message-view-mode") as MessageViewMode) || "right",
+  );
   const theme = ref<Theme>(
     (localStorage.getItem("chithi-theme") as Theme) || "light",
   );
@@ -34,6 +36,7 @@ export const useUiStore = defineStore("ui", () => {
 
   function setMessageViewMode(mode: MessageViewMode) {
     messageViewMode.value = mode;
+    localStorage.setItem("chithi-message-view-mode", mode);
   }
 
   function setTheme(t: Theme) {

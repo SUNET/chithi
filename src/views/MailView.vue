@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useAccountsStore } from "@/stores/accounts";
@@ -16,6 +16,30 @@ const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const messagesStore = useMessagesStore();
 const uiStore = useUiStore();
+
+// In right mode, reader pane shows inline next to the message list
+const showReaderPane = computed(() =>
+  uiStore.messageViewMode === "right" && uiStore.readerVisible,
+);
+
+// Tab mode state: open message tabs
+interface MessageTab {
+  messageId: string;
+  subject: string;
+}
+const openTabs = ref<MessageTab[]>([]);
+const activeTabId = ref<string | null>(null);
+
+function closeTab(messageId: string) {
+  openTabs.value = openTabs.value.filter((t) => t.messageId !== messageId);
+  if (activeTabId.value === messageId) {
+    // Switch to next tab, or clear
+    activeTabId.value = openTabs.value.length > 0 ? openTabs.value[openTabs.value.length - 1].messageId : null;
+    if (activeTabId.value) {
+      messagesStore.loadMessage(activeTabId.value);
+    }
+  }
+}
 
 // Resizing state
 const resizingPane = ref<"folder" | "list" | null>(null);
@@ -53,15 +77,20 @@ function stopResize() {
   document.body.style.userSelect = "";
 }
 
-// Double-click opens reader pane (if hidden) or tab
-function onOpenMessage(_messageId: string) {
+// Double-click opens reader pane (right mode) or tab (tab mode)
+function onOpenMessage(messageId: string) {
   if (uiStore.messageViewMode === "right") {
     uiStore.showReader();
-  }
-  // Tab mode: reader always visible as a "tab" area below or could be a separate view
-  // For now, just ensure reader is visible
-  if (!uiStore.readerVisible) {
-    uiStore.showReader();
+  } else {
+    const msg = messagesStore.messages.find((m) => m.id === messageId);
+    const existing = openTabs.value.find((t) => t.messageId === messageId);
+    if (!existing) {
+      openTabs.value.push({
+        messageId,
+        subject: msg?.subject ?? "(no subject)",
+      });
+    }
+    activeTabId.value = messageId;
   }
 }
 
@@ -213,26 +242,50 @@ onUnmounted(() => {
       </div>
       <div class="resize-handle" @mousedown="startResize('folder', $event)"></div>
 
-      <!-- Message list pane -->
-      <div
-        class="message-list-pane"
-        :style="{ width: uiStore.readerVisible ? uiStore.messageListWidth + 'px' : undefined }"
-        :class="{ expanded: !uiStore.readerVisible }"
-      >
-        <MessageList @open-message="onOpenMessage" />
-      </div>
+      <!-- Right mode: message list + reader side by side -->
+      <template v-if="uiStore.messageViewMode === 'right'">
+        <div
+          class="message-list-pane"
+          :style="{ width: showReaderPane ? uiStore.messageListWidth + 'px' : undefined }"
+          :class="{ expanded: !showReaderPane }"
+        >
+          <MessageList @open-message="onOpenMessage" />
+        </div>
+        <div
+          v-if="showReaderPane"
+          class="resize-handle"
+          @mousedown="startResize('list', $event)"
+        ></div>
+        <div v-if="showReaderPane" class="reader-pane">
+          <MessageReader @close="uiStore.hideReader()" />
+        </div>
+      </template>
 
-    <!-- Resize handle between list and reader -->
-    <div
-      v-if="uiStore.readerVisible"
-      class="resize-handle"
-      @mousedown="startResize('list', $event)"
-    ></div>
-
-      <!-- Reader pane -->
-      <div v-if="uiStore.readerVisible" class="reader-pane">
-        <MessageReader @close="uiStore.hideReader()" />
-      </div>
+      <!-- Tab mode: message list on top, tabbed reader below -->
+      <template v-else>
+        <div class="tab-mode-content">
+          <div class="message-list-pane expanded">
+            <MessageList @open-message="onOpenMessage" />
+          </div>
+          <template v-if="openTabs.length > 0">
+            <div class="tab-bar">
+              <button
+                v-for="tab in openTabs"
+                :key="tab.messageId"
+                class="tab"
+                :class="{ active: activeTabId === tab.messageId }"
+                @click="activeTabId = tab.messageId; messagesStore.loadMessage(tab.messageId)"
+              >
+                <span class="tab-label">{{ tab.subject }}</span>
+                <span class="tab-close" @click.stop="closeTab(tab.messageId)">&times;</span>
+              </button>
+            </div>
+            <div class="tab-reader-pane">
+              <MessageReader @close="closeTab(activeTabId!)" />
+            </div>
+          </template>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -281,5 +334,95 @@ onUnmounted(() => {
 
 .resize-handle:hover {
   background: var(--color-accent);
+}
+
+.tab-mode-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.tab-mode-content .message-list-pane {
+  flex: 1;
+  min-height: 150px;
+}
+
+.tab-bar {
+  display: flex;
+  align-items: center;
+  background: var(--color-bg-secondary);
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  padding: 2px 4px;
+  height: 36px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  gap: 2px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  background: transparent;
+  border-radius: 4px;
+  min-width: 120px;
+  max-width: 240px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tab:hover:not(.active) {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.tab.active {
+  background: var(--color-reader-bg);
+  color: var(--color-text);
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 2px;
+  color: var(--color-text-muted);
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity 0.1s, background 0.1s;
+}
+
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  opacity: 1;
+}
+
+.tab-close:hover {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+}
+
+.tab-reader-pane {
+  flex: 1;
+  min-height: 200px;
+  overflow: auto;
 }
 </style>
