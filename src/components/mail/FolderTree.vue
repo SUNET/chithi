@@ -168,9 +168,8 @@ function openNewFolderFromAccount() {
 }
 
 async function syncThisFolder() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
-  if (!accountId || !folder) return;
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   closeContextMenu();
 
   syncing.value = folder.path;
@@ -183,28 +182,12 @@ async function syncThisFolder() {
   }
 }
 
-function findFolderInTree(folders: Folder[], path: string): boolean {
-  for (const f of folders) {
-    if (f.path === path) return true;
-    if (findFolderInTree(f.children, path)) return true;
-  }
-  return false;
-}
-
-function findAccountForFolder(folder: Folder | undefined): string | null {
-  if (!folder) return null;
-  for (const acc of accountsStore.accounts) {
-    const folders = foldersStore.getAccountFolders(acc.id);
-    if (findFolderInTree(folders, folder.path)) return acc.id;
-  }
-  return accountsStore.activeAccountId;
-}
 
 function openNewFolderModal() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   // Default parent to the right-clicked folder's path
-  newFolderParent.value = folder ? `${accountId}|${folder.path}` : "";
+  newFolderParent.value = `${accountId}|${folder.path}`;
   newFolderName.value = "";
   newFolderError.value = null;
   closeContextMenu();
@@ -305,9 +288,8 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
 }
 
 async function markFolderRead() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
-  if (!accountId || !folder) return;
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   closeContextMenu();
 
   try {
@@ -349,8 +331,11 @@ async function doDeleteFolder() {
       const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
       foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
     }
+    showToast(`Deleted "${folder.name}"`, "success");
   } catch (e) {
     console.error("Delete folder failed:", e);
+    const message = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to delete "${folder.name}": ${message}`, "error", 5000);
   } finally {
     dismissToast(deleteToastId);
   }
