@@ -39,6 +39,11 @@ function toggleReader() {
   uiStore.toggleReader();
   closeMenus();
 }
+
+function toggleDecorations() {
+  uiStore.setDecorations(!uiStore.decorationsEnabled);
+  closeMenus();
+}
 </script>
 
 <template>
@@ -98,6 +103,14 @@ function toggleReader() {
           @click="setTheme('light')"
         >
           {{ uiStore.theme === 'light' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Light
+        </button>
+        <div class="menu-separator"></div>
+        <button
+          class="menu-action"
+          :class="{ checked: !uiStore.decorationsEnabled }"
+          @click="toggleDecorations"
+        >
+          {{ !uiStore.decorationsEnabled ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Hide Window Decorations
         </button>
       </div>
     </div>
