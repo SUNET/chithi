@@ -558,7 +558,15 @@ pub async fn delete_folder(
             password: account.password.clone(),
         };
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await?;
+        conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await.map_err(|e| {
+            log::error!(
+                "Failed to delete JMAP folder '{}' for account {}: {}",
+                folder_path,
+                account_id,
+                e
+            );
+            e
+        })?;
     } else {
         // IMAP: DELETE
         let (imap_password, imap_xoauth2) = if account.provider == "o365" {
@@ -599,7 +607,7 @@ pub async fn delete_folder(
         db::folders::delete_folder(&conn, &account_id, &folder_path)?;
     }
 
-    log::info!("Folder '{}' deleted", folder_path);
+    log::info!("Folder '{}' deleted for account {}", folder_path, account_id);
     emit_folders_changed(&app, &account_id);
     Ok(())
 }

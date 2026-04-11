@@ -1,6 +1,32 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+fn summarize_http_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_string();
+    }
+
+    if trimmed.starts_with('<') {
+        let text = regex::Regex::new(r"<[^>]+>")
+            .ok()
+            .map(|re| re.replace_all(trimmed, " ").to_string())
+            .unwrap_or_else(|| trimmed.to_string());
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            return "HTML error response".to_string();
+        }
+        return collapsed;
+    }
+
+    let single_line = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() > 240 {
+        format!("{}...", &single_line[..240])
+    } else {
+        single_line
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JMAP Calendar types
 // ---------------------------------------------------------------------------
@@ -186,7 +212,8 @@ impl JmapConnection {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP API error {}: {}", status, body)));
+            let summary = summarize_http_error_body(&body);
+            return Err(Error::Other(format!("JMAP API error {}: {}", status, summary)));
         }
 
         resp.json().await.map_err(|e| Error::Other(format!("JMAP response parse error: {}", e)))
@@ -1198,6 +1225,15 @@ impl JmapConnection {
             ]
         });
         let resp = self.api_request(&request, config).await?;
+        let method_name = resp["methodResponses"][0][0].as_str().unwrap_or("<unknown>");
+        if method_name != "Mailbox/set" {
+            log::error!("Unexpected JMAP response to mailbox destroy: {}", resp);
+            return Err(Error::Other(format!(
+                "Unexpected JMAP response to mailbox destroy: {}",
+                method_name,
+            )));
+        }
+
         let destroyed = resp["methodResponses"][0][1]["destroyed"]
             .as_array()
             .map(|a| a.iter().any(|v| v.as_str() == Some(mailbox_id)))
@@ -1206,6 +1242,12 @@ impl JmapConnection {
             let err = resp["methodResponses"][0][1]["notDestroyed"][mailbox_id]["description"]
                 .as_str()
                 .unwrap_or("Unknown error");
+            log::error!(
+                "JMAP mailbox destroy failed for {}: {}. Response: {}",
+                mailbox_id,
+                err,
+                resp
+            );
             return Err(Error::Other(format!("JMAP Mailbox/set destroy failed: {}", err)));
         }
         log::info!("JMAP mailbox destroyed: {}", mailbox_id);
