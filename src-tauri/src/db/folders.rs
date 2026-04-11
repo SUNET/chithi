@@ -121,9 +121,9 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
             }
             depth
         };
-        parent_paths.sort_by(|a, b| depth_of(b).cmp(&depth_of(a)));
+        parent_paths.sort_by_key(|p| std::cmp::Reverse(depth_of(p)));
     } else {
-        parent_paths.sort_by(|a, b| b.matches('/').count().cmp(&a.matches('/').count()));
+        parent_paths.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
     }
 
     for parent_path in parent_paths {
