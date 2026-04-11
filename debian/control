@@ -12,7 +12,7 @@ Build-Depends: debhelper-compat (= 13),
                libsoup-3.0-dev,
                libjavascriptcoregtk-4.1-dev,
                nodejs,
-               pnpm
+               npm
 Standards-Version: 4.6.2
 Homepage: https://github.com/SUNET/chithi
 Rules-Requires-Root: no
@@ -24,7 +24,6 @@ Depends: ${shlibs:Depends},
          libwebkit2gtk-4.1-0,
          libgtk-3-0,
          libayatana-appindicator3-1,
-         libssl3t64,
          libsoup-3.0-0,
          libjavascriptcoregtk-4.1-0
 Description: Desktop email client with IMAP, JMAP and Microsoft 365 support

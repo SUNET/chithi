@@ -1,11 +1,17 @@
 #!/usr/bin/make -f
 
+export CARGO_HOME = $(CURDIR)/debian/.cargo
+export PATH := $(CARGO_HOME)/bin:$(PATH)
+
 %:
 	dh $@
 
 override_dh_auto_build:
+	npm install -g corepack
+	corepack enable
+	corepack prepare pnpm@10.27.0 --activate
 	pnpm install --frozen-lockfile
-	pnpm tauri build --bundles none
+	pnpm tauri build --bundles deb
 
 override_dh_auto_install:
 	install -Dm755 src-tauri/target/release/chithi debian/chithi/usr/bin/chithi
@@ -13,8 +19,11 @@ override_dh_auto_install:
 	install -Dm644 debian/chithi.desktop debian/chithi/usr/share/applications/chithi.desktop
 
 override_dh_auto_test:
-	# Tests require network access and running services
-	true
-
-override_dh_shlibdeps:
-	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
+	# Honour DEB_BUILD_OPTIONS=nocheck; otherwise run the unit tests.
+	# Integration tests that need network / running services are opt-in
+	# and not invoked here.
+	if echo "$(DEB_BUILD_OPTIONS)" | grep -qw nocheck; then \
+		exit 0; \
+	fi
+	pnpm test -- --run
+	cd src-tauri && cargo test

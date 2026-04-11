@@ -14,26 +14,35 @@ depends=(
     'libsoup3'
 )
 makedepends=(
+    'rust'
     'cargo'
-    'rustup'
     'nodejs'
-    'pnpm'
+    'npm'
     'base-devel'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+# TODO: replace with the real SHA-256 (or b2sums) once a v0.1.0 release
+# tag exists on GitHub. Until then the package builds locally but cannot
+# be submitted to the AUR.
 sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"
-    export RUSTUP_TOOLCHAIN=stable
+    # pnpm is not a first-class Arch package; corepack (bundled with
+    # nodejs >= 16) provides a stable shim so we don't need to pin a
+    # specific pnpm version in makedepends.
+    corepack enable
+    corepack prepare pnpm@10.27.0 --activate
+
+    # Pre-fetch all dependencies so build() can run offline.
     cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+    pnpm install --frozen-lockfile
 }
 
 build() {
     cd "$pkgname-$pkgver"
-    export RUSTUP_TOOLCHAIN=stable
-    pnpm install --frozen-lockfile
-    pnpm tauri build --bundles none
+    export CARGO_NET_OFFLINE=true
+    pnpm tauri build --bundles deb
 }
 
 package() {
