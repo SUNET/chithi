@@ -372,6 +372,351 @@ pub async fn refresh_with_scopes(
 }
 
 // ---------------------------------------------------------------------------
+// OIDC discovery for JMAP
+// ---------------------------------------------------------------------------
+
+/// Discovered OIDC endpoints from .well-known/openid-configuration.
+pub struct OidcEndpoints {
+    pub token_endpoint: String,
+    pub device_authorization_endpoint: Option<String>,
+    pub registration_endpoint: Option<String>,
+}
+
+/// Discover OIDC endpoints from a JMAP server's .well-known/openid-configuration.
+/// `base_url` should be like "https://mail.example.com".
+pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
+    let url = format!("{}/.well-known/openid-configuration", base_url.trim_end_matches('/'));
+    log::info!("OIDC: discovering endpoints from {}", url);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client build error: {}", e)))?;
+
+    let resp = client.get(&url).send().await
+        .map_err(|e| Error::Other(format!("OIDC discovery failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(Error::Other(format!(
+            "OIDC discovery returned {}: server may not support OIDC", status
+        )));
+    }
+
+    let config: serde_json::Value = resp.json().await
+        .map_err(|e| Error::Other(format!("OIDC discovery parse error: {}", e)))?;
+
+    let token_endpoint = config["token_endpoint"]
+        .as_str()
+        .ok_or_else(|| Error::Other("OIDC: no token_endpoint in discovery".into()))?
+        .to_string();
+
+    if !token_endpoint.starts_with("https://") {
+        return Err(Error::Other(format!(
+            "OIDC: token_endpoint must use HTTPS, got: {}", token_endpoint
+        )));
+    }
+
+    let device_authorization_endpoint = config["device_authorization_endpoint"]
+        .as_str()
+        .map(|s| s.to_string());
+
+    if let Some(ref ep) = device_authorization_endpoint {
+        if !ep.starts_with("https://") {
+            return Err(Error::Other(format!(
+                "OIDC: device_authorization_endpoint must use HTTPS, got: {}", ep
+            )));
+        }
+    }
+
+    let registration_endpoint = config["registration_endpoint"]
+        .as_str()
+        .map(|s| s.to_string());
+
+    if let Some(ref ep) = registration_endpoint {
+        if !ep.starts_with("https://") {
+            return Err(Error::Other(format!(
+                "OIDC: registration_endpoint must use HTTPS, got: {}", ep
+            )));
+        }
+    }
+
+    log::info!("OIDC: discovered token={}, device_auth={:?}, registration={:?}",
+        token_endpoint, device_authorization_endpoint, registration_endpoint);
+
+    Ok(OidcEndpoints {
+        token_endpoint,
+        device_authorization_endpoint,
+        registration_endpoint,
+    })
+}
+
+/// Register a client dynamically via RFC 7591.
+/// Returns the assigned `client_id`.
+pub async fn register_oidc_client(registration_endpoint: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "client_name": "Chithi Mail",
+        "redirect_uris": [],
+        "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+        "response_types": [],
+        "token_endpoint_auth_method": "none",
+    });
+
+    log::info!("OIDC: registering client at {}", registration_endpoint);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+
+    let resp = client
+        .post(registration_endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("OIDC client registration failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(format!(
+            "OIDC client registration returned {}: {}", status, resp_body
+        )));
+    }
+
+    let reg_resp: serde_json::Value = resp.json().await
+        .map_err(|e| Error::Other(format!("OIDC registration parse error: {}", e)))?;
+
+    let client_id = reg_resp["client_id"]
+        .as_str()
+        .ok_or_else(|| Error::Other("OIDC: no client_id in registration response".into()))?
+        .to_string();
+
+    log::info!("OIDC: registered client_id={}", client_id);
+
+    Ok(client_id)
+}
+
+// ---------------------------------------------------------------------------
+// OAuth2 Device Authorization Grant (RFC 8628) for JMAP OIDC
+// ---------------------------------------------------------------------------
+
+/// Response from the device authorization endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceAuthResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    /// Polling interval in seconds (default 5).
+    #[serde(default = "default_interval")]
+    pub interval: u64,
+    /// Lifetime of the device code in seconds.
+    #[serde(default = "default_expires_in")]
+    pub expires_in: u64,
+}
+
+fn default_interval() -> u64 { 5 }
+fn default_expires_in() -> u64 { 600 }
+
+/// Start the device authorization flow — POST to the device authorization endpoint.
+/// Returns the device code, user code, and verification URL to show to the user.
+pub async fn device_auth_start(
+    device_auth_endpoint: &str,
+    client_id: &str,
+) -> Result<DeviceAuthResponse> {
+    if client_id.trim().is_empty() {
+        return Err(Error::Other("Device authorization requires a client_id".into()));
+    }
+
+    log::info!("OIDC device flow: requesting device code from {}", device_auth_endpoint);
+
+    let mut params = HashMap::new();
+    params.insert("client_id", client_id.to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+
+    let resp = client
+        .post(device_auth_endpoint)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("Device auth request failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(format!(
+            "Device auth endpoint returned {}: {}", status, body
+        )));
+    }
+
+    let auth_resp: DeviceAuthResponse = resp.json().await
+        .map_err(|e| Error::Other(format!("Device auth response parse error: {}", e)))?;
+
+    log::info!("OIDC device flow: received user_code, verification_uri={}",
+        auth_resp.verification_uri);
+
+    Ok(auth_resp)
+}
+
+/// Poll the token endpoint until the user completes device authorization.
+/// Returns tokens on success, or errors on expiry/denial.
+pub async fn device_auth_poll(
+    token_endpoint: &str,
+    device_code: &str,
+    interval: u64,
+    expires_in: u64,
+    client_id: &str,
+) -> Result<OAuthTokens> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    let mut current_interval = std::time::Duration::from_secs(interval);
+    let mut first_poll = true;
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Other("Device authorization timed out — user did not complete sign-in".into()));
+        }
+
+        // Sleep before polling (skip on first attempt per RFC 8628 §3.5)
+        if first_poll {
+            first_poll = false;
+        } else {
+            tokio::time::sleep(current_interval).await;
+        }
+
+        let mut params = HashMap::new();
+        params.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code".to_string());
+        params.insert("device_code", device_code.to_string());
+        if !client_id.is_empty() {
+            params.insert("client_id", client_id.to_string());
+        }
+
+        let resp = client
+            .post(token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Device token poll failed: {}", e)))?;
+
+        if resp.status().is_success() {
+            let token_resp: serde_json::Value = resp.json().await
+                .map_err(|e| Error::Other(format!("Device token parse failed: {}", e)))?;
+
+            let access_token = token_resp["access_token"]
+                .as_str()
+                .ok_or_else(|| Error::Other("No access_token in device token response".into()))?
+                .to_string();
+
+            let refresh_token = token_resp["refresh_token"]
+                .as_str()
+                .map(|s| s.to_string());
+
+            let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
+            let expires_at = chrono::Utc::now().timestamp() + expires_in;
+
+            log::info!("OIDC device flow: authorization complete, expires in {}s", expires_in);
+
+            return Ok(OAuthTokens {
+                access_token,
+                refresh_token,
+                expires_at: Some(expires_at),
+            });
+        }
+
+        // Check error response
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let error = body["error"].as_str().unwrap_or("");
+
+        match error {
+            "authorization_pending" => {
+                log::debug!("OIDC device flow: authorization pending, polling again...");
+                continue;
+            }
+            "slow_down" => {
+                // RFC 8628 §3.5: increase interval by 5 seconds
+                current_interval += std::time::Duration::from_secs(5);
+                log::debug!("OIDC device flow: slow_down, interval now {}s", current_interval.as_secs());
+                continue;
+            }
+            "access_denied" => {
+                return Err(Error::Other("Device authorization denied by user".into()));
+            }
+            "expired_token" => {
+                return Err(Error::Other("Device code expired — please try again".into()));
+            }
+            _ => {
+                let desc = body["error_description"].as_str().unwrap_or("");
+                return Err(Error::Other(format!("Device auth error: {} {}", error, desc)));
+            }
+        }
+    }
+}
+
+/// Refresh an access token using a dynamically discovered token endpoint.
+/// Used for JMAP OIDC where there is no static OAuthProvider.
+pub async fn refresh_token_dynamic(
+    token_url: &str,
+    refresh_token: &str,
+    client_id: &str,
+) -> Result<OAuthTokens> {
+    let mut params = HashMap::new();
+    params.insert("client_id", client_id.to_string());
+    params.insert("refresh_token", refresh_token.to_string());
+    params.insert("grant_type", "refresh_token".to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+    let resp = client
+        .post(token_url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("OIDC token refresh failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Other(format!("OIDC token refresh error: {}", body)));
+    }
+
+    let token_resp: serde_json::Value = resp.json().await
+        .map_err(|e| Error::Other(format!("OIDC token refresh parse failed: {}", e)))?;
+
+    let access_token = token_resp["access_token"]
+        .as_str()
+        .ok_or_else(|| Error::Other("No access_token in OIDC refresh response".into()))?
+        .to_string();
+
+    let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp() + expires_in;
+
+    // IdP may rotate the refresh token
+    let new_refresh = token_resp["refresh_token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| refresh_token.to_string());
+
+    log::info!("OIDC: token refreshed, expires in {}s", expires_in);
+
+    Ok(OAuthTokens {
+        access_token,
+        refresh_token: Some(new_refresh),
+        expires_at: Some(expires_at),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Keyring storage for OAuth tokens
 // ---------------------------------------------------------------------------
 
@@ -520,5 +865,17 @@ mod tests {
         assert!(MICROSOFT_GRAPH_SCOPES.contains("User.Read"));
         assert!(MICROSOFT_GRAPH_SCOPES.contains("Calendars.ReadWrite"));
         assert!(MICROSOFT_GRAPH_SCOPES.contains("Contacts.ReadWrite"));
+    }
+
+    #[test]
+    fn test_device_auth_response_defaults() {
+        let json = r#"{"device_code":"dc","user_code":"UC","verification_uri":"https://example.com/device"}"#;
+        let resp: DeviceAuthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.device_code, "dc");
+        assert_eq!(resp.user_code, "UC");
+        assert_eq!(resp.verification_uri, "https://example.com/device");
+        assert_eq!(resp.interval, 5); // default
+        assert_eq!(resp.expires_in, 600); // default
+        assert!(resp.verification_uri_complete.is_none());
     }
 }

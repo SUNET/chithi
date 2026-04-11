@@ -421,3 +421,39 @@ export async function searchCollectedContacts(
 ): Promise<import("./types").CollectedContact[]> {
   return invoke("search_collected_contacts", { query });
 }
+
+// JMAP OIDC (Device Authorization Flow)
+export async function jmapOidcStart(
+  jmapUrl: string,
+  email: string,
+  clientId: string,
+): Promise<{
+  verification_uri: string;
+  verification_uri_complete: string | null;
+  user_code: string;
+  device_code: string;
+  interval: number;
+  expires_in: number;
+  token_endpoint: string;
+  client_id: string;
+}> {
+  return invoke("jmap_oidc_start", { jmapUrl, email, clientId });
+}
+
+export async function jmapOidcComplete(
+  deviceCode: string,
+  tokenEndpoint: string,
+  interval: number,
+  expiresIn: number,
+  accountId: string,
+  clientId: string,
+): Promise<void> {
+  return invoke("jmap_oidc_complete", {
+    deviceCode,
+    tokenEndpoint,
+    interval,
+    expiresIn,
+    accountId,
+    clientId,
+  });
+}

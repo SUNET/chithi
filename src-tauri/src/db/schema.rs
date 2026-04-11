@@ -244,14 +244,36 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // Add parent_id column to folders if it doesn't exist (for JMAP hierarchy)
-    let has_parent_id: bool = conn
-        .prepare("SELECT parent_id FROM folders LIMIT 0")
+    // Add jmap_auth_method column if it doesn't exist
+    let has_jmap_auth_method: bool = conn
+        .prepare("SELECT jmap_auth_method FROM accounts LIMIT 0")
         .is_ok();
-    if !has_parent_id {
-        log::info!("Migration: adding parent_id column to folders table");
+    if !has_jmap_auth_method {
+        log::info!("Migration: adding jmap_auth_method column to accounts table");
         conn.execute_batch(
-            "ALTER TABLE folders ADD COLUMN parent_id TEXT;",
+            "ALTER TABLE accounts ADD COLUMN jmap_auth_method TEXT NOT NULL DEFAULT 'basic';",
+        )?;
+    }
+
+    // Add oidc_token_endpoint column if it doesn't exist
+    let has_oidc_token_endpoint: bool = conn
+        .prepare("SELECT oidc_token_endpoint FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_oidc_token_endpoint {
+        log::info!("Migration: adding oidc_token_endpoint column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN oidc_token_endpoint TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
+    // Add oidc_client_id column if it doesn't exist
+    let has_oidc_client_id: bool = conn
+        .prepare("SELECT oidc_client_id FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_oidc_client_id {
+        log::info!("Migration: adding oidc_client_id column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN oidc_client_id TEXT NOT NULL DEFAULT '';",
         )?;
     }
 

@@ -160,3 +160,119 @@ pub struct MsProfile {
     /// The Microsoft login identity (e.g., kushaldas@gmail.com) — used for IMAP XOAUTH2
     pub login_email: String,
 }
+
+/// Start the JMAP OIDC device flow. Performs OIDC discovery, requests a device code,
+/// and returns the user code + verification URL for the user to complete in their browser.
+#[tauri::command]
+pub async fn jmap_oidc_start(
+    jmap_url: String,
+    email: String,
+    client_id: String,
+) -> Result<JmapOidcStartResult> {
+    // Derive base URL from jmap_url or email domain (with auto-discovery)
+    let base_url = if !jmap_url.is_empty() {
+        jmap_url.trim_end_matches('/').to_string()
+    } else {
+        let domain = email.rsplit_once('@')
+            .map(|(_, d)| d)
+            .ok_or_else(|| Error::Other(format!("Cannot extract domain from '{}'", email)))?;
+        // Try the same candidates as JMAP auto-discovery
+        let candidates = [
+            format!("https://{}", domain),
+            format!("https://mail.{}", domain),
+            format!("https://jmap.{}", domain),
+        ];
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build().map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+        let mut found = None;
+        for c in &candidates {
+            let url = format!("{}/.well-known/openid-configuration", c);
+            if let Ok(resp) = http.get(&url).send().await {
+                if resp.status().is_success() {
+                    found = Some(c.clone());
+                    break;
+                }
+            }
+        }
+        found.ok_or_else(|| Error::Other(format!(
+            "OIDC auto-discovery failed for {} (tried {}, mail.{}, jmap.{})",
+            domain, domain, domain, domain
+        )))?
+    };
+
+    // Discover OIDC endpoints
+    let endpoints = crate::oauth::discover_oidc(&base_url).await?;
+
+    let device_auth_endpoint = endpoints.device_authorization_endpoint
+        .ok_or_else(|| Error::Other(
+            "Server does not support device authorization flow (no device_authorization_endpoint in OIDC discovery)".into()
+        ))?;
+
+    // Use provided client_id, or register a new one via RFC 7591
+    let effective_client_id = if !client_id.trim().is_empty() {
+        log::info!("JMAP OIDC: reusing existing client_id");
+        client_id.trim().to_string()
+    } else if let Some(ref reg_endpoint) = endpoints.registration_endpoint {
+        crate::oauth::register_oidc_client(reg_endpoint).await?
+    } else {
+        return Err(Error::Other(
+            "OIDC requires a client_id but none was provided and the server does not support dynamic client registration. \
+             Register a client in your identity provider and enter its client_id.".into()
+        ));
+    };
+
+    // Request device code
+    let device_resp = crate::oauth::device_auth_start(&device_auth_endpoint, &effective_client_id).await?;
+
+    log::info!("JMAP OIDC device flow: verification_uri={}, client_id={}",
+        device_resp.verification_uri, effective_client_id);
+
+    Ok(JmapOidcStartResult {
+        verification_uri: device_resp.verification_uri.clone(),
+        verification_uri_complete: device_resp.verification_uri_complete.clone(),
+        user_code: device_resp.user_code.clone(),
+        device_code: device_resp.device_code.clone(),
+        interval: device_resp.interval,
+        expires_in: device_resp.expires_in,
+        token_endpoint: endpoints.token_endpoint,
+        client_id: effective_client_id,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct JmapOidcStartResult {
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub user_code: String,
+    pub device_code: String,
+    pub interval: u64,
+    pub expires_in: u64,
+    pub token_endpoint: String,
+    pub client_id: String,
+}
+
+/// Poll the token endpoint until the user completes device authorization.
+#[tauri::command]
+pub async fn jmap_oidc_complete(
+    device_code: String,
+    token_endpoint: String,
+    interval: u64,
+    expires_in: u64,
+    account_id: String,
+    client_id: String,
+) -> Result<()> {
+    let tokens = crate::oauth::device_auth_poll(
+        &token_endpoint,
+        &device_code,
+        interval,
+        expires_in,
+        &client_id,
+    ).await?;
+
+    // Store tokens in keyring
+    crate::oauth::store_tokens(&account_id, &tokens)?;
+
+    log::info!("JMAP OIDC: device flow completed for account {}", account_id);
+    Ok(())
+}

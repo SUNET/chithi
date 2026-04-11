@@ -86,6 +86,9 @@ pub async fn get_account_config(
         password: String::new(),
         use_tls: full.use_tls,
         signature: full.signature,
+        jmap_auth_method: full.jmap_auth_method,
+        oidc_token_endpoint: full.oidc_token_endpoint,
+        oidc_client_id: full.oidc_client_id,
     })
 }
 

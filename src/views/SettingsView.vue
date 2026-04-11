@@ -45,6 +45,9 @@ const defaultForm = (): AccountConfig => ({
   password: "",
   use_tls: true,
   signature: "",
+  jmap_auth_method: "basic",
+  oidc_token_endpoint: "",
+  oidc_client_id: "",
 });
 
 const form = ref<AccountConfig>(defaultForm());
@@ -141,6 +144,18 @@ async function openEditForm(id: string) {
       } catch { oauthStatus.value = null; }
     } else if (config.mail_protocol === "jmap") {
       accountType.value = "jmap";
+      if (config.jmap_auth_method === "oidc") {
+        try {
+          const hasTokens = await api.oauthHasTokens(id);
+          if (hasTokens) {
+            oauthStatus.value = "Signed in via OIDC";
+          } else {
+            oauthStatus.value = null;
+          }
+        } catch { oauthStatus.value = null; }
+      } else {
+        oauthStatus.value = null;
+      }
     } else if (config.caldav_url && !config.imap_host) {
       accountType.value = "caldav";
     } else {
@@ -247,6 +262,62 @@ async function startMicrosoftOAuth() {
   }
 }
 
+const oidcUserCode = ref<string | null>(null);
+
+async function startJmapOidc() {
+  oauthInProgress.value = true;
+  oauthStatus.value = null;
+  oidcUserCode.value = null;
+  error.value = null;
+
+  try {
+    const tempAccountId = editingAccountId.value ?? `jmap-oidc-pending-${Date.now()}`;
+
+    // Start device flow — passes existing client_id (empty for first-time setup)
+    const result = await api.jmapOidcStart(
+      form.value.jmap_url,
+      form.value.email,
+      form.value.oidc_client_id,
+    );
+
+    // Save token endpoint and client_id for account creation
+    form.value.oidc_token_endpoint = result.token_endpoint;
+    form.value.oidc_client_id = result.client_id;
+
+    // Show the user code and open browser to verification URL
+    oidcUserCode.value = result.user_code;
+    const openUrl = result.verification_uri_complete ?? result.verification_uri;
+    if (!openUrl.startsWith("https://") && !openUrl.startsWith("http://")) {
+      throw new Error(`Unexpected verification URL scheme: ${openUrl}`);
+    }
+    await shellOpen(openUrl);
+
+    // Poll until user completes authorization (this blocks)
+    await api.jmapOidcComplete(
+      result.device_code,
+      result.token_endpoint,
+      result.interval,
+      result.expires_in,
+      tempAccountId,
+      result.client_id,
+    );
+
+    // Only set oauth2: marker for new accounts (triggers token migration in add_account).
+    // On re-auth of existing accounts, keep password empty so save doesn't overwrite keyring.
+    if (!editingAccountId.value) {
+      form.value.password = `oauth2:${tempAccountId}`;
+    }
+    form.value.jmap_auth_method = "oidc";
+    oidcUserCode.value = null;
+    oauthStatus.value = "Signed in via OIDC";
+  } catch (e) {
+    error.value = `OIDC sign-in failed: ${e}`;
+    oidcUserCode.value = null;
+  } finally {
+    oauthInProgress.value = false;
+  }
+}
+
 async function doDelete() {
   if (deletingAccountId.value) {
     await accountsStore.deleteAccount(deletingAccountId.value);
@@ -333,7 +404,7 @@ async function doDelete() {
               <label>Email Address</label>
               <input v-model="form.email" type="email" placeholder="user@example.com" />
             </div>
-            <div v-if="accountType !== 'o365'" class="form-group">
+            <div v-if="accountType !== 'o365' && !(accountType === 'jmap' && form.jmap_auth_method === 'oidc')" class="form-group">
               <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
               <PasswordInput
                 v-model="form.password"
@@ -423,10 +494,56 @@ async function doDelete() {
 
             <template v-if="accountType === 'jmap'">
               <div class="form-group">
+                <label>Authentication</label>
+                <div class="type-selector">
+                  <button
+                    class="type-btn"
+                    :class="{ active: form.jmap_auth_method === 'basic' }"
+                    :disabled="!!editingAccountId"
+                    @click="form.jmap_auth_method = 'basic'; oauthStatus.value = null"
+                  >Password</button>
+                  <button
+                    class="type-btn"
+                    :class="{ active: form.jmap_auth_method === 'oidc' }"
+                    :disabled="!!editingAccountId"
+                    @click="form.jmap_auth_method = 'oidc'"
+                  >OIDC</button>
+                </div>
+              </div>
+              <div class="form-group">
                 <label>JMAP URL</label>
                 <input v-model="form.jmap_url" type="url" placeholder="https://mail.example.com" />
                 <span class="field-hint">Leave blank for auto-discovery via .well-known/jmap</span>
               </div>
+              <template v-if="form.jmap_auth_method === 'oidc'">
+                <div class="form-group">
+                  <label>OIDC Sign In</label>
+                  <div v-if="oauthStatus" class="oauth-row">
+                    <div class="oauth-status">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                      {{ oauthStatus }}
+                    </div>
+                    <button class="btn-reauth" @click="oauthStatus.value = null">Sign in again</button>
+                  </div>
+                  <div v-else-if="oidcUserCode" class="oidc-device-code">
+                    <p class="device-code-label">Enter this code in your browser:</p>
+                    <p class="device-code-value">{{ oidcUserCode }}</p>
+                    <p class="device-code-hint">Waiting for authorization...</p>
+                  </div>
+                  <button
+                    v-else
+                    class="btn-oauth"
+                    :disabled="oauthInProgress || !form.email"
+                    @click="startJmapOidc"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                    </svg>
+                    {{ oauthInProgress ? "Starting..." : "Sign in with OIDC" }}
+                  </button>
+                  <span class="field-hint">Opens your browser to authenticate with your identity provider.</span>
+                </div>
+              </template>
             </template>
 
             <template v-if="accountType === 'imap' || accountType === 'caldav'">
@@ -918,5 +1035,33 @@ async function doDelete() {
   font-size: 13px;
   color: var(--color-text-secondary);
   line-height: 1.5;
+}
+
+.oidc-device-code {
+  text-align: center;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-secondary);
+}
+
+.device-code-label {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+.device-code-value {
+  font-size: 28px;
+  font-weight: 700;
+  font-family: 'Liberation Mono', monospace;
+  letter-spacing: 4px;
+  color: var(--color-accent);
+  margin-bottom: 8px;
+}
+
+.device-code-hint {
+  font-size: 12px;
+  color: var(--color-text-muted);
 }
 </style>

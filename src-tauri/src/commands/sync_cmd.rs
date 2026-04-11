@@ -22,6 +22,98 @@ use crate::mail::jmap_sync;
 use crate::mail::sync as mail_sync;
 use crate::state::AppState;
 
+/// Get a valid OIDC access token for a JMAP account, refreshing if needed.
+/// Returns `None` if the account doesn't use OIDC.
+pub async fn get_jmap_oidc_token(account: &crate::db::accounts::AccountFull) -> crate::error::Result<Option<String>> {
+    if account.jmap_auth_method != "oidc" {
+        return Ok(None);
+    }
+
+    let tokens = crate::oauth::load_tokens(&account.id)?
+        .ok_or_else(|| crate::error::Error::Other(
+            "No OIDC tokens found. Please sign in again.".into()
+        ))?;
+
+    if !tokens.is_expired() {
+        return Ok(Some(tokens.access_token));
+    }
+
+    // Need to refresh
+    let refresh_token = tokens.refresh_token
+        .ok_or_else(|| crate::error::Error::Other(
+            "No refresh token. Please sign in again.".into()
+        ))?;
+
+    if account.oidc_token_endpoint.is_empty() {
+        return Err(crate::error::Error::Other(
+            "OIDC token endpoint not configured. Please sign in again.".into()
+        ));
+    }
+    if account.oidc_client_id.is_empty() {
+        return Err(crate::error::Error::Other(
+            "OIDC client_id not configured. Please sign in again.".into()
+        ));
+    }
+
+    let new_tokens = crate::oauth::refresh_token_dynamic(
+        &account.oidc_token_endpoint,
+        &refresh_token,
+        &account.oidc_client_id,
+    ).await?;
+    crate::oauth::store_tokens(&account.id, &new_tokens)?;
+
+    Ok(Some(new_tokens.access_token))
+}
+
+/// Refresh an OIDC access token using the account_id and OIDC metadata.
+/// Used by the push loop to refresh tokens on reconnect without DB access.
+pub async fn refresh_jmap_oidc_token(
+    account_id: &str,
+    oidc_token_endpoint: &str,
+    oidc_client_id: &str,
+) -> crate::error::Result<Option<String>> {
+    let tokens = match crate::oauth::load_tokens(account_id)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    if !tokens.is_expired() {
+        return Ok(Some(tokens.access_token));
+    }
+
+    let refresh_token = match tokens.refresh_token {
+        Some(rt) => rt,
+        None => return Ok(Some(tokens.access_token)), // can't refresh, return stale
+    };
+
+    if oidc_token_endpoint.is_empty() || oidc_client_id.is_empty() {
+        return Ok(Some(tokens.access_token)); // can't refresh without metadata
+    }
+
+    let new_tokens = crate::oauth::refresh_token_dynamic(
+        oidc_token_endpoint,
+        &refresh_token,
+        oidc_client_id,
+    ).await?;
+    crate::oauth::store_tokens(account_id, &new_tokens)?;
+
+    Ok(Some(new_tokens.access_token))
+}
+
+/// Build a JmapConfig from an AccountFull, with OIDC token if applicable.
+pub async fn build_jmap_config(account: &crate::db::accounts::AccountFull) -> crate::error::Result<crate::mail::jmap::JmapConfig> {
+    let access_token = get_jmap_oidc_token(account).await?;
+    Ok(crate::mail::jmap::JmapConfig {
+        jmap_url: account.jmap_url.clone(),
+        email: account.email.clone(),
+        username: account.username.clone(),
+        password: account.password.clone(),
+        access_token,
+        oidc_token_endpoint: account.oidc_token_endpoint.clone(),
+        oidc_client_id: account.oidc_client_id.clone(),
+    })
+}
+
 #[tauri::command]
 pub async fn trigger_sync(
     app: AppHandle,
@@ -74,12 +166,7 @@ pub async fn trigger_sync(
             account.jmap_url
         );
 
-        let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = build_jmap_config(&account).await?;
 
         if let Err(e) = jmap_sync::sync_jmap_account(
             app.clone(),
@@ -173,12 +260,7 @@ pub async fn sync_folder(
     };
 
     if account.mail_protocol == "jmap" {
-        let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = build_jmap_config(&account).await?;
 
         return jmap_sync::sync_jmap_folder_public(
             app,
@@ -855,12 +937,7 @@ async fn start_jmap_push(
         db::accounts::get_account_full(&conn, &account.id)?
     };
 
-    let jmap_config = JmapConfig {
-        jmap_url: full_account.jmap_url.clone(),
-        email: full_account.email.clone(),
-        username: full_account.username.clone(),
-        password: full_account.password.clone(),
-    };
+    let jmap_config = build_jmap_config(&full_account).await?;
 
     let account_id = account.id.clone();
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

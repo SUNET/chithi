@@ -4,7 +4,6 @@ use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
-use crate::mail::jmap::JmapConfig;
 use crate::mail::jmap_sync;
 use crate::mail::parser;
 use crate::mail::sync as mail_sync;
@@ -158,12 +157,7 @@ pub async fn get_message_body(
         let relative_path = if account.mail_protocol == "jmap" {
             log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
-            let jmap_config = JmapConfig {
-                jmap_url: account.jmap_url.clone(),
-                email: account.email.clone(),
-                username: account.username.clone(),
-                password: account.password.clone(),
-            };
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
             // Extract the JMAP email ID from our composite message ID
             // Format: {account_id}_{folder_path}_{jmap_email_id}
@@ -475,12 +469,7 @@ pub async fn create_folder(
 
     if account.mail_protocol == "jmap" {
         // JMAP: Mailbox/set create
-        let jmap_config = JmapConfig {
-            jmap_url: account.jmap_url.clone(),
-            email: account.email.clone(),
-            username: account.username.clone(),
-            password: account.password.clone(),
-        };
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
         // Split to get the parent mailbox ID and the new folder name.

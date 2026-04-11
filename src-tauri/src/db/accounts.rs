@@ -30,6 +30,16 @@ pub struct AccountConfig {
     pub use_tls: bool,
     #[serde(default)]
     pub signature: String,
+    #[serde(default = "default_basic")]
+    pub jmap_auth_method: String,
+    #[serde(default)]
+    pub oidc_token_endpoint: String,
+    #[serde(default)]
+    pub oidc_client_id: String,
+}
+
+fn default_basic() -> String {
+    "basic".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +60,9 @@ pub struct AccountFull {
     pub use_tls: bool,
     pub enabled: bool,
     pub signature: String,
+    pub jmap_auth_method: String,
+    pub oidc_token_endpoint: String,
+    pub oidc_client_id: String,
 }
 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
@@ -73,7 +86,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature FROM accounts WHERE id = ?1",
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -93,6 +106,9 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 use_tls: row.get(12)?,
                 enabled: row.get(13)?,
                 signature: row.get(14)?,
+                jmap_auth_method: row.get(15)?,
+                oidc_token_endpoint: row.get(16)?,
+                oidc_client_id: row.get(17)?,
             })
         },
     ).map_err(|e| match e {
@@ -112,12 +128,17 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
 }
 
 pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
-    // Store password in system keyring
-    crate::keyring::set_password(id, &config.password)?;
+    // Store real passwords in system keyring; skip OIDC accounts and oauth2 migration markers
+    if !config.password.is_empty()
+        && config.jmap_auth_method != "oidc"
+        && !config.password.starts_with("oauth2:")
+    {
+        crate::keyring::set_password(id, &config.password)?;
+    }
 
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             id,
             config.display_name,
@@ -133,23 +154,30 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.username,
             config.use_tls,
             config.signature,
+            config.jmap_auth_method,
+            config.oidc_token_endpoint,
+            config.oidc_client_id,
         ],
     )?;
     Ok(())
 }
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
-    // Only update keyring if a new password was provided (non-empty).
-    // Empty means "keep existing" — the frontend never receives the stored password.
-    if !config.password.is_empty() {
+    // Only update keyring if a real password was provided; skip OIDC accounts and oauth2 markers.
+    if !config.password.is_empty()
+        && config.jmap_auth_method != "oidc"
+        && !config.password.starts_with("oauth2:")
+    {
         crate::keyring::set_password(id, &config.password)?;
     }
 
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
-         caldav_url=?10, username=?11, use_tls=?12, signature=?13, updated_at=CURRENT_TIMESTAMP
-         WHERE id=?14",
+         caldav_url=?10, username=?11, use_tls=?12, signature=?13,
+         jmap_auth_method=?14, oidc_token_endpoint=?15, oidc_client_id=?16,
+         updated_at=CURRENT_TIMESTAMP
+         WHERE id=?17",
         params![
             config.display_name,
             config.email,
@@ -164,6 +192,9 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.username,
             config.use_tls,
             config.signature,
+            config.jmap_auth_method,
+            config.oidc_token_endpoint,
+            config.oidc_client_id,
             id,
         ],
     )?;
@@ -208,6 +239,9 @@ mod tests {
                 use_tls INTEGER NOT NULL DEFAULT 1,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 signature TEXT NOT NULL DEFAULT '',
+                jmap_auth_method TEXT NOT NULL DEFAULT 'basic',
+                oidc_token_endpoint TEXT NOT NULL DEFAULT '',
+                oidc_client_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -237,6 +271,9 @@ mod tests {
             password: "secret123".to_string(),
             use_tls: true,
             signature: String::new(),
+            jmap_auth_method: "basic".to_string(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
         }
     }
 

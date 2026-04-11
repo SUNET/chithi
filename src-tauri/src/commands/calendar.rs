@@ -317,12 +317,7 @@ pub async fn create_event(
                 log::warn!("create_event: no remote calendar ID for local calendar '{}'", cal_event.calendar_id);
             }
             drop(conn); // Release lock before async call
-            let jmap_config = crate::mail::jmap::JmapConfig {
-                jmap_url: account.jmap_url,
-                email: account.email,
-                username: account.username,
-                password: account.password,
-            };
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             let jmap_event = crate::mail::jmap::JmapCalendarEvent {
                 id: String::new(),
                 calendar_id: remote_cal_id,
@@ -536,12 +531,7 @@ pub async fn delete_event(
                     Err(e) => log::warn!("delete_event: no Graph token, skipping server delete: {}", e),
                 }
             } else if account.mail_protocol == "jmap" {
-                let jmap_config = crate::mail::jmap::JmapConfig {
-                    jmap_url: account.jmap_url.clone(),
-                    email: account.email.clone(),
-                    username: account.username.clone(),
-                    password: account.password.clone(),
-                };
+                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                 match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                     Ok(conn_jmap) => {
                         if let Err(e) = conn_jmap.delete_calendar_event(&jmap_config, remote_id).await {
@@ -626,12 +616,7 @@ async fn sync_calendars_jmap(
     account_id: &str,
     account: &db::accounts::AccountFull,
 ) -> Result<()> {
-    let jmap_config = crate::mail::jmap::JmapConfig {
-        jmap_url: account.jmap_url.clone(),
-        email: account.email.clone(),
-        username: account.username.clone(),
-        password: account.password.clone(),
-    };
+    let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
 
     let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
 
@@ -1385,12 +1370,7 @@ pub async fn respond_to_invite(
 
         if account.mail_protocol == "jmap" {
             log::info!("respond_to_invite: sending reply via JMAP");
-            let jmap_config = crate::mail::jmap::JmapConfig {
-                jmap_url: account.jmap_url.clone(),
-                email: account.email.clone(),
-                username: account.username.clone(),
-                password: account.password.clone(),
-            };
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
             let raw_message = build_calendar_reply_message(
                 &account.email,
@@ -1849,12 +1829,7 @@ pub async fn send_invites(
         }
 
         if account.mail_protocol == "jmap" {
-            let jmap_config = crate::mail::jmap::JmapConfig {
-                jmap_url: account.jmap_url.clone(),
-                email: account.email.clone(),
-                username: account.username.clone(),
-                password: account.password.clone(),
-            };
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
         } else {
@@ -1954,12 +1929,7 @@ pub async fn process_invite_reply(
             // Update on JMAP server if applicable
             if account.mail_protocol == "jmap" {
                 if let Some(ref remote_id) = event.remote_id {
-                    let jmap_config = crate::mail::jmap::JmapConfig {
-                        jmap_url: account.jmap_url.clone(),
-                        email: account.email.clone(),
-                        username: account.username.clone(),
-                        password: account.password.clone(),
-                    };
+                    let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     // Find participant key by matching email
                     // We need to fetch the event to find the right participant key
                     drop(conn);
