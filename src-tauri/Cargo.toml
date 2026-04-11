@@ -41,6 +41,7 @@ urlencoding = "2"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+utf7-imap = "0.3.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

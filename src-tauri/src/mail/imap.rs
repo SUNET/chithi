@@ -133,13 +133,16 @@ impl ImapConnection {
 
         let mut folders = Vec::new();
         for mb in mailboxes.iter() {
-            let name = mb.name().to_string();
+            let path = mb.name().to_string();
             let delimiter = mb.delimiter().unwrap_or("/");
-            let display_name = name
+            // Decode IMAP Modified UTF-7 (RFC 3501 §5.1.3) to UTF-8 for display.
+            // The raw path is kept for IMAP commands (SELECT, etc.).
+            let decoded = utf7_imap::decode_utf7_imap(path.clone());
+            let display_name = decoded
                 .rsplit_once(delimiter)
                 .map(|(_, last)| last.to_string())
-                .unwrap_or_else(|| name.clone());
-            folders.push((display_name, name));
+                .unwrap_or_else(|| decoded.clone());
+            folders.push((display_name, path));
         }
         log::info!("IMAP found {} folders", folders.len());
         for (display, path) in &folders {
@@ -355,13 +358,15 @@ impl ImapConnection {
 
     /// Create a new mailbox (folder) on the IMAP server.
     pub fn create_folder(&mut self, folder_path: &str) -> Result<()> {
-        log::info!("IMAP creating folder: {}", folder_path);
-        self.session.create(folder_path).map_err(|e| {
+        // Encode UTF-8 folder name to IMAP Modified UTF-7 (RFC 3501 §5.1.3)
+        let encoded = utf7_imap::encode_utf7_imap(folder_path.to_string());
+        log::info!("IMAP creating folder: {} (encoded: {})", folder_path, encoded);
+        self.session.create(&encoded).map_err(|e| {
             log::error!("IMAP CREATE folder '{}' failed: {}", folder_path, e);
             Error::Imap(e.to_string())
         })?;
         // Subscribe so it shows in LIST
-        self.session.subscribe(folder_path).ok();
+        self.session.subscribe(&encoded).ok();
         Ok(())
     }
 
@@ -631,4 +636,27 @@ fn addresses_to_json(addrs: Option<&[imap_proto::types::Address<'_>]>) -> String
         })
         .collect();
     serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_utf7_imap_decode() {
+        let decoded = utf7_imap::decode_utf7_imap("Komih&AOU-g".to_string());
+        assert_eq!(decoded, "Komihåg");
+    }
+
+    #[test]
+    fn test_utf7_imap_roundtrip() {
+        let original = "Komihåg";
+        let encoded = utf7_imap::encode_utf7_imap(original.to_string());
+        let decoded = utf7_imap::decode_utf7_imap(encoded);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_utf7_imap_ascii_passthrough() {
+        let decoded = utf7_imap::decode_utf7_imap("INBOX".to_string());
+        assert_eq!(decoded, "INBOX");
+    }
 }
