@@ -34,15 +34,14 @@ onMounted(async () => {
   if (accountsStore.accounts.length === 0) {
     await accountsStore.fetchAccounts();
   }
-  // Sync calendars from server, then fetch local data
-  try {
-    await calendarStore.syncCalendars();
-  } catch (e) {
-    console.error("Calendar sync error:", e);
-  }
-  // Always fetch local calendars even if sync fails
+  // Show cached data immediately (calendars + events live in SQLite),
+  // then refresh from the server in the background. Waiting on the
+  // network sync here makes the view appear empty until sync finishes.
   await calendarStore.fetchCalendars();
   await calendarStore.fetchEvents();
+  calendarStore.syncCalendars().catch((e) => {
+    console.error("Calendar sync error:", e);
+  });
 });
 </script>
 
