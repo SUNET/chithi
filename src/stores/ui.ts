@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-export type MessageViewMode = "right" | "tab";
+export type MessageViewMode = "right" | "bottom" | "tab";
 export type Theme = "dark" | "light";
 
 export const useUiStore = defineStore("ui", () => {

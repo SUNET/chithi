@@ -17,26 +17,44 @@ const foldersStore = useFoldersStore();
 const messagesStore = useMessagesStore();
 const uiStore = useUiStore();
 
-// In right mode, reader pane shows inline next to the message list
-const showReaderPane = computed(() =>
+// Right mode: inline reader pane next to the message list
+const showRightReader = computed(() =>
   uiStore.messageViewMode === "right" && uiStore.readerVisible,
 );
 
-// Tab mode state: open message tabs
+// Bottom mode: show tab bar + reader under the list once a tab is opened
+const showBottomReader = computed(() =>
+  uiStore.messageViewMode === "bottom" && messageTabs.value.length > 0,
+);
+
+// Shared state for bottom and tab modes: open message tabs and the active one.
+// activeTabId === null means the "Messages" list tab (used in tab mode).
 interface MessageTab {
   messageId: string;
   subject: string;
 }
-const openTabs = ref<MessageTab[]>([]);
+const messageTabs = ref<MessageTab[]>([]);
 const activeTabId = ref<string | null>(null);
 
+function activateMessageTab(messageId: string) {
+  activeTabId.value = messageId;
+  messagesStore.loadMessage(messageId);
+}
+
+function activateListTab() {
+  activeTabId.value = null;
+}
+
 function closeTab(messageId: string) {
-  openTabs.value = openTabs.value.filter((t) => t.messageId !== messageId);
+  const idx = messageTabs.value.findIndex((t) => t.messageId === messageId);
+  if (idx === -1) return;
+  messageTabs.value.splice(idx, 1);
   if (activeTabId.value === messageId) {
-    // Switch to next tab, or clear
-    activeTabId.value = openTabs.value.length > 0 ? openTabs.value[openTabs.value.length - 1].messageId : null;
-    if (activeTabId.value) {
-      messagesStore.loadMessage(activeTabId.value);
+    if (messageTabs.value.length > 0) {
+      const next = messageTabs.value[Math.max(0, idx - 1)];
+      activateMessageTab(next.messageId);
+    } else {
+      activeTabId.value = null;
     }
   }
 }
@@ -77,21 +95,22 @@ function stopResize() {
   document.body.style.userSelect = "";
 }
 
-// Double-click opens reader pane (right mode) or tab (tab mode)
+// Double-click opens the message — inline reader in right mode,
+// or a new tab in bottom/tab modes.
 function onOpenMessage(messageId: string) {
   if (uiStore.messageViewMode === "right") {
     uiStore.showReader();
-  } else {
-    const msg = messagesStore.messages.find((m) => m.id === messageId);
-    const existing = openTabs.value.find((t) => t.messageId === messageId);
-    if (!existing) {
-      openTabs.value.push({
-        messageId,
-        subject: msg?.subject ?? "(no subject)",
-      });
-    }
-    activeTabId.value = messageId;
+    return;
   }
+  const existing = messageTabs.value.find((t) => t.messageId === messageId);
+  if (!existing) {
+    const msg = messagesStore.messages.find((m) => m.id === messageId);
+    messageTabs.value.push({
+      messageId,
+      subject: msg?.subject ?? "(no subject)",
+    });
+  }
+  activateMessageTab(messageId);
 }
 
 // Background prefetch after sync
@@ -246,35 +265,35 @@ onUnmounted(() => {
       <template v-if="uiStore.messageViewMode === 'right'">
         <div
           class="message-list-pane"
-          :style="{ width: showReaderPane ? uiStore.messageListWidth + 'px' : undefined }"
-          :class="{ expanded: !showReaderPane }"
+          :style="{ width: showRightReader ? uiStore.messageListWidth + 'px' : undefined }"
+          :class="{ expanded: !showRightReader }"
         >
           <MessageList @open-message="onOpenMessage" />
         </div>
         <div
-          v-if="showReaderPane"
+          v-if="showRightReader"
           class="resize-handle"
           @mousedown="startResize('list', $event)"
         ></div>
-        <div v-if="showReaderPane" class="reader-pane">
+        <div v-if="showRightReader" class="reader-pane">
           <MessageReader @close="uiStore.hideReader()" />
         </div>
       </template>
 
-      <!-- Tab mode: message list on top, tabbed reader below -->
-      <template v-else>
-        <div class="tab-mode-content">
+      <!-- Bottom mode: list on top, tab bar + reader below when any tabs open -->
+      <template v-else-if="uiStore.messageViewMode === 'bottom'">
+        <div class="stacked-content">
           <div class="message-list-pane expanded">
             <MessageList @open-message="onOpenMessage" />
           </div>
-          <template v-if="openTabs.length > 0">
+          <template v-if="showBottomReader">
             <div class="tab-bar">
               <button
-                v-for="tab in openTabs"
+                v-for="tab in messageTabs"
                 :key="tab.messageId"
                 class="tab"
                 :class="{ active: activeTabId === tab.messageId }"
-                @click="activeTabId = tab.messageId; messagesStore.loadMessage(tab.messageId)"
+                @click="activateMessageTab(tab.messageId)"
               >
                 <span class="tab-label">{{ tab.subject }}</span>
                 <span class="tab-close" @click.stop="closeTab(tab.messageId)">&times;</span>
@@ -284,6 +303,35 @@ onUnmounted(() => {
               <MessageReader @close="closeTab(activeTabId!)" />
             </div>
           </template>
+        </div>
+      </template>
+
+      <!-- Tab mode: tab bar on top, list or reader content below -->
+      <template v-else>
+        <div class="stacked-content">
+          <div class="tab-bar">
+            <button
+              class="tab list-tab"
+              :class="{ active: activeTabId === null }"
+              @click="activateListTab"
+            >
+              <span class="tab-label">Messages</span>
+            </button>
+            <button
+              v-for="tab in messageTabs"
+              :key="tab.messageId"
+              class="tab"
+              :class="{ active: activeTabId === tab.messageId }"
+              @click="activateMessageTab(tab.messageId)"
+            >
+              <span class="tab-label">{{ tab.subject }}</span>
+              <span class="tab-close" @click.stop="closeTab(tab.messageId)">&times;</span>
+            </button>
+          </div>
+          <div class="tab-content-pane">
+            <MessageList v-if="activeTabId === null" @open-message="onOpenMessage" />
+            <MessageReader v-else @close="closeTab(activeTabId)" />
+          </div>
         </div>
       </template>
     </div>
@@ -336,29 +384,47 @@ onUnmounted(() => {
   background: var(--color-accent);
 }
 
-.tab-mode-content {
+.stacked-content {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
 }
 
-.tab-mode-content .message-list-pane {
+.stacked-content .message-list-pane {
   flex: 1;
   min-height: 150px;
+}
+
+.tab-content-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+}
+
+.tab-content-pane > * {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 
 .tab-bar {
   display: flex;
   align-items: center;
   background: var(--color-bg-secondary);
-  border-top: 1px solid var(--color-border);
   border-bottom: 1px solid var(--color-border);
   padding: 2px 4px;
   height: 36px;
   flex-shrink: 0;
   overflow-x: auto;
   gap: 2px;
+}
+
+/* In bottom mode the tab bar appears between the list and the reader,
+   so it needs a top border to visually separate it from the list above. */
+.stacked-content > .message-list-pane + .tab-bar {
+  border-top: 1px solid var(--color-border);
 }
 
 .tab {
@@ -377,6 +443,11 @@ onUnmounted(() => {
   max-width: 240px;
   white-space: nowrap;
   cursor: pointer;
+}
+
+.tab.list-tab {
+  min-width: 100px;
+  max-width: 160px;
 }
 
 .tab:hover:not(.active) {
