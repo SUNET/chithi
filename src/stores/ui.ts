@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type MessageViewMode = "right" | "tab";
 export type Theme = "dark" | "light";
@@ -14,6 +15,9 @@ export const useUiStore = defineStore("ui", () => {
   const messageViewMode = ref<MessageViewMode>("right");
   const theme = ref<Theme>(
     (localStorage.getItem("chithi-theme") as Theme) || "light",
+  );
+  const decorationsEnabled = ref(
+    localStorage.getItem("chithi-decorations") !== "false",
   );
 
   function toggleReader() {
@@ -43,8 +47,20 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-threading", String(enabled));
   }
 
+  function setDecorations(enabled: boolean) {
+    decorationsEnabled.value = enabled;
+    localStorage.setItem("chithi-decorations", String(enabled));
+    getCurrentWindow().setDecorations(enabled);
+  }
+
   function initTheme() {
     document.documentElement.setAttribute("data-theme", theme.value);
+  }
+
+  function initDecorations() {
+    if (!decorationsEnabled.value) {
+      getCurrentWindow().setDecorations(false);
+    }
   }
 
   return {
@@ -61,5 +77,8 @@ export const useUiStore = defineStore("ui", () => {
     setTheme,
     setThreading,
     initTheme,
+    decorationsEnabled,
+    setDecorations,
+    initDecorations,
   };
 });
