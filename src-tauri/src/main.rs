@@ -46,6 +46,7 @@ fn main() {
             commands::mail::get_thread_messages,
             commands::mail::unthread_message,
             commands::mail::create_folder,
+            commands::mail::delete_folder,
             commands::mail::save_attachment,
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::sync_folder,

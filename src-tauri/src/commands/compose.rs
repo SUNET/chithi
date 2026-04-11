@@ -43,19 +43,7 @@ pub async fn send_message(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "graph" {
-        log::info!("Sending via Microsoft Graph for account {}", account.email);
-
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        client.send_mail(&crate::mail::graph::GraphSendMessage {
-            to: message.to.clone(),
-            cc: message.cc.clone(),
-            bcc: message.bcc.clone(),
-            subject: message.subject.clone(),
-            body_text: message.body_text.clone(),
-        }).await?;
-    } else if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "jmap" {
         log::info!("Sending via JMAP for account {}", account.email);
 
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -180,7 +168,19 @@ pub async fn save_draft(
         &attachment_data,
     )?;
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "graph" {
+        // Save draft via Graph API: POST /me/messages creates a draft without sending
+        log::info!("Saving draft via Microsoft Graph for account {}", account.email);
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.save_draft(&crate::mail::graph::GraphSendMessage {
+            to: message.to.clone(),
+            cc: message.cc.clone(),
+            bcc: message.bcc.clone(),
+            subject: message.subject.clone(),
+            body_text: message.body_text.clone(),
+        }).await?;
+    } else if account.mail_protocol == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
         conn_jmap.save_draft(&jmap_config, &raw_message).await?;

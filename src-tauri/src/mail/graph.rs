@@ -45,6 +45,26 @@ impl GraphClient {
             .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))
     }
 
+    async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let url = format!("{}{}", GRAPH_BASE, path);
+        let resp = self.http
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", path, e)))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Other(format!("Graph GET {} returned {}: {}", path, status, truncate(&body, 500))));
+        }
+
+        resp.bytes().await
+            .map(|b| b.to_vec())
+            .map_err(|e| Error::Other(format!("Graph GET {} read bytes failed: {}", path, e)))
+    }
+
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self.http
@@ -280,6 +300,53 @@ impl GraphClient {
             content_type: content_type.to_string(),
             content,
         })
+    }
+
+    pub async fn get_attachments(&self, message_id: &str) -> Result<Vec<crate::db::messages::Attachment>> {
+        let resp = self.get(
+            &format!("/me/messages/{}/attachments", message_id),
+            &[("$select", "id,name,contentType,size")],
+        ).await?;
+
+        let mut attachments = Vec::new();
+        if let Some(values) = resp["value"].as_array() {
+            for (i, att) in values.iter().enumerate() {
+                attachments.push(crate::db::messages::Attachment {
+                    index: i as u32,
+                    filename: att["name"].as_str().map(|s| s.to_string()),
+                    content_type: att["contentType"].as_str().unwrap_or("application/octet-stream").to_string(),
+                    size: att["size"].as_u64().unwrap_or(0),
+                });
+            }
+        }
+        Ok(attachments)
+    }
+
+    pub async fn get_mime_message(&self, message_id: &str) -> Result<Vec<u8>> {
+        self.get_bytes(&format!("/me/messages/{}/$value", message_id)).await
+    }
+
+    pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {
+        let body = serde_json::json!({
+            "subject": message.subject,
+            "body": {
+                "contentType": "Text",
+                "content": message.body_text
+            },
+            "toRecipients": message.to.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+            "ccRecipients": message.cc.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+            "bccRecipients": message.bcc.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+        });
+
+        self.post_json("/me/messages", &body).await?;
+        log::info!("Graph: draft saved successfully");
+        Ok(())
     }
 
     /// Send a mail message via Graph API.

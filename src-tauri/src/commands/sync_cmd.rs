@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
+
 /// (message_id, uid, flags_json) tuple for prefetch grouping.
 type PrefetchMsg = (String, u32, String);
 
@@ -158,7 +160,18 @@ pub async fn trigger_sync(
         }
     };
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol == "graph" {
+        log::info!(
+            "Syncing account {} ({}) via Microsoft Graph",
+            account.display_name,
+            account.email,
+        );
+
+        if let Err(e) = sync_graph_account(app.clone(), state.db.clone(), state.data_dir.clone(), &account_id).await {
+            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
+            return Err(e);
+        }
+    } else if account.mail_protocol == "jmap" {
         log::info!(
             "Syncing account {} ({}) via JMAP (url={})",
             account.display_name,
@@ -258,6 +271,11 @@ pub async fn sync_folder(
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)?
     };
+
+    if account.mail_protocol == "graph" {
+        sync_graph_account(app, state.db.clone(), state.data_dir.clone(), &account_id).await?;
+        return Ok(0);
+    }
 
     if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
@@ -709,9 +727,11 @@ pub async fn prefetch_bodies(
 async fn sync_graph_account(
     app: AppHandle,
     db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    data_dir: std::path::PathBuf,
     account_id: &str,
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
+    use crate::mail::sync::{create_maildir_dirs, sanitize_folder_name, flags_to_maildir_suffix};
 
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);
@@ -732,7 +752,6 @@ async fn sync_graph_account(
     // Sync messages for each folder
     let mut grand_total = 0u32;
     for gf in &graph_folders {
-        // Fetch messages (Graph uses skip-based pagination, not UIDs)
         let (messages, _total) = client.list_messages(&gf.id, 200, 0).await?;
 
         if messages.is_empty() {
@@ -752,24 +771,64 @@ async fn sync_graph_account(
             ids
         };
 
-        let conn = db_arc.lock().await;
-        conn.execute_batch("BEGIN")?;
-
-        let mut synced = 0u32;
+        // Collect new messages to insert
+        let mut new_messages = Vec::new();
         for msg in &messages {
             let id = format!("{}_{}", account_id, msg.id);
             if existing_ids.contains(&id) {
                 continue;
             }
+            new_messages.push(msg);
+        }
 
+        if new_messages.is_empty() {
+            continue;
+        }
+
+        // Prepare Maildir directory for this folder
+        let folder_dir = sanitize_folder_name(&gf.id);
+        let maildir_base = data_dir.join(account_id).join(&folder_dir);
+        create_maildir_dirs(&maildir_base)?;
+
+        // Phase 1: Download all MIME bodies (no DB lock held -- UI stays responsive)
+        let mut downloaded: Vec<(&graph::GraphMessage, String)> = Vec::new();
+        for msg in &new_messages {
+            let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
+
+            let maildir_path = match client.get_mime_message(&msg.id).await {
+                Ok(raw_bytes) => {
+                    let filename = format!("{}:2,{}", msg.id, flags_to_maildir_suffix(&flags));
+                    let msg_path = maildir_base.join("cur").join(&filename);
+                    if let Err(e) = std::fs::write(&msg_path, &raw_bytes) {
+                        log::warn!("Graph sync: failed to write body for {}: {}", msg.id, e);
+                        String::new()
+                    } else {
+                        format!("{}/{}/cur/{}", account_id, folder_dir, filename)
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Graph sync: failed to download MIME for {}: {}", msg.id, e);
+                    String::new()
+                }
+            };
+            downloaded.push((msg, maildir_path));
+        }
+
+        // Phase 2: Fast batch DB insert (lock held only for the insert, not the downloads)
+        let conn = db_arc.lock().await;
+        conn.execute_batch("BEGIN")?;
+
+        let mut synced = 0u32;
+        for (msg, maildir_path) in &downloaded {
+            let id = format!("{}_{}", account_id, msg.id);
             let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
             let thread_id = msg.conversation_id.clone();
 
             let new_msg = db::messages::NewMessage {
-                id: id.clone(),
+                id,
                 account_id: account_id.to_string(),
                 folder_path: gf.id.clone(),
-                uid: 0, // Graph doesn't use UIDs
+                uid: 0,
                 message_id: msg.internet_message_id.clone(),
                 in_reply_to: None,
                 thread_id,
@@ -784,7 +843,7 @@ async fn sync_graph_account(
                 is_encrypted: false,
                 is_signed: false,
                 flags: serde_json::to_string(&flags).unwrap_or_default(),
-                maildir_path: format!("graph:{}", msg.id), // Special marker for Graph bodies
+                maildir_path: maildir_path.clone(),
                 snippet: msg.preview.clone(),
             };
             db::messages::insert_message(&conn, &new_msg)?;
@@ -795,7 +854,7 @@ async fn sync_graph_account(
         drop(conn);
 
         if synced > 0 {
-            log::info!("Graph sync: {} new messages in '{}'", synced, gf.display_name);
+            log::info!("Graph sync: {} new messages in '{}' (bodies downloaded)", synced, gf.display_name);
             grand_total += synced;
         }
     }
@@ -804,6 +863,8 @@ async fn sync_graph_account(
         "account_id": account_id,
         "total_synced": grand_total,
     })).ok();
+    emit_folders_changed(&app, account_id);
+    emit_messages_changed(&app, account_id);
 
     log::info!("Graph sync: completed for account {}, {} new messages", account_id, grand_total);
     Ok(())
