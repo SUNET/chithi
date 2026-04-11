@@ -22,7 +22,6 @@ onMounted(async () => {
   // enough state for MessageReader to work (activeAccount, folders, and
   // the message body).
   uiStore.initTheme();
-  uiStore.initDecorations();
 
   const params = new URLSearchParams(window.location.search);
   const messageId = params.get("messageId");

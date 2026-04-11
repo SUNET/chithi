@@ -14,8 +14,10 @@ const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 
-// Compose opens in a separate window — hide app chrome
-const isComposeWindow = computed(() => route.name === "compose");
+// Compose and reader windows are standalone — hide the main app chrome
+const isStandaloneWindow = computed(
+  () => route.name === "compose" || route.name === "reader",
+);
 
 onMounted(async () => {
   uiStore.initTheme();
@@ -46,8 +48,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <!-- Compose window: standalone, no sidebar/menubar/statusbar -->
-  <div v-if="isComposeWindow" class="compose-shell">
+  <!-- Compose / reader: standalone, no sidebar/menubar/statusbar -->
+  <div v-if="isStandaloneWindow" class="standalone-shell">
     <router-view />
   </div>
 
@@ -86,7 +88,7 @@ onMounted(async () => {
   overflow: hidden;
 }
 
-.compose-shell {
+.standalone-shell {
   height: 100vh;
   width: 100vw;
   overflow: hidden;

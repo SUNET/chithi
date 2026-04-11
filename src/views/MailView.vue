@@ -39,7 +39,11 @@ const activeTabId = ref<string | null>(null);
 
 function activateMessageTab(messageId: string) {
   activeTabId.value = messageId;
-  messagesStore.loadMessage(messageId);
+  // Avoid re-fetching the body when MessageList has already loaded it
+  // (single-click → loadMessage → double-click → activateMessageTab).
+  if (messagesStore.activeMessageId !== messageId) {
+    messagesStore.loadMessage(messageId);
+  }
 }
 
 function activateListTab() {
@@ -57,6 +61,15 @@ function closeTab(messageId: string) {
     } else {
       activeTabId.value = null;
     }
+  }
+}
+
+// Guarded helper used by the reader's close event; activeTabId is non-null
+// whenever the reader is visible, but vue-tsc can't narrow across template
+// branches so we check explicitly.
+function closeActiveTab() {
+  if (activeTabId.value !== null) {
+    closeTab(activeTabId.value);
   }
 }
 
@@ -305,28 +318,49 @@ onUnmounted(() => {
       <!-- Tab mode: tab bar on top, list or reader content below -->
       <template v-else>
         <div class="stacked-content">
-          <div class="tab-bar">
-            <button
+          <div class="tab-bar" role="tablist">
+            <div
               class="tab list-tab"
               :class="{ active: activeTabId === null }"
-              @click="activateListTab"
             >
-              <span class="tab-label">Messages</span>
-            </button>
-            <button
+              <button
+                type="button"
+                class="tab-activate"
+                role="tab"
+                :aria-selected="activeTabId === null"
+                @click="activateListTab"
+              >
+                <span class="tab-label">Messages</span>
+              </button>
+            </div>
+            <div
               v-for="tab in messageTabs"
               :key="tab.messageId"
-              class="tab"
+              class="tab message-tab"
               :class="{ active: activeTabId === tab.messageId }"
-              @click="activateMessageTab(tab.messageId)"
             >
-              <span class="tab-label">{{ tab.subject }}</span>
-              <span class="tab-close" @click.stop="closeTab(tab.messageId)">&times;</span>
-            </button>
+              <button
+                type="button"
+                class="tab-activate"
+                role="tab"
+                :aria-selected="activeTabId === tab.messageId"
+                @click="activateMessageTab(tab.messageId)"
+              >
+                <span class="tab-label">{{ tab.subject }}</span>
+              </button>
+              <button
+                type="button"
+                class="tab-close"
+                :aria-label="`Close tab: ${tab.subject}`"
+                @click="closeTab(tab.messageId)"
+              >
+                &times;
+              </button>
+            </div>
           </div>
           <div class="tab-content-pane">
             <MessageList v-if="activeTabId === null" @open-message="onOpenMessage" />
-            <MessageReader v-else @close="closeTab(activeTabId)" />
+            <MessageReader v-else @close="closeActiveTab" />
           </div>
         </div>
       </template>
@@ -420,19 +454,11 @@ onUnmounted(() => {
 .tab {
   display: flex;
   align-items: center;
-  gap: 8px;
   height: 28px;
-  padding: 0 10px;
-  font-family: var(--font-sans);
-  font-weight: 500;
-  font-size: 12px;
-  color: var(--color-text-muted);
   background: transparent;
   border-radius: 4px;
   min-width: 120px;
   max-width: 240px;
-  white-space: nowrap;
-  cursor: pointer;
 }
 
 .tab.list-tab {
@@ -442,18 +468,40 @@ onUnmounted(() => {
 
 .tab:hover:not(.active) {
   background: var(--color-bg-hover);
-  color: var(--color-text);
 }
 
 .tab.active {
   background: var(--color-reader-bg);
+}
+
+.tab-activate {
+  flex: 1;
+  min-width: 0;
+  padding: 0 10px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.tab.active .tab-activate,
+.tab:hover .tab-activate {
   color: var(--color-text);
 }
 
 .tab-label {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   flex: 1;
+  min-width: 0;
 }
 
 .tab-close {
@@ -462,12 +510,16 @@ onUnmounted(() => {
   justify-content: center;
   width: 16px;
   height: 16px;
+  margin-right: 6px;
   font-size: 14px;
   line-height: 1;
+  border: none;
   border-radius: 2px;
+  background: transparent;
   color: var(--color-text-muted);
   opacity: 0;
   flex-shrink: 0;
+  cursor: pointer;
   transition: opacity 0.1s, background 0.1s;
 }
 
