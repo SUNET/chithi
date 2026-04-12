@@ -1,0 +1,102 @@
+# Arch Linux build environment for Tauri app
+# Usage: docker build -f Dockerfile.arch -t chithi-arch .
+ARG BASE_IMAGE=archlinux:latest
+FROM ${BASE_IMAGE}
+
+# Package version (can be overridden)
+ARG PKG_VERSION=""
+
+# Install build dependencies
+RUN pacman -Syu --noconfirm \
+    base-devel \
+    rust \
+    nodejs npm \
+    webkit2gtk-4.1 \
+    gtk3 \
+    libayatana-appindicator \
+    openssl \
+    libsoup3 \
+    librsvg \
+    pango \
+    gdk-pixbuf2 \
+    curl wget file \
+    jq \
+    && pacman -Scc --noconfirm
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Set CI environment for non-interactive builds
+ENV CI=true
+
+# Set up working directory
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Update version in tauri.conf.json if PKG_VERSION is provided
+ARG PKG_VERSION
+RUN if [ -n "$PKG_VERSION" ]; then \
+        echo "Setting package version to: $PKG_VERSION"; \
+        jq --arg v "$PKG_VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json && \
+        mv tmp.json src-tauri/tauri.conf.json; \
+    fi
+
+# Install frontend dependencies
+RUN pnpm install
+
+# Build the Tauri app binary
+RUN pnpm tauri build --bundles none
+
+# Stage pre-built binary and create Arch package via makepkg
+RUN mkdir -p /build/output /build/src && \
+    install -Dm755 src-tauri/target/release/chithi /build/src/chithi && \
+    cp src-tauri/icons/icon.png /build/src/icon.png && \
+    cp LICENSE /build/src/LICENSE
+
+# Write the PKGBUILD for packaging the pre-built binary
+RUN VERSION=$(jq -r .version src-tauri/tauri.conf.json) && \
+    ARCH_VERSION=$(printf '%s' "$VERSION" | tr '-' '.') && \
+    cat > /build/src/PKGBUILD <<PKGEOF
+pkgname=chithi
+pkgver=${ARCH_VERSION}
+pkgrel=1
+pkgdesc="Desktop email client with IMAP, JMAP and Microsoft 365 support"
+arch=("x86_64" "aarch64")
+url="https://github.com/SUNET/chithi"
+license=("GPL-3.0-only")
+depends=("webkit2gtk-4.1" "gtk3" "libayatana-appindicator" "openssl" "libsoup3")
+source=("chithi" "icon.png" "LICENSE")
+noextract=("chithi" "icon.png" "LICENSE")
+sha256sums=("SKIP" "SKIP" "SKIP")
+
+package() {
+    install -Dm755 "\$srcdir/chithi" "\$pkgdir/usr/bin/chithi"
+    install -Dm644 "\$srcdir/icon.png" "\$pkgdir/usr/share/icons/hicolor/128x128/apps/chithi.png"
+    install -Dm644 "\$srcdir/LICENSE" "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
+
+    install -dm755 "\$pkgdir/usr/share/applications"
+    cat > "\$pkgdir/usr/share/applications/chithi.desktop" <<DESKTOPEOF
+[Desktop Entry]
+Name=Chithi
+Comment=Desktop email client with IMAP, JMAP and Microsoft 365 support
+Exec=chithi
+Icon=chithi
+Terminal=false
+Type=Application
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;
+StartupWMClass=chithi
+DESKTOPEOF
+}
+PKGEOF
+
+# Build the package (makepkg refuses to run as root)
+RUN useradd -m builder && \
+    chown -R builder:builder /build && \
+    cd /build/src && \
+    su builder -c "makepkg -f" && \
+    cp /build/src/*.pkg.tar.zst /build/output/
+
+CMD ["ls", "-la", "/build/output/"]
