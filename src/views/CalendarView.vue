@@ -60,7 +60,8 @@ async function promptAttendeeNotification(
       await api.sendInvites(accountId, eventId, attendees.map((a) => a.email));
       showToast("Update sent to attendees", "success");
     } catch (e) {
-      showToast(`Failed to send updates: ${e}`, "error", 5000);
+      const msg = e instanceof Error ? e.message : String(e);
+      showToast(`Failed to send updates: ${msg}`, "error", 5000);
     }
   }
 }
@@ -87,7 +88,8 @@ async function onEventReschedule(payload: {
     }
   } catch (e) {
     dismissToast(toastId);
-    showToast(`Failed to reschedule: ${e}`, "error", 5000);
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to reschedule: ${msg}`, "error", 5000);
   }
 }
 
@@ -103,17 +105,24 @@ async function onCalendarDrop(payload: {
 
   const toastId = showToast("Moving to calendar...", "info", 0);
   try {
-    await calendarStore.moveEventToCalendar(
+    const newId = await calendarStore.moveEventToCalendar(
       payload.eventId,
       payload.targetCalendarId,
       payload.targetAccountId,
     );
     dismissToast(toastId);
     showToast("Event moved to calendar", "success");
-    await promptAttendeeNotification(ev.account_id, payload.eventId, payload.attendeesJson, payload.organizerEmail);
+    // Use the destination account + new event ID for attendee notification
+    await promptAttendeeNotification(
+      payload.targetAccountId,
+      newId,
+      payload.attendeesJson,
+      payload.organizerEmail,
+    );
   } catch (e) {
     dismissToast(toastId);
-    showToast(`Failed to move event: ${e}`, "error", 5000);
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to move event: ${msg}`, "error", 5000);
   }
 }
 

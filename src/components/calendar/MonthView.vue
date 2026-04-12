@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
@@ -73,6 +73,7 @@ const dragStartPos = ref<{ x: number; y: number } | null>(null);
 const dragGhost = ref<HTMLElement | null>(null);
 const dragOverDay = ref<string | null>(null);
 const DRAG_THRESHOLD = 5;
+let dragCleanup: (() => void) | null = null;
 
 function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
   if (event.button !== 0) return;
@@ -122,11 +123,17 @@ function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
     dragStartPos.value = null;
     document.removeEventListener("mousemove", handleMove);
     document.removeEventListener("mouseup", handleUp);
+    dragCleanup = null;
   };
 
   document.addEventListener("mousemove", handleMove);
   document.addEventListener("mouseup", handleUp);
+  dragCleanup = handleUp;
 }
+
+onUnmounted(() => {
+  if (dragCleanup) dragCleanup();
+});
 
 function onCellEnter(day: Date) {
   if (!isCalendarDragging.value) return;

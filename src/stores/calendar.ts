@@ -181,33 +181,49 @@ export const useCalendarStore = defineStore("calendar", () => {
     eventId: string,
     patch: Partial<NewEventInput>,
   ): Promise<void> {
-    // Optimistic local update first for instant UI feedback
+    // Save original values for rollback on failure
     const idx = events.value.findIndex((e) => e.id === eventId);
+    const snapshot = idx !== -1 ? { ...events.value[idx] } : null;
+
+    // Optimistic local update first for instant UI feedback
     if (idx !== -1) {
       if (patch.start_time) events.value[idx].start_time = patch.start_time;
       if (patch.end_time) events.value[idx].end_time = patch.end_time;
       if (patch.calendar_id) events.value[idx].calendar_id = patch.calendar_id;
     }
-    await api.updateEvent(eventId, patch);
-    await fetchEvents();
+    try {
+      await api.updateEvent(eventId, patch);
+      await fetchEvents();
+    } catch (e) {
+      // Rollback optimistic update
+      if (snapshot && idx !== -1 && idx < events.value.length) {
+        Object.assign(events.value[idx], snapshot);
+      }
+      throw e;
+    }
+  }
+
+  function safeParseAttendees(json: string | null): Array<{ email: string; name: string | null; status: string }> {
+    if (!json) return [];
+    try { return JSON.parse(json); } catch { return []; }
   }
 
   async function moveEventToCalendar(
     eventId: string,
     targetCalendarId: string,
     targetAccountId: string,
-  ): Promise<void> {
+  ): Promise<string> {
     const ev = events.value.find((e) => e.id === eventId);
-    if (!ev) return;
+    if (!ev) return eventId;
 
     if (ev.account_id === targetAccountId) {
       // Same account — just update the calendar_id
       await updateEvent(eventId, { calendar_id: targetCalendarId });
+      return eventId;
     } else {
-      // Cross-account — delete from source, create on destination
-      const attendees: Array<{ email: string; name: string | null; status: string }> =
-        ev.attendees_json ? JSON.parse(ev.attendees_json) : [];
-      await api.createEvent({
+      // Cross-account — create on destination, then delete source
+      const attendees = safeParseAttendees(ev.attendees_json);
+      const newId = await api.createEvent({
         account_id: targetAccountId,
         calendar_id: targetCalendarId,
         title: ev.title,
@@ -222,6 +238,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       });
       await api.deleteEvent(eventId);
       await fetchEvents();
+      return newId;
     }
   }
 
