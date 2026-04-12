@@ -3,6 +3,8 @@ import { onMounted, ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { CalendarViewMode } from "@/stores/calendar";
+import { showToast, dismissToast } from "@/lib/toast";
+import * as api from "@/lib/tauri";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
 import MonthView from "@/components/calendar/MonthView.vue";
@@ -29,6 +31,92 @@ function onEventClick(eventId: string) {
   if (event) calendarStore.selectEvent(event);
 }
 
+function tryParseAttendees(json: string | null): Array<{ email: string }> {
+  if (!json) return [];
+  try { return JSON.parse(json); } catch { return []; }
+}
+
+function isOrganizer(accountId: string, organizerEmail: string | null): boolean {
+  if (!organizerEmail) return true;
+  const account = accountsStore.accounts.find((a) => a.id === accountId);
+  return account?.email === organizerEmail;
+}
+
+async function promptAttendeeNotification(
+  accountId: string,
+  eventId: string,
+  attendeesJson: string | null,
+  organizerEmail: string | null,
+) {
+  const attendees = tryParseAttendees(attendeesJson);
+  if (attendees.length === 0) return;
+  const ev = calendarStore.events.find((e) => e.id === eventId);
+  if (!ev || !isOrganizer(accountId, organizerEmail)) return;
+
+  // Simple confirm — Tauri dialog requires plugin import, use browser confirm for now
+  const send = confirm("This event has attendees. Send an update notification?");
+  if (send) {
+    try {
+      await api.sendInvites(accountId, eventId, attendees.map((a) => a.email));
+      showToast("Update sent to attendees", "success");
+    } catch (e) {
+      showToast(`Failed to send updates: ${e}`, "error", 5000);
+    }
+  }
+}
+
+async function onEventReschedule(payload: {
+  eventId: string;
+  newStart: string;
+  newEnd: string;
+  attendeesJson: string | null;
+  organizerEmail: string | null;
+}) {
+  const toastId = showToast("Moving event...", "info", 0);
+  try {
+    await calendarStore.updateEvent(payload.eventId, {
+      start_time: payload.newStart,
+      end_time: payload.newEnd,
+    });
+    dismissToast(toastId);
+    showToast("Event rescheduled", "success");
+
+    const ev = calendarStore.events.find((e) => e.id === payload.eventId);
+    if (ev) {
+      await promptAttendeeNotification(ev.account_id, payload.eventId, payload.attendeesJson, payload.organizerEmail);
+    }
+  } catch (e) {
+    dismissToast(toastId);
+    showToast(`Failed to reschedule: ${e}`, "error", 5000);
+  }
+}
+
+async function onCalendarDrop(payload: {
+  eventId: string;
+  targetCalendarId: string;
+  targetAccountId: string;
+  attendeesJson: string | null;
+  organizerEmail: string | null;
+}) {
+  const ev = calendarStore.events.find((e) => e.id === payload.eventId);
+  if (!ev) return;
+
+  const toastId = showToast("Moving to calendar...", "info", 0);
+  try {
+    await calendarStore.moveEventToCalendar(
+      payload.eventId,
+      payload.targetCalendarId,
+      payload.targetAccountId,
+    );
+    dismissToast(toastId);
+    showToast("Event moved to calendar", "success");
+    await promptAttendeeNotification(ev.account_id, payload.eventId, payload.attendeesJson, payload.organizerEmail);
+  } catch (e) {
+    dismissToast(toastId);
+    showToast(`Failed to move event: ${e}`, "error", 5000);
+  }
+}
+
 onMounted(async () => {
   // Ensure accounts are loaded — App.vue loads them but it may not be done yet
   if (accountsStore.accounts.length === 0) {
@@ -48,7 +136,7 @@ onMounted(async () => {
 <template>
   <div class="calendar-view">
     <div class="calendar-sidebar-pane">
-      <CalendarSidebar />
+      <CalendarSidebar @calendar-drop="onCalendarDrop" />
     </div>
     <div class="calendar-main">
       <!-- Toolbar -->
@@ -89,11 +177,13 @@ onMounted(async () => {
           :single-day="calendarStore.viewMode === 'day'"
           @time-click="onTimeSlotClick"
           @event-click="onEventClick"
+          @event-reschedule="onEventReschedule"
         />
         <MonthView
           v-else
           @date-click="(d) => { calendarStore.setViewMode('day'); calendarStore.goToDate(d); }"
           @event-click="onEventClick"
+          @event-reschedule="onEventReschedule"
         />
       </div>
     </div>

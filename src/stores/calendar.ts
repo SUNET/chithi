@@ -177,6 +177,54 @@ export const useCalendarStore = defineStore("calendar", () => {
     return id;
   }
 
+  async function updateEvent(
+    eventId: string,
+    patch: Partial<NewEventInput>,
+  ): Promise<void> {
+    // Optimistic local update first for instant UI feedback
+    const idx = events.value.findIndex((e) => e.id === eventId);
+    if (idx !== -1) {
+      if (patch.start_time) events.value[idx].start_time = patch.start_time;
+      if (patch.end_time) events.value[idx].end_time = patch.end_time;
+      if (patch.calendar_id) events.value[idx].calendar_id = patch.calendar_id;
+    }
+    await api.updateEvent(eventId, patch);
+    await fetchEvents();
+  }
+
+  async function moveEventToCalendar(
+    eventId: string,
+    targetCalendarId: string,
+    targetAccountId: string,
+  ): Promise<void> {
+    const ev = events.value.find((e) => e.id === eventId);
+    if (!ev) return;
+
+    if (ev.account_id === targetAccountId) {
+      // Same account — just update the calendar_id
+      await updateEvent(eventId, { calendar_id: targetCalendarId });
+    } else {
+      // Cross-account — delete from source, create on destination
+      const attendees: Array<{ email: string; name: string | null; status: string }> =
+        ev.attendees_json ? JSON.parse(ev.attendees_json) : [];
+      await api.createEvent({
+        account_id: targetAccountId,
+        calendar_id: targetCalendarId,
+        title: ev.title,
+        description: ev.description,
+        location: ev.location,
+        start_time: ev.start_time,
+        end_time: ev.end_time,
+        all_day: ev.all_day,
+        timezone: ev.timezone,
+        recurrence_rule: ev.recurrence_rule,
+        attendees,
+      });
+      await api.deleteEvent(eventId);
+      await fetchEvents();
+    }
+  }
+
   async function deleteEvent(eventId: string) {
     await api.deleteEvent(eventId);
     if (selectedEvent.value?.id === eventId) {
@@ -244,6 +292,8 @@ export const useCalendarStore = defineStore("calendar", () => {
     fetchCalendars,
     fetchEvents,
     createEvent,
+    updateEvent,
+    moveEventToCalendar,
     deleteEvent,
     setViewMode,
     goToDate,

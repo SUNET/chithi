@@ -1,10 +1,19 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import type { CalendarEvent } from "@/lib/types";
+import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
 const emit = defineEmits<{
   dateClick: [date: string];
   eventClick: [eventId: string];
+  eventReschedule: [payload: {
+    eventId: string;
+    newStart: string;
+    newEnd: string;
+    attendeesJson: string | null;
+    organizerEmail: string | null;
+  }];
 }>();
 
 const calendarStore = useCalendarStore();
@@ -58,6 +67,102 @@ function getEventColor(event: { calendar_id: string }): string {
 }
 
 const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// Drag-to-reschedule
+const dragStartPos = ref<{ x: number; y: number } | null>(null);
+const dragGhost = ref<HTMLElement | null>(null);
+const dragOverDay = ref<string | null>(null);
+const DRAG_THRESHOLD = 5;
+
+function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
+  if (event.button !== 0) return;
+  if (/_\d{4}-/.test(ev.id) && ev.recurrence_rule) return;
+  if (ev.all_day) return;
+
+  dragStartPos.value = { x: event.clientX, y: event.clientY };
+  const sourceEvent = ev;
+
+  const handleMove = (e: MouseEvent) => {
+    if (!dragStartPos.value) return;
+    const dx = e.clientX - dragStartPos.value.x;
+    const dy = e.clientY - dragStartPos.value.y;
+    if (!isCalendarDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
+
+    if (!isCalendarDragging.value) {
+      dragCalendarEvent.value = sourceEvent;
+      isCalendarDragging.value = true;
+      const ghost = document.createElement("div");
+      ghost.textContent = sourceEvent.title;
+      ghost.dataset.testid = "cal-drag-ghost";
+      ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
+      document.body.appendChild(ghost);
+      dragGhost.value = ghost;
+      document.body.style.cursor = "grabbing";
+    }
+
+    if (dragGhost.value) {
+      dragGhost.value.style.left = e.clientX + 12 + "px";
+      dragGhost.value.style.top = e.clientY + 12 + "px";
+    }
+  };
+
+  const handleUp = () => {
+    document.body.style.cursor = "";
+    if (isCalendarDragging.value) {
+      setTimeout(() => {
+        isCalendarDragging.value = false;
+        dragCalendarEvent.value = null;
+        dragOverDay.value = null;
+        if (dragGhost.value) {
+          dragGhost.value.remove();
+          dragGhost.value = null;
+        }
+      }, 0);
+    }
+    dragStartPos.value = null;
+    document.removeEventListener("mousemove", handleMove);
+    document.removeEventListener("mouseup", handleUp);
+  };
+
+  document.addEventListener("mousemove", handleMove);
+  document.addEventListener("mouseup", handleUp);
+}
+
+function onCellEnter(day: Date) {
+  if (!isCalendarDragging.value) return;
+  dragOverDay.value = day.toISOString().split("T")[0];
+}
+
+function onCellLeave(day: Date) {
+  if (dragOverDay.value === day.toISOString().split("T")[0]) {
+    dragOverDay.value = null;
+  }
+}
+
+function onCellDrop(day: Date) {
+  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  dragOverDay.value = null;
+
+  const ev = dragCalendarEvent.value;
+  const originalStart = new Date(ev.start_time);
+  const originalEnd = new Date(ev.end_time);
+  const durationMs = originalEnd.getTime() - originalStart.getTime();
+
+  // Keep same time-of-day, change the date
+  const newStart = new Date(day);
+  newStart.setHours(originalStart.getHours(), originalStart.getMinutes(), 0, 0);
+  const newEnd = new Date(newStart.getTime() + durationMs);
+
+  if (newStart.getTime() === originalStart.getTime()) return;
+
+  emit("eventReschedule", {
+    eventId: ev.id,
+    newStart: newStart.toISOString(),
+    newEnd: newEnd.toISOString(),
+    attendeesJson: ev.attendees_json,
+    organizerEmail: ev.organizer_email,
+  });
+}
 </script>
 
 <template>
@@ -74,8 +179,13 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
           :class="{
             today: isToday(day),
             'other-month': !isCurrentMonth(day),
+            'drag-over': isCalendarDragging && dragOverDay === day.toISOString().split('T')[0],
           }"
+          :data-testid="`cal-month-cell-${day.toISOString().split('T')[0]}`"
           @click="emit('dateClick', day.toISOString().split('T')[0])"
+          @mouseenter="onCellEnter(day)"
+          @mouseleave="onCellLeave(day)"
+          @mouseup="onCellDrop(day)"
         >
           <span class="day-number">{{ day.getDate() }}</span>
           <div class="month-events">
@@ -83,9 +193,11 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
               v-for="event in getEventsForDay(day).slice(0, 3)"
               :key="event.id"
               class="month-event"
+              :class="{ dragging: isCalendarDragging && dragCalendarEvent?.id === event.id }"
               :data-testid="`cal-event-${event.id}`"
               :style="{ backgroundColor: getEventColor(event) }"
               @click.stop="emit('eventClick', event.id)"
+              @mousedown="onEventMouseDown($event, event)"
             >
               {{ event.title }}
             </div>
@@ -169,6 +281,12 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   opacity: 0.4;
 }
 
+.month-cell.drag-over {
+  background: rgba(66, 133, 244, 0.15);
+  outline: 1px dashed var(--color-accent);
+  outline-offset: -1px;
+}
+
 .day-number {
   font-size: 12px;
   color: var(--color-text-secondary);
@@ -190,6 +308,11 @@ const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+}
+
+.month-event.dragging {
+  opacity: 0.4;
+  pointer-events: none;
 }
 
 .month-more {

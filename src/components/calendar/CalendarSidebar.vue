@@ -2,7 +2,19 @@
 import { ref } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import type { Calendar } from "@/lib/types";
+import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 import * as api from "@/lib/tauri";
+
+const emit = defineEmits<{
+  calendarDrop: [payload: {
+    eventId: string;
+    targetCalendarId: string;
+    targetAccountId: string;
+    attendeesJson: string | null;
+    organizerEmail: string | null;
+  }];
+}>();
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
@@ -26,6 +38,37 @@ function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
 
 function closeContextMenu() {
   contextMenu.value = null;
+}
+
+const dropTargetCalendarId = ref<string | null>(null);
+
+function onCalendarItemEnter(calId: string) {
+  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  if (dragCalendarEvent.value.calendar_id === calId) return;
+  dropTargetCalendarId.value = calId;
+}
+
+function onCalendarItemLeave(calId: string) {
+  if (dropTargetCalendarId.value === calId) {
+    dropTargetCalendarId.value = null;
+  }
+}
+
+function onCalendarItemDrop(cal: Calendar) {
+  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  const ev = dragCalendarEvent.value;
+  if (ev.calendar_id === cal.id) {
+    dropTargetCalendarId.value = null;
+    return;
+  }
+  dropTargetCalendarId.value = null;
+  emit("calendarDrop", {
+    eventId: ev.id,
+    targetCalendarId: cal.id,
+    targetAccountId: cal.account_id,
+    attendeesJson: ev.attendees_json,
+    organizerEmail: ev.organizer_email,
+  });
 }
 
 async function syncThisCalendar() {
@@ -54,8 +97,12 @@ async function syncThisCalendar() {
         v-for="cal in calendarStore.calendars"
         :key="cal.id"
         class="calendar-item"
-        :class="{ syncing: syncing === cal.id }"
+        :class="{ syncing: syncing === cal.id, 'drag-over': dropTargetCalendarId === cal.id }"
+        :data-testid="`calendar-item-${cal.id}`"
         @contextmenu="onContextMenu($event, cal.id, cal.account_id)"
+        @mouseenter="onCalendarItemEnter(cal.id)"
+        @mouseleave="onCalendarItemLeave(cal.id)"
+        @mouseup="onCalendarItemDrop(cal)"
       >
         <label class="calendar-label">
           <input
@@ -121,6 +168,13 @@ async function syncThisCalendar() {
 
 .calendar-item.syncing {
   opacity: 0.6;
+}
+
+.calendar-item.drag-over {
+  background: rgba(66, 133, 244, 0.12);
+  border-radius: 4px;
+  outline: 1px dashed var(--color-accent);
+  outline-offset: -1px;
 }
 
 .calendar-label {
