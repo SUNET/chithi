@@ -560,6 +560,18 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Append a raw RFC5322 message to a folder preserving its original state
+    /// (no extra flags). Used for cross-account moves where we want to keep
+    /// the message as-is.
+    pub fn append_message_raw(&mut self, folder: &str, message: &[u8]) -> Result<()> {
+        log::info!("IMAP appending raw message ({} bytes) to folder '{}'", message.len(), folder);
+        self.session
+            .append(folder, message)
+            .map_err(|e| Error::Imap(format!("IMAP APPEND failed: {}", e)))?;
+        log::info!("IMAP raw message appended to '{}'", folder);
+        Ok(())
+    }
+
     /// Enter IMAP IDLE on the currently selected folder.
     /// Blocks until the server sends a notification (new mail, expunge, etc.)
     /// or the timeout expires. Returns true if there was a server notification.
