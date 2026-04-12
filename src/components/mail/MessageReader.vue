@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -27,6 +27,12 @@ const invites = ref<ParsedInvite[]>([]);
 // Remote images: per-message, not persisted
 const imagesHtml = ref<string | null>(null);
 const loadingImages = ref(false);
+
+// Only show "Load images" when the original email contained remote images.
+// The backend checks the raw HTML before ammonia strips <img> tags.
+const hasRemoteImages = computed(() => {
+  return messagesStore.activeMessage?.has_remote_images ?? false;
+});
 
 // Reset view state when switching messages
 watch(
@@ -624,7 +630,7 @@ async function markSpam() {
           v-if="showHtml && hasHtml()"
           class="body-html-wrapper"
         >
-          <div v-if="!imagesHtml" class="no-remote-notice">
+          <div v-if="hasRemoteImages && !imagesHtml" class="no-remote-notice">
             Remote content blocked
             <button class="load-images-btn" data-testid="reader-load-images" :disabled="loadingImages" @click="loadRemoteImages">
               {{ loadingImages ? 'Loading...' : 'Load images' }}
@@ -647,7 +653,7 @@ async function markSpam() {
           v-else-if="hasHtml()"
           class="body-html-wrapper"
         >
-          <div v-if="!imagesHtml" class="no-remote-notice">
+          <div v-if="hasRemoteImages && !imagesHtml" class="no-remote-notice">
             Remote content blocked
             <button class="load-images-btn" data-testid="reader-load-images" :disabled="loadingImages" @click="loadRemoteImages">
               {{ loadingImages ? 'Loading...' : 'Load images' }}

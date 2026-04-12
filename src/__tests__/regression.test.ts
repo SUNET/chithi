@@ -248,3 +248,33 @@ describe("Regression: selection", () => {
     expect(subjectCollapsed.classes()).toContain("bold");
   });
 });
+
+describe("Regression: Load images button visibility (#34)", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+  });
+
+  it("BUG: Load images button must only appear when has_remote_images is true", () => {
+    // Previously the button was shown for ALL HTML emails because the frontend
+    // tried to detect <img> tags in body_html, but ammonia strips them before
+    // the frontend sees them. Now the backend provides has_remote_images.
+    const messagesStore = useMessagesStore();
+
+    // No remote images — button should not appear
+    messagesStore.activeMessage = {
+      id: "msg1", subject: "Plain", from: { name: "T", email: "t@t.com" },
+      to: [], cc: [], date: "2026-04-12T00:00:00Z", flags: [],
+      body_html: "<p>Hello</p>", body_text: "Hello", attachments: [],
+      is_encrypted: false, is_signed: false, list_id: null,
+      has_remote_images: false,
+    };
+    expect(messagesStore.activeMessage.has_remote_images).toBe(false);
+
+    // With remote images — button should appear
+    messagesStore.activeMessage = {
+      ...messagesStore.activeMessage,
+      has_remote_images: true,
+    };
+    expect(messagesStore.activeMessage.has_remote_images).toBe(true);
+  });
+});

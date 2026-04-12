@@ -57,6 +57,7 @@ export interface MessageBody {
   is_encrypted: boolean;
   is_signed: boolean;
   list_id: string | null;
+  has_remote_images: boolean;
 }
 
 export interface Attachment {
