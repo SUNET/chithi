@@ -11,6 +11,10 @@ const route = useRoute();
 const accountsStore = useAccountsStore();
 const currentWindow = getCurrentWindow();
 
+interface ComposeE2EBridge {
+  closeWindow: () => Promise<void>;
+}
+
 // Compose window has its own Vue instance — stores are empty.
 // Fetch accounts directly and manage locally.
 const accounts = ref<Account[]>([]);
@@ -69,6 +73,17 @@ function onEditShortcut(e: KeyboardEvent) {
 }
 window.addEventListener("keydown", onEditShortcut);
 onUnmounted(() => window.removeEventListener("keydown", onEditShortcut));
+
+const e2eBridge: ComposeE2EBridge = {
+  closeWindow: async () => {
+    await currentWindow.close();
+  },
+};
+
+(window as Window & { __CHITHI_E2E_COMPOSE__?: ComposeE2EBridge }).__CHITHI_E2E_COMPOSE__ = e2eBridge;
+onUnmounted(() => {
+  delete (window as Window & { __CHITHI_E2E_COMPOSE__?: ComposeE2EBridge }).__CHITHI_E2E_COMPOSE__;
+});
 
 // Prefill from query params (reply/reply-all/forward)
 const replyToMessageId = (route.query.replyTo as string) || "";
@@ -253,15 +268,34 @@ watch(selectedAccountId, (newId) => {
 const initialTo = (route.query.to as string) || "";
 const initialCc = (route.query.cc as string) || "";
 const initialSubject = (route.query.subject as string) || "";
+const baselineTo = ref(initialTo);
+const baselineCc = ref(initialCc);
+const baselineBcc = ref("");
+const baselineSubject = ref(initialSubject);
 const baselineBody = ref((route.query.body as string) || "");
 
+function attachmentBaselineValue(items: ComposeAttachment[]): string {
+  return JSON.stringify(items.map(({ path, name }) => ({ path, name })));
+}
+
+const baselineAttachments = ref(attachmentBaselineValue([]));
+
+function markDraftStateAsClean() {
+  baselineTo.value = to.value;
+  baselineCc.value = cc.value;
+  baselineBcc.value = bcc.value;
+  baselineSubject.value = subject.value;
+  baselineBody.value = bodyText.value;
+  baselineAttachments.value = attachmentBaselineValue(attachments.value);
+}
+
 const isDirty = computed(() =>
-  to.value !== initialTo ||
-  cc.value !== initialCc ||
-  bcc.value !== "" ||
-  subject.value !== initialSubject ||
+  to.value !== baselineTo.value ||
+  cc.value !== baselineCc.value ||
+  bcc.value !== baselineBcc.value ||
+  subject.value !== baselineSubject.value ||
   bodyText.value !== baselineBody.value ||
-  attachments.value.length > 0
+  attachmentBaselineValue(attachments.value) !== baselineAttachments.value
 );
 
 const canSend = computed(() => to.value.trim().length > 0 && !sending.value);
@@ -284,8 +318,10 @@ onMounted(() => {
       );
 
       if (result === "Save Draft" || result === "Yes") {
-        await saveDraft();
-        await currentWindow.destroy();
+        const saved = await saveDraft();
+        if (saved) {
+          await currentWindow.destroy();
+        }
       } else if (result === "Discard" || result === "No") {
         await currentWindow.destroy();
       }
@@ -297,9 +333,9 @@ onMounted(() => {
   });
 });
 
-async function saveDraft() {
+async function saveDraft(): Promise<boolean> {
   const accountId = selectedAccountId.value;
-  if (!accountId) return;
+  if (!accountId) return false;
 
   savingDraft.value = true;
   error.value = null;
@@ -313,10 +349,13 @@ async function saveDraft() {
       body_html: null,
       attachments: attachments.value,
     });
+    markDraftStateAsClean();
     // Trigger a sync so the draft appears in the local mailbox
     api.triggerSync(accountId).catch(() => {});
+    return true;
   } catch (e) {
     error.value = `Draft save failed: ${e}`;
+    return false;
   } finally {
     savingDraft.value = false;
   }

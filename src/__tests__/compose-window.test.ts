@@ -139,68 +139,117 @@ describe("openComposeWindow", () => {
 });
 
 describe("Compose dirty tracking", () => {
+  function attachmentBaselineValue(
+    items: Array<{ path: string; name: string }>,
+  ): string {
+    return JSON.stringify(items.map(({ path, name }) => ({ path, name })));
+  }
+
+  function isDirtyState(
+    current: {
+      to: string;
+      cc: string;
+      bcc: string;
+      subject: string;
+      body: string;
+      attachments: Array<{ path: string; name: string }>;
+    },
+    baseline: {
+      to: string;
+      cc: string;
+      bcc: string;
+      subject: string;
+      body: string;
+      attachments: Array<{ path: string; name: string }>;
+    },
+  ): boolean {
+    return current.to !== baseline.to ||
+      current.cc !== baseline.cc ||
+      current.bcc !== baseline.bcc ||
+      current.subject !== baseline.subject ||
+      current.body !== baseline.body ||
+      attachmentBaselineValue(current.attachments) !==
+        attachmentBaselineValue(baseline.attachments);
+  }
+
   it("empty compose is not dirty", () => {
-    const initial = { to: "", cc: "", subject: "", body: "" };
+    const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(false);
   });
 
   it("typing in To makes it dirty", () => {
-    const initial = { to: "", cc: "", subject: "", body: "" };
+    const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "alice@example.com", cc: "", bcc: "", subject: "", body: "", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
   });
 
   it("typing in Subject makes it dirty", () => {
-    const initial = { to: "", cc: "", subject: "", body: "" };
+    const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "", cc: "", bcc: "", subject: "Hello", body: "", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
   });
 
   it("typing in Body makes it dirty", () => {
-    const initial = { to: "", cc: "", subject: "", body: "" };
+    const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "", cc: "", bcc: "", subject: "", body: "Hello world", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
   });
 
   it("adding attachment makes it dirty", () => {
-    const initial = { to: "", cc: "", subject: "", body: "" };
+    const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "", cc: "", bcc: "", subject: "", body: "",
       attachments: [{ path: "/tmp/file.pdf", name: "file.pdf" }] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
   });
 
   it("reply prefill is not dirty when unchanged", () => {
-    const initial = { to: "alice@example.com", cc: "", subject: "Re: Hello", body: "> original" };
+    const initial = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "> original", attachments: [] };
     const current = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "> original", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(false);
   });
 
   it("editing reply body makes it dirty", () => {
-    const initial = { to: "alice@example.com", cc: "", subject: "Re: Hello", body: "> original" };
+    const initial = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "> original", attachments: [] };
     const current = { to: "alice@example.com", cc: "", bcc: "", subject: "Re: Hello", body: "My reply\n\n> original", attachments: [] };
-    const dirty = current.to !== initial.to || current.cc !== initial.cc ||
-      current.bcc !== "" || current.subject !== initial.subject ||
-      current.body !== initial.body || current.attachments.length > 0;
+    const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
+  });
+
+  it("manual save resets dirty baseline", () => {
+    const savedState = {
+      to: "alice@example.com",
+      cc: "",
+      bcc: "",
+      subject: "Draft subject",
+      body: "Draft body",
+      attachments: [{ path: "/tmp/file.pdf", name: "file.pdf" }],
+    };
+
+    expect(isDirtyState(savedState, savedState)).toBe(false);
+  });
+
+  it("editing after manual save becomes dirty again", () => {
+    const savedState = {
+      to: "alice@example.com",
+      cc: "",
+      bcc: "",
+      subject: "Draft subject",
+      body: "Draft body",
+      attachments: [],
+    };
+    const current = {
+      ...savedState,
+      body: "Draft body updated",
+    };
+
+    expect(isDirtyState(current, savedState)).toBe(true);
   });
 });
 
