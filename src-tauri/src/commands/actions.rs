@@ -297,18 +297,47 @@ pub async fn move_messages_cross_account(
         )));
     }
 
-    // Read raw bytes from disk using async I/O to avoid blocking the runtime
+    // Read raw bytes from disk using async I/O to avoid blocking the runtime.
+    // Validate each path: skip non-disk entries (graph: prefix) and reject
+    // absolute paths or ".." segments that could escape the data directory.
     let data_dir = state.data_dir.clone();
     let paths_clone = maildir_paths.clone();
     let raw_messages: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+        let canonical_data_dir = std::fs::canonicalize(&data_dir)
+            .unwrap_or_else(|_| data_dir.clone());
         let mut messages = Vec::with_capacity(paths_clone.len());
-        for (_, maildir_path) in &paths_clone {
+        for (msg_id, maildir_path) in &paths_clone {
+            // Skip non-disk entries (e.g. Graph API messages with "graph:" prefix)
+            if maildir_path.starts_with("graph:") {
+                return Err(Error::Other(format!(
+                    "Message {} is not stored on disk (Graph API). \
+                     Cross-account move requires locally synced messages.",
+                    msg_id
+                )));
+            }
+            let rel = std::path::Path::new(maildir_path);
+            if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(Error::Other(format!(
+                    "Invalid maildir path for message {}: '{}'",
+                    msg_id, maildir_path
+                )));
+            }
             let full_path = data_dir.join(maildir_path);
-            let bytes = std::fs::read(&full_path).map_err(|e| {
+            let canonical = std::fs::canonicalize(&full_path).map_err(|e| {
+                Error::Other(format!(
+                    "Failed to resolve maildir file {}: {}",
+                    full_path.display(), e
+                ))
+            })?;
+            if !canonical.starts_with(&canonical_data_dir) {
+                return Err(Error::Other(format!(
+                    "Path traversal detected for message {}", msg_id
+                )));
+            }
+            let bytes = std::fs::read(&canonical).map_err(|e| {
                 Error::Other(format!(
                     "Failed to read maildir file {}: {}",
-                    full_path.display(),
-                    e
+                    full_path.display(), e
                 ))
             })?;
             messages.push(bytes);
