@@ -145,15 +145,21 @@ pub fn parse_message_body(
         .map(|d| d.to_rfc3339())
         .unwrap_or_default();
 
-    let body_html = parsed.body_html(0).map(|s| {
-        // Sanitize HTML to prevent XSS. Ammonia defaults already:
-        // - Strip <script>, <style> tags and their contents
-        // - Remove event handler attributes (onclick, onerror, etc.)
-        // - Only allow safe URL schemes (http, https, mailto — NOT javascript:)
-        // We additionally:
-        // - Remove <img> to block remote content / tracking pixels
-        // - Remove <object>, <embed>, <iframe>, <form> to block interactive content
-        // - Allow inline "style" for basic formatting but it cannot execute JS
+    // Grab raw HTML once for both image detection and sanitization
+    let raw_html = parsed.body_html(0);
+
+    // Check for remote images before sanitization strips <img> tags.
+    // Only match https:// to align with the loading pipeline (parse_html_with_images
+    // only allows https URL scheme).
+    let has_remote_images = raw_html.as_ref().map(|s| {
+        use std::sync::LazyLock;
+        static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"(?i)<img\b[^>]*\bsrc\s*=\s*["']https://"#).unwrap()
+        });
+        RE.is_match(s)
+    }).unwrap_or(false);
+
+    let body_html = raw_html.map(|s| {
         let url_schemes = std::collections::HashSet::from(["http", "https", "mailto"]);
         ammonia::Builder::default()
             .add_generic_attributes(&["style"])
@@ -207,6 +213,7 @@ pub fn parse_message_body(
         is_encrypted,
         is_signed,
         list_id,
+        has_remote_images,
     })
 }
 
