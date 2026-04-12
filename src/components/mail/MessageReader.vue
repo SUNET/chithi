@@ -106,8 +106,8 @@ function iframeSrcdoc(): string {
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
-    color: ${uiStore.theme === "dark" ? "#e0e0e0" : "#1a1a1a"};
-    background: ${uiStore.theme === "dark" ? "#1e1e1e" : "#ffffff"};
+    color: ${uiStore.theme === "dark" ? "#e5e5e5" : "#1a1a1a"};
+    background: ${uiStore.theme === "dark" ? "#171717" : "#ffffff"};
   }
   a { color: #1a73e8; cursor: pointer; }
 </style>
