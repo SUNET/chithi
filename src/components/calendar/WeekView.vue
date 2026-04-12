@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, nextTick } from "vue";
+import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import type { CalendarEvent } from "@/lib/types";
+import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
 const props = defineProps<{
   singleDay?: boolean;
@@ -10,6 +11,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   timeClick: [dateTime: string];
   eventClick: [eventId: string];
+  eventReschedule: [payload: {
+    eventId: string;
+    newStart: string;
+    newEnd: string;
+    attendeesJson: string | null;
+    organizerEmail: string | null;
+  }];
 }>();
 
 const calendarStore = useCalendarStore();
@@ -164,9 +172,119 @@ function getEventStyle(event: { my_status: string | null }): Record<string, stri
 }
 
 function onSlotClick(date: Date, hour: number) {
+  if (isCalendarDragging.value) return;
   const dt = new Date(date);
   dt.setHours(hour, 0, 0, 0);
   emit("timeClick", dt.toISOString());
+}
+
+// Drag-to-reschedule
+const dragStartPos = ref<{ x: number; y: number } | null>(null);
+const dragGhost = ref<HTMLElement | null>(null);
+const dragOverCell = ref<{ day: string; hour: number } | null>(null);
+const DRAG_THRESHOLD = 5;
+let dragCleanup: (() => void) | null = null;
+
+function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
+  if (event.button !== 0) return;
+  const ev = seg.event;
+
+  // Block recurring occurrences (synthetic ID: originalId_2026-...)
+  if (/_\d{4}-/.test(ev.id) && ev.recurrence_rule) return;
+  // Block all-day events
+  if (ev.all_day) return;
+
+  dragStartPos.value = { x: event.clientX, y: event.clientY };
+  const sourceEvent = ev;
+
+  const handleMove = (e: MouseEvent) => {
+    if (!dragStartPos.value) return;
+    const dx = e.clientX - dragStartPos.value.x;
+    const dy = e.clientY - dragStartPos.value.y;
+    if (!isCalendarDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
+
+    if (!isCalendarDragging.value) {
+      dragCalendarEvent.value = sourceEvent;
+      isCalendarDragging.value = true;
+      const ghost = document.createElement("div");
+      ghost.textContent = sourceEvent.title;
+      ghost.dataset.testid = "cal-drag-ghost";
+      ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
+      document.body.appendChild(ghost);
+      dragGhost.value = ghost;
+      document.body.style.cursor = "grabbing";
+    }
+
+    if (dragGhost.value) {
+      dragGhost.value.style.left = e.clientX + 12 + "px";
+      dragGhost.value.style.top = e.clientY + 12 + "px";
+    }
+  };
+
+  const handleUp = () => {
+    document.body.style.cursor = "";
+    if (isCalendarDragging.value) {
+      setTimeout(() => {
+        isCalendarDragging.value = false;
+        dragCalendarEvent.value = null;
+        dragOverCell.value = null;
+        if (dragGhost.value) {
+          dragGhost.value.remove();
+          dragGhost.value = null;
+        }
+      }, 0);
+    }
+    dragStartPos.value = null;
+    document.removeEventListener("mousemove", handleMove);
+    document.removeEventListener("mouseup", handleUp);
+    dragCleanup = null;
+  };
+
+  document.addEventListener("mousemove", handleMove);
+  document.addEventListener("mouseup", handleUp);
+  dragCleanup = handleUp;
+}
+
+function onTimeCellEnter(day: Date, hour: number) {
+  if (!isCalendarDragging.value) return;
+  dragOverCell.value = { day: day.toISOString().split("T")[0], hour };
+}
+
+function onTimeCellLeave(day: Date, hour: number) {
+  if (dragOverCell.value?.day === day.toISOString().split("T")[0] &&
+      dragOverCell.value?.hour === hour) {
+    dragOverCell.value = null;
+  }
+}
+
+function isDragOver(day: Date, hour: number): boolean {
+  return isCalendarDragging.value &&
+    dragOverCell.value?.day === day.toISOString().split("T")[0] &&
+    dragOverCell.value?.hour === hour;
+}
+
+function onTimeCellDrop(day: Date, hour: number) {
+  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  dragOverCell.value = null;
+
+  const ev = dragCalendarEvent.value;
+  const originalStart = new Date(ev.start_time);
+  const originalEnd = new Date(ev.end_time);
+  const durationMs = originalEnd.getTime() - originalStart.getTime();
+
+  const newStart = new Date(day);
+  newStart.setHours(hour, 0, 0, 0);
+  const newEnd = new Date(newStart.getTime() + durationMs);
+
+  if (newStart.getTime() === originalStart.getTime()) return;
+
+  emit("eventReschedule", {
+    eventId: ev.id,
+    newStart: newStart.toISOString(),
+    newEnd: newEnd.toISOString(),
+    attendeesJson: ev.attendees_json,
+    organizerEmail: ev.organizer_email,
+  });
 }
 
 // Scroll to current hour (or 8 AM if before that) on mount
@@ -178,6 +296,10 @@ onMounted(async () => {
     const scrollToHour = Math.max(now.value.getHours() - 2, 0);
     gridRef.value.scrollTop = hourHeight * scrollToHour;
   }
+});
+
+onUnmounted(() => {
+  if (dragCleanup) dragCleanup();
 });
 </script>
 
@@ -229,8 +351,12 @@ onMounted(async () => {
           v-for="day in days"
           :key="day.toISOString() + hour"
           class="time-cell"
-          :class="{ today: isToday(day), weekend: isWeekend(day) }"
+          :class="{ today: isToday(day), weekend: isWeekend(day), 'drag-over': isDragOver(day, hour) }"
+          :data-testid="`cal-time-cell-${day.toISOString().split('T')[0]}-${hour}`"
           @click="onSlotClick(day, hour)"
+          @mouseenter="onTimeCellEnter(day, hour)"
+          @mouseleave="onTimeCellLeave(day, hour)"
+          @mouseup="onTimeCellDrop(day, hour)"
         >
           <!-- Current time marker positioned within the hour -->
           <div
@@ -242,9 +368,11 @@ onMounted(async () => {
             v-for="seg in getEventsForDayHour(day, hour)"
             :key="seg.event.id + '-' + seg.segStart.toISOString()"
             class="event-block"
+            :class="{ dragging: isCalendarDragging && dragCalendarEvent?.id === seg.event.id }"
             :data-testid="`cal-event-${seg.event.id}`"
             :style="eventBlockStyle(seg)"
             @click.stop="emit('eventClick', seg.event.id)"
+            @mousedown="onEventMouseDown($event, seg)"
           >
             <span class="event-time">
               {{ seg.segStart.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }}
@@ -477,6 +605,17 @@ onMounted(async () => {
 .event-block:hover {
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
   transform: translateY(-1px);
+}
+
+.event-block.dragging {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.time-cell.drag-over {
+  background: rgba(66, 133, 244, 0.15);
+  outline: 1px dashed var(--color-accent);
+  outline-offset: -1px;
 }
 
 .event-time {

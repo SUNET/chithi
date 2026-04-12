@@ -177,6 +177,71 @@ export const useCalendarStore = defineStore("calendar", () => {
     return id;
   }
 
+  async function updateEvent(
+    eventId: string,
+    patch: Partial<NewEventInput>,
+  ): Promise<void> {
+    // Save original values for rollback on failure
+    const idx = events.value.findIndex((e) => e.id === eventId);
+    const snapshot = idx !== -1 ? { ...events.value[idx] } : null;
+
+    // Optimistic local update first for instant UI feedback
+    if (idx !== -1) {
+      if (patch.start_time) events.value[idx].start_time = patch.start_time;
+      if (patch.end_time) events.value[idx].end_time = patch.end_time;
+      if (patch.calendar_id) events.value[idx].calendar_id = patch.calendar_id;
+    }
+    try {
+      await api.updateEvent(eventId, patch);
+      await fetchEvents();
+    } catch (e) {
+      // Rollback optimistic update
+      if (snapshot && idx !== -1 && idx < events.value.length) {
+        Object.assign(events.value[idx], snapshot);
+      }
+      throw e;
+    }
+  }
+
+  function safeParseAttendees(json: string | null): Array<{ email: string; name: string | null; status: string }> {
+    if (!json) return [];
+    try { return JSON.parse(json); } catch { return []; }
+  }
+
+  async function moveEventToCalendar(
+    eventId: string,
+    targetCalendarId: string,
+    targetAccountId: string,
+  ): Promise<string> {
+    const ev = events.value.find((e) => e.id === eventId);
+    if (!ev) return eventId;
+
+    if (ev.account_id === targetAccountId) {
+      // Same account — just update the calendar_id
+      await updateEvent(eventId, { calendar_id: targetCalendarId });
+      return eventId;
+    } else {
+      // Cross-account — create on destination, then delete source
+      const attendees = safeParseAttendees(ev.attendees_json);
+      const newId = await api.createEvent({
+        account_id: targetAccountId,
+        calendar_id: targetCalendarId,
+        title: ev.title,
+        description: ev.description,
+        location: ev.location,
+        start_time: ev.start_time,
+        end_time: ev.end_time,
+        all_day: ev.all_day,
+        timezone: ev.timezone,
+        recurrence_rule: ev.recurrence_rule,
+        attendees,
+      });
+      await api.deleteEvent(eventId);
+      await fetchEvents();
+      return newId;
+    }
+  }
+
   async function deleteEvent(eventId: string) {
     await api.deleteEvent(eventId);
     if (selectedEvent.value?.id === eventId) {
@@ -244,6 +309,8 @@ export const useCalendarStore = defineStore("calendar", () => {
     fetchCalendars,
     fetchEvents,
     createEvent,
+    updateEvent,
+    moveEventToCalendar,
     deleteEvent,
     setViewMode,
     goToDate,
