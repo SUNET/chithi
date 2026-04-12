@@ -215,7 +215,7 @@ collect-release:
     #!/usr/bin/env bash
     set -e
     mkdir -p dist/release
-    find dist -maxdepth 2 \( -name '*.rpm' -o -name '*.deb' -o -name '*.pkg.tar.zst' \) | while read f; do
+    find dist -maxdepth 2 -path 'dist/release' -prune -o \( -name '*.rpm' -o -name '*.deb' -o -name '*.pkg.tar.zst' \) -print | while read f; do
         cp "$f" dist/release/
     done
     echo "Release packages collected in dist/release/:"
