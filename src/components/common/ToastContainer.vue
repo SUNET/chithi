@@ -7,7 +7,7 @@ const toasts = useToasts();
 <template>
   <Teleport to="body">
     <div class="toast-container">
-      <TransitionGroup name="toast">
+      <TransitionGroup name="toast" tag="div">
         <div
           v-for="toast in toasts"
           :key="toast.id"

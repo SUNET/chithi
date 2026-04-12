@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 
@@ -846,15 +846,7 @@ async fn sync_graph_account(
     use crate::mail::graph::{self, GraphClient};
     use crate::mail::sync::{create_maildir_dirs, sanitize_folder_name, flags_to_maildir_suffix};
 
-    let data_dir = {
-        let conn = db_arc.lock().await;
-        // Get data_dir from the first message's path, or use default
-        // Actually we need to pass data_dir — get it from the AppHandle
-        drop(conn);
-        // Use the standard Chithi data directory
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        std::path::PathBuf::from(format!("{}/.local/share/chithi", home))
-    };
+    let data_dir = app.state::<AppState>().data_dir.clone();
 
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);

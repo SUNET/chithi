@@ -23,12 +23,13 @@ onMounted(async () => {
   } else {
     // Separate window — fetch accounts via IPC with timeout
     try {
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Accounts fetch timeout (5s)")), 5000)
-      );
+      let timer: ReturnType<typeof setTimeout>;
+      const timeoutPromise = new Promise<Account[]>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Accounts fetch timeout (5s)")), 5000);
+      });
       accounts.value = await Promise.race([
-        api.listAccounts(),
-        timeoutPromise as Promise<Account[]>,
+        api.listAccounts().finally(() => clearTimeout(timer)),
+        timeoutPromise,
       ]);
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);

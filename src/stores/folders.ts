@@ -109,6 +109,7 @@ export const useFoldersStore = defineStore("folders", () => {
   let stopFoldersListener: null | (() => void) = null;
   let disposed = false;
   void listen<string>("folders-changed", () => {
+    if (disposed) return;
     if (foldersRefreshTimer) clearTimeout(foldersRefreshTimer);
     foldersRefreshTimer = setTimeout(() => {
       fetchAllAccountFolders();

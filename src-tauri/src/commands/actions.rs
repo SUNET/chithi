@@ -390,6 +390,7 @@ pub async fn set_message_flags(
 /// Copy messages to a target folder on the IMAP server.
 #[tauri::command]
 pub async fn copy_messages(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -446,6 +447,9 @@ pub async fn copy_messages(
         message_ids.len(),
         target_folder
     );
+
+    emit_folders_changed(&app, &account_id);
+    emit_messages_changed(&app, &account_id);
 
     Ok(())
 }

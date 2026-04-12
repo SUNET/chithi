@@ -449,6 +449,7 @@ export const useMessagesStore = defineStore("messages", () => {
   let stopMessagesListener: null | (() => void) = null;
   let disposed = false;
   void listen<string>("messages-changed", () => {
+    if (disposed) return;
     if (messagesRefreshTimer) clearTimeout(messagesRefreshTimer);
     messagesRefreshTimer = setTimeout(() => {
       fetchMessages();
