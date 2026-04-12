@@ -534,13 +534,25 @@ pub fn fetch_and_store_body(
         .ok_or_else(|| Error::Imap(format!("No body returned for UID {}", uid)))?;
     conn_imap.logout();
 
-    // Write to Maildir
+    // Write to Maildir — validate path components before creating directories
+    let sanitized = sanitize_folder_name(folder_path);
     let maildir_base = data_dir
         .join(account_id)
-        .join(sanitize_folder_name(folder_path));
+        .join(&sanitized);
+
+    // Reject any remaining ".." or absolute components before touching the filesystem
+    for component in maildir_base.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(Error::Other(format!(
+                "Path traversal detected in maildir path: '{}'",
+                maildir_base.display()
+            )));
+        }
+    }
+
     create_maildir_dirs(&maildir_base)?;
 
-    // Verify resolved path stays inside data_dir (path traversal defence)
+    // Post-creation canonical check as defence-in-depth (catches symlink attacks)
     let canonical_data_dir = std::fs::canonicalize(data_dir)
         .unwrap_or_else(|_| data_dir.to_path_buf());
     let canonical_maildir = std::fs::canonicalize(&maildir_base)
@@ -548,6 +560,8 @@ pub fn fetch_and_store_body(
             "Failed to resolve maildir path: {}", e
         )))?;
     if !canonical_maildir.starts_with(&canonical_data_dir) {
+        // Clean up the directory we just created since it's outside our tree
+        let _ = std::fs::remove_dir_all(&canonical_maildir);
         return Err(Error::Other(format!(
             "Path traversal detected: maildir path '{}' escapes data directory",
             maildir_base.display()

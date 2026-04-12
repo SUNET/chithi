@@ -780,6 +780,10 @@ pub async fn save_attachment(
         }
         drop(file);
 
+        // On Windows, rename fails if dest exists. Remove it first.
+        if dest_path.exists() {
+            let _ = std::fs::remove_file(dest_path);
+        }
         if let Err(e) = std::fs::rename(&temp_path, dest_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(Error::Other(format!("Failed to rename temp file: {}", e)));

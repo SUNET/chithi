@@ -32,7 +32,15 @@ fn store_session(port: u16, session: OAuthSession) {
 
 fn take_session(port: u16) -> Option<OAuthSession> {
     let mut guard = OAUTH_SESSIONS.lock().unwrap();
-    guard.as_mut().and_then(|map| map.remove(&port))
+    guard.as_mut().and_then(|map| {
+        let session = map.remove(&port)?;
+        // Reject expired sessions
+        if Instant::now().duration_since(session.created_at) >= SESSION_TTL {
+            log::warn!("OAuth session on port {} expired", port);
+            return None;
+        }
+        Some(session)
+    })
 }
 
 fn get_provider(name: &str) -> Result<&'static oauth::OAuthProvider> {

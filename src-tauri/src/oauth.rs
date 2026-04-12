@@ -109,7 +109,6 @@ impl OAuthTokens {
 // ---------------------------------------------------------------------------
 
 /// Build the OAuth2 authorization URL with a local redirect server.
-/// Returns `(url, port, code_verifier)` where code_verifier is present for PKCE providers.
 /// Returns (url, listener, code_verifier, state).
 ///
 /// The listener is kept open to prevent port hijacking between URL

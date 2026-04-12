@@ -132,7 +132,8 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<()> {
 }
 
 /// Build extra SQL WHERE clauses for quick filter options.
-/// All clauses are safe (no user-supplied strings injected into SQL).
+/// Text search terms are escaped (FTS5 quoting or LIKE backslash escaping)
+/// before interpolation. Other filter fields use fixed SQL patterns.
 fn build_filter_clauses(filter: &QuickFilter, account_id: &str, use_fts: bool) -> String {
     let mut clauses = Vec::new();
     if filter.unread {
