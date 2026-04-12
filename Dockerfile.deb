@@ -57,7 +57,6 @@ WORKDIR /app
 COPY . .
 
 # Update version in tauri.conf.json if PKG_VERSION is provided
-ARG PKG_VERSION
 RUN if [ -n "$PKG_VERSION" ]; then \
         echo "Setting package version to: $PKG_VERSION"; \
         jq --arg v "$PKG_VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json && \

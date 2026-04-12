@@ -73,7 +73,7 @@ build-rpm base_image="fedora:43":
     OUTPUT_DIR="dist/$DISTRO_NAME"
 
     SEMVER=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-    RPM_VERSION="${SEMVER//-/\~}"
+    RPM_VERSION="${SEMVER//-/~}"
 
     echo "Building RPM for $BASE_IMAGE..."
     echo "Semver: $SEMVER -> RPM version: $RPM_VERSION"
@@ -126,7 +126,7 @@ build-deb base_image="debian:13":
     OUTPUT_DIR="dist/$DISTRO_NAME"
 
     SEMVER=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-    DEB_VERSION="${SEMVER//-/\~}"
+    DEB_VERSION="${SEMVER//-/~}"
 
     echo "Building DEB for $BASE_IMAGE..."
     echo "Semver: $SEMVER -> DEB version: $DEB_VERSION"

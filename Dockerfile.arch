@@ -57,9 +57,10 @@ RUN mkdir -p /build/output /build/src && \
 
 # Write the PKGBUILD for packaging the pre-built binary
 RUN VERSION=$(jq -r .version src-tauri/tauri.conf.json) && \
+    ARCH_VERSION=$(printf '%s' "$VERSION" | tr '-' '.') && \
     cat > /build/src/PKGBUILD <<PKGEOF
 pkgname=chithi
-pkgver=${VERSION}
+pkgver=${ARCH_VERSION}
 pkgrel=1
 pkgdesc="Desktop email client with IMAP, JMAP and Microsoft 365 support"
 arch=("x86_64" "aarch64")
