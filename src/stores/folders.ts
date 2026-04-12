@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref, watch } from "vue";
+import { ref, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
@@ -106,12 +106,30 @@ export const useFoldersStore = defineStore("folders", () => {
 
   // Subscribe to backend folder-change events with debounce
   let foldersRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  listen<string>("folders-changed", () => {
+  let stopFoldersListener: null | (() => void) = null;
+  let disposed = false;
+  void listen<string>("folders-changed", () => {
     if (foldersRefreshTimer) clearTimeout(foldersRefreshTimer);
     foldersRefreshTimer = setTimeout(() => {
       fetchAllAccountFolders();
       fetchFolders();
     }, 200);
+  })
+    .then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      stopFoldersListener = unlisten;
+    })
+    .catch((error) => {
+      console.error("Failed to subscribe to folders-changed:", error);
+    });
+
+  onScopeDispose(() => {
+    disposed = true;
+    if (foldersRefreshTimer) clearTimeout(foldersRefreshTimer);
+    stopFoldersListener?.();
   });
 
   return {

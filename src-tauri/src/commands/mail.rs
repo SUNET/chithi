@@ -1,6 +1,11 @@
 use tauri::State;
 
-use crate::commands::events::emit_folders_changed;
+use crate::commands::sync_cmd::{
+    resume_imap_idle_for_account,
+    should_suspend_idle_for_imap_operation,
+    suspend_imap_idle_for_account,
+};
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
@@ -81,20 +86,70 @@ pub async fn get_messages(
 
 #[tauri::command]
 pub async fn get_message_body(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_id: String,
 ) -> Result<db::messages::MessageBody> {
-    let start = std::time::Instant::now();
-    log::info!("get_message_body START: {}", message_id);
+    log::debug!("Loading message body: {}", message_id);
 
     let (maildir_path, from_email, to_json, cc_json, flags_json, is_encrypted, is_signed) = {
         let conn = state.db.lock().await;
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
-    // If body hasn't been downloaded yet (empty or legacy `graph:` prefix), fetch it on-demand
-    let actual_maildir_path = if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+    // Graph API messages: fetch body directly from Graph, not from disk
+    if let Some(graph_msg_id) = maildir_path.strip_prefix("graph:") {
+        log::debug!("Fetching Graph message body for {}", graph_msg_id);
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        let body = client.get_message_body(graph_msg_id).await?;
+
+        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+        let (body_html, body_text) = if body.content_type == "html" {
+            let sanitized = ammonia::clean(&body.content);
+            // Simple HTML-to-text: strip tags for plain text view
+            let text = body.content
+                .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                .replace("</p>", "\n").replace("</div>", "\n");
+            let text = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&text, "").to_string();
+            (Some(sanitized), text)
+        } else {
+            (None, body.content)
+        };
+
+        // Mark as read on the server if not already
+        if !flags.contains(&"seen".to_string()) {
+            let graph_ids = vec![graph_msg_id.to_string()];
+            client.set_read_status(&graph_ids, true).await.ok();
+            let conn = state.db.lock().await;
+            let mut new_flags = flags.clone();
+            new_flags.push("seen".to_string());
+            db::messages::update_flags(&conn, &message_id, &serde_json::to_string(&new_flags).unwrap_or_default())?;
+        }
+
+        let to: Vec<db::messages::Address> = serde_json::from_str(&to_json).unwrap_or_default();
+        let cc: Vec<db::messages::Address> = serde_json::from_str(&cc_json).unwrap_or_default();
+
+        return Ok(db::messages::MessageBody {
+            id: message_id,
+            subject: None,
+            from: db::messages::Address { name: None, email: from_email },
+            to,
+            cc,
+            date: String::new(),
+            flags,
+            body_html,
+            body_text: Some(body_text),
+            attachments: vec![],
+            is_encrypted,
+            is_signed,
+            list_id: None,
+        });
+    }
+
+    // If body hasn't been downloaded yet, fetch it on-demand
+    let actual_maildir_path = if maildir_path.is_empty() {
         // Get account config and message details
         let (account, folder_path, uid) = {
             let conn = state.db.lock().await;
@@ -106,35 +161,7 @@ pub async fn get_message_body(
         let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
         let data_dir = state.data_dir.clone();
 
-        let relative_path = if account.mail_protocol == "graph" {
-            // Graph: download raw MIME via GET /me/messages/{id}/$value
-            log::info!("Body not on disk for {}, fetching from Graph", message_id);
-
-            let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
-                gid.to_string()
-            } else {
-                // Extract Graph ID from composite message ID: {account_id}_{graph_id}
-                message_id.strip_prefix(&format!("{}_", account_id))
-                    .unwrap_or(&message_id)
-                    .to_string()
-            };
-
-            let token = crate::mail::graph::get_graph_token(&account_id).await?;
-            let client = crate::mail::graph::GraphClient::new(&token);
-            let raw_bytes = client.get_mime_message(&graph_msg_id).await?;
-
-            let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
-            let maildir_base = data_dir.join(&account_id).join(&folder_dir);
-            crate::mail::sync::create_maildir_dirs(&maildir_base)?;
-
-            let filename = format!("{}:2,{}", graph_msg_id, crate::mail::sync::flags_to_maildir_suffix(&flags));
-            let msg_path = maildir_base.join("cur").join(&filename);
-            std::fs::write(&msg_path, &raw_bytes)?;
-
-            let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
-            log::info!("Graph body saved: {} ({} bytes)", rp, raw_bytes.len());
-            rp
-        } else if account.mail_protocol == "jmap" {
+        let relative_path = if account.mail_protocol == "jmap" {
             log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -156,6 +183,13 @@ pub async fn get_message_body(
             .await?
         } else {
             log::info!("Body not on disk for {}, fetching from IMAP", message_id);
+
+            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+                suspend_imap_idle_for_account(&state, &account_id).await?
+            } else {
+                false
+            };
+            let resume_account = account.clone();
 
             // For O365, refresh IMAP-scoped token for XOAUTH2
             let (password, use_xoauth2) = if account.provider == "o365" {
@@ -182,7 +216,7 @@ pub async fn get_message_body(
             };
 
             let account_id_clone = account_id.clone();
-            tokio::task::spawn_blocking(move || {
+            let relative_path = tokio::task::spawn_blocking(move || {
                 mail_sync::fetch_and_store_body(
                     &imap_config,
                     &data_dir,
@@ -193,7 +227,11 @@ pub async fn get_message_body(
                 )
             })
             .await
-            .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??
+            .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??;
+
+            resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+
+            relative_path
         };
 
         // Update the maildir_path in the database
@@ -223,7 +261,7 @@ pub async fn get_message_body(
         ))
     })?;
 
-    let result = parser::parse_message_body(
+    parser::parse_message_body(
         &message_id,
         &raw,
         &from_email,
@@ -236,10 +274,7 @@ pub async fn get_message_body(
     .ok_or_else(|| {
         log::error!("Failed to parse message body for {}", message_id);
         Error::MailParse("Failed to parse message".to_string())
-    });
-
-    log::info!("get_message_body DONE: {} ({:.1?})", message_id, start.elapsed());
-    result
+    })
 }
 
 /// Re-parse the message body allowing <img> tags, then download each image
@@ -520,8 +555,20 @@ pub async fn delete_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
-        // JMAP: Mailbox/set destroy -- folder_path is the mailbox ID
+    if account.mail_protocol == "graph" {
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.delete_mail_folder(&folder_path).await.map_err(|e| {
+            log::error!(
+                "Failed to delete Graph folder '{}' for account {}: {}",
+                folder_path,
+                account_id,
+                e
+            );
+            e
+        })?;
+    } else if account.mail_protocol == "jmap" {
+        // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await.map_err(|e| {
@@ -575,6 +622,7 @@ pub async fn delete_folder(
 
     log::info!("Folder '{}' deleted for account {}", folder_path, account_id);
     emit_folders_changed(&app, &account_id);
+    emit_messages_changed(&app, &account_id);
     Ok(())
 }
 

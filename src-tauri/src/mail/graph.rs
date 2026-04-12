@@ -388,6 +388,11 @@ impl GraphClient {
         self.delete(&format!("/me/messages/{}", message_id)).await
     }
 
+    /// Delete a mail folder.
+    pub async fn delete_mail_folder(&self, folder_id: &str) -> Result<()> {
+        self.delete(&format!("/me/mailFolders/{}", folder_id)).await
+    }
+
     /// Update message properties (isRead, flag, etc).
     pub async fn update_message(&self, message_id: &str, updates: &serde_json::Value) -> Result<()> {
         self.patch_json(&format!("/me/messages/{}", message_id), updates).await

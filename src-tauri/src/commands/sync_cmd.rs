@@ -26,34 +26,33 @@ use crate::state::AppState;
 
 /// Get a valid OIDC access token for a JMAP account, refreshing if needed.
 /// Returns `None` if the account doesn't use OIDC.
-pub async fn get_jmap_oidc_token(account: &crate::db::accounts::AccountFull) -> crate::error::Result<Option<String>> {
+pub async fn get_jmap_oidc_token(
+    account: &crate::db::accounts::AccountFull,
+) -> crate::error::Result<Option<String>> {
     if account.jmap_auth_method != "oidc" {
         return Ok(None);
     }
 
-    let tokens = crate::oauth::load_tokens(&account.id)?
-        .ok_or_else(|| crate::error::Error::Other(
-            "No OIDC tokens found. Please sign in again.".into()
-        ))?;
+    let tokens = crate::oauth::load_tokens(&account.id)?.ok_or_else(|| {
+        crate::error::Error::Other("No OIDC tokens found. Please sign in again.".into())
+    })?;
 
     if !tokens.is_expired() {
         return Ok(Some(tokens.access_token));
     }
 
-    // Need to refresh
-    let refresh_token = tokens.refresh_token
-        .ok_or_else(|| crate::error::Error::Other(
-            "No refresh token. Please sign in again.".into()
-        ))?;
+    let refresh_token = tokens.refresh_token.ok_or_else(|| {
+        crate::error::Error::Other("No refresh token. Please sign in again.".into())
+    })?;
 
     if account.oidc_token_endpoint.is_empty() {
         return Err(crate::error::Error::Other(
-            "OIDC token endpoint not configured. Please sign in again.".into()
+            "OIDC token endpoint not configured. Please sign in again.".into(),
         ));
     }
     if account.oidc_client_id.is_empty() {
         return Err(crate::error::Error::Other(
-            "OIDC client_id not configured. Please sign in again.".into()
+            "OIDC client_id not configured. Please sign in again.".into(),
         ));
     }
 
@@ -61,7 +60,8 @@ pub async fn get_jmap_oidc_token(account: &crate::db::accounts::AccountFull) -> 
         &account.oidc_token_endpoint,
         &refresh_token,
         &account.oidc_client_id,
-    ).await?;
+    )
+    .await?;
     crate::oauth::store_tokens(&account.id, &new_tokens)?;
 
     Ok(Some(new_tokens.access_token))
@@ -75,7 +75,7 @@ pub async fn refresh_jmap_oidc_token(
     oidc_client_id: &str,
 ) -> crate::error::Result<Option<String>> {
     let tokens = match crate::oauth::load_tokens(account_id)? {
-        Some(t) => t,
+        Some(tokens) => tokens,
         None => return Ok(None),
     };
 
@@ -84,26 +84,29 @@ pub async fn refresh_jmap_oidc_token(
     }
 
     let refresh_token = match tokens.refresh_token {
-        Some(rt) => rt,
-        None => return Ok(Some(tokens.access_token)), // can't refresh, return stale
+        Some(refresh_token) => refresh_token,
+        None => return Ok(Some(tokens.access_token)),
     };
 
     if oidc_token_endpoint.is_empty() || oidc_client_id.is_empty() {
-        return Ok(Some(tokens.access_token)); // can't refresh without metadata
+        return Ok(Some(tokens.access_token));
     }
 
     let new_tokens = crate::oauth::refresh_token_dynamic(
         oidc_token_endpoint,
         &refresh_token,
         oidc_client_id,
-    ).await?;
+    )
+    .await?;
     crate::oauth::store_tokens(account_id, &new_tokens)?;
 
     Ok(Some(new_tokens.access_token))
 }
 
-/// Build a JmapConfig from an AccountFull, with OIDC token if applicable.
-pub async fn build_jmap_config(account: &crate::db::accounts::AccountFull) -> crate::error::Result<crate::mail::jmap::JmapConfig> {
+/// Build a JmapConfig from an account, including OIDC token if applicable.
+pub async fn build_jmap_config(
+    account: &crate::db::accounts::AccountFull,
+) -> crate::error::Result<crate::mail::jmap::JmapConfig> {
     let access_token = get_jmap_oidc_token(account).await?;
     Ok(crate::mail::jmap::JmapConfig {
         jmap_url: account.jmap_url.clone(),
@@ -116,6 +119,93 @@ pub async fn build_jmap_config(account: &crate::db::accounts::AccountFull) -> cr
     })
 }
 
+fn should_start_imap_idle(_provider: &str) -> bool {
+    true
+}
+
+pub(crate) fn should_suspend_idle_for_imap_operation(provider: &str) -> bool {
+    provider == "o365"
+}
+
+pub(crate) async fn suspend_imap_idle_for_account(
+    state: &State<'_, AppState>,
+    account_id: &str,
+) -> Result<bool> {
+    let handle = {
+        let mut handles = state.idle_handles.lock().unwrap();
+        handles.remove(account_id)
+    };
+
+    let Some(mut idle_handle) = handle else {
+        return Ok(false);
+    };
+
+    idle_handle.stop_flag.store(true, Ordering::Relaxed);
+
+    if let Some(thread) = idle_handle.thread.take() {
+        tokio::task::spawn_blocking(move || {
+            let _ = thread.join();
+        })
+        .await
+        .map_err(|e| Error::Sync(format!("Stopping IDLE panicked: {}", e)))?;
+    }
+
+    Ok(true)
+}
+
+pub(crate) async fn resume_imap_idle_for_account(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account: &db::accounts::AccountFull,
+    suspended_idle: bool,
+) -> Result<()> {
+    if !suspended_idle || !should_start_imap_idle(&account.provider) {
+        return Ok(());
+    }
+
+    let account_summary = db::accounts::Account {
+        id: account.id.clone(),
+        display_name: account.display_name.clone(),
+        email: account.email.clone(),
+        provider: account.provider.clone(),
+        mail_protocol: account.mail_protocol.clone(),
+        enabled: account.enabled,
+    };
+
+    start_imap_idle(app, state, &account_summary).await
+}
+
+fn try_acquire_account_sync_guard(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    operation: &str,
+) -> Option<SyncGuard> {
+    {
+        let flags = state.sync_in_progress.lock().unwrap();
+        if let Some(flag) = flags.get(account_id) {
+            if flag.load(Ordering::Relaxed) {
+                log::debug!(
+                    "{} already in progress for account {}, skipping",
+                    operation,
+                    account_id
+                );
+                return None;
+            }
+        }
+    }
+
+    let flag = {
+        let mut flags = state.sync_in_progress.lock().unwrap();
+        let flag = flags
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(true, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    Some(SyncGuard(flag))
+}
+
 #[tauri::command]
 pub async fn trigger_sync(
     app: AppHandle,
@@ -123,29 +213,9 @@ pub async fn trigger_sync(
     account_id: String,
     current_folder: Option<String>,
 ) -> Result<()> {
-    // Check if a sync is already running for this account — skip if so
-    {
-        let flags = state.sync_in_progress.lock().unwrap();
-        if let Some(flag) = flags.get(&account_id) {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                log::debug!("Sync already in progress for account {}, skipping", account_id);
-                return Ok(());
-            }
-        }
-    }
-
-    // Set the sync-in-progress flag
-    let sync_flag = {
-        let mut flags = state.sync_in_progress.lock().unwrap();
-        let flag = flags
-            .entry(account_id.clone())
-            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        flag.clone()
+    let Some(_guard) = try_acquire_account_sync_guard(&state, &account_id, "Sync") else {
+        return Ok(());
     };
-
-    // Ensure flag is cleared when sync completes (success or error)
-    let _guard = SyncGuard(sync_flag);
 
     log::info!("Sync requested for account {}", account_id);
     let account_result = {
@@ -160,16 +230,29 @@ pub async fn trigger_sync(
         }
     };
 
-    if account.mail_protocol == "graph" {
+    let suspended_idle = if account.mail_protocol == "imap"
+        && should_suspend_idle_for_imap_operation(&account.provider)
+    {
+        log::info!(
+            "Suspending IMAP IDLE for account {} before sync",
+            account_id
+        );
+        suspend_imap_idle_for_account(&state, &account_id).await?
+    } else {
+        false
+    };
+    let resume_account = account.clone();
+
+    let sync_result = if account.mail_protocol == "graph" {
         log::info!(
             "Syncing account {} ({}) via Microsoft Graph",
             account.display_name,
             account.email,
         );
-
-        if let Err(e) = sync_graph_account(app.clone(), state.db.clone(), state.data_dir.clone(), &account_id).await {
-            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
-            return Err(e);
+        if let Err(e) = sync_graph_account(app.clone(), state.db.clone(), &account_id).await {
+            Err(e)
+        } else {
+            Ok(())
         }
     } else if account.mail_protocol == "jmap" {
         log::info!(
@@ -191,15 +274,13 @@ pub async fn trigger_sync(
             current_folder,
         )
         .await {
-            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
-            return Err(e);
-        }
-
-        // Also sync calendars for JMAP accounts
-        log::info!("Syncing calendars for JMAP account {}", account_id);
-        if let Err(e) = sync_jmap_calendars(state.db.clone(), &account_id, &jmap_config).await {
-            log::error!("Calendar sync failed for account {}: {}", account_id, e);
-            // Don't fail the whole sync if calendar sync fails
+            Err(e)
+        } else {
+            log::info!("Syncing calendars for JMAP account {}", account_id);
+            if let Err(e) = sync_jmap_calendars(state.db.clone(), &account_id, &jmap_config).await {
+                log::error!("Calendar sync failed for account {}: {}", account_id, e);
+            }
+            Ok(())
         }
     } else {
         log::info!(
@@ -251,12 +332,19 @@ pub async fn trigger_sync(
             current_folder,
         )
         .await {
-            app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
-            return Err(e);
+            Err(e)
+        } else {
+            Ok(())
         }
-    }
+    };
 
-    Ok(())
+    let resume_result = resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
+    if let Err(e) = &sync_result {
+        app.emit("sync-error", serde_json::json!({"account_id": account_id, "error": e.to_string()})).ok();
+    }
+    resume_result?;
+
+    sync_result
 }
 
 #[tauri::command]
@@ -266,21 +354,39 @@ pub async fn sync_folder(
     account_id: String,
     folder_path: String,
 ) -> Result<u32> {
+    let Some(_guard) = try_acquire_account_sync_guard(&state, &account_id, "Folder sync") else {
+        return Ok(0);
+    };
+
     log::info!("Single folder sync: account={} folder={}", account_id, folder_path);
     let account = {
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    let suspended_idle = if account.mail_protocol == "imap"
+        && should_suspend_idle_for_imap_operation(&account.provider)
+    {
+        log::info!(
+            "Suspending IMAP IDLE for account {} before single-folder sync",
+            account_id
+        );
+        suspend_imap_idle_for_account(&state, &account_id).await?
+    } else {
+        false
+    };
+    let resume_account = account.clone();
+
     if account.mail_protocol == "graph" {
-        sync_graph_account(app, state.db.clone(), state.data_dir.clone(), &account_id).await?;
+        // Graph sync is whole-account, not per-folder — just run the full sync
+        sync_graph_account(app, state.db.clone(), &account_id).await?;
         return Ok(0);
     }
 
     if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
 
-        return jmap_sync::sync_jmap_folder_public(
+        let result = jmap_sync::sync_jmap_folder_public(
             app,
             state.db.clone(),
             account_id,
@@ -289,6 +395,7 @@ pub async fn sync_folder(
             jmap_config,
         )
         .await;
+        return result;
     }
 
     // IMAP path — for O365, refresh IMAP-scoped token
@@ -342,6 +449,8 @@ pub async fn sync_folder(
     .await
     .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?;
 
+    let resume_result = resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
+
     match &result {
         Ok(count) => {
             app.emit(
@@ -351,6 +460,8 @@ pub async fn sync_folder(
                     "total_synced": count,
                 }),
             ).ok();
+            emit_folders_changed(&app, &account_id);
+            emit_messages_changed(&app, &account_id);
             log::info!("Single folder sync done: {} new in {}", count, folder_path);
         }
         Err(e) => {
@@ -363,6 +474,8 @@ pub async fn sync_folder(
             ).ok();
         }
     }
+
+    resume_result?;
 
     result
 }
@@ -499,29 +612,13 @@ pub async fn get_sync_status(
 /// Returns the number of bodies successfully fetched.
 #[tauri::command]
 pub async fn prefetch_bodies(
+    app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<u32> {
-    // Skip if a prefetch is already running for this account
-    let prefetch_key = format!("prefetch_{}", account_id);
-    {
-        let flags = state.sync_in_progress.lock().unwrap();
-        if let Some(flag) = flags.get(&prefetch_key) {
-            if flag.load(Ordering::Relaxed) {
-                log::debug!("Prefetch already in progress for account {}, skipping", account_id);
-                return Ok(0);
-            }
-        }
-    }
-    let prefetch_flag = {
-        let mut flags = state.sync_in_progress.lock().unwrap();
-        let flag = flags
-            .entry(prefetch_key)
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
-        flag.store(true, Ordering::Relaxed);
-        flag.clone()
+    let Some(_guard) = try_acquire_account_sync_guard(&state, &account_id, "Prefetch") else {
+        return Ok(0);
     };
-    let _guard = SyncGuard(prefetch_flag);
 
     log::info!("Prefetch bodies requested for account {}", account_id);
 
@@ -539,6 +636,17 @@ pub async fn prefetch_bodies(
         let conn = state.db.lock().await;
         db::accounts::get_account_full(&conn, &account_id)?
     };
+
+    let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+        log::info!(
+            "Suspending IMAP IDLE for account {} before body prefetch",
+            account_id
+        );
+        suspend_imap_idle_for_account(&state, &account_id).await?
+    } else {
+        false
+    };
+    let resume_account = account.clone();
 
     // For O365: get IMAP-scoped OAuth token
     let (password, use_xoauth2) = if account.provider == "o365" {
@@ -578,6 +686,7 @@ pub async fn prefetch_bodies(
     };
 
     if unfetched.is_empty() {
+        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
         log::info!("Prefetch: no unfetched messages for account {}", account_id);
         return Ok(0);
     }
@@ -720,6 +829,8 @@ pub async fn prefetch_bodies(
     .await
     .map_err(|e| Error::Sync(format!("Prefetch task panicked: {}", e)))??;
 
+    resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+
     Ok(fetched_count)
 }
 
@@ -727,11 +838,9 @@ pub async fn prefetch_bodies(
 async fn sync_graph_account(
     app: AppHandle,
     db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
-    data_dir: std::path::PathBuf,
     account_id: &str,
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
-    use crate::mail::sync::{create_maildir_dirs, sanitize_folder_name, flags_to_maildir_suffix};
 
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);
@@ -752,6 +861,7 @@ async fn sync_graph_account(
     // Sync messages for each folder
     let mut grand_total = 0u32;
     for gf in &graph_folders {
+        // Fetch messages (Graph uses skip-based pagination, not UIDs)
         let (messages, _total) = client.list_messages(&gf.id, 200, 0).await?;
 
         if messages.is_empty() {
@@ -771,64 +881,24 @@ async fn sync_graph_account(
             ids
         };
 
-        // Collect new messages to insert
-        let mut new_messages = Vec::new();
+        let conn = db_arc.lock().await;
+        conn.execute_batch("BEGIN")?;
+
+        let mut synced = 0u32;
         for msg in &messages {
             let id = format!("{}_{}", account_id, msg.id);
             if existing_ids.contains(&id) {
                 continue;
             }
-            new_messages.push(msg);
-        }
 
-        if new_messages.is_empty() {
-            continue;
-        }
-
-        // Prepare Maildir directory for this folder
-        let folder_dir = sanitize_folder_name(&gf.id);
-        let maildir_base = data_dir.join(account_id).join(&folder_dir);
-        create_maildir_dirs(&maildir_base)?;
-
-        // Phase 1: Download all MIME bodies (no DB lock held -- UI stays responsive)
-        let mut downloaded: Vec<(&graph::GraphMessage, String)> = Vec::new();
-        for msg in &new_messages {
-            let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
-
-            let maildir_path = match client.get_mime_message(&msg.id).await {
-                Ok(raw_bytes) => {
-                    let filename = format!("{}:2,{}", msg.id, flags_to_maildir_suffix(&flags));
-                    let msg_path = maildir_base.join("cur").join(&filename);
-                    if let Err(e) = std::fs::write(&msg_path, &raw_bytes) {
-                        log::warn!("Graph sync: failed to write body for {}: {}", msg.id, e);
-                        String::new()
-                    } else {
-                        format!("{}/{}/cur/{}", account_id, folder_dir, filename)
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Graph sync: failed to download MIME for {}: {}", msg.id, e);
-                    String::new()
-                }
-            };
-            downloaded.push((msg, maildir_path));
-        }
-
-        // Phase 2: Fast batch DB insert (lock held only for the insert, not the downloads)
-        let conn = db_arc.lock().await;
-        conn.execute_batch("BEGIN")?;
-
-        let mut synced = 0u32;
-        for (msg, maildir_path) in &downloaded {
-            let id = format!("{}_{}", account_id, msg.id);
             let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
             let thread_id = msg.conversation_id.clone();
 
             let new_msg = db::messages::NewMessage {
-                id,
+                id: id.clone(),
                 account_id: account_id.to_string(),
                 folder_path: gf.id.clone(),
-                uid: 0,
+                uid: 0, // Graph doesn't use UIDs
                 message_id: msg.internet_message_id.clone(),
                 in_reply_to: None,
                 thread_id,
@@ -843,7 +913,7 @@ async fn sync_graph_account(
                 is_encrypted: false,
                 is_signed: false,
                 flags: serde_json::to_string(&flags).unwrap_or_default(),
-                maildir_path: maildir_path.clone(),
+                maildir_path: format!("graph:{}", msg.id), // Special marker for Graph bodies
                 snippet: msg.preview.clone(),
             };
             db::messages::insert_message(&conn, &new_msg)?;
@@ -854,7 +924,7 @@ async fn sync_graph_account(
         drop(conn);
 
         if synced > 0 {
-            log::info!("Graph sync: {} new messages in '{}' (bodies downloaded)", synced, gf.display_name);
+            log::info!("Graph sync: {} new messages in '{}'", synced, gf.display_name);
             grand_total += synced;
         }
     }
@@ -1062,4 +1132,14 @@ pub async fn stop_idle(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn o365_sync_suspends_idle_but_still_allows_idle_startup() {
+        assert!(super::should_start_imap_idle("o365"));
+        assert!(super::should_suspend_idle_for_imap_operation("o365"));
+        assert!(!super::should_suspend_idle_for_imap_operation("gmail"));
+    }
 }

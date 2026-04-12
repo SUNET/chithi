@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use tauri::State;
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
+use crate::commands::sync_cmd::{
+    resume_imap_idle_for_account,
+    should_suspend_idle_for_imap_operation,
+    suspend_imap_idle_for_account,
+};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
@@ -34,6 +40,7 @@ async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapCo
 /// Move messages to a target folder on the IMAP/JMAP server and update local DB.
 #[tauri::command]
 pub async fn move_messages(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -133,12 +140,16 @@ pub async fn move_messages(
         target_folder
     );
 
+    emit_messages_changed(&app, &account_id);
+    emit_folders_changed(&app, &account_id);
+
     Ok(())
 }
 
 /// Delete messages on the IMAP server and remove from local DB.
 #[tauri::command]
 pub async fn delete_messages(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -183,6 +194,12 @@ pub async fn delete_messages(
         }
     } else {
         // IMAP path (includes O365 with XOAUTH2)
+        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+            suspend_imap_idle_for_account(&state, &account_id).await?
+        } else {
+            false
+        };
+        let resume_account = account.clone();
         let imap_config = build_imap_config(&account).await?;
         let by_folder = {
             let conn = state.db.lock().await;
@@ -213,6 +230,8 @@ pub async fn delete_messages(
         })
         .await
         .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
+
+        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
     }
 
     // Remove from local DB and recalculate folder counts
@@ -227,12 +246,16 @@ pub async fn delete_messages(
         message_ids.len()
     );
 
+    emit_messages_changed(&app, &account_id);
+    emit_folders_changed(&app, &account_id);
+
     Ok(())
 }
 
 /// Set or remove flags on messages (e.g., \Seen, \Flagged).
 #[tauri::command]
 pub async fn set_message_flags(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_ids: Vec<String>,
@@ -279,6 +302,12 @@ pub async fn set_message_flags(
         conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, add).await?;
     } else {
         // IMAP path (includes O365 with XOAUTH2)
+        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+            suspend_imap_idle_for_account(&state, &account_id).await?
+        } else {
+            false
+        };
+        let resume_account = account.clone();
         let imap_config = build_imap_config(&account).await?;
         let by_folder = {
             let conn = state.db.lock().await;
@@ -301,6 +330,8 @@ pub async fn set_message_flags(
             .await
             .map_err(|e| Error::Other(format!("Set flags task panicked: {}", e)))??;
         }
+
+        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
     }
 
     // Build current flags map for local update
@@ -350,6 +381,8 @@ pub async fn set_message_flags(
         flags.join(", "),
         message_ids.len()
     );
+
+    emit_messages_changed(&app, &account_id);
 
     Ok(())
 }

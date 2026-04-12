@@ -121,9 +121,9 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
             }
             depth
         };
-        parent_paths.sort_by(|a, b| depth_of(b).cmp(&depth_of(a)));
+        parent_paths.sort_by_key(|path| std::cmp::Reverse(depth_of(path)));
     } else {
-        parent_paths.sort_by(|a, b| b.matches('/').count().cmp(&a.matches('/').count()));
+        parent_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
     }
 
     for parent_path in parent_paths {
@@ -145,15 +145,64 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
 }
 
 pub fn delete_folder(conn: &Connection, account_id: &str, path: &str) -> Result<()> {
-    // Remove orphaned messages in this folder to keep the local DB consistent
-    conn.execute(
-        "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
-        params![account_id, path],
-    )?;
-    conn.execute(
-        "DELETE FROM folders WHERE account_id = ?1 AND path = ?2",
-        params![account_id, path],
-    )?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let delete_result = (|| -> Result<()> {
+        conn.execute(
+            "WITH RECURSIVE folder_tree(path) AS (
+                SELECT path FROM folders WHERE account_id = ?1 AND path = ?2
+                UNION
+                SELECT f.path
+                FROM folders f
+                JOIN folder_tree ft
+                  ON f.account_id = ?1
+                 AND (
+                     f.parent_id = ft.path
+                     OR (
+                         f.parent_id IS NULL
+                         AND substr(f.path, 1, length(ft.path) + 1) = ft.path || '/'
+                     )
+                 )
+            )
+            DELETE FROM messages
+             WHERE account_id = ?1
+               AND folder_path IN (SELECT path FROM folder_tree)",
+            params![account_id, path],
+        )?;
+
+        conn.execute(
+            "WITH RECURSIVE folder_tree(path) AS (
+                SELECT path FROM folders WHERE account_id = ?1 AND path = ?2
+                UNION
+                SELECT f.path
+                FROM folders f
+                JOIN folder_tree ft
+                  ON f.account_id = ?1
+                 AND (
+                     f.parent_id = ft.path
+                     OR (
+                         f.parent_id IS NULL
+                         AND substr(f.path, 1, length(ft.path) + 1) = ft.path || '/'
+                     )
+                 )
+            )
+            DELETE FROM folders
+             WHERE account_id = ?1
+               AND path IN (SELECT path FROM folder_tree)",
+            params![account_id, path],
+        )?;
+
+        Ok(())
+    })();
+
+    match delete_result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(err);
+        }
+    }
+
     log::info!("Deleted folder '{}' from local DB for account {}", path, account_id);
     Ok(())
 }
@@ -395,5 +444,161 @@ mod tests {
 
         let infra = inbox.children.iter().find(|f| f.path == "INBOX/Infra").unwrap();
         assert_eq!(infra.children.len(), 1);
+    }
+
+    fn create_delete_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                folder_type TEXT,
+                unread_count INTEGER DEFAULT 0,
+                total_count INTEGER DEFAULT 0,
+                parent_id TEXT,
+                UNIQUE(account_id, path)
+            );
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                folder_path TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_delete_folder_removes_imap_descendants_and_messages() {
+        let conn = create_delete_test_db();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Inbox", "INBOX", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "IETF", "INBOX/IETF", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "123", "INBOX/IETF/123", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Sent", "Sent", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m1", "acc1", "INBOX"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m2", "acc1", "INBOX/IETF"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m3", "acc1", "INBOX/IETF/123"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m4", "acc1", "Sent"],
+        )
+        .unwrap();
+
+        delete_folder(&conn, "acc1", "INBOX").unwrap();
+
+        let remaining_folders: Vec<String> = conn
+            .prepare("SELECT path FROM folders WHERE account_id = ?1 ORDER BY path")
+            .unwrap()
+            .query_map(params!["acc1"], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let remaining_messages: Vec<String> = conn
+            .prepare("SELECT id FROM messages WHERE account_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params!["acc1"], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(remaining_folders, vec!["Sent"]);
+        assert_eq!(remaining_messages, vec!["m4"]);
+    }
+
+    #[test]
+    fn test_delete_folder_removes_parent_id_descendants_and_messages() {
+        let conn = create_delete_test_db();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Inbox", "m1", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "IETF", "m2", Some("m1")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "123", "m3", Some("m2")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Sent", "m4", Option::<String>::None],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m1-msg", "acc1", "m1"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m2-msg", "acc1", "m2"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m3-msg", "acc1", "m3"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path) VALUES (?1, ?2, ?3)",
+            params!["m4-msg", "acc1", "m4"],
+        )
+        .unwrap();
+
+        delete_folder(&conn, "acc1", "m2").unwrap();
+
+        let remaining_folders: Vec<String> = conn
+            .prepare("SELECT path FROM folders WHERE account_id = ?1 ORDER BY path")
+            .unwrap()
+            .query_map(params!["acc1"], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let remaining_messages: Vec<String> = conn
+            .prepare("SELECT id FROM messages WHERE account_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params!["acc1"], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(remaining_folders, vec!["m1", "m4"]);
+        assert_eq!(remaining_messages, vec!["m1-msg", "m4-msg"]);
     }
 }

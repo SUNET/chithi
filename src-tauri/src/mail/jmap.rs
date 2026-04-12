@@ -42,6 +42,18 @@ pub struct JmapConfig {
 }
 
 impl JmapConfig {
+    pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
+        Self {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+            access_token: None,
+            oidc_token_endpoint: account.oidc_token_endpoint.clone(),
+            oidc_client_id: account.oidc_client_id.clone(),
+        }
+    }
+
     /// Apply authentication to a reqwest RequestBuilder.
     /// Uses Bearer auth if access_token is set, otherwise Basic auth.
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

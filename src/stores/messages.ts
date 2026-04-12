@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { MessageSummary, MessageBody, ThreadSummary, QuickFilter } from "@/lib/types";
 import * as api from "@/lib/tauri";
@@ -446,11 +446,29 @@ export const useMessagesStore = defineStore("messages", () => {
 
   // Subscribe to backend message-change events with debounce
   let messagesRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  listen<string>("messages-changed", () => {
+  let stopMessagesListener: null | (() => void) = null;
+  let disposed = false;
+  void listen<string>("messages-changed", () => {
     if (messagesRefreshTimer) clearTimeout(messagesRefreshTimer);
     messagesRefreshTimer = setTimeout(() => {
       fetchMessages();
     }, 200);
+  })
+    .then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      stopMessagesListener = unlisten;
+    })
+    .catch((error) => {
+      console.error("Failed to subscribe to messages-changed:", error);
+    });
+
+  onScopeDispose(() => {
+    disposed = true;
+    if (messagesRefreshTimer) clearTimeout(messagesRefreshTimer);
+    stopMessagesListener?.();
   });
 
   return {
