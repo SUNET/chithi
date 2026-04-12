@@ -447,6 +447,7 @@ const displayedCount = () => {
             @toggle="messagesStore.toggleThread(thread.thread_id)"
             @toggle-select="messagesStore.toggleSelectMessage(thread.message_ids[0])"
             @open="onThreadOpen(thread)"
+            @toggle-star="messagesStore.toggleStar(thread.message_ids[0])"
           />
         </div>
         <!-- Expanded thread messages -->
@@ -465,6 +466,7 @@ const displayedCount = () => {
               :selected="messagesStore.isSelected(msg.id)"
               @toggle="messagesStore.toggleSelectMessage(msg.id)"
               @open="onOpen(msg.id)"
+              @toggle-star="messagesStore.toggleStar(msg.id)"
             />
           </div>
         </template>
@@ -487,6 +489,7 @@ const displayedCount = () => {
           :selected="messagesStore.isSelected(msg.id)"
           @toggle="messagesStore.toggleSelectMessage(msg.id)"
           @open="onOpen(msg.id)"
+          @toggle-star="messagesStore.toggleStar(msg.id)"
         />
       </div>
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>

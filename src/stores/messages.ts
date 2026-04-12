@@ -302,6 +302,45 @@ export const useMessagesStore = defineStore("messages", () => {
       .catch((e) => console.error("Failed to mark as read:", e));
   }
 
+  function toggleStar(messageId: string) {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId) return;
+
+    const msg = findMessage(messageId);
+    const thread = threads.value.find((t) =>
+      t.message_ids.includes(messageId),
+    );
+
+    // Check individual message first, fall back to thread summary
+    // (in threaded mode with collapsed threads, msg may be undefined)
+    const isCurrentlyStarred = msg
+      ? msg.flags.includes("flagged")
+      : thread
+        ? thread.flags.includes("flagged")
+        : false;
+
+    if (msg) {
+      if (isCurrentlyStarred) {
+        msg.flags = msg.flags.filter((f) => f !== "flagged");
+      } else {
+        msg.flags = [...msg.flags, "flagged"];
+      }
+    }
+
+    // Update thread summary flags
+    if (thread) {
+      if (isCurrentlyStarred) {
+        thread.flags = thread.flags.filter((f) => f !== "flagged");
+      } else if (!thread.flags.includes("flagged")) {
+        thread.flags = [...thread.flags, "flagged"];
+      }
+    }
+
+    api
+      .setMessageFlags(accountId, [messageId], ["flagged"], !isCurrentlyStarred)
+      .catch((e) => console.error("Failed to toggle star:", e));
+  }
+
   async function loadMessage(messageId: string) {
     const accountId = accountsStore.activeAccountId;
     if (!accountId) return;
@@ -513,5 +552,6 @@ export const useMessagesStore = defineStore("messages", () => {
     onFilterTextChange,
     clearQuickFilters,
     resolveSelectedIds,
+    toggleStar,
   };
 });

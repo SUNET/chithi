@@ -12,6 +12,7 @@ defineEmits<{
   toggle: [];
   open: [];
   toggleSelect: [];
+  toggleStar: [];
 }>();
 
 function formatDate(dateStr: string): string {
@@ -68,9 +69,16 @@ function isReply(): boolean {
         @click.stop="$emit('toggle')"
       >{{ thread.message_count > 1 ? (expanded ? '\u25BF' : '\u25B9') : '\u00A0' }}</span>
       <span
+        class="icon-read"
+        :class="{ unread: hasUnread() }"
+        data-testid="msg-unread-dot"
+      >&#x25CF;</span>
+      <span
         class="icon-star"
         :class="{ starred: isStarred() }"
         data-testid="msg-star"
+        :data-starred="isStarred()"
+        @click.stop="$emit('toggleStar')"
       >{{ isStarred() ? '\u2605' : '\u2606' }}</span>
     </div>
     <div class="col col-subject" :class="{ bold: hasUnread() && !expanded }">
@@ -144,9 +152,18 @@ function isReply(): boolean {
   display: flex;
   align-items: center;
   gap: 2px;
-  width: 38px;
+  width: 46px;
   flex-shrink: 0;
   padding: 0 2px;
+}
+
+.icon-read {
+  font-size: 8px;
+  color: transparent;
+}
+
+.icon-read.unread {
+  color: var(--color-accent);
 }
 
 .expand-icon {
@@ -164,6 +181,7 @@ function isReply(): boolean {
 .icon-star {
   font-size: 13px;
   color: var(--color-text-muted);
+  cursor: pointer;
 }
 
 .icon-star.starred {

@@ -10,6 +10,7 @@ defineProps<{
 defineEmits<{
   toggle: [];
   open: [];
+  toggleStar: [];
 }>();
 
 function formatDate(dateStr: string): string {
@@ -70,6 +71,8 @@ function isReply(subject: string | null, flags: string[]): boolean {
         class="icon-star"
         :class="{ starred: isStarred(message.flags) }"
         data-testid="msg-star"
+        :data-starred="isStarred(message.flags)"
+        @click.stop="$emit('toggleStar')"
       >{{ isStarred(message.flags) ? '\u2605' : '\u2606' }}</span>
     </div>
     <div class="col col-subject" :class="{ bold: isUnread(message.flags) }">
@@ -159,6 +162,7 @@ function isReply(subject: string | null, flags: string[]): boolean {
 .icon-star {
   font-size: 13px;
   color: var(--color-text-muted);
+  cursor: pointer;
 }
 
 .icon-star.starred {

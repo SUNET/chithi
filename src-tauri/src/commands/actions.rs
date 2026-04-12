@@ -275,6 +275,40 @@ pub async fn set_message_flags(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    // Update local DB FIRST (before slow network ops) so that any
+    // concurrent re-fetch from a "messages-changed" event always sees
+    // the latest flags, preventing race conditions with rapid toggles.
+    {
+        let conn = state.db.lock().await;
+
+        let normalized_flags: Vec<String> = flags
+            .iter()
+            .map(|f| normalize_flag_name(f))
+            .collect();
+
+        for msg_id in &message_ids {
+            if let Ok((_, _, _, _, flags_json, _, _)) =
+                db::messages::get_message_metadata(&conn, &account_id, msg_id)
+            {
+                let mut current: Vec<String> =
+                    serde_json::from_str(&flags_json).unwrap_or_default();
+                if add {
+                    for flag in &normalized_flags {
+                        if !current.contains(flag) {
+                            current.push(flag.clone());
+                        }
+                    }
+                } else {
+                    current.retain(|f| !normalized_flags.contains(f));
+                }
+                let updated_json = serde_json::to_string(&current)
+                    .unwrap_or_else(|_| "[]".to_string());
+                db::messages::update_flags(&conn, msg_id, &updated_json)?;
+            }
+        }
+    }
+
+    // Now perform the remote operation (slow, network I/O)
     if account.mail_protocol == "graph" {
         // Graph path: use PATCH to update isRead
         let token = crate::mail::graph::get_graph_token(&account_id).await?;
@@ -332,47 +366,6 @@ pub async fn set_message_flags(
         }
 
         resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
-    }
-
-    // Build current flags map for local update
-    let current_flags_map: HashMap<String, Vec<String>> = {
-        let conn = state.db.lock().await;
-        let mut map = HashMap::new();
-        for msg_id in &message_ids {
-            if let Ok((_, _, _, _, flags_json, _, _)) =
-                db::messages::get_message_metadata(&conn, &account_id, msg_id)
-            {
-                let current: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
-                map.insert(msg_id.clone(), current);
-            }
-        }
-        map
-    };
-
-    // Update flags in local DB
-    {
-        let conn = state.db.lock().await;
-
-        // Convert IMAP flag names (e.g. \Seen) to our lowercase names (e.g. seen)
-        let normalized_flags: Vec<String> = flags
-            .iter()
-            .map(|f| normalize_flag_name(f))
-            .collect();
-
-        for (msg_id, mut current) in current_flags_map {
-            if add {
-                for flag in &normalized_flags {
-                    if !current.contains(flag) {
-                        current.push(flag.clone());
-                    }
-                }
-            } else {
-                current.retain(|f| !normalized_flags.contains(f));
-            }
-            let updated_json = serde_json::to_string(&current)
-                .unwrap_or_else(|_| "[]".to_string());
-            db::messages::update_flags(&conn, &msg_id, &updated_json)?;
-        }
     }
 
     log::info!(

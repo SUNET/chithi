@@ -13,6 +13,10 @@ dev:
 build:
     pnpm tauri build
 
+# Build only the release binary (no deb/rpm/appimage)
+binary:
+    pnpm tauri build --no-bundle
+
 # Build only the frontend
 build-frontend:
     pnpm build

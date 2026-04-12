@@ -31,7 +31,7 @@
     "icon": [
       "icons/icon.png"
     ],
-    "category": "Email",
+    "category": "Productivity",
     "linux": {
       "deb": {
         "depends": [
