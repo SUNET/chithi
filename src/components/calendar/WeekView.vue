@@ -80,31 +80,37 @@ interface EventSegment {
   segEnd: Date;    // clamped to day end (midnight) if event continues next day
 }
 
-function getSegmentsForDay(date: Date): EventSegment[] {
-  const dayStart = new Date(date);
-  dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(date);
-  dayEnd.setHours(23, 59, 59, 999);
+// Precompute segments indexed by "YYYY-MM-DD:HH" so each cell lookup is O(1).
+const segmentsByDayHour = computed(() => {
+  const map = new Map<string, EventSegment[]>();
 
-  const segments: EventSegment[] = [];
-  for (const e of calendarStore.visibleEvents) {
-    const eStart = new Date(e.start_time);
-    const eEnd = new Date(e.end_time);
-    // Skip all-day and multi-day (>24h) events — handled by getAllDayEvents
-    if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) continue;
-    // Check overlap with this day
-    if (eStart > dayEnd || eEnd <= dayStart) continue;
-    // Clamp to this day's boundaries
-    const segStart = eStart < dayStart ? dayStart : eStart;
-    const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd; // midnight = 00:00 next day
-    segments.push({ event: e, segStart, segEnd });
+  for (const day of days.value) {
+    const dayStart = new Date(day);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(day);
+    dayEnd.setHours(23, 59, 59, 999);
+    const dayStr = day.toISOString().split("T")[0];
+
+    for (const e of calendarStore.visibleEvents) {
+      const eStart = new Date(e.start_time);
+      const eEnd = new Date(e.end_time);
+      if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) continue;
+      if (eStart > dayEnd || eEnd <= dayStart) continue;
+
+      const segStart = eStart < dayStart ? dayStart : eStart;
+      const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd;
+      const key = `${dayStr}:${segStart.getHours()}`;
+      const list = map.get(key) || [];
+      list.push({ event: e, segStart, segEnd });
+      map.set(key, list);
+    }
   }
-  return segments;
-}
+  return map;
+});
 
-// Return segments whose start hour matches this slot (one render per segment)
-function getEventsForDayHour(date: Date, hour: number) {
-  return getSegmentsForDay(date).filter((s) => s.segStart.getHours() === hour);
+function getEventsForDayHour(date: Date, hour: number): EventSegment[] {
+  const key = `${date.toISOString().split("T")[0]}:${hour}`;
+  return segmentsByDayHour.value.get(key) || [];
 }
 
 const HOUR_HEIGHT = 52; // must match .hour-row min-height in CSS
@@ -168,7 +174,7 @@ onMounted(async () => {
   now.value = new Date();
   await nextTick();
   if (gridRef.value) {
-    const hourHeight = 52;
+    const hourHeight = HOUR_HEIGHT;
     const scrollToHour = Math.max(now.value.getHours() - 2, 0);
     gridRef.value.scrollTop = hourHeight * scrollToHour;
   }
