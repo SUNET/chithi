@@ -252,6 +252,158 @@ pub async fn delete_messages(
     Ok(())
 }
 
+/// Move messages from one account to a folder in a *different* account.
+///
+/// Reads the raw RFC822 bytes from the source account's maildir, appends
+/// them to the destination folder via the destination protocol, and then
+/// deletes the source messages.
+#[tauri::command]
+pub async fn move_messages_cross_account(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source_account_id: String,
+    message_ids: Vec<String>,
+    target_account_id: String,
+    target_folder: String,
+) -> Result<()> {
+    log::info!(
+        "Cross-account move: {} -> {}/{} ({} messages)",
+        source_account_id,
+        target_account_id,
+        target_folder,
+        message_ids.len()
+    );
+
+    if source_account_id == target_account_id {
+        return Err(Error::Other(
+            "Use move_messages for same-account moves".into(),
+        ));
+    }
+
+    // Load target account and source maildir paths (scoped to source account)
+    let (target_account, maildir_paths) = {
+        let conn = state.db.lock().await;
+        let target = db::accounts::get_account_full(&conn, &target_account_id)?;
+        let paths = db::messages::get_maildir_paths(&conn, &source_account_id, &message_ids)?;
+        (target, paths)
+    };
+
+    if maildir_paths.len() != message_ids.len() {
+        return Err(Error::Other(format!(
+            "Cross-account move requires all messages to be synced locally \
+             (found {}/{} maildir files). Sync the source folder first.",
+            maildir_paths.len(),
+            message_ids.len()
+        )));
+    }
+
+    // Resolve and validate all maildir paths before starting the transfer.
+    // Rejects non-disk entries (graph: prefix), absolute paths, and ".." segments.
+    let data_dir = state.data_dir.clone();
+    let validated_paths: Vec<std::path::PathBuf> = {
+        let canonical_data_dir = std::fs::canonicalize(&data_dir)
+            .unwrap_or_else(|_| data_dir.clone());
+        let mut paths = Vec::with_capacity(maildir_paths.len());
+        for (msg_id, maildir_path) in &maildir_paths {
+            if maildir_path.starts_with("graph:") {
+                return Err(Error::Other(format!(
+                    "Message {} is not stored on disk (Graph API). \
+                     Cross-account move requires locally synced messages.",
+                    msg_id
+                )));
+            }
+            let rel = std::path::Path::new(maildir_path);
+            if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(Error::Other(format!(
+                    "Invalid maildir path for message {}: '{}'",
+                    msg_id, maildir_path
+                )));
+            }
+            let full_path = data_dir.join(maildir_path);
+            let canonical = std::fs::canonicalize(&full_path).map_err(|e| {
+                Error::Other(format!(
+                    "Failed to resolve maildir file {}: {}",
+                    full_path.display(), e
+                ))
+            })?;
+            if !canonical.starts_with(&canonical_data_dir) {
+                return Err(Error::Other(format!(
+                    "Path traversal detected for message {}", msg_id
+                )));
+            }
+            paths.push(canonical);
+        }
+        paths
+    };
+
+    // Append to destination — stream one message at a time to avoid
+    // loading all message bodies into memory simultaneously.
+    match target_account.mail_protocol.as_str() {
+        "imap" => {
+            // IMAP: read and append in a single blocking task (one connection)
+            let imap_config = build_imap_config(&target_account).await?;
+            let target_folder_clone = target_folder.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = ImapConnection::connect(&imap_config)?;
+                for path in &validated_paths {
+                    let bytes = std::fs::read(path).map_err(|e| {
+                        Error::Other(format!("Failed to read {}: {}", path.display(), e))
+                    })?;
+                    conn.append_message_raw(&target_folder_clone, &bytes)?;
+                }
+                conn.logout();
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Other(format!("IMAP append task panicked: {}", e)))??;
+        }
+        "jmap" => {
+            // JMAP: read each message in a blocking task, then import async
+            let jmap_config =
+                crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
+            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            for path in &validated_paths {
+                let path_clone = path.clone();
+                let bytes = tokio::task::spawn_blocking(move || {
+                    std::fs::read(&path_clone)
+                })
+                .await
+                .map_err(|e| Error::Other(format!("Read task panicked: {}", e)))?
+                .map_err(|e| Error::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+                conn_jmap
+                    .import_email_to_mailbox(&jmap_config, &bytes, &target_folder, false)
+                    .await?;
+            }
+        }
+        "graph" => {
+            return Err(Error::Other(
+                "Cross-account move to Microsoft 365 (Graph) is not yet supported.".into(),
+            ));
+        }
+        other => {
+            return Err(Error::Other(format!(
+                "Unknown mail protocol for destination account: {}",
+                other
+            )));
+        }
+    }
+
+    // Append succeeded — delete from source
+    delete_messages(app.clone(), state, source_account_id.clone(), message_ids.clone()).await?;
+
+    // Emit events for the destination account too so its folder counts refresh
+    emit_messages_changed(&app, &target_account_id);
+    emit_folders_changed(&app, &target_account_id);
+
+    log::info!(
+        "Cross-account move complete: {} messages moved to {}/{}",
+        message_ids.len(),
+        target_account_id,
+        target_folder
+    );
+    Ok(())
+}
+
 /// Set or remove flags on messages (e.g., \Seen, \Flagged).
 #[tauri::command]
 pub async fn set_message_flags(

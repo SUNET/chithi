@@ -247,8 +247,10 @@ let dragExpandTimer: ReturnType<typeof setTimeout> | null = null;
 
 function onFolderMouseEnter(accountId: string, folderPath: string) {
   if (!isDragging.value) return;
-  if (dragSourceAccountId.value !== accountId) return;
-  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+  // Allow drops on any account (cross-account moves are supported)
+  if (dragSourceAccountId.value === accountId &&
+      foldersStore.activeFolderPath === folderPath &&
+      accountsStore.activeAccountId === accountId) return;
   dropTarget.value = `${accountId}:${folderPath}`;
   if (isFolderCollapsed(accountId, folderPath)) {
     dragExpandTimer = setTimeout(() => {
@@ -270,18 +272,33 @@ function onFolderMouseLeave(accountId: string, folderPath: string) {
 async function onFolderMouseUp(accountId: string, folderPath: string) {
   if (!isDragging.value || dragMessageIds.value.length === 0) return;
   dropTarget.value = null;
-  if (dragSourceAccountId.value !== accountId) return;
-  if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
+  const sourceAccountId = dragSourceAccountId.value;
+  if (!sourceAccountId) return;
+  if (sourceAccountId === accountId &&
+      foldersStore.activeFolderPath === folderPath &&
+      accountsStore.activeAccountId === accountId) return;
 
   const messageIds = [...dragMessageIds.value];
-  const moveToastId = showToast(`Moving ${messageIds.length} message(s)...`, "info", 0);
+  const isCrossAccount = sourceAccountId !== accountId;
+  const label = isCrossAccount ? "Moving (cross-account)" : "Moving";
+  const moveToastId = showToast(`${label} ${messageIds.length} message(s)...`, "info", 0);
   try {
-    await api.moveMessages(accountId, messageIds, folderPath);
+    if (isCrossAccount) {
+      await api.moveMessagesCrossAccount(sourceAccountId, messageIds, accountId, folderPath);
+      // Sync the destination account so the moved messages appear immediately
+      api.triggerSync(accountId, folderPath).catch((e) =>
+        console.error("Post-move sync failed:", e),
+      );
+    } else {
+      await api.moveMessages(accountId, messageIds, folderPath);
+    }
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
   } catch (e) {
     console.error("Drag-and-drop move failed:", e);
+    const message = e instanceof Error ? e.message : String(e);
+    showToast(`Move failed: ${message}`, "error", 5000);
   } finally {
     dismissToast(moveToastId);
   }
