@@ -297,17 +297,14 @@ pub async fn move_messages_cross_account(
         )));
     }
 
-    // Read raw bytes from disk using async I/O to avoid blocking the runtime.
-    // Validate each path: skip non-disk entries (graph: prefix) and reject
-    // absolute paths or ".." segments that could escape the data directory.
+    // Resolve and validate all maildir paths before starting the transfer.
+    // Rejects non-disk entries (graph: prefix), absolute paths, and ".." segments.
     let data_dir = state.data_dir.clone();
-    let paths_clone = maildir_paths.clone();
-    let raw_messages: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<u8>>> {
+    let validated_paths: Vec<std::path::PathBuf> = {
         let canonical_data_dir = std::fs::canonicalize(&data_dir)
             .unwrap_or_else(|_| data_dir.clone());
-        let mut messages = Vec::with_capacity(paths_clone.len());
-        for (msg_id, maildir_path) in &paths_clone {
-            // Skip non-disk entries (e.g. Graph API messages with "graph:" prefix)
+        let mut paths = Vec::with_capacity(maildir_paths.len());
+        for (msg_id, maildir_path) in &maildir_paths {
             if maildir_path.starts_with("graph:") {
                 return Err(Error::Other(format!(
                     "Message {} is not stored on disk (Graph API). \
@@ -334,28 +331,25 @@ pub async fn move_messages_cross_account(
                     "Path traversal detected for message {}", msg_id
                 )));
             }
-            let bytes = std::fs::read(&canonical).map_err(|e| {
-                Error::Other(format!(
-                    "Failed to read maildir file {}: {}",
-                    full_path.display(), e
-                ))
-            })?;
-            messages.push(bytes);
+            paths.push(canonical);
         }
-        Ok(messages)
-    })
-    .await
-    .map_err(|e| Error::Other(format!("Read task panicked: {}", e)))??;
+        paths
+    };
 
-    // Append to destination
+    // Append to destination — stream one message at a time to avoid
+    // loading all message bodies into memory simultaneously.
     match target_account.mail_protocol.as_str() {
         "imap" => {
+            // IMAP: read and append in a single blocking task (one connection)
             let imap_config = build_imap_config(&target_account).await?;
             let target_folder_clone = target_folder.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = ImapConnection::connect(&imap_config)?;
-                for bytes in &raw_messages {
-                    conn.append_message_raw(&target_folder_clone, bytes)?;
+                for path in &validated_paths {
+                    let bytes = std::fs::read(path).map_err(|e| {
+                        Error::Other(format!("Failed to read {}: {}", path.display(), e))
+                    })?;
+                    conn.append_message_raw(&target_folder_clone, &bytes)?;
                 }
                 conn.logout();
                 Ok(())
@@ -364,12 +358,20 @@ pub async fn move_messages_cross_account(
             .map_err(|e| Error::Other(format!("IMAP append task panicked: {}", e)))??;
         }
         "jmap" => {
+            // JMAP: read each message in a blocking task, then import async
             let jmap_config =
                 crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-            for bytes in &raw_messages {
+            for path in &validated_paths {
+                let path_clone = path.clone();
+                let bytes = tokio::task::spawn_blocking(move || {
+                    std::fs::read(&path_clone)
+                })
+                .await
+                .map_err(|e| Error::Other(format!("Read task panicked: {}", e)))?
+                .map_err(|e| Error::Other(format!("Failed to read {}: {}", path.display(), e)))?;
                 conn_jmap
-                    .import_email_to_mailbox(&jmap_config, bytes, &target_folder, false)
+                    .import_email_to_mailbox(&jmap_config, &bytes, &target_folder, false)
                     .await?;
             }
         }
