@@ -40,7 +40,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="reader-view">
+  <div class="reader-view" data-testid="reader-view">
     <MessageReader :standalone="true" @close="closeWindow" />
   </div>
 </template>

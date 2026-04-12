@@ -85,6 +85,7 @@ function toggleDecorations() {
           class="menu-action"
           :class="{ checked: uiStore.messageViewMode === 'bottom' }"
           @click="setViewMode('bottom')"
+          data-testid="menu-view-bottom"
         >
           {{ uiStore.messageViewMode === 'bottom' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Bottom
         </button>

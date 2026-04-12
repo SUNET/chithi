@@ -305,11 +305,11 @@ onUnmounted(() => {
 
       <!-- Bottom mode: message list on top, single-message reader below -->
       <template v-else-if="uiStore.messageViewMode === 'bottom'">
-        <div class="stacked-content">
+        <div class="stacked-content" data-testid="bottom-mode-content">
           <div class="message-list-pane expanded">
             <MessageList @open-message="onOpenMessage" />
           </div>
-          <div v-if="showBottomReader" class="bottom-reader-pane">
+          <div v-if="showBottomReader" class="bottom-reader-pane" data-testid="bottom-reader-pane">
             <MessageReader @close="uiStore.hideReader()" />
           </div>
         </div>
@@ -317,11 +317,12 @@ onUnmounted(() => {
 
       <!-- Tab mode: tab bar on top, list or reader content below -->
       <template v-else>
-        <div class="stacked-content">
-          <div class="tab-bar" role="tablist">
+        <div class="stacked-content" data-testid="tab-mode-content">
+          <div class="tab-bar" role="tablist" data-testid="tab-bar">
             <div
               class="tab list-tab"
               :class="{ active: activeTabId === null }"
+              data-testid="tab-messages"
             >
               <button
                 type="button"
@@ -329,6 +330,7 @@ onUnmounted(() => {
                 role="tab"
                 :aria-selected="activeTabId === null"
                 @click="activateListTab"
+                data-testid="tab-messages-btn"
               >
                 <span class="tab-label">Messages</span>
               </button>
@@ -338,6 +340,7 @@ onUnmounted(() => {
               :key="tab.messageId"
               class="tab message-tab"
               :class="{ active: activeTabId === tab.messageId }"
+              :data-testid="`tab-message-${tab.messageId}`"
             >
               <button
                 type="button"
@@ -345,6 +348,7 @@ onUnmounted(() => {
                 role="tab"
                 :aria-selected="activeTabId === tab.messageId"
                 @click="activateMessageTab(tab.messageId)"
+                :data-testid="`tab-activate-${tab.messageId}`"
               >
                 <span class="tab-label">{{ tab.subject }}</span>
               </button>
@@ -353,12 +357,13 @@ onUnmounted(() => {
                 class="tab-close"
                 :aria-label="`Close tab: ${tab.subject}`"
                 @click="closeTab(tab.messageId)"
+                :data-testid="`tab-close-${tab.messageId}`"
               >
                 &times;
               </button>
             </div>
           </div>
-          <div class="tab-content-pane">
+          <div class="tab-content-pane" data-testid="tab-content-pane">
             <MessageList v-if="activeTabId === null" @open-message="onOpenMessage" />
             <MessageReader v-else @close="closeActiveTab" />
           </div>
