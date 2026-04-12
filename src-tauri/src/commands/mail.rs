@@ -540,7 +540,13 @@ pub async fn create_folder(
     Ok(())
 }
 
+/// System folder types that must never be deleted.
+const PROTECTED_FOLDER_TYPES: &[&str] = &[
+    "inbox", "sent", "drafts", "trash", "junk", "archive",
+];
+
 /// Delete a folder on the mail server and remove it from local DB.
+/// Refuses to delete system folders (inbox, sent, drafts, trash, junk, archive).
 #[tauri::command]
 pub async fn delete_folder(
     app: tauri::AppHandle,
@@ -550,8 +556,34 @@ pub async fn delete_folder(
 ) -> Result<()> {
     log::info!("Deleting folder '{}' for account {}", folder_path, account_id);
 
+    // Verify the folder exists in the local DB and is not a system folder
     let account = {
         let conn = state.db.lock().await;
+
+        // Check that the folder belongs to this account
+        let folder_type: Option<String> = conn
+            .query_row(
+                "SELECT folder_type FROM folders WHERE account_id = ?1 AND path = ?2",
+                rusqlite::params![account_id, folder_path],
+                |row| row.get(0),
+            )
+            .map_err(|_| Error::Other(format!(
+                "Folder '{}' not found for account {}", folder_path, account_id
+            )))?;
+
+        // Reject deletion of system folders
+        if let Some(ref ft) = folder_type {
+            if PROTECTED_FOLDER_TYPES.contains(&ft.as_str()) {
+                log::warn!(
+                    "Refusing to delete system folder '{}' (type={}) for account {}",
+                    folder_path, ft, account_id
+                );
+                return Err(Error::Other(format!(
+                    "Cannot delete system folder '{}' ({})", folder_path, ft
+                )));
+            }
+        }
+
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
