@@ -39,7 +39,7 @@ describe("Store listener cleanup", () => {
     const accountsStore = useAccountsStore();
     accountsStore.accounts = [];
 
-    let resolveListen: ((unlisten: () => void) => void) | null = null;
+    let resolveListen: ((unlisten: () => void) => void) | undefined;
     const unlisten = vi.fn();
     listenMock.mockImplementationOnce(
       () => new Promise<() => void>((resolve) => {
@@ -50,7 +50,7 @@ describe("Store listener cleanup", () => {
     const foldersStore = useFoldersStore();
     foldersStore.$dispose();
 
-    resolveListen?.(unlisten);
+    resolveListen!(unlisten);
     await Promise.resolve();
 
     expect(unlisten).toHaveBeenCalledOnce();
