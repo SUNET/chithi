@@ -51,14 +51,14 @@ test-all: test test-rust
 _rpm-version:
     #!/usr/bin/env bash
     VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-    echo "${VERSION//-/\~}"
+    echo "${VERSION//-/~}"
 
 # Convert semver prerelease to DEB-compatible version
 # 0.3.0-alpha.1 -> 0.3.0~alpha.1 (sorts before 0.3.0)
 _deb-version:
     #!/usr/bin/env bash
     VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-    echo "${VERSION//-/\~}"
+    echo "${VERSION//-/~}"
 
 # Build RPM package using Docker
 # Usage: just build-rpm [base_image]
