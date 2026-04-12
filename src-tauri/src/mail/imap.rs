@@ -497,6 +497,14 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Mark all messages in the currently selected folder as \Seen.
+    pub fn mark_all_seen(&mut self) -> Result<()> {
+        self.session
+            .uid_store("1:*", "+FLAGS (\\Seen)")
+            .map_err(|e| Error::Imap(format!("STORE +FLAGS \\Seen failed: {}", e)))?;
+        Ok(())
+    }
+
     /// Fetch current flags for all messages in the selected folder.
     /// Returns a map of UID → flags vec. Uses `1:*` to get everything.
     pub fn fetch_all_flags(&mut self) -> Result<Vec<(u32, Vec<String>)>> {
