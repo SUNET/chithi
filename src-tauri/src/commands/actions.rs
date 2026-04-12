@@ -498,7 +498,7 @@ pub async fn mark_account_read(
             let folders = db::folders::list_folders(&conn, &account_id)?;
             folders.into_iter().map(|f| f.path).collect()
         };
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let imap_result = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = ImapConnection::connect(&imap_config)?;
             for folder_path in &folder_paths {
                 if let Err(e) = conn.select_folder(folder_path) {
@@ -513,9 +513,11 @@ pub async fn mark_account_read(
             Ok(())
         })
         .await
-        .map_err(|e| Error::Other(format!("Mark account read task panicked: {}", e)))??;
+        .map_err(|e| Error::Other(format!("Mark account read task panicked: {}", e)))?;
 
+        // Always resume IDLE, even if the mark-read operation failed
         resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+        imap_result?;
     } else if account.mail_protocol == "jmap" {
         // JMAP: bulk update all unread emails to $seen via Email/set
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
