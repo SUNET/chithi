@@ -152,11 +152,12 @@ function isReply(subject: string | null, flags: string[]): boolean {
 
 .icon-read {
   font-size: 8px;
-  color: transparent;
+  color: var(--color-accent);
+  visibility: hidden;
 }
 
 .icon-read.unread {
-  color: var(--color-accent);
+  visibility: visible;
 }
 
 .icon-star {

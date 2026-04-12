@@ -305,6 +305,40 @@ async function ctxDelete() {
   await messagesStore.deleteSelected();
 }
 
+function ctxMarkRead() {
+  const ids = messagesStore.resolveSelectedIds();
+  closeContextMenu();
+  messagesStore.setReadStatus(ids, true);
+}
+
+function ctxMarkUnread() {
+  const ids = messagesStore.resolveSelectedIds();
+  closeContextMenu();
+  messagesStore.setReadStatus(ids, false);
+}
+
+const hasUnreadSelected = () => {
+  const ids = messagesStore.resolveSelectedIds();
+  for (const id of ids) {
+    const msg = messagesStore.messages.find(m => m.id === id);
+    if (msg && !msg.flags.includes("seen")) return true;
+    const thread = messagesStore.threads.find(t => t.message_ids.includes(id));
+    if (thread && thread.unread_count > 0) return true;
+  }
+  return false;
+};
+
+const hasReadSelected = () => {
+  const ids = messagesStore.resolveSelectedIds();
+  for (const id of ids) {
+    const msg = messagesStore.messages.find(m => m.id === id);
+    if (msg && msg.flags.includes("seen")) return true;
+    const thread = messagesStore.threads.find(t => t.message_ids.includes(id));
+    if (thread && thread.unread_count < thread.message_count) return true;
+  }
+  return false;
+};
+
 function ctxShowAsThread() {
   if (contextMenu.value) {
     messagesStore.showAsThread(contextMenu.value.messageId);
@@ -566,6 +600,15 @@ const displayedCount = () => {
         </div>
 
         <div class="ctx-separator"></div>
+
+        <button v-if="hasReadSelected()" class="ctx-item" data-testid="ctx-mark-unread" @click="ctxMarkUnread">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><circle cx="12" cy="12" r="3" fill="currentColor" /></svg>
+          Mark Unread
+        </button>
+        <button v-if="hasUnreadSelected()" class="ctx-item" data-testid="ctx-mark-read" @click="ctxMarkRead">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M9 12l2 2 4-4" /></svg>
+          Mark Read
+        </button>
 
         <button v-if="isJunkFolder()" class="ctx-item" data-testid="ctx-not-spam" @click="ctxNotSpam">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>

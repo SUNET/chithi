@@ -302,6 +302,38 @@ export const useMessagesStore = defineStore("messages", () => {
       .catch((e) => console.error("Failed to mark as read:", e));
   }
 
+  function markAsUnread(messageId: string) {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId) return;
+
+    const msg = findMessage(messageId);
+    if (msg) {
+      if (!msg.flags.includes("seen")) return; // already unread
+      msg.flags = msg.flags.filter((f) => f !== "seen");
+    }
+
+    const thread = threads.value.find((t) =>
+      t.message_ids.includes(messageId),
+    );
+    if (thread) {
+      thread.unread_count++;
+    }
+
+    api
+      .setMessageFlags(accountId, [messageId], ["seen"], false)
+      .catch((e) => console.error("Failed to mark as unread:", e));
+  }
+
+  function setReadStatus(messageIds: string[], read: boolean) {
+    for (const id of messageIds) {
+      if (read) {
+        markAsRead(id);
+      } else {
+        markAsUnread(id);
+      }
+    }
+  }
+
   function toggleStar(messageId: string) {
     const accountId = accountsStore.activeAccountId;
     if (!accountId) return;
@@ -553,5 +585,7 @@ export const useMessagesStore = defineStore("messages", () => {
     clearQuickFilters,
     resolveSelectedIds,
     toggleStar,
+    markAsUnread,
+    setReadStatus,
   };
 });
