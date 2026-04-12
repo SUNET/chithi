@@ -57,7 +57,8 @@ function getEventsForDay(date: Date) {
   const dayStr = date.toISOString().split("T")[0];
   return calendarStore.visibleEvents.filter((e) => {
     const eStart = e.start_time.split("T")[0];
-    return eStart === dayStr;
+    const eEnd = e.end_time.split("T")[0];
+    return eStart <= dayStr && eEnd >= dayStr;
   });
 }
 
