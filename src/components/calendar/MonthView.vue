@@ -54,11 +54,16 @@ function isCurrentMonth(date: Date): boolean {
 }
 
 function getEventsForDay(date: Date) {
-  const dayStr = date.toISOString().split("T")[0];
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
   return calendarStore.visibleEvents.filter((e) => {
-    const eStart = e.start_time.split("T")[0];
-    const eEnd = e.end_time.split("T")[0];
-    return eStart <= dayStr && eEnd >= dayStr;
+    const eStart = new Date(e.start_time);
+    const eEnd = new Date(e.end_time);
+    // Overlap check with exclusive end — events ending exactly at midnight
+    // don't spill onto the next day
+    return eStart <= dayEnd && eEnd > dayStart;
   });
 }
 
