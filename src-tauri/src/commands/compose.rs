@@ -240,6 +240,40 @@ pub async fn save_draft(
 fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::AttachmentData>> {
     let mut result = Vec::new();
     for att in attachments {
+        let path = std::path::Path::new(&att.path);
+
+        // Reject relative paths
+        if !path.is_absolute() {
+            return Err(crate::error::Error::Other(format!(
+                "Attachment path must be absolute: '{}'", att.path
+            )));
+        }
+
+        // Reject paths containing ".." components
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(crate::error::Error::Other(format!(
+                    "Attachment path must not contain '..': '{}'", att.path
+                )));
+            }
+        }
+
+        // Warn on unusual paths outside typical user directories
+        let path_str = att.path.as_str();
+        let is_typical = if cfg!(unix) {
+            path_str.starts_with("/home/")
+                || path_str.starts_with("/tmp/")
+                || path_str.starts_with("/Users/")
+                || path_str.starts_with("/var/tmp/")
+        } else {
+            // Windows
+            path_str.starts_with("C:\\Users\\")
+                || path_str.starts_with("C:\\Temp\\")
+        };
+        if !is_typical {
+            log::warn!("Attachment from unusual path: '{}'", att.path);
+        }
+
         let data = std::fs::read(&att.path)
             .map_err(|e| crate::error::Error::Other(format!("Failed to read attachment '{}': {}", att.path, e)))?;
         let content_type = mime_guess::from_path(&att.name)

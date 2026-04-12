@@ -43,5 +43,8 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

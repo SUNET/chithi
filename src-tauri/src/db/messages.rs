@@ -133,7 +133,7 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<()> {
 
 /// Build extra SQL WHERE clauses for quick filter options.
 /// All clauses are safe (no user-supplied strings injected into SQL).
-fn build_filter_clauses(filter: &QuickFilter, account_id: &str) -> String {
+fn build_filter_clauses(filter: &QuickFilter, account_id: &str, use_fts: bool) -> String {
     let mut clauses = Vec::new();
     if filter.unread {
         clauses.push("flags NOT LIKE '%seen%'".to_string());
@@ -158,45 +158,61 @@ fn build_filter_clauses(filter: &QuickFilter, account_id: &str) -> String {
             acct = account_id.replace('\'', "''")
         ));
     }
-    // Text search via FTS5 for fast full-text matching
+    // Text search
     let text = filter.text.trim();
     if !text.is_empty() {
-        // Escape FTS5 special characters: quotes and single quotes
-        let escaped = text
-            .replace('"', "\"\"")
-            .replace('\'', "''");
-
-        // Determine which FTS5 columns to search (default: all)
+        // Determine which columns to search (default: all)
         let fields = &filter.text_fields;
         let search_sender = fields.is_empty() || fields.iter().any(|f| f == "sender");
         let search_recipients = fields.is_empty() || fields.iter().any(|f| f == "recipients");
         let search_subject = fields.is_empty() || fields.iter().any(|f| f == "subject");
         let search_body = fields.is_empty() || fields.iter().any(|f| f == "body");
 
-        let mut fts_columns = Vec::new();
-        if search_sender {
-            fts_columns.push("from_name");
-            fts_columns.push("from_email");
-        }
-        if search_recipients {
-            fts_columns.push("to_addresses");
-            fts_columns.push("cc_addresses");
-        }
-        if search_subject {
-            fts_columns.push("subject");
-        }
-        if search_body {
-            fts_columns.push("snippet");
-        }
+        if use_fts {
+            // FTS5 for fast full-text matching
+            let escaped = text
+                .replace('"', "\"\"")
+                .replace('\'', "''");
 
-        if !fts_columns.is_empty() {
-            // Build FTS5 column filter: {col1 col2 col3} : "term"
-            let col_filter = format!("{{{}}}", fts_columns.join(" "));
-            // Use prefix matching with * for partial word search
-            clauses.push(format!(
-                "rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH '{} : \"{}\"*')",
-                col_filter, escaped
-            ));
+            let mut fts_columns = Vec::new();
+            if search_sender { fts_columns.push("from_name"); fts_columns.push("from_email"); }
+            if search_recipients { fts_columns.push("to_addresses"); fts_columns.push("cc_addresses"); }
+            if search_subject { fts_columns.push("subject"); }
+            if search_body { fts_columns.push("snippet"); }
+
+            if !fts_columns.is_empty() {
+                let col_filter = format!("{{{}}}", fts_columns.join(" "));
+                clauses.push(format!(
+                    "rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH '{} : \"{}\"*')",
+                    col_filter, escaped
+                ));
+            }
+        } else {
+            // LIKE fallback — escape backslash first, then SQL special chars
+            let like_escaped = text
+                .replace('\\', "\\\\")
+                .replace('\'', "''")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+
+            let mut like_clauses = Vec::new();
+            if search_sender {
+                like_clauses.push(format!("from_name LIKE '%{}%' ESCAPE '\\'", like_escaped));
+                like_clauses.push(format!("from_email LIKE '%{}%' ESCAPE '\\'", like_escaped));
+            }
+            if search_recipients {
+                like_clauses.push(format!("to_addresses LIKE '%{}%' ESCAPE '\\'", like_escaped));
+                like_clauses.push(format!("cc_addresses LIKE '%{}%' ESCAPE '\\'", like_escaped));
+            }
+            if search_subject {
+                like_clauses.push(format!("subject LIKE '%{}%' ESCAPE '\\'", like_escaped));
+            }
+            if search_body {
+                like_clauses.push(format!("snippet LIKE '%{}%' ESCAPE '\\'", like_escaped));
+            }
+            if !like_clauses.is_empty() {
+                clauses.push(format!("({})", like_clauses.join(" OR ")));
+            }
         }
     }
     if clauses.is_empty() {
@@ -216,7 +232,30 @@ pub fn get_messages(
     sort_asc: bool,
     filter: &QuickFilter,
 ) -> Result<MessagePage> {
-    let filter_sql = build_filter_clauses(filter, account_id);
+    // Try FTS5 first; on failure (bad query syntax), fall back to LIKE
+    let has_text = !filter.text.trim().is_empty();
+    match get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
+        Ok(page) => return Ok(page),
+        Err(e) if has_text => {
+            log::warn!("FTS5 query failed, retrying with LIKE fallback: {}", e);
+            return get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+        }
+        Err(e) => return Err(e),
+    }
+}
+
+fn get_messages_inner(
+    conn: &Connection,
+    account_id: &str,
+    folder_path: &str,
+    page: u32,
+    per_page: u32,
+    sort_column: &str,
+    sort_asc: bool,
+    filter: &QuickFilter,
+    use_fts: bool,
+) -> Result<MessagePage> {
+    let filter_sql = build_filter_clauses(filter, account_id, use_fts);
 
     let total: i64 = conn.query_row(
         &format!(
@@ -227,7 +266,6 @@ pub fn get_messages(
         |row| row.get(0),
     )?;
 
-    // Whitelist sort columns to prevent SQL injection
     let order_col = match sort_column {
         "subject" => "subject",
         "from" => "from_name",
@@ -644,7 +682,29 @@ pub fn get_threaded_messages(
     sort_asc: bool,
     filter: &QuickFilter,
 ) -> Result<ThreadedPage> {
-    let filter_sql = build_filter_clauses(filter, account_id);
+    let has_text = !filter.text.trim().is_empty();
+    match get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
+        Ok(page) => return Ok(page),
+        Err(e) if has_text => {
+            log::warn!("FTS5 threaded query failed, retrying with LIKE: {}", e);
+            return get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+        }
+        Err(e) => return Err(e),
+    }
+}
+
+fn get_threaded_messages_inner(
+    conn: &Connection,
+    account_id: &str,
+    folder_path: &str,
+    page: u32,
+    per_page: u32,
+    sort_column: &str,
+    sort_asc: bool,
+    filter: &QuickFilter,
+    use_fts: bool,
+) -> Result<ThreadedPage> {
+    let filter_sql = build_filter_clauses(filter, account_id, use_fts);
 
     // Count total messages in this folder (with filters)
     let total_messages: i64 = conn.query_row(

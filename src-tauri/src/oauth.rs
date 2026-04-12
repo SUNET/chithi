@@ -110,24 +110,32 @@ impl OAuthTokens {
 
 /// Build the OAuth2 authorization URL with a local redirect server.
 /// Returns `(url, port, code_verifier)` where code_verifier is present for PKCE providers.
-pub fn get_auth_url(provider: &OAuthProvider) -> Result<(String, u16, Option<String>)> {
+/// Returns (url, listener, code_verifier, state).
+///
+/// The listener is kept open to prevent port hijacking between URL
+/// generation and callback handling (TOCTOU). The state parameter
+/// provides CSRF protection and must be validated in the callback.
+pub fn get_auth_url(provider: &OAuthProvider) -> Result<(String, TcpListener, Option<String>, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| Error::Other(format!("Failed to bind local server: {}", e)))?;
     let port = listener.local_addr()
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
-    drop(listener);
 
     // Microsoft requires http://localhost (not 127.0.0.1) for native client redirect.
     // Google works with either. Use localhost for both.
     let redirect_uri = format!("http://localhost:{}", port);
 
+    // Generate a random state parameter for CSRF protection
+    let state = generate_code_verifier();
+
     let mut url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
         provider.auth_url,
         urlencoding::encode(provider.client_id),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode(&provider.scopes.join(" ")),
+        urlencoding::encode(&state),
     );
 
     let code_verifier = if provider.use_pkce {
@@ -149,19 +157,46 @@ pub fn get_auth_url(provider: &OAuthProvider) -> Result<(String, u16, Option<Str
         url.push_str("&prompt=consent");
     }
 
-    Ok((url, port, code_verifier))
+    Ok((url, listener, code_verifier, state))
 }
 
-/// Listen on the given port for the OAuth2 redirect callback.
-/// Returns the authorization code.
-pub fn wait_for_callback(port: u16) -> Result<String> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .map_err(|e| Error::Other(format!("Failed to bind on port {}: {}", port, e)))?;
+/// Result from the OAuth2 callback, including the authorization code
+/// and optional state parameter for CSRF validation.
+pub struct CallbackResult {
+    pub code: String,
+    pub state: Option<String>,
+}
 
-    log::info!("OAuth2: waiting for callback on port {}", port);
+/// Listen on the given listener for the OAuth2 redirect callback.
+/// Times out after 5 minutes to prevent indefinite resource holding.
+/// Returns the authorization code and state parameter.
+pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
+    use std::time::{Duration, Instant};
 
-    let (mut stream, _) = listener.accept()
-        .map_err(|e| Error::Other(format!("Failed to accept connection: {}", e)))?;
+    let timeout = Duration::from_secs(300);
+    let deadline = Instant::now() + timeout;
+    listener.set_nonblocking(true)
+        .map_err(|e| Error::Other(format!("Failed to set non-blocking: {}", e)))?;
+
+    log::info!("OAuth2: waiting for callback (timeout={}s)", timeout.as_secs());
+
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(conn) => break conn,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Other(
+                        "OAuth2 callback timed out after 5 minutes".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Other(format!("Failed to accept connection: {}", e)));
+            }
+        }
+    };
 
     let mut reader = BufReader::new(stream.try_clone()
         .map_err(|e| Error::Other(format!("Stream clone failed: {}", e)))?);
@@ -170,27 +205,35 @@ pub fn wait_for_callback(port: u16) -> Result<String> {
     reader.read_line(&mut request_line)
         .map_err(|e| Error::Other(format!("Failed to read request: {}", e)))?;
 
-    // Parse: GET /?code=xxx&scope=yyy HTTP/1.1
-    let code = request_line
+    // Parse query parameters from: GET /?code=xxx&state=yyy HTTP/1.1
+    let query_params: HashMap<String, String> = request_line
         .split_whitespace()
-        .nth(1) // The path
-        .and_then(|path| {
-            let query = path.split('?').nth(1)?;
+        .nth(1)
+        .and_then(|path| path.split('?').nth(1))
+        .map(|query| {
             query.split('&')
-                .find(|p| p.starts_with("code="))
-                .map(|p| p.trim_start_matches("code=").to_string())
+                .filter_map(|param| {
+                    let mut parts = param.splitn(2, '=');
+                    let key = parts.next()?;
+                    let val = parts.next().unwrap_or("");
+                    // URL-decode values (code/state may be percent-encoded)
+                    let decoded = urlencoding::decode(val)
+                        .unwrap_or_else(|_| val.into())
+                        .into_owned();
+                    Some((key.to_string(), decoded))
+                })
+                .collect()
         })
-        .ok_or_else(|| {
-            // Check for error
-            let error = request_line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|path| path.split('?').nth(1))
-                .and_then(|q| q.split('&').find(|p| p.starts_with("error=")))
-                .map(|p| p.trim_start_matches("error=").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            Error::Other(format!("OAuth2 authorization failed: {}", error))
-        })?;
+        .unwrap_or_default();
+
+    let code = query_params.get("code").cloned().ok_or_else(|| {
+        let error = query_params.get("error")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        Error::Other(format!("OAuth2 authorization failed: {}", error))
+    })?;
+
+    let state = query_params.get("state").cloned();
 
     // Send a success response to the browser
     let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
@@ -201,7 +244,7 @@ pub fn wait_for_callback(port: u16) -> Result<String> {
     stream.write_all(response.as_bytes()).ok();
 
     log::info!("OAuth2: received authorization code");
-    Ok(code)
+    Ok(CallbackResult { code, state })
 }
 
 /// Exchange an authorization code for access + refresh tokens.

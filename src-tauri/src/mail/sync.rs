@@ -540,6 +540,20 @@ pub fn fetch_and_store_body(
         .join(sanitize_folder_name(folder_path));
     create_maildir_dirs(&maildir_base)?;
 
+    // Verify resolved path stays inside data_dir (path traversal defence)
+    let canonical_data_dir = std::fs::canonicalize(data_dir)
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_maildir = std::fs::canonicalize(&maildir_base)
+        .map_err(|e| Error::Other(format!(
+            "Failed to resolve maildir path: {}", e
+        )))?;
+    if !canonical_maildir.starts_with(&canonical_data_dir) {
+        return Err(Error::Other(format!(
+            "Path traversal detected: maildir path '{}' escapes data directory",
+            maildir_base.display()
+        )));
+    }
+
     let filename = format!("{}:2,{}", uid, flags_to_maildir_suffix(flags));
     let msg_path = maildir_base.join("cur").join(&filename);
     std::fs::write(&msg_path, &body)?;
@@ -568,8 +582,26 @@ pub(crate) fn create_maildir_dirs(base: &Path) -> Result<()> {
 }
 
 pub(crate) fn sanitize_folder_name(name: &str) -> String {
-    name.replace(['/', '\\'], ".")
-        .replace('\0', "")
+    let normalized = name.replace('\\', "/").replace('\0', "");
+
+    let sanitized: String = std::path::Path::new(&normalized)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => {
+                let s = part.to_string_lossy().replace('.', "_");
+                if s.is_empty() { None } else { Some(s) }
+            }
+            // Strip ., .., /, and prefix components
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 pub(crate) fn flags_to_maildir_suffix(flags: &[String]) -> String {

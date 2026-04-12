@@ -1,21 +1,37 @@
+use std::collections::HashMap;
+use std::net::TcpListener;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::State;
 
 use crate::error::{Error, Result};
 use crate::oauth;
 use crate::state::AppState;
 
-/// Temporary storage for PKCE code verifiers (needed between start and complete).
-static PKCE_VERIFIERS: Mutex<Option<std::collections::HashMap<u16, String>>> = Mutex::new(None);
+/// Maximum time an OAuth session is valid before being evicted.
+const SESSION_TTL: Duration = Duration::from_secs(300);
 
-fn store_verifier(port: u16, verifier: String) {
-    let mut guard = PKCE_VERIFIERS.lock().unwrap();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    map.insert(port, verifier);
+/// Per-session state stored between oauth_start and oauth_complete.
+struct OAuthSession {
+    verifier: Option<String>,
+    state: String,
+    listener: TcpListener,
+    created_at: Instant,
 }
 
-fn take_verifier(port: u16) -> Option<String> {
-    let mut guard = PKCE_VERIFIERS.lock().unwrap();
+static OAUTH_SESSIONS: Mutex<Option<HashMap<u16, OAuthSession>>> = Mutex::new(None);
+
+fn store_session(port: u16, session: OAuthSession) {
+    let mut guard = OAUTH_SESSIONS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    // Evict expired sessions to prevent unbounded growth
+    let now = Instant::now();
+    map.retain(|_, s| now.duration_since(s.created_at) < SESSION_TTL);
+    map.insert(port, session);
+}
+
+fn take_session(port: u16) -> Option<OAuthSession> {
+    let mut guard = OAUTH_SESSIONS.lock().unwrap();
     guard.as_mut().and_then(|map| map.remove(&port))
 }
 
@@ -34,12 +50,17 @@ pub async fn oauth_start(
 ) -> Result<OAuthStartResult> {
     let prov = get_provider(&provider)?;
 
-    let (url, port, code_verifier) = oauth::get_auth_url(prov)?;
+    let (url, listener, code_verifier, state) = oauth::get_auth_url(prov)?;
+    let port = listener.local_addr()
+        .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
+        .port();
 
-    // Store the PKCE verifier for use in oauth_complete
-    if let Some(verifier) = code_verifier {
-        store_verifier(port, verifier);
-    }
+    store_session(port, OAuthSession {
+        verifier: code_verifier,
+        state,
+        listener,
+        created_at: Instant::now(),
+    });
 
     log::info!("OAuth2: started {} flow on port {}", provider, port);
     Ok(OAuthStartResult { url, port })
@@ -52,7 +73,7 @@ pub struct OAuthStartResult {
 }
 
 /// Wait for the OAuth2 callback and exchange the code for tokens.
-/// This blocks until the user completes the browser flow.
+/// This blocks until the user completes the browser flow or 5 minutes elapse.
 #[tauri::command]
 pub async fn oauth_complete(
     _state: State<'_, AppState>,
@@ -62,18 +83,41 @@ pub async fn oauth_complete(
 ) -> Result<()> {
     let prov = get_provider(&provider)?;
 
-    // Retrieve the PKCE verifier if this provider uses PKCE
-    let code_verifier = take_verifier(port);
+    let session = take_session(port)
+        .ok_or_else(|| Error::Other(format!(
+            "No OAuth session found for port {} (expired or never started)", port
+        )))?;
+
+    let expected_state = session.state.clone();
+    let code_verifier = session.verifier.clone();
 
     // Wait for callback in a blocking thread (TcpListener::accept blocks)
-    let code = tokio::task::spawn_blocking(move || {
-        oauth::wait_for_callback(port)
+    let result = tokio::task::spawn_blocking(move || {
+        oauth::wait_for_callback(session.listener)
     })
     .await
     .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
+    // Validate CSRF state parameter
+    match result.state {
+        Some(ref returned_state) if returned_state == &expected_state => {
+            log::debug!("OAuth2: state parameter validated");
+        }
+        Some(ref returned_state) => {
+            return Err(Error::Other(format!(
+                "OAuth2 state mismatch (possible CSRF): expected={}, got={}",
+                expected_state, returned_state
+            )));
+        }
+        None => {
+            return Err(Error::Other(
+                "OAuth2 callback missing required state parameter".into(),
+            ));
+        }
+    }
+
     // Exchange code for tokens
-    let tokens = oauth::exchange_code(prov, &code, port, code_verifier.as_deref()).await?;
+    let tokens = oauth::exchange_code(prov, &result.code, port, code_verifier.as_deref()).await?;
 
     // Store tokens in keyring
     oauth::store_tokens(&account_id, &tokens)?;
@@ -116,8 +160,6 @@ pub async fn oauth_has_tokens(
 }
 
 /// Fetch the user's profile (display name + email) from Microsoft Graph.
-/// Used to auto-fill the account form after OAuth sign-in.
-/// The initial token may be IMAP-scoped, so we refresh with Graph scopes first.
 #[tauri::command]
 pub async fn oauth_get_ms_profile(
     account_id: String,
@@ -128,14 +170,12 @@ pub async fn oauth_get_ms_profile(
     let refresh_token = tokens.refresh_token.as_deref()
         .ok_or_else(|| Error::Other("No refresh token for profile fetch".into()))?;
 
-    // The initial token is IMAP-scoped. Get a Graph-scoped token for /me.
     let graph_tokens = oauth::refresh_with_scopes(
         &oauth::MICROSOFT,
         refresh_token,
         oauth::MICROSOFT_GRAPH_SCOPES,
     ).await?;
 
-    // Save the potentially rotated refresh token
     oauth::store_tokens(&account_id, &oauth::OAuthTokens {
         access_token: tokens.access_token,
         refresh_token: graph_tokens.refresh_token,
@@ -155,28 +195,23 @@ pub async fn oauth_get_ms_profile(
 #[derive(serde::Serialize)]
 pub struct MsProfile {
     pub display_name: String,
-    /// The actual mailbox email (e.g., outlook_...@outlook.com)
     pub email: String,
-    /// The Microsoft login identity (e.g., kushaldas@gmail.com) — used for IMAP XOAUTH2
     pub login_email: String,
 }
 
-/// Start the JMAP OIDC device flow. Performs OIDC discovery, requests a device code,
-/// and returns the user code + verification URL for the user to complete in their browser.
+/// Start the JMAP OIDC device flow.
 #[tauri::command]
 pub async fn jmap_oidc_start(
     jmap_url: String,
     email: String,
     client_id: String,
 ) -> Result<JmapOidcStartResult> {
-    // Derive base URL from jmap_url or email domain (with auto-discovery)
     let base_url = if !jmap_url.is_empty() {
         jmap_url.trim_end_matches('/').to_string()
     } else {
         let domain = email.rsplit_once('@')
             .map(|(_, d)| d)
             .ok_or_else(|| Error::Other(format!("Cannot extract domain from '{}'", email)))?;
-        // Try the same candidates as JMAP auto-discovery
         let candidates = [
             format!("https://{}", domain),
             format!("https://mail.{}", domain),
@@ -201,32 +236,24 @@ pub async fn jmap_oidc_start(
         )))?
     };
 
-    // Discover OIDC endpoints
     let endpoints = crate::oauth::discover_oidc(&base_url).await?;
 
     let device_auth_endpoint = endpoints.device_authorization_endpoint
         .ok_or_else(|| Error::Other(
-            "Server does not support device authorization flow (no device_authorization_endpoint in OIDC discovery)".into()
+            "Server does not support device authorization flow".into()
         ))?;
 
-    // Use provided client_id, or register a new one via RFC 7591
     let effective_client_id = if !client_id.trim().is_empty() {
-        log::info!("JMAP OIDC: reusing existing client_id");
         client_id.trim().to_string()
     } else if let Some(ref reg_endpoint) = endpoints.registration_endpoint {
         crate::oauth::register_oidc_client(reg_endpoint).await?
     } else {
         return Err(Error::Other(
-            "OIDC requires a client_id but none was provided and the server does not support dynamic client registration. \
-             Register a client in your identity provider and enter its client_id.".into()
+            "OIDC requires a client_id but none was provided and the server does not support dynamic client registration.".into()
         ));
     };
 
-    // Request device code
     let device_resp = crate::oauth::device_auth_start(&device_auth_endpoint, &effective_client_id).await?;
-
-    log::info!("JMAP OIDC device flow: verification_uri={}, client_id={}",
-        device_resp.verification_uri, effective_client_id);
 
     Ok(JmapOidcStartResult {
         verification_uri: device_resp.verification_uri.clone(),
@@ -270,7 +297,6 @@ pub async fn jmap_oidc_complete(
         &client_id,
     ).await?;
 
-    // Store tokens in keyring
     crate::oauth::store_tokens(&account_id, &tokens)?;
 
     log::info!("JMAP OIDC: device flow completed for account {}", account_id);
