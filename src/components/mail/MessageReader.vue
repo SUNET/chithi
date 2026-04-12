@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useMessagesStore } from "@/stores/messages";
+import { useUiStore } from "@/stores/ui";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
@@ -19,6 +20,7 @@ const emit = defineEmits<{
 const messagesStore = useMessagesStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
+const uiStore = useUiStore();
 
 // View mode: plain text by default
 const showHtml = ref(false);
@@ -104,8 +106,8 @@ function iframeSrcdoc(): string {
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
-    color: inherit;
-    background: transparent;
+    color: ${uiStore.theme === "dark" ? "#e0e0e0" : "#1a1a1a"};
+    background: ${uiStore.theme === "dark" ? "#1e1e1e" : "#ffffff"};
   }
   a { color: #1a73e8; cursor: pointer; }
 </style>
