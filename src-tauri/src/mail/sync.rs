@@ -534,11 +534,39 @@ pub fn fetch_and_store_body(
         .ok_or_else(|| Error::Imap(format!("No body returned for UID {}", uid)))?;
     conn_imap.logout();
 
-    // Write to Maildir
+    // Write to Maildir — validate path components before creating directories
+    let sanitized = sanitize_folder_name(folder_path);
     let maildir_base = data_dir
         .join(account_id)
-        .join(sanitize_folder_name(folder_path));
+        .join(&sanitized);
+
+    // Reject any remaining ".." or absolute components before touching the filesystem
+    for component in maildir_base.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(Error::Other(format!(
+                "Path traversal detected in maildir path: '{}'",
+                maildir_base.display()
+            )));
+        }
+    }
+
     create_maildir_dirs(&maildir_base)?;
+
+    // Post-creation canonical check as defence-in-depth (catches symlink attacks)
+    let canonical_data_dir = std::fs::canonicalize(data_dir)
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_maildir = std::fs::canonicalize(&maildir_base)
+        .map_err(|e| Error::Other(format!(
+            "Failed to resolve maildir path: {}", e
+        )))?;
+    if !canonical_maildir.starts_with(&canonical_data_dir) {
+        // Clean up the directory we just created since it's outside our tree
+        let _ = std::fs::remove_dir_all(&canonical_maildir);
+        return Err(Error::Other(format!(
+            "Path traversal detected: maildir path '{}' escapes data directory",
+            maildir_base.display()
+        )));
+    }
 
     let filename = format!("{}:2,{}", uid, flags_to_maildir_suffix(flags));
     let msg_path = maildir_base.join("cur").join(&filename);
@@ -568,8 +596,26 @@ pub(crate) fn create_maildir_dirs(base: &Path) -> Result<()> {
 }
 
 pub(crate) fn sanitize_folder_name(name: &str) -> String {
-    name.replace(['/', '\\'], ".")
-        .replace('\0', "")
+    let normalized = name.replace('\\', "/").replace('\0', "");
+
+    let sanitized: String = std::path::Path::new(&normalized)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => {
+                let s = part.to_string_lossy().replace('.', "_");
+                if s.is_empty() { None } else { Some(s) }
+            }
+            // Strip ., .., /, and prefix components
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 pub(crate) fn flags_to_maildir_suffix(flags: &[String]) -> String {

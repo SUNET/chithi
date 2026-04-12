@@ -69,16 +69,26 @@ watch(
 const hasHtml = () => !!messagesStore.activeMessage?.body_html;
 const hasText = () => !!messagesStore.activeMessage?.body_text;
 
+// Generate a random nonce for iframe CSP
+function generateNonce(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Memoize the nonce per active message to prevent iframe reloads on re-render
+const currentNonce = ref(generateNonce());
+
 // Build a sandboxed iframe srcdoc that isolates HTML email from the main webview.
-// The iframe has no access to window.__TAURI__ or any IPC commands.
-// Links inside the iframe send a postMessage to the parent for clipboard copy.
+// Uses a CSP nonce instead of 'unsafe-inline' so only our bootstrap script runs.
+// Email HTML is embedded in srcdoc but sanitized by ammonia on the backend.
 function iframeSrcdoc(): string {
   const html = imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
-  // Strict CSP inside the iframe: no scripts, no external resources except inline styles
+  const nonce = currentNonce.value;
   return `<!DOCTYPE html>
 <html>
 <head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src https: data:;">
 <style>
   body {
     margin: 0;
@@ -94,7 +104,7 @@ function iframeSrcdoc(): string {
   a { color: #1a73e8; cursor: pointer; }
 </style>
 </head>
-<body>${html}<script>
+<body>${html}<script nonce="${nonce}">
   // Intercept all link clicks and forward to parent via postMessage
   document.addEventListener('click', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
@@ -145,6 +155,11 @@ function handleIframeMessage(event: MessageEvent) {
     }
   }
 }
+
+// Reset nonce when active message changes so CSP stays unique per message
+watch(() => messagesStore.activeMessageId, () => {
+  currentNonce.value = generateNonce();
+});
 
 // Set up / tear down message listener
 onMounted(() => window.addEventListener('message', handleIframeMessage));

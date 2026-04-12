@@ -576,6 +576,7 @@ dependencies = [
  "jmap-client",
  "keyring",
  "lettre",
+ "libc",
  "log",
  "mail-parser",
  "maildir",

@@ -698,16 +698,97 @@ pub async fn save_attachment(
         Error::Other("Invalid save path".to_string())
     })?;
 
-    // Refuse to follow symlinks — prevents clobbering arbitrary files
-    if dest_path.is_symlink() {
-        return Err(Error::Other(
-            "Refusing to write to a symlink target".to_string(),
-        ));
+    // Refuse to follow symlinks
+    if let Ok(metadata) = std::fs::symlink_metadata(dest_path) {
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Other(
+                "Refusing to write to a symlink target".to_string(),
+            ));
+        }
     }
 
-    std::fs::write(dest_path, &contents).map_err(|e| {
-        Error::Other(format!("Failed to write attachment: {}", e))
+    // Write atomically: temp file + fsync + rename
+    let dest_dir = dest_path.parent().ok_or_else(|| {
+        Error::Other("Save path must have a parent directory".to_string())
     })?;
+    let dest_name = dest_path.file_name().ok_or_else(|| {
+        Error::Other("Save path must include a file name".to_string())
+    })?;
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let temp_path = dest_dir.join(format!(
+        ".{}.{}.tmp",
+        dest_name.to_string_lossy(),
+        unique_suffix
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp_path)
+            .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
+
+        if let Err(e) = file.write_all(&contents) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to flush attachment: {}", e)));
+        }
+        drop(file);
+
+        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
+        }
+
+        // Fsync parent directory for durability
+        if let Ok(dir) = std::fs::File::open(dest_dir) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
+
+        if let Err(e) = file.write_all(&contents) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to flush attachment: {}", e)));
+        }
+        drop(file);
+
+        // On Windows, rename fails if dest exists. Remove it first.
+        if dest_path.exists() {
+            let _ = std::fs::remove_file(dest_path);
+        }
+        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
+        }
+    }
 
     log::info!("Attachment saved to {}", dest_path.display());
     Ok(())
