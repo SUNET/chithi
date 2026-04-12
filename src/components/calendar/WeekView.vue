@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import type { CalendarEvent } from "@/lib/types";
 
 const props = defineProps<{
   singleDay?: boolean;
@@ -71,19 +72,61 @@ function currentMinutePercent(): string {
   return `${(now.value.getMinutes() / 60) * 100}%`;
 }
 
-function getEventsForDayHour(date: Date, hour: number) {
-  const slotStart = new Date(date);
-  slotStart.setHours(hour, 0, 0, 0);
-  const slotEnd = new Date(date);
-  slotEnd.setHours(hour + 1, 0, 0, 0);
+// A display segment represents one day's portion of an event.
+// Cross-midnight events are split so each day gets its own segment.
+interface EventSegment {
+  event: CalendarEvent;
+  segStart: Date;  // clamped to day start if event started before this day
+  segEnd: Date;    // clamped to day end (midnight) if event continues next day
+}
 
-  return calendarStore.visibleEvents.filter((e) => {
+function getSegmentsForDay(date: Date): EventSegment[] {
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  const segments: EventSegment[] = [];
+  for (const e of calendarStore.visibleEvents) {
     const eStart = new Date(e.start_time);
     const eEnd = new Date(e.end_time);
-    // Treat multi-day events (>24h) as all-day for display
-    if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) return false;
-    return eStart < slotEnd && eEnd > slotStart;
-  });
+    // Skip all-day and multi-day (>24h) events — handled by getAllDayEvents
+    if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) continue;
+    // Check overlap with this day
+    if (eStart > dayEnd || eEnd <= dayStart) continue;
+    // Clamp to this day's boundaries
+    const segStart = eStart < dayStart ? dayStart : eStart;
+    const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd; // midnight = 00:00 next day
+    segments.push({ event: e, segStart, segEnd });
+  }
+  return segments;
+}
+
+// Return segments whose start hour matches this slot (one render per segment)
+function getEventsForDayHour(date: Date, hour: number) {
+  return getSegmentsForDay(date).filter((s) => s.segStart.getHours() === hour);
+}
+
+const HOUR_HEIGHT = 52; // must match .hour-row min-height in CSS
+
+function eventBlockStyle(seg: EventSegment): Record<string, string> {
+  const durationMs = seg.segEnd.getTime() - seg.segStart.getTime();
+  const durationHours = Math.max(durationMs / (60 * 60 * 1000), 0.25);
+  const topOffset = (seg.segStart.getMinutes() / 60) * HOUR_HEIGHT;
+  const height = durationHours * HOUR_HEIGHT;
+
+  const style: Record<string, string> = {
+    position: "absolute",
+    top: `${topOffset}px`,
+    height: `${height}px`,
+    left: "2px",
+    right: "2px",
+    zIndex: "2",
+    backgroundColor: getEventColor(seg.event),
+  };
+
+  Object.assign(style, getEventStyle(seg.event));
+  return style;
 }
 
 function getAllDayEvents(date: Date) {
@@ -190,17 +233,17 @@ onMounted(async () => {
             :style="{ top: currentMinutePercent() }"
           ></div>
           <div
-            v-for="event in getEventsForDayHour(day, hour)"
-            :key="event.id"
+            v-for="seg in getEventsForDayHour(day, hour)"
+            :key="seg.event.id + '-' + seg.segStart.toISOString()"
             class="event-block"
-            :data-testid="`cal-event-${event.id}`"
-            :style="{ backgroundColor: getEventColor(event), ...getEventStyle(event) }"
-            @click.stop="emit('eventClick', event.id)"
+            :data-testid="`cal-event-${seg.event.id}`"
+            :style="eventBlockStyle(seg)"
+            @click.stop="emit('eventClick', seg.event.id)"
           >
             <span class="event-time">
-              {{ new Date(event.start_time).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }}
+              {{ seg.segStart.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }}
             </span>
-            <span class="event-title">{{ event.title }}</span>
+            <span class="event-title">{{ seg.event.title }}</span>
           </div>
         </div>
       </div>
@@ -362,8 +405,9 @@ onMounted(async () => {
   border-left: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
   position: relative;
   cursor: pointer;
-  padding: 1px 2px;
+  padding: 0;
   transition: background 0.1s;
+  overflow: visible;
 }
 
 .time-cell:hover {
@@ -409,18 +453,19 @@ onMounted(async () => {
   border-radius: 50%;
 }
 
-/* Event blocks */
+/* Event blocks — absolutely positioned within time-cell to span duration */
 .event-block {
+  position: absolute;
   font-size: 11px;
   color: white;
   padding: 3px 6px;
   border-radius: 4px;
   cursor: pointer;
-  margin-bottom: 1px;
   overflow: hidden;
   line-height: 1.3;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   transition: box-shadow 0.15s, transform 0.1s;
+  box-sizing: border-box;
 }
 
 .event-block:hover {
