@@ -81,6 +81,13 @@ function makeEvent(
   };
 }
 
+// Applies to every describe/test in this file so localStorage state doesn't
+// leak from the Calendar store suite (which persists hidden calendar IDs)
+// into InviteCard / EventForm / regression suites below.
+beforeEach(() => {
+  localStorage.clear();
+});
+
 describe("Calendar store", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -186,6 +193,29 @@ describe("Calendar store", () => {
       store.toggleCalendarVisibility("cal2");
 
       expect(store.visibleEvents.length).toBe(2);
+    });
+
+    it("should persist hidden calendars to localStorage", () => {
+      // Regression: hiddenCalendarIds must survive reloads.
+      setupAccounts();
+      const store = useCalendarStore();
+      store.toggleCalendarVisibility("cal2");
+      store.toggleCalendarVisibility("cal5");
+
+      const saved = localStorage.getItem("chithi-hidden-calendars");
+      expect(saved).not.toBeNull();
+      expect(JSON.parse(saved!)).toEqual(["cal2", "cal5"]);
+    });
+
+    it("should load hidden calendars from localStorage on init", () => {
+      // Regression: a fresh store reads the saved set on construction.
+      localStorage.setItem(
+        "chithi-hidden-calendars",
+        JSON.stringify(["cal2"]),
+      );
+      setupAccounts();
+      const store = useCalendarStore();
+      expect(store.hiddenCalendarIds).toEqual(["cal2"]);
     });
   });
 

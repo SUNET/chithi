@@ -17,8 +17,35 @@ export const useCalendarStore = defineStore("calendar", () => {
 
   const accountsStore = useAccountsStore();
 
-  // Visible calendars (all by default)
-  const hiddenCalendarIds = ref<string[]>([]);
+  // Visible calendars (all by default). Persisted to localStorage so the
+  // user's hide/show picks survive across sessions.
+  const HIDDEN_CALENDARS_KEY = "chithi-hidden-calendars";
+  const hiddenCalendarIds = ref<string[]>(loadHiddenCalendarIds());
+
+  function loadHiddenCalendarIds(): string[] {
+    try {
+      const raw = localStorage.getItem(HIDDEN_CALENDARS_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.filter((v): v is string => typeof v === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveHiddenCalendarIds() {
+    try {
+      localStorage.setItem(
+        HIDDEN_CALENDARS_KEY,
+        JSON.stringify(hiddenCalendarIds.value),
+      );
+    } catch {
+      // Swallow quota / disabled-storage errors so toggling visibility
+      // never breaks the calendar UI.
+    }
+  }
 
   // Expand recurring events into individual occurrences for display
   const visibleEvents = computed(() => {
@@ -197,6 +224,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     } else {
       hiddenCalendarIds.value = [...hiddenCalendarIds.value, calendarId];
     }
+    saveHiddenCalendarIds();
   }
 
   function selectEvent(event: CalendarEvent | null) {
