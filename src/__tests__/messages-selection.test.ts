@@ -234,4 +234,35 @@ describe("Mark as read", () => {
     expect(store.messages[0].flags).toContain("seen");
     expect(api.setMessageFlags).toHaveBeenCalledWith("acc1", ["msg1"], ["seen"], true);
   });
+
+  it("subjectForMessage finds subject in flat messages list", () => {
+    const store = setup(false);
+    store.messages = [makeSummary("msg1"), makeSummary("msg2")];
+    expect(store.subjectForMessage("msg1")).toBe("Subject msg1");
+    expect(store.subjectForMessage("msg2")).toBe("Subject msg2");
+  });
+
+  it("subjectForMessage falls back to thread subject when threading is enabled", () => {
+    // Regression: when threading is enabled, messages.value may be empty
+    // (data lives in threads.value), causing tab labels to show "(no subject)"
+    const store = setup(true);
+    store.messages = [];
+    store.threads = [makeThread("t1", ["msg1", "msg2"])];
+    expect(store.subjectForMessage("msg1")).toBe("Thread t1");
+    expect(store.subjectForMessage("msg2")).toBe("Thread t1");
+  });
+
+  it("subjectForMessage finds subject in expanded thread messages", () => {
+    const store = setup(true);
+    store.messages = [];
+    store.threads = [makeThread("t1", ["msg1"])];
+    store.threadMessages = { t1: [makeSummary("msg1")] };
+    expect(store.subjectForMessage("msg1")).toBe("Subject msg1");
+  });
+
+  it("subjectForMessage returns null for unknown message id", () => {
+    const store = setup(false);
+    store.messages = [makeSummary("msg1")];
+    expect(store.subjectForMessage("missing")).toBeNull();
+  });
 });

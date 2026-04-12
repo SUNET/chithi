@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { useRouter } from "vue-router";
-import { useUiStore } from "@/stores/ui";
+import { useUiStore, type MessageViewMode } from "@/stores/ui";
 
 const router = useRouter();
 const uiStore = useUiStore();
@@ -25,7 +25,7 @@ function goFilters() {
   router.push("/filters");
 }
 
-function setViewMode(mode: "right" | "tab") {
+function setViewMode(mode: MessageViewMode) {
   uiStore.setMessageViewMode(mode);
   closeMenus();
 }
@@ -83,10 +83,18 @@ function toggleDecorations() {
         </button>
         <button
           class="menu-action"
+          :class="{ checked: uiStore.messageViewMode === 'bottom' }"
+          @click="setViewMode('bottom')"
+          data-testid="menu-view-bottom"
+        >
+          {{ uiStore.messageViewMode === 'bottom' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Bottom
+        </button>
+        <button
+          class="menu-action"
           :class="{ checked: uiStore.messageViewMode === 'tab' }"
           @click="setViewMode('tab')"
         >
-          {{ uiStore.messageViewMode === 'tab' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}New Tab
+          {{ uiStore.messageViewMode === 'tab' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Tabs
         </button>
         <div class="menu-separator"></div>
         <div class="menu-group-label">Theme</div>
