@@ -285,6 +285,10 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
   try {
     if (isCrossAccount) {
       await api.moveMessagesCrossAccount(sourceAccountId, messageIds, accountId, folderPath);
+      // Sync the destination account so the moved messages appear immediately
+      api.triggerSync(accountId, folderPath).catch((e) =>
+        console.error("Post-move sync failed:", e),
+      );
     } else {
       await api.moveMessages(accountId, messageIds, folderPath);
     }
