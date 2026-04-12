@@ -45,6 +45,46 @@ impl GraphClient {
             .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))
     }
 
+    /// Stream a Graph API response directly to a file on disk.
+    /// Returns the number of bytes written. Avoids buffering the entire
+    /// response in memory — critical for large emails with attachments.
+    async fn stream_to_file(&self, path: &str, dest: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+
+        let url = format!("{}{}", GRAPH_BASE, path);
+        let resp = self.http
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", path, e)))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Other(format!("Graph GET {} returned {}: {}", path, status, truncate(&body, 500))));
+        }
+
+        let mut file = tokio::fs::File::create(dest).await
+            .map_err(|e| Error::Other(format!("Failed to create file {}: {}", dest.display(), e)))?;
+        let mut stream = resp.bytes_stream();
+        let mut total: u64 = 0;
+
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
+            file.write_all(&chunk).await
+                .map_err(|e| Error::Other(format!("Failed to write to {}: {}", dest.display(), e)))?;
+            total += chunk.len() as u64;
+        }
+
+        file.flush().await
+            .map_err(|e| Error::Other(format!("Failed to flush {}: {}", dest.display(), e)))?;
+
+        Ok(total)
+    }
+
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self.http
@@ -282,6 +322,62 @@ impl GraphClient {
         })
     }
 
+    pub async fn get_attachments(&self, message_id: &str) -> Result<Vec<crate::db::messages::Attachment>> {
+        let resp = self.get(
+            &format!("/me/messages/{}/attachments", message_id),
+            &[("$select", "id,name,contentType,size")],
+        ).await?;
+
+        let mut attachments = Vec::new();
+        if let Some(values) = resp["value"].as_array() {
+            for (i, att) in values.iter().enumerate() {
+                attachments.push(crate::db::messages::Attachment {
+                    index: i as u32,
+                    filename: att["name"].as_str().map(|s| s.to_string()),
+                    content_type: att["contentType"].as_str().unwrap_or("application/octet-stream").to_string(),
+                    size: att["size"].as_u64().unwrap_or(0),
+                });
+            }
+        }
+        Ok(attachments)
+    }
+
+    /// Download the raw RFC 5322 MIME message and stream it directly to a file.
+    /// Returns the number of bytes written. Never buffers the full message in memory.
+    pub async fn download_mime_to_file(
+        &self,
+        message_id: &str,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        self.stream_to_file(
+            &format!("/me/messages/{}/$value", message_id),
+            dest,
+        ).await
+    }
+
+    pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {
+        let body = serde_json::json!({
+            "subject": message.subject,
+            "body": {
+                "contentType": "Text",
+                "content": message.body_text
+            },
+            "toRecipients": message.to.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+            "ccRecipients": message.cc.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+            "bccRecipients": message.bcc.iter().map(|e| {
+                serde_json::json!({ "emailAddress": { "address": e } })
+            }).collect::<Vec<_>>(),
+        });
+
+        self.post_json("/me/messages", &body).await?;
+        log::info!("Graph: draft saved successfully");
+        Ok(())
+    }
+
     /// Send a mail message via Graph API.
     pub async fn send_mail(&self, message: &GraphSendMessage) -> Result<()> {
         let body = serde_json::json!({
@@ -319,6 +415,11 @@ impl GraphClient {
     /// Delete a message (moves to Deleted Items).
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
         self.delete(&format!("/me/messages/{}", message_id)).await
+    }
+
+    /// Delete a mail folder.
+    pub async fn delete_mail_folder(&self, folder_id: &str) -> Result<()> {
+        self.delete(&format!("/me/mailFolders/{}", folder_id)).await
     }
 
     /// Update message properties (isRead, flag, etc).

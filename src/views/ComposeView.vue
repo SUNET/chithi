@@ -21,11 +21,20 @@ onMounted(async () => {
   if (accountsStore.accounts.length > 0) {
     accounts.value = accountsStore.accounts;
   } else {
-    // Separate window — fetch accounts via IPC
+    // Separate window — fetch accounts via IPC with timeout
     try {
-      accounts.value = await api.listAccounts();
+      let timer: ReturnType<typeof setTimeout>;
+      const timeoutPromise = new Promise<Account[]>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Accounts fetch timeout (5s)")), 5000);
+      });
+      accounts.value = await Promise.race([
+        api.listAccounts().finally(() => clearTimeout(timer)),
+        timeoutPromise,
+      ]);
     } catch (e) {
-      console.error("Failed to fetch accounts:", e);
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      console.error("Failed to fetch accounts:", errorMsg);
+      error.value = `Failed to load accounts: ${errorMsg}`;
     }
   }
   // Set selected account from query param or first account
@@ -33,6 +42,9 @@ onMounted(async () => {
     selectedAccountId.value = initialAccountId;
   } else if (accounts.value.length > 0) {
     selectedAccountId.value = accounts.value[0].id;
+  } else if (!error.value) {
+    // Only set error if we didn't already fail to fetch
+    error.value = "No accounts found. Please add an account first.";
   }
 });
 
@@ -422,7 +434,7 @@ async function send() {
 
     <!-- Toolbar -->
     <div class="compose-toolbar">
-      <button class="toolbar-btn" :class="{ disabled: !canSend }" :disabled="!canSend" @click="send">
+      <button class="toolbar-btn" :class="{ disabled: !canSend }" :disabled="!canSend" data-testid="compose-send" @click="send">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
         </svg>
@@ -441,7 +453,7 @@ async function send() {
         Spelling
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
       </button>
-      <button class="toolbar-btn" :disabled="savingDraft" @click="saveDraft">
+      <button class="toolbar-btn" :disabled="savingDraft" data-testid="compose-save-draft" @click="saveDraft">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" />
         </svg>
@@ -454,7 +466,7 @@ async function send() {
         Contacts
       </button>
       <div class="toolbar-spacer"></div>
-      <button class="toolbar-btn" @click="addAttachment">
+      <button class="toolbar-btn" data-testid="compose-attach" @click="addAttachment">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
         </svg>
@@ -469,7 +481,7 @@ async function send() {
       <div class="compose-fields">
         <div class="field-row">
           <label class="field-label">From</label>
-          <select v-model="selectedAccountId" class="field-select">
+          <select v-model="selectedAccountId" class="field-select" data-testid="compose-account-select">
             <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
               {{ acc.display_name }} &lt;{{ acc.email }}&gt;
             </option>
@@ -483,6 +495,7 @@ async function send() {
                 v-model="to"
                 type="text"
                 class="field-input"
+                data-testid="compose-to"
                 @input="onAddrInput('to')"
                 @keydown="onAddrKeydown"
                 @blur="onAddrBlur"
@@ -502,8 +515,8 @@ async function send() {
                 </button>
               </div>
             </div>
-            <button v-if="!showCc" class="cc-btn" @click="showCc = true">Cc</button>
-            <button v-if="!showBcc" class="cc-btn" @click="showBcc = true">Bcc</button>
+            <button v-if="!showCc" class="cc-btn" data-testid="compose-cc-toggle" @click="showCc = true">Cc</button>
+            <button v-if="!showBcc" class="cc-btn" data-testid="compose-bcc-toggle" @click="showBcc = true">Bcc</button>
           </div>
         </div>
         <div v-if="showCc" class="field-row addr-field-row">
@@ -513,6 +526,7 @@ async function send() {
               v-model="cc"
               type="text"
               class="field-input"
+              data-testid="compose-cc"
               @input="onAddrInput('cc')"
               @keydown="onAddrKeydown"
               @blur="onAddrBlur"
@@ -540,6 +554,7 @@ async function send() {
               v-model="bcc"
               type="text"
               class="field-input"
+              data-testid="compose-bcc"
               @input="onAddrInput('bcc')"
               @keydown="onAddrKeydown"
               @blur="onAddrBlur"
@@ -562,7 +577,7 @@ async function send() {
         </div>
         <div class="field-row">
           <label class="field-label">Subject</label>
-          <input v-model="subject" type="text" class="field-input" />
+          <input v-model="subject" type="text" class="field-input" data-testid="compose-subject" />
         </div>
       </div>
 
@@ -571,6 +586,7 @@ async function send() {
       <textarea
         v-model="bodyText"
         class="compose-textarea"
+        data-testid="compose-body"
         autofocus
       ></textarea>
 

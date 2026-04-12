@@ -1,23 +1,28 @@
 # ADR 0025: Microsoft 365 Integration
 
 ## Status
-Accepted (revised — originally Graph-only, now IMAP+SMTP for mail, Graph for calendar/contacts)
+Accepted (revised twice — IMAP→Graph for mail sync, SMTP retained for sending)
 
 ## Context
 Added Microsoft 365 / Outlook as an account type. Three approaches were evaluated:
 1. **Graph API for everything** — single token, simple, but DMARC failures on sent mail for personal accounts (From header mismatch)
 2. **IMAP+SMTP with XOAUTH2** — proper From address, IMAP IDLE for push, Maildir storage, but two-resource token management
-3. **Hybrid** — IMAP+SMTP for mail, Graph for calendar/contacts
+3. **Hybrid** — Graph API for mail sync + calendar + contacts, SMTP for sending
 
 ## Decision
-Use **IMAP+SMTP with XOAUTH2 for mail, Graph API for calendar/contacts** (Option 3).
+Use **Graph API for mail sync/read, SMTP+XOAUTH2 for sending, Graph for calendar/contacts** (Option 3).
 
-### Why IMAP+SMTP for mail (not Graph)
-- Graph-only sends with `From: kushaldas@gmail.com` but `Sender: outlook_...@outlook.com`, causing **DMARC failures**
-- IMAP+SMTP sends from the actual mailbox address, passing SPF/DKIM/DMARC
-- IMAP IDLE provides push notifications (Graph requires webhooks, not feasible for desktop)
-- Maildir storage enables offline reading
-- Consistent architecture with Gmail (IMAP+SMTP for mail, API for calendar/contacts)
+### Why Graph for mail sync (not IMAP)
+- Outlook IMAP aggressively throttles connections — `SELECT INBOX` fails with `Command Error. 12`, TCP connections reset with `os error 104` (see "What we tried and failed" below)
+- IMAP IDLE reconnection loops make throttling worse, not better
+- Graph REST API is stateless — no persistent connections to throttle
+- `GET /me/messages/{id}/$value` returns full RFC 5322 MIME — same format as IMAP, stores to Maildir for offline reading
+- Single Graph token for mail + calendar + contacts (no two-resource token juggling)
+
+### Why SMTP for sending (not Graph sendMail)
+- Graph `POST /me/sendMail` sets `From: kushaldas@gmail.com` but `Sender: outlook_...@outlook.com` for personal accounts, causing **DMARC failures**
+- SMTP+XOAUTH2 sends from the actual mailbox address, passing SPF/DKIM/DMARC
+- SMTP supports attachments via lettre (Graph sendMail requires base64 attachment encoding)
 
 ### Why Graph for calendar/contacts
 - Richer API than CalDAV for Microsoft-specific features
@@ -87,13 +92,15 @@ The discovered email goes into `account.email` (display/From). The login identit
 
 ### Routing
 ```
-provider == "o365" && mail_protocol == "imap"
-├── Sync: IMAP with XOAUTH2 (same engine as Gmail/generic IMAP)
-├── Send: SMTP with XOAUTH2 via lettre Mechanism::Xoauth2
-├── IDLE: IMAP IDLE with XOAUTH2 (push notifications)
-├── Move/Delete/Flag: IMAP operations (same as other IMAP accounts)
-├── Calendar: Graph API (future — same pattern as Google Calendar)
-└── Contacts: Graph API (future — same pattern as Google People API)
+provider == "o365" && mail_protocol == "graph"
+├── Sync: Graph API GET /me/mailFolders, GET /me/messages (full MIME download)
+├── Send: SMTP with XOAUTH2 via lettre (not Graph sendMail — DMARC)
+├── Body read: Local Maildir (downloaded during sync, no live API call)
+├── Move/Delete/Flag: Graph API (move_message, delete_message, set_read_status)
+├── Draft save: Graph API POST /me/messages
+├── Push: Polling via periodic trigger_sync (no IMAP IDLE, no Graph webhooks)
+├── Calendar: Graph API (list/create/update/delete events)
+└── Contacts: Graph API (list/create/update/delete contacts)
 ```
 
 ### Work/school vs personal accounts
@@ -107,28 +114,99 @@ provider == "o365" && mail_protocol == "imap"
 
 **TODO**: Test with a work/school account to verify scope URLs and token behavior.
 
-### Known issue: error 12 on first account add
+### Graph mail sync architecture
 
-When an O365 account is first added, `triggerSync` and `startIdle` both fire simultaneously. Both attempt XOAUTH2 authentication with the same access token. Outlook may reject the second concurrent session's `SELECT INBOX` with "Command Error. 12".
+The sync function `sync_graph_account` works in two phases to avoid blocking the UI:
 
-This is a race condition, not a persistent failure:
-- The IDLE loop retries with exponential backoff and succeeds within seconds
-- Parallel sync threads may also see error 12 on some folders (`Deleted`, `Outbox`)
-- On subsequent syncs or app restart, all connections work cleanly
+**Phase 1 — Download (no DB lock):**
+- Fetch folder list via `GET /me/mailFolders`
+- For each folder, fetch message list via `GET /me/mailFolders/{id}/messages`
+- For each new message, **stream** full MIME to disk via `GET /me/messages/{id}/$value`
+- MIME bodies are streamed chunk-by-chunk using `reqwest::Response::bytes_stream()` + `tokio::fs::File` — memory usage is bounded to ~8KB per message regardless of email size (no buffering the entire response in memory)
+- Written as raw RFC 5322 to Maildir (`{account_id}/{folder}/cur/{msg_id}:2,{flags}`)
+- Partial files cleaned up on download failure
 
-These errors are logged at `warn` level (not `error`) to avoid false-positive red dots in the StatusBar. A proper fix would be to defer IDLE start until the first sync completes, or use separate token refreshes per connection.
+**Phase 2 — Insert (DB lock held briefly):**
+- Open a single SQLite transaction
+- Batch-insert all new message records with `maildir_path` pointing to the Maildir file
+- Commit — lock held for <10ms regardless of message count
+
+When a user clicks a message, `get_message_body` reads from local Maildir (same code path as IMAP/JMAP). No live API call, no network dependency, works offline.
+
+On-demand fallback: if `maildir_path` is empty or has legacy `graph:` prefix (from before this migration), the body is streamed from Graph to Maildir and the DB path updated — self-healing on first click.
+
+### Security hardening (from differential review)
+
+**System folder deletion guard (ADR 0036):** The `delete_folder` command verifies the folder exists in the local DB and rejects deletion of system folders (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`). This prevents a compromised renderer from destroying critical mailbox folders on the server via IPC.
+
+**Streaming MIME downloads:** The `stream_to_file` method in `GraphClient` streams the Graph API response directly to disk via `bytes_stream()`, never buffering the full message in memory. This prevents OOM from large emails (e.g., 500MB attachments). The previous `get_bytes` approach loaded the entire response into a `Vec<u8>` before writing.
+
+### What we tried and failed
+
+#### Attempt 1: IMAP+XOAUTH2 for everything (original implementation)
+
+Used Outlook IMAP (`outlook.office365.com:993`) with XOAUTH2 authentication for mail sync, IDLE for push, and all message operations.
+
+**Problems encountered:**
+- `SELECT INBOX` fails with `Bad Response: Command Error. 12` — Outlook throttles when too many IMAP sessions open in quick succession
+- `Connection reset by peer (os error 104)` — Outlook drops TCP connections during XOAUTH2 auth under load
+- IDLE reconnection loops make throttling worse — each failed reconnect attempt counts against the rate limit
+- Concurrent connections from sync + IDLE + manual operations trigger throttling
+- Partial sync state: `last_seen_uid` advances past messages that were never actually downloaded, requiring manual DB repair to backfill
+
+**Mitigation attempted:** Per-account IMAP connection limiter (max 2 concurrent sessions), IDLE suspension during sync operations. This reduced the frequency of throttling but did not eliminate it — Outlook's rate limits are aggressive and unpredictable.
+
+**Result:** Abandoned. IMAP is fundamentally unreliable for Outlook personal accounts due to session throttling that cannot be fully worked around client-side.
+
+#### Attempt 2: Graph for sync with on-demand body fetch
+
+Switched mail sync to Graph API but kept the body as `maildir_path = "graph:{msg_id}"` — a marker that triggers a live `GET /me/messages/{id}` call (JSON body, not MIME) when the user clicks a message.
+
+**Problems encountered:**
+- Clicking an email took ~1 second (Graph API latency for each click)
+- No offline reading — every click requires network
+- `subject: None`, `date: String::new()` in the body response — the Graph JSON body endpoint doesn't return envelope fields, and the code wasn't reading them from the DB
+- Attachments returned empty — needed a separate `GET /me/messages/{id}/attachments` call
+
+**Result:** Abandoned. On-demand fetch is the wrong architecture for a desktop email client.
+
+#### Attempt 3: Graph sync with MIME download, single-phase (DB lock during download)
+
+Downloaded full MIME during sync via `GET /me/messages/{id}/$value`, stored to Maildir. But the MIME download loop ran inside a `BEGIN/COMMIT` DB transaction, holding the SQLite mutex lock for the entire download time.
+
+**Problems encountered:**
+- 15 messages × ~800ms per MIME download = ~12 seconds of DB lock
+- Any `get_message_body` call during sync blocked waiting for the lock — user clicks an email and waits 7+ seconds
+- UI completely unresponsive during sync
+
+**Result:** Fixed by splitting into two phases. Phase 1 downloads without the lock, Phase 2 does a fast batch insert.
+
+#### Attempt 4: Two-phase sync with in-memory buffering
+
+Split download and DB insert into two phases (fixing the lock contention), but `get_bytes()` still buffered each entire MIME response into a `Vec<u8>` in memory before writing to disk.
+
+**Problems encountered:**
+- A 500MB email attachment would allocate 500MB of RAM per message during download
+- With 200 messages per folder fetch, multiple large messages could exhaust memory and crash the app
+- Identified in differential security review (F-02)
+
+**Result:** Fixed by replacing `get_bytes()` with `stream_to_file()` which streams the response chunk-by-chunk (~8KB) directly to disk via `reqwest::Response::bytes_stream()` + `tokio::fs::File`. Memory usage is now bounded regardless of email size.
 
 ## Consequences
-- O365 accounts use IMAP+SMTP like Gmail — consistent architecture
-- IMAP IDLE provides push notifications
-- Maildir storage enables offline reading
-- SMTP sends from the actual mailbox address (no DMARC issues)
-- Two-resource token management adds complexity but is handled transparently
+- O365 mail sync uses Graph API — no IMAP throttling, no connection management
+- SMTP+XOAUTH2 retained for sending — avoids DMARC failures on personal accounts
+- Full MIME bodies stored locally in Maildir — offline reading, instant click (~10ms)
+- No push notifications — relies on periodic polling via `trigger_sync` (same as calendar)
+- Single Graph token for all operations (no two-resource IMAP/Graph token juggling)
 - Graph API calendar sync implemented (ADR 0034) — list/create/update/delete events
 - Graph API contacts sync implemented — list/create/update/delete contacts
 - Personal accounts with external login emails need `username` ≠ `email` (login vs mailbox)
+- Filter rules (apply to folder) not supported for Graph accounts — IMAP-only feature
+- New O365 accounts created with `mail_protocol = "graph"`, IMAP fields cleared
+- Existing O365 accounts need DB migration: `UPDATE accounts SET mail_protocol = 'graph' WHERE provider = 'o365'`
 
-### Token pitfalls (discovered during implementation)
-- **On-demand body fetch**: `get_message_body` IMAP path had `use_xoauth2: false` hardcoded. O365 IMAP requires XOAUTH2 — basic auth returns `BasicAuthBlocked`. Fixed by refreshing IMAP-scoped token for O365 accounts.
-- **Graph token vs IMAP token**: Both share one keyring entry. `get_graph_token()` must always refresh with Graph scopes since the stored token is IMAP-scoped. Cannot check expiry — must always refresh.
-- **Calendar auto-sync**: Calendar sync now runs after every mail `sync-complete` event, not just on manual sync button. Ensures O365 calendar events stay current.
+### Token management (simplified)
+- Single refresh token → Graph-scoped access token for mail/calendar/contacts
+- SMTP still needs IMAP-scoped token for XOAUTH2 (`SMTP.Send` is in the IMAP scope set)
+- `get_graph_token()` always refreshes with Graph scopes — cannot reuse stored IMAP token
+- Calendar auto-sync runs after every mail `sync-complete` event

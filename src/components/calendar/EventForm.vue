@@ -155,12 +155,12 @@ async function save() {
 
         <div class="form-group">
           <label>Title *</label>
-          <input v-model="title" type="text" placeholder="Event title" autofocus />
+          <input v-model="title" type="text" placeholder="Event title" autofocus data-testid="event-form-title" />
         </div>
 
         <div class="form-group">
           <label>Calendar</label>
-          <select v-model="calendarId">
+          <select v-model="calendarId" data-testid="event-form-calendar">
             <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
               {{ cal.name }} ({{ accountsStore.accounts.find(a => a.id === cal.account_id)?.display_name || cal.account_id }})
             </option>
@@ -168,7 +168,7 @@ async function save() {
         </div>
 
         <label class="checkbox-row">
-          <input type="checkbox" v-model="allDay" />
+          <input type="checkbox" v-model="allDay" data-testid="event-form-allday" />
           All day event
         </label>
 
@@ -176,22 +176,22 @@ async function save() {
           <div class="form-group">
             <label>Start</label>
             <div class="datetime-inputs">
-              <input v-model="startDate" type="date" class="date-input" />
-              <input v-if="!allDay" v-model="startTime" type="time" class="time-input" />
+              <input v-model="startDate" type="date" class="date-input" data-testid="event-form-start" />
+              <input v-if="!allDay" v-model="startTime" type="time" class="time-input" data-testid="event-form-start-time" />
             </div>
           </div>
           <div class="form-group">
             <label>End</label>
             <div class="datetime-inputs">
-              <input v-model="endDate" type="date" class="date-input" :min="minEndDate" />
-              <input v-if="!allDay" v-model="endTime" type="time" class="time-input" :min="minEndTime" />
+              <input v-model="endDate" type="date" class="date-input" :min="minEndDate" data-testid="event-form-end" />
+              <input v-if="!allDay" v-model="endTime" type="time" class="time-input" :min="minEndTime" data-testid="event-form-end-time" />
             </div>
           </div>
         </div>
 
         <div class="form-group">
           <label>Location</label>
-          <input v-model="location" type="text" placeholder="Add location" />
+          <input v-model="location" type="text" placeholder="Add location" data-testid="event-form-location" />
         </div>
 
         <div class="form-group">
@@ -214,7 +214,7 @@ async function save() {
         <div></div>
         <div class="footer-actions">
           <button class="btn-cancel" @click="emit('close')">Cancel</button>
-          <button class="btn-create" :disabled="saving" @click="save">
+          <button class="btn-create" :disabled="saving" @click="save" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Create" }}
           </button>
         </div>

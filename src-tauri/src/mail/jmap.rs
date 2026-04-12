@@ -42,6 +42,18 @@ pub struct JmapConfig {
 }
 
 impl JmapConfig {
+    pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
+        Self {
+            jmap_url: account.jmap_url.clone(),
+            email: account.email.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+            access_token: None,
+            oidc_token_endpoint: account.oidc_token_endpoint.clone(),
+            oidc_client_id: account.oidc_client_id.clone(),
+        }
+    }
+
     /// Apply authentication to a reqwest RequestBuilder.
     /// Uses Bearer auth if access_token is set, otherwise Basic auth.
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -1192,6 +1204,43 @@ impl JmapConnection {
         }
         log::info!("JMAP mailbox created: id={}", created_id);
         Ok(created_id)
+    }
+
+    pub async fn destroy_mailbox(&self, config: &JmapConfig, mailbox_id: &str, remove_messages: bool) -> Result<()> {
+        log::info!("JMAP destroying mailbox: {} (remove_messages={})", mailbox_id, remove_messages);
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Mailbox/set", {
+                    "accountId": self.account_id,
+                    "onDestroyRemoveMessages": remove_messages,
+                    "destroy": [mailbox_id]
+                }, "d1"]
+            ]
+        });
+        let resp = self.api_request(&request, config).await?;
+        let method_name = resp["methodResponses"][0][0].as_str().unwrap_or("<unknown>");
+        if method_name != "Mailbox/set" {
+            log::error!("Unexpected JMAP response to mailbox destroy: {}", resp);
+            return Err(Error::Other(format!(
+                "Unexpected JMAP response to mailbox destroy: {}",
+                method_name,
+            )));
+        }
+
+        let destroyed = resp["methodResponses"][0][1]["destroyed"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v.as_str() == Some(mailbox_id)))
+            .unwrap_or(false);
+        if !destroyed {
+            let err = resp["methodResponses"][0][1]["notDestroyed"][mailbox_id]["description"]
+                .as_str()
+                .unwrap_or("Unknown error");
+            log::error!("JMAP mailbox destroy failed for {}: {}", mailbox_id, err);
+            return Err(Error::Other(format!("JMAP Mailbox/set destroy failed: {}", err)));
+        }
+        log::info!("JMAP mailbox destroyed: {}", mailbox_id);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

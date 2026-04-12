@@ -1,5 +1,11 @@
 use tauri::State;
 
+use crate::commands::sync_cmd::{
+    resume_imap_idle_for_account,
+    should_suspend_idle_for_imap_operation,
+    suspend_imap_idle_for_account,
+};
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
@@ -80,6 +86,7 @@ pub async fn get_messages(
 
 #[tauri::command]
 pub async fn get_message_body(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_id: String,
@@ -91,58 +98,8 @@ pub async fn get_message_body(
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
-    // Graph API messages: fetch body directly from Graph, not from disk
-    if let Some(graph_msg_id) = maildir_path.strip_prefix("graph:") {
-        log::debug!("Fetching Graph message body for {}", graph_msg_id);
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        let body = client.get_message_body(graph_msg_id).await?;
-
-        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
-        let (body_html, body_text) = if body.content_type == "html" {
-            let sanitized = ammonia::clean(&body.content);
-            // Simple HTML-to-text: strip tags for plain text view
-            let text = body.content
-                .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                .replace("</p>", "\n").replace("</div>", "\n");
-            let text = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&text, "").to_string();
-            (Some(sanitized), text)
-        } else {
-            (None, body.content)
-        };
-
-        // Mark as read on the server if not already
-        if !flags.contains(&"seen".to_string()) {
-            let graph_ids = vec![graph_msg_id.to_string()];
-            client.set_read_status(&graph_ids, true).await.ok();
-            let conn = state.db.lock().await;
-            let mut new_flags = flags.clone();
-            new_flags.push("seen".to_string());
-            db::messages::update_flags(&conn, &message_id, &serde_json::to_string(&new_flags).unwrap_or_default())?;
-        }
-
-        let to: Vec<db::messages::Address> = serde_json::from_str(&to_json).unwrap_or_default();
-        let cc: Vec<db::messages::Address> = serde_json::from_str(&cc_json).unwrap_or_default();
-
-        return Ok(db::messages::MessageBody {
-            id: message_id,
-            subject: None,
-            from: db::messages::Address { name: None, email: from_email },
-            to,
-            cc,
-            date: String::new(),
-            flags,
-            body_html,
-            body_text: Some(body_text),
-            attachments: vec![],
-            is_encrypted,
-            is_signed,
-            list_id: None,
-        });
-    }
-
-    // If body hasn't been downloaded yet, fetch it on-demand
-    let actual_maildir_path = if maildir_path.is_empty() {
+    // If body hasn't been downloaded yet (empty or legacy `graph:` prefix), fetch on-demand
+    let actual_maildir_path = if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
         // Get account config and message details
         let (account, folder_path, uid) = {
             let conn = state.db.lock().await;
@@ -154,7 +111,33 @@ pub async fn get_message_body(
         let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
         let data_dir = state.data_dir.clone();
 
-        let relative_path = if account.mail_protocol == "jmap" {
+        let relative_path = if account.mail_protocol == "graph" {
+            // Graph: stream raw MIME to disk via GET /me/messages/{id}/$value
+            log::info!("Body not on disk for {}, streaming from Graph", message_id);
+
+            let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
+                gid.to_string()
+            } else {
+                message_id.strip_prefix(&format!("{}_", account_id))
+                    .unwrap_or(&message_id)
+                    .to_string()
+            };
+
+            let token = crate::mail::graph::get_graph_token(&account_id).await?;
+            let client = crate::mail::graph::GraphClient::new(&token);
+
+            let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
+            let maildir_base = data_dir.join(&account_id).join(&folder_dir);
+            crate::mail::sync::create_maildir_dirs(&maildir_base)?;
+
+            let filename = format!("{}:2,{}", graph_msg_id, crate::mail::sync::flags_to_maildir_suffix(&flags));
+            let msg_path = maildir_base.join("cur").join(&filename);
+
+            let bytes_written = client.download_mime_to_file(&graph_msg_id, &msg_path).await?;
+            let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
+            log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
+            rp
+        } else if account.mail_protocol == "jmap" {
             log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -176,6 +159,13 @@ pub async fn get_message_body(
             .await?
         } else {
             log::info!("Body not on disk for {}, fetching from IMAP", message_id);
+
+            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+                suspend_imap_idle_for_account(&state, &account_id).await?
+            } else {
+                false
+            };
+            let resume_account = account.clone();
 
             // For O365, refresh IMAP-scoped token for XOAUTH2
             let (password, use_xoauth2) = if account.provider == "o365" {
@@ -202,7 +192,7 @@ pub async fn get_message_body(
             };
 
             let account_id_clone = account_id.clone();
-            tokio::task::spawn_blocking(move || {
+            let relative_path = tokio::task::spawn_blocking(move || {
                 mail_sync::fetch_and_store_body(
                     &imap_config,
                     &data_dir,
@@ -213,7 +203,11 @@ pub async fn get_message_body(
                 )
             })
             .await
-            .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??
+            .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??;
+
+            resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+
+            relative_path
         };
 
         // Update the maildir_path in the database
@@ -456,6 +450,7 @@ pub async fn unthread_message(
 /// Create a new folder on the mail server and register it locally.
 #[tauri::command]
 pub async fn create_folder(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     folder_path: String,
@@ -517,6 +512,125 @@ pub async fn create_folder(
     // with the correct server-side path/ID and register it properly.
 
     log::info!("Folder '{}' created on server, will appear after sync", folder_path);
+    emit_folders_changed(&app, &account_id);
+    Ok(())
+}
+
+/// System folder types that must never be deleted.
+const PROTECTED_FOLDER_TYPES: &[&str] = &[
+    "inbox", "sent", "drafts", "trash", "junk", "archive",
+];
+
+/// Delete a folder on the mail server and remove it from local DB.
+/// Refuses to delete system folders (inbox, sent, drafts, trash, junk, archive).
+#[tauri::command]
+pub async fn delete_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_path: String,
+) -> Result<()> {
+    log::info!("Deleting folder '{}' for account {}", folder_path, account_id);
+
+    // Verify the folder exists in the local DB and is not a system folder
+    let account = {
+        let conn = state.db.lock().await;
+
+        // Check that the folder belongs to this account
+        let folder_type: Option<String> = conn
+            .query_row(
+                "SELECT folder_type FROM folders WHERE account_id = ?1 AND path = ?2",
+                rusqlite::params![account_id, folder_path],
+                |row| row.get(0),
+            )
+            .map_err(|_| Error::Other(format!(
+                "Folder '{}' not found for account {}", folder_path, account_id
+            )))?;
+
+        // Reject deletion of system folders
+        if let Some(ref ft) = folder_type {
+            if PROTECTED_FOLDER_TYPES.contains(&ft.as_str()) {
+                log::warn!(
+                    "Refusing to delete system folder '{}' (type={}) for account {}",
+                    folder_path, ft, account_id
+                );
+                return Err(Error::Other(format!(
+                    "Cannot delete system folder '{}' ({})", folder_path, ft
+                )));
+            }
+        }
+
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.mail_protocol == "graph" {
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.delete_mail_folder(&folder_path).await.map_err(|e| {
+            log::error!(
+                "Failed to delete Graph folder '{}' for account {}: {}",
+                folder_path,
+                account_id,
+                e
+            );
+            e
+        })?;
+    } else if account.mail_protocol == "jmap" {
+        // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await.map_err(|e| {
+            log::error!(
+                "Failed to delete JMAP folder '{}' for account {}: {}",
+                folder_path,
+                account_id,
+                e
+            );
+            e
+        })?;
+    } else {
+        // IMAP: DELETE
+        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password: imap_password,
+            use_tls: account.use_tls,
+            use_xoauth2: imap_xoauth2,
+        };
+        let folder_for_imap = folder_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
+            conn.delete_folder(&folder_for_imap)?;
+            conn.logout();
+            Ok::<(), crate::error::Error>(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Delete folder panicked: {}", e)))??;
+    }
+
+    // Remove from local DB
+    {
+        let conn = state.db.lock().await;
+        db::folders::delete_folder(&conn, &account_id, &folder_path)?;
+    }
+
+    log::info!("Folder '{}' deleted for account {}", folder_path, account_id);
+    emit_folders_changed(&app, &account_id);
+    emit_messages_changed(&app, &account_id);
     Ok(())
 }
 

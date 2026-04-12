@@ -33,6 +33,7 @@ function handleNavClick(item: typeof topItems[0]) {
         class="sidebar-item"
         :class="{ active: item.name !== 'compose' && route.name === item.name }"
         :title="item.label"
+        :data-testid="`nav-${item.name}`"
         @click="handleNavClick(item)"
       >
         <!-- Mail icon -->
@@ -64,6 +65,7 @@ function handleNavClick(item: typeof topItems[0]) {
         class="sidebar-item"
         :class="{ active: route.name === 'settings' }"
         title="Settings"
+        data-testid="nav-settings"
         @click="router.push('/settings')"
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

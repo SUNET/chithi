@@ -370,6 +370,16 @@ impl ImapConnection {
         Ok(())
     }
 
+    pub fn delete_folder(&mut self, folder_path: &str) -> Result<()> {
+        log::info!("IMAP deleting folder: {}", folder_path);
+        self.session.unsubscribe(folder_path).ok();
+        self.session.delete(folder_path).map_err(|e| {
+            log::error!("IMAP DELETE folder '{}' failed: {}", folder_path, e);
+            Error::Imap(e.to_string())
+        })?;
+        Ok(())
+    }
+
     /// Move messages to a destination folder.
     ///
     /// Uses COPY + STORE \Deleted + EXPUNGE, which works on all IMAP servers

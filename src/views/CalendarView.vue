@@ -55,16 +55,16 @@ onMounted(async () => {
       <!-- Toolbar -->
       <div class="calendar-toolbar">
         <div class="toolbar-left">
-          <button class="btn-new-event" @click="showEventForm = true">
+          <button class="btn-new-event" data-testid="cal-btn-new-event" @click="showEventForm = true">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
             Event
           </button>
           <div class="toolbar-divider"></div>
-          <button class="btn-today" @click="calendarStore.goToday()">Today</button>
-          <button class="btn-nav" @click="calendarStore.goPrev()">
+          <button class="btn-today" data-testid="cal-btn-today" @click="calendarStore.goToday()">Today</button>
+          <button class="btn-nav" data-testid="cal-btn-prev" @click="calendarStore.goPrev()">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
           </button>
-          <button class="btn-nav" @click="calendarStore.goNext()">
+          <button class="btn-nav" data-testid="cal-btn-next" @click="calendarStore.goNext()">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
           </button>
           <span class="current-date">{{ formatCurrentDate() }}</span>
@@ -76,6 +76,7 @@ onMounted(async () => {
               :key="mode"
               class="view-btn"
               :class="{ active: calendarStore.viewMode === mode }"
+              :data-testid="`cal-view-${mode}`"
               @click="calendarStore.setViewMode(mode)"
             >{{ mode.charAt(0).toUpperCase() + mode.slice(1) }}</button>
           </div>

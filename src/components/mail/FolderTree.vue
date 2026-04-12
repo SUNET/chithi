@@ -6,12 +6,13 @@ import { useMessagesStore } from "@/stores/messages";
 import type { Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
+import { showToast, dismissToast } from "@/lib/toast";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
 const messagesStore = useMessagesStore();
 
-const contextMenu = ref<{ x: number; y: number; folder: Folder } | null>(null);
+const contextMenu = ref<{ x: number; y: number; folder: Folder; accountId: string } | null>(null);
 const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null);
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
@@ -82,6 +83,7 @@ const newFolderName = ref("");
 const newFolderParent = ref("");
 const newFolderSaving = ref(false);
 const newFolderError = ref<string | null>(null);
+const deletingFolder = ref<{ accountId: string; folder: Folder } | null>(null);
 
 // Predefined avatar colors for accounts
 const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
@@ -140,9 +142,9 @@ watch(
   },
 );
 
-function onFolderContextMenu(event: MouseEvent, folder: Folder) {
+function onFolderContextMenu(event: MouseEvent, folder: Folder, accountId: string) {
   event.preventDefault();
-  contextMenu.value = { x: event.clientX, y: event.clientY, folder };
+  contextMenu.value = { x: event.clientX, y: event.clientY, folder, accountId };
 }
 
 function closeContextMenu() {
@@ -166,18 +168,13 @@ function openNewFolderFromAccount() {
 }
 
 async function syncThisFolder() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
-  if (!accountId || !folder) return;
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   closeContextMenu();
 
   syncing.value = folder.path;
   try {
     await api.syncFolder(accountId, folder.path);
-    await foldersStore.fetchFolders();
-    if (foldersStore.activeFolderPath === folder.path) {
-      await messagesStore.fetchMessages();
-    }
   } catch (e) {
     console.error("Folder sync failed:", e);
   } finally {
@@ -185,28 +182,12 @@ async function syncThisFolder() {
   }
 }
 
-function findFolderInTree(folders: Folder[], path: string): boolean {
-  for (const f of folders) {
-    if (f.path === path) return true;
-    if (findFolderInTree(f.children, path)) return true;
-  }
-  return false;
-}
-
-function findAccountForFolder(folder: Folder | undefined): string | null {
-  if (!folder) return null;
-  for (const acc of accountsStore.accounts) {
-    const folders = foldersStore.getAccountFolders(acc.id);
-    if (findFolderInTree(folders, folder.path)) return acc.id;
-  }
-  return accountsStore.activeAccountId;
-}
 
 function openNewFolderModal() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   // Default parent to the right-clicked folder's path
-  newFolderParent.value = folder ? `${accountId}|${folder.path}` : "";
+  newFolderParent.value = `${accountId}|${folder.path}`;
   newFolderName.value = "";
   newFolderError.value = null;
   closeContextMenu();
@@ -248,16 +229,17 @@ async function createNewFolder() {
 
   newFolderSaving.value = true;
   newFolderError.value = null;
+  const createToastId = showToast(`Creating folder...`, "info", 0);
   try {
     await api.createFolder(accountId, folderPath);
     showNewFolderModal.value = false;
-    // Trigger sync so the server-assigned folder ID/path gets registered locally
     await api.triggerSync(accountId);
     await foldersStore.fetchAllAccountFolders();
   } catch (e) {
     newFolderError.value = String(e);
   } finally {
     newFolderSaving.value = false;
+    dismissToast(createToastId);
   }
 }
 
@@ -292,22 +274,22 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
   if (foldersStore.activeFolderPath === folderPath && accountsStore.activeAccountId === accountId) return;
 
   const messageIds = [...dragMessageIds.value];
+  const moveToastId = showToast(`Moving ${messageIds.length} message(s)...`, "info", 0);
   try {
     await api.moveMessages(accountId, messageIds, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchAllAccountFolders();
   } catch (e) {
     console.error("Drag-and-drop move failed:", e);
+  } finally {
+    dismissToast(moveToastId);
   }
 }
 
 async function markFolderRead() {
-  const folder = contextMenu.value?.folder;
-  const accountId = findAccountForFolder(folder);
-  if (!accountId || !folder) return;
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
   closeContextMenu();
 
   try {
@@ -319,13 +301,43 @@ async function markFolderRead() {
 
     if (unreadIds.length > 0) {
       await api.setMessageFlags(accountId, unreadIds, ["seen"], true);
-      await foldersStore.fetchFolders();
-      if (foldersStore.activeFolderPath === folder.path) {
-        await messagesStore.fetchMessages();
-      }
     }
   } catch (e) {
     console.error("Mark folder read failed:", e);
+  }
+}
+
+function confirmDeleteFolder() {
+  if (!contextMenu.value) return;
+  const { folder, accountId } = contextMenu.value;
+  closeContextMenu();
+  deletingFolder.value = { accountId, folder };
+}
+
+async function doDeleteFolder() {
+  if (!deletingFolder.value) return;
+  const { accountId, folder } = deletingFolder.value;
+  deletingFolder.value = null;
+
+  const deleteToastId = showToast(`Deleting "${folder.name}"...`, "info", 0);
+  try {
+    await api.deleteFolder(accountId, folder.path);
+    await foldersStore.fetchAllAccountFolders();
+    if (
+      accountsStore.activeAccountId === accountId &&
+      foldersStore.activeFolderPath === folder.path
+    ) {
+      const folders = foldersStore.getAccountFolders(accountId);
+      const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
+      foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
+    }
+    showToast(`Deleted "${folder.name}"`, "success");
+  } catch (e) {
+    console.error("Delete folder failed:", e);
+    const message = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to delete "${folder.name}": ${message}`, "error", 5000);
+  } finally {
+    dismissToast(deleteToastId);
   }
 }
 </script>
@@ -339,6 +351,7 @@ async function markFolderRead() {
     >
       <button
         class="account-header"
+        :data-testid="`account-${account.id}`"
         @click="toggleAccountCollapse(account.id)"
         @contextmenu="onAccountContextMenu($event, account.id)"
       >
@@ -369,9 +382,10 @@ async function markFolderRead() {
             syncing: syncing === item.folder.path,
             'drop-target': dropTarget === `${account.id}:${item.folder.path}`,
           }"
+          :data-testid="`folder-${account.id}-${item.folder.path}`"
           :style="{ paddingLeft: (12 + item.depth * 16) + 'px' }"
           @click.stop="selectFolder(account.id, item.folder.path)"
-          @contextmenu="onFolderContextMenu($event, item.folder)"
+          @contextmenu="onFolderContextMenu($event, item.folder, account.id)"
           @mouseenter="onFolderMouseEnter(account.id, item.folder.path)"
           @mouseleave="onFolderMouseLeave(account.id, item.folder.path)"
           @mouseup="onFolderMouseUp(account.id, item.folder.path)"
@@ -436,18 +450,21 @@ async function markFolderRead() {
       <div
         v-if="contextMenu"
         class="folder-context-menu"
+        data-testid="folder-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
         <button class="ctx-item disabled">Open in New Tab</button>
         <button class="ctx-item disabled">Open in New Window</button>
         <button class="ctx-item disabled">Search Messages...</button>
         <div class="ctx-separator"></div>
-        <button class="ctx-item" @click="openNewFolderModal">New Folder...</button>
+        <button class="ctx-item" data-testid="ctx-new-folder" @click="openNewFolderModal">New Folder...</button>
         <div class="ctx-separator"></div>
-        <button class="ctx-item" @click="markFolderRead">Mark Folder Read</button>
+        <button class="ctx-item" data-testid="ctx-mark-read" @click="markFolderRead">Mark Folder Read</button>
+        <div class="ctx-separator"></div>
+        <button class="ctx-item danger" data-testid="ctx-delete-folder" @click="confirmDeleteFolder">Delete Folder</button>
         <div class="ctx-separator"></div>
         <button class="ctx-item disabled">Properties</button>
-        <button class="ctx-item" @click="syncThisFolder">
+        <button class="ctx-item" data-testid="ctx-sync-folder" @click="syncThisFolder">
           Sync "{{ contextMenu.folder.name }}"
         </button>
       </div>
@@ -498,6 +515,27 @@ async function markFolderRead() {
             <button class="nf-btn-create" :disabled="newFolderSaving" @click="createNewFolder">
               {{ newFolderSaving ? "Creating..." : "Create Folder" }}
             </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Delete Folder Confirmation -->
+    <Teleport to="body">
+      <div v-if="deletingFolder" class="modal-overlay" @click.self="deletingFolder = null">
+        <div class="new-folder-modal">
+          <div class="nf-body" style="padding: 20px">
+            <h3 style="margin: 0 0 8px">Delete Folder</h3>
+            <p style="font-size: 13px; color: var(--color-text-secondary); line-height: 1.5; margin: 0 0 4px">
+              Are you sure you want to delete "{{ deletingFolder.folder.name }}"?
+            </p>
+            <p style="font-size: 12px; color: var(--color-text-muted); margin: 0">
+              All messages in this folder will be permanently deleted.
+            </p>
+          </div>
+          <div class="nf-footer">
+            <button class="nf-btn-cancel" @click="deletingFolder = null">Cancel</button>
+            <button class="nf-btn-create" style="background: var(--color-danger, #dc2626)" @click="doDeleteFolder">Delete</button>
           </div>
         </div>
       </div>
@@ -717,6 +755,14 @@ async function markFolderRead() {
 .folder-context-menu .ctx-item.disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+.folder-context-menu .ctx-item.danger {
+  color: var(--color-danger, #dc2626);
+}
+
+.folder-context-menu .ctx-item.danger:hover {
+  background: rgba(220, 53, 69, 0.08);
 }
 
 .folder-context-menu .ctx-separator {

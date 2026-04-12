@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
+import { showToast, dismissToast } from "@/lib/toast";
 import { useMessagesStore } from "@/stores/messages";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
@@ -274,15 +275,16 @@ async function ctxMoveTo(folderPath: string) {
   if (!accountId) return;
   const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
+  const toastId = showToast(`Moving ${ids.length} message(s)...`, "info", 0);
   try {
     await api.moveMessages(accountId, ids, folderPath);
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Move failed:", e);
+  } finally {
+    dismissToast(toastId);
   }
 }
 
@@ -293,7 +295,6 @@ async function ctxCopyTo(folderPath: string) {
   closeContextMenu();
   try {
     await api.copyMessages(accountId, ids, folderPath);
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Copy failed:", e);
   }
@@ -337,8 +338,6 @@ async function ctxNotSpam() {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-    await messagesStore.fetchMessages();
-    await foldersStore.fetchFolders();
   } catch (e) {
     console.error("Not Spam failed:", e);
   }
@@ -381,13 +380,14 @@ const displayedCount = () => {
 </script>
 
 <template>
-  <div class="message-list" @click="closeContextMenu">
+  <div class="message-list" data-testid="message-list" @click="closeContextMenu">
     <QuickFilterBar v-if="messagesStore.quickFilterVisible" />
     <div class="column-headers">
       <div class="col col-check">
         <input
           type="checkbox"
           class="row-checkbox"
+          data-testid="select-all-checkbox"
           :checked="allSelected"
           @click.stop="toggleSelectAll"
         />
@@ -493,9 +493,10 @@ const displayedCount = () => {
     </div>
 
     <div class="list-footer">
-      <span class="message-count">{{ displayedCount() }}</span>
+      <span class="message-count" data-testid="message-count">{{ displayedCount() }}</span>
       <button
         class="quick-filter-toggle"
+        data-testid="quick-filter-toggle"
         :class="{ active: messagesStore.quickFilterVisible }"
         @click.stop="toggleQuickFilter"
       >
@@ -513,15 +514,15 @@ const displayedCount = () => {
       >
         <!-- Single message actions -->
         <template v-if="isSingleSelection()">
-          <button class="ctx-item" @click="ctxReply">
+          <button class="ctx-item" data-testid="ctx-reply" @click="ctxReply">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
             Reply
           </button>
-          <button class="ctx-item" @click="ctxReplyAll">
+          <button class="ctx-item" data-testid="ctx-reply-all" @click="ctxReplyAll">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
             Reply All
           </button>
-          <button class="ctx-item" @click="ctxForward">
+          <button class="ctx-item" data-testid="ctx-forward" @click="ctxForward">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7" /><path d="M4 18v-2a4 4 0 0 1 4-4h12" /></svg>
             Forward
           </button>
@@ -530,7 +531,7 @@ const displayedCount = () => {
 
         <!-- Move To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'move'" @mouseleave="subMenu = null">
-          <button class="ctx-item">
+          <button class="ctx-item" data-testid="ctx-move-to">
             Move To
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
           </button>
@@ -547,7 +548,7 @@ const displayedCount = () => {
 
         <!-- Copy To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'copy'" @mouseleave="subMenu = null">
-          <button class="ctx-item">
+          <button class="ctx-item" data-testid="ctx-copy-to">
             Copy To
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
           </button>
@@ -563,12 +564,12 @@ const displayedCount = () => {
 
         <div class="ctx-separator"></div>
 
-        <button v-if="isJunkFolder()" class="ctx-item" @click="ctxNotSpam">
+        <button v-if="isJunkFolder()" class="ctx-item" data-testid="ctx-not-spam" @click="ctxNotSpam">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
           Not Spam
         </button>
 
-        <button class="ctx-item danger" @click="ctxDelete">
+        <button class="ctx-item danger" data-testid="ctx-delete" @click="ctxDelete">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
           Delete
         </button>

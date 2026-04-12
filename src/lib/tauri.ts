@@ -79,6 +79,13 @@ export async function createFolder(
   return invoke("create_folder", { accountId, folderPath });
 }
 
+export async function deleteFolder(
+  accountId: string,
+  folderPath: string,
+): Promise<void> {
+  return invoke("delete_folder", { accountId, folderPath });
+}
+
 export async function saveAttachment(
   accountId: string,
   messageId: string,

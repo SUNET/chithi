@@ -73,7 +73,7 @@ function selectAccountType(type: AccountType) {
       break;
     case "o365":
       f.provider = "o365";
-      f.mail_protocol = "imap";
+      f.mail_protocol = "graph";
       if (!editingAccountId.value) {
         f.imap_host = "outlook.office365.com";
         f.imap_port = 993;
