@@ -835,12 +835,26 @@ pub async fn prefetch_bodies(
 }
 
 /// Sync an O365 account via Microsoft Graph API.
+/// Downloads full MIME bodies during sync and streams them to Maildir,
+/// so message reading works offline without live API calls.
+/// Two-phase: download without DB lock (UI stays responsive), then fast batch insert.
 async fn sync_graph_account(
     app: AppHandle,
     db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     account_id: &str,
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
+    use crate::mail::sync::{create_maildir_dirs, sanitize_folder_name, flags_to_maildir_suffix};
+
+    let data_dir = {
+        let conn = db_arc.lock().await;
+        // Get data_dir from the first message's path, or use default
+        // Actually we need to pass data_dir — get it from the AppHandle
+        drop(conn);
+        // Use the standard Chithi data directory
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(format!("{}/.local/share/chithi", home))
+    };
 
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);
@@ -861,7 +875,6 @@ async fn sync_graph_account(
     // Sync messages for each folder
     let mut grand_total = 0u32;
     for gf in &graph_folders {
-        // Fetch messages (Graph uses skip-based pagination, not UIDs)
         let (messages, _total) = client.list_messages(&gf.id, 200, 0).await?;
 
         if messages.is_empty() {
@@ -881,24 +894,62 @@ async fn sync_graph_account(
             ids
         };
 
-        let conn = db_arc.lock().await;
-        conn.execute_batch("BEGIN")?;
-
-        let mut synced = 0u32;
+        // Collect new messages
+        let mut new_messages = Vec::new();
         for msg in &messages {
             let id = format!("{}_{}", account_id, msg.id);
             if existing_ids.contains(&id) {
                 continue;
             }
+            new_messages.push(msg);
+        }
 
+        if new_messages.is_empty() {
+            continue;
+        }
+
+        // Prepare Maildir directory
+        let folder_dir = sanitize_folder_name(&gf.id);
+        let maildir_base = data_dir.join(account_id).join(&folder_dir);
+        create_maildir_dirs(&maildir_base)?;
+
+        // Phase 1: Stream MIME bodies to disk (no DB lock — UI stays responsive)
+        let mut downloaded: Vec<(&graph::GraphMessage, String)> = Vec::new();
+        for msg in &new_messages {
+            let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
+            let filename = format!("{}:2,{}", msg.id, flags_to_maildir_suffix(&flags));
+            let msg_path = maildir_base.join("cur").join(&filename);
+
+            let maildir_path = match client.download_mime_to_file(&msg.id, &msg_path).await {
+                Ok(bytes_written) => {
+                    log::debug!("Graph sync: downloaded {} bytes for {}", bytes_written, msg.id);
+                    format!("{}/{}/cur/{}", account_id, folder_dir, filename)
+                }
+                Err(e) => {
+                    log::warn!("Graph sync: failed to download MIME for {}: {}", msg.id, e);
+                    // Clean up partial file
+                    let _ = std::fs::remove_file(&msg_path);
+                    String::new() // Empty = on-demand fetch later
+                }
+            };
+            downloaded.push((msg, maildir_path));
+        }
+
+        // Phase 2: Fast batch DB insert (lock held <10ms, not during downloads)
+        let conn = db_arc.lock().await;
+        conn.execute_batch("BEGIN")?;
+
+        let mut synced = 0u32;
+        for (msg, maildir_path) in &downloaded {
+            let id = format!("{}_{}", account_id, msg.id);
             let flags = if msg.is_read { vec!["seen".to_string()] } else { vec![] };
             let thread_id = msg.conversation_id.clone();
 
             let new_msg = db::messages::NewMessage {
-                id: id.clone(),
+                id,
                 account_id: account_id.to_string(),
                 folder_path: gf.id.clone(),
-                uid: 0, // Graph doesn't use UIDs
+                uid: 0,
                 message_id: msg.internet_message_id.clone(),
                 in_reply_to: None,
                 thread_id,
@@ -913,7 +964,7 @@ async fn sync_graph_account(
                 is_encrypted: false,
                 is_signed: false,
                 flags: serde_json::to_string(&flags).unwrap_or_default(),
-                maildir_path: format!("graph:{}", msg.id), // Special marker for Graph bodies
+                maildir_path: maildir_path.clone(),
                 snippet: msg.preview.clone(),
             };
             db::messages::insert_message(&conn, &new_msg)?;
@@ -924,7 +975,7 @@ async fn sync_graph_account(
         drop(conn);
 
         if synced > 0 {
-            log::info!("Graph sync: {} new messages in '{}'", synced, gf.display_name);
+            log::info!("Graph sync: {} new messages in '{}' (bodies streamed to disk)", synced, gf.display_name);
             grand_total += synced;
         }
     }

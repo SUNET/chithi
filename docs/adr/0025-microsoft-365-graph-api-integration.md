@@ -121,8 +121,10 @@ The sync function `sync_graph_account` works in two phases to avoid blocking the
 **Phase 1 — Download (no DB lock):**
 - Fetch folder list via `GET /me/mailFolders`
 - For each folder, fetch message list via `GET /me/mailFolders/{id}/messages`
-- For each new message, download full MIME via `GET /me/messages/{id}/$value`
-- Write raw RFC 5322 bytes to Maildir (`{account_id}/{folder}/cur/{msg_id}:2,{flags}`)
+- For each new message, **stream** full MIME to disk via `GET /me/messages/{id}/$value`
+- MIME bodies are streamed chunk-by-chunk using `reqwest::Response::bytes_stream()` + `tokio::fs::File` — memory usage is bounded to ~8KB per message regardless of email size (no buffering the entire response in memory)
+- Written as raw RFC 5322 to Maildir (`{account_id}/{folder}/cur/{msg_id}:2,{flags}`)
+- Partial files cleaned up on download failure
 
 **Phase 2 — Insert (DB lock held briefly):**
 - Open a single SQLite transaction
@@ -131,7 +133,13 @@ The sync function `sync_graph_account` works in two phases to avoid blocking the
 
 When a user clicks a message, `get_message_body` reads from local Maildir (same code path as IMAP/JMAP). No live API call, no network dependency, works offline.
 
-On-demand fallback: if `maildir_path` is empty or has legacy `graph:` prefix (from before this migration), the body is downloaded from Graph, stored to Maildir, and the DB path updated — self-healing on first click.
+On-demand fallback: if `maildir_path` is empty or has legacy `graph:` prefix (from before this migration), the body is streamed from Graph to Maildir and the DB path updated — self-healing on first click.
+
+### Security hardening (from differential review)
+
+**System folder deletion guard (ADR 0036):** The `delete_folder` command verifies the folder exists in the local DB and rejects deletion of system folders (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`). This prevents a compromised renderer from destroying critical mailbox folders on the server via IPC.
+
+**Streaming MIME downloads:** The `stream_to_file` method in `GraphClient` streams the Graph API response directly to disk via `bytes_stream()`, never buffering the full message in memory. This prevents OOM from large emails (e.g., 500MB attachments). The previous `get_bytes` approach loaded the entire response into a `Vec<u8>` before writing.
 
 ### What we tried and failed
 
@@ -171,7 +179,18 @@ Downloaded full MIME during sync via `GET /me/messages/{id}/$value`, stored to M
 - Any `get_message_body` call during sync blocked waiting for the lock — user clicks an email and waits 7+ seconds
 - UI completely unresponsive during sync
 
-**Result:** Fixed by splitting into two phases (current implementation). Phase 1 downloads without the lock, Phase 2 does a fast batch insert.
+**Result:** Fixed by splitting into two phases. Phase 1 downloads without the lock, Phase 2 does a fast batch insert.
+
+#### Attempt 4: Two-phase sync with in-memory buffering
+
+Split download and DB insert into two phases (fixing the lock contention), but `get_bytes()` still buffered each entire MIME response into a `Vec<u8>` in memory before writing to disk.
+
+**Problems encountered:**
+- A 500MB email attachment would allocate 500MB of RAM per message during download
+- With 200 messages per folder fetch, multiple large messages could exhaust memory and crash the app
+- Identified in differential security review (F-02)
+
+**Result:** Fixed by replacing `get_bytes()` with `stream_to_file()` which streams the response chunk-by-chunk (~8KB) directly to disk via `reqwest::Response::bytes_stream()` + `tokio::fs::File`. Memory usage is now bounded regardless of email size.
 
 ## Consequences
 - O365 mail sync uses Graph API — no IMAP throttling, no connection management

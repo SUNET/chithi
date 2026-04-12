@@ -45,7 +45,12 @@ impl GraphClient {
             .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))
     }
 
-    async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+    /// Stream a Graph API response directly to a file on disk.
+    /// Returns the number of bytes written. Avoids buffering the entire
+    /// response in memory — critical for large emails with attachments.
+    async fn stream_to_file(&self, path: &str, dest: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self.http
             .get(&url)
@@ -60,9 +65,24 @@ impl GraphClient {
             return Err(Error::Other(format!("Graph GET {} returned {}: {}", path, status, truncate(&body, 500))));
         }
 
-        resp.bytes().await
-            .map(|b| b.to_vec())
-            .map_err(|e| Error::Other(format!("Graph GET {} read bytes failed: {}", path, e)))
+        let mut file = tokio::fs::File::create(dest).await
+            .map_err(|e| Error::Other(format!("Failed to create file {}: {}", dest.display(), e)))?;
+        let mut stream = resp.bytes_stream();
+        let mut total: u64 = 0;
+
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
+            file.write_all(&chunk).await
+                .map_err(|e| Error::Other(format!("Failed to write to {}: {}", dest.display(), e)))?;
+            total += chunk.len() as u64;
+        }
+
+        file.flush().await
+            .map_err(|e| Error::Other(format!("Failed to flush {}: {}", dest.display(), e)))?;
+
+        Ok(total)
     }
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -322,8 +342,17 @@ impl GraphClient {
         Ok(attachments)
     }
 
-    pub async fn get_mime_message(&self, message_id: &str) -> Result<Vec<u8>> {
-        self.get_bytes(&format!("/me/messages/{}/$value", message_id)).await
+    /// Download the raw RFC 5322 MIME message and stream it directly to a file.
+    /// Returns the number of bytes written. Never buffers the full message in memory.
+    pub async fn download_mime_to_file(
+        &self,
+        message_id: &str,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        self.stream_to_file(
+            &format!("/me/messages/{}/$value", message_id),
+            dest,
+        ).await
     }
 
     pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {

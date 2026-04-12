@@ -98,58 +98,8 @@ pub async fn get_message_body(
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
-    // Graph API messages: fetch body directly from Graph, not from disk
-    if let Some(graph_msg_id) = maildir_path.strip_prefix("graph:") {
-        log::debug!("Fetching Graph message body for {}", graph_msg_id);
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        let body = client.get_message_body(graph_msg_id).await?;
-
-        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
-        let (body_html, body_text) = if body.content_type == "html" {
-            let sanitized = ammonia::clean(&body.content);
-            // Simple HTML-to-text: strip tags for plain text view
-            let text = body.content
-                .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-                .replace("</p>", "\n").replace("</div>", "\n");
-            let text = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&text, "").to_string();
-            (Some(sanitized), text)
-        } else {
-            (None, body.content)
-        };
-
-        // Mark as read on the server if not already
-        if !flags.contains(&"seen".to_string()) {
-            let graph_ids = vec![graph_msg_id.to_string()];
-            client.set_read_status(&graph_ids, true).await.ok();
-            let conn = state.db.lock().await;
-            let mut new_flags = flags.clone();
-            new_flags.push("seen".to_string());
-            db::messages::update_flags(&conn, &message_id, &serde_json::to_string(&new_flags).unwrap_or_default())?;
-        }
-
-        let to: Vec<db::messages::Address> = serde_json::from_str(&to_json).unwrap_or_default();
-        let cc: Vec<db::messages::Address> = serde_json::from_str(&cc_json).unwrap_or_default();
-
-        return Ok(db::messages::MessageBody {
-            id: message_id,
-            subject: None,
-            from: db::messages::Address { name: None, email: from_email },
-            to,
-            cc,
-            date: String::new(),
-            flags,
-            body_html,
-            body_text: Some(body_text),
-            attachments: vec![],
-            is_encrypted,
-            is_signed,
-            list_id: None,
-        });
-    }
-
-    // If body hasn't been downloaded yet, fetch it on-demand
-    let actual_maildir_path = if maildir_path.is_empty() {
+    // If body hasn't been downloaded yet (empty or legacy `graph:` prefix), fetch on-demand
+    let actual_maildir_path = if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
         // Get account config and message details
         let (account, folder_path, uid) = {
             let conn = state.db.lock().await;
@@ -161,7 +111,33 @@ pub async fn get_message_body(
         let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
         let data_dir = state.data_dir.clone();
 
-        let relative_path = if account.mail_protocol == "jmap" {
+        let relative_path = if account.mail_protocol == "graph" {
+            // Graph: stream raw MIME to disk via GET /me/messages/{id}/$value
+            log::info!("Body not on disk for {}, streaming from Graph", message_id);
+
+            let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
+                gid.to_string()
+            } else {
+                message_id.strip_prefix(&format!("{}_", account_id))
+                    .unwrap_or(&message_id)
+                    .to_string()
+            };
+
+            let token = crate::mail::graph::get_graph_token(&account_id).await?;
+            let client = crate::mail::graph::GraphClient::new(&token);
+
+            let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
+            let maildir_base = data_dir.join(&account_id).join(&folder_dir);
+            crate::mail::sync::create_maildir_dirs(&maildir_base)?;
+
+            let filename = format!("{}:2,{}", graph_msg_id, crate::mail::sync::flags_to_maildir_suffix(&flags));
+            let msg_path = maildir_base.join("cur").join(&filename);
+
+            let bytes_written = client.download_mime_to_file(&graph_msg_id, &msg_path).await?;
+            let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
+            log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
+            rp
+        } else if account.mail_protocol == "jmap" {
             log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
