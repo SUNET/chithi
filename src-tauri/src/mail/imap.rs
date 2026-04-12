@@ -498,10 +498,12 @@ impl ImapConnection {
     }
 
     /// Mark all messages in the currently selected folder as \Seen.
+    /// Uses .SILENT to suppress per-message FETCH responses, which can be
+    /// very large on folders with many messages.
     pub fn mark_all_seen(&mut self) -> Result<()> {
         self.session
-            .uid_store("1:*", "+FLAGS (\\Seen)")
-            .map_err(|e| Error::Imap(format!("STORE +FLAGS \\Seen failed: {}", e)))?;
+            .uid_store("1:*", "+FLAGS.SILENT (\\Seen)")
+            .map_err(|e| Error::Imap(format!("STORE +FLAGS.SILENT \\Seen failed: {}", e)))?;
         Ok(())
     }
 
