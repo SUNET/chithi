@@ -167,6 +167,22 @@ function openNewFolderFromAccount() {
   showNewFolderModal.value = true;
 }
 
+async function markAccountRead() {
+  const accountId = accountMenu.value?.accountId;
+  if (!accountId) return;
+  closeContextMenu();
+
+  try {
+    await api.markAccountRead(accountId);
+    await foldersStore.fetchAllAccountFolders();
+    if (accountsStore.activeAccountId === accountId) {
+      await messagesStore.fetchMessages();
+    }
+  } catch (e) {
+    console.error("Mark account read failed:", e);
+  }
+}
+
 async function syncThisFolder() {
   if (!contextMenu.value) return;
   const { folder, accountId } = contextMenu.value;
@@ -494,7 +510,8 @@ async function doDeleteFolder() {
         class="folder-context-menu"
         :style="{ left: accountMenu.x + 'px', top: accountMenu.y + 'px' }"
       >
-        <button class="ctx-item" @click="openNewFolderFromAccount">New Folder...</button>
+        <button class="ctx-item" data-testid="ctx-account-mark-read" @click="markAccountRead">Mark All Read</button>
+        <button class="ctx-item" data-testid="ctx-account-new-folder" @click="openNewFolderFromAccount">New Folder...</button>
       </div>
     </Teleport>
 

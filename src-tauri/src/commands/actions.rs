@@ -599,6 +599,129 @@ pub async fn copy_messages(
     Ok(())
 }
 
+/// Mark all messages in all folders of an account as read.
+/// Updates both the remote server and local DB.
+#[tauri::command]
+pub async fn mark_account_read(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<u64> {
+    log::info!("Marking all messages as read for account {}", account_id);
+
+    let account = {
+        let conn = state.db.lock().await;
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    // Mark read on the server first
+    if account.mail_protocol == "graph" {
+        let unread_ids = {
+            let conn = state.db.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+            ).map_err(crate::error::Error::Database)?;
+            let ids: Vec<String> = stmt
+                .query_map(rusqlite::params![&account_id], |row| row.get::<_, String>(0))
+                .map_err(crate::error::Error::Database)?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+        if !unread_ids.is_empty() {
+            let token = crate::mail::graph::get_graph_token(&account_id).await?;
+            let client = crate::mail::graph::GraphClient::new(&token);
+            let graph_ids: Vec<String> = unread_ids.iter().map(|mid| {
+                mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid).to_string()
+            }).collect();
+            client.set_read_status(&graph_ids, true).await?;
+        }
+    } else if account.mail_protocol == "imap" {
+        // IMAP: SELECT each folder and STORE +FLAGS \Seen on all messages
+        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+            suspend_imap_idle_for_account(&state, &account_id).await?
+        } else {
+            false
+        };
+        let resume_account = account.clone();
+        let imap_config = build_imap_config(&account).await?;
+        let folder_paths: Vec<String> = {
+            let conn = state.db.lock().await;
+            let folders = db::folders::list_folders(&conn, &account_id)?;
+            folders.into_iter().map(|f| f.path).collect()
+        };
+        let imap_result = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = ImapConnection::connect(&imap_config)?;
+            for folder_path in &folder_paths {
+                if let Err(e) = conn.select_folder(folder_path) {
+                    log::warn!("Cannot select '{}' for mark-read: {}", folder_path, e);
+                    continue;
+                }
+                if let Err(e) = conn.mark_all_seen() {
+                    log::warn!("Mark all seen failed on '{}': {}", folder_path, e);
+                }
+            }
+            conn.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Mark account read task panicked: {}", e)))?;
+
+        // Always resume IDLE, even if the mark-read operation failed
+        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+        imap_result?;
+    } else if account.mail_protocol == "jmap" {
+        // JMAP: bulk update all unread emails to $seen via Email/set
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+
+        let unread_ids: Vec<String> = {
+            let conn = state.db.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+            ).map_err(crate::error::Error::Database)?;
+            let rows = stmt.query_map(rusqlite::params![&account_id], |row| row.get::<_, String>(0))
+                .map_err(crate::error::Error::Database)?;
+            let ids: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+            ids
+        };
+
+        if !unread_ids.is_empty() {
+            // Extract JMAP email IDs from composite message IDs
+            let jmap_ids: Vec<String> = unread_ids.iter().map(|mid| {
+                let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                if parts.len() == 3 { parts[2].to_string() } else { mid.clone() }
+            }).collect();
+
+            let flag_strs = vec!["seen"];
+            conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, true).await?;
+        }
+    }
+
+    // Update local DB
+    let updated = {
+        let conn = state.db.lock().await;
+        let count = conn.execute(
+            "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
+             WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+            rusqlite::params![account_id],
+        ).map_err(crate::error::Error::Database)?;
+        db::folders::recalculate_folder_counts(&conn, &account_id)?;
+        count
+    };
+
+    log::info!(
+        "mark_account_read: updated {} messages for account {}",
+        updated,
+        account_id,
+    );
+
+    emit_messages_changed(&app, &account_id);
+    emit_folders_changed(&app, &account_id);
+
+    Ok(updated as u64)
+}
+
 /// Group message UIDs by their folder path.
 ///
 /// Takes (message_id, folder_path, uid) rows and returns a HashMap

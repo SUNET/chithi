@@ -185,6 +185,10 @@ export async function copyMessages(
   return invoke("copy_messages", { accountId, messageIds, targetFolder });
 }
 
+export async function markAccountRead(accountId: string): Promise<number> {
+  return invoke("mark_account_read", { accountId });
+}
+
 // Threading
 export async function getThreadedMessages(
   accountId: string,

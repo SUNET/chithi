@@ -429,9 +429,20 @@ impl GraphClient {
 
     /// Mark messages as read or unread.
     pub async fn set_read_status(&self, message_ids: &[String], is_read: bool) -> Result<()> {
-        let body = serde_json::json!({ "isRead": is_read });
-        for id in message_ids {
-            self.patch_json(&format!("/me/messages/{}", id), &body).await?;
+        // Batch up to 20 requests per $batch call (Graph API limit)
+        for chunk in message_ids.chunks(20) {
+            let requests: Vec<serde_json::Value> = chunk.iter().enumerate().map(|(i, id)| {
+                serde_json::json!({
+                    "id": format!("{}", i),
+                    "method": "PATCH",
+                    "url": format!("/me/messages/{}", id),
+                    "headers": { "Content-Type": "application/json" },
+                    "body": { "isRead": is_read }
+                })
+            }).collect();
+
+            let batch_body = serde_json::json!({ "requests": requests });
+            self.post_json("/$batch", &batch_body).await?;
         }
         Ok(())
     }
