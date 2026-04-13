@@ -160,27 +160,29 @@ const overlapLayout = computed(() => {
 
     // Build overlap clusters: group events that transitively overlap
     // so non-overlapping events get full width.
-    const clusters: typeof dayEvents[] = [];
+    // Track each cluster's running end time to avoid O(n²) rescans.
+    type ClusterEntry = { events: typeof dayEvents; end: number };
+    const clusters: ClusterEntry[] = [];
     for (const ev of dayEvents) {
       // Find existing cluster whose time range overlaps with this event
       let merged = false;
       for (const cluster of clusters) {
-        const clusterEnd = Math.max(...cluster.map(e => e.end));
-        if (ev.start < clusterEnd) {
-          cluster.push(ev);
+        if (ev.start < cluster.end) {
+          cluster.events.push(ev);
+          if (ev.end > cluster.end) cluster.end = ev.end;
           merged = true;
           break;
         }
       }
       if (!merged) {
-        clusters.push([ev]);
+        clusters.push({ events: [ev], end: ev.end });
       }
     }
 
     // Assign columns per cluster
     for (const cluster of clusters) {
       const columns: { end: number }[][] = [];
-      for (const ev of cluster) {
+      for (const ev of cluster.events) {
         let placed = false;
         for (let col = 0; col < columns.length; col++) {
           const lastInCol = columns[col][columns[col].length - 1];
@@ -198,7 +200,7 @@ const overlapLayout = computed(() => {
       }
 
       const totalCols = columns.length;
-      for (const ev of cluster) {
+      for (const ev of cluster.events) {
         const info = layout.get(ev.key);
         if (info) info.totalColumns = totalCols;
       }

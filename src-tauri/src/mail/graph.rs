@@ -549,7 +549,9 @@ impl GraphClient {
 
     /// Find an event by its iCalUId. Returns the Graph event ID if found.
     pub async fn find_event_by_ical_uid(&self, ical_uid: &str) -> Result<Option<String>> {
-        let filter = format!("iCalUId eq '{}'", ical_uid);
+        // Escape single quotes per OData rules to prevent filter injection.
+        let escaped_uid = ical_uid.replace('\'', "''");
+        let filter = format!("iCalUId eq '{}'", escaped_uid);
         let resp = self
             .get("/me/events", &[("$filter", filter.as_str()), ("$select", "id")])
             .await?;

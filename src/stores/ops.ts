@@ -38,41 +38,47 @@ export const useOpsStore = defineStore("ops", () => {
 
   async function initEventListeners() {
     if (initialized.value) return;
-    initialized.value = true;
 
-    // Listen for background operation failures
-    stopOpFailed = await listen<{
-      account_id: string;
-      op_type: string;
-      error: string;
-    }>("op-failed", (event) => {
-      if (disposed) return;
-      const p = event.payload;
-      failedOps.value = [
-        ...failedOps.value,
-        {
-          account_id: p.account_id,
-          op_type: p.op_type,
-          error: p.error,
-          timestamp: Date.now(),
-        },
-      ];
-      // Auto-clear old failures after 60 seconds
-      setTimeout(() => {
-        failedOps.value = failedOps.value.filter(
-          (op) => Date.now() - op.timestamp < 60_000,
-        );
-      }, 60_000);
-    });
-
-    // Listen for dead offline operations (exceeded max retries)
-    stopOfflineChanged = await listen<OfflineQueueChange>(
-      "offline-queue-changed",
-      (event) => {
+    try {
+      // Listen for background operation failures
+      stopOpFailed = await listen<{
+        account_id: string;
+        op_type: string;
+        error: string;
+      }>("op-failed", (event) => {
         if (disposed) return;
-        deadOps.value = [...deadOps.value, event.payload];
-      },
-    );
+        const p = event.payload;
+        failedOps.value = [
+          ...failedOps.value,
+          {
+            account_id: p.account_id,
+            op_type: p.op_type,
+            error: p.error,
+            timestamp: Date.now(),
+          },
+        ];
+        // Auto-clear old failures after 60 seconds
+        setTimeout(() => {
+          failedOps.value = failedOps.value.filter(
+            (op) => Date.now() - op.timestamp < 60_000,
+          );
+        }, 60_000);
+      });
+
+      // Listen for dead offline operations (exceeded max retries)
+      stopOfflineChanged = await listen<OfflineQueueChange>(
+        "offline-queue-changed",
+        (event) => {
+          if (disposed) return;
+          deadOps.value = [...deadOps.value, event.payload];
+        },
+      );
+
+      initialized.value = true;
+    } catch (err) {
+      console.error("Failed to initialize ops event listeners:", err);
+      // Do not set initialized = true so a retry remains possible
+    }
   }
 
   onScopeDispose(() => {

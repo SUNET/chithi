@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { showToast } from "@/lib/toast";
+import { showToast, dismissToast } from "@/lib/toast";
 
 export interface Operation {
   id: string;
@@ -157,22 +157,27 @@ export const useActivityStore = defineStore("activity", () => {
       "op-failed",
       (event) => {
         const p = event.payload;
-        failOperation(`op-${p.account_id}-${Date.now()}`, `${p.op_type}: ${p.error}`);
+        // Create and immediately fail an operation entry so it shows up in the
+        // operations panel (failOperation is a no-op for unknown ids).
+        const opId = `op-${p.account_id}-${Date.now()}`;
+        startOperation(opId, "general", `${p.op_type} failed`, p.error);
+        failOperation(opId, `${p.op_type}: ${p.error}`);
       },
     );
+
+    // Maps an operation id → toast id so we can dismiss the persistent
+    // "Sending…" toast when the send completes or fails.
+    const sendToastIds = new Map<string, number>();
 
     // --- Send events ---
     await listen<{ account_id: string; subject: string }>(
       "send-started",
       (event) => {
         const p = event.payload;
-        startOperation(
-          `send-${p.account_id}-${Date.now()}`,
-          "send",
-          `Sending "${p.subject}"`,
-          "Syncing...",
-        );
-        showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
+        const opId = `send-${p.account_id}-${Date.now()}`;
+        startOperation(opId, "send", `Sending "${p.subject}"`, "Syncing...");
+        const toastId = showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
+        sendToastIds.set(opId, toastId);
       },
     );
 
@@ -184,6 +189,11 @@ export const useActivityStore = defineStore("activity", () => {
         for (const [id, op] of operations.value) {
           if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
             completeOperation(id, "Sent");
+            const toastId = sendToastIds.get(id);
+            if (toastId !== undefined) {
+              dismissToast(toastId);
+              sendToastIds.delete(id);
+            }
           }
         }
         showToast(`"${p.subject}" sent`, "success");
@@ -198,6 +208,11 @@ export const useActivityStore = defineStore("activity", () => {
         for (const [id, op] of operations.value) {
           if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
             failOperation(id, p.error);
+            const toastId = sendToastIds.get(id);
+            if (toastId !== undefined) {
+              dismissToast(toastId);
+              sendToastIds.delete(id);
+            }
           }
         }
         showToast(`Send failed: ${p.error}`, "error", 10000);

@@ -94,7 +94,7 @@ async function syncAll() {
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
       <span class="status-dot" :class="connectionStatus" data-testid="sync-status"></span>
       <span v-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
-      <span v-else-if="opsStore.hasFailures" class="sync-error-msg" data-testid="op-failure" @click="opsStore.clearFailures()" title="Click to dismiss">{{ opsStore.recentFailures[0]?.error }}</span>
+      <button v-else-if="opsStore.hasFailures" class="sync-error-msg" data-testid="op-failure" @click="opsStore.clearFailures()" title="Click to dismiss">{{ opsStore.recentFailures[0]?.error }}</button>
       <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
       <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>
@@ -198,6 +198,12 @@ async function syncAll() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Reset <button> browser defaults so it looks like inline text */
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
 
 .disconnect-msg {

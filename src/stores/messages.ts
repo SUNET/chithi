@@ -602,7 +602,9 @@ export const useMessagesStore = defineStore("messages", () => {
       console.warn(`op-failed: ${p.op_type} on account ${p.account_id}: ${p.error}`);
       // Only re-fetch if the failed op belongs to the currently active account
       if (p.account_id === accountsStore.activeAccountId) {
-        fetchMessages();
+        void fetchMessages().catch((err) => {
+          console.error("Failed to reconcile messages after op-failed:", err);
+        });
       }
     },
   )
