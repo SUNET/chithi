@@ -88,6 +88,7 @@ async function unsubscribeThisCalendar() {
   const cal = calendarStore.calendars.find((c) => c.id === calendarId);
   const calName = cal?.name || "Calendar";
   closeContextMenu();
+  if (!confirm(`Unsubscribe from "${calName}"? Local events will be removed.`)) return;
   const toastId = showToast(`Unsubscribing from "${calName}"...`, "info", 0);
   try {
     await calendarStore.unsubscribeCalendar(calendarId);

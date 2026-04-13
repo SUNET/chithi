@@ -110,10 +110,15 @@ pub fn get_calendar(conn: &Connection, id: &str) -> Result<Calendar> {
 }
 
 pub fn set_calendar_subscribed(conn: &Connection, id: &str, subscribed: bool) -> Result<()> {
-    conn.execute(
+    let rows = conn.execute(
         "UPDATE calendars SET is_subscribed = ?1 WHERE id = ?2",
         params![subscribed, id],
     )?;
+    if rows == 0 {
+        return Err(crate::error::Error::Other(format!(
+            "Calendar not found: {}", id
+        )));
+    }
     Ok(())
 }
 
@@ -490,6 +495,7 @@ mod tests {
                 color TEXT DEFAULT '#4285f4',
                 is_default INTEGER DEFAULT 0,
                 remote_id TEXT,
+                is_subscribed INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(account_id, remote_id)
             );
             CREATE TABLE calendar_events (
@@ -824,5 +830,69 @@ mod tests {
         assert!(get_event(&conn, "e1").is_ok());
         assert!(get_event(&conn, "e2").is_ok());
         assert!(get_event(&conn, "e3").is_err(), "C should be deleted");
+    }
+
+    fn make_cal(account_id: &str, name: &str, is_default: bool) -> NewCalendar {
+        NewCalendar {
+            account_id: account_id.to_string(),
+            name: name.to_string(),
+            color: "#4285f4".to_string(),
+            is_default,
+        }
+    }
+
+    #[test]
+    fn test_set_calendar_subscribed() {
+        let conn = setup_db();
+        insert_calendar(&conn, "cal1", &make_cal("acc1", "Work", true)).unwrap();
+
+        let cal = get_calendar(&conn, "cal1").unwrap();
+        assert!(cal.is_subscribed);
+
+        set_calendar_subscribed(&conn, "cal1", false).unwrap();
+        let cal = get_calendar(&conn, "cal1").unwrap();
+        assert!(!cal.is_subscribed);
+
+        set_calendar_subscribed(&conn, "cal1", true).unwrap();
+        let cal = get_calendar(&conn, "cal1").unwrap();
+        assert!(cal.is_subscribed);
+    }
+
+    #[test]
+    fn test_set_calendar_subscribed_not_found() {
+        let conn = setup_db();
+        let result = set_calendar_subscribed(&conn, "nonexistent", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_calendar_events() {
+        let conn = setup_db();
+        insert_calendar(&conn, "cal1", &make_cal("acc1", "Work", true)).unwrap();
+        insert_calendar(&conn, "cal2", &make_cal("acc1", "Personal", false)).unwrap();
+        let mut e1 = make_event("e1", "Event 1", None);
+        e1.calendar_id = "cal1".to_string();
+        insert_event(&conn, &e1).unwrap();
+        let mut e2 = make_event("e2", "Event 2", None);
+        e2.calendar_id = "cal1".to_string();
+        insert_event(&conn, &e2).unwrap();
+        let mut e3 = make_event("e3", "Event 3", None);
+        e3.calendar_id = "cal2".to_string();
+        insert_event(&conn, &e3).unwrap();
+
+        let deleted = delete_calendar_events(&conn, "cal1").unwrap();
+        assert_eq!(deleted, 2);
+
+        assert!(get_event(&conn, "e3").is_ok());
+        assert!(get_event(&conn, "e1").is_err());
+        assert!(get_event(&conn, "e2").is_err());
+    }
+
+    #[test]
+    fn test_delete_calendar_events_empty() {
+        let conn = setup_db();
+        insert_calendar(&conn, "cal1", &make_cal("acc1", "Work", true)).unwrap();
+        let deleted = delete_calendar_events(&conn, "cal1").unwrap();
+        assert_eq!(deleted, 0);
     }
 }

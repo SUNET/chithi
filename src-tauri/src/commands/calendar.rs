@@ -2177,7 +2177,11 @@ async fn sync_calendars_graph(
         ).ok())
         .unwrap_or_default();
 
-    // Check if the default calendar is unsubscribed
+    // Graph sync currently maps all events to the default calendar.
+    // Unlike JMAP/Google/CalDAV, there's no per-calendar event fetch,
+    // so we only check the default calendar's subscription status.
+    // TODO: when multi-calendar Graph support is added, use the same
+    // HashSet<String> pattern as the other sync paths.
     let default_subscribed = if !default_cal_local_id.is_empty() {
         let cal = db::calendar::get_calendar(&conn, &default_cal_local_id)?;
         cal.is_subscribed
