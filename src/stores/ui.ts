@@ -23,8 +23,12 @@ export const useUiStore = defineStore("ui", () => {
   );
 
   // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
+  const VALID_WEEK_STARTS = [0, 1, 6];
   const weekStartDay = ref<number>(
-    parseInt(localStorage.getItem("chithi-week-start-day") || "0", 10),
+    (() => {
+      const stored = parseInt(localStorage.getItem("chithi-week-start-day") || "0", 10);
+      return VALID_WEEK_STARTS.includes(stored) ? stored : 0;
+    })(),
   );
 
   function toggleReader() {
@@ -62,6 +66,7 @@ export const useUiStore = defineStore("ui", () => {
   }
 
   function setWeekStartDay(day: number) {
+    if (!VALID_WEEK_STARTS.includes(day)) return;
     weekStartDay.value = day;
     localStorage.setItem("chithi-week-start-day", String(day));
   }
