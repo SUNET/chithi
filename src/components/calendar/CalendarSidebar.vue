@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Calendar } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
+import { showToast, dismissToast } from "@/lib/toast";
 import * as api from "@/lib/tauri";
 
 const emit = defineEmits<{
@@ -33,12 +34,22 @@ function getCalendarColor(color: string): string {
 
 function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
   event.preventDefault();
+  event.stopPropagation();
   contextMenu.value = { x: event.clientX, y: event.clientY, calendarId: calId, accountId };
 }
 
 function closeContextMenu() {
   contextMenu.value = null;
 }
+
+function onKeyDown(e: KeyboardEvent) {
+  if (e.key === "Escape" && contextMenu.value) {
+    closeContextMenu();
+  }
+}
+
+onMounted(() => document.addEventListener("keydown", onKeyDown));
+onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
 
 const dropTargetCalendarId = ref<string | null>(null);
 
@@ -69,6 +80,24 @@ function onCalendarItemDrop(cal: Calendar) {
     attendeesJson: ev.attendees_json,
     organizerEmail: ev.organizer_email,
   });
+}
+
+async function unsubscribeThisCalendar() {
+  if (!contextMenu.value) return;
+  const calendarId = contextMenu.value.calendarId;
+  const cal = calendarStore.calendars.find((c) => c.id === calendarId);
+  const calName = cal?.name || "Calendar";
+  closeContextMenu();
+  const toastId = showToast(`Unsubscribing from "${calName}"...`, "info", 0);
+  try {
+    await calendarStore.unsubscribeCalendar(calendarId);
+    dismissToast(toastId);
+    showToast(`Unsubscribed from "${calName}"`, "success");
+  } catch (e) {
+    dismissToast(toastId);
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to unsubscribe: ${msg}`, "error", 5000);
+  }
 }
 
 async function syncThisCalendar() {
@@ -126,12 +155,15 @@ async function syncThisCalendar() {
 
     <!-- Right-click context menu -->
     <Teleport to="body">
+      <div v-if="contextMenu" class="cal-menu-overlay" @click="closeContextMenu" @contextmenu.prevent="closeContextMenu"></div>
       <div
         v-if="contextMenu"
         class="cal-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+        @keydown.esc="closeContextMenu"
       >
-        <button class="ctx-item" @click="syncThisCalendar" data-testid="calendar-sync">Sync this calendar</button>
+        <button class="ctx-item" data-testid="calendar-sync" @click="syncThisCalendar">Sync this calendar</button>
+        <button class="ctx-item" data-testid="calendar-unsubscribe" @click="unsubscribeThisCalendar">Unsubscribe</button>
       </div>
     </Teleport>
   </div>
@@ -221,6 +253,15 @@ async function syncThisCalendar() {
 </style>
 
 <style>
+.cal-menu-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9998;
+}
+
 .cal-context-menu {
   position: fixed;
   z-index: 9999;

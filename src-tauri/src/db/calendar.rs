@@ -15,6 +15,7 @@ pub struct Calendar {
     pub color: String,
     pub is_default: bool,
     pub remote_id: Option<String>,
+    pub is_subscribed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +63,7 @@ pub struct Attendee {
 
 pub fn list_calendars(conn: &Connection, account_id: &str) -> Result<Vec<Calendar>> {
     let mut stmt = conn.prepare(
-        "SELECT id, account_id, name, color, is_default, remote_id
+        "SELECT id, account_id, name, color, is_default, remote_id, is_subscribed
          FROM calendars
          WHERE account_id = ?1
          ORDER BY is_default DESC, name ASC",
@@ -76,6 +77,7 @@ pub fn list_calendars(conn: &Connection, account_id: &str) -> Result<Vec<Calenda
                 color: row.get(3)?,
                 is_default: row.get(4)?,
                 remote_id: row.get(5)?,
+                is_subscribed: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -84,7 +86,7 @@ pub fn list_calendars(conn: &Connection, account_id: &str) -> Result<Vec<Calenda
 
 pub fn get_calendar(conn: &Connection, id: &str) -> Result<Calendar> {
     conn.query_row(
-        "SELECT id, account_id, name, color, is_default, remote_id
+        "SELECT id, account_id, name, color, is_default, remote_id, is_subscribed
          FROM calendars WHERE id = ?1",
         params![id],
         |row| {
@@ -95,6 +97,7 @@ pub fn get_calendar(conn: &Connection, id: &str) -> Result<Calendar> {
                 color: row.get(3)?,
                 is_default: row.get(4)?,
                 remote_id: row.get(5)?,
+                is_subscribed: row.get(6)?,
             })
         },
     )
@@ -104,6 +107,22 @@ pub fn get_calendar(conn: &Connection, id: &str) -> Result<Calendar> {
         }
         other => crate::error::Error::Database(other),
     })
+}
+
+pub fn set_calendar_subscribed(conn: &Connection, id: &str, subscribed: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE calendars SET is_subscribed = ?1 WHERE id = ?2",
+        params![subscribed, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_calendar_events(conn: &Connection, calendar_id: &str) -> Result<usize> {
+    let count = conn.execute(
+        "DELETE FROM calendar_events WHERE calendar_id = ?1",
+        params![calendar_id],
+    )?;
+    Ok(count)
 }
 
 pub fn insert_calendar(conn: &Connection, id: &str, calendar: &NewCalendar) -> Result<()> {

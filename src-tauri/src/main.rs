@@ -86,6 +86,7 @@ fn main() {
             commands::calendar::create_calendar,
             commands::calendar::update_calendar,
             commands::calendar::delete_calendar,
+            commands::calendar::unsubscribe_calendar,
             commands::calendar::get_events,
             commands::calendar::create_event,
             commands::calendar::update_event,

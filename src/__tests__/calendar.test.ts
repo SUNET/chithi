@@ -55,7 +55,7 @@ function setupAccounts() {
 function makeCalendar(id: string, name: string, remoteId: string | null = null) {
   return {
     id, account_id: "acc1", name, color: "#4285f4",
-    is_default: true, remote_id: remoteId,
+    is_default: true, remote_id: remoteId, is_subscribed: true,
   };
 }
 
