@@ -600,12 +600,12 @@ export const useMessagesStore = defineStore("messages", () => {
       if (disposed) return;
       const p = event.payload;
       console.warn(`op-failed: ${p.op_type} on account ${p.account_id}: ${p.error}`);
-      // Only re-fetch if the failed op belongs to the currently active account
-      if (p.account_id === accountsStore.activeAccountId) {
-        void fetchMessages().catch((err) => {
-          console.error("Failed to reconcile messages after op-failed:", err);
-        });
-      }
+      // Always re-fetch to reconcile optimistic state — the failed op may
+      // affect the currently visible folder even if the active account has
+      // changed since the op was dispatched.
+      void fetchMessages().catch((err) => {
+        console.error("Failed to reconcile messages after op-failed:", err);
+      });
     },
   )
     .then((unlisten) => {

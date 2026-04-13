@@ -21,10 +21,10 @@ function statusIcon(status: string): string {
 
 <template>
   <Transition name="panel-slide">
-    <div v-if="uiStore.operationsPanelOpen" class="operations-panel">
+    <div v-if="uiStore.operationsPanelOpen" class="operations-panel" data-testid="operations-panel">
       <div class="panel-header">
         <span class="panel-title">Operations</span>
-        <button class="panel-close" @click="uiStore.toggleOperationsPanel()" title="Close">
+        <button class="panel-close" data-testid="ops-panel-close" @click="uiStore.toggleOperationsPanel()" title="Close">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
           </svg>
@@ -42,6 +42,7 @@ function statusIcon(status: string): string {
           :key="op.id"
           class="op-row"
           :class="op.status"
+          data-testid="op-row"
         >
           <span class="op-icon" :class="statusIcon(op.status)">
             <!-- Spinner -->

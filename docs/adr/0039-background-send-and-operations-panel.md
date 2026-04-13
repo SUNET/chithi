@@ -92,9 +92,16 @@ A collapsible panel between the main content area and the status bar, showing al
 - Failed sends are clearly surfaced with error details
 
 ### Negative
-- If the background send fails, the compose window is already closed. The user sees an error toast but cannot retry from the compose window. They would need to compose a new message. (Future: store failed sends in outbox for retry)
+- If the background send fails, the compose window is already closed. The user sees an error toast but cannot retry from the compose window. The failed message is persisted in the outbox table for future retry, but no automatic retry mechanism is implemented yet.
 - The operations panel adds visual complexity to the UI
 - Toast notifications from the main window may not be visible if the user has switched to another application
+
+### Send persistence
+
+The built `raw_message` is base64-encoded and saved to the `outbox` table (action_type = "send") **before** the background task is spawned. This ensures the message survives an app crash during sending:
+- On success: the outbox entry is deleted via `mark_completed()`
+- On failure: the outbox entry is marked failed via `mark_failed()` and the `send-failed` event is emitted
+- On crash: the outbox entry remains with status "pending" for future replay
 
 ### Files modified
 

@@ -136,7 +136,11 @@ onMounted(async () => {
   // network sync here makes the view appear empty until sync finishes.
   await calendarStore.fetchCalendars();
   await calendarStore.fetchEvents();
-  // Initial sync + start independent interval (5 min)
+  // Initial sync + start independent interval (5 min).
+  // The interval is intentionally NOT cleared on unmount — it keeps
+  // calendars fresh in the background for the lifetime of the app,
+  // matching how mail sync runs continuously. The calendar store's
+  // stopCalendarSync() is available if explicit teardown is needed.
   calendarStore.syncCalendars().catch((e) => {
     console.error("Calendar sync error:", e);
   });

@@ -64,7 +64,7 @@ impl DbPool {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
         let guard = self.readers[idx]
             .lock()
-            .expect("reader mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         PooledReader { guard }
     }
 }

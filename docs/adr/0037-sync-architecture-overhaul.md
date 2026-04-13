@@ -95,9 +95,17 @@ Contact sync was manual-only. Now runs on a 30-minute interval (matching Thunder
 - Users can see all background operations in the operations panel
 
 ### Negative
-- `unsafe impl Send for ImapState` is required because `imap` crate's `Session` contains a `Receiver<UnsolicitedResponse>` that isn't `Sync`. This is safe because the state is only ever accessed from one `spawn_blocking` call at a time.
-- Optimistic UI means the frontend may briefly show stale state if a server operation fails and reconciliation hasn't run yet
-- The `outbox` table doesn't have a dedicated `replay_order` column (uses the existing schema to avoid a migration); replay order is computed at read time
+- `unsafe impl Send for ImapState` is required because `imap` crate's `Session` contains a `Receiver<UnsolicitedResponse>` that isn't `Sync`. This is safe because the state is only ever moved into `spawn_blocking` for single-threaded access — never shared. A `# Safety` doc-comment on the struct documents this invariant.
+- Optimistic UI means the frontend may briefly show stale state if a server operation fails. On failure, `op-failed` triggers an immediate re-fetch from the DB, and the next sync reconciles with the server. JMAP and Graph failures are also persisted to the offline outbox for retry.
+- The `outbox` table doesn't have a dedicated `replay_order` column (uses the existing schema to avoid a migration); replay order is computed at read time with a stable sort (by action type priority, then by insertion order)
+- The DB reader pool recovers from mutex poisoning via `unwrap_or_else(|e| e.into_inner())` rather than panicking, which keeps the app running but may use a connection whose previous holder panicked mid-transaction
+
+### Resilience features
+
+- **Worker reconnect backoff**: Consecutive IMAP connection failures trigger exponential backoff (1s, 2s, 4s... max 60s) to avoid burning OAuth token refresh rate limits
+- **Worker init failure**: If a worker fails to initialize (e.g., account deleted), it emits an `op-failed` event before exiting so the UI can surface the error
+- **SyncAll coalescing**: When multiple sync requests are batched, the LAST `current_folder` value is kept (matching the user's most recent navigation)
+- **Background send persistence**: Outgoing emails are saved to the outbox table before the background SMTP/JMAP task runs, surviving app crashes during send
 
 ### Module structure
 

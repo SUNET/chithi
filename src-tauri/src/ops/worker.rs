@@ -21,17 +21,26 @@ use super::queue::{MailOp, OpEntry};
 ///
 /// For JMAP and Graph accounts the worker delegates to async operations
 /// directly (no persistent connection needed — they use HTTP).
+///
 /// Wrapper around ImapConnection + selected folder state.
 /// Stored separately so it can be moved into `spawn_blocking` without
 /// requiring the whole `AccountWorker` to be `Send + Sync`.
+///
+/// # Safety
+///
+/// `ImapState` is manually marked `Send` because `ImapConnection` contains
+/// a `Receiver<UnsolicitedResponse>` which is `!Sync`. However, we guarantee
+/// exclusive single-threaded access: the value is always moved (not shared)
+/// into a `tokio::task::spawn_blocking` closure, used within that closure,
+/// and then moved back. It is never accessed concurrently from multiple
+/// threads.
 struct ImapState {
     conn: ImapConnection,
     selected_folder: Option<String>,
 }
 
-// ImapConnection contains a `Receiver<UnsolicitedResponse>` which is not Sync,
-// but we only ever access it from one thread at a time (via spawn_blocking).
-// SAFETY: The ImapState is always moved into spawn_blocking (single-threaded access).
+// SAFETY: see doc-comment on `ImapState` above. The value is only ever
+// moved into `spawn_blocking` for single-threaded access — never shared.
 unsafe impl Send for ImapState {}
 
 pub struct AccountWorker {
@@ -45,6 +54,9 @@ pub struct AccountWorker {
     last_used: Instant,
     /// Mail protocol for this account ("imap", "jmap", "graph").
     protocol: String,
+    /// Consecutive connection failures — used for exponential backoff to
+    /// avoid burning OAuth token refreshes in a tight reconnect loop.
+    consecutive_failures: u32,
 }
 
 impl AccountWorker {
@@ -63,6 +75,7 @@ impl AccountWorker {
             imap_config: None,
             last_used: Instant::now(),
             protocol: String::new(),
+            consecutive_failures: 0,
         }
     }
 
@@ -76,6 +89,12 @@ impl AccountWorker {
                 "Worker for account {} failed to init: {}",
                 self.account_id,
                 e
+            );
+            emit_op_failed(
+                &self.app,
+                &self.account_id,
+                "worker_init",
+                &format!("Worker failed to initialize: {}", e),
             );
             return;
         }
@@ -393,9 +412,11 @@ impl AccountWorker {
         if result.is_ok() {
             self.imap_state = Some(state_back);
             self.last_used = Instant::now();
+            self.consecutive_failures = 0;
         } else {
             // Connection is likely dead — drop it so next op reconnects
             log::warn!("IMAP op failed, dropping connection for reconnect");
+            self.consecutive_failures += 1;
             state_back.conn.logout();
         }
 
@@ -404,10 +425,25 @@ impl AccountWorker {
 
     /// Ensure the persistent IMAP connection is alive.
     /// Reconnects if the connection is stale (>5 min) or missing.
+    /// Uses exponential backoff on consecutive failures to avoid burning
+    /// OAuth token refreshes in a tight reconnect loop.
     async fn ensure_imap_connection(&mut self) -> Result<()> {
         let stale = self.last_used.elapsed() > std::time::Duration::from_secs(5 * 60);
 
         if self.imap_state.is_none() || stale {
+            // Exponential backoff: 1s, 2s, 4s, 8s, ... max 60s
+            if self.consecutive_failures > 0 {
+                let delay_secs = std::cmp::min(
+                    1u64 << (self.consecutive_failures - 1),
+                    60,
+                );
+                log::info!(
+                    "Worker: backoff {}s before reconnect (failures={}) for account {}",
+                    delay_secs, self.consecutive_failures, self.account_id
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+
             // Drop old connection if stale
             if let Some(state) = self.imap_state.take() {
                 let _ = tokio::task::spawn_blocking(move || state.conn.logout()).await;
@@ -429,6 +465,7 @@ impl AccountWorker {
                 selected_folder: None,
             });
             self.last_used = Instant::now();
+            self.consecutive_failures = 0;
             log::info!(
                 "Worker: IMAP connection established for account {}",
                 self.account_id

@@ -602,9 +602,12 @@ pub async fn sync_calendars(
     // sync tokens to force a full sync that reconciles server-side deletions.
     if force_full_sync.unwrap_or(false) {
         let conn = state.db.writer().await;
+        // Escape SQL LIKE metacharacters in account_id to prevent
+        // unintended pattern matching if the id contains % or _.
+        let escaped_id = account_id.replace('%', "\\%").replace('_', "\\_");
         conn.execute(
-            "DELETE FROM app_metadata WHERE key LIKE ?1",
-            rusqlite::params![format!("google_sync_token_{account_id}_%")],
+            "DELETE FROM app_metadata WHERE key LIKE ?1 ESCAPE '\\'",
+            rusqlite::params![format!("google_sync_token_{escaped_id}_%")],
         ).ok();
         log::info!("sync_calendars: cleared sync tokens for full sync (account={})", account_id);
     }
@@ -2273,10 +2276,11 @@ pub fn auto_process_calendar_emails(
         return;
     }
 
-    let mut calendar_changed = false;
+    // Phase 1: read-only — gather all invites from new messages.
+    // Uses only the reader connection (no writer lock needed yet).
+    let mut all_invites: Vec<ParsedInvite> = Vec::new();
 
     for msg_id in new_message_ids {
-        // Look up the maildir path for this message
         let maildir_path = {
             let conn = db.reader();
             match db::messages::get_message_metadata(&conn, account_id, msg_id) {
@@ -2295,68 +2299,73 @@ pub fn auto_process_calendar_emails(
         };
 
         let invites = ical::parse_ical_from_email(&raw);
-        if invites.is_empty() {
-            continue;
-        }
+        all_invites.extend(invites);
+    }
 
-        for invite in &invites {
-            match invite.method.to_uppercase().as_str() {
-                "REPLY" => {
-                    // Update attendee status on organizer's local event
-                    let conn_w = tokio::runtime::Handle::current()
-                        .block_on(db.writer());
-                    if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
-                        .ok()
-                        .flatten()
-                    {
-                        for attendee in &invite.attendees {
-                            if let Some(ref att_json) = event.attendees_json {
-                                if let Ok(mut attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
-                                    let mut updated = false;
-                                    for att in attendees.iter_mut() {
-                                        if att["email"].as_str() == Some(&attendee.email) {
-                                            att["status"] = serde_json::json!(&attendee.status);
-                                            updated = true;
-                                        }
+    if all_invites.is_empty() {
+        return;
+    }
+
+    // Phase 2: acquire the writer ONCE and batch all calendar updates.
+    let conn_w = tokio::runtime::Handle::current().block_on(db.writer());
+    let mut calendar_changed = false;
+
+    for invite in &all_invites {
+        match invite.method.to_uppercase().as_str() {
+            "REPLY" => {
+                // Update attendee status on organizer's local event
+                if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
+                    .ok()
+                    .flatten()
+                {
+                    for attendee in &invite.attendees {
+                        if let Some(ref att_json) = event.attendees_json {
+                            if let Ok(mut attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+                                let mut updated = false;
+                                for att in attendees.iter_mut() {
+                                    if att["email"].as_str() == Some(&attendee.email) {
+                                        att["status"] = serde_json::json!(&attendee.status);
+                                        updated = true;
                                     }
-                                    if updated {
-                                        let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
-                                        conn_w.execute(
-                                            "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
-                                            rusqlite::params![updated_json, event.id],
-                                        ).ok();
-                                        log::info!(
-                                            "auto_process: {} responded '{}' to event '{}'",
-                                            attendee.email, attendee.status, event.title
-                                        );
-                                        calendar_changed = true;
-                                    }
+                                }
+                                if updated {
+                                    let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
+                                    conn_w.execute(
+                                        "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+                                        rusqlite::params![updated_json, event.id],
+                                    ).ok();
+                                    log::info!(
+                                        "auto_process: {} responded '{}' to event '{}'",
+                                        attendee.email, attendee.status, event.title
+                                    );
+                                    calendar_changed = true;
                                 }
                             }
                         }
                     }
                 }
-                "CANCEL" => {
-                    // Delete cancelled event
-                    let conn_w = tokio::runtime::Handle::current()
-                        .block_on(db.writer());
-                    if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
-                        .ok()
-                        .flatten()
-                    {
-                        if db::calendar::delete_event(&conn_w, &event.id).is_ok() {
-                            log::info!(
-                                "auto_process: deleted cancelled event '{}' (UID={})",
-                                event.title, invite.uid
-                            );
-                            calendar_changed = true;
-                        }
+            }
+            "CANCEL" => {
+                // Delete cancelled event
+                if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
+                    .ok()
+                    .flatten()
+                {
+                    if db::calendar::delete_event(&conn_w, &event.id).is_ok() {
+                        log::info!(
+                            "auto_process: deleted cancelled event '{}' (UID={})",
+                            event.title, invite.uid
+                        );
+                        calendar_changed = true;
                     }
                 }
-                _ => {} // REQUEST etc. handled by user interaction
             }
+            _ => {} // REQUEST etc. handled by user interaction
         }
     }
+
+    // Release writer before emitting events
+    drop(conn_w);
 
     if calendar_changed {
         use tauri::Emitter;

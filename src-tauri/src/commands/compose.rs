@@ -94,6 +94,22 @@ pub async fn send_message(
         "subject": subject_display,
     })).ok();
 
+    // --- Persist to outbox before spawning background send ---
+    // This ensures the message survives a crash during sending.
+    let raw_message_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&raw_message)
+    };
+    let send_payload = serde_json::json!({
+        "raw_message_b64": raw_message_b64,
+        "subject": subject_display,
+    });
+    let outbox_id = {
+        let conn = state.db.writer().await;
+        crate::ops::offline::queue_offline_op(&conn, &account_id, "send", &send_payload)?
+    };
+    log::info!("Persisted send to outbox (id={}) for account {}", outbox_id, account_id);
+
     // --- Background: actual network send ---
     // The command returns Ok(()) here so the compose window can close.
     let app_bg = app.clone();
@@ -143,6 +159,11 @@ pub async fn send_message(
         match result {
             Ok(()) => {
                 log::info!("Message sent successfully for account {}", account_id_bg);
+                // Remove from outbox on success
+                let conn = db_bg.writer().await;
+                if let Err(e) = crate::ops::offline::mark_completed(&conn, outbox_id) {
+                    log::warn!("Failed to remove sent message from outbox: {}", e);
+                }
                 app_bg.emit("send-complete", serde_json::json!({
                     "account_id": account_id_bg,
                     "subject": subject_bg,
@@ -158,6 +179,9 @@ pub async fn send_message(
             }
             Err(e) => {
                 log::error!("Send failed for account {}: {}", account_id_bg, e);
+                // Leave the message in the outbox for retry (mark as failed)
+                let conn = db_bg.writer().await;
+                let _ = crate::ops::offline::mark_failed(&conn, outbox_id, &e.to_string());
                 app_bg.emit("send-failed", serde_json::json!({
                     "account_id": account_id_bg,
                     "subject": subject_bg,

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
 import { useOpsStore } from "@/stores/ops";
 import { useUiStore } from "@/stores/ui";
@@ -21,24 +22,40 @@ const lastSyncTime = ref<Date | null>(null);
 const connectionStatus = ref<"connected" | "disconnected" | "reconnecting">("connected");
 const syncError = ref<string | null>(null);
 
+const unlistenFns: UnlistenFn[] = [];
+
 onMounted(async () => {
   await opsStore.initEventListeners();
 
-  await listen("idle-disconnected", () => {
-    connectionStatus.value = "disconnected";
-  });
-  await listen("idle-reconnected", () => {
-    connectionStatus.value = "connected";
-    syncError.value = null;
-  });
-  await listen<{ error: string }>("sync-error", (event) => {
-    connectionStatus.value = "disconnected";
-    syncError.value = event.payload.error;
-  });
-  await listen("sync-complete", () => {
-    connectionStatus.value = "connected";
-    syncError.value = null;
-  });
+  unlistenFns.push(
+    await listen("idle-disconnected", () => {
+      connectionStatus.value = "disconnected";
+    }),
+  );
+  unlistenFns.push(
+    await listen("idle-reconnected", () => {
+      connectionStatus.value = "connected";
+      syncError.value = null;
+    }),
+  );
+  unlistenFns.push(
+    await listen<{ error: string }>("sync-error", (event) => {
+      connectionStatus.value = "disconnected";
+      syncError.value = event.payload.error;
+    }),
+  );
+  unlistenFns.push(
+    await listen("sync-complete", () => {
+      connectionStatus.value = "connected";
+      syncError.value = null;
+    }),
+  );
+});
+
+onUnmounted(() => {
+  for (const unlisten of unlistenFns) {
+    unlisten();
+  }
 });
 
 const lastSyncLabel = computed(() => {
@@ -104,6 +121,7 @@ async function syncAll() {
         class="ops-toggle-btn"
         :class="{ active: uiStore.operationsPanelOpen }"
         title="Operations"
+        data-testid="ops-toggle-btn"
         @click="uiStore.toggleOperationsPanel()"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

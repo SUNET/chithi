@@ -35,6 +35,7 @@ export const useOpsStore = defineStore("ops", () => {
   let disposed = false;
   let stopOpFailed: null | (() => void) = null;
   let stopOfflineChanged: null | (() => void) = null;
+  const timerIds: ReturnType<typeof setTimeout>[] = [];
 
   async function initEventListeners() {
     if (initialized.value) return;
@@ -58,11 +59,11 @@ export const useOpsStore = defineStore("ops", () => {
           },
         ];
         // Auto-clear old failures after 60 seconds
-        setTimeout(() => {
+        timerIds.push(setTimeout(() => {
           failedOps.value = failedOps.value.filter(
             (op) => Date.now() - op.timestamp < 60_000,
           );
-        }, 60_000);
+        }, 60_000));
       });
 
       // Listen for dead offline operations (exceeded max retries)
@@ -85,6 +86,10 @@ export const useOpsStore = defineStore("ops", () => {
     disposed = true;
     stopOpFailed?.();
     stopOfflineChanged?.();
+    for (const id of timerIds) {
+      clearTimeout(id);
+    }
+    timerIds.length = 0;
   });
 
   return {

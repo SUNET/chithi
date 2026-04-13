@@ -21,7 +21,7 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     let mut pending_deletes: Option<HashMap<String, Vec<u32>>> = None;
     let mut pending_moves: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new(); // target -> by_folder
     let mut pending_flags: HashMap<(Vec<String>, bool), HashMap<String, Vec<u32>>> = HashMap::new();
-    let mut has_sync_all = false;
+    let mut sync_all_folder: Option<Option<String>> = None;
 
     for entry in ops {
         match entry.op {
@@ -48,13 +48,9 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                 merge_by_folder(flag_ops, by_folder);
             }
             MailOp::SyncAll { current_folder } => {
-                if !has_sync_all {
-                    has_sync_all = true;
-                    result.push(OpEntry {
-                        op: MailOp::SyncAll { current_folder },
-                        priority: OpPriority::Sync,
-                    });
-                }
+                // Always keep the LAST current_folder value — the user may
+                // have navigated between folders while ops were queued.
+                sync_all_folder = Some(current_folder);
             }
             // Pass through non-coalescable ops
             other => {
@@ -64,6 +60,14 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                 });
             }
         }
+    }
+
+    // Emit the single coalesced SyncAll with the last folder value
+    if let Some(current_folder) = sync_all_folder {
+        result.push(OpEntry {
+            op: MailOp::SyncAll { current_folder },
+            priority: OpPriority::Sync,
+        });
     }
 
     // Emit coalesced flag operations
@@ -190,18 +194,25 @@ mod tests {
             },
             OpEntry {
                 op: MailOp::SyncAll {
-                    current_folder: None,
+                    current_folder: Some("Sent".into()),
                 },
                 priority: OpPriority::Sync,
             },
         ];
 
         let result = coalesce(ops);
-        let sync_count = result
+        let syncs: Vec<_> = result
             .iter()
             .filter(|e| matches!(e.op, MailOp::SyncAll { .. }))
-            .count();
-        assert_eq!(sync_count, 1);
+            .collect();
+        assert_eq!(syncs.len(), 1);
+        // Should keep the LAST current_folder value
+        match &syncs[0].op {
+            MailOp::SyncAll { current_folder } => {
+                assert_eq!(current_folder.as_deref(), Some("Sent"));
+            }
+            _ => panic!("Expected SyncAll"),
+        }
     }
 
     #[test]
