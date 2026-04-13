@@ -88,15 +88,29 @@ impl AccountWorker {
             }
             let ops = coalesce(batch);
 
+            let mut sync_succeeded = false;
             for entry in ops {
-                if let Err(e) = self.execute(entry.op).await {
-                    log::error!(
-                        "Worker op failed for account {}: {}",
-                        self.account_id,
-                        e
-                    );
-                    // Don't break the loop — continue processing remaining ops
+                let is_sync = matches!(entry.op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+                match self.execute(entry.op).await {
+                    Ok(()) => {
+                        if is_sync {
+                            sync_succeeded = true;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Worker op failed for account {}: {}",
+                            self.account_id,
+                            e
+                        );
+                        // Don't break the loop — continue processing remaining ops
+                    }
                 }
+            }
+
+            // After a successful sync, replay any pending offline operations
+            if sync_succeeded {
+                self.replay_offline_ops().await;
             }
         }
 
@@ -114,9 +128,110 @@ impl AccountWorker {
         Ok(())
     }
 
+    /// Replay pending offline operations after a successful sync.
+    async fn replay_offline_ops(&mut self) {
+        let pending = {
+            let conn = self.db.reader();
+            match super::offline::get_pending_ops(&conn, &self.account_id) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    log::error!("Failed to read offline ops for {}: {}", self.account_id, e);
+                    return;
+                }
+            }
+        };
+
+        if pending.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "Replaying {} offline operations for account {}",
+            pending.len(),
+            self.account_id
+        );
+
+        for entry in &pending {
+            if super::offline::is_dead(entry) {
+                let conn = self.db.writer().await;
+                let _ = super::offline::mark_dead(&conn, entry.id);
+                log::warn!(
+                    "Offline op {} ({}) exceeded max retries, marking dead",
+                    entry.id,
+                    entry.action_type
+                );
+                self.app
+                    .emit(
+                        "offline-queue-changed",
+                        serde_json::json!({
+                            "account_id": self.account_id,
+                            "dead_op_id": entry.id,
+                            "action_type": entry.action_type,
+                        }),
+                    )
+                    .ok();
+                continue;
+            }
+
+            let Some(op) = super::offline::outbox_to_mail_op(entry) else {
+                log::warn!(
+                    "Failed to deserialize offline op {} ({}), skipping",
+                    entry.id,
+                    entry.action_type
+                );
+                continue;
+            };
+
+            // Execute the replayed op directly (not through execute() to avoid
+            // re-queuing to outbox on failure — we handle retries here)
+            let result = match self.protocol.as_str() {
+                "imap" => self.execute_imap(op).await,
+                "jmap" => self.execute_jmap(op).await,
+                "graph" => self.execute_graph(op).await,
+                _ => Ok(()),
+            };
+
+            match result {
+                Ok(()) => {
+                    let conn = self.db.writer().await;
+                    let _ = super::offline::mark_completed(&conn, entry.id);
+                    log::info!(
+                        "Replayed offline op {} ({}) successfully",
+                        entry.id,
+                        entry.action_type
+                    );
+                }
+                Err(e) => {
+                    let conn = self.db.writer().await;
+                    let _ = super::offline::mark_failed(&conn, entry.id, &e.to_string());
+                    log::warn!(
+                        "Replay of offline op {} ({}) failed (attempt {}): {}",
+                        entry.id,
+                        entry.action_type,
+                        entry.retry_count + 1,
+                        e
+                    );
+                    // Stop replaying on first failure — connection is likely broken
+                    break;
+                }
+            }
+        }
+    }
+
     /// Execute a single operation, dispatching by protocol.
+    /// On failure of user operations, queues them to the offline outbox for retry.
     async fn execute(&mut self, op: MailOp) -> Result<()> {
-        match &op {
+        let is_sync = matches!(op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+
+        // Serialize the op for outbox before executing (we move op into execute_*)
+        let outbox_data = if !is_sync {
+            super::offline::mail_op_to_outbox(&op)
+                .map(|(t, p)| (t.to_string(), p))
+        } else {
+            None
+        };
+
+        let result = match &op {
             MailOp::SyncAll { .. } | MailOp::SyncFolder { .. } => {
                 self.execute_sync(op).await
             }
@@ -129,7 +244,46 @@ impl AccountWorker {
                     Ok(())
                 }
             },
+        };
+
+        // On failure of user operations, queue to outbox for later replay
+        if let Err(ref e) = result {
+            if let Some((action_type, payload)) = outbox_data {
+                let conn = self.db.writer().await;
+                match super::offline::queue_offline_op(
+                    &conn,
+                    &self.account_id,
+                    &action_type,
+                    &payload,
+                ) {
+                    Ok(id) => {
+                        log::info!(
+                            "Queued failed {} op to outbox (id={}) for account {}: {}",
+                            action_type,
+                            id,
+                            self.account_id,
+                            e
+                        );
+                        emit_op_failed(
+                            &self.app,
+                            &self.account_id,
+                            &action_type,
+                            &format!("{} (will retry)", e),
+                        );
+                    }
+                    Err(db_err) => {
+                        log::error!(
+                            "Failed to queue offline op for account {}: {}",
+                            self.account_id,
+                            db_err
+                        );
+                        emit_op_failed(&self.app, &self.account_id, &action_type, &e.to_string());
+                    }
+                }
+            }
         }
+
+        result
     }
 
     /// Delegate sync to the existing sync engine.
