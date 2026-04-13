@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
 import type { Calendar } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 import { showToast, dismissToast } from "@/lib/toast";
@@ -19,6 +20,7 @@ const emit = defineEmits<{
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
+const uiStore = useUiStore();
 
 function getAccountName(accountId: string): string {
   const acc = accountsStore.accounts.find((a) => a.id === accountId);
@@ -153,6 +155,20 @@ async function syncThisCalendar() {
       </div>
     </div>
 
+    <div class="week-start-section">
+      <div class="section-header">Week starts on</div>
+      <div class="week-start-options">
+        <button
+          v-for="opt in [{ day: 0, label: 'Sunday' }, { day: 1, label: 'Monday' }, { day: 6, label: 'Saturday' }]"
+          :key="opt.day"
+          class="week-start-btn"
+          :class="{ active: uiStore.weekStartDay === opt.day }"
+          :data-testid="`week-start-${opt.day}`"
+          @click="uiStore.setWeekStartDay(opt.day)"
+        >{{ opt.label }}</button>
+      </div>
+    </div>
+
     <!-- Right-click context menu -->
     <Teleport to="body">
       <div v-if="contextMenu" class="cal-menu-overlay" @click="closeContextMenu" @contextmenu.prevent="closeContextMenu"></div>
@@ -248,6 +264,45 @@ async function syncThisCalendar() {
   color: var(--color-text-muted);
   font-size: 12px;
   padding: 8px 4px;
+}
+
+.week-start-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.section-header {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 0 4px 8px;
+}
+
+.week-start-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.week-start-btn {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  text-align: left;
+  border-radius: 4px;
+  transition: background 0.1s;
+}
+
+.week-start-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.week-start-btn.active {
+  color: var(--color-accent);
+  font-weight: 600;
 }
 </style>
 
