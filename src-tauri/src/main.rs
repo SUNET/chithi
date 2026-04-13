@@ -12,6 +12,7 @@ mod keyring;
 mod logging;
 mod mail;
 mod oauth;
+mod ops;
 mod state;
 
 use state::AppState;

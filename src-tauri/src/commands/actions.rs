@@ -10,6 +10,7 @@ use crate::commands::sync_cmd::{
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 use crate::state::AppState;
 
 /// Build an ImapConfig for an account, handling O365 XOAUTH2 token refresh.
@@ -87,73 +88,83 @@ pub async fn move_messages(
     emit_messages_changed(&app, &account_id);
     emit_folders_changed(&app, &account_id);
 
-    // --- Background: perform server operation ---
-    let app_bg = app.clone();
-    let account_id_bg = account_id.clone();
-    let message_ids_bg = message_ids.clone();
-    let target_folder_bg = target_folder.clone();
-    let db_bg = state.db.clone();
-
-    tokio::spawn(async move {
-        let result: std::result::Result<(), Error> = async {
-            if account.mail_protocol == "graph" {
-                let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
-                for mid in &message_ids_bg {
-                    let graph_id = mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
-                    if let Err(e) = client.move_message(graph_id, &target_folder_bg).await {
-                        log::error!("Graph move failed for {}: {}", graph_id, e);
-                    }
-                }
-            } else if account.mail_protocol == "jmap" {
-                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
-                let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
-                for mid in &message_ids_bg {
-                    let parts: Vec<&str> = mid.splitn(3, '_').collect();
-                    if parts.len() == 3 {
-                        by_folder.entry(parts[1].to_string()).or_default().push(parts[2].to_string());
-                    }
-                }
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-                for (source_mailbox, jmap_ids) in &by_folder {
-                    conn_jmap.move_emails(&jmap_config, jmap_ids, source_mailbox, &target_folder_bg).await?;
-                }
-            } else {
-                // IMAP path
-                let imap_config = build_imap_config(&account).await?;
-                let by_folder = imap_by_folder.unwrap_or_default();
-                let target = target_folder_bg.clone();
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = ImapConnection::connect(&imap_config)?;
-                    for (folder_path, uids) in &by_folder {
-                        conn.select_folder(folder_path)?;
-                        conn.move_messages(uids, &target)?;
-                    }
-                    conn.logout();
-                    Ok(())
+    // --- Background: send to worker queue (IMAP) or spawn ad-hoc (JMAP/Graph) ---
+    if account.mail_protocol == "imap" {
+        if let Some(by_folder) = imap_by_folder {
+            let sender = state.get_op_sender(&account_id, &app);
+            let _ = sender
+                .send(OpEntry {
+                    op: MailOp::MoveMessages {
+                        by_folder,
+                        target_folder: target_folder.clone(),
+                    },
+                    priority: OpPriority::User,
                 })
-                .await
-                .map_err(|e| Error::Other(format!("Move task panicked: {}", e)))??;
-            }
-            Ok(())
+                .await;
         }
-        .await;
+    } else {
+        // JMAP/Graph: async HTTP, spawn directly
+        let app_bg = app.clone();
+        let account_id_bg = account_id.clone();
+        let message_ids_bg = message_ids.clone();
+        let target_folder_bg = target_folder.clone();
 
-        if let Err(e) = result {
-            log::error!("Background move failed for account {}: {}", account_id_bg, e);
-            app_bg.emit("op-failed", serde_json::json!({
-                "account_id": account_id_bg,
-                "op_type": "move",
-                "error": e.to_string(),
-            })).ok();
-            // Recalculate folder counts since the next sync will restore messages
-            if let Ok(conn) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_bg.reader())) {
-                let _ = db::folders::recalculate_folder_counts(&conn, &account_id_bg);
+        tokio::spawn(async move {
+            let result: std::result::Result<(), Error> = async {
+                if account.mail_protocol == "graph" {
+                    let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
+                    let client = crate::mail::graph::GraphClient::new(&token);
+                    for mid in &message_ids_bg {
+                        let graph_id =
+                            mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
+                        if let Err(e) = client.move_message(graph_id, &target_folder_bg).await {
+                            log::error!("Graph move failed for {}: {}", graph_id, e);
+                        }
+                    }
+                } else if account.mail_protocol == "jmap" {
+                    let jmap_config =
+                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                    let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
+                    for mid in &message_ids_bg {
+                        let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                        if parts.len() == 3 {
+                            by_folder
+                                .entry(parts[1].to_string())
+                                .or_default()
+                                .push(parts[2].to_string());
+                        }
+                    }
+                    let conn_jmap =
+                        crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                    for (source_mailbox, jmap_ids) in &by_folder {
+                        conn_jmap
+                            .move_emails(&jmap_config, jmap_ids, source_mailbox, &target_folder_bg)
+                            .await?;
+                    }
+                }
+                Ok(())
             }
-        } else {
-            log::info!("Move complete: {} messages moved to '{}'", message_ids_bg.len(), target_folder_bg);
-        }
-    });
+            .await;
+
+            if let Err(e) = result {
+                log::error!(
+                    "Background move failed for account {}: {}",
+                    account_id_bg,
+                    e
+                );
+                app_bg
+                    .emit(
+                        "op-failed",
+                        serde_json::json!({
+                            "account_id": account_id_bg,
+                            "op_type": "move",
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .ok();
+            }
+        });
+    }
 
     Ok(())
 }
@@ -195,17 +206,6 @@ pub async fn delete_messages(
         None
     };
 
-    // For O365 IMAP: suspend IDLE before background op (needs to happen on this task)
-    let suspended_idle = if account.mail_protocol != "graph"
-        && account.mail_protocol != "jmap"
-        && should_suspend_idle_for_imap_operation(&account.provider)
-    {
-        suspend_imap_idle_for_account(&state, &account_id).await?
-    } else {
-        false
-    };
-    let resume_account = account.clone();
-
     // --- Optimistic: update local DB and notify UI immediately ---
     {
         let conn = state.db.writer().await;
@@ -215,71 +215,80 @@ pub async fn delete_messages(
     emit_messages_changed(&app, &account_id);
     emit_folders_changed(&app, &account_id);
 
-    // --- Background: perform server operation ---
-    let app_bg = app.clone();
-    let account_id_bg = account_id.clone();
-    let message_ids_bg = message_ids.clone();
-
-    tokio::spawn(async move {
-        let result: std::result::Result<(), Error> = async {
-            if account.mail_protocol == "graph" {
-                let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
-                for mid in &message_ids_bg {
-                    let graph_id = mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
-                    if let Err(e) = client.delete_message(graph_id).await {
-                        log::error!("Graph delete failed for {}: {}", graph_id, e);
-                    }
-                }
-            } else if account.mail_protocol == "jmap" {
-                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
-                let jmap_ids: Vec<String> = message_ids_bg
-                    .iter()
-                    .filter_map(|mid| {
-                        let parts: Vec<&str> = mid.splitn(3, '_').collect();
-                        if parts.len() == 3 { Some(parts[2].to_string()) } else { None }
-                    })
-                    .collect();
-                if !jmap_ids.is_empty() {
-                    let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-                    conn_jmap.delete_emails(&jmap_config, &jmap_ids).await?;
-                }
-            } else {
-                // IMAP path
-                let imap_config = build_imap_config(&account).await?;
-                let by_folder = imap_by_folder.unwrap_or_default();
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = ImapConnection::connect(&imap_config)?;
-                    for (folder_path, uids) in &by_folder {
-                        conn.select_folder(folder_path)?;
-                        conn.delete_messages(uids)?;
-                    }
-                    conn.logout();
-                    Ok(())
+    // --- Background: send to worker queue (IMAP) or spawn ad-hoc (JMAP/Graph) ---
+    if account.mail_protocol == "imap" {
+        // Worker has its own connection — no IDLE suspend needed
+        if let Some(by_folder) = imap_by_folder {
+            let sender = state.get_op_sender(&account_id, &app);
+            let _ = sender
+                .send(OpEntry {
+                    op: MailOp::DeleteMessages { by_folder },
+                    priority: OpPriority::User,
                 })
-                .await
-                .map_err(|e| Error::Other(format!("Delete task panicked: {}", e)))??;
+                .await;
+        }
+    } else {
+        // JMAP/Graph: async HTTP, spawn directly
+        let app_bg = app.clone();
+        let account_id_bg = account_id.clone();
+        let message_ids_bg = message_ids.clone();
+
+        tokio::spawn(async move {
+            let result: std::result::Result<(), Error> = async {
+                if account.mail_protocol == "graph" {
+                    let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
+                    let client = crate::mail::graph::GraphClient::new(&token);
+                    for mid in &message_ids_bg {
+                        let graph_id =
+                            mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
+                        if let Err(e) = client.delete_message(graph_id).await {
+                            log::error!("Graph delete failed for {}: {}", graph_id, e);
+                        }
+                    }
+                } else if account.mail_protocol == "jmap" {
+                    let jmap_config =
+                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                    let jmap_ids: Vec<String> = message_ids_bg
+                        .iter()
+                        .filter_map(|mid| {
+                            let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                            if parts.len() == 3 {
+                                Some(parts[2].to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !jmap_ids.is_empty() {
+                        let conn_jmap =
+                            crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                        conn_jmap
+                            .delete_emails(&jmap_config, &jmap_ids)
+                            .await?;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await;
+            .await;
 
-        if let Err(e) = result {
-            log::error!("Background delete failed for account {}: {}", account_id_bg, e);
-            app_bg.emit("op-failed", serde_json::json!({
-                "account_id": account_id_bg,
-                "op_type": "delete",
-                "error": e.to_string(),
-            })).ok();
-        } else {
-            log::info!("Delete complete: {} messages deleted", message_ids_bg.len());
-        }
-    });
-
-    // Resume IDLE (for O365) — do this on the main task, not in the background,
-    // since State<'_, AppState> can't be sent across spawn boundaries.
-    if suspended_idle {
-        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
+            if let Err(e) = result {
+                log::error!(
+                    "Background delete failed for account {}: {}",
+                    account_id_bg,
+                    e
+                );
+                app_bg
+                    .emit(
+                        "op-failed",
+                        serde_json::json!({
+                            "account_id": account_id_bg,
+                            "op_type": "delete",
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .ok();
+            }
+        });
     }
 
     Ok(())
@@ -520,14 +529,7 @@ pub async fn set_message_flags(
         let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
         conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, add).await?;
     } else {
-        // IMAP path (includes O365 with XOAUTH2)
-        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
-            suspend_imap_idle_for_account(&state, &account_id).await?
-        } else {
-            false
-        };
-        let resume_account = account.clone();
-        let imap_config = build_imap_config(&account).await?;
+        // IMAP path: send through worker queue (persistent connection, no IDLE suspend needed)
         let by_folder = {
             let conn = state.db.reader();
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
@@ -535,22 +537,18 @@ pub async fn set_message_flags(
         };
 
         if !by_folder.is_empty() {
-            let flag_refs: Vec<String> = flags.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = ImapConnection::connect(&imap_config)?;
-                let flag_strs: Vec<&str> = flag_refs.iter().map(|s| s.as_str()).collect();
-                for (folder_path, uids) in &by_folder {
-                    conn.select_folder(folder_path)?;
-                    conn.set_flags(uids, &flag_strs, add)?;
-                }
-                conn.logout();
-                Ok(())
-            })
-            .await
-            .map_err(|e| Error::Other(format!("Set flags task panicked: {}", e)))??;
+            let sender = state.get_op_sender(&account_id, &app);
+            let _ = sender
+                .send(OpEntry {
+                    op: MailOp::SetFlags {
+                        by_folder,
+                        flags: flags.clone(),
+                        add,
+                    },
+                    priority: OpPriority::User,
+                })
+                .await;
         }
-
-        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
     }
 
     log::info!(
@@ -581,11 +579,6 @@ pub async fn copy_messages(
         target_folder
     );
 
-    let account = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)?
-    };
-    let imap_config = build_imap_config(&account).await?;
     let by_folder = {
         let conn = state.db.reader();
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
@@ -597,31 +590,20 @@ pub async fn copy_messages(
         return Ok(());
     }
 
-    let target = target_folder.clone();
-
-    // Perform IMAP copy in a blocking thread
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = ImapConnection::connect(&imap_config)?;
-
-        for (folder_path, uids) in &by_folder {
-            log::debug!(
-                "Copying {} messages from '{}' to '{}'",
-                uids.len(),
-                folder_path,
-                target
-            );
-            conn.select_folder(folder_path)?;
-            conn.copy_messages(uids, &target)?;
-        }
-
-        conn.logout();
-        Ok(())
-    })
-    .await
-    .map_err(|e| Error::Other(format!("Copy task panicked: {}", e)))??;
+    // Send through worker queue (persistent connection)
+    let sender = state.get_op_sender(&account_id, &app);
+    let _ = sender
+        .send(OpEntry {
+            op: MailOp::CopyMessages {
+                by_folder,
+                target_folder: target_folder.clone(),
+            },
+            priority: OpPriority::User,
+        })
+        .await;
 
     log::info!(
-        "Copy complete: {} messages copied to '{}'",
+        "Copy queued: {} messages to '{}'",
         message_ids.len(),
         target_folder
     );
