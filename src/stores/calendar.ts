@@ -5,6 +5,7 @@ import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
 import { expandRRule } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
+import { useUiStore } from "./ui";
 
 export type CalendarViewMode = "day" | "week" | "month";
 
@@ -17,6 +18,7 @@ export const useCalendarStore = defineStore("calendar", () => {
   const selectedEvent = ref<CalendarEvent | null>(null);
 
   const accountsStore = useAccountsStore();
+  const uiStore = useUiStore();
 
   // Visible calendars (all by default). Persisted to localStorage so the
   // user's hide/show picks survive across sessions.
@@ -95,7 +97,8 @@ export const useCalendarStore = defineStore("calendar", () => {
       end.setHours(23, 59, 59, 999);
     } else if (viewMode.value === "week") {
       start = new Date(d);
-      start.setDate(d.getDate() - d.getDay()); // Sunday
+      const offset = (d.getDay() - uiStore.weekStartDay + 7) % 7;
+      start.setDate(d.getDate() - offset);
       start.setHours(0, 0, 0, 0);
       end = new Date(start);
       end.setDate(start.getDate() + 6);

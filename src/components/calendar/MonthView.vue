@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import { useUiStore } from "@/stores/ui";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -17,6 +18,7 @@ const emit = defineEmits<{
 }>();
 
 const calendarStore = useCalendarStore();
+const uiStore = useUiStore();
 
 const weeks = computed(() => {
   const d = new Date(calendarStore.currentDate);
@@ -25,9 +27,10 @@ const weeks = computed(() => {
   const firstDay = new Date(year, month, 1);
   const lastDay = new Date(year, month + 1, 0);
 
-  // Start from Sunday of the first week
+  // Start from the configured week start day
   const start = new Date(firstDay);
-  start.setDate(start.getDate() - start.getDay());
+  const offset = (start.getDay() - uiStore.weekStartDay + 7) % 7;
+  start.setDate(start.getDate() - offset);
 
   const rows: Date[][] = [];
   const current = new Date(start);
@@ -72,7 +75,11 @@ function getEventColor(event: { calendar_id: string }): string {
   return cal?.color || "#4285f4";
 }
 
-const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const allDayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const dayNames = computed(() => {
+  const s = uiStore.weekStartDay;
+  return [...allDayNames.slice(s), ...allDayNames.slice(0, s)];
+});
 
 // Drag-to-reschedule
 const dragStartPos = ref<{ x: number; y: number } | null>(null);
