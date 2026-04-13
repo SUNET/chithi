@@ -487,13 +487,23 @@ export const useMessagesStore = defineStore("messages", () => {
     const accountId = accountsStore.activeAccountId;
     if (!accountId || selectedIds.value.length === 0) return;
     const ids = resolveSelectedIds();
+
+    // Optimistic: remove from local state immediately
+    messages.value = messages.value.filter((m) => !ids.includes(m.id));
+    threads.value = threads.value.filter(
+      (t) => !t.message_ids.every((mid) => ids.includes(mid)),
+    );
+    selectedIds.value = [];
+    activeMessage.value = null;
+    activeMessageId.value = null;
+
     try {
       await api.deleteMessages(accountId, ids);
-      selectedIds.value = [];
-      activeMessage.value = null;
-      activeMessageId.value = null;
     } catch (e) {
-      console.error("Delete failed:", e);
+      // Backend returns immediately (optimistic), so errors here are
+      // from the command dispatch itself, not the server operation.
+      // Server failures are reported via the "op-failed" event.
+      console.error("Delete dispatch failed:", e);
     }
   }
 
@@ -547,10 +557,35 @@ export const useMessagesStore = defineStore("messages", () => {
       console.error("Failed to subscribe to messages-changed:", error);
     });
 
+  // Subscribe to op-failed events — reconcile by re-fetching when a
+  // background server operation fails after an optimistic local update.
+  let stopOpFailedListener: null | (() => void) = null;
+  void listen<{ account_id: string; op_type: string; error: string }>(
+    "op-failed",
+    (event) => {
+      if (disposed) return;
+      const p = event.payload;
+      console.warn(`op-failed: ${p.op_type} on account ${p.account_id}: ${p.error}`);
+      // Re-fetch to reconcile local state with server reality
+      fetchMessages();
+    },
+  )
+    .then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      stopOpFailedListener = unlisten;
+    })
+    .catch((error) => {
+      console.error("Failed to subscribe to op-failed:", error);
+    });
+
   onScopeDispose(() => {
     disposed = true;
     if (messagesRefreshTimer) clearTimeout(messagesRefreshTimer);
     stopMessagesListener?.();
+    stopOpFailedListener?.();
   });
 
   return {
