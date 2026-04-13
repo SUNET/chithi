@@ -571,6 +571,7 @@ pub async fn delete_event(
 
 #[tauri::command]
 pub async fn sync_calendars(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<()> {
@@ -605,6 +606,10 @@ pub async fn sync_calendars(
             account_id
         );
     }
+
+    // Notify frontend that calendar data has changed
+    use tauri::Emitter;
+    app.emit("calendar-changed", account_id.as_str()).ok();
 
     log::info!("sync_calendars: completed for account {}", account_id);
     Ok(())

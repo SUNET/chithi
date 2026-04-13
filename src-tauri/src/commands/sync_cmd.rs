@@ -276,10 +276,8 @@ pub async fn trigger_sync(
         .await {
             Err(e)
         } else {
-            log::info!("Syncing calendars for JMAP account {}", account_id);
-            if let Err(e) = sync_jmap_calendars(state.db.clone(), &account_id, &jmap_config).await {
-                log::error!("Calendar sync failed for account {}: {}", account_id, e);
-            }
+            // Calendar sync is now independent — triggered by its own interval,
+            // not chained to mail sync. See CalendarView.vue / calendar.ts.
             Ok(())
         }
     } else {

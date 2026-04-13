@@ -136,9 +136,11 @@ onMounted(async () => {
   // network sync here makes the view appear empty until sync finishes.
   await calendarStore.fetchCalendars();
   await calendarStore.fetchEvents();
+  // Initial sync + start independent interval (5 min)
   calendarStore.syncCalendars().catch((e) => {
     console.error("Calendar sync error:", e);
   });
+  calendarStore.startCalendarSync();
 });
 </script>
 
