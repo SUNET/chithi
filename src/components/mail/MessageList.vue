@@ -414,7 +414,7 @@ const displayedCount = () => {
 </script>
 
 <template>
-  <div class="message-list" data-testid="message-list" @click="closeContextMenu">
+  <div class="message-list" data-testid="message-list" @click.left="closeContextMenu">
     <QuickFilterBar v-if="messagesStore.quickFilterVisible" />
     <div class="column-headers">
       <div class="col col-check">
@@ -568,7 +568,7 @@ const displayedCount = () => {
 
         <!-- Move To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'move'" @mouseleave="subMenu = null">
-          <button class="ctx-item" data-testid="ctx-move-to">
+          <button class="ctx-item" data-testid="ctx-move-to" @click="subMenu = 'move'">
             Move To
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
           </button>
@@ -577,6 +577,7 @@ const displayedCount = () => {
               v-for="folder in foldersStore.getFlatFolders()"
               :key="folder.path"
               class="ctx-item"
+              :data-testid="`ctx-move-${folder.name}`"
               :class="{ disabled: folder.path === foldersStore.activeFolderPath }"
               @click="folder.path !== foldersStore.activeFolderPath && ctxMoveTo(folder.path)"
             >{{ folder.name }}</button>
@@ -585,7 +586,7 @@ const displayedCount = () => {
 
         <!-- Copy To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'copy'" @mouseleave="subMenu = null">
-          <button class="ctx-item" data-testid="ctx-copy-to">
+          <button class="ctx-item" data-testid="ctx-copy-to" @click="subMenu = 'copy'">
             Copy To
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
           </button>
@@ -594,6 +595,7 @@ const displayedCount = () => {
               v-for="folder in foldersStore.getFlatFolders()"
               :key="folder.path"
               class="ctx-item"
+              :data-testid="`ctx-copy-${folder.name}`"
               @click="ctxCopyTo(folder.path)"
             >{{ folder.name }}</button>
           </div>

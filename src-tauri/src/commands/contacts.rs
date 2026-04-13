@@ -485,9 +485,13 @@ async fn get_google_token(account_id: &str) -> Result<String> {
 
     let refresh_token = tokens.refresh_token
         .ok_or_else(|| crate::error::Error::Other("No refresh token".into()))?;
-    let new_tokens = crate::oauth::refresh_access_token(&crate::oauth::GOOGLE, &refresh_token).await?;
-    crate::oauth::store_tokens(account_id, &new_tokens)?;
-    Ok(new_tokens.access_token)
+    match crate::oauth::refresh_access_token(&crate::oauth::GOOGLE, &refresh_token).await {
+        Ok(new_tokens) => {
+            crate::oauth::store_tokens(account_id, &new_tokens)?;
+            Ok(new_tokens.access_token)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn sync_contacts_google(

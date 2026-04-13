@@ -1280,7 +1280,7 @@ impl JmapConnection {
             "methodCalls": [
                 ["Mailbox/set", {
                     "accountId": self.account_id,
-                    "onDestroyRemoveMessages": remove_messages,
+                    "onDestroyRemoveEmails": remove_messages,
                     "destroy": [mailbox_id]
                 }, "d1"]
             ]

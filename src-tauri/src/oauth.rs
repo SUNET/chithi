@@ -24,7 +24,7 @@ pub struct OAuthProvider {
 pub const GOOGLE: OAuthProvider = OAuthProvider {
     name: "google",
     client_id: "96507156934-tb0mgeovj7dhpaabjc4ipm5lukhmebmg.apps.googleusercontent.com",
-    client_secret: "", // Desktop app — public client, uses PKCE instead
+    client_secret: "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", // Desktop app — not truly confidential per Google docs
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
     token_url: "https://oauth2.googleapis.com/token",
     scopes: &[
@@ -146,10 +146,13 @@ pub fn get_auth_url(provider: &OAuthProvider) -> Result<(String, TcpListener, Op
         ));
         Some(verifier)
     } else {
-        // Google uses access_type=offline&prompt=consent instead of PKCE
-        url.push_str("&access_type=offline&prompt=consent");
         None
     };
+
+    // Google requires access_type=offline to return a refresh token
+    if provider.name == "google" {
+        url.push_str("&access_type=offline&prompt=consent");
+    }
 
     // Microsoft needs prompt=consent for first-time consent
     if provider.name == "microsoft" {
@@ -264,10 +267,10 @@ pub async fn exchange_code(
     params.insert("grant_type", "authorization_code".to_string());
 
     if let Some(verifier) = code_verifier {
-        // PKCE flow (Microsoft) — no client_secret, use code_verifier
         params.insert("code_verifier", verifier.to_string());
-    } else if !provider.client_secret.is_empty() {
-        // Traditional flow (Google) — use client_secret
+    }
+    // Send client_secret if present (some providers require it even with PKCE)
+    if !provider.client_secret.is_empty() {
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
@@ -373,6 +376,10 @@ pub async fn refresh_with_scopes(
     params.insert("refresh_token", refresh_token.to_string());
     params.insert("grant_type", "refresh_token".to_string());
     params.insert("scope", scopes.to_string());
+
+    if !provider.client_secret.is_empty() {
+        params.insert("client_secret", provider.client_secret.to_string());
+    }
 
     let client = reqwest::Client::new();
     let resp = client
@@ -868,7 +875,8 @@ mod tests {
     fn test_google_provider_pkce() {
         assert_eq!(GOOGLE.name, "google");
         assert!(GOOGLE.use_pkce);
-        assert!(GOOGLE.client_secret.is_empty());
+        // Google Desktop app clients have a secret (not truly confidential)
+        assert!(!GOOGLE.client_secret.is_empty());
     }
 
     #[test]
