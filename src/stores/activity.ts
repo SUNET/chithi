@@ -88,6 +88,7 @@ export const useActivityStore = defineStore("activity", () => {
     if (initialized.value) return;
     initialized.value = true;
 
+    // --- Mail sync events ---
     await listen<{ account_id: string; account_name: string }>(
       "sync-started",
       (event) => {
@@ -131,6 +132,31 @@ export const useActivityStore = defineStore("activity", () => {
       "sync-error",
       (event) => {
         failOperation(`sync-${event.payload.account_id}`, event.payload.error);
+      },
+    );
+
+    // --- Calendar sync events ---
+    await listen<string>("calendar-changed", (event) => {
+      completeOperation(
+        `cal-sync-${event.payload}`,
+        "Calendars updated",
+      );
+    });
+
+    // --- Contacts sync events ---
+    await listen<string>("contacts-changed", (event) => {
+      completeOperation(
+        `contacts-sync-${event.payload}`,
+        "Contacts updated",
+      );
+    });
+
+    // --- Background operation failures ---
+    await listen<{ account_id: string; op_type: string; error: string }>(
+      "op-failed",
+      (event) => {
+        const p = event.payload;
+        failOperation(`op-${p.account_id}-${Date.now()}`, `${p.op_type}: ${p.error}`);
       },
     );
   }

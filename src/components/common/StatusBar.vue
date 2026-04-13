@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
+import { useOpsStore } from "@/stores/ops";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useCalendarStore } from "@/stores/calendar";
@@ -10,6 +11,7 @@ import * as api from "@/lib/tauri";
 
 const route = useRoute();
 const activityStore = useActivityStore();
+const opsStore = useOpsStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const calendarStore = useCalendarStore();
@@ -18,6 +20,8 @@ const connectionStatus = ref<"connected" | "disconnected" | "reconnecting">("con
 const syncError = ref<string | null>(null);
 
 onMounted(async () => {
+  await opsStore.initEventListeners();
+
   await listen("idle-disconnected", () => {
     connectionStatus.value = "disconnected";
   });
@@ -45,12 +49,15 @@ const lastSyncLabel = computed(() => {
 
 async function syncAll() {
   const isCalendar = route.name === "calendar";
+  const isContacts = route.name === "contacts";
 
   for (const account of accountsStore.accounts) {
     if (!account.enabled) continue;
     try {
       if (isCalendar) {
         await api.syncCalendars(account.id);
+      } else if (isContacts) {
+        await api.syncContacts(account.id);
       } else {
         await api.triggerSync(
           account.id,
@@ -85,6 +92,7 @@ async function syncAll() {
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
       <span class="status-dot" :class="connectionStatus" data-testid="sync-status"></span>
       <span v-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
+      <span v-else-if="opsStore.hasFailures" class="sync-error-msg" data-testid="op-failure" @click="opsStore.clearFailures()" title="Click to dismiss">{{ opsStore.recentFailures[0]?.error }}</span>
       <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
       <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>
