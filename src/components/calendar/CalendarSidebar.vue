@@ -4,6 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Calendar } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
+import { showToast } from "@/lib/toast";
 import * as api from "@/lib/tauri";
 
 const emit = defineEmits<{
@@ -87,6 +88,24 @@ async function syncThisCalendar() {
     syncing.value = null;
   }
 }
+
+async function unsubscribeThisCalendar() {
+  if (!contextMenu.value) return;
+  const calendarId = contextMenu.value.calendarId;
+  const cal = calendarStore.calendars.find((c) => c.id === calendarId);
+  const calName = cal?.name || calendarId;
+  closeContextMenu();
+
+  if (!confirm(`Unsubscribe from "${calName}"? Local events will be removed.`)) return;
+
+  try {
+    await calendarStore.unsubscribeCalendar(calendarId);
+    showToast(`Unsubscribed from "${calName}"`, "success");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to unsubscribe: ${msg}`, "error", 5000);
+  }
+}
 </script>
 
 <template>
@@ -135,6 +154,7 @@ async function syncThisCalendar() {
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
         <button class="ctx-item" @click="syncThisCalendar" data-testid="calendar-sync">Sync this calendar</button>
+        <button class="ctx-item" @click="unsubscribeThisCalendar" data-testid="calendar-unsubscribe">Unsubscribe</button>
       </div>
     </Teleport>
   </div>

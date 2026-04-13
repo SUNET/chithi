@@ -166,6 +166,7 @@ export interface Calendar {
   color: string;
   is_default: boolean;
   remote_id: string | null;
+  is_subscribed: boolean;
 }
 
 export interface CalendarEvent {

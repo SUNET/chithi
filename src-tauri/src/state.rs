@@ -71,7 +71,7 @@ impl AppState {
         account_id: &str,
         app: &tauri::AppHandle,
     ) -> tokio::sync::mpsc::Sender<OpEntry> {
-        let mut senders = self.op_senders.lock().unwrap();
+        let mut senders = self.op_senders.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sender) = senders.get(account_id) {
             if !sender.is_closed() {
                 return sender.clone();

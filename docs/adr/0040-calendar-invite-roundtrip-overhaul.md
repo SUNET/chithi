@@ -114,7 +114,7 @@ Event detail dialog shows the calendar name (with color dot) and account email, 
 ### Negative
 - `auto_process_calendar_emails` during sync requires body prefetch (not yet implemented — envelope-only sync doesn't fetch bodies). Currently invite processing happens on email open. The function batches all DB writes into a single writer acquisition to avoid blocking the async runtime.
 - `respond_to_invite` timezone handling for the local event copy still uses the raw iCal DTSTART without full timezone normalization. The Google-synced copy has correct timezone; the local copy may show wrong time until sync replaces it.
-- Auto-processing CANCEL emails on open does not verify that the sender matches the event's organizer. A spoofed CANCEL could briefly remove an event locally until the next calendar sync restores it from the server.
+- Auto-processing CANCEL emails verifies that the CANCEL organizer email matches the event's organizer before deleting. Mismatches are logged and skipped to prevent spoofed cancellations.
 
 ### Files changed
 - `src-tauri/src/commands/calendar.rs` — bulk of changes (respond_to_invite, process_invite_reply, send_invites, create_event, sync_calendars_google, process_cancelled_invite, auto_process_calendar_emails, get_smtp_credentials)

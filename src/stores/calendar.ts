@@ -112,6 +112,12 @@ export const useCalendarStore = defineStore("calendar", () => {
     };
   }
 
+  async function unsubscribeCalendar(calendarId: string) {
+    await api.unsubscribeCalendar(calendarId);
+    await fetchCalendars();
+    await fetchEvents();
+  }
+
   async function syncCalendars() {
     if (accountsStore.accounts.length === 0) {
       await accountsStore.fetchAccounts();
@@ -141,7 +147,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     for (const account of accountsStore.accounts) {
       try {
         const cals = await api.listCalendars(account.id);
-        all = all.concat(cals);
+        all = all.concat(cals.filter((c) => c.is_subscribed));
       } catch (e) {
         console.error("Failed to fetch calendars for", account.id, e);
       }
@@ -352,6 +358,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     loading,
     selectedEvent,
     hiddenCalendarIds,
+    unsubscribeCalendar,
     syncCalendars,
     fetchCalendars,
     fetchEvents,

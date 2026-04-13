@@ -190,20 +190,42 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
     }
 }
 
+/// Validate that a folder path doesn't contain characters that could be
+/// injected into IMAP commands (null bytes, bare newlines).
+fn validate_folder_paths(by_folder: &std::collections::HashMap<String, Vec<u32>>) -> bool {
+    by_folder.keys().all(|path| {
+        !path.contains('\0') && !path.contains('\n') && !path.contains('\r')
+    })
+}
+
 /// Convert an outbox entry back to a MailOp for replay.
 pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload_json).ok()?;
     match entry.action_type.as_str() {
         "move" => {
-            let by_folder = serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
+            let by_folder: std::collections::HashMap<String, Vec<u32>> =
+                serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
+            if !validate_folder_paths(&by_folder) {
+                log::warn!("outbox_to_mail_op: rejected move op with invalid folder path");
+                return None;
+            }
             let target_folder = payload.get("target_folder")?.as_str()?.to_string();
+            if target_folder.contains('\0') || target_folder.contains('\n') {
+                log::warn!("outbox_to_mail_op: rejected move op with invalid target folder");
+                return None;
+            }
             Some(MailOp::MoveMessages {
                 by_folder,
                 target_folder,
             })
         }
         "delete" => {
-            let by_folder = serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
+            let by_folder: std::collections::HashMap<String, Vec<u32>> =
+                serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
+            if !validate_folder_paths(&by_folder) {
+                log::warn!("outbox_to_mail_op: rejected delete op with invalid folder path");
+                return None;
+            }
             Some(MailOp::DeleteMessages { by_folder })
         }
         "set_flags" => {

@@ -273,6 +273,10 @@ export async function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }
 
+export async function unsubscribeCalendar(calendarId: string): Promise<void> {
+  return invoke("unsubscribe_calendar", { calendarId });
+}
+
 export async function syncCalendars(
   accountId: string,
   forceFullSync?: boolean,

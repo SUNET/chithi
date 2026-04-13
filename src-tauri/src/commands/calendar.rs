@@ -108,6 +108,21 @@ pub async fn delete_calendar(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+pub async fn unsubscribe_calendar(
+    state: State<'_, AppState>,
+    calendar_id: String,
+) -> Result<()> {
+    log::info!("unsubscribe_calendar: id={}", calendar_id);
+    let conn = state.db.writer().await;
+    db::calendar::set_calendar_subscribed(&conn, &calendar_id, false)?;
+    let deleted = db::calendar::delete_calendar_events(&conn, &calendar_id)?;
+    log::info!("unsubscribe_calendar: deleted {} events for calendar {}", deleted, calendar_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
 pub async fn get_events(
     state: State<'_, AppState>,
     account_id: String,
@@ -2246,6 +2261,19 @@ pub async fn process_cancelled_invite(
     let mut deleted = 0;
     for cancel in &cancels {
         if let Some(event) = db::calendar::get_event_by_uid(&conn, &account_id, &cancel.uid)? {
+            // Verify the CANCEL's organizer matches the event's organizer to
+            // prevent spoofed CANCEL emails from deleting events.
+            if let Some(ref cancel_org) = cancel.organizer_email {
+                if let Some(ref event_org) = event.organizer_email {
+                    if cancel_org.to_lowercase() != event_org.to_lowercase() {
+                        log::warn!(
+                            "process_cancelled_invite: organizer mismatch for UID={} (cancel={}, event={}), skipping",
+                            cancel.uid, cancel_org, event_org
+                        );
+                        continue;
+                    }
+                }
+            }
             db::calendar::delete_event(&conn, &event.id)?;
             deleted += 1;
             log::info!("process_cancelled_invite: deleted event '{}' (UID={})", event.title, cancel.uid);
