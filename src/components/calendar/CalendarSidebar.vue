@@ -160,7 +160,6 @@ async function syncThisCalendar() {
         v-if="contextMenu"
         class="cal-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
-        @keydown.esc="closeContextMenu"
       >
         <button class="ctx-item" data-testid="calendar-sync" @click="syncThisCalendar">Sync this calendar</button>
         <button class="ctx-item" data-testid="calendar-unsubscribe" @click="unsubscribeThisCalendar">Unsubscribe</button>

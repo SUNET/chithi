@@ -667,7 +667,7 @@ async fn sync_calendars_jmap(
         let cals = db::calendar::list_calendars(&conn, account_id)?;
         cals.into_iter()
             .filter(|c| !c.is_subscribed)
-            .map(|c| c.remote_id.unwrap_or_default())
+            .filter_map(|c| c.remote_id)
             .collect()
     };
 
@@ -872,7 +872,7 @@ async fn sync_calendars_google(
         let cals = db::calendar::list_calendars(&conn, account_id)?;
         cals.into_iter()
             .filter(|c| !c.is_subscribed)
-            .map(|c| c.remote_id.unwrap_or_default())
+            .filter_map(|c| c.remote_id)
             .collect()
     };
 
@@ -1106,7 +1106,7 @@ async fn sync_calendars_caldav(
         let cals = db::calendar::list_calendars(&conn, account_id)?;
         cals.into_iter()
             .filter(|c| !c.is_subscribed)
-            .map(|c| c.remote_id.unwrap_or_default())
+            .filter_map(|c| c.remote_id)
             .collect()
     };
 
