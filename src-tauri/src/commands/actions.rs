@@ -92,7 +92,7 @@ pub async fn move_messages(
     if account.mail_protocol == "imap" {
         if let Some(by_folder) = imap_by_folder {
             let sender = state.get_op_sender(&account_id, &app);
-            let _ = sender
+            if let Err(e) = sender
                 .send(OpEntry {
                     op: MailOp::MoveMessages {
                         by_folder,
@@ -100,7 +100,19 @@ pub async fn move_messages(
                     },
                     priority: OpPriority::User,
                 })
-                .await;
+                .await
+            {
+                log::error!("Failed to queue move op for account {}: {}", account_id, e);
+                app.emit(
+                    "op-failed",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "op_type": "move",
+                        "error": format!("Failed to queue operation: {}", e),
+                    }),
+                )
+                .ok();
+            }
         }
     } else {
         // JMAP/Graph: async HTTP, spawn directly
@@ -114,12 +126,21 @@ pub async fn move_messages(
                 if account.mail_protocol == "graph" {
                     let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
                     let client = crate::mail::graph::GraphClient::new(&token);
+                    let mut errors: Vec<String> = Vec::new();
                     for mid in &message_ids_bg {
                         let graph_id =
                             mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
                         if let Err(e) = client.move_message(graph_id, &target_folder_bg).await {
                             log::error!("Graph move failed for {}: {}", graph_id, e);
+                            errors.push(format!("{}: {}", graph_id, e));
                         }
+                    }
+                    if !errors.is_empty() {
+                        return Err(Error::Other(format!(
+                            "Graph move failed for {} message(s): {}",
+                            errors.len(),
+                            errors.join("; ")
+                        )));
                     }
                 } else if account.mail_protocol == "jmap" {
                     let jmap_config =
@@ -220,12 +241,24 @@ pub async fn delete_messages(
         // Worker has its own connection — no IDLE suspend needed
         if let Some(by_folder) = imap_by_folder {
             let sender = state.get_op_sender(&account_id, &app);
-            let _ = sender
+            if let Err(e) = sender
                 .send(OpEntry {
                     op: MailOp::DeleteMessages { by_folder },
                     priority: OpPriority::User,
                 })
-                .await;
+                .await
+            {
+                log::error!("Failed to queue delete op for account {}: {}", account_id, e);
+                app.emit(
+                    "op-failed",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "op_type": "delete",
+                        "error": format!("Failed to queue operation: {}", e),
+                    }),
+                )
+                .ok();
+            }
         }
     } else {
         // JMAP/Graph: async HTTP, spawn directly
@@ -238,12 +271,21 @@ pub async fn delete_messages(
                 if account.mail_protocol == "graph" {
                     let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
                     let client = crate::mail::graph::GraphClient::new(&token);
+                    let mut errors: Vec<String> = Vec::new();
                     for mid in &message_ids_bg {
                         let graph_id =
                             mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
                         if let Err(e) = client.delete_message(graph_id).await {
                             log::error!("Graph delete failed for {}: {}", graph_id, e);
+                            errors.push(format!("{}: {}", graph_id, e));
                         }
+                    }
+                    if !errors.is_empty() {
+                        return Err(Error::Other(format!(
+                            "Graph delete failed for {} message(s): {}",
+                            errors.len(),
+                            errors.join("; ")
+                        )));
                     }
                 } else if account.mail_protocol == "jmap" {
                     let jmap_config =
@@ -538,7 +580,7 @@ pub async fn set_message_flags(
 
         if !by_folder.is_empty() {
             let sender = state.get_op_sender(&account_id, &app);
-            let _ = sender
+            if let Err(e) = sender
                 .send(OpEntry {
                     op: MailOp::SetFlags {
                         by_folder,
@@ -547,7 +589,19 @@ pub async fn set_message_flags(
                     },
                     priority: OpPriority::User,
                 })
-                .await;
+                .await
+            {
+                log::error!("Failed to queue set_flags op for account {}: {}", account_id, e);
+                app.emit(
+                    "op-failed",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "op_type": "set_flags",
+                        "error": format!("Failed to queue operation: {}", e),
+                    }),
+                )
+                .ok();
+            }
         }
     }
 
@@ -563,7 +617,11 @@ pub async fn set_message_flags(
     Ok(())
 }
 
-/// Copy messages to a target folder on the IMAP server.
+/// Copy messages to a target folder on the server.
+///
+/// Currently only IMAP accounts support server-side copy. For JMAP and Graph
+/// accounts the command logs a warning and returns Ok, since those protocols
+/// would need a different implementation path.
 #[tauri::command]
 pub async fn copy_messages(
     app: tauri::AppHandle,
@@ -579,6 +637,20 @@ pub async fn copy_messages(
         target_folder
     );
 
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.mail_protocol != "imap" {
+        log::warn!(
+            "Copy not implemented for protocol '{}' (account {}). Skipping.",
+            account.mail_protocol,
+            account_id
+        );
+        return Ok(());
+    }
+
     let by_folder = {
         let conn = state.db.reader();
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
@@ -592,7 +664,7 @@ pub async fn copy_messages(
 
     // Send through worker queue (persistent connection)
     let sender = state.get_op_sender(&account_id, &app);
-    let _ = sender
+    if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::CopyMessages {
                 by_folder,
@@ -600,7 +672,19 @@ pub async fn copy_messages(
             },
             priority: OpPriority::User,
         })
-        .await;
+        .await
+    {
+        log::error!("Failed to queue copy op for account {}: {}", account_id, e);
+        app.emit(
+            "op-failed",
+            serde_json::json!({
+                "account_id": account_id,
+                "op_type": "copy",
+                "error": format!("Failed to queue operation: {}", e),
+            }),
+        )
+        .ok();
+    }
 
     log::info!(
         "Copy queued: {} messages to '{}'",

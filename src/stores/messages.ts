@@ -490,9 +490,43 @@ export const useMessagesStore = defineStore("messages", () => {
 
     // Optimistic: remove from local state immediately
     messages.value = messages.value.filter((m) => !ids.includes(m.id));
-    threads.value = threads.value.filter(
-      (t) => !t.message_ids.every((mid) => ids.includes(mid)),
-    );
+
+    // Track which threads are fully deleted vs partially deleted
+    const fullyDeletedThreadIds: string[] = [];
+    threads.value = threads.value.filter((t) => {
+      if (t.message_ids.every((mid) => ids.includes(mid))) {
+        fullyDeletedThreadIds.push(t.thread_id);
+        return false; // remove fully deleted thread
+      }
+      return true;
+    });
+
+    // Clean up threadMessages for fully deleted threads
+    if (fullyDeletedThreadIds.length > 0) {
+      const updated = { ...threadMessages.value };
+      for (const tid of fullyDeletedThreadIds) {
+        delete updated[tid];
+      }
+      threadMessages.value = updated;
+    }
+
+    // For partially deleted threads, remove the deleted message_ids
+    for (const t of threads.value) {
+      const remaining = t.message_ids.filter((mid) => !ids.includes(mid));
+      if (remaining.length < t.message_ids.length) {
+        t.message_ids = remaining;
+        // Also clean up expanded thread messages
+        if (threadMessages.value[t.thread_id]) {
+          threadMessages.value = {
+            ...threadMessages.value,
+            [t.thread_id]: threadMessages.value[t.thread_id].filter(
+              (m) => !ids.includes(m.id),
+            ),
+          };
+        }
+      }
+    }
+
     selectedIds.value = [];
     activeMessage.value = null;
     activeMessageId.value = null;
@@ -566,8 +600,10 @@ export const useMessagesStore = defineStore("messages", () => {
       if (disposed) return;
       const p = event.payload;
       console.warn(`op-failed: ${p.op_type} on account ${p.account_id}: ${p.error}`);
-      // Re-fetch to reconcile local state with server reality
-      fetchMessages();
+      // Only re-fetch if the failed op belongs to the currently active account
+      if (p.account_id === accountsStore.activeAccountId) {
+        fetchMessages();
+      }
     },
   )
     .then((unlisten) => {

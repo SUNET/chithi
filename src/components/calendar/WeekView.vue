@@ -138,9 +138,10 @@ const overlapLayout = computed(() => {
     dayStart.setHours(0, 0, 0, 0);
     const dayEnd = new Date(day);
     dayEnd.setHours(23, 59, 59, 999);
+    const dayStr = day.toISOString().split("T")[0];
 
     // Collect all timed events for this day
-    const dayEvents: { id: string; start: number; end: number }[] = [];
+    const dayEvents: { id: string; key: string; start: number; end: number }[] = [];
     for (const e of calendarStore.visibleEvents) {
       const eStart = new Date(e.start_time);
       const eEnd = new Date(e.end_time);
@@ -148,6 +149,7 @@ const overlapLayout = computed(() => {
       if (eStart > dayEnd || eEnd <= dayStart) continue;
       dayEvents.push({
         id: e.id,
+        key: `${dayStr}:${e.id}`,
         start: Math.max(eStart.getTime(), dayStart.getTime()),
         end: Math.min(eEnd.getTime(), dayEnd.getTime() + 1),
       });
@@ -156,31 +158,50 @@ const overlapLayout = computed(() => {
     // Sort by start time, then by end time descending (longer events first)
     dayEvents.sort((a, b) => a.start - b.start || b.end - a.end);
 
-    // Assign columns: for each event, find the first column where it doesn't
-    // overlap with any already-placed event.
-    const columns: { end: number }[][] = [];
+    // Build overlap clusters: group events that transitively overlap
+    // so non-overlapping events get full width.
+    const clusters: typeof dayEvents[] = [];
     for (const ev of dayEvents) {
-      let placed = false;
-      for (let col = 0; col < columns.length; col++) {
-        const lastInCol = columns[col][columns[col].length - 1];
-        if (lastInCol.end <= ev.start) {
-          columns[col].push({ end: ev.end });
-          layout.set(ev.id, { column: col, totalColumns: 0 }); // totalColumns set later
-          placed = true;
+      // Find existing cluster whose time range overlaps with this event
+      let merged = false;
+      for (const cluster of clusters) {
+        const clusterEnd = Math.max(...cluster.map(e => e.end));
+        if (ev.start < clusterEnd) {
+          cluster.push(ev);
+          merged = true;
           break;
         }
       }
-      if (!placed) {
-        columns.push([{ end: ev.end }]);
-        layout.set(ev.id, { column: columns.length - 1, totalColumns: 0 });
+      if (!merged) {
+        clusters.push([ev]);
       }
     }
 
-    // Set totalColumns for all events in this day's group
-    const totalCols = columns.length;
-    for (const ev of dayEvents) {
-      const info = layout.get(ev.id);
-      if (info) info.totalColumns = totalCols;
+    // Assign columns per cluster
+    for (const cluster of clusters) {
+      const columns: { end: number }[][] = [];
+      for (const ev of cluster) {
+        let placed = false;
+        for (let col = 0; col < columns.length; col++) {
+          const lastInCol = columns[col][columns[col].length - 1];
+          if (lastInCol.end <= ev.start) {
+            columns[col].push({ end: ev.end });
+            layout.set(ev.key, { column: col, totalColumns: 0 });
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) {
+          columns.push([{ end: ev.end }]);
+          layout.set(ev.key, { column: columns.length - 1, totalColumns: 0 });
+        }
+      }
+
+      const totalCols = columns.length;
+      for (const ev of cluster) {
+        const info = layout.get(ev.key);
+        if (info) info.totalColumns = totalCols;
+      }
     }
   }
 
@@ -193,7 +214,8 @@ function eventBlockStyle(seg: EventSegment): Record<string, string> {
   const topOffset = (seg.segStart.getMinutes() / 60) * HOUR_HEIGHT;
   const height = durationHours * HOUR_HEIGHT;
 
-  const ol = overlapLayout.value.get(seg.event.id);
+  const dayStr = seg.segStart.toISOString().split("T")[0];
+  const ol = overlapLayout.value.get(`${dayStr}:${seg.event.id}`);
   const col = ol?.column ?? 0;
   const totalCols = ol?.totalColumns ?? 1;
   const widthPct = 100 / totalCols;

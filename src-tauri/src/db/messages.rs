@@ -237,12 +237,12 @@ pub fn get_messages(
     // Try FTS5 first; on failure (bad query syntax), fall back to LIKE
     let has_text = !filter.text.trim().is_empty();
     match get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
-        Ok(page) => return Ok(page),
+        Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 query failed, retrying with LIKE fallback: {}", e);
-            return get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+            get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
 }
 
@@ -728,12 +728,12 @@ pub fn get_threaded_messages(
 ) -> Result<ThreadedPage> {
     let has_text = !filter.text.trim().is_empty();
     match get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
-        Ok(page) => return Ok(page),
+        Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 threaded query failed, retrying with LIKE: {}", e);
-            return get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+            get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
 }
 

@@ -42,6 +42,7 @@ const syncing = ref(false);
 const CONTACT_SYNC_INTERVAL = 30 * 60 * 1000; // 30 minutes
 let contactSyncIntervalId: ReturnType<typeof setInterval> | null = null;
 let stopContactsChangedListener: (() => void) | null = null;
+let disposed = false;
 
 onMounted(async () => {
   // Load local data first, then sync in background
@@ -55,16 +56,22 @@ onMounted(async () => {
 
   // Listen for backend contacts-changed events
   listen<string>("contacts-changed", async () => {
+    if (disposed) return;
     await fetchBooks();
     if (selectedBookId.value) {
       contacts.value = await api.listContacts(selectedBookId.value);
     }
   }).then((unlisten) => {
+    if (disposed) {
+      unlisten();
+      return;
+    }
     stopContactsChangedListener = unlisten;
   });
 });
 
 onUnmounted(() => {
+  disposed = true;
   if (contactSyncIntervalId) {
     clearInterval(contactSyncIntervalId);
   }
@@ -72,6 +79,7 @@ onUnmounted(() => {
 });
 
 async function syncAllContacts() {
+  if (syncing.value) return; // re-entrancy guard: skip if sync already in progress
   syncing.value = true;
   try {
     for (const account of accountsStore.accounts) {

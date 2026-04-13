@@ -28,13 +28,16 @@ pub struct OutboxEntry {
 }
 
 /// Write a failed operation to the outbox for later replay.
+///
+/// Replay order (flags -> moves -> copies -> deletes) is computed at read
+/// time in `get_pending_ops` via `replay_order()`, so no extra column or
+/// workaround is needed here.
 pub fn queue_offline_op(
     conn: &Connection,
     account_id: &str,
     action_type: &str,
     payload: &serde_json::Value,
 ) -> Result<i64> {
-    let order = replay_order(action_type);
     conn.execute(
         "INSERT INTO outbox (account_id, action_type, payload_json, status, retry_count, error_message)
          VALUES (?1, ?2, ?3, 'pending', 0, NULL)",
@@ -42,14 +45,6 @@ pub fn queue_offline_op(
     )
     .map_err(Error::Database)?;
     let id = conn.last_insert_rowid();
-    // Store replay_order in error_message field as a workaround until
-    // a schema migration adds a dedicated column. This avoids blocking
-    // the feature on a migration.
-    conn.execute(
-        "UPDATE outbox SET error_message = ?1 WHERE id = ?2 AND error_message IS NULL",
-        rusqlite::params![format!("replay_order:{}", order), id],
-    )
-    .map_err(Error::Database)?;
     Ok(id)
 }
 
@@ -80,8 +75,13 @@ pub fn get_pending_ops(conn: &Connection, account_id: &str) -> Result<Vec<Outbox
         .filter_map(|r| r.ok())
         .collect();
 
-    // Sort by replay order: flags -> moves -> copies -> deletes
-    entries.sort_by_key(|e| replay_order(&e.action_type));
+    // Sort by replay order: flags -> moves -> copies -> deletes.
+    // Use stable ordering: break ties by id to preserve insertion order.
+    entries.sort_by(|a, b| {
+        replay_order(&a.action_type)
+            .cmp(&replay_order(&b.action_type))
+            .then(a.id.cmp(&b.id))
+    });
     Ok(entries)
 }
 
