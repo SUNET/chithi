@@ -103,6 +103,19 @@ pub async fn delete_calendar(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn unsubscribe_calendar(
+    state: State<'_, AppState>,
+    calendar_id: String,
+) -> Result<()> {
+    log::info!("unsubscribe_calendar: id={}", calendar_id);
+    let conn = state.db.lock().await;
+    db::calendar::set_calendar_subscribed(&conn, &calendar_id, false)?;
+    let deleted = db::calendar::delete_calendar_events(&conn, &calendar_id)?;
+    log::info!("unsubscribe_calendar: deleted {} events for calendar {}", deleted, calendar_id);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Event management commands
 // ---------------------------------------------------------------------------
@@ -648,8 +661,22 @@ async fn sync_calendars_jmap(
         }
     }
 
-    // Step 2: For each calendar, fetch events and upsert into local DB
+    // Collect unsubscribed calendar IDs to skip event fetching
+    let unsubscribed: std::collections::HashSet<String> = {
+        let conn = state.db.lock().await;
+        let cals = db::calendar::list_calendars(&conn, account_id)?;
+        cals.into_iter()
+            .filter(|c| !c.is_subscribed)
+            .filter_map(|c| c.remote_id)
+            .collect()
+    };
+
+    // Step 2: For each subscribed calendar, fetch events and upsert into local DB
     for jcal in &jmap_calendars {
+        if unsubscribed.contains(&jcal.id) {
+            log::debug!("sync_calendars: skipping unsubscribed calendar '{}'", jcal.name);
+            continue;
+        }
         let events = match jmap_conn
             .fetch_calendar_events(&jmap_config, Some(&jcal.id))
             .await
@@ -839,8 +866,22 @@ async fn sync_calendars_google(
         }
     }
 
-    // Step 2: Fetch events for each calendar (with syncToken for incremental sync)
+    // Collect unsubscribed calendar IDs to skip event fetching
+    let unsubscribed: std::collections::HashSet<String> = {
+        let conn = state.db.lock().await;
+        let cals = db::calendar::list_calendars(&conn, account_id)?;
+        cals.into_iter()
+            .filter(|c| !c.is_subscribed)
+            .filter_map(|c| c.remote_id)
+            .collect()
+    };
+
+    // Step 2: Fetch events for each subscribed calendar
     for (remote_cal_id, local_cal_id) in &remote_to_local {
+        if unsubscribed.contains(remote_cal_id) {
+            log::debug!("sync_calendars_google: skipping unsubscribed calendar {}", remote_cal_id);
+            continue;
+        }
         let sync_key = format!("google_sync_token_{}_{}", account_id, remote_cal_id);
 
         // Check for existing syncToken
@@ -1059,8 +1100,22 @@ async fn sync_calendars_caldav(
         }
     }
 
-    // Step 2: For each calendar, fetch events and upsert into local DB
+    // Collect unsubscribed calendar IDs to skip event fetching
+    let unsubscribed: std::collections::HashSet<String> = {
+        let conn = state.db.lock().await;
+        let cals = db::calendar::list_calendars(&conn, account_id)?;
+        cals.into_iter()
+            .filter(|c| !c.is_subscribed)
+            .filter_map(|c| c.remote_id)
+            .collect()
+    };
+
+    // Step 2: For each subscribed calendar, fetch events and upsert into local DB
     for cal in &caldav_calendars {
+        if unsubscribed.contains(&cal.href) {
+            log::debug!("sync_calendars_caldav: skipping unsubscribed calendar '{}'", cal.name);
+            continue;
+        }
         let caldav_events = match client.fetch_events(&cal.href).await {
             Ok(evts) => evts,
             Err(e) => {
@@ -2121,6 +2176,23 @@ async fn sync_calendars_graph(
             |row| row.get(0),
         ).ok())
         .unwrap_or_default();
+
+    // Graph sync currently maps all events to the default calendar.
+    // Unlike JMAP/Google/CalDAV, there's no per-calendar event fetch,
+    // so we only check the default calendar's subscription status.
+    // TODO: when multi-calendar Graph support is added, use the same
+    // HashSet<String> pattern as the other sync paths.
+    let default_subscribed = if !default_cal_local_id.is_empty() {
+        let cal = db::calendar::get_calendar(&conn, &default_cal_local_id)?;
+        cal.is_subscribed
+    } else {
+        true
+    };
+
+    if !default_subscribed {
+        log::debug!("sync_calendars_graph: default calendar unsubscribed, skipping events");
+        return Ok(());
+    }
 
     for ge in &graph_events {
         // Find local calendar ID for this event
