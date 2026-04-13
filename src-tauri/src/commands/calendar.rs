@@ -2293,6 +2293,16 @@ pub async fn process_cancelled_invite(
 /// during mail sync. Called after new messages are synced for an account.
 /// This enables Thunderbird-style automatic invite processing without
 /// requiring the user to open each reply/cancel email.
+///
+/// # Safety / Threading
+///
+/// This function is intentionally **synchronous** and uses
+/// `tokio::runtime::Handle::current().block_on(db.writer())` to acquire
+/// the DB writer lock from a non-async call site.  It **must only be
+/// called from a `tokio::task::spawn_blocking` context** (i.e. a thread
+/// that does not service the async executor).  Calling it directly from
+/// an `async fn` will deadlock if any other task already holds or is
+/// waiting on the writer lock.
 pub fn auto_process_calendar_emails(
     app: &tauri::AppHandle,
     db: &std::sync::Arc<crate::db::pool::DbPool>,
