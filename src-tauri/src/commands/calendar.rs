@@ -240,6 +240,15 @@ pub async fn create_event(
                                 "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                                 rusqlite::params![remote_id, id],
                             ).ok();
+                            // Update local UID to match Google's iCalUID so RSVP
+                            // replies can be matched back to the event.
+                            if let Some(ical_uid) = data["iCalUID"].as_str() {
+                                conn.execute(
+                                    "UPDATE calendar_events SET uid = ?1 WHERE id = ?2",
+                                    rusqlite::params![ical_uid, id],
+                                ).ok();
+                                log::info!("create_event: updated local UID to Google iCalUID={}", ical_uid);
+                            }
                         }
                     }
                     Ok(resp) => {
@@ -298,13 +307,23 @@ pub async fn create_event(
                 // Graph sends invite emails automatically when attendees are present
                 log::debug!("create_event: O365 graph_event JSON: {}", serde_json::to_string_pretty(&graph_event).unwrap_or_default());
                 match client.create_event(&graph_event).await {
-                    Ok(remote_id) => {
-                        log::info!("create_event: pushed to Graph Calendar, id={}", remote_id);
+                    Ok((remote_id, ical_uid)) => {
+                        log::info!("create_event: pushed to Graph Calendar, id={}, iCalUid={:?}", remote_id, ical_uid);
                         let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, id],
                         ).ok();
+                        // Update the local UID to match Exchange's iCalUid so that
+                        // incoming RSVP reply emails (which reference this UID) can
+                        // be matched back to the event by process_invite_reply.
+                        if let Some(ref ical_uid) = ical_uid {
+                            conn.execute(
+                                "UPDATE calendar_events SET uid = ?1 WHERE id = ?2",
+                                rusqlite::params![ical_uid, id],
+                            ).ok();
+                            log::info!("create_event: updated local UID to Exchange iCalUid={}", ical_uid);
+                        }
                     }
                     Err(e) => log::error!("create_event: Graph Calendar push failed: {}", e),
                 }
@@ -574,8 +593,21 @@ pub async fn sync_calendars(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
+    #[allow(unused_variables)]
+    force_full_sync: Option<bool>,
 ) -> Result<()> {
     log::info!("sync_calendars: account={}", account_id);
+
+    // When force_full_sync is true (manual Sync button), clear Google/O365
+    // sync tokens to force a full sync that reconciles server-side deletions.
+    if force_full_sync.unwrap_or(false) {
+        let conn = state.db.writer().await;
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key LIKE ?1",
+            rusqlite::params![format!("google_sync_token_{account_id}_%")],
+        ).ok();
+        log::info!("sync_calendars: cleared sync tokens for full sync (account={})", account_id);
+    }
 
     let account = {
         let conn = state.db.reader();
@@ -923,9 +955,35 @@ async fn sync_calendars_google(
         log::info!("sync_calendars_google: fetched {} events for calendar {}", count, remote_cal_id);
 
         let conn = state.db.writer().await;
+        let mut server_event_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut server_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(events) = events {
             for ev in events {
                 let event_id_remote = ev["id"].as_str().unwrap_or_default();
+                server_event_ids.insert(event_id_remote.to_string());
+                if let Some(uid) = ev["iCalUID"].as_str() {
+                    server_uids.insert(uid.to_string());
+                }
+
+                // Incremental sync: cancelled events should be deleted locally
+                if ev["status"].as_str() == Some("cancelled") {
+                    let deleted = conn.execute(
+                        "DELETE FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
+                        rusqlite::params![account_id, event_id_remote],
+                    ).unwrap_or(0);
+                    // Also delete by iCalUID for events created locally via respond_to_invite
+                    if let Some(ical_uid) = ev["iCalUID"].as_str() {
+                        conn.execute(
+                            "DELETE FROM calendar_events WHERE account_id = ?1 AND uid = ?2 AND remote_id IS NULL",
+                            rusqlite::params![account_id, ical_uid],
+                        ).ok();
+                    }
+                    if deleted > 0 {
+                        log::info!("sync_calendars_google: deleted cancelled event '{}'", event_id_remote);
+                    }
+                    continue;
+                }
+
                 let title = ev["summary"].as_str().unwrap_or("(No title)");
                 let description = ev["description"].as_str().map(|s| s.to_string());
                 let location = ev["location"].as_str().map(|s| s.to_string());
@@ -989,6 +1047,63 @@ async fn sync_calendars_google(
                 rusqlite::params![sync_key, next_token],
             ).ok();
             log::debug!("sync_calendars_google: saved syncToken for calendar {}", remote_cal_id);
+        }
+
+        // During full sync (no syncToken), reconcile: delete local events
+        // whose remote_id no longer appears on the server. Incremental sync
+        // handles deletions via "status: cancelled" (see above).
+        if existing_token.is_none() && !server_event_ids.is_empty() {
+            let conn = state.db.writer().await;
+            let local_events: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT ce.id, ce.remote_id FROM calendar_events ce
+                     JOIN calendars c ON ce.calendar_id = c.id
+                     WHERE ce.account_id = ?1 AND ce.remote_id IS NOT NULL AND ce.remote_id != ''
+                     AND c.remote_id = ?2"
+                )
+                .map(|mut stmt| {
+                    stmt.query_map(rusqlite::params![account_id, remote_cal_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            let mut deleted = 0;
+            for (local_id, remote_id) in &local_events {
+                if !server_event_ids.contains(remote_id) {
+                    db::calendar::delete_event(&conn, local_id).ok();
+                    deleted += 1;
+                }
+            }
+            // Also remove orphan events (no remote_id) by matching UID
+            if !server_uids.is_empty() {
+                let orphans: Vec<(String, String)> = conn
+                    .prepare(
+                        "SELECT ce.id, ce.uid FROM calendar_events ce
+                         JOIN calendars c ON ce.calendar_id = c.id
+                         WHERE ce.account_id = ?1 AND (ce.remote_id IS NULL OR ce.remote_id = '')
+                         AND ce.uid IS NOT NULL AND c.remote_id = ?2"
+                    )
+                    .map(|mut stmt| {
+                        stmt.query_map(rusqlite::params![account_id, remote_cal_id], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                for (local_id, uid) in &orphans {
+                    if !server_uids.contains(uid) {
+                        db::calendar::delete_event(&conn, local_id).ok();
+                        deleted += 1;
+                    }
+                }
+            }
+            if deleted > 0 {
+                log::info!("sync_calendars_google: removed {} server-deleted events from '{}'", deleted, remote_cal_id);
+            }
         }
     }
 
@@ -1311,6 +1426,7 @@ pub async fn get_invite_status(
 
 #[tauri::command]
 pub async fn respond_to_invite(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_id: String,
@@ -1401,12 +1517,16 @@ pub async fn respond_to_invite(
                 &reply_ical,
             )?;
 
+            // For O365: refresh SMTP-scoped OAuth token
+            let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
                 &account.username,
-                &account.password,
+                &smtp_password,
                 account.use_tls,
+                use_xoauth2,
                 &account.email,
                 organizer_email,
                 &raw_message,
@@ -1421,13 +1541,19 @@ pub async fn respond_to_invite(
     let my_status = response.to_lowercase();
     let conn = state.db.writer().await;
 
-    // Find or create the default calendar for this account
+    // Find the best calendar for this account: prefer default, then any with
+    // a remote_id (synced from server), then any existing, finally create one.
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
-    let default_calendar = calendars.iter().find(|c| c.is_default);
-    let calendar_id = if let Some(cal) = default_calendar {
+    let calendar_id = if let Some(cal) = calendars.iter().find(|c| c.is_default && c.remote_id.is_some()) {
+        cal.id.clone()
+    } else if let Some(cal) = calendars.iter().find(|c| c.is_default) {
+        cal.id.clone()
+    } else if let Some(cal) = calendars.iter().find(|c| c.remote_id.is_some()) {
+        cal.id.clone()
+    } else if let Some(cal) = calendars.first() {
         cal.id.clone()
     } else {
-        // Create a default calendar
+        // No calendars at all — create a default one
         let cal_id = uuid::Uuid::new_v4().to_string();
         let new_cal = NewCalendar {
             account_id: account_id.clone(),
@@ -1583,8 +1709,52 @@ pub async fn respond_to_invite(
                     }
                 }
             }
+            // Store the Google Calendar event ID as remote_id on the local event
+            // so that Google Calendar sync doesn't create a duplicate.
+            if let Some(ref geid) = google_event_id_found {
+                if !geid.is_empty() {
+                    let conn = state.db.writer().await;
+                    conn.execute(
+                        "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3 AND (remote_id IS NULL OR remote_id = '')",
+                        rusqlite::params![geid, invite_uid, account_id],
+                    ).ok();
+                    log::info!("respond_to_invite: stored Google Calendar remote_id={}", geid);
+                }
+            }
         }
     }
+
+    // Step 6: Update O365 calendar via Graph API RSVP
+    if account.provider == "o365" {
+        match crate::mail::graph::get_graph_token(&account_id).await {
+            Ok(token) => {
+                let client = crate::mail::graph::GraphClient::new(&token);
+                match client.find_event_by_ical_uid(&invite_uid).await {
+                    Ok(Some(graph_event_id)) => {
+                        match client.rsvp_event(&graph_event_id, &response, "").await {
+                            Ok(()) => {
+                                log::info!("respond_to_invite: updated O365 Calendar response to {}", response);
+                                // Store remote_id so process_invite_reply can find the event later
+                                let conn = state.db.writer().await;
+                                conn.execute(
+                                    "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3",
+                                    rusqlite::params![graph_event_id, invite_uid, account_id],
+                                ).ok();
+                            }
+                            Err(e) => log::warn!("respond_to_invite: O365 Graph RSVP failed: {}", e),
+                        }
+                    }
+                    Ok(None) => log::debug!("respond_to_invite: event not found on O365 Calendar by iCalUId"),
+                    Err(e) => log::warn!("respond_to_invite: O365 Graph event lookup failed: {}", e),
+                }
+            }
+            Err(e) => log::warn!("respond_to_invite: failed to get O365 token: {}", e),
+        }
+    }
+
+    // Notify frontend that calendar data changed so the UI refreshes
+    use tauri::Emitter as _;
+    app.emit("calendar-changed", account_id.as_str()).ok();
 
     Ok(())
 }
@@ -1660,47 +1830,82 @@ fn build_calendar_reply_message(
     Ok(message.formatted())
 }
 
-/// Send a pre-built raw message via SMTP.
+/// Get SMTP credentials for an account, refreshing OAuth tokens for O365.
+async fn get_smtp_credentials(
+    account: &db::accounts::AccountFull,
+) -> Result<(String, bool)> {
+    if account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account.id)?
+            .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
+        let refresh_token = tokens.refresh_token
+            .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for SMTP".into()))?;
+        let smtp_tokens = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT,
+            &refresh_token,
+            crate::oauth::MICROSOFT_IMAP_SCOPES, // SMTP.Send is in the same scope set
+        ).await?;
+        crate::oauth::store_tokens(&account.id, &crate::oauth::OAuthTokens {
+            access_token: smtp_tokens.access_token.clone(),
+            refresh_token: smtp_tokens.refresh_token,
+            expires_at: smtp_tokens.expires_at,
+        })?;
+        Ok((smtp_tokens.access_token, true))
+    } else {
+        Ok((account.password.clone(), false))
+    }
+}
+
+/// Send a pre-built raw message via SMTP, with XOAUTH2 support for O365.
 async fn send_raw_smtp(
     smtp_host: &str,
     smtp_port: u16,
     username: &str,
     password: &str,
     use_tls: bool,
+    use_xoauth2: bool,
     from: &str,
     to: &str,
     raw_message: &[u8],
 ) -> Result<()> {
-    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::transport::smtp::authentication::{Credentials, Mechanism};
     use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
     log::info!(
-        "send_raw_smtp: from={} to={} via {}:{}",
+        "send_raw_smtp: from={} to={} via {}:{} (xoauth2={})",
         from,
         to,
         smtp_host,
-        smtp_port
+        smtp_port,
+        use_xoauth2,
     );
 
     let creds = Credentials::new(username.to_string(), password.to_string());
+    let auth_mechanisms = if use_xoauth2 {
+        vec![Mechanism::Xoauth2]
+    } else {
+        vec![Mechanism::Plain, Mechanism::Login]
+    };
 
     let transport = if smtp_port == 587 {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
             .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     } else if use_tls || smtp_port == 465 {
         AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
             .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
             .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
             .port(smtp_port)
             .credentials(creds)
+            .authentication(auth_mechanisms)
             .build()
     };
 
@@ -1791,6 +1996,30 @@ pub async fn send_invites(
         (acc, evt)
     };
 
+    // Gmail and O365 handle sending invite emails server-side when
+    // events are pushed via Google Calendar API (sendUpdates=all) or
+    // Graph API. Sending our own SMTP invite would create duplicates.
+    if account.provider == "gmail" || account.provider == "o365" {
+        log::info!(
+            "send_invites: skipping manual send for {} account (server handles invites)",
+            account.provider
+        );
+        // Still update attendees in the local DB
+        let conn = state.db.writer().await;
+        let attendees_json = serde_json::to_string(
+            &attendee_emails.iter().map(|e| Attendee {
+                email: e.clone(),
+                name: None,
+                status: "needs-action".to_string(),
+            }).collect::<Vec<_>>()
+        ).unwrap_or_default();
+        conn.execute(
+            "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+            rusqlite::params![attendees_json, event_id],
+        ).ok();
+        return Ok(());
+    }
+
     let attendees: Vec<Attendee> = attendee_emails
         .iter()
         .map(|email| Attendee {
@@ -1842,12 +2071,14 @@ pub async fn send_invites(
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
         } else {
+            let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
                 &account.username,
-                &account.password,
+                &smtp_password,
                 account.use_tls,
+                use_xoauth2,
                 &account.email,
                 attendee_email,
                 &raw,
@@ -1876,6 +2107,7 @@ pub async fn send_invites(
 /// Called when the organizer receives a METHOD:REPLY email.
 #[tauri::command]
 pub async fn process_invite_reply(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message_id: String,
@@ -1971,8 +2203,165 @@ pub async fn process_invite_reply(
         }
     }
 
+    // Notify frontend to refresh calendar UI
+    use tauri::Emitter as _;
+    app.emit("calendar-changed", account_id.as_str()).ok();
+
     log::info!("process_invite_reply: completed for account {}", account_id);
     Ok(())
+}
+
+/// Process a METHOD:CANCEL email — delete the matching local event.
+#[tauri::command]
+pub async fn process_cancelled_invite(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<()> {
+    log::info!("process_cancelled_invite: account={} message={}", account_id, message_id);
+
+    let raw = {
+        let conn = state.db.reader();
+        let (maildir_path, _, _, _, _, _, _) = db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        let data_dir = state.data_dir.clone();
+        std::fs::read(data_dir.join(maildir_path))
+            .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
+    };
+
+    let invites = ical::parse_ical_from_email(&raw);
+    let cancels: Vec<_> = invites.iter()
+        .filter(|inv| inv.method.to_uppercase() == "CANCEL")
+        .collect();
+
+    if cancels.is_empty() {
+        log::debug!("process_cancelled_invite: no METHOD:CANCEL found");
+        return Ok(());
+    }
+
+    let conn = state.db.writer().await;
+    let mut deleted = 0;
+    for cancel in &cancels {
+        if let Some(event) = db::calendar::get_event_by_uid(&conn, &account_id, &cancel.uid)? {
+            db::calendar::delete_event(&conn, &event.id)?;
+            deleted += 1;
+            log::info!("process_cancelled_invite: deleted event '{}' (UID={})", event.title, cancel.uid);
+        }
+    }
+
+    if deleted > 0 {
+        use tauri::Emitter as _;
+        app.emit("calendar-changed", account_id.as_str()).ok();
+    }
+
+    log::info!("process_cancelled_invite: completed for account {}", account_id);
+    Ok(())
+}
+
+/// Auto-process calendar emails (METHOD:REPLY and METHOD:CANCEL) found
+/// during mail sync. Called after new messages are synced for an account.
+/// This enables Thunderbird-style automatic invite processing without
+/// requiring the user to open each reply/cancel email.
+pub fn auto_process_calendar_emails(
+    app: &tauri::AppHandle,
+    db: &std::sync::Arc<crate::db::pool::DbPool>,
+    account_id: &str,
+    data_dir: &std::path::Path,
+    new_message_ids: &[String],
+) {
+    if new_message_ids.is_empty() {
+        return;
+    }
+
+    let mut calendar_changed = false;
+
+    for msg_id in new_message_ids {
+        // Look up the maildir path for this message
+        let maildir_path = {
+            let conn = db.reader();
+            match db::messages::get_message_metadata(&conn, account_id, msg_id) {
+                Ok((path, _, _, _, _, _, _)) => path,
+                Err(_) => continue,
+            }
+        };
+
+        if maildir_path.is_empty() {
+            continue; // Body not fetched yet
+        }
+
+        let raw = match std::fs::read(data_dir.join(&maildir_path)) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        let invites = ical::parse_ical_from_email(&raw);
+        if invites.is_empty() {
+            continue;
+        }
+
+        for invite in &invites {
+            match invite.method.to_uppercase().as_str() {
+                "REPLY" => {
+                    // Update attendee status on organizer's local event
+                    let conn_w = tokio::runtime::Handle::current()
+                        .block_on(db.writer());
+                    if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
+                        .ok()
+                        .flatten()
+                    {
+                        for attendee in &invite.attendees {
+                            if let Some(ref att_json) = event.attendees_json {
+                                if let Ok(mut attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+                                    let mut updated = false;
+                                    for att in attendees.iter_mut() {
+                                        if att["email"].as_str() == Some(&attendee.email) {
+                                            att["status"] = serde_json::json!(&attendee.status);
+                                            updated = true;
+                                        }
+                                    }
+                                    if updated {
+                                        let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
+                                        conn_w.execute(
+                                            "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+                                            rusqlite::params![updated_json, event.id],
+                                        ).ok();
+                                        log::info!(
+                                            "auto_process: {} responded '{}' to event '{}'",
+                                            attendee.email, attendee.status, event.title
+                                        );
+                                        calendar_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "CANCEL" => {
+                    // Delete cancelled event
+                    let conn_w = tokio::runtime::Handle::current()
+                        .block_on(db.writer());
+                    if let Some(event) = db::calendar::get_event_by_uid(&conn_w, account_id, &invite.uid)
+                        .ok()
+                        .flatten()
+                    {
+                        if db::calendar::delete_event(&conn_w, &event.id).is_ok() {
+                            log::info!(
+                                "auto_process: deleted cancelled event '{}' (UID={})",
+                                event.title, invite.uid
+                            );
+                            calendar_changed = true;
+                        }
+                    }
+                }
+                _ => {} // REQUEST etc. handled by user interaction
+            }
+        }
+    }
+
+    if calendar_changed {
+        use tauri::Emitter;
+        app.emit("calendar-changed", account_id).ok();
+    }
 }
 
 fn build_invite_message(

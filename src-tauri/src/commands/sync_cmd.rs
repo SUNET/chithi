@@ -362,6 +362,15 @@ pub async fn sync_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    // Emit sync-started for ALL protocols so the activity UI tracks every sync
+    app.emit(
+        "sync-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "account_name": account.display_name,
+        }),
+    ).ok();
+
     let suspended_idle = if account.mail_protocol == "imap"
         && should_suspend_idle_for_imap_operation(&account.provider)
     {
@@ -375,81 +384,68 @@ pub async fn sync_folder(
     };
     let resume_account = account.clone();
 
-    if account.mail_protocol == "graph" {
+    let sync_result: Result<u32> = if account.mail_protocol == "graph" {
         // Graph sync is whole-account, not per-folder — just run the full sync
-        sync_graph_account(app, state.db.clone(), &account_id).await?;
-        return Ok(0);
-    }
-
-    if account.mail_protocol == "jmap" {
+        match sync_graph_account(app.clone(), state.db.clone(), &account_id).await {
+            Ok(()) => Ok(0),
+            Err(e) => Err(e),
+        }
+    } else if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
-
-        let result = jmap_sync::sync_jmap_folder_public(
-            app,
+        jmap_sync::sync_jmap_folder_public(
+            app.clone(),
             state.db.clone(),
-            account_id,
-            account.display_name,
-            folder_path,
+            account_id.clone(),
+            account.display_name.clone(),
+            folder_path.clone(),
             jmap_config,
         )
-        .await;
-        return result;
-    }
-
-    // IMAP path — for O365, refresh IMAP-scoped token
-    let (password, use_xoauth2) = if account.provider == "o365" {
-        let tokens = crate::oauth::load_tokens(&account_id)?
-            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens.refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-        let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-        ).await?;
-        crate::oauth::store_tokens(&account_id, &new)?;
-        (new.access_token, true)
+        .await
     } else {
-        (account.password, false)
+        // IMAP path — for O365, refresh IMAP-scoped token
+        let (password, use_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
+
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password,
+            use_tls: account.use_tls,
+            use_xoauth2,
+        };
+
+        let db = state.db.clone();
+        let account_id_clone = account_id.clone();
+        let folder_clone = folder_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn_imap = ImapConnection::connect(&imap_config)?;
+            conn_imap.select_folder(&folder_clone)?;
+            let count = mail_sync::sync_folder_envelopes_public(
+                &db, &account_id_clone, &mut conn_imap, &folder_clone,
+            )?;
+            conn_imap.logout();
+            Ok::<u32, Error>(count)
+        })
+        .await
+        .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?
     };
-
-    let imap_config = ImapConfig {
-        host: account.imap_host,
-        port: account.imap_port,
-        username: account.username,
-        password,
-        use_tls: account.use_tls,
-        use_xoauth2,
-    };
-
-    let db = state.db.clone();
-    let account_name = account.display_name.clone();
-
-    app.emit(
-        "sync-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "account_name": account_name,
-        }),
-    ).ok();
-
-    let _app_clone = app.clone();
-    let account_id_clone = account_id.clone();
-    let folder_clone = folder_path.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let mut conn_imap = ImapConnection::connect(&imap_config)?;
-        conn_imap.select_folder(&folder_clone)?;
-        let count = mail_sync::sync_folder_envelopes_public(
-            &db, &account_id_clone, &mut conn_imap, &folder_clone,
-        )?;
-        conn_imap.logout();
-        Ok::<u32, Error>(count)
-    })
-    .await
-    .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?;
 
     let resume_result = resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
 
-    match &result {
+    match &sync_result {
         Ok(count) => {
             app.emit(
                 "sync-complete",
@@ -475,7 +471,7 @@ pub async fn sync_folder(
 
     resume_result?;
 
-    result
+    sync_result
 }
 
 /// Sync JMAP calendars for an account. Extracted as a standalone async function

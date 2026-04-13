@@ -123,18 +123,88 @@ function getEventsForDayHour(date: Date, hour: number): EventSegment[] {
 
 const HOUR_HEIGHT = 52; // must match .hour-row min-height in CSS
 
+// Precompute overlap layout: for each day, find overlapping events and assign
+// columns so they render side-by-side instead of stacking on top of each other.
+interface OverlapInfo {
+  column: number;
+  totalColumns: number;
+}
+
+const overlapLayout = computed(() => {
+  const layout = new Map<string, OverlapInfo>();
+
+  for (const day of days.value) {
+    const dayStart = new Date(day);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(day);
+    dayEnd.setHours(23, 59, 59, 999);
+
+    // Collect all timed events for this day
+    const dayEvents: { id: string; start: number; end: number }[] = [];
+    for (const e of calendarStore.visibleEvents) {
+      const eStart = new Date(e.start_time);
+      const eEnd = new Date(e.end_time);
+      if (e.all_day || (eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000)) continue;
+      if (eStart > dayEnd || eEnd <= dayStart) continue;
+      dayEvents.push({
+        id: e.id,
+        start: Math.max(eStart.getTime(), dayStart.getTime()),
+        end: Math.min(eEnd.getTime(), dayEnd.getTime() + 1),
+      });
+    }
+
+    // Sort by start time, then by end time descending (longer events first)
+    dayEvents.sort((a, b) => a.start - b.start || b.end - a.end);
+
+    // Assign columns: for each event, find the first column where it doesn't
+    // overlap with any already-placed event.
+    const columns: { end: number }[][] = [];
+    for (const ev of dayEvents) {
+      let placed = false;
+      for (let col = 0; col < columns.length; col++) {
+        const lastInCol = columns[col][columns[col].length - 1];
+        if (lastInCol.end <= ev.start) {
+          columns[col].push({ end: ev.end });
+          layout.set(ev.id, { column: col, totalColumns: 0 }); // totalColumns set later
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        columns.push([{ end: ev.end }]);
+        layout.set(ev.id, { column: columns.length - 1, totalColumns: 0 });
+      }
+    }
+
+    // Set totalColumns for all events in this day's group
+    const totalCols = columns.length;
+    for (const ev of dayEvents) {
+      const info = layout.get(ev.id);
+      if (info) info.totalColumns = totalCols;
+    }
+  }
+
+  return layout;
+});
+
 function eventBlockStyle(seg: EventSegment): Record<string, string> {
   const durationMs = seg.segEnd.getTime() - seg.segStart.getTime();
   const durationHours = Math.max(durationMs / (60 * 60 * 1000), 0.25);
   const topOffset = (seg.segStart.getMinutes() / 60) * HOUR_HEIGHT;
   const height = durationHours * HOUR_HEIGHT;
 
+  const ol = overlapLayout.value.get(seg.event.id);
+  const col = ol?.column ?? 0;
+  const totalCols = ol?.totalColumns ?? 1;
+  const widthPct = 100 / totalCols;
+  const leftPct = col * widthPct;
+
   const style: Record<string, string> = {
     position: "absolute",
     top: `${topOffset}px`,
     height: `${height}px`,
-    left: "2px",
-    right: "2px",
+    left: `calc(${leftPct}% + 1px)`,
+    width: `calc(${widthPct}% - 2px)`,
     zIndex: "2",
     backgroundColor: getEventColor(seg.event),
   };

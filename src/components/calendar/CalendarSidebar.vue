@@ -19,9 +19,9 @@ const emit = defineEmits<{
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 
-function getAccountName(accountId: string): string {
+function getAccountLabel(accountId: string): string {
   const acc = accountsStore.accounts.find((a) => a.id === accountId);
-  return acc ? `${acc.display_name} (${acc.email})` : "";
+  return acc ? acc.email : "";
 }
 
 const contextMenu = ref<{ x: number; y: number; calendarId: string; accountId: string } | null>(null);
@@ -115,7 +115,10 @@ async function syncThisCalendar() {
             class="calendar-color"
             :style="{ backgroundColor: getCalendarColor(cal.color) }"
           ></span>
-          <span class="calendar-name" :title="getAccountName(cal.account_id)">{{ cal.name }}</span>
+          <span class="calendar-name-group">
+            <span class="calendar-name">{{ cal.name }}</span>
+            <span class="calendar-account">{{ getAccountLabel(cal.account_id) }}</span>
+          </span>
           <span v-if="syncing === cal.id" class="sync-spinner"></span>
         </label>
       </div>
@@ -192,11 +195,27 @@ async function syncThisCalendar() {
   flex-shrink: 0;
 }
 
+.calendar-name-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 0;
+}
+
 .calendar-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex: 1;
+}
+
+.calendar-account {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.2;
 }
 
 .sync-spinner {

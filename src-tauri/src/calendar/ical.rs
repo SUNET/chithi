@@ -80,8 +80,17 @@ pub fn parse_ical_from_email(raw_message: &[u8]) -> Vec<ParsedInvite> {
 pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
     let mut invites = Vec::new();
 
+    // Normalize line endings and unfold continuation lines.
+    // Microsoft Exchange sends \r\n (CRLF) with RFC 5545 line folding
+    // (long lines split with CRLF + space/tab). The icalendar crate
+    // parser doesn't handle folded lines, so we must unfold first.
+    let normalized = ical_text
+        .replace("\r\n ", "")   // Unfold CRLF + space
+        .replace("\r\n\t", "")  // Unfold CRLF + tab
+        .replace("\r\n", "\n"); // Normalize remaining CRLF to LF
+
     // Use the icalendar parser to get structured components
-    let components = match icalendar::parser::read_calendar_simple(ical_text) {
+    let components = match icalendar::parser::read_calendar_simple(&normalized) {
         Ok(components) => components,
         Err(e) => {
             log::error!("parse_ical_data: failed to parse iCalendar: {}", e);
@@ -618,6 +627,20 @@ END:VCALENDAR";
 
         let invites = parse_ical_data(ical);
         assert_eq!(invites.len(), 0, "Events without UID should be skipped");
+    }
+
+    #[test]
+    fn test_parse_microsoft_exchange_invite() {
+        // Real iCal from Microsoft Exchange Server with CRLF line endings
+        // and RFC 5545 folded lines (continuation lines starting with space)
+        let ical = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nORGANIZER;CN=kushal das:mailto:chithiapp@outlook.com\r\nATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=sdossec@gm\r\n ail.com:mailto:sdossec@gmail.com\r\nDESCRIPTION;LANGUAGE=en-US:This is yo food event.\r\nUID:040000008200E00074C5B7101A82E008000000009B9A10BF48CBDC01000000000000000\r\n 0100000009B9409D22D123D48BA2ABC0BABC17911\r\nSUMMARY;LANGUAGE=en-US:Yo food\r\nDTSTART;TZID=UTC:20260414T170000\r\nDTEND;TZID=UTC:20260414T180000\r\nCLASS:PUBLIC\r\nPRIORITY:5\r\nDTSTAMP:20260413T132342Z\r\nTRANSP:OPAQUE\r\nSTATUS:CONFIRMED\r\nSEQUENCE:0\r\nBEGIN:VALARM\r\nDESCRIPTION:REMINDER\r\nTRIGGER;RELATED=START:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1, "Should parse 1 invite from Microsoft Exchange iCal");
+        let inv = &invites[0];
+        assert_eq!(inv.summary, Some("Yo food".to_string()));
+        assert_eq!(inv.method, "REQUEST");
+        assert!(inv.organizer_email.as_deref() == Some("chithiapp@outlook.com"));
     }
 
     #[test]

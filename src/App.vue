@@ -4,6 +4,7 @@ import { useRoute } from "vue-router";
 import Sidebar from "@/components/common/Sidebar.vue";
 import MenuBar from "@/components/common/MenuBar.vue";
 import StatusBar from "@/components/common/StatusBar.vue";
+import OperationsPanel from "@/components/common/OperationsPanel.vue";
 import ToastContainer from "@/components/common/ToastContainer.vue";
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
@@ -61,6 +62,7 @@ onMounted(async () => {
       <main class="app-content">
         <router-view />
       </main>
+      <OperationsPanel />
       <StatusBar />
     </div>
   </div>

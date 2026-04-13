@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -25,8 +25,13 @@ pub struct FileAttachment {
     pub name: String,
 }
 
+/// Send an email. Validates and reads attachments synchronously, then spawns
+/// the actual network send in the background so the compose window can close
+/// immediately. Emits `send-started`, `send-complete`, or `send-failed` events
+/// to the main window for status tracking.
 #[tauri::command]
 pub async fn send_message(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message: ComposeMessage,
@@ -43,90 +48,124 @@ pub async fn send_message(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
-        log::info!("Sending via JMAP for account {}", account.email);
+    // --- Synchronous part: validate, read attachments, build message ---
+    // This is fast (local I/O only) so the compose window waits for it.
+    let attachment_data = read_attachments(&message.attachments)?;
+    let raw_message = smtp::build_raw_message(
+        &account.email,
+        &message.to,
+        &message.cc,
+        &message.bcc,
+        &message.subject,
+        &message.body_text,
+        message.body_html.as_deref(),
+        &attachment_data,
+    )?;
 
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
-
-        // Build raw RFC5322 message using lettre's builder, then send via JMAP
-        let attachment_data = read_attachments(&message.attachments)?;
-        let raw_message = smtp::build_raw_message(
-            &account.email,
-            &message.to,
-            &message.cc,
-            &message.bcc,
-            &message.subject,
-            &message.body_text,
-            message.body_html.as_deref(),
-            &attachment_data,
-        )?;
-
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.send_email(&jmap_config, &raw_message).await?;
+    // For O365 SMTP: refresh OAuth token now (needs keyring access)
+    let smtp_creds = if account.mail_protocol != "jmap" && account.provider == "o365" {
+        let tokens = crate::oauth::load_tokens(&account_id)?
+            .ok_or_else(|| Error::Other("No O365 tokens for SMTP".into()))?;
+        let refresh_token = tokens.refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token for SMTP".into()))?;
+        let smtp_tokens = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT,
+            &refresh_token,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        ).await?;
+        crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
+            access_token: smtp_tokens.access_token.clone(),
+            refresh_token: smtp_tokens.refresh_token,
+            expires_at: smtp_tokens.expires_at,
+        })?;
+        Some((account.username.clone(), smtp_tokens.access_token, true))
     } else {
-        log::debug!(
-            "Sending via SMTP {}:{} as {}",
-            account.smtp_host,
-            account.smtp_port,
-            account.email
-        );
+        None
+    };
 
-        // For O365: get SMTP-scoped OAuth token
-        let (smtp_username, smtp_password, use_xoauth2) = if account.provider == "o365" {
-            let tokens = crate::oauth::load_tokens(&account_id)?
-                .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
-            let refresh_token = tokens.refresh_token
-                .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for SMTP".into()))?;
-            let smtp_tokens = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh_token,
-                crate::oauth::MICROSOFT_IMAP_SCOPES, // SMTP.Send is in the same scope set
-            ).await?;
-            crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
-                access_token: smtp_tokens.access_token.clone(),
-                refresh_token: smtp_tokens.refresh_token,
-                expires_at: smtp_tokens.expires_at,
-            })?;
-            (account.username.clone(), smtp_tokens.access_token, true)
-        } else {
-            (account.username.clone(), account.password.clone(), false)
-        };
+    // Notify main window that send is starting
+    let subject_display = if message.subject.is_empty() {
+        "(no subject)".to_string()
+    } else {
+        message.subject.clone()
+    };
+    app.emit("send-started", serde_json::json!({
+        "account_id": account_id,
+        "subject": subject_display,
+    })).ok();
 
-        let attachment_data = read_attachments(&message.attachments)?;
-        smtp::send_message(
-            &account.smtp_host,
-            account.smtp_port,
-            &smtp_username,
-            &smtp_password,
-            account.use_tls,
-            use_xoauth2,
-            &account.email,
-            &message.to,
-            &message.cc,
-            &message.bcc,
-            &message.subject,
-            &message.body_text,
-            message.body_html.as_deref(),
-            &attachment_data,
-        )
-        .await?;
-    }
+    // --- Background: actual network send ---
+    // The command returns Ok(()) here so the compose window can close.
+    let app_bg = app.clone();
+    let account_id_bg = account_id.clone();
+    let subject_bg = subject_display.clone();
+    let db_bg = state.db.clone();
+    let recipients: Vec<String> = message.to.iter().chain(message.cc.iter()).cloned().collect();
 
-    // Auto-collect recipients to "Collected Contacts"
-    {
-        let conn = state.db.writer().await;
-        for addr in message.to.iter().chain(message.cc.iter()) {
-            if let Err(e) = db::contacts::collect_contact(&conn, &account_id, addr, None) {
-                log::warn!("Failed to collect contact '{}': {}", addr, e);
+    tokio::spawn(async move {
+        let result: std::result::Result<(), Error> = async {
+            if account.mail_protocol == "jmap" {
+                log::info!("Sending via JMAP for account {}", account.email);
+                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+                conn_jmap.send_email(&jmap_config, &raw_message).await?;
+            } else {
+                let (smtp_username, smtp_password, use_xoauth2) = smtp_creds
+                    .unwrap_or_else(|| (account.username.clone(), account.password.clone(), false));
+
+                log::info!(
+                    "Sending via SMTP {}:{} as {}",
+                    account.smtp_host,
+                    account.smtp_port,
+                    account.email
+                );
+                smtp::send_message(
+                    &account.smtp_host,
+                    account.smtp_port,
+                    &smtp_username,
+                    &smtp_password,
+                    account.use_tls,
+                    use_xoauth2,
+                    &account.email,
+                    &message.to,
+                    &message.cc,
+                    &message.bcc,
+                    &message.subject,
+                    &message.body_text,
+                    message.body_html.as_deref(),
+                    &attachment_data,
+                )
+                .await?;
+            }
+            Ok(())
+        }.await;
+
+        match result {
+            Ok(()) => {
+                log::info!("Message sent successfully for account {}", account_id_bg);
+                app_bg.emit("send-complete", serde_json::json!({
+                    "account_id": account_id_bg,
+                    "subject": subject_bg,
+                })).ok();
+
+                // Auto-collect recipients to "Collected Contacts"
+                let conn = db_bg.writer().await;
+                for addr in &recipients {
+                    if let Err(e) = db::contacts::collect_contact(&conn, &account_id_bg, addr, None) {
+                        log::warn!("Failed to collect contact '{}': {}", addr, e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Send failed for account {}: {}", account_id_bg, e);
+                app_bg.emit("send-failed", serde_json::json!({
+                    "account_id": account_id_bg,
+                    "subject": subject_bg,
+                    "error": e.to_string(),
+                })).ok();
             }
         }
-    }
-
-    log::info!(
-        "Message sent successfully for account {} to {:?}",
-        account_id,
-        message.to
-    );
+    });
 
     Ok(())
 }

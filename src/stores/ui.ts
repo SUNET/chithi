@@ -66,6 +66,13 @@ export const useUiStore = defineStore("ui", () => {
     }
   }
 
+  // Operations panel (slide-up from status bar)
+  const operationsPanelOpen = ref(false);
+
+  function toggleOperationsPanel() {
+    operationsPanelOpen.value = !operationsPanelOpen.value;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -83,5 +90,7 @@ export const useUiStore = defineStore("ui", () => {
     decorationsEnabled,
     setDecorations,
     initDecorations,
+    operationsPanelOpen,
+    toggleOperationsPanel,
   };
 });

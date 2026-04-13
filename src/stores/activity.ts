@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { showToast } from "@/lib/toast";
 
 export interface Operation {
   id: string;
@@ -61,11 +62,11 @@ export const useActivityStore = defineStore("activity", () => {
       op.status = "done";
       if (detail) op.detail = detail;
       operations.value = new Map(operations.value);
-      // Auto-remove after 5 seconds
+      // Auto-remove after 60 seconds (visible in operations panel)
       setTimeout(() => {
         operations.value.delete(id);
         operations.value = new Map(operations.value);
-      }, 5000);
+      }, 60_000);
     }
   }
 
@@ -76,11 +77,11 @@ export const useActivityStore = defineStore("activity", () => {
       op.error = error;
       op.detail = error;
       operations.value = new Map(operations.value);
-      // Auto-remove errors after 15 seconds
+      // Auto-remove errors after 5 minutes
       setTimeout(() => {
         operations.value.delete(id);
         operations.value = new Map(operations.value);
-      }, 15000);
+      }, 5 * 60_000);
     }
   }
 
@@ -96,7 +97,7 @@ export const useActivityStore = defineStore("activity", () => {
           `sync-${event.payload.account_id}`,
           "sync",
           `Syncing ${event.payload.account_name}`,
-          "Connecting...",
+          "Syncing...",
         );
       },
     );
@@ -157,6 +158,49 @@ export const useActivityStore = defineStore("activity", () => {
       (event) => {
         const p = event.payload;
         failOperation(`op-${p.account_id}-${Date.now()}`, `${p.op_type}: ${p.error}`);
+      },
+    );
+
+    // --- Send events ---
+    await listen<{ account_id: string; subject: string }>(
+      "send-started",
+      (event) => {
+        const p = event.payload;
+        startOperation(
+          `send-${p.account_id}-${Date.now()}`,
+          "send",
+          `Sending "${p.subject}"`,
+          "Syncing...",
+        );
+        showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
+      },
+    );
+
+    await listen<{ account_id: string; subject: string }>(
+      "send-complete",
+      (event) => {
+        const p = event.payload;
+        // Complete all running send operations for this account
+        for (const [id, op] of operations.value) {
+          if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
+            completeOperation(id, "Sent");
+          }
+        }
+        showToast(`"${p.subject}" sent`, "success");
+      },
+    );
+
+    await listen<{ account_id: string; subject: string; error: string }>(
+      "send-failed",
+      (event) => {
+        const p = event.payload;
+        // Fail all running send operations for this account
+        for (const [id, op] of operations.value) {
+          if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
+            failOperation(id, p.error);
+          }
+        }
+        showToast(`Send failed: ${p.error}`, "error", 10000);
       },
     );
   }

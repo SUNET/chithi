@@ -4,6 +4,7 @@ import { useRoute } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
 import { useOpsStore } from "@/stores/ops";
+import { useUiStore } from "@/stores/ui";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useCalendarStore } from "@/stores/calendar";
@@ -12,6 +13,7 @@ import * as api from "@/lib/tauri";
 const route = useRoute();
 const activityStore = useActivityStore();
 const opsStore = useOpsStore();
+const uiStore = useUiStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const calendarStore = useCalendarStore();
@@ -55,7 +57,7 @@ async function syncAll() {
     if (!account.enabled) continue;
     try {
       if (isCalendar) {
-        await api.syncCalendars(account.id);
+        await api.syncCalendars(account.id, true);
       } else if (isContacts) {
         await api.syncContacts(account.id);
       } else {
@@ -98,6 +100,17 @@ async function syncAll() {
     </div>
     <div class="status-right">
       <span v-if="lastSyncLabel" class="last-sync">{{ lastSyncLabel }}</span>
+      <button
+        class="ops-toggle-btn"
+        :class="{ active: uiStore.operationsPanelOpen }"
+        title="Operations"
+        @click="uiStore.toggleOperationsPanel()"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+        </svg>
+        <span v-if="activityStore.activeOperations.length > 0" class="ops-badge">{{ activityStore.activeOperations.length }}</span>
+      </button>
       <button class="help-btn" title="Help">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="10" />
@@ -209,6 +222,41 @@ async function syncAll() {
 .last-sync {
   white-space: nowrap;
   color: var(--color-text-muted);
+}
+
+.ops-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 24px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  transition: all 0.12s;
+}
+
+.ops-toggle-btn:hover,
+.ops-toggle-btn.active {
+  color: var(--color-text);
+  background: var(--color-bg-hover);
+}
+
+.ops-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--color-accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
 }
 
 .help-btn {
