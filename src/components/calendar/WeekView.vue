@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
+import { useUiStore } from "@/stores/ui";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -21,6 +22,7 @@ const emit = defineEmits<{
 }>();
 
 const calendarStore = useCalendarStore();
+const uiStore = useUiStore();
 const gridRef = ref<HTMLElement | null>(null);
 
 const hours = Array.from({ length: 24 }, (_, i) => i);
@@ -31,7 +33,8 @@ const days = computed(() => {
     return [new Date(d)];
   }
   const start = new Date(d);
-  start.setDate(d.getDate() - d.getDay()); // Sunday
+  const offset = (d.getDay() - uiStore.weekStartDay + 7) % 7;
+  start.setDate(d.getDate() - offset);
   return Array.from({ length: 7 }, (_, i) => {
     const day = new Date(start);
     day.setDate(start.getDate() + i);
@@ -67,7 +70,13 @@ function isToday(date: Date): boolean {
 }
 
 function isWeekend(date: Date): boolean {
-  return date.getDay() === 0 || date.getDay() === 6;
+  const day = date.getDay();
+  if (uiStore.weekStartDay === 6) {
+    // Saturday start → weekend is Thursday (4) + Friday (5)
+    return day === 4 || day === 5;
+  }
+  // Sunday or Monday start → weekend is Saturday (6) + Sunday (0)
+  return day === 0 || day === 6;
 }
 
 function isCurrentHour(hour: number): boolean {

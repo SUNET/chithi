@@ -22,6 +22,15 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.getItem("chithi-decorations") !== "false",
   );
 
+  // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
+  const VALID_WEEK_STARTS = [0, 1, 6];
+  const weekStartDay = ref<number>(
+    (() => {
+      const stored = parseInt(localStorage.getItem("chithi-week-start-day") || "0", 10);
+      return VALID_WEEK_STARTS.includes(stored) ? stored : 0;
+    })(),
+  );
+
   function toggleReader() {
     readerVisible.value = !readerVisible.value;
   }
@@ -54,6 +63,12 @@ export const useUiStore = defineStore("ui", () => {
     decorationsEnabled.value = enabled;
     localStorage.setItem("chithi-decorations", String(enabled));
     getCurrentWindow().setDecorations(enabled);
+  }
+
+  function setWeekStartDay(day: number) {
+    if (!VALID_WEEK_STARTS.includes(day)) return;
+    weekStartDay.value = day;
+    localStorage.setItem("chithi-week-start-day", String(day));
   }
 
   function initTheme() {
@@ -92,5 +107,7 @@ export const useUiStore = defineStore("ui", () => {
     initDecorations,
     operationsPanelOpen,
     toggleOperationsPanel,
+    weekStartDay,
+    setWeekStartDay,
   };
 });
