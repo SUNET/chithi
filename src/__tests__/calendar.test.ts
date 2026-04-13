@@ -9,7 +9,6 @@ vi.mock("@/lib/tauri", () => ({
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
-  unsubscribeCalendar: vi.fn().mockResolvedValue(undefined),
   getEmailInvites: vi.fn().mockResolvedValue([]),
   getInviteStatus: vi.fn().mockResolvedValue(null),
   respondToInvite: vi.fn().mockResolvedValue(undefined),
@@ -56,7 +55,7 @@ function setupAccounts() {
 function makeCalendar(id: string, name: string, remoteId: string | null = null) {
   return {
     id, account_id: "acc1", name, color: "#4285f4",
-    is_default: true, remote_id: remoteId, is_subscribed: true,
+    is_default: true, remote_id: remoteId,
   };
 }
 
@@ -165,35 +164,6 @@ describe("Calendar store", () => {
       await store.fetchCalendars();
 
       expect(store.calendars).toEqual([]);
-    });
-  });
-
-  describe("unsubscribeCalendar", () => {
-    it("should call backend and refresh calendars and events", async () => {
-      setupAccounts();
-      const store = useCalendarStore();
-      const cal = makeCalendar("cal1", "Work", "remote-1");
-      vi.mocked(api.listCalendars).mockResolvedValue([cal]);
-      vi.mocked(api.getEvents).mockResolvedValue([]);
-
-      await store.unsubscribeCalendar("cal1");
-
-      expect(api.unsubscribeCalendar).toHaveBeenCalledWith("cal1");
-      expect(api.listCalendars).toHaveBeenCalled();
-      expect(api.getEvents).toHaveBeenCalled();
-    });
-
-    it("should filter out unsubscribed calendars from fetchCalendars", async () => {
-      setupAccounts();
-      const store = useCalendarStore();
-      const subscribed = makeCalendar("cal1", "Work", "remote-1");
-      const unsubscribed = { ...makeCalendar("cal2", "Holidays", "remote-2"), is_subscribed: false };
-      vi.mocked(api.listCalendars).mockResolvedValueOnce([subscribed, unsubscribed]);
-
-      await store.fetchCalendars();
-
-      expect(store.calendars).toHaveLength(1);
-      expect(store.calendars[0].id).toBe("cal1");
     });
   });
 

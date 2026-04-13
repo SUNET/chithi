@@ -15,7 +15,7 @@ pub async fn list_contact_books(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<Vec<ContactBook>> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     db::contacts::list_contact_books(&conn, &account_id)
 }
 
@@ -28,7 +28,7 @@ pub async fn list_contacts(
     state: State<'_, AppState>,
     book_id: String,
 ) -> Result<Vec<Contact>> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     db::contacts::list_contacts(&conn, &book_id)
 }
 
@@ -37,7 +37,7 @@ pub async fn get_contact(
     state: State<'_, AppState>,
     contact_id: String,
 ) -> Result<Contact> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     db::contacts::get_contact(&conn, &contact_id)
 }
 
@@ -74,7 +74,7 @@ pub async fn create_contact(
         remote_id: None,
         etag: None,
     };
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::contacts::insert_contact(&conn, &c)?;
     log::info!("Created contact {} '{}'", id, c.display_name);
 
@@ -113,7 +113,7 @@ pub async fn create_contact(
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(data) = resp.json::<serde_json::Value>().await {
                             if let Some(rn) = data["resourceName"].as_str() {
-                                let conn = state.db.lock().await;
+                                let conn = state.db.writer().await;
                                 conn.execute(
                                     "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                                     rusqlite::params![rn, id],
@@ -153,7 +153,7 @@ pub async fn create_contact(
                 if let Some(ref t) = c.title { gc["jobTitle"] = serde_json::json!(t); }
                 match graph.create_contact(&gc).await {
                     Ok(remote_id) => {
-                        let conn = state.db.lock().await;
+                        let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, id],
@@ -165,7 +165,7 @@ pub async fn create_contact(
             }
         } else if sync_type == "carddav" {
             let book_href = {
-                let conn = state.db.lock().await;
+                let conn = state.db.reader();
                 conn.query_row(
                     "SELECT remote_id FROM contact_books WHERE id = ?1",
                     rusqlite::params![c.book_id],
@@ -174,7 +174,7 @@ pub async fn create_contact(
             };
             if let Some(href) = book_href {
                 let account = {
-                    let conn = state.db.lock().await;
+                    let conn = state.db.reader();
                     db::accounts::get_account_full(&conn, &account_id)?
                 };
                 match crate::mail::carddav::CardDavClient::connect(
@@ -194,7 +194,7 @@ pub async fn create_contact(
                         match client.put_contact(&href, uid, &vcard).await {
                             Ok(etag) => {
                                 let remote_id = format!("{}/{}.vcf", href.trim_end_matches('/'), uid);
-                                let conn = state.db.lock().await;
+                                let conn = state.db.writer().await;
                                 conn.execute("UPDATE contacts SET remote_id = ?1, etag = ?2, vcard_data = ?3 WHERE id = ?4", rusqlite::params![remote_id, etag, vcard, id]).ok();
                                 log::info!("Created contact on CardDAV: {}", remote_id);
                             }
@@ -215,7 +215,7 @@ pub async fn update_contact(
     state: State<'_, AppState>,
     contact: Contact,
 ) -> Result<()> {
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::contacts::update_contact(&conn, &contact)?;
     log::info!("Updated contact {}", contact.id);
 
@@ -290,7 +290,7 @@ pub async fn update_contact(
                     }
                 } else if sync_type == "jmap" {
                     let account = {
-                        let conn = state.db.lock().await;
+                        let conn = state.db.reader();
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
                     let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -314,7 +314,7 @@ pub async fn update_contact(
                     }
                 } else if sync_type == "carddav" {
                     let account = {
-                        let conn = state.db.lock().await;
+                        let conn = state.db.reader();
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
                     match crate::mail::carddav::CardDavClient::connect(
@@ -323,7 +323,7 @@ pub async fn update_contact(
                         Ok(client) => {
                             let uid = contact.uid.as_deref().unwrap_or(&contact.id);
                             let book_href = {
-                                let conn = state.db.lock().await;
+                                let conn = state.db.reader();
                                 conn.query_row("SELECT remote_id FROM contact_books WHERE id = ?1", rusqlite::params![contact.book_id], |row| row.get::<_, Option<String>>(0)).ok().flatten().unwrap_or_default()
                             };
                             let emails: Vec<crate::mail::carddav::VCardEmail> = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
@@ -337,7 +337,7 @@ pub async fn update_contact(
                             let vcard = crate::mail::carddav::generate_vcard(uid, &contact.display_name, &emails, &phones, contact.organization.as_deref(), contact.title.as_deref(), contact.notes.as_deref());
                             match client.put_contact(&book_href, uid, &vcard).await {
                                 Ok(etag) => {
-                                    let conn = state.db.lock().await;
+                                    let conn = state.db.writer().await;
                                     conn.execute("UPDATE contacts SET etag = ?1, vcard_data = ?2 WHERE id = ?3", rusqlite::params![etag, vcard, contact.id]).ok();
                                     log::info!("Updated contact on CardDAV: {}", remote_id);
                                 }
@@ -361,7 +361,7 @@ pub async fn delete_contact(
     contact_id: String,
 ) -> Result<()> {
     // Check if this contact has a Google remote_id before deleting
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     let remote_info = conn.query_row(
         "SELECT c.remote_id, cb.sync_type, cb.account_id FROM contacts c JOIN contact_books cb ON c.book_id = cb.id WHERE c.id = ?1",
         rusqlite::params![contact_id],
@@ -395,7 +395,7 @@ pub async fn delete_contact(
             }
         } else if sync_type == "jmap" && !remote_id.is_empty() {
             let account = {
-                let conn = state.db.lock().await;
+                let conn = state.db.reader();
                 db::accounts::get_account_full(&conn, &account_id)?
             };
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -410,7 +410,7 @@ pub async fn delete_contact(
             }
         } else if sync_type == "carddav" && !remote_id.is_empty() {
             let account = {
-                let conn = state.db.lock().await;
+                let conn = state.db.reader();
                 db::accounts::get_account_full(&conn, &account_id)?
             };
             match crate::mail::carddav::CardDavClient::connect(
@@ -442,7 +442,7 @@ pub async fn sync_contacts(
     log::info!("sync_contacts: account={}", account_id);
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -502,7 +502,7 @@ async fn sync_contacts_google(
     // Get a valid OAuth2 access token
     let access_token = get_google_token(account_id).await?;
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     let book_id = {
         let existing: Option<String> = conn
             .query_row(
@@ -551,7 +551,7 @@ async fn sync_contacts_google(
     let count = connections.map(|c| c.len()).unwrap_or(0);
     log::info!("sync_contacts_google: fetched {} contacts", count);
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     if let Some(people) = connections {
         for person in people {
@@ -652,7 +652,7 @@ async fn sync_contacts_jmap(
         std::collections::HashMap::new();
 
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for ab in &address_books {
             // Upsert contact book
             let existing: Option<String> = conn
@@ -694,7 +694,7 @@ async fn sync_contacts_jmap(
         log::info!("sync_contacts: fetched {} contacts for '{}'", jmap_contacts.len(), ab.name);
 
         let local_book_id = remote_to_local.get(&ab.id).cloned().unwrap_or_default();
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
 
         for jc in &jmap_contacts {
             // Upsert by remote_id
@@ -786,7 +786,7 @@ async fn sync_contacts_jmap(
                 ).await {
                     Ok(remote_id) => {
                         log::info!("sync_contacts: pushed contact '{}' to JMAP, remote_id={}", name, remote_id);
-                        let conn = state.db.lock().await;
+                        let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, local_id],
@@ -831,7 +831,7 @@ async fn sync_contacts_carddav(
     for ab in &address_books {
         // Upsert contact book in DB
         let book_id = {
-            let conn = state.db.lock().await;
+            let conn = state.db.writer().await;
             let book = db::contacts::ContactBook {
                 id: uuid::Uuid::new_v4().to_string(),
                 account_id: account_id.to_string(),
@@ -872,7 +872,7 @@ async fn sync_contacts_carddav(
             ab.name
         );
 
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
 
         // Get existing local contacts for this book
         let local_contacts = db::contacts::list_contacts(&conn, &book_id)?;
@@ -957,7 +957,7 @@ pub async fn search_contacts(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<Contact>> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     db::contacts::search_all_contacts(&conn, &query)
 }
 
@@ -966,7 +966,7 @@ pub async fn search_collected_contacts(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<CollectedContact>> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     db::contacts::search_collected_contacts(&conn, &query)
 }
 
@@ -991,7 +991,7 @@ async fn sync_contacts_graph(
 
     // 1. Ensure contact book exists
     let book_id = {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let existing: Option<String> = conn.query_row(
             "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
             rusqlite::params![account_id],
@@ -1022,7 +1022,7 @@ async fn sync_contacts_graph(
     };
     log::info!("sync_contacts_graph: fetched {} contacts", graph_contacts.len());
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     // Build set of server IDs for reconciliation
     let server_ids: std::collections::HashSet<String> =

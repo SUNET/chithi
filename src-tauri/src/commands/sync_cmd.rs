@@ -219,7 +219,7 @@ pub async fn trigger_sync(
 
     log::info!("Sync requested for account {}", account_id);
     let account_result = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)
     };
     let account = match account_result {
@@ -360,7 +360,7 @@ pub async fn sync_folder(
 
     log::info!("Single folder sync: account={} folder={}", account_id, folder_path);
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -483,7 +483,7 @@ pub async fn sync_folder(
 /// Sync JMAP calendars for an account. Extracted as a standalone async function
 /// so it can be called from `trigger_sync` without needing `State`.
 async fn sync_jmap_calendars(
-    db: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    db: std::sync::Arc<crate::db::pool::DbPool>,
     account_id: &str,
     jmap_config: &JmapConfig,
 ) -> Result<()> {
@@ -503,7 +503,7 @@ async fn sync_jmap_calendars(
         std::collections::HashMap::new();
 
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         for jcal in &jmap_calendars {
             let color = jcal.color.as_deref().unwrap_or("#4285f4");
             let local_id = crate::db::calendar::upsert_calendar_by_remote_id(
@@ -546,7 +546,7 @@ async fn sync_jmap_calendars(
             .cloned()
             .unwrap_or_default();
 
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         for ev in &events {
             let event_id = uuid::Uuid::new_v4().to_string();
             let cal_event = crate::db::calendar::CalendarEvent {
@@ -624,7 +624,7 @@ pub async fn prefetch_bodies(
 
     // Skip prefetch for JMAP accounts — bodies are fetched on-demand via JMAP API
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let account = db::accounts::get_account_full(&conn, &account_id)?;
         if account.mail_protocol == "jmap" {
             log::debug!("Prefetch: skipping JMAP account {}", account_id);
@@ -633,7 +633,7 @@ pub async fn prefetch_bodies(
     }
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -681,7 +681,7 @@ pub async fn prefetch_bodies(
 
     // Fetch the list of unfetched messages (up to 1000 per cycle)
     let unfetched = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::messages::get_unfetched_messages(&conn, &account_id, 1000)?
     };
 
@@ -795,7 +795,7 @@ pub async fn prefetch_bodies(
                                 }
 
                                 if !db_updates.is_empty() {
-                                    let conn = rt.block_on(db.lock());
+                                    let conn = rt.block_on(db.writer());
                                     conn.execute_batch("BEGIN").ok();
                                     for (msg_id, path) in &db_updates {
                                         db::messages::update_maildir_path(&conn, msg_id, path).ok();
@@ -840,7 +840,7 @@ pub async fn prefetch_bodies(
 /// Two-phase: download without DB lock (UI stays responsive), then fast batch insert.
 async fn sync_graph_account(
     app: AppHandle,
-    db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    db_arc: std::sync::Arc<crate::db::pool::DbPool>,
     account_id: &str,
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
@@ -856,7 +856,7 @@ async fn sync_graph_account(
     log::info!("Graph sync: {} mail folders for account {}", graph_folders.len(), account_id);
 
     {
-        let conn = db_arc.lock().await;
+        let conn = db_arc.writer().await;
         for gf in &graph_folders {
             let folder_type = graph::guess_folder_type(&gf.display_name);
             db::folders::upsert_folder(&conn, account_id, &gf.display_name, &gf.id, folder_type, None)?;
@@ -874,7 +874,7 @@ async fn sync_graph_account(
         }
 
         let existing_ids = {
-            let conn = db_arc.lock().await;
+            let conn = db_arc.reader();
             let mut stmt = conn.prepare(
                 "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
             ).map_err(Error::Database)?;
@@ -928,7 +928,7 @@ async fn sync_graph_account(
         }
 
         // Phase 2: Fast batch DB insert (lock held <10ms, not during downloads)
-        let conn = db_arc.lock().await;
+        let conn = db_arc.writer().await;
         conn.execute_batch("BEGIN")?;
 
         let mut synced = 0u32;
@@ -990,7 +990,7 @@ pub async fn start_idle(
     state: State<'_, AppState>,
 ) -> Result<()> {
     let accounts = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::list_accounts(&conn)?
     };
 
@@ -1022,7 +1022,7 @@ async fn start_imap_idle(
     }
 
     let full_account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account.id)?
     };
 
@@ -1107,7 +1107,7 @@ async fn start_jmap_push(
     }
 
     let full_account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account.id)?
     };
 

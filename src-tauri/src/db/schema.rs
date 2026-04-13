@@ -288,17 +288,6 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         log::info!("Migration: FTS5 index populated");
     }
 
-    // Add is_subscribed column to calendars if it doesn't exist
-    let has_is_subscribed: bool = conn
-        .prepare("SELECT is_subscribed FROM calendars LIMIT 0")
-        .is_ok();
-    if !has_is_subscribed {
-        log::info!("Migration: adding is_subscribed column to calendars table");
-        conn.execute_batch(
-            "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
-        )?;
-    }
-
     Ok(())
 }
 

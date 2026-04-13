@@ -140,7 +140,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     for (const account of accountsStore.accounts) {
       try {
         const cals = await api.listCalendars(account.id);
-        all = all.concat(cals.filter((c) => c.is_subscribed));
+        all = all.concat(cals);
       } catch (e) {
         console.error("Failed to fetch calendars for", account.id, e);
       }
@@ -242,12 +242,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
-  async function unsubscribeCalendar(calendarId: string) {
-    await api.unsubscribeCalendar(calendarId);
-    await fetchCalendars();
-    await fetchEvents();
-  }
-
   async function deleteEvent(eventId: string) {
     await api.deleteEvent(eventId);
     if (selectedEvent.value?.id === eventId) {
@@ -318,7 +312,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     updateEvent,
     moveEventToCalendar,
     deleteEvent,
-    unsubscribeCalendar,
     setViewMode,
     goToDate,
     goToday,

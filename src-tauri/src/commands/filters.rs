@@ -15,7 +15,7 @@ pub async fn list_filters(
     account_id: Option<String>,
 ) -> Result<Vec<FilterRule>> {
     log::info!("List filters command: account_id={:?}", account_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let rules = db::filters::list_filters(&conn, account_id.as_deref())?;
     log::info!("Found {} filter rules", rules.len());
     Ok(rules)
@@ -29,7 +29,7 @@ pub async fn save_filter(state: State<'_, AppState>, rule: FilterRule) -> Result
         rule.id,
         rule.name
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     // Check if the rule already exists
     match db::filters::get_filter(&conn, &rule.id) {
@@ -50,7 +50,7 @@ pub async fn save_filter(state: State<'_, AppState>, rule: FilterRule) -> Result
 #[tauri::command]
 pub async fn delete_filter(state: State<'_, AppState>, filter_id: String) -> Result<()> {
     log::info!("Delete filter command: id={}", filter_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::filters::delete_filter(&conn, &filter_id)?;
     Ok(())
 }
@@ -71,7 +71,7 @@ pub async fn apply_filters_to_folder(
 
     // 1. Load filters from DB
     let (rules, messages, account) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
 
         let rules = db::filters::list_filters(&conn, Some(&account_id))?;
         let enabled_rules: Vec<FilterRule> = rules.into_iter().filter(|r| r.enabled).collect();
@@ -268,7 +268,7 @@ pub async fn apply_filters_to_folder(
 
     // 6. Update local DB: remove moved/deleted messages
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let mut to_remove = moved_message_ids;
         to_remove.extend(deleted_message_ids);
         to_remove.sort();

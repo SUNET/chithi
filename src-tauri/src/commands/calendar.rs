@@ -50,7 +50,7 @@ pub async fn list_calendars(
     account_id: String,
 ) -> Result<Vec<Calendar>> {
     log::debug!("list_calendars: account={}", account_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
     log::debug!("list_calendars: found {} calendars", calendars.len());
     Ok(calendars)
@@ -67,7 +67,7 @@ pub async fn create_calendar(
         calendar.name
     );
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::calendar::insert_calendar(&conn, &id, &calendar)?;
     log::info!("create_calendar: created calendar id={}", id);
     Ok(id)
@@ -86,7 +86,7 @@ pub async fn update_calendar(
         name,
         color
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::calendar::update_calendar(&conn, &calendar_id, &name, &color)?;
     Ok(())
 }
@@ -97,22 +97,9 @@ pub async fn delete_calendar(
     calendar_id: String,
 ) -> Result<()> {
     log::info!("delete_calendar: id={}", calendar_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::calendar::delete_calendar(&conn, &calendar_id)?;
     log::info!("delete_calendar: deleted calendar {}", calendar_id);
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn unsubscribe_calendar(
-    state: State<'_, AppState>,
-    calendar_id: String,
-) -> Result<()> {
-    log::info!("unsubscribe_calendar: id={}", calendar_id);
-    let conn = state.db.lock().await;
-    db::calendar::set_calendar_subscribed(&conn, &calendar_id, false)?;
-    let deleted = db::calendar::delete_calendar_events(&conn, &calendar_id)?;
-    log::info!("unsubscribe_calendar: deleted {} events for calendar {}", deleted, calendar_id);
     Ok(())
 }
 
@@ -135,7 +122,7 @@ pub async fn get_events(
         end,
         calendar_id
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let events = db::calendar::list_events(
         &conn,
         &account_id,
@@ -169,7 +156,7 @@ pub async fn create_event(
 
     // Get organizer email from account
     let organizer_email = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &event.account_id)
             .ok()
             .map(|a| a.email)
@@ -199,7 +186,7 @@ pub async fn create_event(
 
     // Insert locally first, then push to server
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         db::calendar::insert_event(&conn, &cal_event)?;
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
 
@@ -248,7 +235,7 @@ pub async fn create_event(
                         if let Ok(data) = resp.json::<serde_json::Value>().await {
                             let remote_id = data["id"].as_str().unwrap_or_default().to_string();
                             log::info!("create_event: pushed to Google Calendar, id={}", remote_id);
-                            let conn = state.db.lock().await;
+                            let conn = state.db.writer().await;
                             conn.execute(
                                 "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                                 rusqlite::params![remote_id, id],
@@ -313,7 +300,7 @@ pub async fn create_event(
                 match client.create_event(&graph_event).await {
                     Ok(remote_id) => {
                         log::info!("create_event: pushed to Graph Calendar, id={}", remote_id);
-                        let conn = state.db.lock().await;
+                        let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, id],
@@ -350,7 +337,7 @@ pub async fn create_event(
                     match conn_jmap.create_calendar_event(&jmap_config, &jmap_event).await {
                         Ok(remote_id) => {
                             log::info!("create_event: pushed to JMAP, remote_id={}", remote_id);
-                            let conn = state.db.lock().await;
+                            let conn = state.db.writer().await;
                             conn.execute(
                                 "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                                 rusqlite::params![remote_id, id],
@@ -375,7 +362,7 @@ pub async fn update_event(
     event: UpdateEventInput,
 ) -> Result<()> {
     log::info!("update_event: id={}", event_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     // Load existing event, apply updates
     let mut existing = db::calendar::get_event(&conn, &event_id)?;
@@ -497,7 +484,7 @@ pub async fn delete_event(
 
     // Look up the event, account, and calendar remote_id
     let (event, account, cal_remote_id) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let evt = db::calendar::get_event(&conn, &event_id)?;
         let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
         let cal = db::calendar::get_calendar(&conn, &evt.calendar_id).ok();
@@ -572,7 +559,7 @@ pub async fn delete_event(
         }
     }
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::calendar::delete_event(&conn, &event_id)?;
     log::info!("delete_event: deleted event {}", event_id);
     Ok(())
@@ -590,7 +577,7 @@ pub async fn sync_calendars(
     log::info!("sync_calendars: account={}", account_id);
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -646,7 +633,7 @@ async fn sync_calendars_jmap(
         std::collections::HashMap::new();
 
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for jcal in &jmap_calendars {
             let color = jcal.color.as_deref().unwrap_or("#4285f4");
             let local_id = db::calendar::upsert_calendar_by_remote_id(
@@ -661,22 +648,8 @@ async fn sync_calendars_jmap(
         }
     }
 
-    // Collect unsubscribed calendar IDs to skip event fetching
-    let unsubscribed: std::collections::HashSet<String> = {
-        let conn = state.db.lock().await;
-        let cals = db::calendar::list_calendars(&conn, account_id)?;
-        cals.into_iter()
-            .filter(|c| !c.is_subscribed)
-            .filter_map(|c| c.remote_id)
-            .collect()
-    };
-
-    // Step 2: For each subscribed calendar, fetch events and upsert into local DB
+    // Step 2: For each calendar, fetch events and upsert into local DB
     for jcal in &jmap_calendars {
-        if unsubscribed.contains(&jcal.id) {
-            log::debug!("sync_calendars: skipping unsubscribed calendar '{}'", jcal.name);
-            continue;
-        }
         let events = match jmap_conn
             .fetch_calendar_events(&jmap_config, Some(&jcal.id))
             .await
@@ -703,7 +676,7 @@ async fn sync_calendars_jmap(
             .cloned()
             .unwrap_or_default();
 
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for ev in &events {
             let event_id = uuid::Uuid::new_v4().to_string();
             let cal_event = CalendarEvent {
@@ -766,7 +739,7 @@ async fn sync_calendars_jmap(
 
     // Step 3: Push local events (no remote_id) to the JMAP server
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, account_id)?;
 
         if !local_events.is_empty() {
@@ -803,7 +776,7 @@ async fn sync_calendars_jmap(
                 match jmap_conn.create_calendar_event(&jmap_config, &jmap_event).await {
                     Ok(remote_id) => {
                         log::info!("sync_calendars: pushed event '{}' to JMAP, remote_id={}", ev.title, remote_id);
-                        let conn = state.db.lock().await;
+                        let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, ev.id],
@@ -850,7 +823,7 @@ async fn sync_calendars_google(
         std::collections::HashMap::new();
 
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         if let Some(calendars) = items {
             for cal in calendars {
                 let cal_id = cal["id"].as_str().unwrap_or_default();
@@ -866,27 +839,13 @@ async fn sync_calendars_google(
         }
     }
 
-    // Collect unsubscribed calendar IDs to skip event fetching
-    let unsubscribed: std::collections::HashSet<String> = {
-        let conn = state.db.lock().await;
-        let cals = db::calendar::list_calendars(&conn, account_id)?;
-        cals.into_iter()
-            .filter(|c| !c.is_subscribed)
-            .filter_map(|c| c.remote_id)
-            .collect()
-    };
-
-    // Step 2: Fetch events for each subscribed calendar
+    // Step 2: Fetch events for each calendar (with syncToken for incremental sync)
     for (remote_cal_id, local_cal_id) in &remote_to_local {
-        if unsubscribed.contains(remote_cal_id) {
-            log::debug!("sync_calendars_google: skipping unsubscribed calendar {}", remote_cal_id);
-            continue;
-        }
         let sync_key = format!("google_sync_token_{}_{}", account_id, remote_cal_id);
 
         // Check for existing syncToken
         let existing_token: Option<String> = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             conn.query_row(
                 "SELECT value FROM app_metadata WHERE key = ?1",
                 rusqlite::params![sync_key],
@@ -936,7 +895,7 @@ async fn sync_calendars_google(
         if resp.status().as_u16() == 410 {
             // syncToken expired — clear it and retry with full sync on next cycle
             log::info!("sync_calendars_google: syncToken expired for {}, will full sync next time", remote_cal_id);
-            let conn = state.db.lock().await;
+            let conn = state.db.writer().await;
             conn.execute("DELETE FROM app_metadata WHERE key = ?1", rusqlite::params![sync_key]).ok();
             continue;
         }
@@ -958,7 +917,7 @@ async fn sync_calendars_google(
         let count = events.map(|e| e.len()).unwrap_or(0);
         log::info!("sync_calendars_google: fetched {} events for calendar {}", count, remote_cal_id);
 
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         if let Some(events) = events {
             for ev in events {
                 let event_id_remote = ev["id"].as_str().unwrap_or_default();
@@ -1019,7 +978,7 @@ async fn sync_calendars_google(
 
         // Save nextSyncToken for incremental sync next time
         if let Some(next_token) = events_data["nextSyncToken"].as_str() {
-            let conn = state.db.lock().await;
+            let conn = state.db.writer().await;
             conn.execute(
                 "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
                 rusqlite::params![sync_key, next_token],
@@ -1084,7 +1043,7 @@ async fn sync_calendars_caldav(
         std::collections::HashMap::new();
 
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for (idx, cal) in caldav_calendars.iter().enumerate() {
             let color = cal.color.as_deref().unwrap_or("#4285f4");
             let is_default = idx == 0; // First calendar is default
@@ -1100,22 +1059,8 @@ async fn sync_calendars_caldav(
         }
     }
 
-    // Collect unsubscribed calendar IDs to skip event fetching
-    let unsubscribed: std::collections::HashSet<String> = {
-        let conn = state.db.lock().await;
-        let cals = db::calendar::list_calendars(&conn, account_id)?;
-        cals.into_iter()
-            .filter(|c| !c.is_subscribed)
-            .filter_map(|c| c.remote_id)
-            .collect()
-    };
-
-    // Step 2: For each subscribed calendar, fetch events and upsert into local DB
+    // Step 2: For each calendar, fetch events and upsert into local DB
     for cal in &caldav_calendars {
-        if unsubscribed.contains(&cal.href) {
-            log::debug!("sync_calendars_caldav: skipping unsubscribed calendar '{}'", cal.name);
-            continue;
-        }
         let caldav_events = match client.fetch_events(&cal.href).await {
             Ok(evts) => evts,
             Err(e) => {
@@ -1139,7 +1084,7 @@ async fn sync_calendars_caldav(
             .cloned()
             .unwrap_or_default();
 
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for ev in &caldav_events {
             // Parse the iCalendar data to extract event details
             let parsed = ical::parse_ical_data(&ev.ical_data);
@@ -1225,7 +1170,7 @@ async fn sync_calendars_caldav(
 
     // Step 3: Push local events with no remote_id to CalDAV
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, account_id)?;
 
         if !local_events.is_empty() {
@@ -1281,7 +1226,7 @@ async fn sync_calendars_caldav(
                             ev.title,
                             remote_id
                         );
-                        let conn = state.db.lock().await;
+                        let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE calendar_events SET remote_id = ?1, etag = ?2, uid = ?3, ical_data = ?4 WHERE id = ?5",
                             rusqlite::params![remote_id, etag, uid, ical_data, ev.id],
@@ -1318,7 +1263,7 @@ pub async fn get_email_invites(
         account_id,
         message_id
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
 
     // Look up the message to get its maildir path
     let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
@@ -1354,7 +1299,7 @@ pub async fn get_invite_status(
     account_id: String,
     invite_uid: String,
 ) -> Result<Option<String>> {
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let event = db::calendar::get_event_by_uid(&conn, &account_id, &invite_uid)?;
     Ok(event.and_then(|e| e.my_status))
 }
@@ -1377,7 +1322,7 @@ pub async fn respond_to_invite(
 
     // Step 1: Parse the invite from the email
     let (raw, account) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
 
@@ -1469,7 +1414,7 @@ pub async fn respond_to_invite(
 
     // Step 4: Create/update event in local calendar
     let my_status = response.to_lowercase();
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     // Find or create the default calendar for this account
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
@@ -1835,7 +1780,7 @@ pub async fn send_invites(
     );
 
     let (account, event) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let acc = db::accounts::get_account_full(&conn, &account_id)?;
         let evt = db::calendar::get_event(&conn, &event_id)?;
         (acc, evt)
@@ -1909,7 +1854,7 @@ pub async fn send_invites(
 
     // Update event's attendees in local DB
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let attendees_json = serde_json::to_string(&attendees).unwrap_or_default();
         conn.execute(
             "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
@@ -1933,7 +1878,7 @@ pub async fn process_invite_reply(
     log::info!("process_invite_reply: account={} message={}", account_id, message_id);
 
     let raw = {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let (maildir_path, _, _, _, _, _, _) = db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
         let data_dir = state.data_dir.clone();
         std::fs::read(data_dir.join(maildir_path))
@@ -1950,7 +1895,7 @@ pub async fn process_invite_reply(
         return Ok(());
     }
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     let account = db::accounts::get_account_full(&conn, &account_id)?;
 
     for reply in &reply_invites {
@@ -2107,7 +2052,7 @@ async fn sync_calendars_graph(
     };
     log::info!("sync_calendars_graph: fetched {} calendars", graph_calendars.len());
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     for gc in &graph_calendars {
         // Check if calendar with this remote_id already exists
         let existing: Option<String> = conn.query_row(
@@ -2161,7 +2106,7 @@ async fn sync_calendars_graph(
     };
     log::info!("sync_calendars_graph: fetched {} events", graph_events.len());
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
 
     // Build a set of server event IDs for reconciliation
     let server_ids: std::collections::HashSet<String> =
@@ -2176,23 +2121,6 @@ async fn sync_calendars_graph(
             |row| row.get(0),
         ).ok())
         .unwrap_or_default();
-
-    // Graph sync currently maps all events to the default calendar.
-    // Unlike JMAP/Google/CalDAV, there's no per-calendar event fetch,
-    // so we only check the default calendar's subscription status.
-    // TODO: when multi-calendar Graph support is added, use the same
-    // HashSet<String> pattern as the other sync paths.
-    let default_subscribed = if !default_cal_local_id.is_empty() {
-        let cal = db::calendar::get_calendar(&conn, &default_cal_local_id)?;
-        cal.is_subscribed
-    } else {
-        true
-    };
-
-    if !default_subscribed {
-        log::debug!("sync_calendars_graph: default calendar unsubscribed, skipping events");
-        return Ok(());
-    }
 
     for ge in &graph_events {
         // Find local calendar ID for this event

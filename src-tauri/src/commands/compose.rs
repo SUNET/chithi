@@ -39,7 +39,7 @@ pub async fn send_message(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -114,7 +114,7 @@ pub async fn send_message(
 
     // Auto-collect recipients to "Collected Contacts"
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         for addr in message.to.iter().chain(message.cc.iter()) {
             if let Err(e) = db::contacts::collect_contact(&conn, &account_id, addr, None) {
                 log::warn!("Failed to collect contact '{}': {}", addr, e);
@@ -144,7 +144,7 @@ pub async fn save_draft(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 

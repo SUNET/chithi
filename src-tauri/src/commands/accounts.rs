@@ -11,7 +11,7 @@ pub async fn list_accounts(
     state: State<'_, AppState>,
 ) -> Result<Vec<db::accounts::Account>> {
     log::debug!("Listing accounts");
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let accounts = db::accounts::list_accounts(&conn)?;
     log::debug!("Found {} accounts", accounts.len());
     Ok(accounts)
@@ -43,7 +43,7 @@ pub async fn add_account(
         }
     }
 
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::accounts::insert_account(&conn, &id, &config)?;
     log::info!("Account created with id={}", id);
 
@@ -67,7 +67,7 @@ pub async fn get_account_config(
     account_id: String,
 ) -> Result<db::accounts::AccountConfig> {
     log::debug!("Getting config for account {}", account_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let full = db::accounts::get_account_full(&conn, &account_id)?;
     // Never return the actual password to the frontend.
     // The edit form shows a placeholder; empty on save means "keep existing".
@@ -99,7 +99,7 @@ pub async fn update_account(
     config: db::accounts::AccountConfig,
 ) -> Result<()> {
     log::info!("Updating account {} ({})", account_id, config.email);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::accounts::update_account(&conn, &account_id, &config)?;
     Ok(())
 }
@@ -110,7 +110,7 @@ pub async fn delete_account(
     account_id: String,
 ) -> Result<()> {
     log::info!("Deleting account {}", account_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::accounts::delete_account(&conn, &account_id)?;
     // Also remove Maildir
     let maildir_path = state.data_dir.join(&account_id);

@@ -42,7 +42,7 @@ pub async fn list_folders(
     account_id: String,
 ) -> Result<Vec<db::folders::Folder>> {
     log::debug!("Listing folders for account {}", account_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let flat_folders = db::folders::list_folders(&conn, &account_id)?;
     log::debug!("Found {} folders for account {}", flat_folders.len(), account_id);
     let tree = db::folders::build_folder_tree(flat_folders);
@@ -72,7 +72,7 @@ pub async fn get_messages(
         col,
         if asc { "asc" } else { "desc" }
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let result =
         db::messages::get_messages(&conn, &account_id, &folder_path, page, per_page, col, asc, &qf)?;
     log::debug!(
@@ -94,7 +94,7 @@ pub async fn get_message_body(
     log::debug!("Loading message body: {}", message_id);
 
     let (maildir_path, from_email, to_json, cc_json, flags_json, is_encrypted, is_signed) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
@@ -102,7 +102,7 @@ pub async fn get_message_body(
     let actual_maildir_path = if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
         // Get account config and message details
         let (account, folder_path, uid) = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let account = db::accounts::get_account_full(&conn, &account_id)?;
             let (fp, u) = db::messages::get_folder_and_uid(&conn, &message_id)?;
             (account, fp, u)
@@ -212,7 +212,7 @@ pub async fn get_message_body(
 
         // Update the maildir_path in the database
         {
-            let conn = state.db.lock().await;
+            let conn = state.db.writer().await;
             db::messages::update_maildir_path(&conn, &message_id, &relative_path)?;
         }
 
@@ -263,7 +263,7 @@ pub async fn get_message_html_with_images(
     message_id: String,
 ) -> Result<String> {
     let maildir_path = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let (mp, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
         mp
@@ -392,7 +392,7 @@ pub async fn get_threaded_messages(
         col,
         if asc { "asc" } else { "desc" }
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let result = db::messages::get_threaded_messages(
         &conn,
         &account_id,
@@ -426,7 +426,7 @@ pub async fn get_thread_messages(
         folder_path,
         thread_id
     );
-    let conn = state.db.lock().await;
+    let conn = state.db.reader();
     let messages = db::messages::get_thread_messages(&conn, &account_id, &folder_path, &thread_id)?;
     log::debug!(
         "Returned {} messages for thread {}",
@@ -442,7 +442,7 @@ pub async fn unthread_message(
     message_id: String,
 ) -> Result<()> {
     log::info!("Unthreading message: {}", message_id);
-    let conn = state.db.lock().await;
+    let conn = state.db.writer().await;
     db::messages::unthread_message(&conn, &message_id)?;
     Ok(())
 }
@@ -458,7 +458,7 @@ pub async fn create_folder(
     log::info!("Creating folder '{}' for account {}", folder_path, account_id);
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -534,7 +534,7 @@ pub async fn delete_folder(
 
     // Verify the folder exists in the local DB and is not a system folder
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
 
         // Check that the folder belongs to this account
         let folder_type: Option<String> = conn
@@ -624,7 +624,7 @@ pub async fn delete_folder(
 
     // Remove from local DB
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         db::folders::delete_folder(&conn, &account_id, &folder_path)?;
     }
 
@@ -652,7 +652,7 @@ pub async fn save_attachment(
     );
 
     let maildir_path = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let (mp, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
         mp

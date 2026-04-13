@@ -54,7 +54,7 @@ pub async fn move_messages(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -94,7 +94,7 @@ pub async fn move_messages(
         // IMAP path (includes O365 with XOAUTH2)
         let imap_config = build_imap_config(&account).await?;
         let by_folder = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
             group_by_folder(uid_rows)
         };
@@ -129,7 +129,7 @@ pub async fn move_messages(
 
     // Remove moved messages from local DB and recalculate folder counts
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         db::messages::delete_messages_by_ids(&conn, &message_ids)?;
         db::folders::recalculate_folder_counts(&conn, &account_id)?;
     }
@@ -161,7 +161,7 @@ pub async fn delete_messages(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -202,7 +202,7 @@ pub async fn delete_messages(
         let resume_account = account.clone();
         let imap_config = build_imap_config(&account).await?;
         let by_folder = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
             group_by_folder(uid_rows)
         };
@@ -236,7 +236,7 @@ pub async fn delete_messages(
 
     // Remove from local DB and recalculate folder counts
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         db::messages::delete_messages_by_ids(&conn, &message_ids)?;
         db::folders::recalculate_folder_counts(&conn, &account_id)?;
     }
@@ -282,7 +282,7 @@ pub async fn move_messages_cross_account(
 
     // Load target account and source maildir paths (scoped to source account)
     let (target_account, maildir_paths) = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let target = db::accounts::get_account_full(&conn, &target_account_id)?;
         let paths = db::messages::get_maildir_paths(&conn, &source_account_id, &message_ids)?;
         (target, paths)
@@ -423,7 +423,7 @@ pub async fn set_message_flags(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -431,7 +431,7 @@ pub async fn set_message_flags(
     // concurrent re-fetch from a "messages-changed" event always sees
     // the latest flags, preventing race conditions with rapid toggles.
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
 
         let normalized_flags: Vec<String> = flags
             .iter()
@@ -496,7 +496,7 @@ pub async fn set_message_flags(
         let resume_account = account.clone();
         let imap_config = build_imap_config(&account).await?;
         let by_folder = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
             group_by_folder(uid_rows)
         };
@@ -549,12 +549,12 @@ pub async fn copy_messages(
     );
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
     let imap_config = build_imap_config(&account).await?;
     let by_folder = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
         group_by_folder(uid_rows)
     };
@@ -610,14 +610,14 @@ pub async fn mark_account_read(
     log::info!("Marking all messages as read for account {}", account_id);
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
     // Mark read on the server first
     if account.mail_protocol == "graph" {
         let unread_ids = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let mut stmt = conn.prepare(
                 "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
             ).map_err(crate::error::Error::Database)?;
@@ -646,7 +646,7 @@ pub async fn mark_account_read(
         let resume_account = account.clone();
         let imap_config = build_imap_config(&account).await?;
         let folder_paths: Vec<String> = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let folders = db::folders::list_folders(&conn, &account_id)?;
             folders.into_iter().map(|f| f.path).collect()
         };
@@ -676,7 +676,7 @@ pub async fn mark_account_read(
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
 
         let unread_ids: Vec<String> = {
-            let conn = state.db.lock().await;
+            let conn = state.db.reader();
             let mut stmt = conn.prepare(
                 "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
             ).map_err(crate::error::Error::Database)?;
@@ -700,7 +700,7 @@ pub async fn mark_account_read(
 
     // Update local DB
     let updated = {
-        let conn = state.db.lock().await;
+        let conn = state.db.writer().await;
         let count = conn.execute(
             "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
              WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",

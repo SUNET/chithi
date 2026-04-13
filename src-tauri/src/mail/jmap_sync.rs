@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
 
 use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
+use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::mail::jmap::{JmapConfig, JmapConnection};
 
@@ -39,7 +39,7 @@ struct SyncError {
 /// `mail::sync::sync_account` for IMAP.
 pub async fn sync_jmap_account(
     app: AppHandle,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<DbPool>,
     _data_dir: PathBuf,
     account_id: String,
     account_name: String,
@@ -89,7 +89,7 @@ pub async fn sync_jmap_account(
 
 async fn sync_jmap_account_inner(
     app: &AppHandle,
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &Arc<DbPool>,
     account_id: &str,
     jmap_config: &JmapConfig,
     current_folder: Option<&str>,
@@ -99,7 +99,7 @@ async fn sync_jmap_account_inner(
     // List and update mailboxes in DB
     let jmap_folders = conn_jmap.list_folders(jmap_config).await?;
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         for (display_name, mailbox_id, folder_type, parent_id) in &jmap_folders {
             // For JMAP, we store the mailbox_id in the `path` column
             db::folders::upsert_folder(
@@ -173,7 +173,7 @@ async fn sync_jmap_account_inner(
 
 /// Sync a single JMAP mailbox.
 async fn sync_jmap_folder(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &Arc<DbPool>,
     account_id: &str,
     conn_jmap: &JmapConnection,
     jmap_config: &JmapConfig,
@@ -182,7 +182,7 @@ async fn sync_jmap_folder(
 ) -> Result<u32> {
     // Get the stored JMAP state for this folder (for delta sync)
     let jmap_state = {
-        let conn = db.lock().await;
+        let conn = db.reader();
         db::folders::get_jmap_state(&conn, account_id, mailbox_id)?
     };
 
@@ -193,7 +193,7 @@ async fn sync_jmap_folder(
     if emails.is_empty() {
         // Still update the state so we don't re-fetch next time
         if !new_state.is_empty() {
-            let conn = db.lock().await;
+            let conn = db.writer().await;
             db::folders::update_jmap_state(&conn, account_id, mailbox_id, &new_state)?;
         }
         return Ok(0);
@@ -209,7 +209,7 @@ async fn sync_jmap_folder(
     let mut total_synced = 0u32;
 
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
 
         for email in &emails {
             // Use the JMAP email ID as the unique identifier
@@ -285,7 +285,7 @@ async fn sync_jmap_folder(
     // Build a set of JMAP email IDs from the server response.
     let server_ids: std::collections::HashSet<String> = emails.iter().map(|e| e.id.clone()).collect();
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         // Get all local message IDs for this folder
         let mut stmt = conn.prepare(
             "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
@@ -318,7 +318,7 @@ async fn sync_jmap_folder(
 
     // Update folder counts
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         let page =
             db::messages::get_messages(&conn, account_id, mailbox_id, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, mailbox_id)?;
@@ -357,7 +357,7 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
 /// Sync a single JMAP folder — public entry point for the `sync_folder` command.
 pub async fn sync_jmap_folder_public(
     app: AppHandle,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<DbPool>,
     account_id: String,
     account_name: String,
     mailbox_id: String,
