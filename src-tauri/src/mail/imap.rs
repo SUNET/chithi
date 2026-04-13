@@ -151,7 +151,8 @@ impl ImapConnection {
         Ok(folders)
     }
 
-    pub fn select_folder(&mut self, folder: &str) -> Result<(u32, u32)> {
+    /// SELECT a folder. Returns (exists, uid_validity, uid_next).
+    pub fn select_folder(&mut self, folder: &str) -> Result<(u32, u32, u32)> {
         log::debug!("IMAP SELECT {}", folder);
         let mailbox = self
             .session
@@ -162,13 +163,15 @@ impl ImapConnection {
             })?;
         let exists = mailbox.exists;
         let uid_validity = mailbox.uid_validity.unwrap_or(0);
+        let uid_next = mailbox.uid_next.unwrap_or(0);
         log::debug!(
-            "IMAP SELECT {}: {} messages, uidvalidity={}",
+            "IMAP SELECT {}: {} messages, uidvalidity={}, uidnext={}",
             folder,
             exists,
-            uid_validity
+            uid_validity,
+            uid_next,
         );
-        Ok((exists, uid_validity))
+        Ok((exists, uid_validity, uid_next))
     }
 
     /// Fetch UIDs in folder. If since_uid > 0, only fetch UIDs after it.

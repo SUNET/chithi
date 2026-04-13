@@ -219,7 +219,7 @@ pub async fn trigger_sync(
 
     log::info!("Sync requested for account {}", account_id);
     let account_result = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)
     };
     let account = match account_result {
@@ -276,10 +276,8 @@ pub async fn trigger_sync(
         .await {
             Err(e)
         } else {
-            log::info!("Syncing calendars for JMAP account {}", account_id);
-            if let Err(e) = sync_jmap_calendars(state.db.clone(), &account_id, &jmap_config).await {
-                log::error!("Calendar sync failed for account {}: {}", account_id, e);
-            }
+            // Calendar sync is now independent — triggered by its own interval,
+            // not chained to mail sync. See CalendarView.vue / calendar.ts.
             Ok(())
         }
     } else {
@@ -360,9 +358,18 @@ pub async fn sync_folder(
 
     log::info!("Single folder sync: account={} folder={}", account_id, folder_path);
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
+
+    // Emit sync-started for ALL protocols so the activity UI tracks every sync
+    app.emit(
+        "sync-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "account_name": account.display_name,
+        }),
+    ).ok();
 
     let suspended_idle = if account.mail_protocol == "imap"
         && should_suspend_idle_for_imap_operation(&account.provider)
@@ -377,81 +384,68 @@ pub async fn sync_folder(
     };
     let resume_account = account.clone();
 
-    if account.mail_protocol == "graph" {
+    let sync_result: Result<u32> = if account.mail_protocol == "graph" {
         // Graph sync is whole-account, not per-folder — just run the full sync
-        sync_graph_account(app, state.db.clone(), &account_id).await?;
-        return Ok(0);
-    }
-
-    if account.mail_protocol == "jmap" {
+        match sync_graph_account(app.clone(), state.db.clone(), &account_id).await {
+            Ok(()) => Ok(0),
+            Err(e) => Err(e),
+        }
+    } else if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
-
-        let result = jmap_sync::sync_jmap_folder_public(
-            app,
+        jmap_sync::sync_jmap_folder_public(
+            app.clone(),
             state.db.clone(),
-            account_id,
-            account.display_name,
-            folder_path,
+            account_id.clone(),
+            account.display_name.clone(),
+            folder_path.clone(),
             jmap_config,
         )
-        .await;
-        return result;
-    }
-
-    // IMAP path — for O365, refresh IMAP-scoped token
-    let (password, use_xoauth2) = if account.provider == "o365" {
-        let tokens = crate::oauth::load_tokens(&account_id)?
-            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens.refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-        let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-        ).await?;
-        crate::oauth::store_tokens(&account_id, &new)?;
-        (new.access_token, true)
+        .await
     } else {
-        (account.password, false)
+        // IMAP path — for O365, refresh IMAP-scoped token
+        let (password, use_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens.refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ).await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
+
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password,
+            use_tls: account.use_tls,
+            use_xoauth2,
+        };
+
+        let db = state.db.clone();
+        let account_id_clone = account_id.clone();
+        let folder_clone = folder_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn_imap = ImapConnection::connect(&imap_config)?;
+            conn_imap.select_folder(&folder_clone)?;
+            let count = mail_sync::sync_folder_envelopes_public(
+                &db, &account_id_clone, &mut conn_imap, &folder_clone,
+            )?;
+            conn_imap.logout();
+            Ok::<u32, Error>(count)
+        })
+        .await
+        .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?
     };
-
-    let imap_config = ImapConfig {
-        host: account.imap_host,
-        port: account.imap_port,
-        username: account.username,
-        password,
-        use_tls: account.use_tls,
-        use_xoauth2,
-    };
-
-    let db = state.db.clone();
-    let account_name = account.display_name.clone();
-
-    app.emit(
-        "sync-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "account_name": account_name,
-        }),
-    ).ok();
-
-    let _app_clone = app.clone();
-    let account_id_clone = account_id.clone();
-    let folder_clone = folder_path.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let mut conn_imap = ImapConnection::connect(&imap_config)?;
-        conn_imap.select_folder(&folder_clone)?;
-        let count = mail_sync::sync_folder_envelopes_public(
-            &db, &account_id_clone, &mut conn_imap, &folder_clone,
-        )?;
-        conn_imap.logout();
-        Ok::<u32, Error>(count)
-    })
-    .await
-    .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?;
 
     let resume_result = resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
 
-    match &result {
+    match &sync_result {
         Ok(count) => {
             app.emit(
                 "sync-complete",
@@ -477,13 +471,13 @@ pub async fn sync_folder(
 
     resume_result?;
 
-    result
+    sync_result
 }
 
 /// Sync JMAP calendars for an account. Extracted as a standalone async function
 /// so it can be called from `trigger_sync` without needing `State`.
 async fn sync_jmap_calendars(
-    db: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    db: std::sync::Arc<crate::db::pool::DbPool>,
     account_id: &str,
     jmap_config: &JmapConfig,
 ) -> Result<()> {
@@ -503,7 +497,7 @@ async fn sync_jmap_calendars(
         std::collections::HashMap::new();
 
     {
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         for jcal in &jmap_calendars {
             let color = jcal.color.as_deref().unwrap_or("#4285f4");
             let local_id = crate::db::calendar::upsert_calendar_by_remote_id(
@@ -546,7 +540,7 @@ async fn sync_jmap_calendars(
             .cloned()
             .unwrap_or_default();
 
-        let conn = db.lock().await;
+        let conn = db.writer().await;
         for ev in &events {
             let event_id = uuid::Uuid::new_v4().to_string();
             let cal_event = crate::db::calendar::CalendarEvent {
@@ -624,7 +618,7 @@ pub async fn prefetch_bodies(
 
     // Skip prefetch for JMAP accounts — bodies are fetched on-demand via JMAP API
     {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         let account = db::accounts::get_account_full(&conn, &account_id)?;
         if account.mail_protocol == "jmap" {
             log::debug!("Prefetch: skipping JMAP account {}", account_id);
@@ -633,7 +627,7 @@ pub async fn prefetch_bodies(
     }
 
     let account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
@@ -681,7 +675,7 @@ pub async fn prefetch_bodies(
 
     // Fetch the list of unfetched messages (up to 1000 per cycle)
     let unfetched = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::messages::get_unfetched_messages(&conn, &account_id, 1000)?
     };
 
@@ -795,7 +789,7 @@ pub async fn prefetch_bodies(
                                 }
 
                                 if !db_updates.is_empty() {
-                                    let conn = rt.block_on(db.lock());
+                                    let conn = rt.block_on(db.writer());
                                     conn.execute_batch("BEGIN").ok();
                                     for (msg_id, path) in &db_updates {
                                         db::messages::update_maildir_path(&conn, msg_id, path).ok();
@@ -840,7 +834,7 @@ pub async fn prefetch_bodies(
 /// Two-phase: download without DB lock (UI stays responsive), then fast batch insert.
 async fn sync_graph_account(
     app: AppHandle,
-    db_arc: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    db_arc: std::sync::Arc<crate::db::pool::DbPool>,
     account_id: &str,
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
@@ -856,7 +850,7 @@ async fn sync_graph_account(
     log::info!("Graph sync: {} mail folders for account {}", graph_folders.len(), account_id);
 
     {
-        let conn = db_arc.lock().await;
+        let conn = db_arc.writer().await;
         for gf in &graph_folders {
             let folder_type = graph::guess_folder_type(&gf.display_name);
             db::folders::upsert_folder(&conn, account_id, &gf.display_name, &gf.id, folder_type, None)?;
@@ -874,7 +868,7 @@ async fn sync_graph_account(
         }
 
         let existing_ids = {
-            let conn = db_arc.lock().await;
+            let conn = db_arc.reader();
             let mut stmt = conn.prepare(
                 "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
             ).map_err(Error::Database)?;
@@ -928,7 +922,7 @@ async fn sync_graph_account(
         }
 
         // Phase 2: Fast batch DB insert (lock held <10ms, not during downloads)
-        let conn = db_arc.lock().await;
+        let conn = db_arc.writer().await;
         conn.execute_batch("BEGIN")?;
 
         let mut synced = 0u32;
@@ -990,7 +984,7 @@ pub async fn start_idle(
     state: State<'_, AppState>,
 ) -> Result<()> {
     let accounts = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::list_accounts(&conn)?
     };
 
@@ -1022,7 +1016,7 @@ async fn start_imap_idle(
     }
 
     let full_account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account.id)?
     };
 
@@ -1107,7 +1101,7 @@ async fn start_jmap_push(
     }
 
     let full_account = {
-        let conn = state.db.lock().await;
+        let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account.id)?
     };
 

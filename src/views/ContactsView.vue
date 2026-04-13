@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import { useAccountsStore } from "@/stores/accounts";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
@@ -37,13 +38,48 @@ const error = ref<string | null>(null);
 
 const syncing = ref(false);
 
+// --- Independent contact sync (30-minute interval, matching Thunderbird) ---
+const CONTACT_SYNC_INTERVAL = 30 * 60 * 1000; // 30 minutes
+let contactSyncIntervalId: ReturnType<typeof setInterval> | null = null;
+let stopContactsChangedListener: (() => void) | null = null;
+let disposed = false;
+
 onMounted(async () => {
   // Load local data first, then sync in background
   await fetchBooks();
   syncAllContacts();
+
+  // Start periodic sync
+  contactSyncIntervalId = setInterval(() => {
+    syncAllContacts();
+  }, CONTACT_SYNC_INTERVAL);
+
+  // Listen for backend contacts-changed events
+  listen<string>("contacts-changed", async () => {
+    if (disposed) return;
+    await fetchBooks();
+    if (selectedBookId.value) {
+      contacts.value = await api.listContacts(selectedBookId.value);
+    }
+  }).then((unlisten) => {
+    if (disposed) {
+      unlisten();
+      return;
+    }
+    stopContactsChangedListener = unlisten;
+  });
+});
+
+onUnmounted(() => {
+  disposed = true;
+  if (contactSyncIntervalId) {
+    clearInterval(contactSyncIntervalId);
+  }
+  stopContactsChangedListener?.();
 });
 
 async function syncAllContacts() {
+  if (syncing.value) return; // re-entrancy guard: skip if sync already in progress
   syncing.value = true;
   try {
     for (const account of accountsStore.accounts) {

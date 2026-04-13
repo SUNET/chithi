@@ -12,6 +12,7 @@ mod keyring;
 mod logging;
 mod mail;
 mod oauth;
+mod ops;
 mod state;
 
 use state::AppState;
@@ -86,7 +87,6 @@ fn main() {
             commands::calendar::create_calendar,
             commands::calendar::update_calendar,
             commands::calendar::delete_calendar,
-            commands::calendar::unsubscribe_calendar,
             commands::calendar::get_events,
             commands::calendar::create_event,
             commands::calendar::update_event,
@@ -96,6 +96,8 @@ fn main() {
             commands::calendar::respond_to_invite,
             commands::calendar::send_invites,
             commands::calendar::process_invite_reply,
+            commands::calendar::process_cancelled_invite,
+            commands::calendar::unsubscribe_calendar,
             commands::calendar::sync_calendars,
         ])
         .run(tauri::generate_context!())

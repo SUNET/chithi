@@ -273,3 +273,18 @@ export interface CollectedContact {
   last_used: string;
   use_count: number;
 }
+
+// --- Operation status types (for sync architecture) ---
+
+export interface FailedOp {
+  account_id: string;
+  op_type: string;
+  error: string;
+  timestamp: number;
+}
+
+export interface OfflineQueueChange {
+  account_id: string;
+  dead_op_id: number;
+  action_type: string;
+}

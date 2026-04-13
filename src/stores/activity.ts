@@ -1,6 +1,8 @@
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { showToast, dismissToast } from "@/lib/toast";
 
 export interface Operation {
   id: string;
@@ -61,11 +63,11 @@ export const useActivityStore = defineStore("activity", () => {
       op.status = "done";
       if (detail) op.detail = detail;
       operations.value = new Map(operations.value);
-      // Auto-remove after 5 seconds
+      // Auto-remove after 60 seconds (visible in operations panel)
       setTimeout(() => {
         operations.value.delete(id);
         operations.value = new Map(operations.value);
-      }, 5000);
+      }, 60_000);
     }
   }
 
@@ -76,64 +78,176 @@ export const useActivityStore = defineStore("activity", () => {
       op.error = error;
       op.detail = error;
       operations.value = new Map(operations.value);
-      // Auto-remove errors after 15 seconds
+      // Auto-remove errors after 5 minutes
       setTimeout(() => {
         operations.value.delete(id);
         operations.value = new Map(operations.value);
-      }, 15000);
+      }, 5 * 60_000);
     }
   }
+
+  const unlistenFns: UnlistenFn[] = [];
 
   async function initEventListeners() {
     if (initialized.value) return;
     initialized.value = true;
 
-    await listen<{ account_id: string; account_name: string }>(
-      "sync-started",
-      (event) => {
-        startOperation(
-          `sync-${event.payload.account_id}`,
-          "sync",
-          `Syncing ${event.payload.account_name}`,
-          "Connecting...",
-        );
-      },
+    // --- Mail sync events ---
+    unlistenFns.push(
+      await listen<{ account_id: string; account_name: string }>(
+        "sync-started",
+        (event) => {
+          startOperation(
+            `sync-${event.payload.account_id}`,
+            "sync",
+            `Syncing ${event.payload.account_name}`,
+            "Syncing...",
+          );
+        },
+      ),
     );
 
-    await listen<{
-      account_id: string;
-      folder: string;
-      synced: number;
-      total_folders: number;
-      current_folder: number;
-    }>("sync-progress", (event) => {
-      const p = event.payload;
-      updateOperation(
-        `sync-${p.account_id}`,
-        `${p.folder} (${p.current_folder}/${p.total_folders})${p.synced > 0 ? ` - ${p.synced} new` : ""}`,
-      );
-    });
-
-    await listen<{ account_id: string; total_synced: number }>(
-      "sync-complete",
-      (event) => {
+    unlistenFns.push(
+      await listen<{
+        account_id: string;
+        folder: string;
+        synced: number;
+        total_folders: number;
+        current_folder: number;
+      }>("sync-progress", (event) => {
         const p = event.payload;
-        completeOperation(
+        updateOperation(
           `sync-${p.account_id}`,
-          p.total_synced > 0
-            ? `Done - ${p.total_synced} new messages`
-            : "Up to date",
+          `${p.folder} (${p.current_folder}/${p.total_folders})${p.synced > 0 ? ` - ${p.synced} new` : ""}`,
         );
-      },
+      }),
     );
 
-    await listen<{ account_id: string; error: string }>(
-      "sync-error",
-      (event) => {
-        failOperation(`sync-${event.payload.account_id}`, event.payload.error);
-      },
+    unlistenFns.push(
+      await listen<{ account_id: string; total_synced: number }>(
+        "sync-complete",
+        (event) => {
+          const p = event.payload;
+          completeOperation(
+            `sync-${p.account_id}`,
+            p.total_synced > 0
+              ? `Done - ${p.total_synced} new messages`
+              : "Up to date",
+          );
+        },
+      ),
+    );
+
+    unlistenFns.push(
+      await listen<{ account_id: string; error: string }>(
+        "sync-error",
+        (event) => {
+          failOperation(`sync-${event.payload.account_id}`, event.payload.error);
+        },
+      ),
+    );
+
+    // --- Calendar sync events ---
+    unlistenFns.push(
+      await listen<string>("calendar-changed", (event) => {
+        completeOperation(
+          `cal-sync-${event.payload}`,
+          "Calendars updated",
+        );
+      }),
+    );
+
+    // --- Contacts sync events ---
+    unlistenFns.push(
+      await listen<string>("contacts-changed", (event) => {
+        completeOperation(
+          `contacts-sync-${event.payload}`,
+          "Contacts updated",
+        );
+      }),
+    );
+
+    // --- Background operation failures ---
+    unlistenFns.push(
+      await listen<{ account_id: string; op_type: string; error: string }>(
+        "op-failed",
+        (event) => {
+          const p = event.payload;
+          // Create and immediately fail an operation entry so it shows up in the
+          // operations panel (failOperation is a no-op for unknown ids).
+          const opId = `op-${p.account_id}-${Date.now()}`;
+          startOperation(opId, "general", `${p.op_type} failed`, p.error);
+          failOperation(opId, `${p.op_type}: ${p.error}`);
+        },
+      ),
+    );
+
+    // Maps an operation id → toast id so we can dismiss the persistent
+    // "Sending..." toast when the send completes or fails.
+    const sendToastIds = new Map<string, number>();
+
+    // --- Send events ---
+    unlistenFns.push(
+      await listen<{ account_id: string; subject: string }>(
+        "send-started",
+        (event) => {
+          const p = event.payload;
+          const opId = `send-${p.account_id}-${Date.now()}`;
+          startOperation(opId, "send", `Sending "${p.subject}"`, "Syncing...");
+          const toastId = showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
+          sendToastIds.set(opId, toastId);
+        },
+      ),
+    );
+
+    unlistenFns.push(
+      await listen<{ account_id: string; subject: string }>(
+        "send-complete",
+        (event) => {
+          const p = event.payload;
+          // Complete all running send operations for this account
+          for (const [id, op] of operations.value) {
+            if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
+              completeOperation(id, "Sent");
+              const toastId = sendToastIds.get(id);
+              if (toastId !== undefined) {
+                dismissToast(toastId);
+                sendToastIds.delete(id);
+              }
+            }
+          }
+          showToast(`"${p.subject}" sent`, "success");
+        },
+      ),
+    );
+
+    unlistenFns.push(
+      await listen<{ account_id: string; subject: string; error: string }>(
+        "send-failed",
+        (event) => {
+          const p = event.payload;
+          // Fail all running send operations for this account
+          for (const [id, op] of operations.value) {
+            if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
+              failOperation(id, p.error);
+              const toastId = sendToastIds.get(id);
+              if (toastId !== undefined) {
+                dismissToast(toastId);
+                sendToastIds.delete(id);
+              }
+            }
+          }
+          showToast(`Send failed: ${p.error}`, "error", 10000);
+        },
+      ),
     );
   }
+
+  onScopeDispose(() => {
+    for (const unlisten of unlistenFns) {
+      unlisten();
+    }
+  });
 
   return {
     operations,

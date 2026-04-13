@@ -529,9 +529,12 @@ impl GraphClient {
     }
 
     /// Create a calendar event.
-    pub async fn create_event(&self, event: &serde_json::Value) -> Result<String> {
+    /// Create a calendar event. Returns (graph_id, iCalUid).
+    pub async fn create_event(&self, event: &serde_json::Value) -> Result<(String, Option<String>)> {
         let resp = self.post_json("/me/events", event).await?;
-        Ok(resp["id"].as_str().unwrap_or("").to_string())
+        let id = resp["id"].as_str().unwrap_or("").to_string();
+        let ical_uid = resp["iCalUId"].as_str().map(|s| s.to_string());
+        Ok((id, ical_uid))
     }
 
     /// Update a calendar event.
@@ -542,6 +545,21 @@ impl GraphClient {
     /// Delete a calendar event.
     pub async fn delete_event(&self, event_id: &str) -> Result<()> {
         self.delete(&format!("/me/events/{}", event_id)).await
+    }
+
+    /// Find an event by its iCalUId. Returns the Graph event ID if found.
+    pub async fn find_event_by_ical_uid(&self, ical_uid: &str) -> Result<Option<String>> {
+        // Escape single quotes per OData rules to prevent filter injection.
+        let escaped_uid = ical_uid.replace('\'', "''");
+        let filter = format!("iCalUId eq '{}'", escaped_uid);
+        let resp = self
+            .get("/me/events", &[("$filter", filter.as_str()), ("$select", "id")])
+            .await?;
+        Ok(resp["value"]
+            .as_array()
+            .and_then(|a: &Vec<serde_json::Value>| a.first())
+            .and_then(|e: &serde_json::Value| e["id"].as_str())
+            .map(|s: &str| s.to_string()))
     }
 
     /// RSVP to an event (accept, tentativelyAccept, or decline).

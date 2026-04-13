@@ -37,6 +37,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             jmap_state TEXT,
             unread_count INTEGER DEFAULT 0,
             total_count INTEGER DEFAULT 0,
+            uid_next INTEGER DEFAULT 0,
             UNIQUE(account_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);
@@ -277,6 +278,15 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add uid_next column to folders for IMAP preflight sync optimization
+    let has_uid_next: bool = conn
+        .prepare("SELECT uid_next FROM folders LIMIT 0")
+        .is_ok();
+    if !has_uid_next {
+        log::info!("Migration: adding uid_next column to folders table");
+        conn.execute_batch("ALTER TABLE folders ADD COLUMN uid_next INTEGER DEFAULT 0;")?;
+    }
+
     // Populate FTS index for existing messages (one-time migration)
     if !has_migration(conn, "fts5_initial_populate") {
         log::info!("Migration: populating FTS5 index for existing messages");
@@ -286,17 +296,6 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
         set_migration(conn, "fts5_initial_populate")?;
         log::info!("Migration: FTS5 index populated");
-    }
-
-    // Add is_subscribed column to calendars if it doesn't exist
-    let has_is_subscribed: bool = conn
-        .prepare("SELECT is_subscribed FROM calendars LIMIT 0")
-        .is_ok();
-    if !has_is_subscribed {
-        log::info!("Migration: adding is_subscribed column to calendars table");
-        conn.execute_batch(
-            "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
-        )?;
     }
 
     Ok(())

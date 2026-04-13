@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, onScopeDispose } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
 import { expandRRule } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
@@ -109,6 +110,12 @@ export const useCalendarStore = defineStore("calendar", () => {
       start: start.toISOString(),
       end: end.toISOString(),
     };
+  }
+
+  async function unsubscribeCalendar(calendarId: string) {
+    await api.unsubscribeCalendar(calendarId);
+    await fetchCalendars();
+    await fetchEvents();
   }
 
   async function syncCalendars() {
@@ -242,12 +249,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
-  async function unsubscribeCalendar(calendarId: string) {
-    await api.unsubscribeCalendar(calendarId);
-    await fetchCalendars();
-    await fetchEvents();
-  }
-
   async function deleteEvent(eventId: string) {
     await api.deleteEvent(eventId);
     if (selectedEvent.value?.id === eventId) {
@@ -302,6 +303,52 @@ export const useCalendarStore = defineStore("calendar", () => {
     selectedEvent.value = event;
   }
 
+  // --- Independent calendar sync (5-minute interval) ---
+  // Calendar sync is decoupled from mail sync. It runs on its own timer
+  // so calendar updates don't wait for mail sync to finish.
+  const CALENDAR_SYNC_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  let calendarSyncIntervalId: ReturnType<typeof setInterval> | null = null;
+
+  function startCalendarSync() {
+    if (calendarSyncIntervalId) return;
+    calendarSyncIntervalId = setInterval(() => {
+      syncCalendars().catch((e) =>
+        console.error("Periodic calendar sync failed:", e),
+      );
+    }, CALENDAR_SYNC_INTERVAL);
+  }
+
+  function stopCalendarSync() {
+    if (calendarSyncIntervalId) {
+      clearInterval(calendarSyncIntervalId);
+      calendarSyncIntervalId = null;
+    }
+  }
+
+  // Listen for backend calendar-changed events to refresh UI
+  let stopCalendarChangedListener: null | (() => void) = null;
+  let calendarDisposed = false;
+  void listen<string>("calendar-changed", () => {
+    if (calendarDisposed) return;
+    fetchCalendars().then(() => fetchEvents()).catch(() => {});
+  })
+    .then((unlisten) => {
+      if (calendarDisposed) {
+        unlisten();
+        return;
+      }
+      stopCalendarChangedListener = unlisten;
+    })
+    .catch((error) => {
+      console.error("Failed to subscribe to calendar-changed:", error);
+    });
+
+  onScopeDispose(() => {
+    calendarDisposed = true;
+    stopCalendarSync();
+    stopCalendarChangedListener?.();
+  });
+
   return {
     calendars,
     events,
@@ -311,6 +358,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     loading,
     selectedEvent,
     hiddenCalendarIds,
+    unsubscribeCalendar,
     syncCalendars,
     fetchCalendars,
     fetchEvents,
@@ -318,7 +366,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     updateEvent,
     moveEventToCalendar,
     deleteEvent,
-    unsubscribeCalendar,
     setViewMode,
     goToDate,
     goToday,
@@ -326,5 +373,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     goNext,
     toggleCalendarVisibility,
     selectEvent,
+    startCalendarSync,
+    stopCalendarSync,
   };
 });

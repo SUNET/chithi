@@ -48,3 +48,6 @@ libc = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

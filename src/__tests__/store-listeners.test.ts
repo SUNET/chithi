@@ -72,9 +72,11 @@ describe("Store listener cleanup", () => {
 
     const foldersUnlisten = vi.fn();
     const messagesUnlisten = vi.fn();
+    const opFailedUnlisten = vi.fn();
     listenMock
       .mockImplementationOnce(() => Promise.resolve(foldersUnlisten))
-      .mockImplementationOnce(() => Promise.resolve(messagesUnlisten));
+      .mockImplementationOnce(() => Promise.resolve(messagesUnlisten))
+      .mockImplementationOnce(() => Promise.resolve(opFailedUnlisten));
 
     const foldersStore = useFoldersStore();
     foldersStore.activeFolderPath = "INBOX";
@@ -84,6 +86,7 @@ describe("Store listener cleanup", () => {
     messagesStore.$dispose();
 
     expect(messagesUnlisten).toHaveBeenCalledOnce();
+    expect(opFailedUnlisten).toHaveBeenCalledOnce();
     expect(foldersUnlisten).not.toHaveBeenCalled();
   });
 });

@@ -36,6 +36,16 @@ const isOrganizer = computed(() => {
   return account?.email === event.organizer_email;
 });
 
+const calendarInfo = computed(() => {
+  const cal = calendarStore.calendars.find(c => c.id === event.calendar_id);
+  const account = accountsStore.accounts.find(a => a.id === event.account_id);
+  return {
+    name: cal?.name || "Unknown calendar",
+    color: cal?.color || "#4285f4",
+    accountEmail: account?.email || "",
+  };
+});
+
 // Edit form state — convert UTC to local timezone
 const editTitle = ref(event.title);
 const _startLocal = new Date(event.start_time);
@@ -215,6 +225,14 @@ async function handleDelete() {
           </div>
         </div>
 
+        <div class="detail-row">
+          <span class="calendar-dot" :style="{ backgroundColor: calendarInfo.color }"></span>
+          <div>
+            <div>{{ calendarInfo.name }}</div>
+            <div class="detail-secondary">{{ calendarInfo.accountEmail }}</div>
+          </div>
+        </div>
+
         <div v-if="event.location" class="detail-row">
           <span class="detail-icon">&#x1F4CD;</span>
           <span>{{ event.location }}</span>
@@ -385,6 +403,14 @@ async function handleDelete() {
   flex-shrink: 0;
   width: 20px;
   text-align: center;
+}
+
+.calendar-dot {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  margin: 3px 4px 0 4px;
 }
 
 .detail-secondary {

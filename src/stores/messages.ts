@@ -487,13 +487,57 @@ export const useMessagesStore = defineStore("messages", () => {
     const accountId = accountsStore.activeAccountId;
     if (!accountId || selectedIds.value.length === 0) return;
     const ids = resolveSelectedIds();
+
+    // Optimistic: remove from local state immediately
+    messages.value = messages.value.filter((m) => !ids.includes(m.id));
+
+    // Track which threads are fully deleted vs partially deleted
+    const fullyDeletedThreadIds: string[] = [];
+    threads.value = threads.value.filter((t) => {
+      if (t.message_ids.every((mid) => ids.includes(mid))) {
+        fullyDeletedThreadIds.push(t.thread_id);
+        return false; // remove fully deleted thread
+      }
+      return true;
+    });
+
+    // Clean up threadMessages for fully deleted threads
+    if (fullyDeletedThreadIds.length > 0) {
+      const updated = { ...threadMessages.value };
+      for (const tid of fullyDeletedThreadIds) {
+        delete updated[tid];
+      }
+      threadMessages.value = updated;
+    }
+
+    // For partially deleted threads, remove the deleted message_ids
+    for (const t of threads.value) {
+      const remaining = t.message_ids.filter((mid) => !ids.includes(mid));
+      if (remaining.length < t.message_ids.length) {
+        t.message_ids = remaining;
+        // Also clean up expanded thread messages
+        if (threadMessages.value[t.thread_id]) {
+          threadMessages.value = {
+            ...threadMessages.value,
+            [t.thread_id]: threadMessages.value[t.thread_id].filter(
+              (m) => !ids.includes(m.id),
+            ),
+          };
+        }
+      }
+    }
+
+    selectedIds.value = [];
+    activeMessage.value = null;
+    activeMessageId.value = null;
+
     try {
       await api.deleteMessages(accountId, ids);
-      selectedIds.value = [];
-      activeMessage.value = null;
-      activeMessageId.value = null;
     } catch (e) {
-      console.error("Delete failed:", e);
+      // Backend returns immediately (optimistic), so errors here are
+      // from the command dispatch itself, not the server operation.
+      // Server failures are reported via the "op-failed" event.
+      console.error("Delete dispatch failed:", e);
     }
   }
 
@@ -547,10 +591,39 @@ export const useMessagesStore = defineStore("messages", () => {
       console.error("Failed to subscribe to messages-changed:", error);
     });
 
+  // Subscribe to op-failed events — reconcile by re-fetching when a
+  // background server operation fails after an optimistic local update.
+  let stopOpFailedListener: null | (() => void) = null;
+  void listen<{ account_id: string; op_type: string; error: string }>(
+    "op-failed",
+    (event) => {
+      if (disposed) return;
+      const p = event.payload;
+      console.warn(`op-failed: ${p.op_type} on account ${p.account_id}: ${p.error}`);
+      // Always re-fetch to reconcile optimistic state — the failed op may
+      // affect the currently visible folder even if the active account has
+      // changed since the op was dispatched.
+      void fetchMessages().catch((err) => {
+        console.error("Failed to reconcile messages after op-failed:", err);
+      });
+    },
+  )
+    .then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      stopOpFailedListener = unlisten;
+    })
+    .catch((error) => {
+      console.error("Failed to subscribe to op-failed:", error);
+    });
+
   onScopeDispose(() => {
     disposed = true;
     if (messagesRefreshTimer) clearTimeout(messagesRefreshTimer);
     stopMessagesListener?.();
+    stopOpFailedListener?.();
   });
 
   return {

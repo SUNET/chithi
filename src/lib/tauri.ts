@@ -247,10 +247,6 @@ export async function deleteCalendar(calendarId: string): Promise<void> {
   return invoke("delete_calendar", { calendarId });
 }
 
-export async function unsubscribeCalendar(calendarId: string): Promise<void> {
-  return invoke("unsubscribe_calendar", { calendarId });
-}
-
 export async function getEvents(
   accountId: string,
   start: string,
@@ -277,8 +273,15 @@ export async function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }
 
-export async function syncCalendars(accountId: string): Promise<void> {
-  return invoke("sync_calendars", { accountId });
+export async function unsubscribeCalendar(calendarId: string): Promise<void> {
+  return invoke("unsubscribe_calendar", { calendarId });
+}
+
+export async function syncCalendars(
+  accountId: string,
+  forceFullSync?: boolean,
+): Promise<void> {
+  return invoke("sync_calendars", { accountId, forceFullSync });
 }
 
 export async function getEmailInvites(
@@ -308,6 +311,13 @@ export async function processInviteReply(
   messageId: string,
 ): Promise<void> {
   return invoke("process_invite_reply", { accountId, messageId });
+}
+
+export async function processCancelledInvite(
+  accountId: string,
+  messageId: string,
+): Promise<void> {
+  return invoke("process_cancelled_invite", { accountId, messageId });
 }
 
 export async function getInviteStatus(

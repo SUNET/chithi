@@ -237,12 +237,12 @@ pub fn get_messages(
     // Try FTS5 first; on failure (bad query syntax), fall back to LIKE
     let has_text = !filter.text.trim().is_empty();
     match get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
-        Ok(page) => return Ok(page),
+        Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 query failed, retrying with LIKE fallback: {}", e);
-            return get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+            get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
 }
 
@@ -517,23 +517,32 @@ pub fn update_flags(conn: &Connection, message_id: &str, flags: &str) -> Result<
 
 /// Bulk-update flags for messages by UID within a folder.
 /// Returns the number of messages whose flags actually changed.
+/// Sync flag changes from server. Uses a single bulk query to load all
+/// messages in the folder into a HashMap, then compares in memory and
+/// only UPDATEs changed rows. This replaces the previous per-message
+/// SELECT loop which did N queries (e.g., 15k for Trash).
 pub fn sync_flags_by_uid(
     conn: &Connection,
     account_id: &str,
     folder_path: &str,
     uid_flags: &[(u32, String)],
 ) -> Result<u32> {
-    let mut changed = 0u32;
+    // One query: load all (uid -> (id, flags)) for the folder
     let mut stmt = conn.prepare(
-        "SELECT id, flags FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+        "SELECT uid, id, flags FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid > 0",
     )?;
+    let local: std::collections::HashMap<u32, (String, String)> = stmt
+        .query_map(params![account_id, folder_path], |row| {
+            Ok((row.get::<_, u32>(0)?, (row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Compare in memory, only UPDATE changed rows
+    let mut changed = 0u32;
     for (uid, new_flags_json) in uid_flags {
-        let row: std::result::Result<(String, String), _> = stmt.query_row(
-            params![account_id, folder_path, uid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        );
-        if let Ok((msg_id, current_flags)) = row {
-            if current_flags != *new_flags_json {
+        if let Some((msg_id, current_flags)) = local.get(uid) {
+            if current_flags != new_flags_json {
                 conn.execute(
                     "UPDATE messages SET flags = ?1 WHERE id = ?2",
                     params![new_flags_json, msg_id],
@@ -728,12 +737,12 @@ pub fn get_threaded_messages(
 ) -> Result<ThreadedPage> {
     let has_text = !filter.text.trim().is_empty();
     match get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
-        Ok(page) => return Ok(page),
+        Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 threaded query failed, retrying with LIKE: {}", e);
-            return get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false);
+            get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
 }
 

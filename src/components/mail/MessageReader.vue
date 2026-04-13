@@ -67,6 +67,13 @@ watch(
           api.processInviteReply(accountId, msgId).catch((e) =>
             console.error("Failed to process invite reply:", e));
         }
+
+        // Auto-process METHOD:CANCEL emails (event cancellations)
+        const cancels = all.filter((inv) => inv.method.toUpperCase() === "CANCEL");
+        if (cancels.length > 0) {
+          api.processCancelledInvite(accountId, msgId).catch((e) =>
+            console.error("Failed to process cancelled invite:", e));
+        }
       } catch {
         // No invites or parse error — silently ignore
       }

@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
+import { useOpsStore } from "@/stores/ops";
+import { useUiStore } from "@/stores/ui";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useCalendarStore } from "@/stores/calendar";
@@ -10,6 +13,8 @@ import * as api from "@/lib/tauri";
 
 const route = useRoute();
 const activityStore = useActivityStore();
+const opsStore = useOpsStore();
+const uiStore = useUiStore();
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const calendarStore = useCalendarStore();
@@ -17,22 +22,40 @@ const lastSyncTime = ref<Date | null>(null);
 const connectionStatus = ref<"connected" | "disconnected" | "reconnecting">("connected");
 const syncError = ref<string | null>(null);
 
+const unlistenFns: UnlistenFn[] = [];
+
 onMounted(async () => {
-  await listen("idle-disconnected", () => {
-    connectionStatus.value = "disconnected";
-  });
-  await listen("idle-reconnected", () => {
-    connectionStatus.value = "connected";
-    syncError.value = null;
-  });
-  await listen<{ error: string }>("sync-error", (event) => {
-    connectionStatus.value = "disconnected";
-    syncError.value = event.payload.error;
-  });
-  await listen("sync-complete", () => {
-    connectionStatus.value = "connected";
-    syncError.value = null;
-  });
+  await opsStore.initEventListeners();
+
+  unlistenFns.push(
+    await listen("idle-disconnected", () => {
+      connectionStatus.value = "disconnected";
+    }),
+  );
+  unlistenFns.push(
+    await listen("idle-reconnected", () => {
+      connectionStatus.value = "connected";
+      syncError.value = null;
+    }),
+  );
+  unlistenFns.push(
+    await listen<{ error: string }>("sync-error", (event) => {
+      connectionStatus.value = "disconnected";
+      syncError.value = event.payload.error;
+    }),
+  );
+  unlistenFns.push(
+    await listen("sync-complete", () => {
+      connectionStatus.value = "connected";
+      syncError.value = null;
+    }),
+  );
+});
+
+onUnmounted(() => {
+  for (const unlisten of unlistenFns) {
+    unlisten();
+  }
 });
 
 const lastSyncLabel = computed(() => {
@@ -45,12 +68,15 @@ const lastSyncLabel = computed(() => {
 
 async function syncAll() {
   const isCalendar = route.name === "calendar";
+  const isContacts = route.name === "contacts";
 
   for (const account of accountsStore.accounts) {
     if (!account.enabled) continue;
     try {
       if (isCalendar) {
-        await api.syncCalendars(account.id);
+        await api.syncCalendars(account.id, true);
+      } else if (isContacts) {
+        await api.syncContacts(account.id);
       } else {
         await api.triggerSync(
           account.id,
@@ -85,11 +111,24 @@ async function syncAll() {
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
       <span class="status-dot" :class="connectionStatus" data-testid="sync-status"></span>
       <span v-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
+      <button v-else-if="opsStore.hasFailures" class="sync-error-msg" data-testid="op-failure" @click="opsStore.clearFailures()" title="Click to dismiss">{{ opsStore.recentFailures[0]?.error }}</button>
       <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
       <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>
     <div class="status-right">
       <span v-if="lastSyncLabel" class="last-sync">{{ lastSyncLabel }}</span>
+      <button
+        class="ops-toggle-btn"
+        :class="{ active: uiStore.operationsPanelOpen }"
+        title="Operations"
+        data-testid="ops-toggle-btn"
+        @click="uiStore.toggleOperationsPanel()"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+        </svg>
+        <span v-if="activityStore.activeOperations.length > 0" class="ops-badge">{{ activityStore.activeOperations.length }}</span>
+      </button>
       <button class="help-btn" title="Help">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="10" />
@@ -177,6 +216,12 @@ async function syncAll() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Reset <button> browser defaults so it looks like inline text */
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
 
 .disconnect-msg {
@@ -201,6 +246,41 @@ async function syncAll() {
 .last-sync {
   white-space: nowrap;
   color: var(--color-text-muted);
+}
+
+.ops-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 24px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--color-text-muted);
+  transition: all 0.12s;
+}
+
+.ops-toggle-btn:hover,
+.ops-toggle-btn.active {
+  color: var(--color-text);
+  background: var(--color-bg-hover);
+}
+
+.ops-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--color-accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
 }
 
 .help-btn {

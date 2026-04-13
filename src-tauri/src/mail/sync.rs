@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
 
 use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
+use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::FilterAction;
@@ -40,7 +40,7 @@ struct SyncError {
 /// Sync all folders for an account. If `current_folder` is set, sync it first.
 pub async fn sync_account(
     app: AppHandle,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<DbPool>,
     data_dir: PathBuf,
     account_id: String,
     account_name: String,
@@ -99,7 +99,7 @@ const MAX_PARALLEL_CONNECTIONS: usize = 4;
 
 fn sync_account_blocking(
     app: &AppHandle,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<DbPool>,
     data_dir: &Path,
     account_id: &str,
     imap_config: &ImapConfig,
@@ -112,7 +112,7 @@ fn sync_account_blocking(
     // Update folders in DB
     {
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
         for (display_name, path) in &imap_folders {
             let folder_type = db::folders::guess_folder_type(display_name)
                 .or_else(|| db::folders::guess_folder_type(path));
@@ -191,7 +191,6 @@ fn sync_account_blocking(
     conn_imap.logout();
 
     // Phase 2: Sync remaining folders in parallel with multiple connections.
-    // Capture the Tokio runtime handle so spawned threads can block_on the async DB mutex.
     if !others.is_empty() {
         let parallel_count = MAX_PARALLEL_CONNECTIONS.min(others.len());
         log::info!(
@@ -218,7 +217,7 @@ fn sync_account_blocking(
                     let app = app.clone();
                     let rt = rt_handle.clone();
                     s.spawn(move || {
-                        // Enter the Tokio runtime context so block_on(db.lock()) works
+                        // Enter the Tokio runtime context for db.writer() calls inside sync
                         let _guard = rt.enter();
                         let mut conn = match ImapConnection::connect(&imap_config) {
                             Ok(c) => c,
@@ -276,7 +275,7 @@ fn sync_account_blocking(
 /// After syncing, runs filter rules on any newly synced messages.
 /// Public entry point for single-folder sync from commands.
 pub fn sync_folder_envelopes_public(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &Arc<DbPool>,
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
@@ -285,18 +284,31 @@ pub fn sync_folder_envelopes_public(
 }
 
 fn sync_folder_envelopes(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &Arc<DbPool>,
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
 ) -> Result<u32> {
-    let last_uid = {
-        let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
-        db::folders::get_last_seen_uid(&conn, account_id, folder_path)?
+    let (last_uid, stored_uid_next, stored_total) = {
+        let conn = db.reader();
+        let last_uid = db::folders::get_last_seen_uid(&conn, account_id, folder_path)?;
+        let (uid_next, total) = db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
+        (last_uid, uid_next, total)
     };
 
-    conn_imap.select_folder(folder_path)?;
+    let (exists, _uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+
+    // Preflight: if UIDNEXT and EXISTS haven't changed since last sync, the
+    // folder is unchanged — skip deletion reconciliation, flag sync, and
+    // envelope fetch entirely. Most folders are dormant, so this skips ~80%
+    // of folders on a typical sync cycle.
+    if last_uid > 0 && stored_uid_next > 0 && uid_next == stored_uid_next && exists as i64 == stored_total {
+        log::debug!(
+            "Folder '{}' unchanged (uidnext={}, exists={}), skipping",
+            folder_path, uid_next, exists
+        );
+        return Ok(0);
+    }
 
     // Reconcile deletions — skip on first sync (last_uid == 0) since the local DB is empty.
     if last_uid > 0 {
@@ -305,7 +317,7 @@ fn sync_folder_envelopes(
             all_server_uids.into_iter().collect();
 
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
 
         let mut stmt = conn
             .prepare(
@@ -349,7 +361,7 @@ fn sync_folder_envelopes(
                     .map(|(uid, flags)| (uid, serde_json::to_string(&flags).unwrap_or_default()))
                     .collect();
                 let rt = tokio::runtime::Handle::current();
-                let conn = rt.block_on(db.lock());
+                let conn = rt.block_on(db.writer());
                 match db::messages::sync_flags_by_uid(&conn, account_id, folder_path, &uid_flags) {
                     Ok(changed) if changed > 0 => {
                         log::info!("Updated flags on {} messages in '{}'", changed, folder_path);
@@ -370,11 +382,14 @@ fn sync_folder_envelopes(
 
     if new_uids.is_empty() {
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
         let page =
             db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
+        if uid_next > 0 {
+            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+        }
         return Ok(0);
     }
 
@@ -390,8 +405,7 @@ fn sync_folder_envelopes(
     // Pre-load existing UIDs for this folder into a HashSet for fast existence check.
     // This replaces 1 SELECT per message with 1 bulk query.
     let existing_uids = {
-        let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = db.reader();
         db::messages::get_existing_uids(&conn, account_id, folder_path)?
     };
 
@@ -402,7 +416,7 @@ fn sync_folder_envelopes(
         let envelopes = conn_imap.fetch_envelopes_batch(chunk)?;
 
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
 
         conn.execute_batch("BEGIN")?;
 
@@ -500,11 +514,15 @@ fn sync_folder_envelopes(
     // Update folder counts
     {
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
         let page =
             db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
+        // Store uid_next for preflight optimization on next sync
+        if uid_next > 0 {
+            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+        }
     }
 
     Ok(total_synced)
@@ -649,7 +667,7 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
 /// new message, runs the filter engine, and executes any resulting IMAP actions
 /// using the already-open connection. Returns the count of messages affected.
 pub fn run_filters_on_new_messages(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &Arc<DbPool>,
     account_id: &str,
     folder_path: &str,
     new_message_ids: &[String],
@@ -661,8 +679,7 @@ pub fn run_filters_on_new_messages(
 
     // Load enabled filter rules for this account
     let rules = {
-        let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = db.reader();
         let all_rules = db::filters::list_filters(&conn, Some(account_id))?;
         all_rules
             .into_iter()
@@ -683,8 +700,7 @@ pub fn run_filters_on_new_messages(
 
     // Load message data for the new messages
     let messages = {
-        let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = db.reader();
         load_messages_by_ids(&conn, new_message_ids)?
     };
 
@@ -812,7 +828,7 @@ pub fn run_filters_on_new_messages(
     // Update local DB: remove moved/deleted messages
     {
         let rt = tokio::runtime::Handle::current();
-        let conn = rt.block_on(db.lock());
+        let conn = rt.block_on(db.writer());
         let mut to_remove = moved_ids;
         to_remove.extend(deleted_ids);
         to_remove.sort();

@@ -168,35 +168,6 @@ describe("Calendar store", () => {
     });
   });
 
-  describe("unsubscribeCalendar", () => {
-    it("should call backend and refresh calendars and events", async () => {
-      setupAccounts();
-      const store = useCalendarStore();
-      const cal = makeCalendar("cal1", "Work", "remote-1");
-      vi.mocked(api.listCalendars).mockResolvedValue([cal]);
-      vi.mocked(api.getEvents).mockResolvedValue([]);
-
-      await store.unsubscribeCalendar("cal1");
-
-      expect(api.unsubscribeCalendar).toHaveBeenCalledWith("cal1");
-      expect(api.listCalendars).toHaveBeenCalled();
-      expect(api.getEvents).toHaveBeenCalled();
-    });
-
-    it("should filter out unsubscribed calendars from fetchCalendars", async () => {
-      setupAccounts();
-      const store = useCalendarStore();
-      const subscribed = makeCalendar("cal1", "Work", "remote-1");
-      const unsubscribed = { ...makeCalendar("cal2", "Holidays", "remote-2"), is_subscribed: false };
-      vi.mocked(api.listCalendars).mockResolvedValueOnce([subscribed, unsubscribed]);
-
-      await store.fetchCalendars();
-
-      expect(store.calendars).toHaveLength(1);
-      expect(store.calendars[0].id).toBe("cal1");
-    });
-  });
-
   describe("visibleEvents with hidden calendars", () => {
     it("should filter out events from hidden calendars", async () => {
       setupAccounts();
@@ -305,6 +276,35 @@ describe("Calendar store", () => {
       vi.mocked(api.syncCalendars).mockRejectedValueOnce(new Error("Network error"));
 
       await expect(store.syncCalendars()).resolves.not.toThrow();
+    });
+  });
+
+  describe("unsubscribeCalendar", () => {
+    it("should call backend and refresh calendars and events", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const cal = makeCalendar("cal1", "Work", "remote-1");
+      vi.mocked(api.listCalendars).mockResolvedValue([cal]);
+      vi.mocked(api.getEvents).mockResolvedValue([]);
+
+      await store.unsubscribeCalendar("cal1");
+
+      expect(api.unsubscribeCalendar).toHaveBeenCalledWith("cal1");
+      expect(api.listCalendars).toHaveBeenCalled();
+      expect(api.getEvents).toHaveBeenCalled();
+    });
+
+    it("should filter out unsubscribed calendars from fetchCalendars", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const subscribed = makeCalendar("cal1", "Work", "remote-1");
+      const unsubscribed = { ...makeCalendar("cal2", "Holidays", "remote-2"), is_subscribed: false };
+      vi.mocked(api.listCalendars).mockResolvedValueOnce([subscribed, unsubscribed]);
+
+      await store.fetchCalendars();
+
+      expect(store.calendars).toHaveLength(1);
+      expect(store.calendars[0].id).toBe("cal1");
     });
   });
 });
