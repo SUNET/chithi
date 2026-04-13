@@ -289,12 +289,26 @@ fn sync_folder_envelopes(
     conn_imap: &mut ImapConnection,
     folder_path: &str,
 ) -> Result<u32> {
-    let last_uid = {
+    let (last_uid, stored_uid_next, stored_total) = {
         let conn = db.reader();
-        db::folders::get_last_seen_uid(&conn, account_id, folder_path)?
+        let last_uid = db::folders::get_last_seen_uid(&conn, account_id, folder_path)?;
+        let (uid_next, total) = db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
+        (last_uid, uid_next, total)
     };
 
-    conn_imap.select_folder(folder_path)?;
+    let (exists, _uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+
+    // Preflight: if UIDNEXT and EXISTS haven't changed since last sync, the
+    // folder is unchanged — skip deletion reconciliation, flag sync, and
+    // envelope fetch entirely. Most folders are dormant, so this skips ~80%
+    // of folders on a typical sync cycle.
+    if last_uid > 0 && stored_uid_next > 0 && uid_next == stored_uid_next && exists as i64 == stored_total {
+        log::debug!(
+            "Folder '{}' unchanged (uidnext={}, exists={}), skipping",
+            folder_path, uid_next, exists
+        );
+        return Ok(0);
+    }
 
     // Reconcile deletions — skip on first sync (last_uid == 0) since the local DB is empty.
     if last_uid > 0 {
@@ -373,6 +387,9 @@ fn sync_folder_envelopes(
             db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
+        if uid_next > 0 {
+            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+        }
         return Ok(0);
     }
 
@@ -502,6 +519,10 @@ fn sync_folder_envelopes(
             db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
+        // Store uid_next for preflight optimization on next sync
+        if uid_next > 0 {
+            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+        }
     }
 
     Ok(total_synced)

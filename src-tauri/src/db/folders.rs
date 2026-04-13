@@ -235,6 +235,34 @@ pub fn update_last_seen_uid(
     Ok(())
 }
 
+/// Get the stored sync state (uid_next, total_count) for preflight checks.
+pub fn get_folder_sync_state(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+) -> Result<(u32, i64)> {
+    let result = conn.query_row(
+        "SELECT uid_next, total_count FROM folders WHERE account_id = ?1 AND path = ?2",
+        params![account_id, path],
+        |row| Ok((row.get::<_, u32>(0).unwrap_or(0), row.get::<_, i64>(1).unwrap_or(0))),
+    );
+    Ok(result.unwrap_or((0, 0)))
+}
+
+/// Update the stored uid_next after a successful folder sync.
+pub fn update_uid_next(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+    uid_next: u32,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET uid_next = ?1 WHERE account_id = ?2 AND path = ?3",
+        params![uid_next, account_id, path],
+    )?;
+    Ok(())
+}
+
 pub fn get_last_seen_uid(conn: &Connection, account_id: &str, path: &str) -> Result<u32> {
     let uid: u32 = conn
         .query_row(

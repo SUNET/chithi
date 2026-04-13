@@ -37,6 +37,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             jmap_state TEXT,
             unread_count INTEGER DEFAULT 0,
             total_count INTEGER DEFAULT 0,
+            uid_next INTEGER DEFAULT 0,
             UNIQUE(account_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);
@@ -275,6 +276,15 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE accounts ADD COLUMN oidc_client_id TEXT NOT NULL DEFAULT '';",
         )?;
+    }
+
+    // Add uid_next column to folders for IMAP preflight sync optimization
+    let has_uid_next: bool = conn
+        .prepare("SELECT uid_next FROM folders LIMIT 0")
+        .is_ok();
+    if !has_uid_next {
+        log::info!("Migration: adding uid_next column to folders table");
+        conn.execute_batch("ALTER TABLE folders ADD COLUMN uid_next INTEGER DEFAULT 0;")?;
     }
 
     // Populate FTS index for existing messages (one-time migration)

@@ -120,6 +120,7 @@ pub async fn move_messages(
         let account_id_bg = account_id.clone();
         let message_ids_bg = message_ids.clone();
         let target_folder_bg = target_folder.clone();
+        let db_bg = state.db.clone();
 
         tokio::spawn(async move {
             let result: std::result::Result<(), Error> = async {
@@ -173,21 +174,32 @@ pub async fn move_messages(
                     account_id_bg,
                     e
                 );
-                // JMAP/Graph operations are not queued to the offline outbox because
-                // the replay system only understands IMAP-style `by_folder` payloads.
-                // Reconciliation will happen automatically on the next full sync.
-                log::warn!(
-                    "JMAP/Graph move failure for account {} will not be retried offline; \
-                     reconciliation deferred to next sync",
-                    account_id_bg
-                );
+                // Queue to offline outbox for retry on next sync
+                let payload = serde_json::json!({
+                    "protocol": account.mail_protocol,
+                    "message_ids": message_ids_bg,
+                    "target_folder": target_folder_bg,
+                });
+                let conn = db_bg.writer().await;
+                match crate::ops::offline::queue_offline_op(
+                    &conn, &account_id_bg, "move", &payload,
+                ) {
+                    Ok(id) => log::info!(
+                        "Queued failed JMAP/Graph move to outbox (id={}) for account {}",
+                        id, account_id_bg
+                    ),
+                    Err(db_err) => log::error!(
+                        "Failed to queue offline move op for account {}: {}",
+                        account_id_bg, db_err
+                    ),
+                }
                 app_bg
                     .emit(
                         "op-failed",
                         serde_json::json!({
                             "account_id": account_id_bg,
                             "op_type": "move",
-                            "error": e.to_string(),
+                            "error": format!("{} (will retry)", e),
                         }),
                     )
                     .ok();
@@ -273,6 +285,7 @@ pub async fn delete_messages(
         let app_bg = app.clone();
         let account_id_bg = account_id.clone();
         let message_ids_bg = message_ids.clone();
+        let db_bg = state.db.clone();
 
         tokio::spawn(async move {
             let result: std::result::Result<(), Error> = async {
@@ -327,21 +340,31 @@ pub async fn delete_messages(
                     account_id_bg,
                     e
                 );
-                // JMAP/Graph operations are not queued to the offline outbox because
-                // the replay system only understands IMAP-style `by_folder` payloads.
-                // Reconciliation will happen automatically on the next full sync.
-                log::warn!(
-                    "JMAP/Graph delete failure for account {} will not be retried offline; \
-                     reconciliation deferred to next sync",
-                    account_id_bg
-                );
+                // Queue to offline outbox for retry on next sync
+                let payload = serde_json::json!({
+                    "protocol": account.mail_protocol,
+                    "message_ids": message_ids_bg,
+                });
+                let conn = db_bg.writer().await;
+                match crate::ops::offline::queue_offline_op(
+                    &conn, &account_id_bg, "delete", &payload,
+                ) {
+                    Ok(id) => log::info!(
+                        "Queued failed JMAP/Graph delete to outbox (id={}) for account {}",
+                        id, account_id_bg
+                    ),
+                    Err(db_err) => log::error!(
+                        "Failed to queue offline delete op for account {}: {}",
+                        account_id_bg, db_err
+                    ),
+                }
                 app_bg
                     .emit(
                         "op-failed",
                         serde_json::json!({
                             "account_id": account_id_bg,
                             "op_type": "delete",
-                            "error": e.to_string(),
+                            "error": format!("{} (will retry)", e),
                         }),
                     )
                     .ok();
