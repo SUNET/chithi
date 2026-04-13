@@ -436,6 +436,7 @@ pub async fn delete_contact(
 
 #[tauri::command]
 pub async fn sync_contacts(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<()> {
@@ -468,6 +469,10 @@ pub async fn sync_contacts(
     } else {
         log::debug!("sync_contacts: skipping account {} (no supported sync)", account_id);
     }
+
+    // Notify frontend that contact data has changed
+    use tauri::Emitter;
+    app.emit("contacts-changed", account_id.as_str()).ok();
 
     log::info!("sync_contacts: completed for account {}", account_id);
     Ok(())
