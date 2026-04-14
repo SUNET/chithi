@@ -3,7 +3,7 @@ import { ref, computed, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
-import { localInputToUTC } from "@/lib/datetime";
+import { localInputToUTC, toDateInTimezone, toTimeInTimezone } from "@/lib/datetime";
 import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
@@ -21,31 +21,16 @@ const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 
-/** Format a Date to local YYYY-MM-DD */
-function toLocalDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-/** Format a Date to local HH:MM */
-function toLocalTime(d: Date): string {
-  const h = String(d.getHours()).padStart(2, "0");
-  const min = String(d.getMinutes()).padStart(2, "0");
-  return `${h}:${min}`;
-}
-
 const defaultStart = props.initialStart
   ? new Date(props.initialStart)
   : new Date();
 const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 
 const title = ref("");
-const startDate = ref(toLocalDate(defaultStart));
-const startTime = ref(toLocalTime(defaultStart));
-const endDate = ref(toLocalDate(defaultEnd));
-const endTime = ref(toLocalTime(defaultEnd));
+const startDate = ref(toDateInTimezone(defaultStart, uiStore.displayTimezone));
+const startTime = ref(toTimeInTimezone(defaultStart, uiStore.displayTimezone));
+const endDate = ref(toDateInTimezone(defaultEnd, uiStore.displayTimezone));
+const endTime = ref(toTimeInTimezone(defaultEnd, uiStore.displayTimezone));
 
 /** Minimum end date: cannot be before start date */
 const minEndDate = computed(() => startDate.value);
@@ -60,12 +45,12 @@ const minEndTime = computed(() => {
 
 // When start moves past end, push end forward
 watch([startDate, startTime], () => {
-  const s = new Date(`${startDate.value}T${startTime.value}:00`);
-  const e = new Date(`${endDate.value}T${endTime.value}:00`);
-  if (e <= s) {
-    const newEnd = new Date(s.getTime() + 60 * 60 * 1000);
-    endDate.value = toLocalDate(newEnd);
-    endTime.value = toLocalTime(newEnd);
+  const sISO = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
+  const eISO = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
+  if (new Date(eISO) <= new Date(sISO)) {
+    const newEnd = new Date(new Date(sISO).getTime() + 60 * 60 * 1000);
+    endDate.value = toDateInTimezone(newEnd, uiStore.displayTimezone);
+    endTime.value = toTimeInTimezone(newEnd, uiStore.displayTimezone);
   }
 });
 const allDay = ref(false);

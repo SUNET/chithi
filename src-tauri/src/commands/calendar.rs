@@ -2651,10 +2651,12 @@ async fn sync_calendars_graph(
 /// Return all IANA timezone names from the chrono-tz database.
 #[tauri::command]
 pub fn list_timezones() -> Vec<String> {
-    chrono_tz::TZ_VARIANTS
+    let mut tzs: Vec<String> = chrono_tz::TZ_VARIANTS
         .iter()
         .map(|tz| tz.name().to_string())
-        .collect()
+        .collect();
+    tzs.sort();
+    tzs
 }
 
 /// Return the OS timezone, falling back to "UTC".

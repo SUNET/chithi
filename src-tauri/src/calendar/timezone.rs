@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_naive_with_tzid_new_york() {
+    fn test_offset_datetime_tzid_ignored() {
         // Offset already present → parsed directly, tzid ignored
         assert_eq!(to_utc("2026-04-14T08:00:00-04:00", "America/New_York"), "2026-04-14T12:00:00Z");
     }

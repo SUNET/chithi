@@ -2,7 +2,14 @@
 import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
-import { getHourInTimezone } from "@/lib/datetime";
+import {
+  getHourInTimezone,
+  getMinutesInTimezone,
+  getDateInTimezone,
+  formatInTimezone,
+  startOfDayUTC,
+  endOfDayUTC,
+} from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -107,11 +114,11 @@ const segmentsByDayHour = computed(() => {
   const map = new Map<string, EventSegment[]>();
 
   for (const day of days.value) {
-    const dayStart = new Date(day);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(day);
-    dayEnd.setHours(23, 59, 59, 999);
-    const dayStr = day.toISOString().split("T")[0];
+    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayStart = new Date(dayStartMs);
+    const dayEnd = new Date(dayEndMs);
 
     for (const e of calendarStore.visibleEvents) {
       const eStart = new Date(e.start_time);
@@ -131,7 +138,7 @@ const segmentsByDayHour = computed(() => {
 });
 
 function getEventsForDayHour(date: Date, hour: number): EventSegment[] {
-  const key = `${date.toISOString().split("T")[0]}:${hour}`;
+  const key = `${getDateInTimezone(date.toISOString(), uiStore.displayTimezone)}:${hour}`;
   return segmentsByDayHour.value.get(key) || [];
 }
 
@@ -148,11 +155,11 @@ const overlapLayout = computed(() => {
   const layout = new Map<string, OverlapInfo>();
 
   for (const day of days.value) {
-    const dayStart = new Date(day);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(day);
-    dayEnd.setHours(23, 59, 59, 999);
-    const dayStr = day.toISOString().split("T")[0];
+    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayStart = new Date(dayStartMs);
+    const dayEnd = new Date(dayEndMs);
 
     // Collect all timed events for this day
     const dayEvents: { id: string; key: string; start: number; end: number }[] = [];
@@ -227,10 +234,10 @@ const overlapLayout = computed(() => {
 function eventBlockStyle(seg: EventSegment): Record<string, string> {
   const durationMs = seg.segEnd.getTime() - seg.segStart.getTime();
   const durationHours = Math.max(durationMs / (60 * 60 * 1000), 0.25);
-  const topOffset = (seg.segStart.getMinutes() / 60) * HOUR_HEIGHT;
+  const topOffset = (getMinutesInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone) / 60) * HOUR_HEIGHT;
   const height = durationHours * HOUR_HEIGHT;
 
-  const dayStr = seg.segStart.toISOString().split("T")[0];
+  const dayStr = getDateInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
   const ol = overlapLayout.value.get(`${dayStr}:${seg.event.id}`);
   const col = ol?.column ?? 0;
   const totalCols = ol?.totalColumns ?? 1;
@@ -483,7 +490,7 @@ onUnmounted(() => {
             @mousedown="onEventMouseDown($event, seg)"
           >
             <span class="event-time">
-              {{ seg.segStart.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }}
+              {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
             </span>
             <span class="event-title">{{ seg.event.title }}</span>
           </div>

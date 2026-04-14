@@ -99,6 +99,23 @@ export function localInputToUTC(date: string, time: string, timezone: string): s
   return new Date(utcMs).toISOString();
 }
 
+/**
+ * Get the UTC timestamp (ms) for midnight (00:00) of a given date in a timezone.
+ * E.g., startOfDayUTC("2026-04-14", "Europe/Stockholm") returns the UTC ms
+ * for 2026-04-14T00:00:00 Stockholm time (= 2026-04-13T22:00:00Z).
+ */
+export function startOfDayUTC(dateStr: string, timezone: string): number {
+  return new Date(localInputToUTC(dateStr, "00:00", timezone)).getTime();
+}
+
+/**
+ * Get the UTC timestamp (ms) for the last millisecond of a given date in a timezone.
+ * Uses 23:59 + 59999 ms to cover the full minute.
+ */
+export function endOfDayUTC(dateStr: string, timezone: string): number {
+  return new Date(localInputToUTC(dateStr, "23:59", timezone)).getTime() + 59999;
+}
+
 interface DateTimeParts {
   year: number;
   month: number;

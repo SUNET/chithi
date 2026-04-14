@@ -65,6 +65,8 @@ function getEventsForDay(date: Date) {
     // Include events that start on or before this day and end on or after this day
     // Events ending exactly at midnight (00:00) are excluded from spilling to next day
     if (eStartDay <= dayStr && eEndDay >= dayStr) {
+      // All-day events always match if date overlaps
+      if (e.all_day) return true;
       // Exclude events that end at exactly midnight of this day (they belong to prev day)
       if (eEndDay === dayStr) {
         const eEnd = new Date(e.end_time);

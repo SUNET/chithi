@@ -34,7 +34,7 @@ export const useUiStore = defineStore("ui", () => {
 
   // Display timezone
   const displayTimezone = ref<string>(
-    localStorage.getItem("chithi-display-timezone") || "",
+    localStorage.getItem("chithi-display-timezone") || "UTC",
   );
   const timezoneList = ref<string[]>([]);
 
@@ -79,6 +79,10 @@ export const useUiStore = defineStore("ui", () => {
   }
 
   function setDisplayTimezone(tz: string) {
+    if (timezoneList.value.length > 0 && !timezoneList.value.includes(tz)) {
+      console.warn(`setDisplayTimezone: unknown timezone '${tz}', ignoring`);
+      return;
+    }
     displayTimezone.value = tz;
     localStorage.setItem("chithi-display-timezone", tz);
   }
