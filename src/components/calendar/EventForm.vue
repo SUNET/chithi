@@ -73,9 +73,9 @@ async function save() {
   }
 
   if (!allDay.value) {
-    const s = new Date(`${startDate.value}T${startTime.value}:00`);
-    const e = new Date(`${endDate.value}T${endTime.value}:00`);
-    if (e <= s) {
+    const sUTC = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
+    const eUTC = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
+    if (new Date(eUTC) <= new Date(sUTC)) {
       error.value = "End time must be after start time";
       return;
     }

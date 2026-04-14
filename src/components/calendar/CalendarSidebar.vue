@@ -241,12 +241,28 @@ async function unsubscribeThisCalendar() {
           @focus="onTzInputFocus"
           @blur="onTzInputBlur"
           @keydown="onTzKeydown"
+          aria-label="Display timezone"
+          role="combobox"
+          :aria-expanded="tzDropdownOpen"
+          aria-controls="tz-listbox"
+          aria-autocomplete="list"
+          :aria-activedescendant="tzHighlightIndex >= 0 ? `tz-opt-${tzHighlightIndex}` : undefined"
           data-testid="timezone-search"
         />
-        <div v-if="tzDropdownOpen" ref="tzDropdownRef" class="tz-dropdown">
+        <div
+          v-if="tzDropdownOpen"
+          ref="tzDropdownRef"
+          id="tz-listbox"
+          role="listbox"
+          aria-label="Timezones"
+          class="tz-dropdown"
+        >
           <button
             v-for="(tz, idx) in filteredTimezones"
             :key="tz"
+            :id="`tz-opt-${idx}`"
+            role="option"
+            :aria-selected="tz === uiStore.displayTimezone"
             class="tz-option"
             :class="{ active: tz === uiStore.displayTimezone, highlighted: idx === tzHighlightIndex }"
             @mousedown.prevent="selectTimezone(tz)"
