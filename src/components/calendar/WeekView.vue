@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
+import { getHourInTimezone } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -81,12 +82,16 @@ function isWeekend(date: Date): boolean {
 
 function isCurrentHour(hour: number): boolean {
   const todayVisible = days.value.some((d) => isToday(d));
-  return todayVisible && now.value.getHours() === hour;
+  return todayVisible && getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) === hour;
 }
 
 // Minutes past the hour as percentage (0-100) for positioning the time line
 function currentMinutePercent(): string {
-  return `${(now.value.getMinutes() / 60) * 100}%`;
+  const minutes = parseInt(
+    now.value.toLocaleString("en-US", { minute: "numeric", timeZone: uiStore.displayTimezone }),
+    10,
+  );
+  return `${(minutes / 60) * 100}%`;
 }
 
 // A display segment represents one day's portion of an event.
@@ -116,7 +121,7 @@ const segmentsByDayHour = computed(() => {
 
       const segStart = eStart < dayStart ? dayStart : eStart;
       const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd;
-      const key = `${dayStr}:${segStart.getHours()}`;
+      const key = `${dayStr}:${getHourInTimezone(segStart.toISOString(), uiStore.displayTimezone)}`;
       const list = map.get(key) || [];
       list.push({ event: e, segStart, segEnd });
       map.set(key, list);
@@ -396,7 +401,7 @@ onMounted(async () => {
   await nextTick();
   if (gridRef.value) {
     const hourHeight = HOUR_HEIGHT;
-    const scrollToHour = Math.max(now.value.getHours() - 2, 0);
+    const scrollToHour = Math.max(getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) - 2, 0);
     gridRef.value.scrollTop = hourHeight * scrollToHour;
   }
 });

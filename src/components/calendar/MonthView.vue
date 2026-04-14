@@ -2,6 +2,7 @@
 import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
+import { getDateInTimezone } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -57,16 +58,29 @@ function isCurrentMonth(date: Date): boolean {
 }
 
 function getEventsForDay(date: Date) {
-  const dayStart = new Date(date);
-  dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(date);
-  dayEnd.setHours(23, 59, 59, 999);
+  const dayStr = getDateInTimezone(date.toISOString(), uiStore.displayTimezone);
   return calendarStore.visibleEvents.filter((e) => {
-    const eStart = new Date(e.start_time);
-    const eEnd = new Date(e.end_time);
-    // Overlap check with exclusive end — events ending exactly at midnight
-    // don't spill onto the next day
-    return eStart <= dayEnd && eEnd > dayStart;
+    const eStartDay = getDateInTimezone(e.start_time, uiStore.displayTimezone);
+    const eEndDay = getDateInTimezone(e.end_time, uiStore.displayTimezone);
+    // Include events that start on or before this day and end on or after this day
+    // Events ending exactly at midnight (00:00) are excluded from spilling to next day
+    if (eStartDay <= dayStr && eEndDay >= dayStr) {
+      // Exclude events that end at exactly midnight of this day (they belong to prev day)
+      if (eEndDay === dayStr) {
+        const eEnd = new Date(e.end_time);
+        const endHour = parseInt(
+          eEnd.toLocaleString("en-US", { hour: "numeric", hour12: false, timeZone: uiStore.displayTimezone }),
+          10,
+        );
+        const endMin = parseInt(
+          eEnd.toLocaleString("en-US", { minute: "numeric", timeZone: uiStore.displayTimezone }),
+          10,
+        );
+        return endHour !== 0 || endMin !== 0;
+      }
+      return true;
+    }
+    return false;
   });
 }
 
