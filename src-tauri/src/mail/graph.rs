@@ -725,6 +725,7 @@ pub struct GraphCalendarEvent {
     pub start: String,
     pub end: String,
     pub all_day: bool,
+    pub timezone: Option<String>,
     pub location: Option<String>,
     pub organizer_email: Option<String>,
     pub attendees_json: Option<String>,
@@ -799,30 +800,25 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
     let end_obj = &e["end"];
     let all_day = e["isAllDay"].as_bool().unwrap_or(false);
 
-    // Graph returns {dateTime, timeZone} — normalize to ISO 8601
+    // Graph returns {dateTime, timeZone} — normalize to UTC
+    let start_tz = start_obj["timeZone"].as_str().unwrap_or("UTC");
+
     let start = if all_day {
         start_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
     } else {
         let dt = start_obj["dateTime"].as_str().unwrap_or("");
-        let tz = start_obj["timeZone"].as_str().unwrap_or("UTC");
-        if tz == "UTC" && !dt.ends_with('Z') {
-            format!("{}Z", dt)
-        } else {
-            dt.to_string()
-        }
+        crate::calendar::timezone::to_utc(dt, start_tz)
     };
 
     let end = if all_day {
         end_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
     } else {
         let dt = end_obj["dateTime"].as_str().unwrap_or("");
-        let tz = end_obj["timeZone"].as_str().unwrap_or("UTC");
-        if tz == "UTC" && !dt.ends_with('Z') {
-            format!("{}Z", dt)
-        } else {
-            dt.to_string()
-        }
+        let end_tz = end_obj["timeZone"].as_str().unwrap_or("UTC");
+        crate::calendar::timezone::to_utc(dt, end_tz)
     };
+
+    let timezone = if all_day { None } else { Some(start_tz.to_string()) };
 
     let location = e["location"]["displayName"].as_str()
         .filter(|s| !s.is_empty())
@@ -850,6 +846,7 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         start,
         end,
         all_day,
+        timezone,
         location,
         organizer_email,
         attendees_json,

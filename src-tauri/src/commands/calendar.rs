@@ -2573,7 +2573,7 @@ async fn sync_calendars_graph(
                 conn.execute(
                     "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                      all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                     description = ?8 WHERE id = ?9",
+                     description = ?8, timezone = ?9 WHERE id = ?10",
                     rusqlite::params![
                         ge.subject,
                         ge.start,
@@ -2583,6 +2583,7 @@ async fn sync_calendars_graph(
                         ge.organizer_email,
                         ge.attendees_json,
                         ge.body_preview,
+                        ge.timezone,
                         local_id,
                     ],
                 ).ok();
@@ -2600,7 +2601,7 @@ async fn sync_calendars_graph(
                     start_time: ge.start.clone(),
                     end_time: ge.end.clone(),
                     all_day: ge.all_day,
-                    timezone: None,
+                    timezone: ge.timezone.clone(),
                     recurrence_rule: None,
                     organizer_email: ge.organizer_email.clone(),
                     attendees_json: ge.attendees_json.clone(),
