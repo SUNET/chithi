@@ -2640,3 +2640,18 @@ async fn sync_calendars_graph(
     log::info!("sync_calendars_graph: completed for account {}", account_id);
     Ok(())
 }
+
+/// Return all IANA timezone names from the chrono-tz database.
+#[tauri::command]
+pub fn list_timezones() -> Vec<String> {
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .map(|tz| tz.name().to_string())
+        .collect()
+}
+
+/// Return the OS timezone, falling back to "UTC".
+#[tauri::command]
+pub fn get_default_timezone() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
+}
