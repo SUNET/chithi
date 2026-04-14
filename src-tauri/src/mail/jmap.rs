@@ -23,6 +23,7 @@ pub struct JmapCalendarEvent {
     pub start: String,      // ISO 8601
     pub end: String,
     pub all_day: bool,
+    pub timezone: Option<String>,
     pub recurrence_rule: Option<String>,
     pub uid: Option<String>,
     pub organizer_email: Option<String>,
@@ -890,13 +891,13 @@ impl JmapConnection {
                 .and_then(|loc| loc["name"].as_str())
                 .map(|s| s.to_string());
 
-            // Start datetime — JSCalendar uses local time without timezone.
-            // Stalwart stores in UTC, so append Z to mark as UTC for correct display.
+            // Start datetime — JSCalendar uses "start" as local time + "timeZone" as IANA id.
             let raw_start = ev["start"].as_str().unwrap_or("").to_string();
-            let start = if !raw_start.is_empty() && !raw_start.ends_with('Z') && !raw_start.contains('+') {
-                format!("{}Z", raw_start)
+            let event_tz = ev["timeZone"].as_str().unwrap_or("").to_string();
+            let start = if raw_start.is_empty() {
+                raw_start.clone()
             } else {
-                raw_start
+                crate::calendar::timezone::to_utc(&raw_start, &event_tz)
             };
 
             let all_day = ev["showWithoutTime"].as_bool().unwrap_or(false);
@@ -906,6 +907,8 @@ impl JmapConnection {
                 let e = compute_end_from_duration(start.trim_end_matches('Z'), duration_str);
                 if start.ends_with('Z') && !e.ends_with('Z') { format!("{}Z", e) } else { e }
             };
+
+            let event_tz_opt = if event_tz.is_empty() { None } else { Some(event_tz) };
 
             // Recurrence rules: JSCalendar uses an array of recurrence rule objects
             let recurrence_rule = ev["recurrenceRules"]
@@ -961,6 +964,7 @@ impl JmapConnection {
                 start,
                 end,
                 all_day,
+                timezone: event_tz_opt,
                 recurrence_rule,
                 uid,
                 organizer_email,
