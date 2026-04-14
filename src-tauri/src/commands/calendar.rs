@@ -1007,18 +1007,20 @@ async fn sync_calendars_google(
                 let location = ev["location"].as_str().map(|s| s.to_string());
 
                 // Parse start/end — can be date (all-day) or dateTime
+                let start_tz = ev["start"]["timeZone"].as_str().map(|s| s.to_string());
                 let (start_time, all_day) = if let Some(dt) = ev["start"]["dateTime"].as_str() {
-                    (dt.to_string(), false)
+                    (crate::calendar::timezone::to_utc(dt, start_tz.as_deref().unwrap_or("")), false)
                 } else if let Some(d) = ev["start"]["date"].as_str() {
-                    (format!("{}T00:00:00Z", d), true)
+                    (d.to_string(), true)
                 } else {
                     continue;
                 };
 
                 let end_time = if let Some(dt) = ev["end"]["dateTime"].as_str() {
-                    dt.to_string()
+                    let end_tz = ev["end"]["timeZone"].as_str().unwrap_or("");
+                    crate::calendar::timezone::to_utc(dt, end_tz)
                 } else if let Some(d) = ev["end"]["date"].as_str() {
-                    format!("{}T23:59:59Z", d)
+                    d.to_string()
                 } else {
                     start_time.clone()
                 };
@@ -1037,7 +1039,7 @@ async fn sync_calendars_google(
                     start_time,
                     end_time,
                     all_day,
-                    timezone: None,
+                    timezone: start_tz,
                     recurrence_rule: None,
                     organizer_email,
                     attendees_json: None,
