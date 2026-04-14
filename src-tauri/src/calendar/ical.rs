@@ -346,35 +346,31 @@ fn parse_dt_property(
 /// - `20250415` (DATE, all-day) -> `2025-04-15`
 /// - `20250415T100000` (local datetime) -> `2025-04-15T10:00:00`
 /// - `20250415T100000Z` (UTC datetime) -> `2025-04-15T10:00:00Z`
-fn ical_datetime_to_iso(val: &str, all_day: bool, _tzid: Option<&str>) -> String {
+fn ical_datetime_to_iso(val: &str, all_day: bool, tzid: Option<&str>) -> String {
     let val = val.trim();
 
     if all_day && val.len() >= 8 {
-        // DATE format: YYYYMMDD
-        return format!(
-            "{}-{}-{}",
-            &val[0..4],
-            &val[4..6],
-            &val[6..8]
-        );
+        return format!("{}-{}-{}", &val[0..4], &val[4..6], &val[6..8]);
     }
 
-    // DATETIME format: YYYYMMDDTHHmmss or YYYYMMDDTHHmmssZ
     if val.len() >= 15 {
         let utc_suffix = if val.ends_with('Z') { "Z" } else { "" };
-        return format!(
+        let iso = format!(
             "{}-{}-{}T{}:{}:{}{}",
-            &val[0..4],
-            &val[4..6],
-            &val[6..8],
-            &val[9..11],
-            &val[11..13],
-            &val[13..15],
+            &val[0..4], &val[4..6], &val[6..8],
+            &val[9..11], &val[11..13], &val[13..15],
             utc_suffix,
         );
+
+        // If there's a TZID and the time isn't already UTC, convert to UTC
+        if !val.ends_with('Z') {
+            let tz_str = tzid.unwrap_or("");
+            return crate::calendar::timezone::to_utc(&iso, tz_str);
+        }
+
+        return iso;
     }
 
-    // Fallback: return as-is
     val.to_string()
 }
 
@@ -522,7 +518,7 @@ mod tests {
     fn test_ical_datetime_to_iso_local() {
         assert_eq!(
             ical_datetime_to_iso("20260407T170000", false, None),
-            "2026-04-07T17:00:00"
+            "2026-04-07T17:00:00Z"
         );
     }
 
@@ -531,6 +527,22 @@ mod tests {
         assert_eq!(
             ical_datetime_to_iso("20260407", true, None),
             "2026-04-07"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_with_tzid() {
+        assert_eq!(
+            ical_datetime_to_iso("20260414T140000", false, Some("Europe/Stockholm")),
+            "2026-04-14T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_utc_ignores_tzid() {
+        assert_eq!(
+            ical_datetime_to_iso("20260414T120000Z", false, Some("Europe/Stockholm")),
+            "2026-04-14T12:00:00Z"
         );
     }
 
