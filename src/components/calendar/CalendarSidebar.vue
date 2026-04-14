@@ -109,6 +109,11 @@ function selectTimezone(tz: string) {
   tzHighlightIndex.value = -1;
 }
 
+function onTzInput(e: Event) {
+  tzSearch.value = (e.target as HTMLInputElement).value;
+  tzHighlightIndex.value = 0;
+}
+
 function onTzInputFocus() {
   tzDropdownOpen.value = true;
   tzSearch.value = "";
@@ -232,7 +237,7 @@ async function unsubscribeThisCalendar() {
           class="tz-search-input"
           :placeholder="uiStore.displayTimezone"
           :value="tzDropdownOpen ? tzSearch : ''"
-          @input="tzSearch = ($event.target as HTMLInputElement).value; tzHighlightIndex = 0"
+          @input="onTzInput($event)"
           @focus="onTzInputFocus"
           @blur="onTzInputBlur"
           @keydown="onTzKeydown"
