@@ -1353,6 +1353,7 @@ async fn sync_calendars_caldav(
                         &ev.start_time,
                         &ev.end_time,
                         ev.all_day,
+                        ev.timezone.as_deref(),
                     )
                 });
 
@@ -2063,6 +2064,7 @@ pub async fn send_invites(
         None, // Use email as organizer name — display_name is the account label, not a person's name
         &attendees,
         event.recurrence_rule.as_deref(),
+        event.timezone.as_deref(),
     );
 
     let subject = format!("Invitation: {}", event.title);

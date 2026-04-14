@@ -636,17 +636,24 @@ pub fn generate_ical_event(
     start_time: &str,
     end_time: &str,
     all_day: bool,
+    timezone: Option<&str>,
 ) -> String {
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
     let dtstart = if all_day {
         format!("DTSTART;VALUE=DATE:{}", to_ical_date(start_time))
+    } else if let Some(tz) = timezone {
+        let local_time = utc_to_local(start_time, tz);
+        format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_time))
     } else {
         format!("DTSTART:{}", to_ical_datetime(start_time))
     };
 
     let dtend = if all_day {
         format!("DTEND;VALUE=DATE:{}", to_ical_date(end_time))
+    } else if let Some(tz) = timezone {
+        let local_time = utc_to_local(end_time, tz);
+        format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_time))
     } else {
         format!("DTEND:{}", to_ical_datetime(end_time))
     };
@@ -690,4 +697,22 @@ fn to_ical_datetime(iso: &str) -> String {
 /// "2025-04-15" -> "20250415"
 fn to_ical_date(iso: &str) -> String {
     iso.replace('-', "").chars().take(8).collect()
+}
+
+/// Convert a UTC datetime string back to a local datetime in the given timezone.
+/// Used when generating iCalendar with TZID for CalDAV servers.
+pub fn utc_to_local(utc_datetime: &str, tzid: &str) -> String {
+    let dt = utc_datetime.trim();
+    if let Ok(tz) = tzid.parse::<chrono_tz::Tz>() {
+        if let Ok(utc) = chrono::DateTime::parse_from_rfc3339(dt) {
+            return utc.with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S").to_string();
+        }
+        let bare = dt.trim_end_matches('Z');
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(bare, "%Y-%m-%dT%H:%M:%S") {
+            use chrono::TimeZone;
+            let utc = chrono::Utc.from_utc_datetime(&naive);
+            return utc.with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S").to_string();
+        }
+    }
+    dt.trim_end_matches('Z').to_string()
 }
