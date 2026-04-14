@@ -256,6 +256,7 @@ async function unsubscribeThisCalendar() {
           role="listbox"
           aria-label="Timezones"
           class="tz-dropdown"
+          data-testid="timezone-dropdown"
         >
           <button
             v-for="(tz, idx) in filteredTimezones"
@@ -267,6 +268,7 @@ async function unsubscribeThisCalendar() {
             :class="{ active: tz === uiStore.displayTimezone, highlighted: idx === tzHighlightIndex }"
             @mousedown.prevent="selectTimezone(tz)"
             @mouseenter="tzHighlightIndex = idx"
+            :data-testid="`timezone-option-${tz}`"
           >
             {{ tz }}
           </button>
