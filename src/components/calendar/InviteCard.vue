@@ -2,6 +2,8 @@
 import { ref, onMounted } from "vue";
 import type { ParsedInvite } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
+import { formatInTimezone } from "@/lib/datetime";
 import * as api from "@/lib/tauri";
 
 const props = defineProps<{
@@ -10,6 +12,7 @@ const props = defineProps<{
 }>();
 
 const accountsStore = useAccountsStore();
+const uiStore = useUiStore();
 const responding = ref(false);
 const responded = ref<string | null>(null);
 const error = ref<string | null>(null);
@@ -28,14 +31,7 @@ onMounted(async () => {
 });
 
 function formatDateTime(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return formatInTimezone(iso, uiStore.displayTimezone);
 }
 
 async function respond(response: string) {

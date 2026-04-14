@@ -2,6 +2,8 @@
 import { ref, computed } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
+import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 
@@ -11,6 +13,7 @@ const emit = defineEmits<{
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
+const uiStore = useUiStore();
 const event = calendarStore.selectedEvent!;
 
 const editing = ref(false);
@@ -46,33 +49,18 @@ const calendarInfo = computed(() => {
   };
 });
 
-// Edit form state — convert UTC to local timezone
+// Edit form state — convert UTC to display timezone
 const editTitle = ref(event.title);
-const _startLocal = new Date(event.start_time);
-const _endLocal = new Date(event.end_time);
-function _padD(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-function _padT(d: Date): string {
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-const editStartDate = ref(_padD(_startLocal));
-const editStartTime = ref(_padT(_startLocal));
-const editEndDate = ref(_padD(_endLocal));
-const editEndTime = ref(_padT(_endLocal));
+const editStartDate = ref(getDateInTimezone(event.start_time, uiStore.displayTimezone));
+const editStartTime = ref(toTimeInTimezone(new Date(event.start_time), uiStore.displayTimezone));
+const editEndDate = ref(getDateInTimezone(event.end_time, uiStore.displayTimezone));
+const editEndTime = ref(toTimeInTimezone(new Date(event.end_time), uiStore.displayTimezone));
 const editAllDay = ref(event.all_day);
 const editLocation = ref(event.location || "");
 const editDescription = ref(event.description || "");
 
 function formatDateTime(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return formatInTimezone(iso, uiStore.displayTimezone);
 }
 
 function statusLabel(status: string | null): string {
@@ -112,11 +100,11 @@ async function saveEdit() {
   error.value = null;
   try {
     const startISO = editAllDay.value
-      ? `${editStartDate.value}T00:00:00`
-      : `${editStartDate.value}T${editStartTime.value}:00`;
+      ? `${editStartDate.value}T00:00:00Z`
+      : localInputToUTC(editStartDate.value, editStartTime.value, uiStore.displayTimezone);
     const endISO = editAllDay.value
-      ? `${editEndDate.value}T23:59:59`
-      : `${editEndDate.value}T${editEndTime.value}:00`;
+      ? `${editEndDate.value}T23:59:59Z`
+      : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
 
     // Use the real event ID (strip occurrence suffix for recurring events)
     const realId = event.id.includes("_2") && event.recurrence_rule
@@ -129,10 +117,10 @@ async function saveEdit() {
       title: editTitle.value,
       description: editDescription.value || null,
       location: editLocation.value || null,
-      start_time: new Date(startISO).toISOString(),
-      end_time: new Date(endISO).toISOString(),
+      start_time: startISO,
+      end_time: endISO,
       all_day: editAllDay.value,
-      timezone: null,
+      timezone: uiStore.displayTimezone,
       recurrence_rule: event.recurrence_rule,
       attendees: [],
     });

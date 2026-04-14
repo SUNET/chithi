@@ -2,6 +2,8 @@
 import { ref, computed, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
+import { localInputToUTC } from "@/lib/datetime";
 import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
@@ -17,6 +19,7 @@ const emit = defineEmits<{
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
+const uiStore = useUiStore();
 
 /** Format a Date to local YYYY-MM-DD */
 function toLocalDate(d: Date): string {
@@ -101,11 +104,11 @@ async function save() {
 
   try {
     const startISO = allDay.value
-      ? `${startDate.value}T00:00:00`
-      : `${startDate.value}T${startTime.value}:00`;
+      ? `${startDate.value}T00:00:00Z`
+      : localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
     const endISO = allDay.value
-      ? `${endDate.value}T23:59:59`
-      : `${endDate.value}T${endTime.value}:00`;
+      ? `${endDate.value}T23:59:59Z`
+      : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
     const eventId = await calendarStore.createEvent({
       account_id: accountId,
@@ -113,10 +116,10 @@ async function save() {
       title: title.value,
       description: description.value || null,
       location: location.value || null,
-      start_time: new Date(startISO).toISOString(),
-      end_time: new Date(endISO).toISOString(),
+      start_time: startISO,
+      end_time: endISO,
       all_day: allDay.value,
-      timezone: null,
+      timezone: uiStore.displayTimezone,
       recurrence_rule: recurrenceRule.value,
       attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
     });
