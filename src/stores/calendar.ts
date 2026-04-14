@@ -125,13 +125,16 @@ export const useCalendarStore = defineStore("calendar", () => {
     if (accountsStore.accounts.length === 0) {
       await accountsStore.fetchAccounts();
     }
-    for (const account of accountsStore.accounts) {
-      try {
-        await api.syncCalendars(account.id);
-      } catch (e) {
-        console.error("Calendar sync failed for", account.id, e);
-      }
-    }
+    // Sync all accounts in parallel so a hanging account doesn't block others.
+    // Each backend sync_calendars emits "calendar-changed" when done, which
+    // triggers fetchCalendars + fetchEvents via the event listener.
+    await Promise.allSettled(
+      accountsStore.accounts.map((account) =>
+        api.syncCalendars(account.id).catch((e) => {
+          console.error("Calendar sync failed for", account.id, e);
+        }),
+      ),
+    );
     await fetchCalendars();
     await fetchEvents();
   }
