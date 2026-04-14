@@ -52,6 +52,8 @@ export function getMinutesInTimezone(iso: string, timezone: string): number {
  * Used for bucketing events into calendar days.
  */
 export function getDateInTimezone(iso: string, timezone: string): string {
+  // Date-only strings (all-day events) should not be shifted by timezone
+  if (!iso.includes("T")) return iso.split("T")[0] || iso;
   const date = new Date(iso);
   if (isNaN(date.getTime())) return iso.split("T")[0] || iso;
   return date.toLocaleDateString("sv-SE", { timeZone: timezone });

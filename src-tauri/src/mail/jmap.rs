@@ -846,7 +846,7 @@ impl JmapConnection {
                     "accountId": self.account_id,
                     "properties": ["id", "calendarIds", "title", "description",
                                    "start", "duration", "showWithoutTime",
-                                   "recurrenceRules", "uid", "locations",
+                                   "timeZone", "recurrenceRules", "uid", "locations",
                                    "participants", "@type"]
                 }, "g1"]
             ]

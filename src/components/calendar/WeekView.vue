@@ -74,7 +74,8 @@ function formatHour(hour: number): string {
 }
 
 function isToday(date: Date): boolean {
-  return date.toDateString() === now.value.toDateString();
+  return getDateInTimezone(date.toISOString(), uiStore.displayTimezone) ===
+    getDateInTimezone(now.value.toISOString(), uiStore.displayTimezone);
 }
 
 function isWeekend(date: Date): boolean {

@@ -2064,7 +2064,7 @@ pub async fn send_invites(
         None, // Use email as organizer name — display_name is the account label, not a person's name
         &attendees,
         event.recurrence_rule.as_deref(),
-        event.timezone.as_deref(),
+        if event.all_day { None } else { event.timezone.as_deref() },
     );
 
     let subject = format!("Invitation: {}", event.title);

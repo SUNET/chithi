@@ -33,9 +33,8 @@ export const useUiStore = defineStore("ui", () => {
   );
 
   // Display timezone
-  const displayTimezone = ref<string>(
-    localStorage.getItem("chithi-display-timezone") || "UTC",
-  );
+  const _storedTz = localStorage.getItem("chithi-display-timezone");
+  const displayTimezone = ref<string>(_storedTz || "UTC");
   const timezoneList = ref<string[]>([]);
 
   function toggleReader() {
@@ -94,7 +93,8 @@ export const useUiStore = defineStore("ui", () => {
       console.error("Failed to load timezones:", e);
     }
 
-    if (!displayTimezone.value) {
+    // Detect OS timezone on first launch (no stored value)
+    if (!_storedTz) {
       try {
         const osTimezone = await api.getDefaultTimezone();
         setDisplayTimezone(osTimezone);

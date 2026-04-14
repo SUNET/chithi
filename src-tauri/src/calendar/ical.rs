@@ -211,14 +211,19 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     if let Some(ref summary) = invite.summary {
         lines.push(format!("SUMMARY:{}", summary));
     }
-    if let Some(ref tz) = invite.timezone {
-        let local_start = crate::mail::caldav::utc_to_local(&invite.dtstart, tz);
-        let local_end = crate::mail::caldav::utc_to_local(&invite.dtend, tz);
-        lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
-        lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+    if !invite.all_day {
+        if let Some(ref tz) = invite.timezone {
+            let local_start = crate::mail::caldav::utc_to_local(&invite.dtstart, tz);
+            let local_end = crate::mail::caldav::utc_to_local(&invite.dtend, tz);
+            lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
+            lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+        } else {
+            lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
+            lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+        }
     } else {
-        lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
-        lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+        lines.push(format!("DTSTART;VALUE=DATE:{}", invite.dtstart.split('T').next().unwrap_or(&invite.dtstart)));
+        lines.push(format!("DTEND;VALUE=DATE:{}", invite.dtend.split('T').next().unwrap_or(&invite.dtend)));
     }
     lines.push(format!("SEQUENCE:{}", invite.sequence));
     lines.push(format!("DTSTAMP:{}", now));

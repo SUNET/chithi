@@ -52,27 +52,36 @@ pub fn to_utc(datetime: &str, tzid: &str) -> String {
                 chrono::NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S")
             {
                 use chrono::TimeZone;
-                if let chrono::LocalResult::Single(local) = tz.from_local_datetime(&naive) {
-                    return local
-                        .with_timezone(&chrono::Utc)
-                        .format("%Y-%m-%dT%H:%M:%SZ")
-                        .to_string();
+                match tz.from_local_datetime(&naive) {
+                    chrono::LocalResult::Single(local) => {
+                        return local
+                            .with_timezone(&chrono::Utc)
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string();
+                    }
+                    chrono::LocalResult::Ambiguous(early, _late) => {
+                        return early
+                            .with_timezone(&chrono::Utc)
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string();
+                    }
+                    chrono::LocalResult::None => {
+                        // DST gap — advance minute by minute to find next valid local time
+                        log::warn!(
+                            "to_utc: datetime {} in {} falls in a DST gap, advancing to next valid time",
+                            dt, tzid
+                        );
+                        for mins in 1..=120 {
+                            let shifted = naive + chrono::Duration::minutes(mins);
+                            if let chrono::LocalResult::Single(local) = tz.from_local_datetime(&shifted) {
+                                return local
+                                    .with_timezone(&chrono::Utc)
+                                    .format("%Y-%m-%dT%H:%M:%SZ")
+                                    .to_string();
+                            }
+                        }
+                    }
                 }
-                // Ambiguous (DST fall-back) — pick the earlier one
-                if let chrono::LocalResult::Ambiguous(early, _late) =
-                    tz.from_local_datetime(&naive)
-                {
-                    return early
-                        .with_timezone(&chrono::Utc)
-                        .format("%Y-%m-%dT%H:%M:%SZ")
-                        .to_string();
-                }
-                // None (DST gap) — the time doesn't exist; push forward
-                log::warn!(
-                    "to_utc: datetime {} in {} falls in a DST gap, treating as UTC",
-                    dt,
-                    tzid
-                );
             }
         } else {
             log::warn!("to_utc: unrecognized timezone '{}', treating as UTC", tzid);

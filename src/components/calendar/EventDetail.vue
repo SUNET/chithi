@@ -120,7 +120,7 @@ async function saveEdit() {
       start_time: startISO,
       end_time: endISO,
       all_day: editAllDay.value,
-      timezone: uiStore.displayTimezone,
+      timezone: event.timezone,
       recurrence_rule: event.recurrence_rule,
       attendees: [],
     });
