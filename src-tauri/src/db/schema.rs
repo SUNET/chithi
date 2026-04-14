@@ -278,6 +278,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add is_subscribed column to calendars if it doesn't exist
+    let has_is_subscribed: bool = conn
+        .prepare("SELECT is_subscribed FROM calendars LIMIT 0")
+        .is_ok();
+    if !has_is_subscribed {
+        log::info!("Migration: adding is_subscribed column to calendars table");
+        conn.execute_batch(
+            "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+
     // Add uid_next column to folders for IMAP preflight sync optimization
     let has_uid_next: bool = conn
         .prepare("SELECT uid_next FROM folders LIMIT 0")
