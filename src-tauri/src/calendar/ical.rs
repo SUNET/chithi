@@ -211,8 +211,15 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     if let Some(ref summary) = invite.summary {
         lines.push(format!("SUMMARY:{}", summary));
     }
-    lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
-    lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+    if let Some(ref tz) = invite.timezone {
+        let local_start = crate::mail::caldav::utc_to_local(&invite.dtstart, tz);
+        let local_end = crate::mail::caldav::utc_to_local(&invite.dtend, tz);
+        lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
+        lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+    } else {
+        lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
+        lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+    }
     lines.push(format!("SEQUENCE:{}", invite.sequence));
     lines.push(format!("DTSTAMP:{}", now));
     lines.push("END:VEVENT".to_string());
@@ -233,6 +240,7 @@ pub fn generate_invite(
     organizer_name: Option<&str>,
     attendees: &[Attendee],
     recurrence_rule: Option<&str>,
+    timezone: Option<&str>,
 ) -> String {
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -266,8 +274,15 @@ pub fn generate_invite(
 
     lines.push(format!("UID:{}", uid));
     lines.push(format!("SUMMARY:{}", summary));
-    lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
-    lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
+    if let Some(tz) = timezone {
+        let local_start = crate::mail::caldav::utc_to_local(dtstart, tz);
+        let local_end = crate::mail::caldav::utc_to_local(dtend, tz);
+        lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
+        lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+    } else {
+        lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
+        lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
+    }
 
     if let Some(loc) = location {
         lines.push(format!("LOCATION:{}", loc));
@@ -728,6 +743,7 @@ END:VCALENDAR";
             Some("Alice"),
             &attendees,
             None,
+            None,
         );
 
         assert!(ical.contains("METHOD:REQUEST"));
@@ -760,6 +776,7 @@ END:VCALENDAR";
             None,
             &attendees,
             None,
+            None,
         );
 
         let parsed = parse_ical_data(&ical);
@@ -787,6 +804,7 @@ END:VCALENDAR";
             None, // No organizer name
             &[],
             None,
+            None,
         );
         assert!(ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
             "Should have ORGANIZER without CN, got: {}", ical);
@@ -804,6 +822,7 @@ END:VCALENDAR";
             "kushal@civilized.systems",
             Some("Kushal Das"),
             &[],
+            None,
             None,
         );
         assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@civilized.systems"));
