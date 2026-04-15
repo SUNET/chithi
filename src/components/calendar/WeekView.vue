@@ -490,10 +490,10 @@ onUnmounted(() => {
             @click.stop="emit('eventClick', seg.event.id)"
             @mousedown="onEventMouseDown($event, seg)"
           >
+            <span class="event-title">{{ seg.event.title }}</span>
             <span class="event-time">
               {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
             </span>
-            <span class="event-title">{{ seg.event.title }}</span>
           </div>
         </div>
       </div>
@@ -745,7 +745,7 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 /* Scrollbar */
