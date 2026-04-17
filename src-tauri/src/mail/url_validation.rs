@@ -2,15 +2,17 @@ use crate::error::{Error, Result};
 
 /// Reject URLs that would send credentials over cleartext.
 ///
-/// Accepts `https://` URLs, and `http://` only for loopback hosts
-/// (`localhost`, `127.0.0.0/8`, `::1`). Everything else is rejected.
+/// Accepts `https://` URLs. In debug builds, `http://` is permitted for
+/// loopback hosts (`localhost`, `127.0.0.0/8`, `::1`) to support local
+/// development against test servers. Release builds reject all cleartext
+/// URLs unconditionally.
 pub fn require_https(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url)
         .map_err(|e| Error::Other(format!("Invalid URL '{}': {}", url, e)))?;
 
     match parsed.scheme() {
         "https" => Ok(()),
-        "http" if is_loopback_host(parsed.host_str()) => Ok(()),
+        "http" if cfg!(debug_assertions) && is_loopback_host(parsed.host_str()) => Ok(()),
         scheme => Err(Error::Other(format!(
             "URL must use https:// (got '{}'): {}",
             scheme, url
