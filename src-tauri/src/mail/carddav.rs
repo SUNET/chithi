@@ -86,6 +86,7 @@ impl CardDavClient {
             log::info!("carddav: no URL configured, attempting auto-discovery");
             auto_discover(&http, &auth, email).await?
         } else {
+            crate::mail::url_validation::require_https(carddav_url)?;
             carddav_url.to_string()
         };
 
@@ -294,6 +295,7 @@ async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> R
                         final_url.host_str().unwrap_or(domain),
                         final_url.path().trim_end_matches('/')
                     );
+                    crate::mail::url_validation::require_https(&discovered)?;
                     log::info!("carddav: auto-discovered URL: {}", discovered);
                     return Ok(discovered);
                 }
@@ -511,6 +513,27 @@ pub fn generate_vcard(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_rejects_http_url() {
+        let msg = match CardDavClient::connect(
+            "http://example.com/dav/",
+            "u",
+            "p",
+            "u@example.com",
+        )
+        .await
+        {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+}
 
 #[cfg(test)]
 mod tests {

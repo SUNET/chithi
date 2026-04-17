@@ -42,6 +42,32 @@ pub struct JmapConfig {
     pub oidc_client_id: String,
 }
 
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn http_config() -> JmapConfig {
+        JmapConfig {
+            jmap_url: "http://example.com/jmap".into(),
+            email: "u@example.com".into(),
+            username: "u".into(),
+            password: "p".into(),
+            access_token: None,
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_http_url() {
+        let msg = match JmapConnection::connect(&http_config()).await {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+}
+
 impl JmapConfig {
     pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
         Self {
@@ -114,6 +140,7 @@ impl JmapConnection {
         let base_url = if !config.jmap_url.is_empty() {
             let url = config.jmap_url.trim_end_matches('/').to_string();
             let url = url.trim_end_matches("/.well-known/jmap").to_string();
+            crate::mail::url_validation::require_https(&url)?;
             url
         } else {
             // Auto-discover

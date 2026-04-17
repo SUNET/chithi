@@ -25,6 +25,36 @@ pub struct CalDavConfig {
     pub email: String, // Used for domain extraction during auto-discovery
 }
 
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn err_msg<T>(r: Result<T>) -> String {
+        match r {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_http_url() {
+        let cfg = CalDavConfig {
+            caldav_url: "http://example.com/dav/".into(),
+            username: "u".into(),
+            password: "p".into(),
+            email: "u@example.com".into(),
+        };
+        let msg = err_msg(CalDavClient::connect(&cfg).await);
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn connect_with_token_rejects_http_url() {
+        let msg = err_msg(CalDavClient::connect_with_token("http://example.com/dav/", "tok").await);
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+}
+
 /// A CalDAV client that holds an HTTP client and connection details.
 pub struct CalDavClient {
     http: reqwest::Client,
@@ -90,6 +120,7 @@ impl CalDavClient {
             log::info!("caldav: no URL configured, attempting auto-discovery");
             Self::auto_discover(&http, &auth, &config.email).await?
         } else {
+            crate::mail::url_validation::require_https(&config.caldav_url)?;
             config.caldav_url.clone()
         };
 
@@ -100,6 +131,8 @@ impl CalDavClient {
 
     /// Create a CalDAV client with OAuth2 bearer token authentication.
     pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
+        crate::mail::url_validation::require_https(caldav_url)?;
+
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
@@ -171,6 +204,7 @@ impl CalDavClient {
                             final_url.host_str().unwrap_or(domain),
                             final_url.path().trim_end_matches('/')
                         );
+                        crate::mail::url_validation::require_https(&discovered)?;
                         log::info!("caldav: auto-discovered URL: {}", discovered);
                         return Ok(discovered);
                     }
