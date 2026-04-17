@@ -2,6 +2,14 @@
 import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
+import {
+  getHourInTimezone,
+  getMinutesInTimezone,
+  getDateInTimezone,
+  formatInTimezone,
+  startOfDayUTC,
+  endOfDayUTC,
+} from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 
@@ -66,7 +74,8 @@ function formatHour(hour: number): string {
 }
 
 function isToday(date: Date): boolean {
-  return date.toDateString() === now.value.toDateString();
+  return getDateInTimezone(date.toISOString(), uiStore.displayTimezone) ===
+    getDateInTimezone(now.value.toISOString(), uiStore.displayTimezone);
 }
 
 function isWeekend(date: Date): boolean {
@@ -81,12 +90,16 @@ function isWeekend(date: Date): boolean {
 
 function isCurrentHour(hour: number): boolean {
   const todayVisible = days.value.some((d) => isToday(d));
-  return todayVisible && now.value.getHours() === hour;
+  return todayVisible && getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) === hour;
 }
 
 // Minutes past the hour as percentage (0-100) for positioning the time line
 function currentMinutePercent(): string {
-  return `${(now.value.getMinutes() / 60) * 100}%`;
+  const minutes = parseInt(
+    now.value.toLocaleString("en-US", { minute: "numeric", timeZone: uiStore.displayTimezone }),
+    10,
+  );
+  return `${(minutes / 60) * 100}%`;
 }
 
 // A display segment represents one day's portion of an event.
@@ -102,11 +115,11 @@ const segmentsByDayHour = computed(() => {
   const map = new Map<string, EventSegment[]>();
 
   for (const day of days.value) {
-    const dayStart = new Date(day);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(day);
-    dayEnd.setHours(23, 59, 59, 999);
-    const dayStr = day.toISOString().split("T")[0];
+    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayStart = new Date(dayStartMs);
+    const dayEnd = new Date(dayEndMs);
 
     for (const e of calendarStore.visibleEvents) {
       const eStart = new Date(e.start_time);
@@ -116,7 +129,7 @@ const segmentsByDayHour = computed(() => {
 
       const segStart = eStart < dayStart ? dayStart : eStart;
       const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd;
-      const key = `${dayStr}:${segStart.getHours()}`;
+      const key = `${dayStr}:${getHourInTimezone(segStart.toISOString(), uiStore.displayTimezone)}`;
       const list = map.get(key) || [];
       list.push({ event: e, segStart, segEnd });
       map.set(key, list);
@@ -126,7 +139,7 @@ const segmentsByDayHour = computed(() => {
 });
 
 function getEventsForDayHour(date: Date, hour: number): EventSegment[] {
-  const key = `${date.toISOString().split("T")[0]}:${hour}`;
+  const key = `${getDateInTimezone(date.toISOString(), uiStore.displayTimezone)}:${hour}`;
   return segmentsByDayHour.value.get(key) || [];
 }
 
@@ -143,11 +156,11 @@ const overlapLayout = computed(() => {
   const layout = new Map<string, OverlapInfo>();
 
   for (const day of days.value) {
-    const dayStart = new Date(day);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(day);
-    dayEnd.setHours(23, 59, 59, 999);
-    const dayStr = day.toISOString().split("T")[0];
+    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
+    const dayStart = new Date(dayStartMs);
+    const dayEnd = new Date(dayEndMs);
 
     // Collect all timed events for this day
     const dayEvents: { id: string; key: string; start: number; end: number }[] = [];
@@ -222,10 +235,10 @@ const overlapLayout = computed(() => {
 function eventBlockStyle(seg: EventSegment): Record<string, string> {
   const durationMs = seg.segEnd.getTime() - seg.segStart.getTime();
   const durationHours = Math.max(durationMs / (60 * 60 * 1000), 0.25);
-  const topOffset = (seg.segStart.getMinutes() / 60) * HOUR_HEIGHT;
+  const topOffset = (getMinutesInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone) / 60) * HOUR_HEIGHT;
   const height = durationHours * HOUR_HEIGHT;
 
-  const dayStr = seg.segStart.toISOString().split("T")[0];
+  const dayStr = getDateInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
   const ol = overlapLayout.value.get(`${dayStr}:${seg.event.id}`);
   const col = ol?.column ?? 0;
   const totalCols = ol?.totalColumns ?? 1;
@@ -396,7 +409,7 @@ onMounted(async () => {
   await nextTick();
   if (gridRef.value) {
     const hourHeight = HOUR_HEIGHT;
-    const scrollToHour = Math.max(now.value.getHours() - 2, 0);
+    const scrollToHour = Math.max(getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) - 2, 0);
     gridRef.value.scrollTop = hourHeight * scrollToHour;
   }
 });
@@ -477,10 +490,10 @@ onUnmounted(() => {
             @click.stop="emit('eventClick', seg.event.id)"
             @mousedown="onEventMouseDown($event, seg)"
           >
-            <span class="event-time">
-              {{ seg.segStart.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }}
-            </span>
             <span class="event-title">{{ seg.event.title }}</span>
+            <span class="event-time">
+              {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
+            </span>
           </div>
         </div>
       </div>
@@ -732,7 +745,7 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 /* Scrollbar */

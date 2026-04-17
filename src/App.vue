@@ -23,6 +23,7 @@ const isStandaloneWindow = computed(
 onMounted(async () => {
   uiStore.initTheme();
   uiStore.initDecorations();
+  await uiStore.initTimezone();
   activityStore.initEventListeners();
   // Load accounts globally so all views (Calendar, Contacts, etc.) have them
   await accountsStore.fetchAccounts();

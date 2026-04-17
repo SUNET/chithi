@@ -2,6 +2,8 @@
 import { ref, computed, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
+import { localInputToUTC, toDateInTimezone, toTimeInTimezone } from "@/lib/datetime";
 import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
@@ -17,21 +19,7 @@ const emit = defineEmits<{
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
-
-/** Format a Date to local YYYY-MM-DD */
-function toLocalDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-/** Format a Date to local HH:MM */
-function toLocalTime(d: Date): string {
-  const h = String(d.getHours()).padStart(2, "0");
-  const min = String(d.getMinutes()).padStart(2, "0");
-  return `${h}:${min}`;
-}
+const uiStore = useUiStore();
 
 const defaultStart = props.initialStart
   ? new Date(props.initialStart)
@@ -39,10 +27,10 @@ const defaultStart = props.initialStart
 const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 
 const title = ref("");
-const startDate = ref(toLocalDate(defaultStart));
-const startTime = ref(toLocalTime(defaultStart));
-const endDate = ref(toLocalDate(defaultEnd));
-const endTime = ref(toLocalTime(defaultEnd));
+const startDate = ref(toDateInTimezone(defaultStart, uiStore.displayTimezone));
+const startTime = ref(toTimeInTimezone(defaultStart, uiStore.displayTimezone));
+const endDate = ref(toDateInTimezone(defaultEnd, uiStore.displayTimezone));
+const endTime = ref(toTimeInTimezone(defaultEnd, uiStore.displayTimezone));
 
 /** Minimum end date: cannot be before start date */
 const minEndDate = computed(() => startDate.value);
@@ -57,12 +45,12 @@ const minEndTime = computed(() => {
 
 // When start moves past end, push end forward
 watch([startDate, startTime], () => {
-  const s = new Date(`${startDate.value}T${startTime.value}:00`);
-  const e = new Date(`${endDate.value}T${endTime.value}:00`);
-  if (e <= s) {
-    const newEnd = new Date(s.getTime() + 60 * 60 * 1000);
-    endDate.value = toLocalDate(newEnd);
-    endTime.value = toLocalTime(newEnd);
+  const sISO = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
+  const eISO = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
+  if (new Date(eISO) <= new Date(sISO)) {
+    const newEnd = new Date(new Date(sISO).getTime() + 60 * 60 * 1000);
+    endDate.value = toDateInTimezone(newEnd, uiStore.displayTimezone);
+    endTime.value = toTimeInTimezone(newEnd, uiStore.displayTimezone);
   }
 });
 const allDay = ref(false);
@@ -85,9 +73,9 @@ async function save() {
   }
 
   if (!allDay.value) {
-    const s = new Date(`${startDate.value}T${startTime.value}:00`);
-    const e = new Date(`${endDate.value}T${endTime.value}:00`);
-    if (e <= s) {
+    const sUTC = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
+    const eUTC = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
+    if (new Date(eUTC) <= new Date(sUTC)) {
       error.value = "End time must be after start time";
       return;
     }
@@ -101,11 +89,11 @@ async function save() {
 
   try {
     const startISO = allDay.value
-      ? `${startDate.value}T00:00:00`
-      : `${startDate.value}T${startTime.value}:00`;
+      ? `${startDate.value}T00:00:00Z`
+      : localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
     const endISO = allDay.value
-      ? `${endDate.value}T23:59:59`
-      : `${endDate.value}T${endTime.value}:00`;
+      ? `${endDate.value}T23:59:59Z`
+      : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
     const eventId = await calendarStore.createEvent({
       account_id: accountId,
@@ -113,10 +101,10 @@ async function save() {
       title: title.value,
       description: description.value || null,
       location: location.value || null,
-      start_time: new Date(startISO).toISOString(),
-      end_time: new Date(endISO).toISOString(),
+      start_time: startISO,
+      end_time: endISO,
       all_day: allDay.value,
-      timezone: null,
+      timezone: uiStore.displayTimezone,
       recurrence_rule: recurrenceRule.value,
       attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
     });

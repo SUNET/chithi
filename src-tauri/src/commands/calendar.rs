@@ -361,6 +361,7 @@ pub async fn create_event(
                 start: cal_event.start_time.clone(),
                 end: cal_event.end_time.clone(),
                 all_day: cal_event.all_day,
+                timezone: cal_event.timezone.clone(),
                 recurrence_rule: cal_event.recurrence_rule.clone(),
                 uid: cal_event.uid.clone(),
                 organizer_email: cal_event.organizer_email.clone(),
@@ -745,7 +746,7 @@ async fn sync_calendars_jmap(
                 start_time: ev.start.clone(),
                 end_time: ev.end.clone(),
                 all_day: ev.all_day,
-                timezone: None,
+                timezone: ev.timezone.clone(),
                 recurrence_rule: ev.recurrence_rule.clone(),
                 organizer_email: ev.organizer_email.clone(),
                 attendees_json: ev.attendees_json.clone(),
@@ -822,6 +823,7 @@ async fn sync_calendars_jmap(
                     start: ev.start_time.clone(),
                     end: ev.end_time.clone(),
                     all_day: ev.all_day,
+                    timezone: ev.timezone.clone(),
                     recurrence_rule: ev.recurrence_rule.clone(),
                     uid: ev.uid.clone(),
                     organizer_email: ev.organizer_email.clone(),
@@ -1007,18 +1009,20 @@ async fn sync_calendars_google(
                 let location = ev["location"].as_str().map(|s| s.to_string());
 
                 // Parse start/end — can be date (all-day) or dateTime
+                let start_tz = ev["start"]["timeZone"].as_str().map(|s| s.to_string());
                 let (start_time, all_day) = if let Some(dt) = ev["start"]["dateTime"].as_str() {
-                    (dt.to_string(), false)
+                    (crate::calendar::timezone::to_utc(dt, start_tz.as_deref().unwrap_or("")), false)
                 } else if let Some(d) = ev["start"]["date"].as_str() {
-                    (format!("{}T00:00:00Z", d), true)
+                    (d.to_string(), true)
                 } else {
                     continue;
                 };
 
                 let end_time = if let Some(dt) = ev["end"]["dateTime"].as_str() {
-                    dt.to_string()
+                    let end_tz = ev["end"]["timeZone"].as_str().unwrap_or("");
+                    crate::calendar::timezone::to_utc(dt, end_tz)
                 } else if let Some(d) = ev["end"]["date"].as_str() {
-                    format!("{}T23:59:59Z", d)
+                    d.to_string()
                 } else {
                     start_time.clone()
                 };
@@ -1037,7 +1041,7 @@ async fn sync_calendars_google(
                     start_time,
                     end_time,
                     all_day,
-                    timezone: None,
+                    timezone: start_tz,
                     recurrence_rule: None,
                     organizer_email,
                     attendees_json: None,
@@ -1349,6 +1353,7 @@ async fn sync_calendars_caldav(
                         &ev.start_time,
                         &ev.end_time,
                         ev.all_day,
+                        ev.timezone.as_deref(),
                     )
                 });
 
@@ -2059,6 +2064,7 @@ pub async fn send_invites(
         None, // Use email as organizer name — display_name is the account label, not a person's name
         &attendees,
         event.recurrence_rule.as_deref(),
+        if event.all_day { None } else { event.timezone.as_deref() },
     );
 
     let subject = format!("Invitation: {}", event.title);
@@ -2573,7 +2579,7 @@ async fn sync_calendars_graph(
                 conn.execute(
                     "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                      all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                     description = ?8 WHERE id = ?9",
+                     description = ?8, timezone = ?9 WHERE id = ?10",
                     rusqlite::params![
                         ge.subject,
                         ge.start,
@@ -2583,6 +2589,7 @@ async fn sync_calendars_graph(
                         ge.organizer_email,
                         ge.attendees_json,
                         ge.body_preview,
+                        ge.timezone,
                         local_id,
                     ],
                 ).ok();
@@ -2600,7 +2607,7 @@ async fn sync_calendars_graph(
                     start_time: ge.start.clone(),
                     end_time: ge.end.clone(),
                     all_day: ge.all_day,
-                    timezone: None,
+                    timezone: ge.timezone.clone(),
                     recurrence_rule: None,
                     organizer_email: ge.organizer_email.clone(),
                     attendees_json: ge.attendees_json.clone(),
@@ -2639,4 +2646,21 @@ async fn sync_calendars_graph(
 
     log::info!("sync_calendars_graph: completed for account {}", account_id);
     Ok(())
+}
+
+/// Return all IANA timezone names from the chrono-tz database.
+#[tauri::command]
+pub fn list_timezones() -> Vec<String> {
+    let mut tzs: Vec<String> = chrono_tz::TZ_VARIANTS
+        .iter()
+        .map(|tz| tz.name().to_string())
+        .collect();
+    tzs.sort();
+    tzs
+}
+
+/// Return the OS timezone, falling back to "UTC".
+#[tauri::command]
+pub fn get_default_timezone() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
 }

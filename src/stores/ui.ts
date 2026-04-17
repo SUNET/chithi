@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import * as api from "@/lib/tauri";
 
 export type MessageViewMode = "right" | "bottom" | "tab";
 export type Theme = "dark" | "light";
@@ -30,6 +31,11 @@ export const useUiStore = defineStore("ui", () => {
       return VALID_WEEK_STARTS.includes(stored) ? stored : 0;
     })(),
   );
+
+  // Display timezone
+  const _storedTz = localStorage.getItem("chithi-display-timezone");
+  const displayTimezone = ref<string>(_storedTz || "UTC");
+  const timezoneList = ref<string[]>([]);
 
   function toggleReader() {
     readerVisible.value = !readerVisible.value;
@@ -71,6 +77,33 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-week-start-day", String(day));
   }
 
+  function setDisplayTimezone(tz: string) {
+    if (timezoneList.value.length > 0 && !timezoneList.value.includes(tz)) {
+      console.warn(`setDisplayTimezone: unknown timezone '${tz}', ignoring`);
+      return;
+    }
+    displayTimezone.value = tz;
+    localStorage.setItem("chithi-display-timezone", tz);
+  }
+
+  async function initTimezone() {
+    try {
+      timezoneList.value = await api.listTimezones();
+    } catch (e) {
+      console.error("Failed to load timezones:", e);
+    }
+
+    // Detect OS timezone on first launch (no stored value)
+    if (!_storedTz) {
+      try {
+        const osTimezone = await api.getDefaultTimezone();
+        setDisplayTimezone(osTimezone);
+      } catch {
+        setDisplayTimezone("UTC");
+      }
+    }
+  }
+
   function initTheme() {
     document.documentElement.setAttribute("data-theme", theme.value);
   }
@@ -109,5 +142,9 @@ export const useUiStore = defineStore("ui", () => {
     toggleOperationsPanel,
     weekStartDay,
     setWeekStartDay,
+    displayTimezone,
+    timezoneList,
+    setDisplayTimezone,
+    initTimezone,
   };
 });

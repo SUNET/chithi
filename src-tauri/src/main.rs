@@ -99,6 +99,8 @@ fn main() {
             commands::calendar::process_cancelled_invite,
             commands::calendar::unsubscribe_calendar,
             commands::calendar::sync_calendars,
+            commands::calendar::list_timezones,
+            commands::calendar::get_default_timezone,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -211,8 +211,20 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     if let Some(ref summary) = invite.summary {
         lines.push(format!("SUMMARY:{}", summary));
     }
-    lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
-    lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+    if !invite.all_day {
+        if let Some(ref tz) = invite.timezone {
+            let local_start = crate::mail::caldav::utc_to_local(&invite.dtstart, tz);
+            let local_end = crate::mail::caldav::utc_to_local(&invite.dtend, tz);
+            lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
+            lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+        } else {
+            lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
+            lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
+        }
+    } else {
+        lines.push(format!("DTSTART;VALUE=DATE:{}", invite.dtstart.split('T').next().unwrap_or(&invite.dtstart)));
+        lines.push(format!("DTEND;VALUE=DATE:{}", invite.dtend.split('T').next().unwrap_or(&invite.dtend)));
+    }
     lines.push(format!("SEQUENCE:{}", invite.sequence));
     lines.push(format!("DTSTAMP:{}", now));
     lines.push("END:VEVENT".to_string());
@@ -233,6 +245,7 @@ pub fn generate_invite(
     organizer_name: Option<&str>,
     attendees: &[Attendee],
     recurrence_rule: Option<&str>,
+    timezone: Option<&str>,
 ) -> String {
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -266,8 +279,15 @@ pub fn generate_invite(
 
     lines.push(format!("UID:{}", uid));
     lines.push(format!("SUMMARY:{}", summary));
-    lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
-    lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
+    if let Some(tz) = timezone {
+        let local_start = crate::mail::caldav::utc_to_local(dtstart, tz);
+        let local_end = crate::mail::caldav::utc_to_local(dtend, tz);
+        lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
+        lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+    } else {
+        lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
+        lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
+    }
 
     if let Some(loc) = location {
         lines.push(format!("LOCATION:{}", loc));
@@ -346,35 +366,31 @@ fn parse_dt_property(
 /// - `20250415` (DATE, all-day) -> `2025-04-15`
 /// - `20250415T100000` (local datetime) -> `2025-04-15T10:00:00`
 /// - `20250415T100000Z` (UTC datetime) -> `2025-04-15T10:00:00Z`
-fn ical_datetime_to_iso(val: &str, all_day: bool, _tzid: Option<&str>) -> String {
+fn ical_datetime_to_iso(val: &str, all_day: bool, tzid: Option<&str>) -> String {
     let val = val.trim();
 
     if all_day && val.len() >= 8 {
-        // DATE format: YYYYMMDD
-        return format!(
-            "{}-{}-{}",
-            &val[0..4],
-            &val[4..6],
-            &val[6..8]
-        );
+        return format!("{}-{}-{}", &val[0..4], &val[4..6], &val[6..8]);
     }
 
-    // DATETIME format: YYYYMMDDTHHmmss or YYYYMMDDTHHmmssZ
     if val.len() >= 15 {
         let utc_suffix = if val.ends_with('Z') { "Z" } else { "" };
-        return format!(
+        let iso = format!(
             "{}-{}-{}T{}:{}:{}{}",
-            &val[0..4],
-            &val[4..6],
-            &val[6..8],
-            &val[9..11],
-            &val[11..13],
-            &val[13..15],
+            &val[0..4], &val[4..6], &val[6..8],
+            &val[9..11], &val[11..13], &val[13..15],
             utc_suffix,
         );
+
+        // If there's a TZID and the time isn't already UTC, convert to UTC
+        if !val.ends_with('Z') {
+            let tz_str = tzid.unwrap_or("");
+            return crate::calendar::timezone::to_utc(&iso, tz_str);
+        }
+
+        return iso;
     }
 
-    // Fallback: return as-is
     val.to_string()
 }
 
@@ -522,7 +538,7 @@ mod tests {
     fn test_ical_datetime_to_iso_local() {
         assert_eq!(
             ical_datetime_to_iso("20260407T170000", false, None),
-            "2026-04-07T17:00:00"
+            "2026-04-07T17:00:00Z"
         );
     }
 
@@ -531,6 +547,22 @@ mod tests {
         assert_eq!(
             ical_datetime_to_iso("20260407", true, None),
             "2026-04-07"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_with_tzid() {
+        assert_eq!(
+            ical_datetime_to_iso("20260414T140000", false, Some("Europe/Stockholm")),
+            "2026-04-14T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_ical_datetime_to_iso_utc_ignores_tzid() {
+        assert_eq!(
+            ical_datetime_to_iso("20260414T120000Z", false, Some("Europe/Stockholm")),
+            "2026-04-14T12:00:00Z"
         );
     }
 
@@ -716,6 +748,7 @@ END:VCALENDAR";
             Some("Alice"),
             &attendees,
             None,
+            None,
         );
 
         assert!(ical.contains("METHOD:REQUEST"));
@@ -748,6 +781,7 @@ END:VCALENDAR";
             None,
             &attendees,
             None,
+            None,
         );
 
         let parsed = parse_ical_data(&ical);
@@ -775,6 +809,7 @@ END:VCALENDAR";
             None, // No organizer name
             &[],
             None,
+            None,
         );
         assert!(ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
             "Should have ORGANIZER without CN, got: {}", ical);
@@ -792,6 +827,7 @@ END:VCALENDAR";
             "kushal@civilized.systems",
             Some("Kushal Das"),
             &[],
+            None,
             None,
         );
         assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@civilized.systems"));

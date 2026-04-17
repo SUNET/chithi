@@ -496,3 +496,11 @@ export async function jmapOidcComplete(
     clientId,
   });
 }
+
+export async function listTimezones(): Promise<string[]> {
+  return invoke("list_timezones");
+}
+
+export async function getDefaultTimezone(): Promise<string> {
+  return invoke("get_default_timezone");
+}

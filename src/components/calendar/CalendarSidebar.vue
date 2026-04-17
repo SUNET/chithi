@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
@@ -91,6 +91,73 @@ async function syncThisCalendar() {
   }
 }
 
+const tzSearch = ref("");
+const tzDropdownOpen = ref(false);
+const tzHighlightIndex = ref(-1);
+const tzDropdownRef = ref<HTMLElement | null>(null);
+
+const filteredTimezones = computed(() => {
+  const query = tzSearch.value.toLowerCase();
+  if (!query) return uiStore.timezoneList;
+  return uiStore.timezoneList.filter((tz: string) => tz.toLowerCase().includes(query));
+});
+
+function selectTimezone(tz: string) {
+  uiStore.setDisplayTimezone(tz);
+  tzSearch.value = "";
+  tzDropdownOpen.value = false;
+  tzHighlightIndex.value = -1;
+}
+
+function onTzInput(e: Event) {
+  tzSearch.value = (e.target as HTMLInputElement).value;
+  tzHighlightIndex.value = 0;
+}
+
+function onTzInputFocus() {
+  tzDropdownOpen.value = true;
+  tzSearch.value = "";
+  tzHighlightIndex.value = -1;
+}
+
+function onTzInputBlur() {
+  setTimeout(() => {
+    tzDropdownOpen.value = false;
+    tzSearch.value = "";
+    tzHighlightIndex.value = -1;
+  }, 200);
+}
+
+function onTzKeydown(e: KeyboardEvent) {
+  if (!tzDropdownOpen.value) return;
+  const list = filteredTimezones.value;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    tzHighlightIndex.value = Math.min(tzHighlightIndex.value + 1, list.length - 1);
+    scrollHighlightedIntoView();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    tzHighlightIndex.value = Math.max(tzHighlightIndex.value - 1, 0);
+    scrollHighlightedIntoView();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (tzHighlightIndex.value >= 0 && tzHighlightIndex.value < list.length) {
+      selectTimezone(list[tzHighlightIndex.value]);
+      (e.target as HTMLInputElement)?.blur();
+    }
+  } else if (e.key === "Escape") {
+    tzDropdownOpen.value = false;
+    (e.target as HTMLInputElement)?.blur();
+  }
+}
+
+function scrollHighlightedIntoView() {
+  nextTick(() => {
+    const el = tzDropdownRef.value?.querySelector(".tz-option.highlighted");
+    if (el) el.scrollIntoView({ block: "nearest" });
+  });
+}
+
 async function unsubscribeThisCalendar() {
   if (!contextMenu.value) return;
   const calendarId = contextMenu.value.calendarId;
@@ -159,6 +226,56 @@ async function unsubscribeThisCalendar() {
           :data-testid="`week-start-${opt.day}`"
           @click="uiStore.setWeekStartDay(opt.day)"
         >{{ opt.label }}</button>
+      </div>
+    </div>
+
+    <div class="timezone-section">
+      <div class="section-header">Use timezone</div>
+      <div class="timezone-picker">
+        <input
+          type="text"
+          class="tz-search-input"
+          :placeholder="uiStore.displayTimezone"
+          :value="tzDropdownOpen ? tzSearch : ''"
+          @input="onTzInput($event)"
+          @focus="onTzInputFocus"
+          @blur="onTzInputBlur"
+          @keydown="onTzKeydown"
+          aria-label="Display timezone"
+          role="combobox"
+          :aria-expanded="tzDropdownOpen"
+          aria-controls="tz-listbox"
+          aria-autocomplete="list"
+          :aria-activedescendant="tzHighlightIndex >= 0 ? `tz-opt-${tzHighlightIndex}` : undefined"
+          data-testid="timezone-search"
+        />
+        <div
+          v-if="tzDropdownOpen"
+          ref="tzDropdownRef"
+          id="tz-listbox"
+          role="listbox"
+          aria-label="Timezones"
+          class="tz-dropdown"
+          data-testid="timezone-dropdown"
+        >
+          <button
+            v-for="(tz, idx) in filteredTimezones"
+            :key="tz"
+            :id="`tz-opt-${idx}`"
+            role="option"
+            :aria-selected="tz === uiStore.displayTimezone"
+            class="tz-option"
+            :class="{ active: tz === uiStore.displayTimezone, highlighted: idx === tzHighlightIndex }"
+            @mousedown.prevent="selectTimezone(tz)"
+            @mouseenter="tzHighlightIndex = idx"
+            :data-testid="`timezone-option-${tz}`"
+          >
+            {{ tz }}
+          </button>
+          <div v-if="filteredTimezones.length === 0" class="tz-empty">
+            No matching timezones
+          </div>
+        </div>
       </div>
     </div>
 
@@ -311,6 +428,81 @@ async function unsubscribeThisCalendar() {
 .week-start-btn.active {
   color: var(--color-accent);
   font-weight: 600;
+}
+
+.timezone-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.timezone-picker {
+  position: relative;
+  padding: 0 4px;
+}
+
+.tz-search-input {
+  width: 100%;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  outline: none;
+  box-sizing: border-box;
+}
+
+.tz-search-input:focus {
+  border-color: var(--color-accent);
+}
+
+.tz-search-input::placeholder {
+  color: var(--color-text-secondary);
+}
+
+.tz-dropdown {
+  position: absolute;
+  bottom: 100%;
+  left: 4px;
+  right: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  margin-bottom: 2px;
+  z-index: 50;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.tz-option {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.tz-option:hover,
+.tz-option.highlighted {
+  background: var(--color-bg-hover);
+}
+
+.tz-option.active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.tz-empty {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  text-align: center;
 }
 </style>
 
