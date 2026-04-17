@@ -289,10 +289,15 @@ async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> R
                 let status = resp.status();
                 let final_url = resp.url().clone();
                 if status.is_success() || status.as_u16() == 207 {
+                    let port_str = final_url
+                        .port()
+                        .map(|p| format!(":{}", p))
+                        .unwrap_or_default();
                     let discovered = format!(
-                        "{}://{}{}",
+                        "{}://{}{}{}",
                         final_url.scheme(),
                         final_url.host_str().unwrap_or(domain),
+                        port_str,
                         final_url.path().trim_end_matches('/')
                     );
                     crate::mail::url_validation::require_https(&discovered)?;
