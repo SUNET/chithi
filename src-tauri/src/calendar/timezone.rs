@@ -1,7 +1,7 @@
-/// Timezone conversion utilities for calendar events.
-///
-/// All calendar events are stored with UTC times. This module handles
-/// converting provider-specific datetime+timezone pairs to UTC.
+//! Timezone conversion utilities for calendar events.
+//!
+//! All calendar events are stored with UTC times. This module handles
+//! converting provider-specific datetime+timezone pairs to UTC.
 
 /// Convert a datetime string to UTC given an IANA timezone identifier.
 ///
