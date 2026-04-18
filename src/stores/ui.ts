@@ -147,6 +147,23 @@ export const useUiStore = defineStore("ui", () => {
     operationsPanelOpen.value = !operationsPanelOpen.value;
   }
 
+  // Mobile chrome state — used by MobileShell and friends.
+  const composeOpen = ref(false);
+  const drawerOpen = ref(false);
+
+  function openCompose() {
+    composeOpen.value = true;
+  }
+  function closeCompose() {
+    composeOpen.value = false;
+  }
+  function openDrawer() {
+    drawerOpen.value = true;
+  }
+  function closeDrawer() {
+    drawerOpen.value = false;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -175,5 +192,11 @@ export const useUiStore = defineStore("ui", () => {
     timeFormat,
     hour12,
     setTimeFormat,
+    composeOpen,
+    drawerOpen,
+    openCompose,
+    closeCompose,
+    openDrawer,
+    closeDrawer,
   };
 });

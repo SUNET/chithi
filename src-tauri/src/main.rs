@@ -33,6 +33,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_os::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::accounts::list_accounts,

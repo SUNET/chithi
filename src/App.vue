@@ -1,31 +1,26 @@
 <script setup lang="ts">
-import { onMounted, computed } from "vue";
-import { useRoute } from "vue-router";
-import Sidebar from "@/components/common/Sidebar.vue";
-import MenuBar from "@/components/common/MenuBar.vue";
-import StatusBar from "@/components/common/StatusBar.vue";
-import OperationsPanel from "@/components/common/OperationsPanel.vue";
+import { onMounted } from "vue";
+import { storeToRefs } from "pinia";
+import DesktopShell from "@/components/shell/DesktopShell.vue";
+import MobileShell from "@/components/shell/MobileShell.vue";
 import ToastContainer from "@/components/common/ToastContainer.vue";
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
+import { usePlatformStore } from "@/stores/platform";
 
-const route = useRoute();
 const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
+const platformStore = usePlatformStore();
 
-// Compose and reader windows are standalone — hide the main app chrome
-const isStandaloneWindow = computed(
-  () => route.name === "compose" || route.name === "reader",
-);
+const { isMobile } = storeToRefs(platformStore);
 
 onMounted(async () => {
   uiStore.initTheme();
   uiStore.initDecorations();
   await uiStore.initTimezone();
   activityStore.initEventListeners();
-  // Load accounts globally so all views (Calendar, Contacts, etc.) have them
   await accountsStore.fetchAccounts();
 
   // Zoom with Ctrl+/Ctrl- (WebKitGTK doesn't support zoomHotkeysEnabled)
@@ -50,57 +45,15 @@ onMounted(async () => {
 </script>
 
 <template>
-  <!-- Compose / reader: standalone, no sidebar/menubar/statusbar -->
-  <div v-if="isStandaloneWindow" class="standalone-shell">
-    <router-view />
+  <div :data-layout="isMobile ? 'mobile' : 'desktop'" class="chrome-root">
+    <DesktopShell v-if="!isMobile" />
+    <MobileShell v-else />
   </div>
-
-  <!-- Main app shell -->
-  <div v-else class="app-shell">
-    <Sidebar />
-    <div class="app-main">
-      <MenuBar />
-      <main class="app-content">
-        <router-view v-slot="{ Component }">
-          <!-- Only CalendarView is kept alive — its WeekView subtree is
-               the heavy one (see #72) and cold-mount is ~400ms. Other
-               views (ContactsView, FiltersView, SettingsView, MailView)
-               rely on onMounted/onUnmounted for listener and interval
-               cleanup, so caching them would leak background work. -->
-          <KeepAlive include="CalendarView">
-            <component :is="Component" />
-          </KeepAlive>
-        </router-view>
-      </main>
-      <OperationsPanel />
-      <StatusBar />
-    </div>
-  </div>
-
   <ToastContainer />
 </template>
 
 <style scoped>
-.app-shell {
-  display: flex;
-  height: 100vh;
-  width: 100vw;
-  overflow: hidden;
-}
-
-.app-main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.app-content {
-  flex: 1;
-  overflow: hidden;
-}
-
-.standalone-shell {
+.chrome-root {
   height: 100vh;
   width: 100vw;
   overflow: hidden;

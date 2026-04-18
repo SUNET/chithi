@@ -84,6 +84,18 @@
     Oxygen, Ubuntu, sans-serif;
   --font-mono: "Liberation Mono", "SF Mono", "Fira Code", Menlo, Consolas,
     monospace;
+
+  /* Touch / mobile */
+  --touch-min: 44px;
+  --mobile-app-bar-h: 56px;
+  --mobile-tab-bar-h: 56px;
+  --mobile-tab-bar-h-android: 64px;
+
+  --radius-sheet: 16px;
+  --radius-card-mobile: 12px;
+  --shadow-fab: 0 8px 20px rgba(181, 71, 8, 0.35),
+    0 2px 4px rgba(181, 71, 8, 0.25);
+  --shadow-sheet: 0 -12px 30px rgba(30, 20, 10, 0.18);
 }
 
 /* === Dark theme (from Figma design tokens) === */
@@ -165,4 +177,14 @@ textarea,
 select {
   font: inherit;
   color: inherit;
+}
+
+/* === Mobile overrides (<= 720px) === */
+@media (max-width: 720px) {
+  body {
+    font-size: 15px;
+  }
+  .desktop-only {
+    display: none !important;
+  }
 }

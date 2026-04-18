@@ -12,6 +12,7 @@
     "core:window:allow-set-decorations",
     "notification:default",
     "shell:allow-open",
-    "dialog:allow-message"
+    "dialog:allow-message",
+    "os:allow-platform"
   ]
 }
