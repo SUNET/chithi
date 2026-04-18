@@ -776,8 +776,21 @@ pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
         .map_err(|e| Error::Other(format!("Token serialize failed: {}", e)))?;
     let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
         .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
-    entry.set_password(&json)
-        .map_err(|e| Error::Keyring(format!("Failed to store tokens: {}", e)))?;
+    if let Err(first) = entry.set_password(&json) {
+        // Secret Service backends (gnome-keyring on Linux) can return
+        // "Object does not exist at path …" when their in-memory item
+        // registry is desynced from disk after a daemon crash/restart:
+        // SearchItems resolves a stale path and the SetSecret on it fails.
+        // Drop the stale credential and retry once with a fresh CreateItem.
+        log::warn!(
+            "OAuth2: keyring set_password failed for {} ({}); attempting recovery",
+            account_id, first,
+        );
+        let _ = entry.delete_credential();
+        entry.set_password(&json).map_err(|e| {
+            Error::Keyring(format!("Failed to store tokens (after recovery): {}", e))
+        })?;
+    }
     log::info!("OAuth2: tokens stored in keyring for account {}", account_id);
     Ok(())
 }
