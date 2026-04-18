@@ -1,5 +1,6 @@
 pub mod caldav;
 pub mod carddav;
+pub mod dav_http;
 pub mod graph;
 pub mod idle;
 pub mod imap;

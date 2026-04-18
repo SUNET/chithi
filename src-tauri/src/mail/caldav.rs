@@ -149,12 +149,7 @@ impl CalDavClient {
     /// Create a new CalDAV client. If `caldav_url` is empty, attempt
     /// auto-discovery via `.well-known/caldav`.
     pub async fn connect(config: &CalDavConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
+        let http = crate::mail::dav_http::build_client()?;
 
         let auth = DavAuth::Basic {
             username: config.username.clone(),
@@ -178,12 +173,7 @@ impl CalDavClient {
     pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
         crate::mail::url_validation::require_https(caldav_url)?;
 
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
+        let http = crate::mail::dav_http::build_client()?;
 
         let auth = DavAuth::Bearer { token: token.to_string() };
 

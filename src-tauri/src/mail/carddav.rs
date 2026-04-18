@@ -72,12 +72,7 @@ impl CardDavClient {
         password: &str,
         email: &str,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+        let http = crate::mail::dav_http::build_client()?;
 
         let auth = DavAuth::Basic {
             username: username.to_string(),
