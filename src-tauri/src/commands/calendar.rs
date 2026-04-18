@@ -1547,7 +1547,7 @@ pub async fn get_email_invites(
     }
 
     // Read the raw message from disk (maildir_path is relative to data_dir)
-    let full_path = state.data_dir.join(&maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
     log::debug!("get_email_invites: reading from {}", full_path.display());
     let raw = std::fs::read(&full_path).map_err(|e| {
         crate::error::Error::Other(format!(
@@ -1606,7 +1606,7 @@ pub async fn respond_to_invite(
             ));
         }
 
-        let full_path = state.data_dir.join(&maildir_path);
+        let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
         let raw = std::fs::read(&full_path).map_err(|e| {
             crate::error::Error::Other(format!(
                 "Failed to read message file '{}': {}",
@@ -2322,8 +2322,8 @@ pub async fn process_invite_reply(
         let conn = state.db.writer().await;
         let (maildir_path, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
-        let data_dir = state.data_dir.clone();
-        std::fs::read(data_dir.join(maildir_path))
+        let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
+        std::fs::read(&full_path)
             .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
     };
 
@@ -2452,8 +2452,8 @@ pub async fn process_cancelled_invite(
         let conn = state.db.reader();
         let (maildir_path, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
-        let data_dir = state.data_dir.clone();
-        std::fs::read(data_dir.join(maildir_path))
+        let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
+        std::fs::read(&full_path)
             .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
     };
 
@@ -2526,6 +2526,20 @@ pub fn auto_process_calendar_emails(
     // Uses only the reader connection (no writer lock needed yet).
     let mut all_invites: Vec<ParsedInvite> = Vec::new();
 
+    // Canonicalise the base once for the whole loop; individual paths are
+    // still validated per-iteration against this canonical base.
+    let canonical_data_dir = match std::fs::canonicalize(data_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "auto_process_calendar_emails: cannot canonicalise data dir {}: {}",
+                data_dir.display(),
+                e
+            );
+            return;
+        }
+    };
+
     for msg_id in new_message_ids {
         let maildir_path = {
             let conn = db.reader();
@@ -2539,7 +2553,22 @@ pub fn auto_process_calendar_emails(
             continue; // Body not fetched yet
         }
 
-        let raw = match std::fs::read(data_dir.join(&maildir_path)) {
+        let full_path = match crate::path_validation::resolve_under_canonical(
+            &canonical_data_dir,
+            &maildir_path,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "auto_process_calendar_emails: rejecting maildir path for msg {}: {}",
+                    msg_id,
+                    e
+                );
+                continue;
+            }
+        };
+
+        let raw = match std::fs::read(&full_path) {
             Ok(data) => data,
             Err(_) => continue,
         };

@@ -245,7 +245,7 @@ pub async fn get_message_body(
     };
 
     // Read and parse the message from disk
-    let full_path = state.data_dir.join(&actual_maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &actual_maildir_path)?;
     log::debug!("Reading message from {}", full_path.display());
     let raw = std::fs::read(&full_path).map_err(|e| {
         log::error!("Failed to read message file {}: {}", full_path.display(), e);
@@ -294,7 +294,7 @@ pub async fn get_message_html_with_images(
         ));
     }
 
-    let full_path = state.data_dir.join(&maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
     let raw = std::fs::read(&full_path)
         .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 
@@ -733,7 +733,7 @@ pub async fn save_attachment(
     }
 
     // Extract attachment bytes first, before showing dialog
-    let full_path = state.data_dir.join(&maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
     let raw = std::fs::read(&full_path)
         .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 

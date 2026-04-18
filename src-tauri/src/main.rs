@@ -13,6 +13,7 @@ mod logging;
 mod mail;
 mod oauth;
 mod ops;
+mod path_validation;
 mod state;
 
 use state::AppState;
