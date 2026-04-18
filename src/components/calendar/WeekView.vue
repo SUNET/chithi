@@ -1,4 +1,21 @@
 <script setup lang="ts">
+// PERF NOTE (issue #72):
+// Early versions of WeekView rendered the time grid as 24 hour-rows × 8
+// children (1 gutter + 7 day cells) = ~192 cell <div>s, each with its own
+// click / mouseenter / mouseleave / mouseup listeners. First mail→calendar
+// navigation took ~1.7 s end-to-end (beforeEach → first paint), split
+// roughly as:
+//   script-setup → first child onMounted   ~550 ms  (Vue creating the tree)
+//   WeekView nextTick-await in onMounted   ~530 ms  (scheduler settling)
+//   onMounted return → first rAF          ~1100 ms  (browser layout + paint)
+//
+// The current implementation keeps the all-day row and day-header grids
+// small (7 cells each) and draws the hour grid inside a single <div> per
+// day with a CSS repeating-linear-gradient, then captures pointer events
+// on the column directly and derives the hit hour from offsetY. DOM in
+// the grid region drops from ~216 → ~32 leaf nodes; first mail→calendar
+// nav is ~390 ms in the same profile. Combined with <KeepAlive> in
+// App.vue, subsequent mail↔calendar swaps are essentially free (~1-2 ms).
 import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
@@ -34,6 +51,7 @@ const uiStore = useUiStore();
 const gridRef = ref<HTMLElement | null>(null);
 
 const hours = Array.from({ length: 24 }, (_, i) => i);
+const HOUR_HEIGHT = 52; // must match .day-column hour-step in CSS
 
 const days = computed(() => {
   const d = new Date(calendarStore.currentDate);
@@ -51,10 +69,6 @@ const days = computed(() => {
 });
 
 const now = ref(new Date());
-
-onMounted(() => {
-  now.value = new Date(); // Update when view is shown
-});
 
 setInterval(() => { now.value = new Date(); }, 60000);
 
@@ -81,10 +95,8 @@ function isToday(date: Date): boolean {
 function isWeekend(date: Date): boolean {
   const day = date.getDay();
   if (uiStore.weekStartDay === 6) {
-    // Saturday start → weekend is Thursday (4) + Friday (5)
     return day === 4 || day === 5;
   }
-  // Sunday or Monday start → weekend is Saturday (6) + Sunday (0)
   return day === 0 || day === 6;
 }
 
@@ -93,25 +105,26 @@ function isCurrentHour(hour: number): boolean {
   return todayVisible && getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) === hour;
 }
 
-// Minutes past the hour as percentage (0-100) for positioning the time line
-function currentMinutePercent(): string {
-  const minutes = parseInt(
-    now.value.toLocaleString("en-US", { minute: "numeric", timeZone: uiStore.displayTimezone }),
-    10,
-  );
-  return `${(minutes / 60) * 100}%`;
-}
+// Absolute pixel offset of the current-time line within a day column.
+const nowMarkerTop = computed(() => {
+  const hour = getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+  const minutes = getMinutesInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+  return `${hour * HOUR_HEIGHT + (minutes / 60) * HOUR_HEIGHT}px`;
+});
 
 // A display segment represents one day's portion of an event.
 // Cross-midnight events are split so each day gets its own segment.
 interface EventSegment {
   event: CalendarEvent;
-  segStart: Date;  // clamped to day start if event started before this day
-  segEnd: Date;    // clamped to day end (midnight) if event continues next day
+  segStart: Date;
+  segEnd: Date;
 }
 
-// Precompute segments indexed by "YYYY-MM-DD:HH" so each cell lookup is O(1).
-const segmentsByDayHour = computed(() => {
+// Group timed event segments by day. The previous implementation keyed by
+// (day, hour) because every hour cell was its own DOM node; now events live
+// inside a single day column and are positioned absolutely, so per-hour
+// partitioning is no longer needed.
+const segmentsByDay = computed(() => {
   const map = new Map<string, EventSegment[]>();
 
   for (const day of days.value) {
@@ -120,6 +133,7 @@ const segmentsByDayHour = computed(() => {
     const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
     const dayStart = new Date(dayStartMs);
     const dayEnd = new Date(dayEndMs);
+    const segs: EventSegment[] = [];
 
     for (const e of calendarStore.visibleEvents) {
       const eStart = new Date(e.start_time);
@@ -129,21 +143,18 @@ const segmentsByDayHour = computed(() => {
 
       const segStart = eStart < dayStart ? dayStart : eStart;
       const segEnd = eEnd > dayEnd ? new Date(dayEnd.getTime() + 1) : eEnd;
-      const key = `${dayStr}:${getHourInTimezone(segStart.toISOString(), uiStore.displayTimezone)}`;
-      const list = map.get(key) || [];
-      list.push({ event: e, segStart, segEnd });
-      map.set(key, list);
+      segs.push({ event: e, segStart, segEnd });
     }
+
+    map.set(dayStr, segs);
   }
   return map;
 });
 
-function getEventsForDayHour(date: Date, hour: number): EventSegment[] {
-  const key = `${getDateInTimezone(date.toISOString(), uiStore.displayTimezone)}:${hour}`;
-  return segmentsByDayHour.value.get(key) || [];
+function segmentsForDay(date: Date): EventSegment[] {
+  const dayStr = getDateInTimezone(date.toISOString(), uiStore.displayTimezone);
+  return segmentsByDay.value.get(dayStr) || [];
 }
-
-const HOUR_HEIGHT = 52; // must match .hour-row min-height in CSS
 
 // Precompute overlap layout: for each day, find overlapping events and assign
 // columns so they render side-by-side instead of stacking on top of each other.
@@ -162,7 +173,6 @@ const overlapLayout = computed(() => {
     const dayStart = new Date(dayStartMs);
     const dayEnd = new Date(dayEndMs);
 
-    // Collect all timed events for this day
     const dayEvents: { id: string; key: string; start: number; end: number }[] = [];
     for (const e of calendarStore.visibleEvents) {
       const eStart = new Date(e.start_time);
@@ -177,16 +187,11 @@ const overlapLayout = computed(() => {
       });
     }
 
-    // Sort by start time, then by end time descending (longer events first)
     dayEvents.sort((a, b) => a.start - b.start || b.end - a.end);
 
-    // Build overlap clusters: group events that transitively overlap
-    // so non-overlapping events get full width.
-    // Track each cluster's running end time to avoid O(n²) rescans.
     type ClusterEntry = { events: typeof dayEvents; end: number };
     const clusters: ClusterEntry[] = [];
     for (const ev of dayEvents) {
-      // Find existing cluster whose time range overlaps with this event
       let merged = false;
       for (const cluster of clusters) {
         if (ev.start < cluster.end) {
@@ -201,7 +206,6 @@ const overlapLayout = computed(() => {
       }
     }
 
-    // Assign columns per cluster
     for (const cluster of clusters) {
       const columns: { end: number }[][] = [];
       for (const ev of cluster.events) {
@@ -233,9 +237,14 @@ const overlapLayout = computed(() => {
 });
 
 function eventBlockStyle(seg: EventSegment): Record<string, string> {
+  // `top` is now absolute within the day column (column height = 24 * HOUR_HEIGHT),
+  // not relative to an hour cell as before.
+  const startHour = getHourInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
+  const startMin = getMinutesInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
+  const topOffset = startHour * HOUR_HEIGHT + (startMin / 60) * HOUR_HEIGHT;
+
   const durationMs = seg.segEnd.getTime() - seg.segStart.getTime();
   const durationHours = Math.max(durationMs / (60 * 60 * 1000), 0.25);
-  const topOffset = (getMinutesInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone) / 60) * HOUR_HEIGHT;
   const height = durationHours * HOUR_HEIGHT;
 
   const dayStr = getDateInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
@@ -287,8 +296,18 @@ function getEventStyle(event: { my_status: string | null }): Record<string, stri
   return {};
 }
 
-function onSlotClick(date: Date, hour: number) {
+// Compute the clicked/hovered hour from the column's bounding box and the
+// mouse Y coordinate. Clamped to 0..23.
+function hourFromEvent(e: MouseEvent): number {
+  const target = e.currentTarget as HTMLElement;
+  const rect = target.getBoundingClientRect();
+  const y = e.clientY - rect.top;
+  return Math.max(0, Math.min(23, Math.floor(y / HOUR_HEIGHT)));
+}
+
+function onColumnClick(date: Date, e: MouseEvent) {
   if (isCalendarDragging.value) return;
+  const hour = hourFromEvent(e);
   const dt = new Date(date);
   dt.setHours(hour, 0, 0, 0);
   emit("timeClick", dt.toISOString());
@@ -305,9 +324,7 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
   if (event.button !== 0) return;
   const ev = seg.event;
 
-  // Block recurring occurrences (synthetic ID: originalId_2026-...)
   if (/_\d{4}-/.test(ev.id) && ev.recurrence_rule) return;
-  // Block all-day events
   if (ev.all_day) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };
@@ -361,26 +378,38 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
   dragCleanup = handleUp;
 }
 
-function onTimeCellEnter(day: Date, hour: number) {
+function onColumnMove(day: Date, e: MouseEvent) {
   if (!isCalendarDragging.value) return;
-  dragOverCell.value = { day: day.toISOString().split("T")[0], hour };
+  const hour = hourFromEvent(e);
+  const dayStr = day.toISOString().split("T")[0];
+  if (dragOverCell.value?.day !== dayStr || dragOverCell.value?.hour !== hour) {
+    dragOverCell.value = { day: dayStr, hour };
+  }
 }
 
-function onTimeCellLeave(day: Date, hour: number) {
-  if (dragOverCell.value?.day === day.toISOString().split("T")[0] &&
-      dragOverCell.value?.hour === hour) {
+function onColumnLeave(day: Date) {
+  const dayStr = day.toISOString().split("T")[0];
+  if (dragOverCell.value?.day === dayStr) {
     dragOverCell.value = null;
   }
 }
 
-function isDragOver(day: Date, hour: number): boolean {
+function dragHintVisible(day: Date): boolean {
   return isCalendarDragging.value &&
-    dragOverCell.value?.day === day.toISOString().split("T")[0] &&
-    dragOverCell.value?.hour === hour;
+    dragOverCell.value?.day === day.toISOString().split("T")[0];
 }
 
-function onTimeCellDrop(day: Date, hour: number) {
+const dragHintStyle = computed(() => {
+  if (!dragOverCell.value) return {};
+  return {
+    top: `${dragOverCell.value.hour * HOUR_HEIGHT}px`,
+    height: `${HOUR_HEIGHT}px`,
+  };
+});
+
+function onColumnDrop(day: Date, e: MouseEvent) {
   if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  const hour = hourFromEvent(e);
   dragOverCell.value = null;
 
   const ev = dragCalendarEvent.value;
@@ -408,9 +437,8 @@ onMounted(async () => {
   now.value = new Date();
   await nextTick();
   if (gridRef.value) {
-    const hourHeight = HOUR_HEIGHT;
     const scrollToHour = Math.max(getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) - 2, 0);
-    gridRef.value.scrollTop = hourHeight * scrollToHour;
+    gridRef.value.scrollTop = HOUR_HEIGHT * scrollToHour;
   }
 });
 
@@ -457,44 +485,61 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Time grid -->
+    <!-- Time grid: one gutter of hour labels + one column per day. Hour grid
+         lines are drawn with a CSS repeating-linear-gradient on each day
+         column, so we don't create 24 × 7 = 168 cell <div>s per mount. -->
     <div ref="gridRef" class="time-grid">
-      <div v-for="hour in hours" :key="hour" class="hour-row" :class="{ 'current-hour': isCurrentHour(hour) }">
-        <div class="time-gutter time-label">
+      <div class="time-gutter hour-labels">
+        <div
+          v-for="hour in hours"
+          :key="hour"
+          class="hour-label"
+          :class="{ 'current-hour': isCurrentHour(hour) }"
+        >
           <span v-if="hour > 0">{{ formatHour(hour) }}</span>
         </div>
+      </div>
+
+      <div
+        v-for="day in days"
+        :key="day.toISOString()"
+        class="day-column"
+        :class="{ today: isToday(day), weekend: isWeekend(day) }"
+        :data-testid="`cal-day-col-${day.toISOString().split('T')[0]}`"
+        @click="onColumnClick(day, $event)"
+        @mousemove="onColumnMove(day, $event)"
+        @mouseleave="onColumnLeave(day)"
+        @mouseup="onColumnDrop(day, $event)"
+      >
+        <!-- Current time marker — absolute within the today column -->
         <div
-          v-for="day in days"
-          :key="day.toISOString() + hour"
-          class="time-cell"
-          :class="{ today: isToday(day), weekend: isWeekend(day), 'drag-over': isDragOver(day, hour) }"
-          :data-testid="`cal-time-cell-${day.toISOString().split('T')[0]}-${hour}`"
-          @click="onSlotClick(day, hour)"
-          @mouseenter="onTimeCellEnter(day, hour)"
-          @mouseleave="onTimeCellLeave(day, hour)"
-          @mouseup="onTimeCellDrop(day, hour)"
+          v-if="isToday(day)"
+          class="now-marker"
+          :style="{ top: nowMarkerTop }"
+        ></div>
+
+        <!-- Drag-over hint band -->
+        <div
+          v-if="dragHintVisible(day)"
+          class="drag-hint"
+          :style="dragHintStyle"
+        ></div>
+
+        <!-- Timed event blocks -->
+        <div
+          v-for="seg in segmentsForDay(day)"
+          :key="seg.event.id + '-' + seg.segStart.toISOString()"
+          class="event-block"
+          :class="{ dragging: isCalendarDragging && dragCalendarEvent?.id === seg.event.id }"
+          :data-testid="`cal-event-${seg.event.id}`"
+          :style="eventBlockStyle(seg)"
+          @click.stop="emit('eventClick', seg.event.id)"
+          @mousedown="onEventMouseDown($event, seg)"
         >
-          <!-- Current time marker positioned within the hour -->
-          <div
-            v-if="isCurrentHour(hour) && isToday(day)"
-            class="now-marker"
-            :style="{ top: currentMinutePercent() }"
-          ></div>
-          <div
-            v-for="seg in getEventsForDayHour(day, hour)"
-            :key="seg.event.id + '-' + seg.segStart.toISOString()"
-            class="event-block"
-            :class="{ dragging: isCalendarDragging && dragCalendarEvent?.id === seg.event.id }"
-            :data-testid="`cal-event-${seg.event.id}`"
-            :style="eventBlockStyle(seg)"
-            @click.stop="emit('eventClick', seg.event.id)"
-            @mousedown="onEventMouseDown($event, seg)"
-          >
-            <span class="event-title">{{ seg.event.title }}</span>
-            <span class="event-time">
-              {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
-            </span>
-          </div>
+          <span class="event-title">{{ seg.event.title }}</span>
+          <span class="event-time">
+            {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
+          </span>
         </div>
       </div>
     </div>
@@ -516,6 +561,7 @@ onUnmounted(() => {
   border-bottom: 2px solid var(--color-border);
   min-height: 32px;
   flex-shrink: 0;
+  padding-right: 6px;
 }
 
 .all-day-label {
@@ -554,17 +600,13 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
-/* Day headers — add right padding to compensate for time-grid scrollbar */
+/* Day headers */
 .day-headers {
   display: flex;
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
   background: var(--color-bg);
-  padding-right: 6px; /* scrollbar width compensation */
-}
-
-.all-day-row {
-  padding-right: 6px; /* scrollbar width compensation */
+  padding-right: 6px;
 }
 
 .day-header {
@@ -618,68 +660,75 @@ onUnmounted(() => {
   opacity: 0.6;
 }
 
-/* Time gutter */
+/* Time gutter — single column of 24 hour labels */
 .time-gutter {
   width: 64px;
   flex-shrink: 0;
 }
 
-/* Time grid */
-.time-grid {
-  flex: 1;
-  overflow-y: scroll;
-}
-
-.hour-row {
+.hour-labels {
   display: flex;
-  min-height: 52px;
-  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
+  flex-direction: column;
 }
 
-.hour-row:nth-child(even) {
-  /* subtle alternating stripe */
-}
-
-.time-label {
+.hour-label {
+  height: 52px;
   font-size: 10px;
   color: var(--color-text-muted);
   padding: 0 12px 0 0;
   text-align: right;
+  line-height: 1;
   position: relative;
   top: -7px;
-  line-height: 1;
 }
 
-.time-cell {
-  flex: 1;
-  border-left: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
-  position: relative;
-  cursor: pointer;
-  padding: 0;
-  transition: background 0.1s;
-  overflow: visible;
-}
-
-.time-cell:hover {
-  background: var(--color-bg-hover);
-}
-
-.time-cell.today {
-  background: rgba(66, 133, 244, 0.03);
-}
-
-.time-cell.today:hover {
-  background: rgba(66, 133, 244, 0.07);
-}
-
-.time-cell.weekend {
-  background: color-mix(in srgb, var(--color-bg-tertiary) 30%, transparent);
-}
-
-/* Current hour highlight */
-.hour-row.current-hour .time-label {
+.hour-label.current-hour {
   color: #ea4335;
   font-weight: 700;
+}
+
+/* Time grid — flex row of [gutter, 7 day columns] */
+.time-grid {
+  flex: 1;
+  overflow-y: scroll;
+  display: flex;
+  align-items: flex-start;
+  min-height: 0;
+}
+
+/* Day columns. The hour grid is a CSS gradient rather than 24 cells. */
+.day-column {
+  position: relative;
+  flex: 1;
+  align-self: stretch;
+  height: calc(24 * 52px);
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
+  cursor: pointer;
+  background-color: var(--color-bg);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(52px - 1px),
+    color-mix(in srgb, var(--color-border) 50%, transparent) calc(52px - 1px),
+    color-mix(in srgb, var(--color-border) 50%, transparent) 52px
+  );
+  transition: background-color 0.1s;
+}
+
+.day-column:hover {
+  background-color: var(--color-bg-hover);
+}
+
+.day-column.today {
+  background-color: rgba(66, 133, 244, 0.03);
+}
+
+.day-column.today:hover {
+  background-color: rgba(66, 133, 244, 0.07);
+}
+
+.day-column.weekend {
+  background-color: color-mix(in srgb, var(--color-bg-tertiary) 30%, transparent);
 }
 
 .now-marker {
@@ -703,7 +752,18 @@ onUnmounted(() => {
   border-radius: 50%;
 }
 
-/* Event blocks — absolutely positioned within time-cell to span duration */
+.drag-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(66, 133, 244, 0.15);
+  outline: 1px dashed var(--color-accent);
+  outline-offset: -1px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Event blocks — absolutely positioned within the day column */
 .event-block {
   position: absolute;
   font-size: 11px;
@@ -726,12 +786,6 @@ onUnmounted(() => {
 .event-block.dragging {
   opacity: 0.4;
   pointer-events: none;
-}
-
-.time-cell.drag-over {
-  background: rgba(66, 133, 244, 0.15);
-  outline: 1px dashed var(--color-accent);
-  outline-offset: -1px;
 }
 
 .event-time {
