@@ -434,11 +434,17 @@ pub async fn move_messages_cross_account(
     }
 
     // Resolve and validate all maildir paths before starting the transfer.
-    // Rejects non-disk entries (graph: prefix), absolute paths, and ".." segments.
+    // Rejects non-disk entries (graph: prefix); delegates absolute/`..`/
+    // escape checks to crate::path_validation::resolve_under_canonical.
     let data_dir = state.data_dir.clone();
     let validated_paths: Vec<std::path::PathBuf> = {
-        let canonical_data_dir =
-            std::fs::canonicalize(&data_dir).unwrap_or_else(|_| data_dir.clone());
+        let canonical_data_dir = std::fs::canonicalize(&data_dir).map_err(|e| {
+            Error::Other(format!(
+                "Failed to resolve data directory {}: {}",
+                data_dir.display(),
+                e
+            ))
+        })?;
         let mut paths = Vec::with_capacity(maildir_paths.len());
         for (msg_id, maildir_path) in &maildir_paths {
             if maildir_path.starts_with("graph:") {
@@ -448,31 +454,14 @@ pub async fn move_messages_cross_account(
                     msg_id
                 )));
             }
-            let rel = std::path::Path::new(maildir_path);
-            if rel.is_absolute()
-                || rel
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(Error::Other(format!(
-                    "Invalid maildir path for message {}: '{}'",
-                    msg_id, maildir_path
-                )));
-            }
-            let full_path = data_dir.join(maildir_path);
-            let canonical = std::fs::canonicalize(&full_path).map_err(|e| {
-                Error::Other(format!(
-                    "Failed to resolve maildir file {}: {}",
-                    full_path.display(),
-                    e
-                ))
-            })?;
-            if !canonical.starts_with(&canonical_data_dir) {
-                return Err(Error::Other(format!(
-                    "Path traversal detected for message {}",
-                    msg_id
-                )));
-            }
+            let canonical =
+                crate::path_validation::resolve_under_canonical(&canonical_data_dir, maildir_path)
+                    .map_err(|e| {
+                        Error::Other(format!(
+                            "Invalid maildir path for message {}: {}",
+                            msg_id, e
+                        ))
+                    })?;
             paths.push(canonical);
         }
         paths

@@ -245,7 +245,7 @@ pub async fn get_message_body(
     };
 
     // Read and parse the message from disk
-    let full_path = state.data_dir.join(&actual_maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &actual_maildir_path)?;
     log::debug!("Reading message from {}", full_path.display());
     let raw = std::fs::read(&full_path).map_err(|e| {
         log::error!("Failed to read message file {}: {}", full_path.display(), e);
@@ -294,7 +294,7 @@ pub async fn get_message_html_with_images(
         ));
     }
 
-    let full_path = state.data_dir.join(&maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
     let raw = std::fs::read(&full_path)
         .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 
@@ -733,7 +733,7 @@ pub async fn save_attachment(
     }
 
     // Extract attachment bytes first, before showing dialog
-    let full_path = state.data_dir.join(&maildir_path);
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
     let raw = std::fs::read(&full_path)
         .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 
@@ -748,13 +748,23 @@ pub async fn save_attachment(
 
     let contents = attachment.contents().to_vec();
 
-    // Open the native save dialog from the backend — renderer cannot bypass this
+    // Open the native save dialog from the backend (renderer cannot bypass).
+    // We use the non-blocking callback API and await a oneshot rather than
+    // `blocking_save_file()` because blocking the tokio worker that invoked
+    // this command starves the GTK main thread on Linux, which manifests as
+    // a dialog that opens but never renders its Save button.
     use tauri_plugin_dialog::DialogExt;
-    let dest = app
-        .dialog()
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
         .file()
         .set_file_name(&suggested_filename)
-        .blocking_save_file();
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+
+    let dest = rx
+        .await
+        .map_err(|e| Error::Other(format!("Save dialog closed unexpectedly: {}", e)))?;
 
     let dest = match dest {
         Some(path) => path,
