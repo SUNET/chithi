@@ -87,15 +87,19 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # Some db::accounts tests store/retrieve passwords in the OS keyring,
-      # so they need a D-Bus session with an unlocked gnome-keyring Secret
-      # Service available. `dbus-run-session` gives us a throwaway bus; we
-      # unlock the keyring with an empty password on first use.
+      # so they need a D-Bus session with a usable gnome-keyring Secret
+      # Service. Pattern adapted from keyring-rs' own CI:
+      # - dbus-run-session provides a throwaway session bus.
+      # - Removing ~/.local/share/keyrings forces a fresh login keyring.
+      # - `gnome-keyring-daemon --unlock` with a non-empty password creates
+      #   and unlocks the login keyring; the daemon then registers as the
+      #   default Secret Service collection on the bus.
       - name: cargo test
         working-directory: src-tauri
         run: |
           dbus-run-session -- bash -c '
-            echo -n "" | gnome-keyring-daemon --unlock
-            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
-            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            rm -rf "$HOME/.local/share/keyrings"
+            mkdir -p "$HOME/.local/share/keyrings"
+            echo -n "test" | gnome-keyring-daemon --unlock
             cargo test --locked --all-targets
           '
