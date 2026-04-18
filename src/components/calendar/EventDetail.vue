@@ -434,13 +434,24 @@ async function handleDelete() {
   color: var(--color-text-secondary);
 }
 
+/* Sizing tokens consumed by DateInput / TimeInput so they match the
+   native inputs in this form. See .date-input-trigger / .time-input-text
+   in src/components/common/{DateInput,TimeInput}.vue. */
+.edit-group {
+  --input-height: 28px;
+  --input-padding: 6px 8px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 13px;
+}
+
 .edit-group input,
 .edit-group textarea {
-  padding: 6px 8px;
-  border: 1px solid var(--color-border);
+  padding: var(--input-padding);
+  border: var(--input-border);
   border-radius: 4px;
-  background: var(--color-bg);
-  font-size: 13px;
+  background: var(--input-bg);
+  font-size: var(--input-font-size);
 }
 
 .edit-group textarea { resize: vertical; }

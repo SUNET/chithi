@@ -77,6 +77,10 @@ function belowMin(value: string): boolean {
 
 function onInput(e: Event) {
   displayValue.value = (e.target as HTMLInputElement).value;
+  // Clear the invalid flag as soon as the user is typing again; the real
+  // check happens on blur. Leaving the red outline on while editing is
+  // distracting.
+  invalid.value = false;
 }
 
 function onBlur() {
@@ -88,7 +92,12 @@ function onBlur() {
   }
   const parsed = parse(displayValue.value);
   if (parsed === null || belowMin(parsed)) {
+    // Restore the last known-good display so the field doesn't get stuck
+    // in an invalid state — matches the behavior documented at the top
+    // of the file and in the PR description. Flash the red outline
+    // briefly so the user sees why the value didn't take.
     invalid.value = true;
+    displayValue.value = toDisplay(props.modelValue);
     return;
   }
   invalid.value = false;
@@ -121,7 +130,20 @@ const placeholder = computed(() => {
 </template>
 
 <style scoped>
+/* The parent form styles sizing by setting these custom properties on the
+   enclosing element (see EventForm .form-group, EventDetail .edit-group).
+   The defaults here cover standalone usage / the compact form in
+   RecurrenceEditor. */
 .time-input-text {
+  width: 100%;
+  box-sizing: border-box;
+  height: var(--input-height, 28px);
+  padding: var(--input-padding, 4px 8px);
+  border: var(--input-border, 1px solid var(--color-border));
+  border-radius: 4px;
+  background: var(--input-bg, var(--color-bg));
+  color: var(--color-text);
+  font-size: var(--input-font-size, 13px);
   font-variant-numeric: tabular-nums;
 }
 

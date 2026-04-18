@@ -166,14 +166,14 @@ async function save() {
           <div class="form-group">
             <label>Start</label>
             <div class="datetime-inputs">
-              <DateInput v-model="startDate" testid="event-form-start" />
+              <DateInput v-model="startDate" class="date-input" testid="event-form-start" />
               <TimeInput v-if="!allDay" v-model="startTime" class="time-input" testid="event-form-start-time" />
             </div>
           </div>
           <div class="form-group">
             <label>End</label>
             <div class="datetime-inputs">
-              <DateInput v-model="endDate" :min="minEndDate" testid="event-form-end" />
+              <DateInput v-model="endDate" class="date-input" :min="minEndDate" testid="event-form-end" />
               <TimeInput v-if="!allDay" v-model="endTime" class="time-input" :min="minEndTime" testid="event-form-end-time" />
             </div>
           </div>
@@ -293,16 +293,28 @@ async function save() {
   color: var(--color-text);
 }
 
+/* Sizing tokens consumed by DateInput / TimeInput so they visually match
+   the sibling native <input>/<select> elements. CSS custom properties
+   cross the scoped-styles boundary that :deep would otherwise be needed
+   for. */
+.form-group {
+  --input-height: 36px;
+  --input-padding: 0 12px;
+  --input-border: 0.8px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 16px;
+}
+
 .form-group input,
 .form-group select,
 .form-group textarea {
   width: 100%;
-  height: 36px;
-  padding: 0 12px;
-  border: 0.8px solid var(--color-border);
+  height: var(--input-height);
+  padding: var(--input-padding);
+  border: var(--input-border);
   border-radius: 4px;
-  background: var(--color-bg-secondary);
-  font-size: 16px;
+  background: var(--input-bg);
+  font-size: var(--input-font-size);
 }
 
 .form-group textarea {

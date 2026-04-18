@@ -249,21 +249,27 @@ onUnmounted(() => {
 .date-input-wrap {
   position: relative;
   display: inline-block;
+  width: 100%;
 }
 
+/* Sizing tokens are inherited from the nearest enclosing parent (see
+   EventForm .form-group / EventDetail .edit-group / RecurrenceEditor
+   .recurrence-row). Defaults cover compact/standalone use. */
 .date-input-trigger {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
+  width: 100%;
+  box-sizing: border-box;
+  height: var(--input-height, 28px);
+  padding: var(--input-padding, 4px 8px);
+  background: var(--input-bg, var(--color-bg));
+  border: var(--input-border, 1px solid var(--color-border));
   border-radius: 4px;
   color: var(--color-text);
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--input-font-size, 13px);
   font-variant-numeric: tabular-nums;
-  min-width: 120px;
   transition: background 0.1s, border-color 0.1s;
 }
 

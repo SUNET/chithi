@@ -149,14 +149,22 @@ watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { de
   min-width: 40px;
 }
 
+/* Sizing tokens consumed by DateInput's trigger button. */
+.recurrence-row {
+  --input-height: 24px;
+  --input-padding: 4px 6px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 12px;
+}
+
 .recurrence-row select,
-.num-input,
-.date-input {
-  padding: 4px 6px;
-  border: 1px solid var(--color-border);
+.num-input {
+  padding: var(--input-padding);
+  border: var(--input-border);
   border-radius: 4px;
-  background: var(--color-bg);
-  font-size: 12px;
+  background: var(--input-bg);
+  font-size: var(--input-font-size);
 }
 
 .num-input {
