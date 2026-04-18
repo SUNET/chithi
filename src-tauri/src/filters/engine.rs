@@ -43,7 +43,7 @@ pub fn matches_message(rule: &FilterRule, msg: &MessageData) -> bool {
 /// evaluating further rules.
 pub fn apply_filters(rules: &[FilterRule], msg: &MessageData) -> Vec<FilterAction> {
     let mut sorted: Vec<&FilterRule> = rules.iter().filter(|r| r.enabled).collect();
-    sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
     let mut collected_actions: Vec<FilterAction> = Vec::new();
 
