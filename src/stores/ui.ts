@@ -1,10 +1,11 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "@/lib/tauri";
 
 export type MessageViewMode = "right" | "bottom" | "tab";
 export type Theme = "dark" | "light";
+export type TimeFormat = "auto" | "12" | "24";
 
 export const useUiStore = defineStore("ui", () => {
   const threadingEnabled = ref(
@@ -36,6 +37,25 @@ export const useUiStore = defineStore("ui", () => {
   const _storedTz = localStorage.getItem("chithi-display-timezone");
   const displayTimezone = ref<string>(_storedTz || "UTC");
   const timezoneList = ref<string[]>([]);
+
+  // Time format: "12" (AM/PM), "24" (00-23), or "auto" (follow OS locale).
+  const VALID_TIME_FORMATS: TimeFormat[] = ["auto", "12", "24"];
+  const timeFormat = ref<TimeFormat>(
+    (() => {
+      const stored = localStorage.getItem("chithi-time-format") as TimeFormat | null;
+      return stored && VALID_TIME_FORMATS.includes(stored) ? stored : "auto";
+    })(),
+  );
+
+  // Resolved `hour12` value to pass into Intl.DateTimeFormatOptions. `true`
+  // forces 12-hour, `false` forces 24-hour, `undefined` lets the locale
+  // decide (which is what Intl does by default).
+  const hour12 = computed<boolean | undefined>(() => {
+    if (timeFormat.value === "12") return true;
+    if (timeFormat.value === "24") return false;
+    return undefined;
+  });
+
 
   function toggleReader() {
     readerVisible.value = !readerVisible.value;
@@ -75,6 +95,12 @@ export const useUiStore = defineStore("ui", () => {
     if (!VALID_WEEK_STARTS.includes(day)) return;
     weekStartDay.value = day;
     localStorage.setItem("chithi-week-start-day", String(day));
+  }
+
+  function setTimeFormat(tf: TimeFormat) {
+    if (!VALID_TIME_FORMATS.includes(tf)) return;
+    timeFormat.value = tf;
+    localStorage.setItem("chithi-time-format", tf);
   }
 
   function setDisplayTimezone(tz: string) {
@@ -146,5 +172,8 @@ export const useUiStore = defineStore("ui", () => {
     timezoneList,
     setDisplayTimezone,
     initTimezone,
+    timeFormat,
+    hour12,
+    setTimeFormat,
   };
 });

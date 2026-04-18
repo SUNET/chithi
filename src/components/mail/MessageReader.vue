@@ -6,8 +6,21 @@ import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
+import Select from "@/components/common/Select.vue";
 import { openComposeWindow } from "@/lib/compose-window";
 import * as api from "@/lib/tauri";
+
+const EMAIL_LABEL_OPTIONS = [
+  { value: "work", label: "Work" },
+  { value: "home", label: "Home" },
+  { value: "other", label: "Other" },
+];
+
+const PHONE_LABEL_OPTIONS = [
+  { value: "mobile", label: "Mobile" },
+  { value: "work", label: "Work" },
+  { value: "home", label: "Home" },
+];
 
 defineProps<{
   standalone?: boolean;
@@ -393,7 +406,7 @@ function quoteBody(): string {
   const msg = messagesStore.activeMessage;
   if (!msg) return "";
   const text = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
@@ -440,7 +453,7 @@ function forward() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
   const text = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
@@ -594,7 +607,7 @@ async function markSpam() {
         </div>
         <div class="header-row" data-testid="reader-date">
           <span class="header-label">Date:</span>
-          <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString() }}</span>
+          <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString(undefined, { hour12: uiStore.hour12 }) }}</span>
         </div>
         <div v-if="messagesStore.activeMessage.list_id" class="header-row">
           <span class="header-label">List:</span>
@@ -713,9 +726,11 @@ async function markSpam() {
 
             <div v-if="contactBooks.length > 0" class="form-group">
               <label>Contact Book</label>
-              <select v-model="cfBookId" class="form-select">
-                <option v-for="book in contactBooks" :key="book.id" :value="book.id">{{ book.name }}</option>
-              </select>
+              <Select
+                v-model="cfBookId"
+                :options="contactBooks.map(b => ({ value: b.id, label: b.name }))"
+                class="form-select"
+              />
             </div>
 
             <div class="form-row">
@@ -737,11 +752,7 @@ async function markSpam() {
               <label>Emails</label>
               <div v-for="(e, i) in cfEmails" :key="i" class="multi-field-row">
                 <input v-model="e.email" type="email" class="form-input" placeholder="email@example.com" />
-                <select v-model="e.label" class="form-select form-select-sm">
-                  <option value="work">Work</option>
-                  <option value="home">Home</option>
-                  <option value="other">Other</option>
-                </select>
+                <Select v-model="e.label" :options="EMAIL_LABEL_OPTIONS" class="form-select form-select-sm" />
                 <button v-if="cfEmails.length > 1" class="remove-btn" @click="cfEmails.splice(i, 1)">&times;</button>
               </div>
               <button class="add-field-btn" @click="cfEmails.push({ email: '', label: 'work' })">+ Add Email</button>
@@ -751,11 +762,7 @@ async function markSpam() {
               <label>Phones</label>
               <div v-for="(p, i) in cfPhones" :key="i" class="multi-field-row">
                 <input v-model="p.number" type="tel" class="form-input" placeholder="+1 555-0100" />
-                <select v-model="p.label" class="form-select form-select-sm">
-                  <option value="mobile">Mobile</option>
-                  <option value="work">Work</option>
-                  <option value="home">Home</option>
-                </select>
+                <Select v-model="p.label" :options="PHONE_LABEL_OPTIONS" class="form-select form-select-sm" />
                 <button class="remove-btn" @click="cfPhones.splice(i, 1)">&times;</button>
               </div>
               <button class="add-field-btn" @click="cfPhones.push({ number: '', label: 'mobile' })">+ Add Phone</button>
@@ -1220,6 +1227,13 @@ async function markSpam() {
   border-radius: 4px;
   background: var(--color-bg);
   color: var(--color-text);
+}
+
+.contact-form-modal .form-select {
+  --input-padding: 6px 8px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 13px;
 }
 
 .contact-form-modal .form-input:focus,

@@ -5,6 +5,19 @@ import { useAccountsStore } from "@/stores/accounts";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import Select from "@/components/common/Select.vue";
+
+const EMAIL_LABEL_OPTIONS = [
+  { value: "work", label: "Work" },
+  { value: "home", label: "Home" },
+  { value: "other", label: "Other" },
+];
+
+const PHONE_LABEL_OPTIONS = [
+  { value: "mobile", label: "Mobile" },
+  { value: "work", label: "Work" },
+  { value: "home", label: "Home" },
+];
 
 const accountsStore = useAccountsStore();
 
@@ -395,11 +408,10 @@ function getAccountName(accountId: string): string {
 
             <div class="form-group">
               <label>Contact Book</label>
-              <select v-model="formBookId">
-                <option v-for="book in contactBooks" :key="book.id" :value="book.id">
-                  {{ book.name }} ({{ getAccountName(book.account_id) }})
-                </option>
-              </select>
+              <Select
+                v-model="formBookId"
+                :options="contactBooks.map(b => ({ value: b.id, label: `${b.name} (${getAccountName(b.account_id)})` }))"
+              />
             </div>
 
             <div class="name-row">
@@ -421,11 +433,7 @@ function getAccountName(accountId: string): string {
               <label>Email</label>
               <div v-for="(em, idx) in formEmails" :key="idx" class="multi-row">
                 <input v-model="em.email" type="email" placeholder="email@example.com" />
-                <select v-model="em.label">
-                  <option value="work">Work</option>
-                  <option value="home">Home</option>
-                  <option value="other">Other</option>
-                </select>
+                <Select v-model="em.label" :options="EMAIL_LABEL_OPTIONS" class="label-select" />
                 <button v-if="formEmails.length > 1" class="rm-btn" @click="removeEmailField(idx)">&times;</button>
               </div>
               <button class="add-btn" @click="addEmailField">+ Add email</button>
@@ -435,11 +443,7 @@ function getAccountName(accountId: string): string {
               <label>Phone</label>
               <div v-for="(ph, idx) in formPhones" :key="idx" class="multi-row">
                 <input v-model="ph.number" type="tel" placeholder="+1 (555) 123-4567" />
-                <select v-model="ph.label">
-                  <option value="mobile">Mobile</option>
-                  <option value="work">Work</option>
-                  <option value="home">Home</option>
-                </select>
+                <Select v-model="ph.label" :options="PHONE_LABEL_OPTIONS" class="label-select" />
                 <button class="rm-btn" @click="removePhoneField(idx)">&times;</button>
               </div>
               <button class="add-btn" @click="addPhoneField">+ Add phone</button>
@@ -826,13 +830,21 @@ function getAccountName(accountId: string): string {
 
 .form-group { margin-bottom: 16px; }
 .form-group label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500; color: var(--color-text-secondary); }
-.form-group input, .form-group select, .form-group textarea {
+.form-group {
+  --input-height: 36px;
+  --input-padding: 0 12px;
+  --input-border: 0.8px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 16px;
+}
+
+.form-group input, .form-group textarea {
   width: 100%; height: 36px; padding: 0 12px;
   border: 0.8px solid var(--color-border); border-radius: 4px;
   background: var(--color-bg-secondary); font-size: 16px;
 }
 .form-group textarea { height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.5; }
-.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+.form-group input:focus, .form-group textarea:focus {
   outline: none; border-color: var(--color-accent);
 }
 
@@ -841,7 +853,7 @@ function getAccountName(accountId: string): string {
 
 .multi-row { display: flex; gap: 6px; margin-bottom: 6px; }
 .multi-row input { flex: 1; }
-.multi-row select { width: 100px; flex-shrink: 0; }
+.multi-row .label-select { width: 100px; flex-shrink: 0; }
 
 .rm-btn {
   width: 36px; height: 36px; border-radius: 4px; font-size: 18px;

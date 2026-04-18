@@ -7,6 +7,7 @@ import { open, message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import Select from "@/components/common/Select.vue";
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
@@ -527,11 +528,12 @@ async function send() {
             :style="{ background: acctColor(selectedAccountId).fill }"
             aria-hidden="true"
           ></span>
-          <select v-model="selectedAccountId" class="field-select" data-testid="compose-account-select">
-            <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
-              {{ acc.display_name }} &lt;{{ acc.email }}&gt;
-            </option>
-          </select>
+          <Select
+            v-model="selectedAccountId"
+            :options="accounts.map(a => ({ value: a.id, label: `${a.display_name} <${a.email}>` }))"
+            class="field-select"
+            testid="compose-account-select"
+          />
         </div>
         <div class="field-row addr-field-row">
           <label class="field-label">To</label>
@@ -811,14 +813,11 @@ async function send() {
 
 .field-select {
   width: 306px;
-  height: 32px;
-  padding: 0 8px;
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg-secondary);
-  color: var(--color-text);
-  font-size: 14px;
-  appearance: auto;
+  --input-height: 32px;
+  --input-padding: 0 8px;
+  --input-border: 0.8px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 14px;
 }
 
 .field-input-group {

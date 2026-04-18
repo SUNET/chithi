@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ThreadSummary } from "@/lib/types";
+import { useUiStore } from "@/stores/ui";
 
 const props = defineProps<{
   thread: ThreadSummary;
@@ -15,12 +16,14 @@ defineEmits<{
   toggleStar: [];
 }>();
 
+const uiStore = useUiStore();
+
 function formatDate(dateStr: string): string {
   const date = new Date(dateStr);
   const now = new Date();
   const isToday = date.toDateString() === now.toDateString();
   if (isToday) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: uiStore.hour12 });
   }
   const isThisYear = date.getFullYear() === now.getFullYear();
   if (isThisYear) {

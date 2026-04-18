@@ -229,6 +229,20 @@ async function unsubscribeThisCalendar() {
       </div>
     </div>
 
+    <div class="time-format-section">
+      <div class="section-header">Time format</div>
+      <div class="time-format-options">
+        <button
+          v-for="opt in [{ value: 'auto' as const, label: 'Auto' }, { value: '12' as const, label: '12h' }, { value: '24' as const, label: '24h' }]"
+          :key="opt.value"
+          class="time-format-btn"
+          :class="{ active: uiStore.timeFormat === opt.value }"
+          :data-testid="`time-format-${opt.value}`"
+          @click="uiStore.setTimeFormat(opt.value)"
+        >{{ opt.label }}</button>
+      </div>
+    </div>
+
     <div class="timezone-section">
       <div class="section-header">Use timezone</div>
       <div class="timezone-picker">
@@ -427,6 +441,40 @@ async function unsubscribeThisCalendar() {
 
 .week-start-btn.active {
   color: var(--color-accent);
+  font-weight: 600;
+}
+
+.time-format-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.time-format-options {
+  display: flex;
+  gap: 4px;
+  padding: 0 4px;
+}
+
+.time-format-btn {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: transparent;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.time-format-btn:hover {
+  background: var(--color-bg-hover);
+}
+
+.time-format-btn.active {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
   font-weight: 600;
 }
 

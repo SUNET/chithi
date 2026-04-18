@@ -6,6 +6,8 @@ import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
+import TimeInput from "@/components/common/TimeInput.vue";
+import DateInput from "@/components/common/DateInput.vue";
 
 const emit = defineEmits<{
   close: [];
@@ -60,7 +62,7 @@ const editLocation = ref(event.location || "");
 const editDescription = ref(event.description || "");
 
 function formatDateTime(iso: string): string {
-  return formatInTimezone(iso, uiStore.displayTimezone);
+  return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
 }
 
 function statusLabel(status: string | null): string {
@@ -270,21 +272,21 @@ async function handleDelete() {
         <div class="edit-row">
           <div class="edit-group">
             <label>Start date</label>
-            <input v-model="editStartDate" type="date" data-testid="event-form-start" />
+            <DateInput v-model="editStartDate" testid="event-form-start" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>Start time</label>
-            <input v-model="editStartTime" type="time" data-testid="event-form-start-time" />
+            <TimeInput v-model="editStartTime" testid="event-form-start-time" />
           </div>
         </div>
         <div class="edit-row">
           <div class="edit-group">
             <label>End date</label>
-            <input v-model="editEndDate" type="date" data-testid="event-form-end" />
+            <DateInput v-model="editEndDate" testid="event-form-end" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>End time</label>
-            <input v-model="editEndTime" type="time" data-testid="event-form-end-time" />
+            <TimeInput v-model="editEndTime" testid="event-form-end-time" />
           </div>
         </div>
         <div class="edit-group">
@@ -432,13 +434,24 @@ async function handleDelete() {
   color: var(--color-text-secondary);
 }
 
+/* Sizing tokens consumed by DateInput / TimeInput so they match the
+   native inputs in this form. See .date-input-trigger / .time-input-text
+   in src/components/common/{DateInput,TimeInput}.vue. */
+.edit-group {
+  --input-height: 28px;
+  --input-padding: 6px 8px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 13px;
+}
+
 .edit-group input,
 .edit-group textarea {
-  padding: 6px 8px;
-  border: 1px solid var(--color-border);
+  padding: var(--input-padding);
+  border: var(--input-border);
   border-radius: 4px;
-  background: var(--color-bg);
-  font-size: 13px;
+  background: var(--input-bg);
+  font-size: var(--input-font-size);
 }
 
 .edit-group textarea { resize: vertical; }
