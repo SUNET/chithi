@@ -1,9 +1,32 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, computed } from "vue";
 import { useFiltersStore } from "@/stores/filters";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import type { FilterRule, FilterAction } from "@/lib/types";
+import Select from "@/components/common/Select.vue";
+
+const MATCH_TYPE_OPTIONS = [
+  { value: "all", label: "All conditions (AND)" },
+  { value: "any", label: "Any condition (OR)" },
+];
+
+const ACTION_TYPE_OPTIONS = [
+  { value: "move", label: "Move to folder" },
+  { value: "copy", label: "Copy to folder" },
+  { value: "delete", label: "Delete" },
+  { value: "flag", label: "Add flag" },
+  { value: "unflag", label: "Remove flag" },
+  { value: "mark_read", label: "Mark as read" },
+  { value: "mark_unread", label: "Mark as unread" },
+  { value: "stop", label: "Stop processing" },
+];
+
+const FLAG_OPTIONS = [
+  { value: "flagged", label: "Flagged" },
+  { value: "seen", label: "Seen" },
+  { value: "answered", label: "Answered" },
+];
 
 const filtersStore = useFiltersStore();
 const accountsStore = useAccountsStore();
@@ -157,6 +180,8 @@ const fieldLabels: Record<string, string> = {
   has_attachment: "Has Attachment",
 };
 
+const FIELD_OPTIONS = Object.entries(fieldLabels).map(([value, label]) => ({ value, label }));
+
 const opLabels: Record<string, string> = {
   contains: "contains",
   not_contains: "does not contain",
@@ -166,6 +191,22 @@ const opLabels: Record<string, string> = {
   greater_than: "greater than",
   less_than: "less than",
 };
+
+const OP_OPTIONS = Object.entries(opLabels).map(([value, label]) => ({ value, label }));
+
+const accountOptions = computed(() =>
+  accountsStore.accounts.map((a) => ({ value: a.id, label: a.display_name })),
+);
+
+const folderOptions = computed(() => [
+  { value: null as string | null, label: "Select folder…", disabled: true },
+  ...foldersStore.getFlatFolders().map((f) => ({ value: f.path, label: f.name })),
+]);
+
+const actionFolderOptions = computed(() => [
+  { value: "", label: "Select folder…", disabled: true },
+  ...foldersStore.getFlatFolders().map((f) => ({ value: f.path, label: f.name })),
+]);
 </script>
 
 <template>
@@ -174,11 +215,12 @@ const opLabels: Record<string, string> = {
     <div class="filters-left">
       <div class="left-header">
         <h2 class="left-title">Message Filters</h2>
-        <select class="account-select" :value="accountsStore.activeAccountId ?? ''" @change="accountsStore.setActiveAccount(($event.target as HTMLSelectElement).value)">
-          <option v-for="acc in accountsStore.accounts" :key="acc.id" :value="acc.id">
-            {{ acc.display_name }}
-          </option>
-        </select>
+        <Select
+          :model-value="accountsStore.activeAccountId ?? ''"
+          :options="accountOptions"
+          class="account-select"
+          @update:model-value="accountsStore.setActiveAccount($event)"
+        />
         <button class="btn-new-filter" :disabled="!accountsStore.activeAccountId" data-testid="filter-new-btn" @click="newFilter">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
           New Filter
@@ -225,12 +267,7 @@ const opLabels: Record<string, string> = {
 
       <div class="apply-section">
         <label class="apply-label">Apply filters to folder</label>
-        <select v-model="applyingFolder" class="apply-select">
-          <option :value="null" disabled>Select folder...</option>
-          <option v-for="f in foldersStore.getFlatFolders()" :key="f.path" :value="f.path">
-            {{ f.name }}
-          </option>
-        </select>
+        <Select v-model="applyingFolder" :options="folderOptions" class="apply-select" />
         <button class="btn-apply" :disabled="!applyingFolder" data-testid="filter-apply-btn" @click="applyToFolder">
           Apply Filters to Folder
         </button>
@@ -257,10 +294,7 @@ const opLabels: Record<string, string> = {
           </div>
           <div class="form-group match-group">
             <label class="field-label">Match Type</label>
-            <select v-model="editingRule.match_type" class="field-select">
-              <option value="all">All conditions (AND)</option>
-              <option value="any">Any condition (OR)</option>
-            </select>
+            <Select v-model="editingRule.match_type" :options="MATCH_TYPE_OPTIONS" class="field-select" />
           </div>
           <label class="checkbox-label">
             <input v-model="editingRule.enabled" type="checkbox" />
@@ -292,12 +326,8 @@ const opLabels: Record<string, string> = {
           :key="'c' + i"
           class="condition-row"
         >
-          <select v-model="cond.field" class="field-select cond-field">
-            <option v-for="(label, key) in fieldLabels" :key="key" :value="key">{{ label }}</option>
-          </select>
-          <select v-model="cond.op" class="field-select cond-op">
-            <option v-for="(label, key) in opLabels" :key="key" :value="key">{{ label }}</option>
-          </select>
+          <Select v-model="cond.field" :options="FIELD_OPTIONS" class="field-select cond-field" />
+          <Select v-model="cond.op" :options="OP_OPTIONS" class="field-select cond-op" />
           <input v-model="cond.value" type="text" class="field-input cond-value" placeholder="Value" />
           <button class="btn-remove" @click="removeCondition(i)">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
@@ -317,37 +347,26 @@ const opLabels: Record<string, string> = {
           :key="'a' + i"
           class="action-row"
         >
-          <select class="field-select action-type" :value="getActionType(action)" @change="updateAction(i, ($event.target as HTMLSelectElement).value)">
-            <option value="move">Move to folder</option>
-            <option value="copy">Copy to folder</option>
-            <option value="delete">Delete</option>
-            <option value="flag">Add flag</option>
-            <option value="unflag">Remove flag</option>
-            <option value="mark_read">Mark as read</option>
-            <option value="mark_unread">Mark as unread</option>
-            <option value="stop">Stop processing</option>
-          </select>
-          <select
+          <Select
+            :model-value="getActionType(action)"
+            :options="ACTION_TYPE_OPTIONS"
+            class="field-select action-type"
+            @update:model-value="updateAction(i, $event)"
+          />
+          <Select
             v-if="needsTarget(action)"
+            :model-value="getActionTarget(action)"
+            :options="actionFolderOptions"
             class="field-select action-target"
-            :value="getActionTarget(action)"
-            @change="setActionTarget(i, ($event.target as HTMLSelectElement).value)"
-          >
-            <option value="" disabled>Select folder...</option>
-            <option v-for="f in foldersStore.getFlatFolders()" :key="f.path" :value="f.path">
-              {{ f.name }}
-            </option>
-          </select>
-          <select
+            @update:model-value="setActionTarget(i, $event)"
+          />
+          <Select
             v-else-if="needsValue(action)"
+            :model-value="getActionTarget(action)"
+            :options="FLAG_OPTIONS"
             class="field-select action-target"
-            :value="getActionTarget(action)"
-            @change="setActionTarget(i, ($event.target as HTMLSelectElement).value)"
-          >
-            <option value="flagged">Flagged</option>
-            <option value="seen">Seen</option>
-            <option value="answered">Answered</option>
-          </select>
+            @update:model-value="setActionTarget(i, $event)"
+          />
           <button class="btn-remove" @click="removeAction(i)">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
           </button>

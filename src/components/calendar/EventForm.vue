@@ -9,6 +9,7 @@ import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
 import TimeInput from "@/components/common/TimeInput.vue";
 import DateInput from "@/components/common/DateInput.vue";
+import Select from "@/components/common/Select.vue";
 
 const props = defineProps<{
   initialStart?: string;
@@ -22,6 +23,13 @@ const emit = defineEmits<{
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
+
+const calendarOptions = computed(() =>
+  calendarStore.calendars.map((cal) => ({
+    value: cal.id,
+    label: `${cal.name} (${accountsStore.accounts.find((a) => a.id === cal.account_id)?.display_name || cal.account_id})`,
+  })),
+);
 
 const defaultStart = props.initialStart
   ? new Date(props.initialStart)
@@ -150,11 +158,7 @@ async function save() {
 
         <div class="form-group">
           <label>Calendar</label>
-          <select v-model="calendarId" data-testid="event-form-calendar">
-            <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
-              {{ cal.name }} ({{ accountsStore.accounts.find(a => a.id === cal.account_id)?.display_name || cal.account_id }})
-            </option>
-          </select>
+          <Select v-model="calendarId" :options="calendarOptions" testid="event-form-calendar" />
         </div>
 
         <label class="checkbox-row">

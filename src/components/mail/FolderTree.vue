@@ -8,6 +8,7 @@ import * as api from "@/lib/tauri";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
 import { showToast, dismissToast } from "@/lib/toast";
 import { acctColor } from "@/lib/account-colors";
+import Select from "@/components/common/Select.vue";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
@@ -545,11 +546,7 @@ async function doDeleteFolder() {
             </div>
             <div class="nf-field">
               <label>Create as a subfolder of:</label>
-              <select v-model="newFolderParent" class="nf-select">
-                <option v-for="opt in buildParentOptions()" :key="opt.value" :value="opt.value">
-                  {{ opt.label }}
-                </option>
-              </select>
+              <Select v-model="newFolderParent" :options="buildParentOptions()" class="nf-select" />
             </div>
           </div>
           <div class="nf-footer">

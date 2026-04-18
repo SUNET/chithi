@@ -1,6 +1,20 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
 import DateInput from "@/components/common/DateInput.vue";
+import Select from "@/components/common/Select.vue";
+
+const freqOptions = [
+  { value: "DAILY", label: "day(s)" },
+  { value: "WEEKLY", label: "week(s)" },
+  { value: "MONTHLY", label: "month(s)" },
+  { value: "YEARLY", label: "year(s)" },
+];
+
+const endTypeOptions = [
+  { value: "never", label: "Never" },
+  { value: "count", label: "After N times" },
+  { value: "until", label: "On date" },
+];
 
 const props = defineProps<{
   modelValue: string | null;
@@ -74,12 +88,7 @@ watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { de
       <div class="recurrence-row">
         <label>Every</label>
         <input type="number" v-model.number="interval" min="1" max="99" class="num-input" />
-        <select v-model="freq">
-          <option value="DAILY">day(s)</option>
-          <option value="WEEKLY">week(s)</option>
-          <option value="MONTHLY">month(s)</option>
-          <option value="YEARLY">year(s)</option>
-        </select>
+        <Select v-model="freq" :options="freqOptions" class="freq-select" />
       </div>
 
       <div v-if="freq === 'WEEKLY'" class="day-picker">
@@ -101,11 +110,7 @@ watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { de
 
       <div class="recurrence-row">
         <label>Ends</label>
-        <select v-model="endType">
-          <option value="never">Never</option>
-          <option value="count">After N times</option>
-          <option value="until">On date</option>
-        </select>
+        <Select v-model="endType" :options="endTypeOptions" class="end-type-select" />
         <input
           v-if="endType === 'count'"
           type="number"
@@ -158,13 +163,18 @@ watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { de
   --input-font-size: 12px;
 }
 
-.recurrence-row select,
 .num-input {
   padding: var(--input-padding);
   border: var(--input-border);
   border-radius: 4px;
   background: var(--input-bg);
   font-size: var(--input-font-size);
+}
+
+.freq-select,
+.end-type-select {
+  width: auto;
+  min-width: 100px;
 }
 
 .num-input {
