@@ -86,6 +86,7 @@ impl CardDavClient {
             log::info!("carddav: no URL configured, attempting auto-discovery");
             auto_discover(&http, &auth, email).await?
         } else {
+            crate::mail::url_validation::require_https(carddav_url)?;
             carddav_url.to_string()
         };
 
@@ -131,11 +132,13 @@ impl CardDavClient {
         Ok(text)
     }
 
-    fn resolve_url(&self, href: &str) -> String {
-        if href.starts_with("http://") || href.starts_with("https://") {
-            return href.to_string();
-        }
-        if let Ok(base) = url::Url::parse(&self.base_url) {
+    /// Resolve a potentially relative URL against the base URL. Rejects
+    /// cleartext schemes via `require_https` so a server can't downgrade
+    /// subsequent auth-bearing requests by returning absolute `http://` hrefs.
+    fn resolve_url(&self, href: &str) -> Result<String> {
+        let resolved = if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_string()
+        } else if let Ok(base) = url::Url::parse(&self.base_url) {
             let port_str = base.port().map(|p| format!(":{}", p)).unwrap_or_default();
             format!(
                 "{}://{}{}{}",
@@ -146,7 +149,9 @@ impl CardDavClient {
             )
         } else {
             format!("{}{}", self.base_url.trim_end_matches('/'), href)
-        }
+        };
+        crate::mail::url_validation::require_https(&resolved)?;
+        Ok(resolved)
     }
 
     /// Discover the current user's principal URL.
@@ -154,7 +159,7 @@ impl CardDavClient {
         let resp = self.propfind(&self.base_url, "0", PROPFIND_PRINCIPAL).await?;
         let principal = parse_href_from_xml(&resp, "current-user-principal")
             .ok_or_else(|| Error::Other("CardDAV: no current-user-principal".to_string()))?;
-        Ok(self.resolve_url(&principal))
+        self.resolve_url(&principal)
     }
 
     /// Discover the addressbook home set URL.
@@ -164,7 +169,7 @@ impl CardDavClient {
             .await?;
         let home = parse_href_from_xml(&resp, "addressbook-home-set")
             .ok_or_else(|| Error::Other("CardDAV: no addressbook-home-set".to_string()))?;
-        Ok(self.resolve_url(&home))
+        self.resolve_url(&home)
     }
 
     /// List all address books.
@@ -181,7 +186,7 @@ impl CardDavClient {
 
     /// Fetch all contacts from an address book.
     pub async fn fetch_contacts(&self, book_href: &str) -> Result<Vec<CardDavContact>> {
-        let url = self.resolve_url(book_href);
+        let url = self.resolve_url(book_href)?;
         log::debug!("carddav: fetching contacts from {}", url);
 
         let resp = self
@@ -217,11 +222,8 @@ impl CardDavClient {
 
     /// PUT a vCard to the server. Returns the new etag.
     pub async fn put_contact(&self, book_href: &str, uid: &str, vcard_data: &str) -> Result<String> {
-        let url = format!(
-            "{}/{}.vcf",
-            self.resolve_url(book_href).trim_end_matches('/'),
-            uid
-        );
+        let book_url = self.resolve_url(book_href)?;
+        let url = format!("{}/{}.vcf", book_url.trim_end_matches('/'), uid);
         log::info!("carddav: PUT contact to {}", url);
 
         let resp = self
@@ -243,7 +245,7 @@ impl CardDavClient {
 
     /// DELETE a contact from the server.
     pub async fn delete_contact(&self, contact_href: &str) -> Result<()> {
-        let url = self.resolve_url(contact_href);
+        let url = self.resolve_url(contact_href)?;
         let resp = self.apply_auth(self.http.delete(&url)).send().await
             .map_err(|e| Error::Other(format!("CardDAV DELETE failed: {}", e)))?;
         let status = resp.status();
@@ -288,12 +290,18 @@ async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> R
                 let status = resp.status();
                 let final_url = resp.url().clone();
                 if status.is_success() || status.as_u16() == 207 {
+                    let port_str = final_url
+                        .port()
+                        .map(|p| format!(":{}", p))
+                        .unwrap_or_default();
                     let discovered = format!(
-                        "{}://{}{}",
+                        "{}://{}{}{}",
                         final_url.scheme(),
                         final_url.host_str().unwrap_or(domain),
+                        port_str,
                         final_url.path().trim_end_matches('/')
                     );
+                    crate::mail::url_validation::require_https(&discovered)?;
                     log::info!("carddav: auto-discovered URL: {}", discovered);
                     return Ok(discovered);
                 }
@@ -511,6 +519,57 @@ pub fn generate_vcard(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_rejects_http_url() {
+        let msg = match CardDavClient::connect(
+            "http://example.com/dav/",
+            "u",
+            "p",
+            "u@example.com",
+        )
+        .await
+        {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    fn client_with_base(base: &str) -> CardDavClient {
+        CardDavClient {
+            http: reqwest::Client::new(),
+            base_url: base.to_string(),
+            auth: DavAuth::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_url_rejects_absolute_http_href() {
+        let client = client_with_base("https://example.com/dav/");
+        let msg = match client.resolve_url("http://evil.example.com/path") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    #[test]
+    fn resolve_url_resolves_relative_href_with_port() {
+        let client = client_with_base("https://example.com:8443/dav/");
+        let resolved = client
+            .resolve_url("/addressbooks/u/default/")
+            .expect("expected Ok");
+        assert_eq!(resolved, "https://example.com:8443/addressbooks/u/default/");
+    }
+}
 
 #[cfg(test)]
 mod tests {

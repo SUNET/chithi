@@ -25,6 +25,79 @@ pub struct CalDavConfig {
     pub email: String, // Used for domain extraction during auto-discovery
 }
 
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn err_msg<T>(r: Result<T>) -> String {
+        match r {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn ok_str(r: Result<String>) -> String {
+        match r {
+            Ok(s) => s,
+            Err(e) => panic!("expected Ok, got Err: {}", e),
+        }
+    }
+
+    fn client_with_base(base: &str) -> CalDavClient {
+        CalDavClient {
+            http: reqwest::Client::new(),
+            base_url: base.to_string(),
+            auth: DavAuth::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_url_rejects_absolute_http_href() {
+        let client = client_with_base("https://example.com/dav/");
+        let msg = err_msg(client.resolve_url("http://evil.example.com/path"));
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    #[test]
+    fn resolve_url_accepts_absolute_https_href() {
+        let client = client_with_base("https://example.com/dav/");
+        assert_eq!(
+            ok_str(client.resolve_url("https://other.example.com/x")),
+            "https://other.example.com/x"
+        );
+    }
+
+    #[test]
+    fn resolve_url_resolves_relative_href() {
+        let client = client_with_base("https://example.com:8443/dav/");
+        assert_eq!(
+            ok_str(client.resolve_url("/calendars/user/default/")),
+            "https://example.com:8443/calendars/user/default/"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_http_url() {
+        let cfg = CalDavConfig {
+            caldav_url: "http://example.com/dav/".into(),
+            username: "u".into(),
+            password: "p".into(),
+            email: "u@example.com".into(),
+        };
+        let msg = err_msg(CalDavClient::connect(&cfg).await);
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn connect_with_token_rejects_http_url() {
+        let msg = err_msg(CalDavClient::connect_with_token("http://example.com/dav/", "tok").await);
+        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+}
+
 /// A CalDAV client that holds an HTTP client and connection details.
 pub struct CalDavClient {
     http: reqwest::Client,
@@ -90,6 +163,7 @@ impl CalDavClient {
             log::info!("caldav: no URL configured, attempting auto-discovery");
             Self::auto_discover(&http, &auth, &config.email).await?
         } else {
+            crate::mail::url_validation::require_https(&config.caldav_url)?;
             config.caldav_url.clone()
         };
 
@@ -100,6 +174,8 @@ impl CalDavClient {
 
     /// Create a CalDAV client with OAuth2 bearer token authentication.
     pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
+        crate::mail::url_validation::require_https(caldav_url)?;
+
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
@@ -165,12 +241,18 @@ impl CalDavClient {
                     let final_url = resp.url().clone();
                     if status.is_success() || status.as_u16() == 207 {
                         // The redirect target (or final URL) is our CalDAV base
+                        let port_str = final_url
+                            .port()
+                            .map(|p| format!(":{}", p))
+                            .unwrap_or_default();
                         let discovered = format!(
-                            "{}://{}{}",
+                            "{}://{}{}{}",
                             final_url.scheme(),
                             final_url.host_str().unwrap_or(domain),
+                            port_str,
                             final_url.path().trim_end_matches('/')
                         );
+                        crate::mail::url_validation::require_https(&discovered)?;
                         log::info!("caldav: auto-discovered URL: {}", discovered);
                         return Ok(discovered);
                     }
@@ -204,7 +286,7 @@ impl CalDavClient {
                 Error::Other("CalDAV: could not find current-user-principal in response".to_string())
             })?;
 
-        let principal_url = self.resolve_url(&principal);
+        let principal_url = self.resolve_url(&principal)?;
         log::info!("caldav: principal URL: {}", principal_url);
         Ok(principal_url)
     }
@@ -223,7 +305,7 @@ impl CalDavClient {
                 )
             })?;
 
-        let home_url = self.resolve_url(&home);
+        let home_url = self.resolve_url(&home)?;
         log::info!("caldav: calendar home URL: {}", home_url);
         Ok(home_url)
     }
@@ -260,7 +342,7 @@ impl CalDavClient {
 
     /// Fetch all events from a calendar collection using REPORT calendar-query.
     pub async fn fetch_events(&self, calendar_href: &str) -> Result<Vec<CalDavEvent>> {
-        let url = self.resolve_url(calendar_href);
+        let url = self.resolve_url(calendar_href)?;
         log::debug!("caldav: fetching events from {}", url);
 
         let resp = self.apply_auth(
@@ -303,9 +385,10 @@ impl CalDavClient {
         uid: &str,
         ical_data: &str,
     ) -> Result<String> {
+        let calendar_url = self.resolve_url(calendar_href)?;
         let event_url = format!(
             "{}/{}.ics",
-            self.resolve_url(calendar_href).trim_end_matches('/'),
+            calendar_url.trim_end_matches('/'),
             uid
         );
         log::info!("caldav: PUT event to {}", event_url);
@@ -344,7 +427,7 @@ impl CalDavClient {
 
     /// DELETE an event from the server.
     pub async fn delete_event(&self, event_href: &str) -> Result<()> {
-        let url = self.resolve_url(event_href);
+        let url = self.resolve_url(event_href)?;
         log::info!("caldav: DELETE event at {}", url);
 
         let resp = self.apply_auth(self.http.delete(&url))
@@ -410,12 +493,14 @@ impl CalDavClient {
     }
 
     /// Resolve a potentially relative URL against the base URL.
-    fn resolve_url(&self, href: &str) -> String {
-        if href.starts_with("http://") || href.starts_with("https://") {
-            return href.to_string();
-        }
-        // Parse the base URL to get the scheme and host
-        if let Ok(base) = url::Url::parse(&self.base_url) {
+    ///
+    /// Rejects absolute URLs with a scheme that would send auth-bearing
+    /// requests over cleartext (see `require_https`). Relative hrefs inherit
+    /// the base URL's scheme and are accepted as-is.
+    fn resolve_url(&self, href: &str) -> Result<String> {
+        let resolved = if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_string()
+        } else if let Ok(base) = url::Url::parse(&self.base_url) {
             let scheme = base.scheme();
             let host = base.host_str().unwrap_or("");
             let port_str = base
@@ -426,7 +511,9 @@ impl CalDavClient {
         } else {
             // Fallback: just concatenate
             format!("{}{}", self.base_url.trim_end_matches('/'), href)
-        }
+        };
+        crate::mail::url_validation::require_https(&resolved)?;
+        Ok(resolved)
     }
 }
 
