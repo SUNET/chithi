@@ -813,14 +813,11 @@ async function send() {
 
 .field-select {
   width: 306px;
-  height: 32px;
-  padding: 0 8px;
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg-secondary);
-  color: var(--color-text);
-  font-size: 14px;
-  appearance: auto;
+  --input-height: 32px;
+  --input-padding: 0 8px;
+  --input-border: 0.8px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 14px;
 }
 
 .field-input-group {

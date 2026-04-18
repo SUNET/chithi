@@ -1229,6 +1229,13 @@ async function markSpam() {
   color: var(--color-text);
 }
 
+.contact-form-modal .form-select {
+  --input-padding: 6px 8px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 13px;
+}
+
 .contact-form-modal .form-input:focus,
 .contact-form-modal .form-select:focus {
   outline: none;

@@ -895,6 +895,14 @@ async function doDeleteFolder() {
   font-size: 14px;
 }
 
+.nf-select {
+  --input-height: 36px;
+  --input-padding: 0 10px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg);
+  --input-font-size: 14px;
+}
+
 .nf-input:focus,
 .nf-select:focus {
   outline: none;

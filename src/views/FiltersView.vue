@@ -599,13 +599,11 @@ const actionFolderOptions = computed(() => [
 
 .apply-select {
   width: 100%;
-  height: 36px;
-  padding: 0 8px;
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg-secondary);
-  color: var(--color-text);
-  font-size: 13px;
+  --input-height: 36px;
+  --input-padding: 0 8px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 13px;
 }
 
 .btn-apply {
@@ -681,6 +679,14 @@ const actionFolderOptions = computed(() => [
   background: var(--color-bg-secondary);
   color: var(--color-text);
   font-size: 14px;
+}
+
+.field-select {
+  --input-height: 36px;
+  --input-padding: 0 12px;
+  --input-border: 1px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 14px;
 }
 
 .field-input:focus,

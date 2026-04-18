@@ -830,13 +830,21 @@ function getAccountName(accountId: string): string {
 
 .form-group { margin-bottom: 16px; }
 .form-group label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500; color: var(--color-text-secondary); }
-.form-group input, .form-group select, .form-group textarea {
+.form-group {
+  --input-height: 36px;
+  --input-padding: 0 12px;
+  --input-border: 0.8px solid var(--color-border);
+  --input-bg: var(--color-bg-secondary);
+  --input-font-size: 16px;
+}
+
+.form-group input, .form-group textarea {
   width: 100%; height: 36px; padding: 0 12px;
   border: 0.8px solid var(--color-border); border-radius: 4px;
   background: var(--color-bg-secondary); font-size: 16px;
 }
 .form-group textarea { height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.5; }
-.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+.form-group input:focus, .form-group textarea:focus {
   outline: none; border-color: var(--color-accent);
 }
 
@@ -845,7 +853,7 @@ function getAccountName(accountId: string): string {
 
 .multi-row { display: flex; gap: 6px; margin-bottom: 6px; }
 .multi-row input { flex: 1; }
-.multi-row select { width: 100px; flex-shrink: 0; }
+.multi-row .label-select { width: 100px; flex-shrink: 0; }
 
 .rm-btn {
   width: 36px; height: 36px; border-radius: 4px; font-size: 18px;
