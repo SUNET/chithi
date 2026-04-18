@@ -139,6 +139,27 @@ export async function saveDraft(
   return invoke("save_draft", { accountId, message });
 }
 
+/**
+ * Open a backend-owned native file picker and register the chosen files.
+ * The renderer receives opaque tokens, never the raw paths, so a
+ * compromised renderer cannot ask the backend to read arbitrary files
+ * when composing a message.
+ */
+export async function pickAttachments(): Promise<
+  Array<{ token: string; name: string; size: number }>
+> {
+  return invoke("pick_attachments");
+}
+
+/**
+ * Release a previously-issued attachment token so the backend forgets
+ * the path. Called when the user removes an attachment chip or when
+ * the compose window unmounts without sending.
+ */
+export async function releaseAttachment(token: string): Promise<void> {
+  return invoke("release_attachment", { token });
+}
+
 export async function moveMessages(
   accountId: string,
   messageIds: string[],

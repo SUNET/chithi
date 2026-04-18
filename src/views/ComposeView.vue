@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open, message as tauriMessage } from "@tauri-apps/plugin-dialog";
+import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
@@ -85,6 +85,12 @@ const e2eBridge: ComposeE2EBridge = {
 (window as Window & { __CHITHI_E2E_COMPOSE__?: ComposeE2EBridge }).__CHITHI_E2E_COMPOSE__ = e2eBridge;
 onUnmounted(() => {
   delete (window as Window & { __CHITHI_E2E_COMPOSE__?: ComposeE2EBridge }).__CHITHI_E2E_COMPOSE__;
+  // Free any attachment tokens we still hold so the backend registry
+  // doesn't leak paths from cancelled compose sessions. A successful
+  // send/draft leaves the list empty; this covers window close.
+  for (const att of attachments.value) {
+    api.releaseAttachment(att.token).catch(() => {});
+  }
 });
 
 // Prefill from query params (reply/reply-all/forward)
@@ -277,7 +283,7 @@ const baselineSubject = ref(initialSubject);
 const baselineBody = ref((route.query.body as string) || "");
 
 function attachmentBaselineValue(items: ComposeAttachment[]): string {
-  return JSON.stringify(items.map(({ path, name }) => ({ path, name })));
+  return JSON.stringify(items.map(({ token, name }) => ({ token, name })));
 }
 
 const baselineAttachments = ref(attachmentBaselineValue([]));
@@ -364,22 +370,28 @@ async function saveDraft(): Promise<boolean> {
 }
 
 async function addAttachment() {
-  const selected = await open({
-    multiple: true,
-    title: "Attach Files",
-  });
-  if (!selected) return;
-  const paths = Array.isArray(selected) ? selected : [selected];
-  for (const filePath of paths) {
-    const name = filePath.split(/[/\\]/).pop() ?? filePath;
-    if (!attachments.value.some(a => a.path === filePath)) {
-      attachments.value.push({ path: filePath, name });
+  // The backend dedups by canonical path, so picking the same file twice
+  // returns the same token both times. Our dedup-by-token check here
+  // then keeps the compose list from showing a duplicate chip. We must
+  // NOT release the token in that case (it's the same registry entry
+  // we're keeping).
+  const picked = await api.pickAttachments();
+  for (const handle of picked) {
+    if (!attachments.value.some(a => a.token === handle.token)) {
+      attachments.value.push({
+        token: handle.token,
+        name: handle.name,
+        size: handle.size,
+      });
     }
   }
 }
 
 function removeAttachment(index: number) {
-  attachments.value.splice(index, 1);
+  const [removed] = attachments.value.splice(index, 1);
+  if (removed) {
+    api.releaseAttachment(removed.token).catch(() => {});
+  }
 }
 
 
@@ -647,7 +659,7 @@ async function send() {
           <span>{{ attachments.length }} attachment{{ attachments.length !== 1 ? 's' : '' }}</span>
         </div>
         <div class="attachment-list">
-          <div v-for="(att, idx) in attachments" :key="att.path" class="attachment-chip">
+          <div v-for="(att, idx) in attachments" :key="att.token" class="attachment-chip">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
             </svg>

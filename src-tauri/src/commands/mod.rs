@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod actions;
+pub mod attachments;
 pub mod calendar;
 pub mod compose;
 pub mod contacts;

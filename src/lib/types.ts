@@ -236,8 +236,9 @@ export interface ComposeMessage {
 }
 
 export interface ComposeAttachment {
-  path: string;
+  token: string;
   name: string;
+  size?: number;
 }
 
 // Contacts types

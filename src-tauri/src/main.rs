@@ -56,6 +56,8 @@ fn main() {
             commands::sync_cmd::prefetch_bodies,
             commands::compose::send_message,
             commands::compose::save_draft,
+            commands::attachments::pick_attachments,
+            commands::attachments::release_attachment,
             commands::contacts::list_contact_books,
             commands::contacts::list_contacts,
             commands::contacts::get_contact,
