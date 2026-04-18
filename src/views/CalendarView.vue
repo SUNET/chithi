@@ -11,6 +11,9 @@ import MonthView from "@/components/calendar/MonthView.vue";
 import EventDetail from "@/components/calendar/EventDetail.vue";
 import EventForm from "@/components/calendar/EventForm.vue";
 
+// Explicit name so <KeepAlive include="CalendarView"> in App.vue matches.
+defineOptions({ name: "CalendarView" });
+
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const showEventForm = ref(false);
@@ -126,25 +129,34 @@ async function onCalendarDrop(payload: {
   }
 }
 
-onMounted(async () => {
-  // Ensure accounts are loaded — App.vue loads them but it may not be done yet
-  if (accountsStore.accounts.length === 0) {
-    await accountsStore.fetchAccounts();
-  }
-  // Show cached data immediately (calendars + events live in SQLite),
-  // then refresh from the server in the background. Waiting on the
-  // network sync here makes the view appear empty until sync finishes.
-  await calendarStore.fetchCalendars();
-  await calendarStore.fetchEvents();
+onMounted(() => {
+  // Ensure accounts are loaded — App.vue loads them but it may not be done yet.
+  // Everything below runs without blocking the mount: the template renders
+  // against the (cached) reactive refs immediately and updates as the
+  // parallel fetches resolve.
+  const ready =
+    accountsStore.accounts.length === 0
+      ? accountsStore.fetchAccounts()
+      : Promise.resolve();
+
+  ready
+    .then(() => calendarStore.fetchCalendars())
+    .catch((e) => console.error("fetchCalendars error:", e));
+  ready
+    .then(() => calendarStore.fetchEvents())
+    .catch((e) => console.error("fetchEvents error:", e));
+
   // Initial sync + start independent interval (5 min).
   // The interval is intentionally NOT cleared on unmount — it keeps
   // calendars fresh in the background for the lifetime of the app,
   // matching how mail sync runs continuously. The calendar store's
   // stopCalendarSync() is available if explicit teardown is needed.
-  calendarStore.syncCalendars().catch((e) => {
-    console.error("Calendar sync error:", e);
-  });
-  calendarStore.startCalendarSync();
+  ready
+    .then(() => calendarStore.syncCalendars())
+    .catch((e) => console.error("Calendar sync error:", e));
+  ready
+    .then(() => calendarStore.startCalendarSync())
+    .catch((e) => console.error("startCalendarSync error:", e));
 });
 </script>
 

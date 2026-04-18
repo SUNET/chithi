@@ -61,7 +61,16 @@ onMounted(async () => {
     <div class="app-main">
       <MenuBar />
       <main class="app-content">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <!-- Only CalendarView is kept alive — its WeekView subtree is
+               the heavy one (see #72) and cold-mount is ~400ms. Other
+               views (ContactsView, FiltersView, SettingsView, MailView)
+               rely on onMounted/onUnmounted for listener and interval
+               cleanup, so caching them would leak background work. -->
+          <KeepAlive include="CalendarView">
+            <component :is="Component" />
+          </KeepAlive>
+        </router-view>
       </main>
       <OperationsPanel />
       <StatusBar />

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from "vue-router";
 import MailView from "@/views/MailView.vue";
+import CalendarView from "@/views/CalendarView.vue";
 
 const router = createRouter({
   history: createWebHistory(),
@@ -10,9 +11,13 @@ const router = createRouter({
       component: MailView,
     },
     {
+      // Eager-imported so its module chunk is in memory before the user
+      // first navigates (see #72). Component still only mounts on
+      // navigation, but KeepAlive (App.vue) keeps the instance warm after
+      // the first mount.
       path: "/calendar",
       name: "calendar",
-      component: () => import("@/views/CalendarView.vue"),
+      component: CalendarView,
     },
     {
       path: "/filters",
