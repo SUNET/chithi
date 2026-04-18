@@ -19,12 +19,18 @@ pub const DAV_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAV_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build a `reqwest::Client` pre-configured for DAV traffic: bounded
-/// redirects and both connect + overall request timeouts.
+/// redirects, connect + overall request timeouts, and automatic response
+/// decompression. Some CalDAV/CardDAV servers (or their reverse proxies)
+/// send `Content-Encoding: gzip` on PROPFIND/REPORT responses; without
+/// decompression `resp.text()` fails with "error decoding response body"
+/// (see #56).
 pub fn build_client() -> Result<Client> {
     Client::builder()
         .redirect(redirect::Policy::limited(10))
         .connect_timeout(DAV_CONNECT_TIMEOUT)
         .timeout(DAV_REQUEST_TIMEOUT)
+        .gzip(true)
+        .deflate(true)
         .build()
         .map_err(|e| Error::Other(format!("Failed to create DAV HTTP client: {}", e)))
 }
