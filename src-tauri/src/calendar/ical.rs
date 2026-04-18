@@ -89,6 +89,13 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
         .replace("\r\n\t", "")  // Unfold CRLF + tab
         .replace("\r\n", "\n"); // Normalize remaining CRLF to LF
 
+    // Exchange/Outlook emit DESCRIPTION;ALTREP="data:text/html,...":plain text
+    // where the quoted value contains raw unescaped " chars (RFC-violating but
+    // common in the wild). The strict icalendar parser fails with
+    // "Satisfy at: BEGIN:VEVENT" when it encounters this. We don't use ALTREP,
+    // so strip the parameter entirely before parsing.
+    let normalized = strip_altrep_params(&normalized);
+
     // Use the icalendar parser to get structured components
     let components = match icalendar::parser::read_calendar_simple(&normalized) {
         Ok(components) => components,
@@ -311,6 +318,71 @@ pub fn generate_invite(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Remove `;ALTREP=...` parameters from every property line.
+///
+/// Real-world Exchange/Outlook invites embed raw unescaped `"` characters
+/// inside `ALTREP="data:text/html,..."` (HTML attributes like `class="foo"`).
+/// This violates RFC 5545 §3.1 (`QSAFE-CHAR` excludes `"`) and causes strict
+/// parsers to reject the whole VEVENT. We don't use the ALTREP value, so it's
+/// simplest to drop the parameter before parsing.
+fn strip_altrep_params(ical: &str) -> String {
+    let mut out = String::with_capacity(ical.len());
+    for line in ical.split_inclusive('\n') {
+        out.push_str(&strip_altrep_from_line(line));
+    }
+    out
+}
+
+fn strip_altrep_from_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let Some(start) = lower.find(";altrep=") else {
+        return line.to_string();
+    };
+    let after_eq = start + ";altrep=".len();
+    let bytes = line.as_bytes();
+    let end = altrep_value_end(bytes, after_eq);
+    let mut result = String::with_capacity(line.len());
+    result.push_str(&line[..start]);
+    result.push_str(&line[end..]);
+    result
+}
+
+/// Given a line and the offset just after `;ALTREP=`, return the offset where
+/// the parameter value ends. Handles both quoted and unquoted forms and
+/// tolerates raw `"` inside the quoted value by only treating `"` followed by
+/// `;`, `:`, or end-of-line as the real closer.
+fn altrep_value_end(bytes: &[u8], after_eq: usize) -> usize {
+    if after_eq >= bytes.len() {
+        return bytes.len();
+    }
+    if bytes[after_eq] == b'"' {
+        let mut i = after_eq + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => match bytes.get(i + 1) {
+                    Some(b';') | Some(b':') | Some(b'\r') | Some(b'\n') | None => {
+                        return i + 1;
+                    }
+                    _ => {}
+                },
+                b'\n' => return i,
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
+    } else {
+        let mut i = after_eq;
+        while i < bytes.len() {
+            match bytes[i] {
+                b';' | b':' | b'\r' | b'\n' => return i,
+                _ => i += 1,
+            }
+        }
+        bytes.len()
+    }
+}
 
 /// Find a property value by name on a parser component.
 fn find_property_value(
@@ -673,6 +745,84 @@ END:VCALENDAR";
         assert_eq!(inv.summary, Some("Yo food".to_string()));
         assert_eq!(inv.method, "REQUEST");
         assert!(inv.organizer_email.as_deref() == Some("chithiapp@outlook.com"));
+    }
+
+    #[test]
+    fn test_parse_ical_with_altrep_description() {
+        // Regression for issue #46. Real Exchange/Outlook DESCRIPTION lines
+        // embed an ALTREP="data:text/html,..." payload whose HTML contains raw
+        // double-quote characters (e.g. <p class="foo">). The quoted param
+        // value therefore contains unescaped " chars, which the strict
+        // icalendar parser rejects with "Satisfy at: BEGIN:VEVENT". The event
+        // also uses RFC 5545 line folding (CRLF + space).
+        let ical = "BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+PRODID:Microsoft Exchange Server 2010\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:bob@exam\r\n ple.com\r\n\
+DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<html><body><p class=\"gre\r\n eting\">Hello, world: this is <b>bold</b></p></body></html>\":Plain text fall\r\n back description\r\n\
+UID:altrep-test-uid\r\n\
+SUMMARY:Meeting with ALTREP description\r\n\
+DTSTART;TZID=UTC:20260414T170000\r\n\
+DTEND;TZID=UTC:20260414T180000\r\n\
+DTSTAMP:20260413T132342Z\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1, "Should parse 1 invite with ALTREP DESCRIPTION");
+        let inv = &invites[0];
+        assert_eq!(inv.uid, "altrep-test-uid");
+        assert_eq!(inv.summary, Some("Meeting with ALTREP description".to_string()));
+        assert_eq!(
+            inv.description,
+            Some("Plain text fallback description".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_altrep_quoted_with_inner_quotes() {
+        let line = "DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out, "DESCRIPTION;LANGUAGE=en-US:plain\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_quoted_well_formed() {
+        let line = "DESCRIPTION;ALTREP=\"cid:part1\":hello\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out, "DESCRIPTION:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_followed_by_other_param() {
+        let line = "DESCRIPTION;ALTREP=\"cid:part1\";LANGUAGE=en:hello\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out, "DESCRIPTION;LANGUAGE=en:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_case_insensitive() {
+        let line = "DESCRIPTION;altrep=\"cid:part1\":hello\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out, "DESCRIPTION:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_unquoted() {
+        let line = "DESCRIPTION;ALTREP=cid:part1:hello\n";
+        let out = strip_altrep_from_line(line);
+        // Unquoted terminates at first ':' per RFC 5545 §3.1
+        assert_eq!(out, "DESCRIPTION:part1:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_line_without_altrep() {
+        let line = "SUMMARY:Team Standup\n";
+        assert_eq!(strip_altrep_from_line(line), line);
     }
 
     #[test]
