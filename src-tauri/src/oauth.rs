@@ -863,6 +863,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_microsoft_provider_config() {
         assert_eq!(MICROSOFT.name, "microsoft");
         assert!(MICROSOFT.use_pkce);
@@ -872,6 +873,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_google_provider_pkce() {
         assert_eq!(GOOGLE.name, "google");
         assert!(GOOGLE.use_pkce);
