@@ -6,6 +6,7 @@ import type { AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import PasswordInput from "@/components/common/PasswordInput.vue";
+import { acctColor } from "@/lib/account-colors";
 
 const router = useRouter();
 const accountsStore = useAccountsStore();
@@ -17,12 +18,6 @@ const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
 const oauthStatus = ref<string | null>(null);
 const oauthInProgress = ref(false);
-
-const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
-
-function getAvatarColor(index: number): string {
-  return avatarColors[index % avatarColors.length];
-}
 
 function getInitials(name: string): string {
   const words = name.split(/\s+/);
@@ -341,18 +336,19 @@ async function doDelete() {
 
       <div class="account-list">
         <div
-          v-for="(account, idx) in accountsStore.accounts"
+          v-for="account in accountsStore.accounts"
           :key="account.id"
           class="account-card"
+          :style="{ '--acct-color': acctColor(account.id).fill } as Record<string, string>"
         >
           <div class="account-card-left">
-            <span class="account-avatar" :style="{ background: getAvatarColor(idx) }">
+            <span class="account-avatar" :style="{ background: acctColor(account.id).fill }">
               {{ getInitials(account.display_name) }}
             </span>
             <div class="account-card-info">
               <span class="account-card-name">{{ account.display_name }}</span>
               <span class="account-card-email">{{ account.email }}</span>
-              <span class="account-card-type">{{ account.provider === 'gmail' ? 'Gmail' : account.provider === 'o365' ? 'Microsoft 365' : account.mail_protocol.toUpperCase() }}</span>
+              <span class="account-card-type" :style="{ color: acctColor(account.id).fill }">{{ account.provider === 'gmail' ? 'Gmail' : account.provider === 'o365' ? 'Microsoft 365' : account.mail_protocol.toUpperCase() }}</span>
             </div>
           </div>
           <div class="account-card-actions">
@@ -655,10 +651,12 @@ async function doDelete() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px;
-  border: 0.8px solid var(--color-border);
-  border-radius: 10px;
-  background: var(--color-bg-secondary);
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-left: 4px solid var(--acct-color, var(--color-accent));
+  border-radius: var(--radius);
+  background: #fff;
+  box-shadow: var(--shadow-sm);
   min-height: 100px;
 }
 
@@ -726,11 +724,11 @@ async function doDelete() {
 }
 
 .icon-btn-sm.danger {
-  color: var(--color-danger);
+  color: #c2410c; /* warm red per PATCHES §9, not raw danger */
 }
 
 .icon-btn-sm.danger:hover {
-  background: rgba(220, 53, 69, 0.08);
+  background: rgba(194, 65, 12, 0.08);
 }
 
 /* Modal */
@@ -882,8 +880,8 @@ async function doDelete() {
 }
 
 .type-btn.active {
-  background: rgba(43, 127, 255, 0.1);
-  border-color: #2b7fff;
+  background: var(--color-accent-light);
+  border-color: var(--color-accent);
   color: var(--color-accent);
 }
 

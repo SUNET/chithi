@@ -31,30 +31,53 @@
   src: url("../fonts/LiberationMono-Regular.ttf") format("truetype");
 }
 
-/* === Light theme (default) === */
+/* === Light theme (warm-amber redesign — see PATCHES.md §1) === */
 :root,
 [data-theme="light"] {
-  --color-bg: #fafafa;
-  --color-bg-secondary: #f5f5f5;
-  --color-bg-tertiary: #e5e5e5;
-  --color-bg-hover: #e5e5e5;
-  --color-bg-active: #e5e5e5;
-  --color-text: #171717;
-  --color-text-secondary: #525252;
-  --color-text-muted: #737373;
-  --color-border: #d4d4d4;
-  --color-accent: #155dfc;
-  --color-accent-hover: #1250d4;
-  --color-accent-light: rgba(21, 93, 252, 0.08);
-  --color-unread: #171717;
+  --color-bg: #faf7f2;              /* warm off-white ground */
+  --color-bg-secondary: #f4efe6;    /* sidebar ground, amber-tint */
+  --color-bg-tertiary: #ede6d8;     /* rail, slightly deeper */
+  --color-bg-hover: #fdf4e7;        /* row hover */
+  --color-bg-active: #fbe7cf;       /* selected row / active folder */
+  --color-text: #1f1914;            /* near-black warm */
+  --color-text-secondary: #5b4e3d;
+  --color-text-muted: #8a7a64;
+  --color-border: #d9cdb5;          /* assertive warm border */
+  --color-accent: #b54708;          /* deep amber */
+  --color-accent-hover: #9a3c06;
+  --color-accent-light: #fbe7cf;
+  --color-unread: #1f1914;
   --color-danger: #fb2c36;
   --color-danger-text: #e7000b;
   --color-success: #00a63e;
   --color-warning: #e17100;
   --color-email-body-bg: #ffffff;
   --color-email-body-text: #1a1a1a;
-  --color-status-dot: #00c950;
+  --color-status-dot: #6ca04f;      /* sync green */
   --color-reader-bg: #ffffff;
+
+  --color-border-heavy: #a6927a;
+  --color-divider:      #e9e0cd;
+  --color-star-flag:    #c2410c;
+  --color-sync-green:   #6ca04f;
+
+  /* Per-account palette — picked deterministically by UID hash
+   * (NOT by provider type, since users can have N accounts on the
+   * same provider). 7 warm-palette entries, rotated by index. */
+  --acct-1: #b54708; --acct-1-soft: #fef3e2;  /* amber */
+  --acct-2: #6d8a3a; --acct-2-soft: #eef2dc;  /* olive */
+  --acct-3: #b8404d; --acct-3-soft: #fbe0e3;  /* rose */
+  --acct-4: #8a6a3a; --acct-4-soft: #f3ead7;  /* clay */
+  --acct-5: #2c7a7b; --acct-5-soft: #d8eeee;  /* teal */
+  --acct-6: #7a3a7a; --acct-6-soft: #f0e0f0;  /* plum */
+  --acct-7: #3a5a8a; --acct-7-soft: #dbe5f0;  /* indigo */
+
+  /* Calendar-only accent (e.g. seeded "Holidays" calendar) */
+  --acct-holidays: #8a6a3a;
+
+  --radius: 6px;
+  --shadow-sm:  0 1px 2px rgba(30,20,10,0.06);
+  --shadow-mdl: 0 16px 48px rgba(30,20,10,0.24);
 
   --sidebar-width: 56px;
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,

@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { acctColor } from "@/lib/account-colors";
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
@@ -473,7 +474,7 @@ async function send() {
 
     <!-- Toolbar -->
     <div class="compose-toolbar">
-      <button class="toolbar-btn" :class="{ disabled: !canSend }" :disabled="!canSend" data-testid="compose-send" @click="send">
+      <button class="toolbar-btn compose-send" :class="{ disabled: !canSend }" :disabled="!canSend" data-testid="compose-send" @click="send">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
         </svg>
@@ -520,6 +521,12 @@ async function send() {
       <div class="compose-fields">
         <div class="field-row">
           <label class="field-label">From</label>
+          <span
+            v-if="selectedAccountId"
+            class="from-swatch"
+            :style="{ background: acctColor(selectedAccountId).fill }"
+            aria-hidden="true"
+          ></span>
           <select v-model="selectedAccountId" class="field-select" data-testid="compose-account-select">
             <option v-for="acc in accounts" :key="acc.id" :value="acc.id">
               {{ acc.display_name }} &lt;{{ acc.email }}&gt;
@@ -724,6 +731,17 @@ async function send() {
   opacity: 0.5;
 }
 
+.toolbar-btn.compose-send:not(.disabled):not(:disabled) {
+  background: var(--color-accent-light);
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.toolbar-btn.compose-send.disabled,
+.toolbar-btn.compose-send:disabled {
+  opacity: 0.55;
+}
+
 .toolbar-spacer {
   flex: 1;
 }
@@ -757,6 +775,14 @@ async function send() {
   align-items: center;
   gap: 12px;
   height: 32px;
+}
+
+.from-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  margin-left: -4px;
 }
 
 .field-label {
@@ -879,15 +905,14 @@ async function send() {
   height: 24px;
   padding: 0 6px;
   font-size: 12px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
+  font-weight: 600;
+  color: var(--color-accent);
   border-radius: 4px;
   transition: all 0.12s;
 }
 
 .cc-btn:hover {
   background: var(--color-bg-hover);
-  color: var(--color-text);
 }
 
 .compose-divider {
@@ -901,9 +926,10 @@ async function send() {
   flex: 1;
   margin: 13px 16px 16px;
   padding: 12px;
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg-secondary);
+  /* Always-visible amber focus ring per PATCHES §11 */
+  border: 2px solid var(--color-accent);
+  border-radius: var(--radius);
+  background: var(--color-reader-bg);
   font-size: 14px;
   line-height: 1.6;
   resize: none;

@@ -118,11 +118,18 @@ function isReply(): boolean {
 }
 
 .thread-row.selected {
-  background: #3b82f633;
+  background: var(--color-bg-active);
+  box-shadow: inset 3px 0 0 var(--color-accent);
 }
 
 .thread-row.selected:hover {
-  background: #3b82f644;
+  background: var(--color-bg-active);
+}
+
+.thread-row.unread .col-subject,
+.thread-row.unread .col-from {
+  font-weight: 700;
+  color: var(--color-text);
 }
 
 .col {
@@ -186,7 +193,7 @@ function isReply(): boolean {
 }
 
 .icon-star.starred {
-  color: var(--color-warning);
+  color: var(--color-star-flag);
 }
 
 .col-subject {

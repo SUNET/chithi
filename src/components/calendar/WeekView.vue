@@ -687,7 +687,7 @@ onUnmounted(() => {
   left: -1px;
   right: 0;
   height: 2px;
-  background: #ea4335;
+  background: var(--color-accent);
   z-index: 5;
   pointer-events: none;
 }
@@ -695,11 +695,11 @@ onUnmounted(() => {
 .now-marker::before {
   content: "";
   position: absolute;
-  left: -5px;
-  top: -4px;
-  width: 10px;
-  height: 10px;
-  background: #ea4335;
+  left: -4px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  background: var(--color-accent);
   border-radius: 50%;
 }
 
@@ -707,19 +707,19 @@ onUnmounted(() => {
 .event-block {
   position: absolute;
   font-size: 11px;
-  color: white;
+  color: #fff;
   padding: 3px 6px;
   border-radius: 4px;
   cursor: pointer;
   overflow: hidden;
   line-height: 1.3;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.15);
   transition: box-shadow 0.15s, transform 0.1s;
   box-sizing: border-box;
 }
 
 .event-block:hover {
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.15), 0 2px 6px rgba(30,20,10,0.18);
   transform: translateY(-1px);
 }
 

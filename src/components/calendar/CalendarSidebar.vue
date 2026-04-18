@@ -342,9 +342,9 @@ async function unsubscribeThisCalendar() {
 }
 
 .calendar-color {
-  width: 12px;
-  height: 12px;
-  border-radius: 3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
   flex-shrink: 0;
 }
 

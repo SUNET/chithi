@@ -170,7 +170,7 @@ async function syncAll() {
   align-items: center;
   gap: 4px;
   font-size: 11px;
-  color: var(--color-text-secondary);
+  color: var(--color-text-muted);
   padding: 2px 6px;
   border-radius: 4px;
   transition: background 0.12s;
@@ -198,7 +198,8 @@ async function syncAll() {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--color-status-dot);
+  background: var(--color-sync-green);
+  box-shadow: 0 0 0 2px rgba(108, 160, 79, 0.2);
   flex-shrink: 0;
 }
 
