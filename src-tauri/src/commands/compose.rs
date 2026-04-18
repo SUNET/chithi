@@ -61,15 +61,18 @@ pub async fn send_message(
 
     // --- Synchronous part: validate, read attachments, build message ---
     // This is fast (local I/O only) so the compose window waits for it.
-    // Tokens are consumed: once send has read the files, the mapping is
-    // gone and the renderer cannot refer to them again.
+    // We *peek* tokens for the build so a failure here (e.g. file
+    // removed between pick and send) leaves the registry intact and the
+    // user can fix it and retry. Tokens are released only after the
+    // message bytes are safely persisted to the outbox; from that point
+    // on the outbox owns retry.
     let tokens: Vec<String> = message
         .attachments
         .iter()
         .map(|a| a.token.clone())
         .collect();
     let names: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
-    let paths = crate::commands::attachments::consume_tokens(&state, &tokens)?;
+    let paths = crate::commands::attachments::peek_tokens(&state, &tokens)?;
     let attachment_data = build_attachment_data(&paths, &names)?;
     let raw_message = smtp::build_raw_message(
         &account.email,
@@ -142,6 +145,12 @@ pub async fn send_message(
         outbox_id,
         account_id
     );
+
+    // From here on the outbox owns the payload — the attachment bytes
+    // are already inlined in raw_message. Releasing tokens is safe even
+    // if the background send retries, and prevents the registry from
+    // leaking paths for the lifetime of the process.
+    crate::commands::attachments::release_tokens(&state, &tokens);
 
     // --- Background: actual network send ---
     // The command returns Ok(()) here so the compose window can close.

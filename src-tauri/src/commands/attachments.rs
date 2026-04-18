@@ -142,17 +142,34 @@ pub fn release_attachment(state: State<'_, AppState>, token: String) -> Result<(
 /// paths in the same order. Unknown tokens produce an error so a
 /// compromised renderer cannot inject bogus handles into a send.
 ///
-/// Intended to be called once per send from the compose flow.
+/// Atomic under the registry lock: either every token is validated and
+/// removed, or the call errors out and the registry is unchanged. This
+/// keeps retries viable when the caller mixes a valid bunch with one
+/// stale token.
 pub fn consume_tokens(state: &AppState, tokens: &[String]) -> Result<Vec<std::path::PathBuf>> {
     let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = Vec::with_capacity(tokens.len());
     for t in tokens {
-        let path = reg
-            .remove(t)
-            .ok_or_else(|| Error::Other("Unknown or expired attachment token".to_string()))?;
-        out.push(path);
+        if !reg.contains_key(t) {
+            return Err(Error::Other(
+                "Unknown or expired attachment token".to_string(),
+            ));
+        }
     }
-    Ok(out)
+    Ok(tokens
+        .iter()
+        .map(|t| reg.remove(t).expect("contains_key checked above"))
+        .collect())
+}
+
+/// Release the given tokens, ignoring any that are unknown. Useful for
+/// best-effort cleanup (e.g. after a successful send has persisted the
+/// message bytes elsewhere). Unlike `consume_tokens`, this does not
+/// fail on stale tokens.
+pub fn release_tokens(state: &AppState, tokens: &[String]) {
+    let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
+    for t in tokens {
+        reg.remove(t);
+    }
 }
 
 /// Look up the given tokens *without* removing them. Used by drafts:
