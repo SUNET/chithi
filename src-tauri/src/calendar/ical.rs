@@ -84,12 +84,17 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
 
     // Normalize line endings and unfold continuation lines.
     // Microsoft Exchange sends \r\n (CRLF) with RFC 5545 line folding
-    // (long lines split with CRLF + space/tab). The icalendar crate
-    // parser doesn't handle folded lines, so we must unfold first.
+    // (long lines split with CRLF + space/tab). Radicale and many
+    // Thunderbird-exported calendars emit LF-only line endings with
+    // LF-based folds. The icalendar parser handles neither, so we
+    // unfold both forms — CRLF folds first, then anything remaining
+    // after CRLF→LF normalization is treated as LF folding.
     let normalized = ical_text
         .replace("\r\n ", "")   // Unfold CRLF + space
         .replace("\r\n\t", "")  // Unfold CRLF + tab
-        .replace("\r\n", "\n"); // Normalize remaining CRLF to LF
+        .replace("\r\n", "\n")  // Normalize remaining CRLF to LF
+        .replace("\n ", "")     // Unfold LF + space
+        .replace("\n\t", "");   // Unfold LF + tab
 
     // Exchange/Outlook emit DESCRIPTION;ALTREP="data:text/html,...":plain text
     // where the quoted value contains raw unescaped " chars (RFC-violating but
@@ -875,6 +880,40 @@ END:VCALENDAR";
         assert_eq!(inv.summary, Some("Yo food".to_string()));
         assert_eq!(inv.method, "REQUEST");
         assert!(inv.organizer_email.as_deref() == Some("chithiapp@outlook.com"));
+    }
+
+    #[test]
+    fn test_parse_ical_with_lf_line_folding() {
+        // Regression for issue #70. Radicale / Thunderbird-exported calendars
+        // use LF-only line endings with LF-based folds (\n<space>). The old
+        // unfolder only handled CRLF folds, so continuation lines survived
+        // and the strict icalendar parser failed at the next BEGIN marker
+        // with "Satisfy at: BEGIN:VEVENT".
+        let ical = "BEGIN:VCALENDAR\n\
+VERSION:2.0\n\
+PRODID:-//Mozilla.org/NONSGML Mozilla Calendar V1.1//EN\n\
+BEGIN:VEVENT\n\
+UID:lf-fold-test\n\
+DTSTART;TZID=Europe/Stockholm:20240815T100000\n\
+DTEND;TZID=Europe/Stockholm:20240815T110000\n\
+ATTENDEE;CN=Example User;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:exampleus\n er@example.com\n\
+SUMMARY:Folded attendee\n\
+STATUS:CONFIRMED\n\
+X-MOZ-GENERATION:1\n\
+END:VEVENT\n\
+END:VCALENDAR\n";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(
+            invites.len(),
+            1,
+            "LF-folded VEVENT should parse after unfold"
+        );
+        let inv = &invites[0];
+        assert_eq!(inv.uid, "lf-fold-test");
+        assert_eq!(inv.summary, Some("Folded attendee".to_string()));
+        assert_eq!(inv.attendees.len(), 1);
+        assert_eq!(inv.attendees[0].email, "exampleuser@example.com");
     }
 
     #[test]
