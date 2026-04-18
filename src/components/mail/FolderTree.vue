@@ -7,6 +7,7 @@ import type { Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
 import { showToast, dismissToast } from "@/lib/toast";
+import { acctColor } from "@/lib/account-colors";
 
 const foldersStore = useFoldersStore();
 const accountsStore = useAccountsStore();
@@ -85,21 +86,6 @@ const newFolderSaving = ref(false);
 const newFolderError = ref<string | null>(null);
 const deletingFolder = ref<{ accountId: string; folder: Folder } | null>(null);
 
-// Predefined avatar colors for accounts
-const avatarColors = ["#3366cc", "#2e7d32", "#9c27b0", "#e65100", "#00838f"];
-
-function getAvatarColor(index: number): string {
-  return avatarColors[index % avatarColors.length];
-}
-
-function getInitials(name: string): string {
-  const words = name.split(/\s+/);
-  if (words.length >= 2) {
-    return (words[0][0] + words[1][0]).toUpperCase();
-  }
-  return name.slice(0, 2).toUpperCase();
-}
-
 function folderIcon(folder: Folder): string {
   switch (folder.folder_type) {
     case "inbox": return "inbox";
@@ -108,6 +94,7 @@ function folderIcon(folder: Folder): string {
     case "trash": return "trash";
     case "junk": return "spam";
     case "archive": return "archive";
+    case "outbox": return "outbox";
     default: return "folder";
   }
 }
@@ -378,7 +365,7 @@ async function doDeleteFolder() {
 <template>
   <div class="folder-tree" @click="closeContextMenu">
     <div
-      v-for="(account, idx) in accountsStore.accounts"
+      v-for="account in accountsStore.accounts"
       :key="account.id"
       class="account-section"
     >
@@ -388,8 +375,15 @@ async function doDeleteFolder() {
         @click="toggleAccountCollapse(account.id)"
         @contextmenu="onAccountContextMenu($event, account.id)"
       >
-        <span class="account-avatar" :style="{ background: getAvatarColor(idx) }">
-          {{ getInitials(account.display_name) }}
+        <span
+          class="account-avatar"
+          :style="{
+            background: acctColor(account.id).soft,
+            color: acctColor(account.id).fill,
+            boxShadow: 'inset 0 0 0 1.5px ' + acctColor(account.id).fill,
+          }"
+        >
+          {{ account.email.slice(0, 1).toUpperCase() }}
         </span>
         <span class="account-info">
           <span class="account-name">{{ account.display_name }}</span>
@@ -443,31 +437,45 @@ async function doDeleteFolder() {
           </span>
           <span v-else class="folder-toggle-spacer"></span>
 
-          <!-- Folder icons as SVG -->
-          <svg v-if="folderIcon(item.folder) === 'inbox'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-            <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'sent'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 18l6-6-6-6" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'drafts'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'trash'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'spam'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'archive'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="21 8 21 21 3 21 3 8" /><rect x="1" y="3" width="22" height="5" /><line x1="10" y1="12" x2="14" y2="12" />
-          </svg>
-          <svg v-else-if="folderIcon(item.folder) === 'starred'" class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-          </svg>
-          <svg v-else class="folder-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+          <!-- Folder icons as SVG — filled, per-type color (PATCHES.md §2) -->
+          <svg
+            class="folder-svg"
+            :class="'folder-svg--' + folderIcon(item.folder)"
+            width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
+          >
+            <template v-if="folderIcon(item.folder) === 'inbox'">
+              <path fill="currentColor" d="M3 13h4l1.5 2h7L17 13h4v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>
+              <path fill="currentColor" opacity=".55" d="M7 4h10l3 8h-5l-1.5 2h-3L9 12H4l3-8Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'sent'">
+              <path fill="currentColor" d="M21 3 3 11l7 2 2 7 9-17Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'drafts'">
+              <path fill="currentColor" opacity=".55" d="M5 3h10l4 4v14H5V3Z"/>
+              <path fill="currentColor" d="m14 8 3 3-6.5 6.5H8V15l6-7Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'trash'">
+              <path fill="currentColor" d="M6 7h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7Z"/>
+              <path fill="currentColor" d="M9 4h6l1 3H8l1-3Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'spam'">
+              <path fill="currentColor" d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/>
+              <path fill="#fff" d="M11 7h2v6h-2V7Zm0 8h2v2h-2v-2Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'archive'">
+              <path fill="currentColor" opacity=".55" d="M3 4h18v4H3V4Z"/>
+              <path fill="currentColor" d="M4 9h16v11H4V9Zm5 3h6v2H9v-2Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'outbox'">
+              <path fill="currentColor" d="M3 13h5l1 2h6l1-2h5v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>
+              <path fill="currentColor" opacity=".55" d="m12 3 5 6h-3v4h-4V9H7l5-6Z"/>
+            </template>
+            <template v-else-if="folderIcon(item.folder) === 'starred'">
+              <path fill="currentColor" d="m12 2 3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7l3-7Z"/>
+            </template>
+            <template v-else>
+              <path fill="currentColor" d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Z"/>
+            </template>
           </svg>
 
           <span class="folder-name">{{ item.folder.name }}</span>
@@ -609,14 +617,13 @@ async function doDeleteFolder() {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  color: white;
+  /* color + background + boxShadow are set inline per-account via acctColor() */
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   flex-shrink: 0;
-  letter-spacing: 0.5px;
 }
 
 .account-info {
@@ -678,9 +685,9 @@ async function doDeleteFolder() {
   color: var(--color-accent);
 }
 
-.folder-item.active .folder-svg {
-  color: var(--color-accent);
-}
+/* Folder icons keep their type hue at all times — active state is
+ * communicated by row background + text weight, not icon color (PATCHES.md §2). */
+.folder-item.active .folder-svg { /* intentionally empty */ }
 
 .folder-item.syncing {
   opacity: 0.6;
@@ -713,10 +720,17 @@ async function doDeleteFolder() {
   flex-shrink: 0;
 }
 
-.folder-svg {
-  flex-shrink: 0;
-  color: var(--color-text-muted);
-}
+.folder-svg { flex-shrink: 0; }
+
+.folder-svg--inbox    { color: #b54708; }
+.folder-svg--drafts   { color: #9f5a00; }
+.folder-svg--sent     { color: #7a5c0f; }
+.folder-svg--spam     { color: #a03912; }
+.folder-svg--trash    { color: #8a3a24; }
+.folder-svg--archive  { color: #6b4226; }
+.folder-svg--outbox   { color: #b8404d; }
+.folder-svg--starred  { color: #c2410c; }
+.folder-svg--folder   { color: #8a8079; }  /* user folders, neutral */
 
 .folder-name {
   flex: 1;

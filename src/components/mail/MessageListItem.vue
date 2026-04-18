@@ -111,11 +111,22 @@ function isReply(subject: string | null, flags: string[]): boolean {
 }
 
 .message-row.selected {
-  background: #3b82f633;
+  background: var(--color-bg-active);
+  box-shadow: inset 3px 0 0 var(--color-accent);
 }
 
 .message-row.selected:hover {
-  background: #3b82f644;
+  background: var(--color-bg-active);
+}
+
+.message-row.unread .col-subject,
+.message-row.unread .col-from {
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.icon-star.starred {
+  color: var(--color-star-flag);
 }
 
 .col {
@@ -164,10 +175,6 @@ function isReply(subject: string | null, flags: string[]): boolean {
   font-size: 13px;
   color: var(--color-text-muted);
   cursor: pointer;
-}
-
-.icon-star.starred {
-  color: var(--color-warning);
 }
 
 .col-subject {

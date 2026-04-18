@@ -80,7 +80,7 @@ function handleNavClick(item: typeof topItems[0]) {
 <style scoped>
 .sidebar {
   width: var(--sidebar-width);
-  background: var(--color-bg-secondary);
+  background: var(--color-bg-tertiary);
   border-right: 0.8px solid var(--color-border);
   display: flex;
   flex-direction: column;
@@ -100,7 +100,7 @@ function handleNavClick(item: typeof topItems[0]) {
 .sidebar-item {
   width: 36px;
   height: 36px;
-  border-radius: 10px;
+  border-radius: var(--radius);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -114,7 +114,7 @@ function handleNavClick(item: typeof topItems[0]) {
 }
 
 .sidebar-item.active {
-  color: white;
+  color: #fff;
   background: var(--color-accent);
 }
 </style>

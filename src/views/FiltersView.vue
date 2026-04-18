@@ -213,9 +213,11 @@ const opLabels: Record<string, string> = {
           </button>
         </div>
         <div v-if="filtersStore.filters.length === 0" class="empty-list">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3">
-            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-          </svg>
+          <span class="empty-glyph">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+            </svg>
+          </span>
           <span>No filters configured</span>
           <span class="empty-hint">Create your first filter to automatically organize incoming mail</span>
         </div>
@@ -537,11 +539,23 @@ const opLabels: Record<string, string> = {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   padding: 48px 24px;
   color: var(--color-text-muted);
   font-size: 13px;
   text-align: center;
+}
+
+.empty-glyph {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
 }
 
 .empty-hint {
@@ -578,22 +592,24 @@ const opLabels: Record<string, string> = {
 .btn-apply {
   width: 100%;
   height: 32px;
-  background: var(--color-bg-hover);
-  color: var(--color-text);
+  background: var(--color-accent);
+  color: #fff;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius);
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
 }
 
-.btn-apply:hover {
-  background: var(--color-bg-active);
+.btn-apply:hover:not(:disabled) {
+  background: var(--color-accent-hover);
 }
 
 .btn-apply:disabled {
-  opacity: 0.5;
-  cursor: default;
+  background: #ede2cc;
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  opacity: 1;
 }
 
 .apply-result {

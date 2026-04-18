@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useAccountsStore } from "@/stores/accounts";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { acctColor } from "@/lib/account-colors";
 
 const accountsStore = useAccountsStore();
 
@@ -16,10 +17,11 @@ const showForm = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingContactId = ref<string | null>(null);
 
-// Book colors
-const bookColors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444", "#06b6d4"];
-function getBookColor(idx: number): string {
-  return bookColors[idx % bookColors.length];
+// Per-book / per-contact color is derived from the owning account's UID
+// (see src/lib/account-colors.ts) so two books on the same provider get
+// distinct colors.
+function bookAccountId(bookId: string): string {
+  return contactBooks.value.find((b) => b.id === bookId)?.account_id ?? "";
 }
 
 // Form state
@@ -278,13 +280,20 @@ function getAccountName(accountId: string): string {
       <!-- Left: Contact Books -->
       <div class="books-sidebar" data-testid="contacts-book-select">
         <div
-          v-for="(book, idx) in contactBooks"
+          v-for="book in contactBooks"
           :key="book.id"
           class="book-item"
           :class="{ active: selectedBookId === book.id }"
           @click="selectedBookId = book.id"
         >
-          <span class="book-avatar" :style="{ background: getBookColor(idx) }">
+          <span
+            class="book-avatar"
+            :style="{
+              background: acctColor(book.account_id).soft,
+              color: acctColor(book.account_id).fill,
+              boxShadow: 'inset 0 0 0 1.5px ' + acctColor(book.account_id).fill,
+            }"
+          >
             {{ book.name.charAt(0).toUpperCase() }}
           </span>
           <span class="book-info">
@@ -311,7 +320,10 @@ function getAccountName(accountId: string): string {
             :data-testid="`contact-${contact.id}`"
             @click="selectContact(contact)"
           >
-            <div class="contact-avatar">{{ contact.display_name.charAt(0).toUpperCase() }}</div>
+            <div
+              class="contact-avatar"
+              :style="{ background: acctColor(bookAccountId(contact.book_id)).fill }"
+            >{{ contact.display_name.charAt(0).toUpperCase() }}</div>
             <div class="contact-info">
               <span class="contact-name">{{ contact.display_name }}</span>
               <span class="contact-email">{{ parseEmails(contact.emails_json)[0]?.email ?? "" }}</span>
@@ -328,7 +340,10 @@ function getAccountName(accountId: string): string {
       <div class="detail-panel">
         <template v-if="selectedContact">
           <div class="detail-header">
-            <div class="detail-avatar">{{ selectedContact.display_name.charAt(0).toUpperCase() }}</div>
+            <div
+              class="detail-avatar"
+              :style="{ background: acctColor(bookAccountId(selectedContact.book_id)).fill }"
+            >{{ selectedContact.display_name.charAt(0).toUpperCase() }}</div>
             <div class="detail-info">
               <h2 data-testid="contact-detail-name">{{ selectedContact.display_name }}</h2>
               <span v-if="selectedContact.organization" class="detail-org">
@@ -521,14 +536,14 @@ function getAccountName(accountId: string): string {
   gap: 6px;
   height: 32px;
   padding: 0 12px;
-  background: #00a63e;
-  color: white;
-  border-radius: 4px;
+  background: var(--color-sync-green);
+  color: #fff;
+  border-radius: var(--radius);
   font-size: 14px;
   font-weight: 500;
-  transition: background 0.12s;
+  transition: filter 0.12s;
 }
-.btn-sync:hover { background: #008f35; }
+.btn-sync:hover { filter: brightness(0.92); }
 .btn-sync:disabled { opacity: 0.7; }
 .spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -562,18 +577,20 @@ function getAccountName(accountId: string): string {
   margin-bottom: 2px;
 }
 .book-item:hover { background: var(--color-bg-hover); }
-.book-item.active { background: var(--color-bg-tertiary); }
+.book-item.active {
+  background: var(--color-accent-light);
+  border: 1px solid var(--color-border);
+}
 
 .book-avatar {
-  width: 24px;
-  height: 24px;
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
-  color: white;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   flex-shrink: 0;
 }
 
@@ -650,18 +667,21 @@ function getAccountName(accountId: string): string {
   transition: background 0.12s;
 }
 .contact-row:hover { background: var(--color-bg-hover); }
-.contact-row.active { background: var(--color-bg-tertiary); }
+.contact-row.active {
+  background: var(--color-bg-active);
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
 
 .contact-avatar {
-  width: 48px;
-  height: 48px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
-  background: var(--color-accent);
-  color: white;
+  /* background set inline by acctColor() */
+  color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   flex-shrink: 0;
 }
@@ -697,8 +717,8 @@ function getAccountName(accountId: string): string {
   width: 56px;
   height: 56px;
   border-radius: 50%;
-  background: var(--color-accent);
-  color: white;
+  /* background set inline by acctColor() */
+  color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
