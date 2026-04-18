@@ -865,7 +865,7 @@ mod tests {
     #[test]
     fn test_microsoft_provider_config() {
         assert_eq!(MICROSOFT.name, "microsoft");
-        assert!(MICROSOFT.use_pkce);
+        const { assert!(MICROSOFT.use_pkce) };
         assert!(MICROSOFT.client_secret.is_empty());
         assert!(MICROSOFT.auth_url.contains("login.microsoftonline.com"));
         assert!(MICROSOFT.token_url.contains("login.microsoftonline.com"));
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn test_google_provider_pkce() {
         assert_eq!(GOOGLE.name, "google");
-        assert!(GOOGLE.use_pkce);
+        const { assert!(GOOGLE.use_pkce) };
         // Google Desktop app clients have a secret (not truly confidential)
         assert!(!GOOGLE.client_secret.is_empty());
     }

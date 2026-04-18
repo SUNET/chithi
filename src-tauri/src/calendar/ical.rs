@@ -575,6 +575,87 @@ fn extract_mailto(val: &str) -> Option<String> {
     }
 }
 
+/// Compute an end datetime from a start datetime and an iCalendar DURATION.
+///
+/// Handles simple durations like PT1H, PT30M, P1D, PT1H30M.
+fn compute_end_from_duration(dtstart: &str, duration: &str) -> String {
+    // Try to parse dtstart as a chrono DateTime
+    if let Ok(start) = chrono::DateTime::parse_from_rfc3339(dtstart) {
+        if let Some(dur) = parse_ical_duration(duration) {
+            let end = start + dur;
+            return end.to_rfc3339();
+        }
+    }
+
+    // Try parsing without timezone (e.g., "2025-04-15T10:00:00")
+    if let Ok(start) = chrono::NaiveDateTime::parse_from_str(dtstart, "%Y-%m-%dT%H:%M:%S") {
+        if let Some(dur) = parse_ical_duration(duration) {
+            let end = start + dur;
+            return end.format("%Y-%m-%dT%H:%M:%S").to_string();
+        }
+    }
+
+    // Fallback
+    dtstart.to_string()
+}
+
+/// Parse an iCalendar DURATION value like "PT1H30M", "P1D", "PT45M" into chrono::Duration.
+fn parse_ical_duration(duration: &str) -> Option<chrono::Duration> {
+    let s = duration.trim();
+    if !s.starts_with('P') {
+        return None;
+    }
+
+    let s = &s[1..]; // strip 'P'
+    let mut days = 0i64;
+    let mut hours = 0i64;
+    let mut minutes = 0i64;
+    let mut seconds = 0i64;
+
+    let mut in_time = false;
+    let mut num_buf = String::new();
+
+    for ch in s.chars() {
+        match ch {
+            'T' => {
+                in_time = true;
+            }
+            '0'..='9' => {
+                num_buf.push(ch);
+            }
+            'D' if !in_time => {
+                days = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'W' if !in_time => {
+                let weeks: i64 = num_buf.parse().unwrap_or(0);
+                days += weeks * 7;
+                num_buf.clear();
+            }
+            'H' if in_time => {
+                hours = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'M' if in_time => {
+                minutes = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'S' if in_time => {
+                seconds = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            _ => {}
+        }
+    }
+
+    Some(
+        chrono::Duration::days(days)
+            + chrono::Duration::hours(hours)
+            + chrono::Duration::minutes(minutes)
+            + chrono::Duration::seconds(seconds),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,86 +1073,5 @@ END:VCALENDAR\r\n";
         assert_eq!(parse_ical_duration("P1W"), Some(chrono::Duration::weeks(1)));
         assert_eq!(parse_ical_duration("invalid"), None);
     }
-}
-
-/// Compute an end datetime from a start datetime and an iCalendar DURATION.
-///
-/// Handles simple durations like PT1H, PT30M, P1D, PT1H30M.
-fn compute_end_from_duration(dtstart: &str, duration: &str) -> String {
-    // Try to parse dtstart as a chrono DateTime
-    if let Ok(start) = chrono::DateTime::parse_from_rfc3339(dtstart) {
-        if let Some(dur) = parse_ical_duration(duration) {
-            let end = start + dur;
-            return end.to_rfc3339();
-        }
-    }
-
-    // Try parsing without timezone (e.g., "2025-04-15T10:00:00")
-    if let Ok(start) = chrono::NaiveDateTime::parse_from_str(dtstart, "%Y-%m-%dT%H:%M:%S") {
-        if let Some(dur) = parse_ical_duration(duration) {
-            let end = start + dur;
-            return end.format("%Y-%m-%dT%H:%M:%S").to_string();
-        }
-    }
-
-    // Fallback
-    dtstart.to_string()
-}
-
-/// Parse an iCalendar DURATION value like "PT1H30M", "P1D", "PT45M" into chrono::Duration.
-fn parse_ical_duration(duration: &str) -> Option<chrono::Duration> {
-    let s = duration.trim();
-    if !s.starts_with('P') {
-        return None;
-    }
-
-    let s = &s[1..]; // strip 'P'
-    let mut days = 0i64;
-    let mut hours = 0i64;
-    let mut minutes = 0i64;
-    let mut seconds = 0i64;
-
-    let mut in_time = false;
-    let mut num_buf = String::new();
-
-    for ch in s.chars() {
-        match ch {
-            'T' => {
-                in_time = true;
-            }
-            '0'..='9' => {
-                num_buf.push(ch);
-            }
-            'D' if !in_time => {
-                days = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'W' if !in_time => {
-                let weeks: i64 = num_buf.parse().unwrap_or(0);
-                days += weeks * 7;
-                num_buf.clear();
-            }
-            'H' if in_time => {
-                hours = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'M' if in_time => {
-                minutes = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'S' if in_time => {
-                seconds = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            _ => {}
-        }
-    }
-
-    Some(
-        chrono::Duration::days(days)
-            + chrono::Duration::hours(hours)
-            + chrono::Duration::minutes(minutes)
-            + chrono::Duration::seconds(seconds),
-    )
 }
 
