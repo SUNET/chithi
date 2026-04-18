@@ -154,37 +154,40 @@ export const useCalendarStore = defineStore("calendar", () => {
       calendars.value = [];
       return;
     }
-    // Fetch calendars for all accounts
-    let all: Calendar[] = [];
-    for (const account of accountsStore.accounts) {
-      try {
-        const cals = await api.listCalendars(account.id);
-        all = all.concat(cals.filter((c) => c.is_subscribed));
-      } catch (e) {
-        console.error("Failed to fetch calendars for", account.id, e);
-      }
-    }
-    calendars.value = all;
+    // Fan out across accounts in parallel — each api.listCalendars is a
+    // pure SQLite read, so the round-trip cost is mostly Tauri IPC.
+    // Serialized awaits here add up to hundreds of ms on nav.
+    const results = await Promise.all(
+      accountsStore.accounts.map((account) =>
+        api
+          .listCalendars(account.id)
+          .catch((e) => {
+            console.error("Failed to fetch calendars for", account.id, e);
+            return [] as Calendar[];
+          }),
+      ),
+    );
+    calendars.value = results
+      .flat()
+      .filter((c) => c.is_subscribed);
   }
 
   async function fetchEvents() {
     loading.value = true;
     try {
       const range = getDateRange();
-      let all: CalendarEvent[] = [];
-      for (const account of accountsStore.accounts) {
-        try {
-          const evts = await api.getEvents(
-            account.id,
-            range.start,
-            range.end,
-          );
-          all = all.concat(evts);
-        } catch (e) {
-          console.error("Failed to fetch events for", account.id, e);
-        }
-      }
-      events.value = all;
+      // Same parallelization as fetchCalendars — purely local reads.
+      const results = await Promise.all(
+        accountsStore.accounts.map((account) =>
+          api
+            .getEvents(account.id, range.start, range.end)
+            .catch((e) => {
+              console.error("Failed to fetch events for", account.id, e);
+              return [] as CalendarEvent[];
+            }),
+        ),
+      );
+      events.value = results.flat();
     } finally {
       loading.value = false;
     }
