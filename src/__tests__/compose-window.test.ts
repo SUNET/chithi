@@ -335,11 +335,11 @@ describe("saveDraft API", () => {
       subject: "",
       body_text: "",
       body_html: null,
-      attachments: [{ path: "/tmp/doc.pdf", name: "doc.pdf" }],
+      attachments: [{ token: "tok-123", name: "doc.pdf" }],
     });
 
     expect(api.saveDraft).toHaveBeenCalledWith("acc-1", expect.objectContaining({
-      attachments: [{ path: "/tmp/doc.pdf", name: "doc.pdf" }],
+      attachments: [{ token: "tok-123", name: "doc.pdf" }],
     }));
   });
 });

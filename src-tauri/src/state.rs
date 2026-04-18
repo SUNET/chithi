@@ -38,6 +38,10 @@ pub struct AppState {
     /// first use and hold persistent connections for their protocol.
     pub op_senders: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<OpEntry>>>,
     pub data_dir: PathBuf,
+    /// Token -> canonical file path for attachments picked via the native
+    /// dialog. The renderer only ever sees the token, so a compromised
+    /// renderer cannot ask the backend to read arbitrary files.
+    pub attachments: std::sync::Mutex<HashMap<String, PathBuf>>,
 }
 
 impl AppState {
@@ -61,6 +65,7 @@ impl AppState {
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             op_senders: std::sync::Mutex::new(HashMap::new()),
             data_dir,
+            attachments: std::sync::Mutex::new(HashMap::new()),
         })
     }
 

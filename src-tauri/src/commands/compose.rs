@@ -19,9 +19,12 @@ pub struct ComposeMessage {
     pub attachments: Vec<FileAttachment>,
 }
 
+/// An attachment referenced by the renderer. `token` is the opaque handle
+/// returned by `commands::attachments::pick_attachments`; the backend
+/// resolves it to the real canonical path at send/save time.
 #[derive(Debug, Deserialize)]
 pub struct FileAttachment {
-    pub path: String,
+    pub token: String,
     pub name: String,
 }
 
@@ -50,7 +53,16 @@ pub async fn send_message(
 
     // --- Synchronous part: validate, read attachments, build message ---
     // This is fast (local I/O only) so the compose window waits for it.
-    let attachment_data = read_attachments(&message.attachments)?;
+    // Tokens are consumed: once send has read the files, the mapping is
+    // gone and the renderer cannot refer to them again.
+    let tokens: Vec<String> = message
+        .attachments
+        .iter()
+        .map(|a| a.token.clone())
+        .collect();
+    let names: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
+    let paths = crate::commands::attachments::consume_tokens(&state, &tokens)?;
+    let attachment_data = build_attachment_data(&paths, &names)?;
     let raw_message = smtp::build_raw_message(
         &account.email,
         &message.to,
@@ -241,7 +253,16 @@ pub async fn save_draft(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    let attachment_data = read_attachments(&message.attachments)?;
+    // Drafts peek rather than consume tokens: the user may save a draft
+    // and keep editing, so we must keep the token → path mapping alive.
+    let tokens: Vec<String> = message
+        .attachments
+        .iter()
+        .map(|a| a.token.clone())
+        .collect();
+    let names: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
+    let paths = crate::commands::attachments::peek_tokens(&state, &tokens)?;
+    let attachment_data = build_attachment_data(&paths, &names)?;
 
     // Drafts may have no recipients — use sender as placeholder To for valid RFC5322
     let draft_to = if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
@@ -341,58 +362,35 @@ pub async fn save_draft(
     Ok(())
 }
 
-fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::AttachmentData>> {
-    let mut result = Vec::new();
-    for att in attachments {
-        let path = std::path::Path::new(&att.path);
-
-        // Reject relative paths
-        if !path.is_absolute() {
-            return Err(crate::error::Error::Other(format!(
-                "Attachment path must be absolute: '{}'",
-                att.path
-            )));
-        }
-
-        // Reject paths containing ".." components
-        for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return Err(crate::error::Error::Other(format!(
-                    "Attachment path must not contain '..': '{}'",
-                    att.path
-                )));
-            }
-        }
-
-        // Warn on unusual paths outside typical user directories
-        let path_str = att.path.as_str();
-        let is_typical = if cfg!(unix) {
-            path_str.starts_with("/home/")
-                || path_str.starts_with("/tmp/")
-                || path_str.starts_with("/Users/")
-                || path_str.starts_with("/var/tmp/")
-        } else {
-            // Windows
-            path_str.starts_with("C:\\Users\\") || path_str.starts_with("C:\\Temp\\")
-        };
-        if !is_typical {
-            log::warn!("Attachment from unusual path: '{}'", att.path);
-        }
-
-        let data = std::fs::read(&att.path).map_err(|e| {
-            crate::error::Error::Other(format!("Failed to read attachment '{}': {}", att.path, e))
+/// Read each resolved attachment path, pair it with its display name and
+/// guessed content type, and return the payload structures the SMTP layer
+/// wants. Paths are trusted — they come from the backend-owned attachment
+/// registry after a user-initiated native file pick.
+fn build_attachment_data(
+    paths: &[std::path::PathBuf],
+    names: &[String],
+) -> Result<Vec<smtp::AttachmentData>> {
+    assert_eq!(paths.len(), names.len(), "paths/names length mismatch");
+    let mut result = Vec::with_capacity(paths.len());
+    for (path, name) in paths.iter().zip(names.iter()) {
+        let data = std::fs::read(path).map_err(|e| {
+            crate::error::Error::Other(format!(
+                "Failed to read attachment '{}': {}",
+                path.display(),
+                e
+            ))
         })?;
-        let content_type = mime_guess::from_path(&att.name)
+        let content_type = mime_guess::from_path(name)
             .first_or_octet_stream()
             .to_string();
         log::info!(
             "Attachment: {} ({}, {} bytes)",
-            att.name,
+            name,
             content_type,
             data.len()
         );
         result.push(smtp::AttachmentData {
-            name: att.name.clone(),
+            name: name.clone(),
             content_type,
             data,
         });
