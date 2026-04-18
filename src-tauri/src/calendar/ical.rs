@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 
@@ -334,18 +336,65 @@ fn strip_altrep_params(ical: &str) -> String {
     out
 }
 
-fn strip_altrep_from_line(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    let Some(start) = lower.find(";altrep=") else {
-        return line.to_string();
-    };
-    let after_eq = start + ";altrep=".len();
+fn strip_altrep_from_line(line: &str) -> Cow<'_, str> {
+    // Only consider the parameter region (before the real property `:`
+    // separator). This keeps a literal `;ALTREP=` that happens to appear
+    // inside a property VALUE from being clobbered.
+    let search_end = property_value_separator(line).unwrap_or(line.len());
     let bytes = line.as_bytes();
+    let Some(start) = find_altrep_param(&bytes[..search_end]) else {
+        return Cow::Borrowed(line);
+    };
+    let after_eq = start + b";ALTREP=".len();
     let end = altrep_value_end(bytes, after_eq);
     let mut result = String::with_capacity(line.len());
     result.push_str(&line[..start]);
     result.push_str(&line[end..]);
-    result
+    Cow::Owned(result)
+}
+
+/// Case-insensitive search for `;ALTREP=` in a byte slice. Avoids the
+/// per-line lowercasing allocation on the common (no-ALTREP) path.
+fn find_altrep_param(haystack: &[u8]) -> Option<usize> {
+    const NEEDLE: &[u8] = b";altrep=";
+    if haystack.len() < NEEDLE.len() {
+        return None;
+    }
+    haystack
+        .windows(NEEDLE.len())
+        .position(|w| w.iter().zip(NEEDLE).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
+/// Find the offset of the real property/value `:` separator on a content line.
+///
+/// Parameter values may be quoted; colons inside quotes don't count. This scan
+/// tolerates Exchange/Outlook's malformed quoted values that contain raw `"`
+/// chars by only treating a `"` as the closing quote when the next byte is
+/// `;`, `:`, `\r`, `\n`, or end-of-input.
+fn property_value_separator(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_quotes = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes {
+                    let next = bytes.get(i + 1).copied();
+                    if matches!(next, Some(b';' | b':' | b'\r' | b'\n') | None) {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                }
+            }
+            b':' if !in_quotes => return Some(i),
+            b'\r' | b'\n' if !in_quotes => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Given a line and the offset just after `;ALTREP=`, return the offset where
@@ -867,43 +916,83 @@ END:VCALENDAR\r\n";
     #[test]
     fn test_strip_altrep_quoted_with_inner_quotes() {
         let line = "DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
-        let out = strip_altrep_from_line(line);
-        assert_eq!(out, "DESCRIPTION;LANGUAGE=en-US:plain\n");
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION;LANGUAGE=en-US:plain\n"
+        );
     }
 
     #[test]
     fn test_strip_altrep_quoted_well_formed() {
         let line = "DESCRIPTION;ALTREP=\"cid:part1\":hello\n";
-        let out = strip_altrep_from_line(line);
-        assert_eq!(out, "DESCRIPTION:hello\n");
+        assert_eq!(strip_altrep_from_line(line).as_ref(), "DESCRIPTION:hello\n");
     }
 
     #[test]
     fn test_strip_altrep_followed_by_other_param() {
         let line = "DESCRIPTION;ALTREP=\"cid:part1\";LANGUAGE=en:hello\n";
-        let out = strip_altrep_from_line(line);
-        assert_eq!(out, "DESCRIPTION;LANGUAGE=en:hello\n");
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION;LANGUAGE=en:hello\n"
+        );
     }
 
     #[test]
     fn test_strip_altrep_case_insensitive() {
         let line = "DESCRIPTION;altrep=\"cid:part1\":hello\n";
-        let out = strip_altrep_from_line(line);
-        assert_eq!(out, "DESCRIPTION:hello\n");
+        assert_eq!(strip_altrep_from_line(line).as_ref(), "DESCRIPTION:hello\n");
     }
 
     #[test]
     fn test_strip_altrep_unquoted() {
         let line = "DESCRIPTION;ALTREP=cid:part1:hello\n";
-        let out = strip_altrep_from_line(line);
-        // Unquoted terminates at first ':' per RFC 5545 §3.1
-        assert_eq!(out, "DESCRIPTION:part1:hello\n");
+        // Unquoted terminates at first ':' per RFC 5545 §3.1, so we strip
+        // only ";ALTREP=cid" and the remainder becomes the property value.
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION:part1:hello\n"
+        );
     }
 
     #[test]
-    fn test_strip_altrep_line_without_altrep() {
+    fn test_strip_altrep_line_without_altrep_is_borrowed() {
         let line = "SUMMARY:Team Standup\n";
-        assert_eq!(strip_altrep_from_line(line), line);
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out.as_ref(), line);
+        assert!(matches!(out, Cow::Borrowed(_)), "no-ALTREP lines must not allocate");
+    }
+
+    #[test]
+    fn test_strip_altrep_leaves_value_substring_alone() {
+        // A literal `;ALTREP=` that appears inside the property VALUE
+        // (after the real `:` separator) must not be touched.
+        let line = "DESCRIPTION:look at ;ALTREP=example in the value\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out.as_ref(), line);
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_property_value_separator_plain() {
+        assert_eq!(property_value_separator("SUMMARY:hello\n"), Some(7));
+    }
+
+    #[test]
+    fn test_property_value_separator_with_quoted_param() {
+        // The first `:` is inside the quoted ALTREP value; the real separator
+        // is the one after the closing `"`.
+        let line = "DESCRIPTION;ALTREP=\"data:text/html,x\":plain\n";
+        let pos = property_value_separator(line).unwrap();
+        assert_eq!(&line[pos..pos + 1], ":");
+        assert_eq!(&line[pos + 1..].trim_end(), &"plain");
+    }
+
+    #[test]
+    fn test_property_value_separator_with_inner_quotes() {
+        // Malformed Exchange payload — raw `"` inside quoted ALTREP.
+        let line = "DESCRIPTION;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
+        let pos = property_value_separator(line).unwrap();
+        assert_eq!(&line[pos + 1..].trim_end(), &"plain");
     }
 
     #[test]
