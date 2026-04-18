@@ -370,6 +370,11 @@ async function saveDraft(): Promise<boolean> {
 }
 
 async function addAttachment() {
+  // The backend dedups by canonical path, so picking the same file twice
+  // returns the same token both times. Our dedup-by-token check here
+  // then keeps the compose list from showing a duplicate chip. We must
+  // NOT release the token in that case (it's the same registry entry
+  // we're keeping).
   const picked = await api.pickAttachments();
   for (const handle of picked) {
     if (!attachments.value.some(a => a.token === handle.token)) {
@@ -378,10 +383,6 @@ async function addAttachment() {
         name: handle.name,
         size: handle.size,
       });
-    } else {
-      // User picked a file we already hold a token for. Release the
-      // duplicate so we don't leak it in the backend registry.
-      api.releaseAttachment(handle.token).catch(() => {});
     }
   }
 }

@@ -32,8 +32,14 @@ pub struct AttachmentHandle {
 /// a random token, and return the handles.
 ///
 /// The token is a v4 UUID. The backend stores `token -> canonical_path`
-/// in `AppState::attachments`. On send, `read_attachments` looks paths
-/// up by token; tokens the renderer invents will not match.
+/// in `AppState::attachments`. Later send/save flows resolve tokens via
+/// `consume_tokens` / `peek_tokens` and pass the resulting paths into
+/// `build_attachment_data`; tokens the renderer invents will not match
+/// and are rejected.
+///
+/// Picking the same file twice returns the *existing* token for that
+/// canonical path rather than a fresh one, so the frontend's
+/// dedup-by-token check catches it.
 #[tauri::command]
 pub async fn pick_attachments(
     app: tauri::AppHandle,
@@ -55,9 +61,9 @@ pub async fn pick_attachments(
         None => return Ok(vec![]), // user cancelled
     };
 
-    let mut handles = Vec::with_capacity(paths.len());
-    let mut registrations: Vec<(String, std::path::PathBuf)> = Vec::with_capacity(paths.len());
-
+    // Resolve + stat every picked file before touching the registry so a
+    // bad pick doesn't leave a half-populated state.
+    let mut resolved: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(paths.len());
     for file_path in paths {
         let path = file_path
             .as_path()
@@ -86,26 +92,35 @@ pub async fn pick_attachments(
             )));
         }
 
+        resolved.push((canonical, metadata.len()));
+    }
+
+    let mut handles = Vec::with_capacity(resolved.len());
+    let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
+    for (canonical, size) in resolved {
+        // Dedup by canonical path: if the same file was already registered
+        // in this session, hand back the existing token. The renderer then
+        // sees the same token and its dedup-by-token check keeps the
+        // compose list clean.
+        let existing = reg
+            .iter()
+            .find(|(_, p)| **p == canonical)
+            .map(|(t, _)| t.clone());
+        let token = match existing {
+            Some(t) => t,
+            None => {
+                let t = uuid::Uuid::new_v4().to_string();
+                reg.insert(t.clone(), canonical.clone());
+                t
+            }
+        };
+
         let name = canonical
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "attachment".to_string());
 
-        let token = uuid::Uuid::new_v4().to_string();
-
-        handles.push(AttachmentHandle {
-            token: token.clone(),
-            name,
-            size: metadata.len(),
-        });
-        registrations.push((token, canonical));
-    }
-
-    {
-        let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
-        for (token, path) in registrations {
-            reg.insert(token, path);
-        }
+        handles.push(AttachmentHandle { token, name, size });
     }
 
     Ok(handles)

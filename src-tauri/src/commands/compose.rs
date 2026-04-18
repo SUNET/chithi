@@ -22,10 +22,18 @@ pub struct ComposeMessage {
 /// An attachment referenced by the renderer. `token` is the opaque handle
 /// returned by `commands::attachments::pick_attachments`; the backend
 /// resolves it to the real canonical path at send/save time.
+///
+/// `size` is accepted but ignored — the renderer carries it for UI
+/// purposes and Tauri IPC round-trips the ComposeAttachment structure
+/// verbatim. Declaring it here (instead of relying on serde's implicit
+/// unknown-field tolerance) makes the contract explicit.
 #[derive(Debug, Deserialize)]
 pub struct FileAttachment {
     pub token: String,
     pub name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub size: Option<u64>,
 }
 
 /// Send an email. Validates and reads attachments synchronously, then spawns
@@ -370,7 +378,13 @@ fn build_attachment_data(
     paths: &[std::path::PathBuf],
     names: &[String],
 ) -> Result<Vec<smtp::AttachmentData>> {
-    assert_eq!(paths.len(), names.len(), "paths/names length mismatch");
+    if paths.len() != names.len() {
+        return Err(crate::error::Error::Other(format!(
+            "Attachment path/name length mismatch: {} paths for {} names",
+            paths.len(),
+            names.len()
+        )));
+    }
     let mut result = Vec::with_capacity(paths.len());
     for (path, name) in paths.iter().zip(names.iter()) {
         let data = std::fs::read(path).map_err(|e| {
