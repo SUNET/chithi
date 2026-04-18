@@ -8,6 +8,7 @@ import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
 import TimeInput from "@/components/common/TimeInput.vue";
+import DateInput from "@/components/common/DateInput.vue";
 
 const props = defineProps<{
   initialStart?: string;
@@ -165,14 +166,14 @@ async function save() {
           <div class="form-group">
             <label>Start</label>
             <div class="datetime-inputs">
-              <input v-model="startDate" type="date" class="date-input" data-testid="event-form-start" />
+              <DateInput v-model="startDate" testid="event-form-start" />
               <TimeInput v-if="!allDay" v-model="startTime" class="time-input" testid="event-form-start-time" />
             </div>
           </div>
           <div class="form-group">
             <label>End</label>
             <div class="datetime-inputs">
-              <input v-model="endDate" type="date" class="date-input" :min="minEndDate" data-testid="event-form-end" />
+              <DateInput v-model="endDate" :min="minEndDate" testid="event-form-end" />
               <TimeInput v-if="!allDay" v-model="endTime" class="time-input" :min="minEndTime" testid="event-form-end-time" />
             </div>
           </div>

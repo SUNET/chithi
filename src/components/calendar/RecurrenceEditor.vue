@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import DateInput from "@/components/common/DateInput.vue";
 
 const props = defineProps<{
   modelValue: string | null;
@@ -112,11 +113,9 @@ watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { de
           min="1"
           class="num-input"
         />
-        <input
+        <DateInput
           v-if="endType === 'until'"
-          type="date"
           v-model="untilDate"
-          class="date-input"
         />
       </div>
     </template>

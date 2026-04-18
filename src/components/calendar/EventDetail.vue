@@ -7,6 +7,7 @@ import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC 
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import TimeInput from "@/components/common/TimeInput.vue";
+import DateInput from "@/components/common/DateInput.vue";
 
 const emit = defineEmits<{
   close: [];
@@ -271,7 +272,7 @@ async function handleDelete() {
         <div class="edit-row">
           <div class="edit-group">
             <label>Start date</label>
-            <input v-model="editStartDate" type="date" data-testid="event-form-start" />
+            <DateInput v-model="editStartDate" testid="event-form-start" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>Start time</label>
@@ -281,7 +282,7 @@ async function handleDelete() {
         <div class="edit-row">
           <div class="edit-group">
             <label>End date</label>
-            <input v-model="editEndDate" type="date" data-testid="event-form-end" />
+            <DateInput v-model="editEndDate" testid="event-form-end" />
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>End time</label>
