@@ -70,7 +70,13 @@ pub fn insert_contact_book(conn: &Connection, book: &ContactBook) -> Result<()> 
     conn.execute(
         "INSERT INTO contact_books (id, account_id, name, remote_id, sync_type)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![book.id, book.account_id, book.name, book.remote_id, book.sync_type],
+        params![
+            book.id,
+            book.account_id,
+            book.name,
+            book.remote_id,
+            book.sync_type
+        ],
     )?;
     Ok(())
 }
@@ -232,7 +238,12 @@ pub fn search_all_contacts(conn: &Connection, query: &str) -> Result<Vec<Contact
 // ---------------------------------------------------------------------------
 
 /// Upsert a collected contact — increment use_count if exists, insert if not.
-pub fn collect_contact(conn: &Connection, account_id: &str, email: &str, name: Option<&str>) -> Result<()> {
+pub fn collect_contact(
+    conn: &Connection,
+    account_id: &str,
+    email: &str,
+    name: Option<&str>,
+) -> Result<()> {
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM collected_contacts WHERE account_id = ?1 AND email = ?2",
@@ -333,7 +344,10 @@ mod tests {
             book_id: book_id.to_string(),
             uid: None,
             display_name: name.to_string(),
-            emails_json: format!("[{{\"email\":\"{}@example.com\",\"label\":\"work\"}}]", name.to_lowercase().replace(' ', ".")),
+            emails_json: format!(
+                "[{{\"email\":\"{}@example.com\",\"label\":\"work\"}}]",
+                name.to_lowercase().replace(' ', ".")
+            ),
             phones_json: "[]".to_string(),
             addresses_json: "[]".to_string(),
             organization: None,
@@ -459,7 +473,10 @@ mod tests {
 
         let results = search_collected_contacts(&conn, "example").unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].email, "frequent@example.com", "Most used should be first");
+        assert_eq!(
+            results[0].email, "frequent@example.com",
+            "Most used should be first"
+        );
         assert_eq!(results[0].use_count, 6);
     }
 

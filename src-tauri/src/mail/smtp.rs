@@ -1,4 +1,4 @@
-use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart, Mailbox};
+use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -46,8 +46,7 @@ fn build_body(
     let mut mixed = MultiPart::mixed().multipart(text_part);
     for att in attachments {
         let ct = ContentType::parse(&att.content_type).unwrap_or(ContentType::TEXT_PLAIN);
-        let attachment = Attachment::new(att.name.clone())
-            .body(att.data.clone(), ct);
+        let attachment = Attachment::new(att.name.clone()).body(att.data.clone(), ct);
         mixed = mixed.singlepart(attachment);
     }
 
@@ -73,16 +72,18 @@ pub async fn send_message(
 ) -> Result<()> {
     log::info!(
         "SMTP sending message from {} to {:?} via {}:{} ({} attachments)",
-        from, to, smtp_host, smtp_port, attachments.len()
+        from,
+        to,
+        smtp_host,
+        smtp_port,
+        attachments.len()
     );
 
     let from_mailbox: Mailbox = from
         .parse()
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
-    let mut builder = Message::builder()
-        .from(from_mailbox)
-        .subject(subject);
+    let mut builder = Message::builder().from(from_mailbox).subject(subject);
 
     for addr in to {
         let mailbox: Mailbox = addr

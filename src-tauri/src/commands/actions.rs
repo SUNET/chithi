@@ -3,8 +3,7 @@ use tauri::{Emitter, State};
 
 use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::commands::sync_cmd::{
-    resume_imap_idle_for_account,
-    should_suspend_idle_for_imap_operation,
+    resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
     suspend_imap_idle_for_account,
 };
 use crate::db;
@@ -18,11 +17,15 @@ async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapCo
     let (password, use_xoauth2) = if account.provider == "o365" {
         let tokens = crate::oauth::load_tokens(&account.id)?
             .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens.refresh_token
+        let refresh = tokens
+            .refresh_token
             .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
         let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-        ).await?;
+            &crate::oauth::MICROSOFT,
+            &refresh,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        )
+        .await?;
         crate::oauth::store_tokens(&account.id, &new)?;
         (new.access_token, true)
     } else {
@@ -129,8 +132,9 @@ pub async fn move_messages(
                     let client = crate::mail::graph::GraphClient::new(&token);
                     let mut errors: Vec<String> = Vec::new();
                     for mid in &message_ids_bg {
-                        let graph_id =
-                            mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
+                        let graph_id = mid
+                            .strip_prefix(&format!("{}_", account_id_bg))
+                            .unwrap_or(mid);
                         if let Err(e) = client.move_message(graph_id, &target_folder_bg).await {
                             log::error!("Graph move failed for {}: {}", graph_id, e);
                             errors.push(format!("{}: {}", graph_id, e));
@@ -181,16 +185,17 @@ pub async fn move_messages(
                     "target_folder": target_folder_bg,
                 });
                 let conn = db_bg.writer().await;
-                match crate::ops::offline::queue_offline_op(
-                    &conn, &account_id_bg, "move", &payload,
-                ) {
+                match crate::ops::offline::queue_offline_op(&conn, &account_id_bg, "move", &payload)
+                {
                     Ok(id) => log::info!(
                         "Queued failed JMAP/Graph move to outbox (id={}) for account {}",
-                        id, account_id_bg
+                        id,
+                        account_id_bg
                     ),
                     Err(db_err) => log::error!(
                         "Failed to queue offline move op for account {}: {}",
-                        account_id_bg, db_err
+                        account_id_bg,
+                        db_err
                     ),
                 }
                 app_bg
@@ -268,7 +273,11 @@ pub async fn delete_messages(
                 })
                 .await
             {
-                log::error!("Failed to queue delete op for account {}: {}", account_id, e);
+                log::error!(
+                    "Failed to queue delete op for account {}: {}",
+                    account_id,
+                    e
+                );
                 app.emit(
                     "op-failed",
                     serde_json::json!({
@@ -294,8 +303,9 @@ pub async fn delete_messages(
                     let client = crate::mail::graph::GraphClient::new(&token);
                     let mut errors: Vec<String> = Vec::new();
                     for mid in &message_ids_bg {
-                        let graph_id =
-                            mid.strip_prefix(&format!("{}_", account_id_bg)).unwrap_or(mid);
+                        let graph_id = mid
+                            .strip_prefix(&format!("{}_", account_id_bg))
+                            .unwrap_or(mid);
                         if let Err(e) = client.delete_message(graph_id).await {
                             log::error!("Graph delete failed for {}: {}", graph_id, e);
                             errors.push(format!("{}: {}", graph_id, e));
@@ -325,9 +335,7 @@ pub async fn delete_messages(
                     if !jmap_ids.is_empty() {
                         let conn_jmap =
                             crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-                        conn_jmap
-                            .delete_emails(&jmap_config, &jmap_ids)
-                            .await?;
+                        conn_jmap.delete_emails(&jmap_config, &jmap_ids).await?;
                     }
                 }
                 Ok(())
@@ -347,15 +355,20 @@ pub async fn delete_messages(
                 });
                 let conn = db_bg.writer().await;
                 match crate::ops::offline::queue_offline_op(
-                    &conn, &account_id_bg, "delete", &payload,
+                    &conn,
+                    &account_id_bg,
+                    "delete",
+                    &payload,
                 ) {
                     Ok(id) => log::info!(
                         "Queued failed JMAP/Graph delete to outbox (id={}) for account {}",
-                        id, account_id_bg
+                        id,
+                        account_id_bg
                     ),
                     Err(db_err) => log::error!(
                         "Failed to queue offline delete op for account {}: {}",
-                        account_id_bg, db_err
+                        account_id_bg,
+                        db_err
                     ),
                 }
                 app_bg
@@ -424,8 +437,8 @@ pub async fn move_messages_cross_account(
     // Rejects non-disk entries (graph: prefix), absolute paths, and ".." segments.
     let data_dir = state.data_dir.clone();
     let validated_paths: Vec<std::path::PathBuf> = {
-        let canonical_data_dir = std::fs::canonicalize(&data_dir)
-            .unwrap_or_else(|_| data_dir.clone());
+        let canonical_data_dir =
+            std::fs::canonicalize(&data_dir).unwrap_or_else(|_| data_dir.clone());
         let mut paths = Vec::with_capacity(maildir_paths.len());
         for (msg_id, maildir_path) in &maildir_paths {
             if maildir_path.starts_with("graph:") {
@@ -436,7 +449,11 @@ pub async fn move_messages_cross_account(
                 )));
             }
             let rel = std::path::Path::new(maildir_path);
-            if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 return Err(Error::Other(format!(
                     "Invalid maildir path for message {}: '{}'",
                     msg_id, maildir_path
@@ -446,12 +463,14 @@ pub async fn move_messages_cross_account(
             let canonical = std::fs::canonicalize(&full_path).map_err(|e| {
                 Error::Other(format!(
                     "Failed to resolve maildir file {}: {}",
-                    full_path.display(), e
+                    full_path.display(),
+                    e
                 ))
             })?;
             if !canonical.starts_with(&canonical_data_dir) {
                 return Err(Error::Other(format!(
-                    "Path traversal detected for message {}", msg_id
+                    "Path traversal detected for message {}",
+                    msg_id
                 )));
             }
             paths.push(canonical);
@@ -482,17 +501,16 @@ pub async fn move_messages_cross_account(
         }
         "jmap" => {
             // JMAP: read each message in a blocking task, then import async
-            let jmap_config =
-                crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
+            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             for path in &validated_paths {
                 let path_clone = path.clone();
-                let bytes = tokio::task::spawn_blocking(move || {
-                    std::fs::read(&path_clone)
-                })
-                .await
-                .map_err(|e| Error::Other(format!("Read task panicked: {}", e)))?
-                .map_err(|e| Error::Other(format!("Failed to read {}: {}", path.display(), e)))?;
+                let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path_clone))
+                    .await
+                    .map_err(|e| Error::Other(format!("Read task panicked: {}", e)))?
+                    .map_err(|e| {
+                        Error::Other(format!("Failed to read {}: {}", path.display(), e))
+                    })?;
                 conn_jmap
                     .import_email_to_mailbox(&jmap_config, &bytes, &target_folder, false)
                     .await?;
@@ -512,7 +530,13 @@ pub async fn move_messages_cross_account(
     }
 
     // Append succeeded — delete from source
-    delete_messages(app.clone(), state, source_account_id.clone(), message_ids.clone()).await?;
+    delete_messages(
+        app.clone(),
+        state,
+        source_account_id.clone(),
+        message_ids.clone(),
+    )
+    .await?;
 
     // Emit events for the destination account too so its folder counts refresh
     emit_messages_changed(&app, &target_account_id);
@@ -556,10 +580,7 @@ pub async fn set_message_flags(
     {
         let conn = state.db.writer().await;
 
-        let normalized_flags: Vec<String> = flags
-            .iter()
-            .map(|f| normalize_flag_name(f))
-            .collect();
+        let normalized_flags: Vec<String> = flags.iter().map(|f| normalize_flag_name(f)).collect();
 
         for msg_id in &message_ids {
             if let Ok((_, _, _, _, flags_json, _, _)) =
@@ -576,8 +597,8 @@ pub async fn set_message_flags(
                 } else {
                     current.retain(|f| !normalized_flags.contains(f));
                 }
-                let updated_json = serde_json::to_string(&current)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let updated_json =
+                    serde_json::to_string(&current).unwrap_or_else(|_| "[]".to_string());
                 db::messages::update_flags(&conn, msg_id, &updated_json)?;
             }
         }
@@ -590,9 +611,14 @@ pub async fn set_message_flags(
         let client = crate::mail::graph::GraphClient::new(&token);
         let is_seen_flag = flags.iter().any(|f| f == "seen" || f == "\\Seen");
         if is_seen_flag {
-            let graph_ids: Vec<String> = message_ids.iter().map(|mid| {
-                mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid).to_string()
-            }).collect();
+            let graph_ids: Vec<String> = message_ids
+                .iter()
+                .map(|mid| {
+                    mid.strip_prefix(&format!("{}_", account_id))
+                        .unwrap_or(mid)
+                        .to_string()
+                })
+                .collect();
             client.set_read_status(&graph_ids, add).await?;
         }
     } else if account.mail_protocol == "jmap" {
@@ -600,15 +626,24 @@ pub async fn set_message_flags(
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
         // Extract JMAP email IDs from composite message IDs
-        let jmap_ids: Vec<String> = message_ids.iter().map(|mid| {
-            // Format: {account_id}_{folder}_{jmap_email_id}
-            let parts: Vec<&str> = mid.splitn(3, '_').collect();
-            if parts.len() == 3 { parts[2].to_string() } else { mid.clone() }
-        }).collect();
+        let jmap_ids: Vec<String> = message_ids
+            .iter()
+            .map(|mid| {
+                // Format: {account_id}_{folder}_{jmap_email_id}
+                let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                if parts.len() == 3 {
+                    parts[2].to_string()
+                } else {
+                    mid.clone()
+                }
+            })
+            .collect();
 
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
-        conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, add).await?;
+        conn_jmap
+            .set_flags(&jmap_config, &jmap_ids, &flag_strs, add)
+            .await?;
     } else {
         // IMAP path: send through worker queue (persistent connection, no IDLE suspend needed)
         let by_folder = {
@@ -630,7 +665,11 @@ pub async fn set_message_flags(
                 })
                 .await
             {
-                log::error!("Failed to queue set_flags op for account {}: {}", account_id, e);
+                log::error!(
+                    "Failed to queue set_flags op for account {}: {}",
+                    account_id,
+                    e
+                );
                 app.emit(
                     "op-failed",
                     serde_json::json!({
@@ -756,11 +795,15 @@ pub async fn mark_account_read(
     if account.mail_protocol == "graph" {
         let unread_ids = {
             let conn = state.db.reader();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
-            ).map_err(crate::error::Error::Database)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+                )
+                .map_err(crate::error::Error::Database)?;
             let ids: Vec<String> = stmt
-                .query_map(rusqlite::params![&account_id], |row| row.get::<_, String>(0))
+                .query_map(rusqlite::params![&account_id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .map_err(crate::error::Error::Database)?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -769,9 +812,14 @@ pub async fn mark_account_read(
         if !unread_ids.is_empty() {
             let token = crate::mail::graph::get_graph_token(&account_id).await?;
             let client = crate::mail::graph::GraphClient::new(&token);
-            let graph_ids: Vec<String> = unread_ids.iter().map(|mid| {
-                mid.strip_prefix(&format!("{}_", account_id)).unwrap_or(mid).to_string()
-            }).collect();
+            let graph_ids: Vec<String> = unread_ids
+                .iter()
+                .map(|mid| {
+                    mid.strip_prefix(&format!("{}_", account_id))
+                        .unwrap_or(mid)
+                        .to_string()
+                })
+                .collect();
             client.set_read_status(&graph_ids, true).await?;
         }
     } else if account.mail_protocol == "imap" {
@@ -815,10 +863,15 @@ pub async fn mark_account_read(
 
         let unread_ids: Vec<String> = {
             let conn = state.db.reader();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
-            ).map_err(crate::error::Error::Database)?;
-            let rows = stmt.query_map(rusqlite::params![&account_id], |row| row.get::<_, String>(0))
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM messages WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
+                )
+                .map_err(crate::error::Error::Database)?;
+            let rows = stmt
+                .query_map(rusqlite::params![&account_id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .map_err(crate::error::Error::Database)?;
             let ids: Vec<String> = rows.filter_map(|r| r.ok()).collect();
             ids
@@ -826,24 +879,35 @@ pub async fn mark_account_read(
 
         if !unread_ids.is_empty() {
             // Extract JMAP email IDs from composite message IDs
-            let jmap_ids: Vec<String> = unread_ids.iter().map(|mid| {
-                let parts: Vec<&str> = mid.splitn(3, '_').collect();
-                if parts.len() == 3 { parts[2].to_string() } else { mid.clone() }
-            }).collect();
+            let jmap_ids: Vec<String> = unread_ids
+                .iter()
+                .map(|mid| {
+                    let parts: Vec<&str> = mid.splitn(3, '_').collect();
+                    if parts.len() == 3 {
+                        parts[2].to_string()
+                    } else {
+                        mid.clone()
+                    }
+                })
+                .collect();
 
             let flag_strs = vec!["seen"];
-            conn_jmap.set_flags(&jmap_config, &jmap_ids, &flag_strs, true).await?;
+            conn_jmap
+                .set_flags(&jmap_config, &jmap_ids, &flag_strs, true)
+                .await?;
         }
     }
 
     // Update local DB
     let updated = {
         let conn = state.db.writer().await;
-        let count = conn.execute(
-            "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
+        let count = conn
+            .execute(
+                "UPDATE messages SET flags = json_insert(flags, '$[#]', 'seen')
              WHERE account_id = ?1 AND flags NOT LIKE '%seen%'",
-            rusqlite::params![account_id],
-        ).map_err(crate::error::Error::Database)?;
+                rusqlite::params![account_id],
+            )
+            .map_err(crate::error::Error::Database)?;
         db::folders::recalculate_folder_counts(&conn, &account_id)?;
         count
     };

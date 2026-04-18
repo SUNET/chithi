@@ -24,19 +24,13 @@ pub async fn list_contact_books(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn list_contacts(
-    state: State<'_, AppState>,
-    book_id: String,
-) -> Result<Vec<Contact>> {
+pub async fn list_contacts(state: State<'_, AppState>, book_id: String) -> Result<Vec<Contact>> {
     let conn = state.db.reader();
     db::contacts::list_contacts(&conn, &book_id)
 }
 
 #[tauri::command]
-pub async fn get_contact(
-    state: State<'_, AppState>,
-    contact_id: String,
-) -> Result<Contact> {
+pub async fn get_contact(state: State<'_, AppState>, contact_id: String) -> Result<Contact> {
     let conn = state.db.reader();
     db::contacts::get_contact(&conn, &contact_id)
 }
@@ -79,11 +73,13 @@ pub async fn create_contact(
     log::info!("Created contact {} '{}'", id, c.display_name);
 
     // Push to Google People API if applicable
-    let book = conn.query_row(
-        "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
-        rusqlite::params![c.book_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    ).ok();
+    let book = conn
+        .query_row(
+            "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
+            rusqlite::params![c.book_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok();
     drop(conn);
 
     if let Some((sync_type, account_id)) = book {
@@ -94,21 +90,37 @@ pub async fn create_contact(
                     "names": [{"givenName": c.display_name}],
                 });
                 if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json) {
-                    let ge: Vec<_> = emails.iter()
-                        .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"value": addr})))
+                    let ge: Vec<_> = emails
+                        .iter()
+                        .filter_map(|e| {
+                            e["email"]
+                                .as_str()
+                                .map(|addr| serde_json::json!({"value": addr}))
+                        })
                         .collect();
-                    if !ge.is_empty() { person["emailAddresses"] = serde_json::json!(ge); }
+                    if !ge.is_empty() {
+                        person["emailAddresses"] = serde_json::json!(ge);
+                    }
                 }
                 if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json) {
-                    let gp: Vec<_> = phones.iter()
-                        .filter_map(|p| p["number"].as_str().map(|n| serde_json::json!({"value": n})))
+                    let gp: Vec<_> = phones
+                        .iter()
+                        .filter_map(|p| {
+                            p["number"]
+                                .as_str()
+                                .map(|n| serde_json::json!({"value": n}))
+                        })
                         .collect();
-                    if !gp.is_empty() { person["phoneNumbers"] = serde_json::json!(gp); }
+                    if !gp.is_empty() {
+                        person["phoneNumbers"] = serde_json::json!(gp);
+                    }
                 }
-                match http.post("https://people.googleapis.com/v1/people:createContact")
+                match http
+                    .post("https://people.googleapis.com/v1/people:createContact")
                     .bearer_auth(&token)
                     .json(&person)
-                    .send().await
+                    .send()
+                    .await
                 {
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(data) = resp.json::<serde_json::Value>().await {
@@ -117,12 +129,16 @@ pub async fn create_contact(
                                 conn.execute(
                                     "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                                     rusqlite::params![rn, id],
-                                ).ok();
+                                )
+                                .ok();
                                 log::info!("Created contact on Google: {}", rn);
                             }
                         }
                     }
-                    Ok(resp) => { let b = resp.text().await.unwrap_or_default(); log::error!("Google create contact failed: {}", b); }
+                    Ok(resp) => {
+                        let b = resp.text().await.unwrap_or_default();
+                        log::error!("Google create contact failed: {}", b);
+                    }
                     Err(e) => log::error!("Google create contact request failed: {}", e),
                 }
             }
@@ -133,31 +149,48 @@ pub async fn create_contact(
                     "displayName": c.display_name,
                 });
                 if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json) {
-                    let ge: Vec<_> = emails.iter()
-                        .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"address": addr, "name": ""})))
+                    let ge: Vec<_> = emails
+                        .iter()
+                        .filter_map(|e| {
+                            e["email"]
+                                .as_str()
+                                .map(|addr| serde_json::json!({"address": addr, "name": ""}))
+                        })
                         .collect();
-                    if !ge.is_empty() { gc["emailAddresses"] = serde_json::json!(ge); }
+                    if !ge.is_empty() {
+                        gc["emailAddresses"] = serde_json::json!(ge);
+                    }
                 }
                 if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json) {
-                    let mobile = phones.iter().find(|p| p["label"].as_str() == Some("mobile"));
+                    let mobile = phones
+                        .iter()
+                        .find(|p| p["label"].as_str() == Some("mobile"));
                     if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
                         gc["mobilePhone"] = serde_json::json!(m);
                     }
-                    let biz: Vec<&str> = phones.iter()
+                    let biz: Vec<&str> = phones
+                        .iter()
                         .filter(|p| p["label"].as_str() == Some("work"))
                         .filter_map(|p| p["number"].as_str())
                         .collect();
-                    if !biz.is_empty() { gc["businessPhones"] = serde_json::json!(biz); }
+                    if !biz.is_empty() {
+                        gc["businessPhones"] = serde_json::json!(biz);
+                    }
                 }
-                if let Some(ref org) = c.organization { gc["companyName"] = serde_json::json!(org); }
-                if let Some(ref t) = c.title { gc["jobTitle"] = serde_json::json!(t); }
+                if let Some(ref org) = c.organization {
+                    gc["companyName"] = serde_json::json!(org);
+                }
+                if let Some(ref t) = c.title {
+                    gc["jobTitle"] = serde_json::json!(t);
+                }
                 match graph.create_contact(&gc).await {
                     Ok(remote_id) => {
                         let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, id],
-                        ).ok();
+                        )
+                        .ok();
                         log::info!("Created contact on Graph: {}", remote_id);
                     }
                     Err(e) => log::error!("Graph create contact failed: {}", e),
@@ -170,7 +203,9 @@ pub async fn create_contact(
                     "SELECT remote_id FROM contact_books WHERE id = ?1",
                     rusqlite::params![c.book_id],
                     |row| row.get::<_, Option<String>>(0),
-                ).ok().flatten()
+                )
+                .ok()
+                .flatten()
             };
             if let Some(href) = book_href {
                 let account = {
@@ -178,22 +213,50 @@ pub async fn create_contact(
                     db::accounts::get_account_full(&conn, &account_id)?
                 };
                 match crate::mail::carddav::CardDavClient::connect(
-                    &account.caldav_url, &account.username, &account.password, &account.email,
-                ).await {
+                    &account.caldav_url,
+                    &account.username,
+                    &account.password,
+                    &account.email,
+                )
+                .await
+                {
                     Ok(client) => {
                         let uid = c.uid.as_deref().unwrap_or(&id);
-                        let emails: Vec<crate::mail::carddav::VCardEmail> = serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json)
-                            .unwrap_or_default().iter()
-                            .filter_map(|e| Some(crate::mail::carddav::VCardEmail { email: e["email"].as_str()?.to_string(), label: e["label"].as_str().unwrap_or("work").to_string() }))
-                            .collect();
-                        let phones: Vec<crate::mail::carddav::VCardPhone> = serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json)
-                            .unwrap_or_default().iter()
-                            .filter_map(|p| Some(crate::mail::carddav::VCardPhone { number: p["number"].as_str()?.to_string(), label: p["label"].as_str().unwrap_or("work").to_string() }))
-                            .collect();
-                        let vcard = crate::mail::carddav::generate_vcard(uid, &c.display_name, &emails, &phones, c.organization.as_deref(), c.title.as_deref(), c.notes.as_deref());
+                        let emails: Vec<crate::mail::carddav::VCardEmail> =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&c.emails_json)
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|e| {
+                                    Some(crate::mail::carddav::VCardEmail {
+                                        email: e["email"].as_str()?.to_string(),
+                                        label: e["label"].as_str().unwrap_or("work").to_string(),
+                                    })
+                                })
+                                .collect();
+                        let phones: Vec<crate::mail::carddav::VCardPhone> =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&c.phones_json)
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|p| {
+                                    Some(crate::mail::carddav::VCardPhone {
+                                        number: p["number"].as_str()?.to_string(),
+                                        label: p["label"].as_str().unwrap_or("work").to_string(),
+                                    })
+                                })
+                                .collect();
+                        let vcard = crate::mail::carddav::generate_vcard(
+                            uid,
+                            &c.display_name,
+                            &emails,
+                            &phones,
+                            c.organization.as_deref(),
+                            c.title.as_deref(),
+                            c.notes.as_deref(),
+                        );
                         match client.put_contact(&href, uid, &vcard).await {
                             Ok(etag) => {
-                                let remote_id = format!("{}/{}.vcf", href.trim_end_matches('/'), uid);
+                                let remote_id =
+                                    format!("{}/{}.vcf", href.trim_end_matches('/'), uid);
                                 let conn = state.db.writer().await;
                                 conn.execute("UPDATE contacts SET remote_id = ?1, etag = ?2, vcard_data = ?3 WHERE id = ?4", rusqlite::params![remote_id, etag, vcard, id]).ok();
                                 log::info!("Created contact on CardDAV: {}", remote_id);
@@ -211,10 +274,7 @@ pub async fn create_contact(
 }
 
 #[tauri::command]
-pub async fn update_contact(
-    state: State<'_, AppState>,
-    contact: Contact,
-) -> Result<()> {
+pub async fn update_contact(state: State<'_, AppState>, contact: Contact) -> Result<()> {
     let conn = state.db.writer().await;
     db::contacts::update_contact(&conn, &contact)?;
     log::info!("Updated contact {}", contact.id);
@@ -222,11 +282,13 @@ pub async fn update_contact(
     // Push to Google People API if applicable
     if let Some(ref remote_id) = contact.remote_id {
         if !remote_id.is_empty() {
-            let book_info = conn.query_row(
-                "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
-                rusqlite::params![contact.book_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ).ok();
+            let book_info = conn
+                .query_row(
+                    "SELECT cb.sync_type, cb.account_id FROM contact_books cb WHERE cb.id = ?1",
+                    rusqlite::params![contact.book_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .ok();
             drop(conn);
 
             if let Some((sync_type, account_id)) = book_info {
@@ -236,25 +298,52 @@ pub async fn update_contact(
                         let mut person = serde_json::json!({
                             "names": [{"givenName": contact.display_name}],
                         });
-                        if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json) {
-                            let ge: Vec<_> = emails.iter()
-                                .filter_map(|e| e["email"].as_str().map(|a| serde_json::json!({"value": a})))
+                        if let Ok(emails) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
+                        {
+                            let ge: Vec<_> = emails
+                                .iter()
+                                .filter_map(|e| {
+                                    e["email"].as_str().map(|a| serde_json::json!({"value": a}))
+                                })
                                 .collect();
-                            if !ge.is_empty() { person["emailAddresses"] = serde_json::json!(ge); }
+                            if !ge.is_empty() {
+                                person["emailAddresses"] = serde_json::json!(ge);
+                            }
                         }
-                        if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json) {
-                            let gp: Vec<_> = phones.iter()
-                                .filter_map(|p| p["number"].as_str().map(|n| serde_json::json!({"value": n})))
+                        if let Ok(phones) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json)
+                        {
+                            let gp: Vec<_> = phones
+                                .iter()
+                                .filter_map(|p| {
+                                    p["number"]
+                                        .as_str()
+                                        .map(|n| serde_json::json!({"value": n}))
+                                })
                                 .collect();
-                            if !gp.is_empty() { person["phoneNumbers"] = serde_json::json!(gp); }
+                            if !gp.is_empty() {
+                                person["phoneNumbers"] = serde_json::json!(gp);
+                            }
                         }
                         let url = format!(
                             "https://people.googleapis.com/v1/{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
                             remote_id
                         );
-                        match http.patch(&url).bearer_auth(&token).json(&person).send().await {
-                            Ok(r) if r.status().is_success() => log::info!("Updated contact on Google: {}", remote_id),
-                            Ok(r) => { let b = r.text().await.unwrap_or_default(); log::warn!("Google update contact failed: {}", b); }
+                        match http
+                            .patch(&url)
+                            .bearer_auth(&token)
+                            .json(&person)
+                            .send()
+                            .await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                log::info!("Updated contact on Google: {}", remote_id)
+                            }
+                            Ok(r) => {
+                                let b = r.text().await.unwrap_or_default();
+                                log::warn!("Google update contact failed: {}", b);
+                            }
                             Err(e) => log::warn!("Google update contact request failed: {}", e),
                         }
                     }
@@ -264,25 +353,45 @@ pub async fn update_contact(
                         let mut gc = serde_json::json!({
                             "displayName": contact.display_name,
                         });
-                        if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json) {
-                            let ge: Vec<_> = emails.iter()
-                                .filter_map(|e| e["email"].as_str().map(|addr| serde_json::json!({"address": addr, "name": ""})))
+                        if let Ok(emails) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
+                        {
+                            let ge: Vec<_> = emails
+                                .iter()
+                                .filter_map(|e| {
+                                    e["email"].as_str().map(
+                                        |addr| serde_json::json!({"address": addr, "name": ""}),
+                                    )
+                                })
                                 .collect();
-                            if !ge.is_empty() { gc["emailAddresses"] = serde_json::json!(ge); }
+                            if !ge.is_empty() {
+                                gc["emailAddresses"] = serde_json::json!(ge);
+                            }
                         }
-                        if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json) {
-                            let mobile = phones.iter().find(|p| p["label"].as_str() == Some("mobile"));
+                        if let Ok(phones) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json)
+                        {
+                            let mobile = phones
+                                .iter()
+                                .find(|p| p["label"].as_str() == Some("mobile"));
                             if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
                                 gc["mobilePhone"] = serde_json::json!(m);
                             }
-                            let biz: Vec<&str> = phones.iter()
+                            let biz: Vec<&str> = phones
+                                .iter()
                                 .filter(|p| p["label"].as_str() == Some("work"))
                                 .filter_map(|p| p["number"].as_str())
                                 .collect();
-                            if !biz.is_empty() { gc["businessPhones"] = serde_json::json!(biz); }
+                            if !biz.is_empty() {
+                                gc["businessPhones"] = serde_json::json!(biz);
+                            }
                         }
-                        if let Some(ref org) = contact.organization { gc["companyName"] = serde_json::json!(org); }
-                        if let Some(ref t) = contact.title { gc["jobTitle"] = serde_json::json!(t); }
+                        if let Some(ref org) = contact.organization {
+                            gc["companyName"] = serde_json::json!(org);
+                        }
+                        if let Some(ref t) = contact.title {
+                            gc["jobTitle"] = serde_json::json!(t);
+                        }
                         match graph.update_contact(remote_id, &gc).await {
                             Ok(()) => log::info!("Updated contact on Graph: {}", remote_id),
                             Err(e) => log::warn!("Graph update contact failed: {}", e),
@@ -293,19 +402,23 @@ pub async fn update_contact(
                         let conn = state.db.reader();
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
-                    let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                    let jmap_config =
+                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                         Ok(conn_jmap) => {
-                            match conn_jmap.update_contact_card(
-                                &jmap_config,
-                                remote_id,
-                                &contact.display_name,
-                                &contact.emails_json,
-                                &contact.phones_json,
-                                contact.organization.as_deref(),
-                                contact.title.as_deref(),
-                                contact.notes.as_deref(),
-                            ).await {
+                            match conn_jmap
+                                .update_contact_card(
+                                    &jmap_config,
+                                    remote_id,
+                                    &contact.display_name,
+                                    &contact.emails_json,
+                                    &contact.phones_json,
+                                    contact.organization.as_deref(),
+                                    contact.title.as_deref(),
+                                    contact.notes.as_deref(),
+                                )
+                                .await
+                            {
                                 Ok(()) => log::info!("Updated contact on JMAP: {}", remote_id),
                                 Err(e) => log::warn!("JMAP update contact failed: {}", e),
                             }
@@ -318,23 +431,61 @@ pub async fn update_contact(
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
                     match crate::mail::carddav::CardDavClient::connect(
-                        &account.caldav_url, &account.username, &account.password, &account.email,
-                    ).await {
+                        &account.caldav_url,
+                        &account.username,
+                        &account.password,
+                        &account.email,
+                    )
+                    .await
+                    {
                         Ok(client) => {
                             let uid = contact.uid.as_deref().unwrap_or(&contact.id);
                             let book_href = {
                                 let conn = state.db.reader();
-                                conn.query_row("SELECT remote_id FROM contact_books WHERE id = ?1", rusqlite::params![contact.book_id], |row| row.get::<_, Option<String>>(0)).ok().flatten().unwrap_or_default()
+                                conn.query_row(
+                                    "SELECT remote_id FROM contact_books WHERE id = ?1",
+                                    rusqlite::params![contact.book_id],
+                                    |row| row.get::<_, Option<String>>(0),
+                                )
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
                             };
-                            let emails: Vec<crate::mail::carddav::VCardEmail> = serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
-                                .unwrap_or_default().iter()
-                                .filter_map(|e| Some(crate::mail::carddav::VCardEmail { email: e["email"].as_str()?.to_string(), label: e["label"].as_str().unwrap_or("work").to_string() }))
+                            let emails: Vec<crate::mail::carddav::VCardEmail> =
+                                serde_json::from_str::<Vec<serde_json::Value>>(
+                                    &contact.emails_json,
+                                )
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|e| {
+                                    Some(crate::mail::carddav::VCardEmail {
+                                        email: e["email"].as_str()?.to_string(),
+                                        label: e["label"].as_str().unwrap_or("work").to_string(),
+                                    })
+                                })
                                 .collect();
-                            let phones: Vec<crate::mail::carddav::VCardPhone> = serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json)
-                                .unwrap_or_default().iter()
-                                .filter_map(|p| Some(crate::mail::carddav::VCardPhone { number: p["number"].as_str()?.to_string(), label: p["label"].as_str().unwrap_or("work").to_string() }))
+                            let phones: Vec<crate::mail::carddav::VCardPhone> =
+                                serde_json::from_str::<Vec<serde_json::Value>>(
+                                    &contact.phones_json,
+                                )
+                                .unwrap_or_default()
+                                .iter()
+                                .filter_map(|p| {
+                                    Some(crate::mail::carddav::VCardPhone {
+                                        number: p["number"].as_str()?.to_string(),
+                                        label: p["label"].as_str().unwrap_or("work").to_string(),
+                                    })
+                                })
                                 .collect();
-                            let vcard = crate::mail::carddav::generate_vcard(uid, &contact.display_name, &emails, &phones, contact.organization.as_deref(), contact.title.as_deref(), contact.notes.as_deref());
+                            let vcard = crate::mail::carddav::generate_vcard(
+                                uid,
+                                &contact.display_name,
+                                &emails,
+                                &phones,
+                                contact.organization.as_deref(),
+                                contact.title.as_deref(),
+                                contact.notes.as_deref(),
+                            );
                             match client.put_contact(&book_href, uid, &vcard).await {
                                 Ok(etag) => {
                                     let conn = state.db.writer().await;
@@ -356,10 +507,7 @@ pub async fn update_contact(
 }
 
 #[tauri::command]
-pub async fn delete_contact(
-    state: State<'_, AppState>,
-    contact_id: String,
-) -> Result<()> {
+pub async fn delete_contact(state: State<'_, AppState>, contact_id: String) -> Result<()> {
     // Check if this contact has a Google remote_id before deleting
     let conn = state.db.writer().await;
     let remote_info = conn.query_row(
@@ -376,12 +524,18 @@ pub async fn delete_contact(
         if sync_type == "google" && !remote_id.is_empty() {
             if let Ok(token) = get_google_token(&account_id).await {
                 let http = reqwest::Client::new();
-                let url = format!("https://people.googleapis.com/v1/{}:deleteContact", remote_id);
+                let url = format!(
+                    "https://people.googleapis.com/v1/{}:deleteContact",
+                    remote_id
+                );
                 match http.delete(&url).bearer_auth(&token).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         log::info!("Deleted contact from Google: {}", remote_id);
                     }
-                    Ok(resp) => { let b = resp.text().await.unwrap_or_default(); log::warn!("Google delete contact failed: {}", b); }
+                    Ok(resp) => {
+                        let b = resp.text().await.unwrap_or_default();
+                        log::warn!("Google delete contact failed: {}", b);
+                    }
                     Err(e) => log::warn!("Google delete contact request failed: {}", e),
                 }
             }
@@ -401,7 +555,10 @@ pub async fn delete_contact(
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                 Ok(conn_jmap) => {
-                    match conn_jmap.delete_contact_card(&jmap_config, &remote_id).await {
+                    match conn_jmap
+                        .delete_contact_card(&jmap_config, &remote_id)
+                        .await
+                    {
                         Ok(()) => log::info!("Deleted contact from JMAP: {}", remote_id),
                         Err(e) => log::warn!("JMAP delete contact failed: {}", e),
                     }
@@ -414,14 +571,17 @@ pub async fn delete_contact(
                 db::accounts::get_account_full(&conn, &account_id)?
             };
             match crate::mail::carddav::CardDavClient::connect(
-                &account.caldav_url, &account.username, &account.password, &account.email,
-            ).await {
-                Ok(client) => {
-                    match client.delete_contact(&remote_id).await {
-                        Ok(()) => log::info!("Deleted contact from CardDAV: {}", remote_id),
-                        Err(e) => log::warn!("CardDAV delete contact failed: {}", e),
-                    }
-                }
+                &account.caldav_url,
+                &account.username,
+                &account.password,
+                &account.email,
+            )
+            .await
+            {
+                Ok(client) => match client.delete_contact(&remote_id).await {
+                    Ok(()) => log::info!("Deleted contact from CardDAV: {}", remote_id),
+                    Err(e) => log::warn!("CardDAV delete contact failed: {}", e),
+                },
                 Err(e) => log::warn!("CardDAV connect failed for contact delete: {}", e),
             }
         }
@@ -453,7 +613,10 @@ pub async fn sync_contacts(
         match sync_contacts_google(&state, &account_id, &account).await {
             Ok(()) => {}
             Err(e) => {
-                log::warn!("sync_contacts: Gmail CardDAV failed (OAuth may not be set up): {}", e);
+                log::warn!(
+                    "sync_contacts: Gmail CardDAV failed (OAuth may not be set up): {}",
+                    e
+                );
             }
         }
     } else if account.provider == "o365" {
@@ -467,7 +630,10 @@ pub async fn sync_contacts(
             }
         }
     } else {
-        log::debug!("sync_contacts: skipping account {} (no supported sync)", account_id);
+        log::debug!(
+            "sync_contacts: skipping account {} (no supported sync)",
+            account_id
+        );
     }
 
     // Notify frontend that contact data has changed
@@ -479,16 +645,18 @@ pub async fn sync_contacts(
 }
 
 async fn get_google_token(account_id: &str) -> Result<String> {
-    let tokens = crate::oauth::load_tokens(account_id)?
-        .ok_or_else(|| crate::error::Error::Other(
+    let tokens = crate::oauth::load_tokens(account_id)?.ok_or_else(|| {
+        crate::error::Error::Other(
             "No Google OAuth tokens. Please sign in with Google in Settings.".into(),
-        ))?;
+        )
+    })?;
 
     if !tokens.is_expired() {
         return Ok(tokens.access_token);
     }
 
-    let refresh_token = tokens.refresh_token
+    let refresh_token = tokens
+        .refresh_token
         .ok_or_else(|| crate::error::Error::Other("No refresh token".into()))?;
     match crate::oauth::refresh_access_token(&crate::oauth::GOOGLE, &refresh_token).await {
         Ok(new_tokens) => {
@@ -536,7 +704,10 @@ async fn sync_contacts_google(
         .get("https://people.googleapis.com/v1/people/me/connections")
         .bearer_auth(&access_token)
         .query(&[
-            ("personFields", "names,emailAddresses,phoneNumbers,organizations"),
+            (
+                "personFields",
+                "names,emailAddresses,phoneNumbers,organizations",
+            ),
             ("pageSize", "1000"),
         ])
         .send()
@@ -546,10 +717,15 @@ async fn sync_contacts_google(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(crate::error::Error::Other(format!("Google People API error {}: {}", status, body)));
+        return Err(crate::error::Error::Other(format!(
+            "Google People API error {}: {}",
+            status, body
+        )));
     }
 
-    let data: serde_json::Value = resp.json().await
+    let data: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| crate::error::Error::Other(format!("Google People API parse error: {}", e)))?;
 
     let connections = data["connections"].as_array();
@@ -651,7 +827,10 @@ async fn sync_contacts_jmap(
 
     // Step 1: Fetch address books
     let address_books = jmap_conn.list_address_books(&jmap_config).await?;
-    log::info!("sync_contacts: fetched {} address books from JMAP", address_books.len());
+    log::info!(
+        "sync_contacts: fetched {} address books from JMAP",
+        address_books.len()
+    );
 
     let mut remote_to_local: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -691,12 +870,20 @@ async fn sync_contacts_jmap(
         let jmap_contacts = match jmap_conn.fetch_contacts(&jmap_config, Some(&ab.id)).await {
             Ok(c) => c,
             Err(e) => {
-                log::error!("sync_contacts: failed to fetch contacts for '{}': {}", ab.name, e);
+                log::error!(
+                    "sync_contacts: failed to fetch contacts for '{}': {}",
+                    ab.name,
+                    e
+                );
                 continue;
             }
         };
 
-        log::info!("sync_contacts: fetched {} contacts for '{}'", jmap_contacts.len(), ab.name);
+        log::info!(
+            "sync_contacts: fetched {} contacts for '{}'",
+            jmap_contacts.len(),
+            ab.name
+        );
 
         let local_book_id = remote_to_local.get(&ab.id).cloned().unwrap_or_default();
         let conn = state.db.writer().await;
@@ -743,16 +930,32 @@ async fn sync_contacts_jmap(
         let mut deleted = 0u32;
         for (local_id, remote_id) in &local_synced {
             if !server_ids.contains(remote_id) {
-                conn.execute("DELETE FROM contacts WHERE id = ?1", rusqlite::params![local_id]).ok();
+                conn.execute(
+                    "DELETE FROM contacts WHERE id = ?1",
+                    rusqlite::params![local_id],
+                )
+                .ok();
                 deleted += 1;
             }
         }
         if deleted > 0 {
-            log::info!("sync_contacts: removed {} server-deleted contacts from '{}'", deleted, ab.name);
+            log::info!(
+                "sync_contacts: removed {} server-deleted contacts from '{}'",
+                deleted,
+                ab.name
+            );
         }
 
         // Push local contacts (no remote_id) to server
-        type UnpushedRow = (String, String, String, String, Option<String>, Option<String>, Option<String>);
+        type UnpushedRow = (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let unpushed: Vec<UnpushedRow> = conn
             .prepare(
                 "SELECT id, display_name, emails_json, phones_json, organization, title, notes
@@ -775,27 +978,39 @@ async fn sync_contacts_jmap(
             .unwrap_or_default();
 
         if !unpushed.is_empty() {
-            log::info!("sync_contacts: pushing {} local contacts to JMAP for '{}'", unpushed.len(), ab.name);
+            log::info!(
+                "sync_contacts: pushing {} local contacts to JMAP for '{}'",
+                unpushed.len(),
+                ab.name
+            );
             drop(conn); // Release lock for async calls
 
             for (local_id, name, emails, phones, org, title, notes) in &unpushed {
-                match jmap_conn.create_contact_card(
-                    &jmap_config,
-                    &ab.id,
-                    name,
-                    emails,
-                    phones,
-                    org.as_deref(),
-                    title.as_deref(),
-                    notes.as_deref(),
-                ).await {
+                match jmap_conn
+                    .create_contact_card(
+                        &jmap_config,
+                        &ab.id,
+                        name,
+                        emails,
+                        phones,
+                        org.as_deref(),
+                        title.as_deref(),
+                        notes.as_deref(),
+                    )
+                    .await
+                {
                     Ok(remote_id) => {
-                        log::info!("sync_contacts: pushed contact '{}' to JMAP, remote_id={}", name, remote_id);
+                        log::info!(
+                            "sync_contacts: pushed contact '{}' to JMAP, remote_id={}",
+                            name,
+                            remote_id
+                        );
                         let conn = state.db.writer().await;
                         conn.execute(
                             "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                             rusqlite::params![remote_id, local_id],
-                        ).ok();
+                        )
+                        .ok();
                     }
                     Err(e) => {
                         log::error!("sync_contacts: failed to push contact '{}': {}", name, e);
@@ -813,7 +1028,7 @@ async fn sync_contacts_carddav(
     account_id: &str,
     account: &db::accounts::AccountFull,
 ) -> Result<()> {
-    use crate::mail::carddav::{CardDavClient, parse_vcard};
+    use crate::mail::carddav::{parse_vcard, CardDavClient};
 
     log::info!("sync_contacts_carddav: starting for account {}", account_id);
 
@@ -891,8 +1106,10 @@ async fn sync_contacts_carddav(
         for sc in &server_contacts {
             let parsed = parse_vcard(&sc.vcard_data);
 
-            let emails_json = serde_json::to_string(&parsed.emails).unwrap_or_else(|_| "[]".to_string());
-            let phones_json = serde_json::to_string(&parsed.phones).unwrap_or_else(|_| "[]".to_string());
+            let emails_json =
+                serde_json::to_string(&parsed.emails).unwrap_or_else(|_| "[]".to_string());
+            let phones_json =
+                serde_json::to_string(&parsed.phones).unwrap_or_else(|_| "[]".to_string());
 
             if let Some(existing) = local_by_uid.remove(&sc.uid) {
                 // Update if etag changed
@@ -949,7 +1166,10 @@ async fn sync_contacts_carddav(
         }
     }
 
-    log::info!("sync_contacts_carddav: completed for account {}", account_id);
+    log::info!(
+        "sync_contacts_carddav: completed for account {}",
+        account_id
+    );
     Ok(())
 }
 
@@ -958,10 +1178,7 @@ async fn sync_contacts_carddav(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn search_contacts(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<Vec<Contact>> {
+pub async fn search_contacts(state: State<'_, AppState>, query: String) -> Result<Vec<Contact>> {
     let conn = state.db.reader();
     db::contacts::search_all_contacts(&conn, &query)
 }
@@ -979,10 +1196,7 @@ pub async fn search_collected_contacts(
 // Microsoft Graph contacts sync
 // ---------------------------------------------------------------------------
 
-async fn sync_contacts_graph(
-    state: &State<'_, AppState>,
-    account_id: &str,
-) -> Result<()> {
+async fn sync_contacts_graph(state: &State<'_, AppState>, account_id: &str) -> Result<()> {
     log::info!("sync_contacts_graph: starting for account {}", account_id);
 
     let token = match crate::mail::graph::get_graph_token(account_id).await {
@@ -997,11 +1211,13 @@ async fn sync_contacts_graph(
     // 1. Ensure contact book exists
     let book_id = {
         let conn = state.db.writer().await;
-        let existing: Option<String> = conn.query_row(
-            "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
-            rusqlite::params![account_id],
-            |row| row.get(0),
-        ).ok();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )
+            .ok();
 
         match existing {
             Some(id) => id,
@@ -1025,7 +1241,10 @@ async fn sync_contacts_graph(
             return Err(e);
         }
     };
-    log::info!("sync_contacts_graph: fetched {} contacts", graph_contacts.len());
+    log::info!(
+        "sync_contacts_graph: fetched {} contacts",
+        graph_contacts.len()
+    );
 
     let conn = state.db.writer().await;
 
@@ -1035,11 +1254,13 @@ async fn sync_contacts_graph(
 
     // 3. Upsert contacts
     for gc in &graph_contacts {
-        let existing: Option<String> = conn.query_row(
-            "SELECT id FROM contacts WHERE book_id = ?1 AND remote_id = ?2",
-            rusqlite::params![book_id, gc.id],
-            |row| row.get(0),
-        ).ok();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM contacts WHERE book_id = ?1 AND remote_id = ?2",
+                rusqlite::params![book_id, gc.id],
+                |row| row.get(0),
+            )
+            .ok();
 
         match existing {
             Some(local_id) => {
@@ -1056,7 +1277,8 @@ async fn sync_contacts_graph(
                         gc.title,
                         local_id,
                     ],
-                ).ok();
+                )
+                .ok();
             }
             None => {
                 // Insert new contact
@@ -1093,12 +1315,19 @@ async fn sync_contacts_graph(
     let mut deleted = 0;
     for (local_id, remote_id) in &local_contacts {
         if !server_ids.contains(remote_id) {
-            conn.execute("DELETE FROM contacts WHERE id = ?1", rusqlite::params![local_id]).ok();
+            conn.execute(
+                "DELETE FROM contacts WHERE id = ?1",
+                rusqlite::params![local_id],
+            )
+            .ok();
             deleted += 1;
         }
     }
     if deleted > 0 {
-        log::info!("sync_contacts_graph: removed {} server-deleted contacts", deleted);
+        log::info!(
+            "sync_contacts_graph: removed {} server-deleted contacts",
+            deleted
+        );
     }
 
     log::info!("sync_contacts_graph: completed for account {}", account_id);

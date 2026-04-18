@@ -55,9 +55,14 @@ pub async fn sync_jmap_account(
     )
     .ok();
 
-    let result =
-        sync_jmap_account_inner(&app, &db, &account_id, &jmap_config, current_folder.as_deref())
-            .await;
+    let result = sync_jmap_account_inner(
+        &app,
+        &db,
+        &account_id,
+        &jmap_config,
+        current_folder.as_deref(),
+    )
+    .await;
 
     match &result {
         Ok(total) => {
@@ -146,7 +151,16 @@ async fn sync_jmap_account_inner(
         )
         .ok();
 
-        match sync_jmap_folder(db, account_id, &conn_jmap, jmap_config, mailbox_id, folder_name).await {
+        match sync_jmap_folder(
+            db,
+            account_id,
+            &conn_jmap,
+            jmap_config,
+            mailbox_id,
+            folder_name,
+        )
+        .await
+        {
             Ok(count) => {
                 grand_total += count;
                 if count > 0 {
@@ -239,11 +253,7 @@ async fn sync_jmap_folder(
                 email.subject.as_deref(),
             );
             if let Some(ref tid) = thread_id {
-                log::debug!(
-                    "JMAP assigned thread_id '{}' to email {}",
-                    tid,
-                    email.id
-                );
+                log::debug!("JMAP assigned thread_id '{}' to email {}", tid, email.id);
             }
 
             let new_msg = db::messages::NewMessage {
@@ -283,44 +293,58 @@ async fn sync_jmap_folder(
 
     // Remove local messages that no longer exist on the server.
     // Build a set of JMAP email IDs from the server response.
-    let server_ids: std::collections::HashSet<String> = emails.iter().map(|e| e.id.clone()).collect();
+    let server_ids: std::collections::HashSet<String> =
+        emails.iter().map(|e| e.id.clone()).collect();
     {
         let conn = db.writer().await;
         // Get all local message IDs for this folder
-        let mut stmt = conn.prepare(
-            "SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2"
-        ).map_err(Error::Database)?;
-        let local_ids: Vec<String> = stmt.query_map(
-            rusqlite::params![account_id, mailbox_id],
-            |row| row.get(0),
-        ).map_err(Error::Database)?
-        .filter_map(|r| r.ok())
-        .collect();
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2")
+            .map_err(Error::Database)?;
+        let local_ids: Vec<String> = stmt
+            .query_map(rusqlite::params![account_id, mailbox_id], |row| row.get(0))
+            .map_err(Error::Database)?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let _prefix = format!("{}_{}_{}", account_id, mailbox_id, "");
         let mut deleted = 0u32;
         for local_id in &local_ids {
             // Extract the JMAP email ID from the composite local ID
-            let jmap_id = local_id.strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
+            let jmap_id = local_id
+                .strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
                 .unwrap_or(local_id);
             if !server_ids.contains(jmap_id) {
                 conn.execute(
                     "DELETE FROM messages WHERE id = ?1",
                     rusqlite::params![local_id],
-                ).ok();
+                )
+                .ok();
                 deleted += 1;
             }
         }
         if deleted > 0 {
-            log::info!("JMAP removed {} locally deleted messages from {}", deleted, folder_name);
+            log::info!(
+                "JMAP removed {} locally deleted messages from {}",
+                deleted,
+                folder_name
+            );
         }
     }
 
     // Update folder counts
     {
         let conn = db.writer().await;
-        let page =
-            db::messages::get_messages(&conn, account_id, mailbox_id, 0, 1, "date", false, &Default::default())?;
+        let page = db::messages::get_messages(
+            &conn,
+            account_id,
+            mailbox_id,
+            0,
+            1,
+            "date",
+            false,
+            &Default::default(),
+        )?;
         let unread = count_unread(&conn, account_id, mailbox_id)?;
         db::folders::update_folder_counts(&conn, account_id, mailbox_id, unread, page.total)?;
     }
@@ -374,7 +398,15 @@ pub async fn sync_jmap_folder_public(
 
     let conn_jmap = JmapConnection::connect(&jmap_config).await?;
     let folder_name = mailbox_id.clone();
-    let result = sync_jmap_folder(&db, &account_id, &conn_jmap, &jmap_config, &mailbox_id, &folder_name).await;
+    let result = sync_jmap_folder(
+        &db,
+        &account_id,
+        &conn_jmap,
+        &jmap_config,
+        &mailbox_id,
+        &folder_name,
+    )
+    .await;
 
     match &result {
         Ok(count) => {
@@ -427,7 +459,9 @@ pub async fn fetch_and_store_jmap_body(
     let body = conn_jmap
         .fetch_email_body(jmap_config, jmap_email_id)
         .await?
-        .ok_or_else(|| Error::Other(format!("JMAP no body returned for email {}", jmap_email_id)))?;
+        .ok_or_else(|| {
+            Error::Other(format!("JMAP no body returned for email {}", jmap_email_id))
+        })?;
 
     // Write to Maildir structure for parsing
     let maildir_base = data_dir
@@ -446,11 +480,7 @@ pub async fn fetch_and_store_jmap_body(
         filename
     );
 
-    log::info!(
-        "JMAP body saved: {} ({} bytes)",
-        relative_path,
-        body.len()
-    );
+    log::info!("JMAP body saved: {} ({} bytes)", relative_path, body.len());
 
     Ok(relative_path)
 }

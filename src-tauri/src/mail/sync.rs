@@ -61,7 +61,14 @@ pub async fn sync_account(
 
     let current_folder_clone = current_folder;
     let result = tokio::task::spawn_blocking(move || {
-        sync_account_blocking(&app_clone, db, &data_dir, &account_id_clone, &imap_config, current_folder_clone.as_deref())
+        sync_account_blocking(
+            &app_clone,
+            db,
+            &data_dir,
+            &account_id_clone,
+            &imap_config,
+            current_folder_clone.as_deref(),
+        )
     })
     .await
     .map_err(|e| Error::Sync(format!("Sync task panicked: {}", e)))?;
@@ -124,22 +131,24 @@ fn sync_account_blocking(
     // but keep them in the DB (they're needed for move/delete operations).
     // [Gmail]/All Mail contains every email, [Gmail]/Important is a virtual view.
     // [Gmail] itself is not a selectable mailbox.
-    let skip_sync_folders: &[&str] = &[
-        "[Gmail]/All Mail",
-        "[Gmail]/Important",
-        "[Gmail]",
-    ];
+    let skip_sync_folders: &[&str] = &["[Gmail]/All Mail", "[Gmail]/Important", "[Gmail]"];
 
     // Sync order: priority folders first (current, INBOX), then rest in parallel.
     // Folders in skip_sync_folders are registered in DB (above) but not synced.
     let mut priority: Vec<String> = Vec::new();
     let mut others: Vec<String> = Vec::new();
     for (_, path) in &imap_folders {
-        if skip_sync_folders.iter().any(|skip| path.eq_ignore_ascii_case(skip)) {
+        if skip_sync_folders
+            .iter()
+            .any(|skip| path.eq_ignore_ascii_case(skip))
+        {
             log::debug!("Skipping envelope sync for Gmail virtual folder: {}", path);
             continue;
         }
-        if current_folder.map(|cf| cf == path.as_str()).unwrap_or(false) {
+        if current_folder
+            .map(|cf| cf == path.as_str())
+            .unwrap_or(false)
+        {
             priority.insert(0, path.clone());
         } else if path.to_uppercase() == "INBOX" {
             priority.push(path.clone());
@@ -199,7 +208,8 @@ fn sync_account_blocking(
             parallel_count
         );
 
-        let mut thread_folders: Vec<Vec<String>> = (0..parallel_count).map(|_| Vec::new()).collect();
+        let mut thread_folders: Vec<Vec<String>> =
+            (0..parallel_count).map(|_| Vec::new()).collect();
         for (i, folder) in others.iter().enumerate() {
             thread_folders[i % parallel_count].push(folder.clone());
         }
@@ -222,13 +232,20 @@ fn sync_account_blocking(
                         let mut conn = match ImapConnection::connect(&imap_config) {
                             Ok(c) => c,
                             Err(e) => {
-                                log::error!("Parallel sync thread {}: connect failed: {}", thread_idx, e);
+                                log::error!(
+                                    "Parallel sync thread {}: connect failed: {}",
+                                    thread_idx,
+                                    e
+                                );
                                 return Err(e);
                             }
                         };
                         let mut thread_total = 0u32;
                         for folder in &folders {
-                            let folder_idx = priority_count + thread_idx + (folders.iter().position(|f| f == folder).unwrap_or(0) * parallel_count);
+                            let folder_idx = priority_count
+                                + thread_idx
+                                + (folders.iter().position(|f| f == folder).unwrap_or(0)
+                                    * parallel_count);
                             app.emit(
                                 "sync-progress",
                                 SyncProgress {
@@ -244,10 +261,16 @@ fn sync_account_blocking(
                                 Ok(count) => {
                                     thread_total += count;
                                     if count > 0 {
-                                        log::info!("Parallel sync: {} envelopes in {}", count, folder);
+                                        log::info!(
+                                            "Parallel sync: {} envelopes in {}",
+                                            count,
+                                            folder
+                                        );
                                     }
                                 }
-                                Err(e) => log::warn!("Parallel sync: skipping folder '{}': {}", folder, e),
+                                Err(e) => {
+                                    log::warn!("Parallel sync: skipping folder '{}': {}", folder, e)
+                                }
                             }
                         }
                         conn.logout();
@@ -256,7 +279,13 @@ fn sync_account_blocking(
                 })
                 .collect();
 
-            handles.into_iter().map(|h| h.join().unwrap_or(Err(Error::Sync("Thread panicked".into())))).collect()
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or(Err(Error::Sync("Thread panicked".into())))
+                })
+                .collect()
         });
 
         for count in results.into_iter().flatten() {
@@ -302,10 +331,16 @@ fn sync_folder_envelopes(
     // folder is unchanged — skip deletion reconciliation, flag sync, and
     // envelope fetch entirely. Most folders are dormant, so this skips ~80%
     // of folders on a typical sync cycle.
-    if last_uid > 0 && stored_uid_next > 0 && uid_next == stored_uid_next && exists as i64 == stored_total {
+    if last_uid > 0
+        && stored_uid_next > 0
+        && uid_next == stored_uid_next
+        && exists as i64 == stored_total
+    {
         log::debug!(
             "Folder '{}' unchanged (uidnext={}, exists={}), skipping",
-            folder_path, uid_next, exists
+            folder_path,
+            uid_next,
+            exists
         );
         return Ok(0);
     }
@@ -313,8 +348,7 @@ fn sync_folder_envelopes(
     // Reconcile deletions — skip on first sync (last_uid == 0) since the local DB is empty.
     if last_uid > 0 {
         let all_server_uids = conn_imap.fetch_uids(0)?;
-        let server_uid_set: std::collections::HashSet<u32> =
-            all_server_uids.into_iter().collect();
+        let server_uid_set: std::collections::HashSet<u32> = all_server_uids.into_iter().collect();
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
@@ -383,8 +417,16 @@ fn sync_folder_envelopes(
     if new_uids.is_empty() {
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
-        let page =
-            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
+        let page = db::messages::get_messages(
+            &conn,
+            account_id,
+            folder_path,
+            0,
+            1,
+            "date",
+            false,
+            &Default::default(),
+        )?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         if uid_next > 0 {
@@ -515,8 +557,16 @@ fn sync_folder_envelopes(
     {
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
-        let page =
-            db::messages::get_messages(&conn, account_id, folder_path, 0, 1, "date", false, &Default::default())?;
+        let page = db::messages::get_messages(
+            &conn,
+            account_id,
+            folder_path,
+            0,
+            1,
+            "date",
+            false,
+            &Default::default(),
+        )?;
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         // Store uid_next for preflight optimization on next sync
@@ -554,9 +604,7 @@ pub fn fetch_and_store_body(
 
     // Write to Maildir — validate path components before creating directories
     let sanitized = sanitize_folder_name(folder_path);
-    let maildir_base = data_dir
-        .join(account_id)
-        .join(&sanitized);
+    let maildir_base = data_dir.join(account_id).join(&sanitized);
 
     // Reject any remaining ".." or absolute components before touching the filesystem
     for component in maildir_base.components() {
@@ -571,12 +619,10 @@ pub fn fetch_and_store_body(
     create_maildir_dirs(&maildir_base)?;
 
     // Post-creation canonical check as defence-in-depth (catches symlink attacks)
-    let canonical_data_dir = std::fs::canonicalize(data_dir)
-        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_data_dir =
+        std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let canonical_maildir = std::fs::canonicalize(&maildir_base)
-        .map_err(|e| Error::Other(format!(
-            "Failed to resolve maildir path: {}", e
-        )))?;
+        .map_err(|e| Error::Other(format!("Failed to resolve maildir path: {}", e)))?;
     if !canonical_maildir.starts_with(&canonical_data_dir) {
         // Clean up the directory we just created since it's outside our tree
         let _ = std::fs::remove_dir_all(&canonical_maildir);
@@ -597,11 +643,7 @@ pub fn fetch_and_store_body(
         filename
     );
 
-    log::info!(
-        "Body saved: {} ({} bytes)",
-        relative_path,
-        body.len()
-    );
+    log::info!("Body saved: {} ({} bytes)", relative_path, body.len());
 
     Ok(relative_path)
 }
@@ -621,7 +663,11 @@ pub(crate) fn sanitize_folder_name(name: &str) -> String {
         .filter_map(|c| match c {
             std::path::Component::Normal(part) => {
                 let s = part.to_string_lossy().replace('.', "_");
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             }
             // Strip ., .., /, and prefix components
             _ => None,
@@ -906,11 +952,22 @@ fn load_messages_by_ids(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut messages = Vec::with_capacity(rows.len());
-    for (id, uid, folder, from_name, from_email, to_json, cc_json, subject, size, has_attach, flags_json) in rows {
-        let to_addresses: Vec<AddressEntry> =
-            serde_json::from_str(&to_json).unwrap_or_default();
-        let cc_addresses: Vec<AddressEntry> =
-            serde_json::from_str(&cc_json).unwrap_or_default();
+    for (
+        id,
+        uid,
+        folder,
+        from_name,
+        from_email,
+        to_json,
+        cc_json,
+        subject,
+        size,
+        has_attach,
+        flags_json,
+    ) in rows
+    {
+        let to_addresses: Vec<AddressEntry> = serde_json::from_str(&to_json).unwrap_or_default();
+        let cc_addresses: Vec<AddressEntry> = serde_json::from_str(&cc_json).unwrap_or_default();
         let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
 
         messages.push(MessageData {

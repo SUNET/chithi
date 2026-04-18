@@ -33,9 +33,7 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                 by_folder,
                 target_folder,
             } => {
-                let moves = pending_moves
-                    .entry(target_folder)
-                    .or_default();
+                let moves = pending_moves.entry(target_folder).or_default();
                 merge_by_folder(moves, by_folder);
             }
             MailOp::SetFlags {

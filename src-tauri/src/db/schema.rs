@@ -229,9 +229,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .is_ok();
     if !has_caldav_url {
         log::info!("Migration: adding caldav_url column to accounts table");
-        conn.execute_batch(
-            "ALTER TABLE accounts ADD COLUMN caldav_url TEXT NOT NULL DEFAULT '';",
-        )?;
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN caldav_url TEXT NOT NULL DEFAULT '';")?;
     }
 
     // Add signature column if it doesn't exist
@@ -240,9 +238,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .is_ok();
     if !has_signature {
         log::info!("Migration: adding signature column to accounts table");
-        conn.execute_batch(
-            "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';",
-        )?;
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';")?;
     }
 
     // Add jmap_auth_method column if it doesn't exist
@@ -290,9 +286,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     // Add uid_next column to folders for IMAP preflight sync optimization
-    let has_uid_next: bool = conn
-        .prepare("SELECT uid_next FROM folders LIMIT 0")
-        .is_ok();
+    let has_uid_next: bool = conn.prepare("SELECT uid_next FROM folders LIMIT 0").is_ok();
     if !has_uid_next {
         log::info!("Migration: adding uid_next column to folders table");
         conn.execute_batch("ALTER TABLE folders ADD COLUMN uid_next INTEGER DEFAULT 0;")?;

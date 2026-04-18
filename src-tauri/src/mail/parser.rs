@@ -8,7 +8,11 @@ fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
             .iter()
             .map(|a| Address {
                 name: a.name.as_ref().map(|s| s.to_string()),
-                email: a.address.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                email: a
+                    .address
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
             })
             .collect(),
         MailAddress::Group(groups) => groups
@@ -16,7 +20,11 @@ fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
             .flat_map(|g| {
                 g.addresses.iter().map(|a| Address {
                     name: a.name.as_ref().map(|s| s.to_string()),
-                    email: a.address.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                    email: a
+                        .address
+                        .as_ref()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
                 })
             })
             .collect(),
@@ -75,16 +83,12 @@ pub fn parse_envelope(
     let is_encrypted = parsed
         .content_type()
         .map(|ct| {
-            ct.ctype() == "multipart"
-                && ct.subtype().map(|s| s == "encrypted").unwrap_or(false)
+            ct.ctype() == "multipart" && ct.subtype().map(|s| s == "encrypted").unwrap_or(false)
         })
         .unwrap_or(false);
     let is_signed = parsed
         .content_type()
-        .map(|ct| {
-            ct.ctype() == "multipart"
-                && ct.subtype().map(|s| s == "signed").unwrap_or(false)
-        })
+        .map(|ct| ct.ctype() == "multipart" && ct.subtype().map(|s| s == "signed").unwrap_or(false))
         .unwrap_or(false);
 
     let id = format!("{}_{}_{}", account_id, folder_path, uid);
@@ -140,10 +144,7 @@ pub fn parse_message_body(
     let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
 
     let subject = parsed.subject().map(|s| s.to_string());
-    let date = parsed
-        .date()
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_default();
+    let date = parsed.date().map(|d| d.to_rfc3339()).unwrap_or_default();
 
     // Grab raw HTML once for both image detection and sanitization
     let raw_html = parsed.body_html(0);
@@ -151,19 +152,25 @@ pub fn parse_message_body(
     // Check for remote images before sanitization strips <img> tags.
     // Only match https:// to align with the loading pipeline (parse_html_with_images
     // only allows https URL scheme).
-    let has_remote_images = raw_html.as_ref().map(|s| {
-        use std::sync::LazyLock;
-        static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r#"(?i)<img\b[^>]*\bsrc\s*=\s*["']https://"#).unwrap()
-        });
-        RE.is_match(s)
-    }).unwrap_or(false);
+    let has_remote_images = raw_html
+        .as_ref()
+        .map(|s| {
+            use std::sync::LazyLock;
+            static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+                regex::Regex::new(r#"(?i)<img\b[^>]*\bsrc\s*=\s*["']https://"#).unwrap()
+            });
+            RE.is_match(s)
+        })
+        .unwrap_or(false);
 
     let body_html = raw_html.map(|s| {
         let url_schemes = std::collections::HashSet::from(["http", "https", "mailto"]);
         ammonia::Builder::default()
             .add_generic_attributes(&["style"])
-            .rm_tags(&["img", "object", "embed", "iframe", "form", "input", "button", "textarea", "select", "video", "audio", "source", "svg", "math"])
+            .rm_tags(&[
+                "img", "object", "embed", "iframe", "form", "input", "button", "textarea",
+                "select", "video", "audio", "source", "svg", "math",
+            ])
             .url_schemes(url_schemes)
             .clean(&s)
             .to_string()
@@ -177,13 +184,7 @@ pub fn parse_message_body(
             let filename = att.attachment_name().map(|s| s.to_string());
             let content_type = att
                 .content_type()
-                .map(|ct| {
-                    format!(
-                        "{}/{}",
-                        ct.ctype(),
-                        ct.subtype().unwrap_or("octet-stream")
-                    )
-                })
+                .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             Attachment {
                 index: i as u32,
@@ -229,7 +230,10 @@ pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
             .add_generic_attributes(&["style"])
             .add_tags(&["img"])
             .add_tag_attributes("img", &["src", "alt", "width", "height", "style"])
-            .rm_tags(&["object", "embed", "iframe", "form", "input", "button", "textarea", "select", "video", "audio", "source", "svg", "math"])
+            .rm_tags(&[
+                "object", "embed", "iframe", "form", "input", "button", "textarea", "select",
+                "video", "audio", "source", "svg", "math",
+            ])
             .url_schemes(url_schemes)
             .clean(&s)
             .to_string()

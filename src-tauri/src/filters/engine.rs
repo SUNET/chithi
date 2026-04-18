@@ -1,9 +1,7 @@
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::rules::{
-    Condition, ConditionField, ConditionOp, FilterAction, FilterRule, MatchType,
-};
+use super::rules::{Condition, ConditionField, ConditionOp, FilterAction, FilterRule, MatchType};
 
 /// Lightweight struct holding the message fields needed for filter matching.
 /// Constructed from DB row data before running the filter engine.
@@ -45,7 +43,7 @@ pub fn matches_message(rule: &FilterRule, msg: &MessageData) -> bool {
 /// evaluating further rules.
 pub fn apply_filters(rules: &[FilterRule], msg: &MessageData) -> Vec<FilterAction> {
     let mut sorted: Vec<&FilterRule> = rules.iter().filter(|r| r.enabled).collect();
-    sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
     let mut collected_actions: Vec<FilterAction> = Vec::new();
 
@@ -115,16 +113,15 @@ fn eval_string_op(op: &ConditionOp, haystack: &str, needle: &str) -> bool {
         ConditionOp::NotContains => !h.contains(&n),
         ConditionOp::Equals => h == n,
         ConditionOp::NotEquals => h != n,
-        ConditionOp::MatchesRegex => match RegexBuilder::new(needle)
-            .size_limit(1_000_000)
-            .build()
-        {
-            Ok(re) => re.is_match(haystack),
-            Err(e) => {
-                log::warn!("Invalid or too complex regex '{}': {}", needle, e);
-                false
+        ConditionOp::MatchesRegex => {
+            match RegexBuilder::new(needle).size_limit(1_000_000).build() {
+                Ok(re) => re.is_match(haystack),
+                Err(e) => {
+                    log::warn!("Invalid or too complex regex '{}': {}", needle, e);
+                    false
+                }
             }
-        },
+        }
         ConditionOp::GreaterThan | ConditionOp::LessThan => {
             // Numeric ops don't apply to strings; always false
             false
@@ -167,33 +164,21 @@ fn eval_address_list_op(op: &ConditionOp, addrs: &[AddressEntry], value: &str) -
         ConditionOp::NotContains => {
             // True if no address contains the value
             !addrs.iter().any(|a| {
-                let combined = format!(
-                    "{} {}",
-                    a.name.as_deref().unwrap_or(""),
-                    a.email
-                );
+                let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(&ConditionOp::Contains, &combined, value)
             })
         }
         ConditionOp::NotEquals => {
             // True if no address equals the value
             !addrs.iter().any(|a| {
-                let combined = format!(
-                    "{} {}",
-                    a.name.as_deref().unwrap_or(""),
-                    a.email
-                );
+                let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(&ConditionOp::Equals, &combined, value)
             })
         }
         _ => {
             // For Contains, Equals, MatchesRegex: true if any address matches
             addrs.iter().any(|a| {
-                let combined = format!(
-                    "{} {}",
-                    a.name.as_deref().unwrap_or(""),
-                    a.email
-                );
+                let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(op, &combined, value)
             })
         }

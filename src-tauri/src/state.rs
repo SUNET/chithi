@@ -81,12 +81,7 @@ impl AppState {
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<OpEntry>(256);
-        let worker = AccountWorker::new(
-            account_id.to_string(),
-            rx,
-            self.db.clone(),
-            app.clone(),
-        );
+        let worker = AccountWorker::new(account_id.to_string(), rx, self.db.clone(), app.clone());
         tokio::spawn(worker.run());
         senders.insert(account_id.to_string(), tx.clone());
         tx

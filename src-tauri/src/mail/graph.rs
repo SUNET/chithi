@@ -27,7 +27,8 @@ impl GraphClient {
 
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .bearer_auth(&self.access_token)
             .query(params)
@@ -38,7 +39,12 @@ impl GraphClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(Error::Other(format!("Graph GET {} returned {}: {}", path, status, truncate(&body, 500))));
+            return Err(Error::Other(format!(
+                "Graph GET {} returned {}: {}",
+                path,
+                status,
+                truncate(&body, 500)
+            )));
         }
 
         serde_json::from_str(&body)
@@ -52,7 +58,8 @@ impl GraphClient {
         use tokio::io::AsyncWriteExt;
 
         let url = format!("{}{}", GRAPH_BASE, path);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .bearer_auth(&self.access_token)
             .send()
@@ -62,24 +69,32 @@ impl GraphClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("Graph GET {} returned {}: {}", path, status, truncate(&body, 500))));
+            return Err(Error::Other(format!(
+                "Graph GET {} returned {}: {}",
+                path,
+                status,
+                truncate(&body, 500)
+            )));
         }
 
-        let mut file = tokio::fs::File::create(dest).await
-            .map_err(|e| Error::Other(format!("Failed to create file {}: {}", dest.display(), e)))?;
+        let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
+            Error::Other(format!("Failed to create file {}: {}", dest.display(), e))
+        })?;
         let mut stream = resp.bytes_stream();
         let mut total: u64 = 0;
 
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
-            file.write_all(&chunk).await
-                .map_err(|e| Error::Other(format!("Failed to write to {}: {}", dest.display(), e)))?;
+            let chunk =
+                chunk.map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
+            file.write_all(&chunk).await.map_err(|e| {
+                Error::Other(format!("Failed to write to {}: {}", dest.display(), e))
+            })?;
             total += chunk.len() as u64;
         }
 
-        file.flush().await
+        file.flush()
+            .await
             .map_err(|e| Error::Other(format!("Failed to flush {}: {}", dest.display(), e)))?;
 
         Ok(total)
@@ -87,7 +102,8 @@ impl GraphClient {
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .bearer_auth(&self.access_token)
             .json(body)
@@ -98,7 +114,12 @@ impl GraphClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(Error::Other(format!("Graph POST {} returned {}: {}", path, status, truncate(&text, 500))));
+            return Err(Error::Other(format!(
+                "Graph POST {} returned {}: {}",
+                path,
+                status,
+                truncate(&text, 500)
+            )));
         }
 
         if text.is_empty() {
@@ -111,7 +132,8 @@ impl GraphClient {
 
     async fn patch_json(&self, path: &str, body: &serde_json::Value) -> Result<()> {
         let url = format!("{}{}", GRAPH_BASE, path);
-        let resp = self.http
+        let resp = self
+            .http
             .patch(&url)
             .bearer_auth(&self.access_token)
             .json(body)
@@ -122,14 +144,20 @@ impl GraphClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("Graph PATCH {} returned {}: {}", path, status, truncate(&text, 500))));
+            return Err(Error::Other(format!(
+                "Graph PATCH {} returned {}: {}",
+                path,
+                status,
+                truncate(&text, 500)
+            )));
         }
         Ok(())
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
         let url = format!("{}{}", GRAPH_BASE, path);
-        let resp = self.http
+        let resp = self
+            .http
             .delete(&url)
             .bearer_auth(&self.access_token)
             .send()
@@ -139,7 +167,12 @@ impl GraphClient {
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("Graph DELETE {} returned {}: {}", path, status, truncate(&text, 500))));
+            return Err(Error::Other(format!(
+                "Graph DELETE {} returned {}: {}",
+                path,
+                status,
+                truncate(&text, 500)
+            )));
         }
         Ok(())
     }
@@ -150,25 +183,38 @@ impl GraphClient {
 
     /// Get the signed-in user's profile (email, display name).
     pub async fn get_me(&self) -> Result<GraphUser> {
-        let resp = self.get("/me", &[("$select", "id,displayName,userPrincipalName,mail")]).await?;
+        let resp = self
+            .get(
+                "/me",
+                &[("$select", "id,displayName,userPrincipalName,mail")],
+            )
+            .await?;
 
         let display_name = resp["displayName"].as_str().unwrap_or("").to_string();
-        let mut email = resp["mail"].as_str()
+        let mut email = resp["mail"]
+            .as_str()
             .or_else(|| resp["userPrincipalName"].as_str())
             .unwrap_or("")
             .to_string();
 
         let login_email = email.clone();
-        log::info!("Graph /me: displayName={}, login_email={}", display_name, login_email);
+        log::info!(
+            "Graph /me: displayName={}, login_email={}",
+            display_name,
+            login_email
+        );
 
         // For personal Microsoft accounts, the login email (e.g., gmail.com) may differ
         // from the actual Outlook mailbox address. Try multiple sources:
 
         // 1. Check To address of inbox messages (catches user-configured aliases like chithiapp@outlook.com)
-        if let Ok(inbox_resp) = self.get(
-            "/me/mailFolders('Inbox')/messages",
-            &[("$top", "1"), ("$select", "toRecipients")],
-        ).await {
+        if let Ok(inbox_resp) = self
+            .get(
+                "/me/mailFolders('Inbox')/messages",
+                &[("$top", "1"), ("$select", "toRecipients")],
+            )
+            .await
+        {
             if let Some(to_addr) = inbox_resp["value"]
                 .as_array()
                 .and_then(|a| a.first())
@@ -176,7 +222,11 @@ impl GraphClient {
                 .and_then(|r| r.first())
                 .and_then(|r| r["emailAddress"]["address"].as_str())
             {
-                if to_addr != email && (to_addr.contains("outlook.") || to_addr.contains("hotmail.") || to_addr.contains("live.")) {
+                if to_addr != email
+                    && (to_addr.contains("outlook.")
+                        || to_addr.contains("hotmail.")
+                        || to_addr.contains("live."))
+                {
                     log::info!("Graph: mailbox email from Inbox To: {}", to_addr);
                     email = to_addr.to_string();
                 }
@@ -185,10 +235,13 @@ impl GraphClient {
 
         // 2. Fallback: check From address of sent messages
         if email == login_email {
-            if let Ok(sent_resp) = self.get(
-                "/me/mailFolders('SentItems')/messages",
-                &[("$top", "1"), ("$select", "from")],
-            ).await {
+            if let Ok(sent_resp) = self
+                .get(
+                    "/me/mailFolders('SentItems')/messages",
+                    &[("$top", "1"), ("$select", "from")],
+                )
+                .await
+            {
                 if let Some(from_addr) = sent_resp["value"]
                     .as_array()
                     .and_then(|a| a.first())
@@ -219,11 +272,19 @@ impl GraphClient {
         let mut url = "/me/mailFolders".to_string();
 
         loop {
-            let resp = self.get(&url, &[
-                ("$select", "id,displayName,totalItemCount,unreadItemCount,parentFolderId"),
-                ("$top", "100"),
-                ("includeHiddenFolders", "true"),
-            ]).await?;
+            let resp = self
+                .get(
+                    &url,
+                    &[
+                        (
+                            "$select",
+                            "id,displayName,totalItemCount,unreadItemCount,parentFolderId",
+                        ),
+                        ("$top", "100"),
+                        ("includeHiddenFolders", "true"),
+                    ],
+                )
+                .await?;
 
             if let Some(values) = resp["value"].as_array() {
                 for f in values {
@@ -249,10 +310,15 @@ impl GraphClient {
         // Also fetch child folders (Graph only returns top-level by default)
         let top_ids: Vec<String> = folders.iter().map(|f| f.id.clone()).collect();
         for parent_id in &top_ids {
-            let child_resp = self.get(
-                &format!("/me/mailFolders/{}/childFolders", parent_id),
-                &[("$select", "id,displayName,totalItemCount,unreadItemCount,parentFolderId")],
-            ).await;
+            let child_resp = self
+                .get(
+                    &format!("/me/mailFolders/{}/childFolders", parent_id),
+                    &[(
+                        "$select",
+                        "id,displayName,totalItemCount,unreadItemCount,parentFolderId",
+                    )],
+                )
+                .await;
             if let Ok(resp) = child_resp {
                 if let Some(values) = resp["value"].as_array() {
                     for f in values {
@@ -308,10 +374,12 @@ impl GraphClient {
 
     /// Fetch the full body of a message.
     pub async fn get_message_body(&self, message_id: &str) -> Result<GraphMessageBody> {
-        let resp = self.get(
-            &format!("/me/messages/{}", message_id),
-            &[("$select", "body,uniqueBody")],
-        ).await?;
+        let resp = self
+            .get(
+                &format!("/me/messages/{}", message_id),
+                &[("$select", "body,uniqueBody")],
+            )
+            .await?;
 
         let content_type = resp["body"]["contentType"].as_str().unwrap_or("text");
         let content = resp["body"]["content"].as_str().unwrap_or("").to_string();
@@ -322,11 +390,16 @@ impl GraphClient {
         })
     }
 
-    pub async fn get_attachments(&self, message_id: &str) -> Result<Vec<crate::db::messages::Attachment>> {
-        let resp = self.get(
-            &format!("/me/messages/{}/attachments", message_id),
-            &[("$select", "id,name,contentType,size")],
-        ).await?;
+    pub async fn get_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<crate::db::messages::Attachment>> {
+        let resp = self
+            .get(
+                &format!("/me/messages/{}/attachments", message_id),
+                &[("$select", "id,name,contentType,size")],
+            )
+            .await?;
 
         let mut attachments = Vec::new();
         if let Some(values) = resp["value"].as_array() {
@@ -334,7 +407,10 @@ impl GraphClient {
                 attachments.push(crate::db::messages::Attachment {
                     index: i as u32,
                     filename: att["name"].as_str().map(|s| s.to_string()),
-                    content_type: att["contentType"].as_str().unwrap_or("application/octet-stream").to_string(),
+                    content_type: att["contentType"]
+                        .as_str()
+                        .unwrap_or("application/octet-stream")
+                        .to_string(),
                     size: att["size"].as_u64().unwrap_or(0),
                 });
             }
@@ -349,10 +425,8 @@ impl GraphClient {
         message_id: &str,
         dest: &std::path::Path,
     ) -> Result<u64> {
-        self.stream_to_file(
-            &format!("/me/messages/{}/$value", message_id),
-            dest,
-        ).await
+        self.stream_to_file(&format!("/me/messages/{}/$value", message_id), dest)
+            .await
     }
 
     pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {
@@ -408,7 +482,8 @@ impl GraphClient {
     /// Move a message to a different folder.
     pub async fn move_message(&self, message_id: &str, dest_folder_id: &str) -> Result<()> {
         let body = serde_json::json!({ "destinationId": dest_folder_id });
-        self.post_json(&format!("/me/messages/{}/move", message_id), &body).await?;
+        self.post_json(&format!("/me/messages/{}/move", message_id), &body)
+            .await?;
         Ok(())
     }
 
@@ -423,23 +498,32 @@ impl GraphClient {
     }
 
     /// Update message properties (isRead, flag, etc).
-    pub async fn update_message(&self, message_id: &str, updates: &serde_json::Value) -> Result<()> {
-        self.patch_json(&format!("/me/messages/{}", message_id), updates).await
+    pub async fn update_message(
+        &self,
+        message_id: &str,
+        updates: &serde_json::Value,
+    ) -> Result<()> {
+        self.patch_json(&format!("/me/messages/{}", message_id), updates)
+            .await
     }
 
     /// Mark messages as read or unread.
     pub async fn set_read_status(&self, message_ids: &[String], is_read: bool) -> Result<()> {
         // Batch up to 20 requests per $batch call (Graph API limit)
         for chunk in message_ids.chunks(20) {
-            let requests: Vec<serde_json::Value> = chunk.iter().enumerate().map(|(i, id)| {
-                serde_json::json!({
-                    "id": format!("{}", i),
-                    "method": "PATCH",
-                    "url": format!("/me/messages/{}", id),
-                    "headers": { "Content-Type": "application/json" },
-                    "body": { "isRead": is_read }
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    serde_json::json!({
+                        "id": format!("{}", i),
+                        "method": "PATCH",
+                        "url": format!("/me/messages/{}", id),
+                        "headers": { "Content-Type": "application/json" },
+                        "body": { "isRead": is_read }
+                    })
                 })
-            }).collect();
+                .collect();
 
             let batch_body = serde_json::json!({ "requests": requests });
             self.post_json("/$batch", &batch_body).await?;
@@ -453,14 +537,22 @@ impl GraphClient {
 
     /// List all calendars for the signed-in user.
     pub async fn list_calendars(&self) -> Result<Vec<GraphCalendar>> {
-        let resp = self.get("/me/calendars", &[("$select", "id,name,color,isDefaultCalendar")]).await?;
+        let resp = self
+            .get(
+                "/me/calendars",
+                &[("$select", "id,name,color,isDefaultCalendar")],
+            )
+            .await?;
         let items = resp["value"].as_array().cloned().unwrap_or_default();
-        Ok(items.iter().map(|c| GraphCalendar {
-            id: c["id"].as_str().unwrap_or("").to_string(),
-            name: c["name"].as_str().unwrap_or("Calendar").to_string(),
-            color: graph_color_to_hex(c["color"].as_str().unwrap_or("")),
-            is_default: c["isDefaultCalendar"].as_bool().unwrap_or(false),
-        }).collect())
+        Ok(items
+            .iter()
+            .map(|c| GraphCalendar {
+                id: c["id"].as_str().unwrap_or("").to_string(),
+                name: c["name"].as_str().unwrap_or("Calendar").to_string(),
+                color: graph_color_to_hex(c["color"].as_str().unwrap_or("")),
+                is_default: c["isDefaultCalendar"].as_bool().unwrap_or(false),
+            })
+            .collect())
     }
 
     /// Fetch events in a time range via calendarView.
@@ -472,7 +564,8 @@ impl GraphClient {
             let resp: serde_json::Value = match next_path.take() {
                 Some(path) => {
                     // Pagination: next link is a full URL, fetch directly with UTC preference
-                    let resp = self.http
+                    let resp = self
+                        .http
                         .get(&path)
                         .bearer_auth(&self.access_token)
                         .header("Prefer", "outlook.timezone=\"UTC\"")
@@ -482,7 +575,11 @@ impl GraphClient {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
-                        return Err(Error::Other(format!("Graph GET returned {}: {}", status, truncate(&body, 500))));
+                        return Err(Error::Other(format!(
+                            "Graph GET returned {}: {}",
+                            status,
+                            truncate(&body, 500)
+                        )));
                     }
                     serde_json::from_str(&body)
                         .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
@@ -506,7 +603,11 @@ impl GraphClient {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
-                        return Err(Error::Other(format!("Graph GET /me/calendarView returned {}: {}", status, truncate(&body, 500))));
+                        return Err(Error::Other(format!(
+                            "Graph GET /me/calendarView returned {}: {}",
+                            status,
+                            truncate(&body, 500)
+                        )));
                     }
                     serde_json::from_str(&body)
                         .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
@@ -517,7 +618,9 @@ impl GraphClient {
                     events.push(parse_graph_event(e));
                 }
             }
-            let next_link = resp["@odata.nextLink"].as_str().map(|s: &str| s.to_string());
+            let next_link = resp["@odata.nextLink"]
+                .as_str()
+                .map(|s: &str| s.to_string());
             match next_link {
                 Some(next) => {
                     next_path = Some(next);
@@ -530,7 +633,10 @@ impl GraphClient {
 
     /// Create a calendar event.
     /// Create a calendar event. Returns (graph_id, iCalUid).
-    pub async fn create_event(&self, event: &serde_json::Value) -> Result<(String, Option<String>)> {
+    pub async fn create_event(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(String, Option<String>)> {
         let resp = self.post_json("/me/events", event).await?;
         let id = resp["id"].as_str().unwrap_or("").to_string();
         let ical_uid = resp["iCalUId"].as_str().map(|s| s.to_string());
@@ -539,7 +645,8 @@ impl GraphClient {
 
     /// Update a calendar event.
     pub async fn update_event(&self, event_id: &str, updates: &serde_json::Value) -> Result<()> {
-        self.patch_json(&format!("/me/events/{}", event_id), updates).await
+        self.patch_json(&format!("/me/events/{}", event_id), updates)
+            .await
     }
 
     /// Delete a calendar event.
@@ -553,7 +660,10 @@ impl GraphClient {
         let escaped_uid = ical_uid.replace('\'', "''");
         let filter = format!("iCalUId eq '{}'", escaped_uid);
         let resp = self
-            .get("/me/events", &[("$filter", filter.as_str()), ("$select", "id")])
+            .get(
+                "/me/events",
+                &[("$filter", filter.as_str()), ("$select", "id")],
+            )
             .await?;
         Ok(resp["value"]
             .as_array()
@@ -574,7 +684,8 @@ impl GraphClient {
             "comment": comment,
             "sendResponse": true,
         });
-        self.post_json(&format!("/me/events/{}/{}", event_id, action), &body).await?;
+        self.post_json(&format!("/me/events/{}/{}", event_id, action), &body)
+            .await?;
         Ok(())
     }
 
@@ -619,9 +730,13 @@ impl GraphClient {
                     contacts.push(parse_graph_contact(c));
                 }
             }
-            let next_link = resp["@odata.nextLink"].as_str().map(|s: &str| s.to_string());
+            let next_link = resp["@odata.nextLink"]
+                .as_str()
+                .map(|s: &str| s.to_string());
             match next_link {
-                Some(next) => { next_path = Some(next); }
+                Some(next) => {
+                    next_path = Some(next);
+                }
                 None => break,
             }
         }
@@ -635,8 +750,13 @@ impl GraphClient {
     }
 
     /// Update a contact.
-    pub async fn update_contact(&self, contact_id: &str, updates: &serde_json::Value) -> Result<()> {
-        self.patch_json(&format!("/me/contacts/{}", contact_id), updates).await
+    pub async fn update_contact(
+        &self,
+        contact_id: &str,
+        updates: &serde_json::Value,
+    ) -> Result<()> {
+        self.patch_json(&format!("/me/contacts/{}", contact_id), updates)
+            .await
     }
 
     /// Delete a contact.
@@ -745,7 +865,8 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
     let to_addresses = parse_recipients(&m["toRecipients"]);
     let cc_addresses = parse_recipients(&m["ccRecipients"]);
 
-    let date = m["receivedDateTime"].as_str()
+    let date = m["receivedDateTime"]
+        .as_str()
         .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_default();
@@ -767,19 +888,28 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
 }
 
 fn parse_recipients(arr: &serde_json::Value) -> String {
-    let addrs: Vec<serde_json::Value> = arr.as_array()
-        .map(|a| a.iter().map(|r| {
-            serde_json::json!({
-                "name": r["emailAddress"]["name"].as_str().unwrap_or(""),
-                "email": r["emailAddress"]["address"].as_str().unwrap_or(""),
-            })
-        }).collect())
+    let addrs: Vec<serde_json::Value> = arr
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "name": r["emailAddress"]["name"].as_str().unwrap_or(""),
+                        "email": r["emailAddress"]["address"].as_str().unwrap_or(""),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     serde_json::to_string(&addrs).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
 }
 
 /// Map well-known Graph folder display names to our folder_type.
@@ -804,23 +934,40 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
     let start_tz = start_obj["timeZone"].as_str().unwrap_or("UTC");
 
     let start = if all_day {
-        start_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
+        start_obj["dateTime"]
+            .as_str()
+            .unwrap_or("")
+            .split('T')
+            .next()
+            .unwrap_or("")
+            .to_string()
     } else {
         let dt = start_obj["dateTime"].as_str().unwrap_or("");
         crate::calendar::timezone::to_utc(dt, start_tz)
     };
 
     let end = if all_day {
-        end_obj["dateTime"].as_str().unwrap_or("").split('T').next().unwrap_or("").to_string()
+        end_obj["dateTime"]
+            .as_str()
+            .unwrap_or("")
+            .split('T')
+            .next()
+            .unwrap_or("")
+            .to_string()
     } else {
         let dt = end_obj["dateTime"].as_str().unwrap_or("");
         let end_tz = end_obj["timeZone"].as_str().unwrap_or("UTC");
         crate::calendar::timezone::to_utc(dt, end_tz)
     };
 
-    let timezone = if all_day { None } else { Some(start_tz.to_string()) };
+    let timezone = if all_day {
+        None
+    } else {
+        Some(start_tz.to_string())
+    };
 
-    let location = e["location"]["displayName"].as_str()
+    let location = e["location"]["displayName"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
@@ -829,13 +976,16 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         .map(|s| s.to_string());
 
     let attendees_json = e["attendees"].as_array().map(|atts| {
-        let parsed: Vec<serde_json::Value> = atts.iter().map(|a| {
-            serde_json::json!({
-                "name": a["emailAddress"]["name"].as_str().unwrap_or(""),
-                "email": a["emailAddress"]["address"].as_str().unwrap_or(""),
-                "status": a["status"]["response"].as_str().unwrap_or("none"),
+        let parsed: Vec<serde_json::Value> = atts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a["emailAddress"]["name"].as_str().unwrap_or(""),
+                    "email": a["emailAddress"]["address"].as_str().unwrap_or(""),
+                    "status": a["status"]["response"].as_str().unwrap_or("none"),
+                })
             })
-        }).collect();
+            .collect();
         serde_json::to_string(&parsed).unwrap_or_else(|_| "[]".to_string())
     });
 
@@ -859,22 +1009,32 @@ fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
     let display_name = c["displayName"].as_str().unwrap_or("").to_string();
     let given_name = c["givenName"].as_str().map(|s| s.to_string());
     let surname = c["surname"].as_str().map(|s| s.to_string());
-    let organization = c["companyName"].as_str()
+    let organization = c["companyName"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let title = c["jobTitle"].as_str()
+    let title = c["jobTitle"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     // Parse emails — Graph's "name" field is a display label, not work/home.
     // Use index-based labeling: first = "work", rest = "other".
-    let emails: Vec<serde_json::Value> = c["emailAddresses"].as_array()
-        .map(|arr| arr.iter().enumerate().filter_map(|(i, e)| {
-            let addr = e["address"].as_str()?;
-            if addr.is_empty() { return None; }
-            let label = if i == 0 { "work" } else { "other" };
-            Some(serde_json::json!({"email": addr, "label": label}))
-        }).collect())
+    let emails: Vec<serde_json::Value> = c["emailAddresses"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    let addr = e["address"].as_str()?;
+                    if addr.is_empty() {
+                        return None;
+                    }
+                    let label = if i == 0 { "work" } else { "other" };
+                    Some(serde_json::json!({"email": addr, "label": label}))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string());
 
@@ -932,10 +1092,12 @@ fn graph_color_to_hex(color: &str) -> String {
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
 pub async fn get_graph_token(account_id: &str) -> Result<String> {
-    let tokens = crate::oauth::load_tokens(account_id)?
-        .ok_or_else(|| Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into()))?;
+    let tokens = crate::oauth::load_tokens(account_id)?.ok_or_else(|| {
+        Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
+    })?;
 
-    let refresh_token = tokens.refresh_token
+    let refresh_token = tokens
+        .refresh_token
         .ok_or_else(|| Error::Other("No refresh token for O365. Please sign in again.".into()))?;
 
     // Always refresh with Graph scopes — the cached token is likely IMAP-scoped
@@ -943,15 +1105,19 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
         &crate::oauth::MICROSOFT,
         &refresh_token,
         crate::oauth::MICROSOFT_GRAPH_SCOPES,
-    ).await?;
+    )
+    .await?;
     // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
     // The refresh_token may rotate, so save that part only.
     if new_tokens.refresh_token.is_some() {
-        crate::oauth::store_tokens(account_id, &crate::oauth::OAuthTokens {
-            access_token: tokens.access_token, // Keep the IMAP token as stored
-            refresh_token: new_tokens.refresh_token,
-            expires_at: tokens.expires_at,
-        })?;
+        crate::oauth::store_tokens(
+            account_id,
+            &crate::oauth::OAuthTokens {
+                access_token: tokens.access_token, // Keep the IMAP token as stored
+                refresh_token: new_tokens.refresh_token,
+                expires_at: tokens.expires_at,
+            },
+        )?;
     }
 
     Ok(new_tokens.access_token)

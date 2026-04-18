@@ -116,7 +116,8 @@ pub fn set_calendar_subscribed(conn: &Connection, id: &str, subscribed: bool) ->
     )?;
     if rows == 0 {
         return Err(crate::error::Error::Other(format!(
-            "Calendar not found: {}", id
+            "Calendar not found: {}",
+            id
         )));
     }
     Ok(())
@@ -402,10 +403,7 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
 }
 
 pub fn delete_event(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM calendar_events WHERE id = ?1",
-        params![id],
-    )?;
+    conn.execute("DELETE FROM calendar_events WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -748,10 +746,9 @@ mod tests {
         let conn = setup_db();
 
         // First upsert creates a new calendar
-        let id1 = upsert_calendar_by_remote_id(
-            &conn, "acc1", "remote-cal", "Work", "#4285f4", true,
-        )
-        .unwrap();
+        let id1 =
+            upsert_calendar_by_remote_id(&conn, "acc1", "remote-cal", "Work", "#4285f4", true)
+                .unwrap();
 
         let cal = get_calendar(&conn, &id1).unwrap();
         assert_eq!(cal.name, "Work");
@@ -759,7 +756,12 @@ mod tests {
 
         // Second upsert with same remote_id updates
         let id2 = upsert_calendar_by_remote_id(
-            &conn, "acc1", "remote-cal", "Work Updated", "#ff0000", false,
+            &conn,
+            "acc1",
+            "remote-cal",
+            "Work Updated",
+            "#ff0000",
+            false,
         )
         .unwrap();
 
@@ -785,7 +787,10 @@ mod tests {
 
         delete_calendar(&conn, "cal1").unwrap();
 
-        assert!(get_event(&conn, "e1").is_err(), "Events should be deleted with calendar");
+        assert!(
+            get_event(&conn, "e1").is_err(),
+            "Events should be deleted with calendar"
+        );
     }
 
     #[test]
@@ -798,8 +803,10 @@ mod tests {
         insert_event(&conn, &make_event("e3", "C", Some("remote-c"))).unwrap();
 
         // Server only has A and B
-        let server_ids: std::collections::HashSet<String> =
-            ["remote-a", "remote-b"].iter().map(|s| s.to_string()).collect();
+        let server_ids: std::collections::HashSet<String> = ["remote-a", "remote-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         // Find local events with remote_id
         let local_synced: Vec<(String, String)> = conn

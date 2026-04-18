@@ -50,13 +50,24 @@ pub fn run_idle_loop(
             Ok(c) => c,
             Err(e) => {
                 if !was_disconnected {
-                    log::error!("IDLE: connection failed for {} ({}): {}", account_id, config.username, e);
+                    log::error!(
+                        "IDLE: connection failed for {} ({}): {}",
+                        account_id,
+                        config.username,
+                        e
+                    );
                     on_event(IdleEvent::Disconnected(&account_id));
                     was_disconnected = true;
                 }
-                if stop.load(Ordering::Relaxed) { break; }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 // Exponential backoff with jitter
-                log::debug!("IDLE: retrying in {}s for {}", backoff.as_secs(), account_id);
+                log::debug!(
+                    "IDLE: retrying in {}s for {}",
+                    backoff.as_secs(),
+                    account_id
+                );
                 sleep_interruptible(&stop, backoff);
                 backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
                 continue;
@@ -65,7 +76,12 @@ pub fn run_idle_loop(
 
         // Select INBOX
         if let Err(e) = conn.select_folder("INBOX") {
-            log::warn!("IDLE: failed to select INBOX for {} ({}): {}, will retry", account_id, config.username, e);
+            log::warn!(
+                "IDLE: failed to select INBOX for {} ({}): {}, will retry",
+                account_id,
+                config.username,
+                e
+            );
             sleep_interruptible(&stop, backoff);
             backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
             continue;
@@ -81,12 +97,17 @@ pub fn run_idle_loop(
             on_event(IdleEvent::NewMail(&account_id));
             was_disconnected = false;
         } else {
-            log::info!("IDLE: connected and selected INBOX for account {}", account_id);
+            log::info!(
+                "IDLE: connected and selected INBOX for account {}",
+                account_id
+            );
         }
 
         // IDLE loop — stay on this connection until it breaks
         loop {
-            if stop.load(Ordering::Relaxed) { break; }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
 
             match conn.idle_wait(IDLE_TIMEOUT) {
                 Ok(had_notification) => {
@@ -121,7 +142,9 @@ pub fn run_idle_loop(
 fn sleep_interruptible(stop: &AtomicBool, duration: Duration) {
     let steps = duration.as_secs();
     for _ in 0..steps {
-        if stop.load(Ordering::Relaxed) { return; }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
 }

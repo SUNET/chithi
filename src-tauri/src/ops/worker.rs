@@ -109,7 +109,8 @@ impl AccountWorker {
 
             let mut sync_succeeded = false;
             for entry in ops {
-                let is_sync = matches!(entry.op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+                let is_sync =
+                    matches!(entry.op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
                 match self.execute(entry.op).await {
                     Ok(()) => {
                         if is_sync {
@@ -117,11 +118,7 @@ impl AccountWorker {
                         }
                     }
                     Err(e) => {
-                        log::error!(
-                            "Worker op failed for account {}: {}",
-                            self.account_id,
-                            e
-                        );
+                        log::error!("Worker op failed for account {}: {}", self.account_id, e);
                         // Don't break the loop — continue processing remaining ops
                     }
                 }
@@ -244,22 +241,23 @@ impl AccountWorker {
 
         // Serialize the op for outbox before executing (we move op into execute_*)
         let outbox_data = if !is_sync {
-            super::offline::mail_op_to_outbox(&op)
-                .map(|(t, p)| (t.to_string(), p))
+            super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p))
         } else {
             None
         };
 
         let result = match &op {
-            MailOp::SyncAll { .. } | MailOp::SyncFolder { .. } => {
-                self.execute_sync(op).await
-            }
+            MailOp::SyncAll { .. } | MailOp::SyncFolder { .. } => self.execute_sync(op).await,
             _ => match self.protocol.as_str() {
                 "imap" => self.execute_imap(op).await,
                 "jmap" => self.execute_jmap(op).await,
                 "graph" => self.execute_graph(op).await,
                 _ => {
-                    log::warn!("Worker: unknown protocol '{}' for account {}", self.protocol, self.account_id);
+                    log::warn!(
+                        "Worker: unknown protocol '{}' for account {}",
+                        self.protocol,
+                        self.account_id
+                    );
                     Ok(())
                 }
             },
@@ -399,11 +397,7 @@ impl AccountWorker {
         let mut imap_state = self.imap_state.take().unwrap();
 
         let (result, state_back) = tokio::task::spawn_blocking(move || {
-            let result = execute_imap_op(
-                &mut imap_state.conn,
-                &mut imap_state.selected_folder,
-                op,
-            );
+            let result = execute_imap_op(&mut imap_state.conn, &mut imap_state.selected_folder, op);
             (result, imap_state)
         })
         .await
@@ -433,13 +427,12 @@ impl AccountWorker {
         if self.imap_state.is_none() || stale {
             // Exponential backoff: 1s, 2s, 4s, 8s, ... max 60s
             if self.consecutive_failures > 0 {
-                let delay_secs = std::cmp::min(
-                    1u64 << (self.consecutive_failures - 1),
-                    60,
-                );
+                let delay_secs = std::cmp::min(1u64 << (self.consecutive_failures - 1), 60);
                 log::info!(
                     "Worker: backoff {}s before reconnect (failures={}) for account {}",
-                    delay_secs, self.consecutive_failures, self.account_id
+                    delay_secs,
+                    self.consecutive_failures,
+                    self.account_id
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             }
