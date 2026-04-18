@@ -60,7 +60,9 @@ pub async fn run_push_loop(
                 &account_id,
                 &config.oidc_token_endpoint,
                 &config.oidc_client_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(Some(new_token)) => config.access_token = Some(new_token),
                 Ok(None) => {}
                 Err(e) => log::warn!("JMAP push: token refresh failed for {}: {}", account_id, e),
@@ -72,10 +74,7 @@ pub async fn run_push_loop(
             Ok(v) => v,
             Err(e) => {
                 if !was_disconnected {
-                    log::error!(
-                        "JMAP push: connection failed for {}: {}",
-                        account_id, e
-                    );
+                    log::error!("JMAP push: connection failed for {}: {}", account_id, e);
                     on_event(PushEvent::Disconnected(account_id.clone()));
                     was_disconnected = true;
                 }
@@ -126,7 +125,8 @@ pub async fn run_push_loop(
             Err(e) => {
                 log::warn!(
                     "JMAP push: stream error for {}: {}, reconnecting...",
-                    account_id, e
+                    account_id,
+                    e
                 );
                 on_event(PushEvent::Disconnected(account_id.clone()));
                 was_disconnected = true;
@@ -197,7 +197,8 @@ async fn stream_events(
         .build()
         .map_err(|e| format!("HTTP client build error: {}", e))?;
 
-    let response = auth.apply_auth(client.get(url))
+    let response = auth
+        .apply_auth(client.get(url))
         .header("Accept", "text/event-stream")
         // Prevent reverse proxies (nginx) from buffering SSE responses.
         .header("Cache-Control", "no-cache")
@@ -276,12 +277,7 @@ async fn stream_events(
 
 /// Process a single SSE event. JMAP EventSource sends `state` events
 /// with a JSON payload containing changed type→state mappings.
-fn handle_sse_event(
-    account_id: &str,
-    event_type: &str,
-    data: &str,
-    on_event: &dyn Fn(PushEvent),
-) {
+fn handle_sse_event(account_id: &str, event_type: &str, data: &str, on_event: &dyn Fn(PushEvent)) {
     match event_type {
         "state" => {
             // RFC 8620 §7.3: The data is a StateChange object with

@@ -8,13 +8,13 @@ use crate::db::calendar::Attendee;
 /// A parsed calendar invite extracted from an email or raw iCalendar text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedInvite {
-    pub method: String,              // REQUEST, REPLY, CANCEL
+    pub method: String, // REQUEST, REPLY, CANCEL
     pub uid: String,
     pub summary: Option<String>,
     pub description: Option<String>,
     pub location: Option<String>,
-    pub dtstart: String,             // ISO 8601
-    pub dtend: String,               // ISO 8601
+    pub dtstart: String, // ISO 8601
+    pub dtend: String,   // ISO 8601
     pub all_day: bool,
     pub timezone: Option<String>,
     pub organizer_email: Option<String>,
@@ -22,7 +22,7 @@ pub struct ParsedInvite {
     pub attendees: Vec<Attendee>,
     pub recurrence_rule: Option<String>,
     pub sequence: u32,
-    pub ical_raw: String,            // Original iCalendar text
+    pub ical_raw: String, // Original iCalendar text
 }
 
 /// Parse calendar invites from a raw RFC 5322 email message.
@@ -42,8 +42,7 @@ pub fn parse_ical_from_email(raw_message: &[u8]) -> Vec<ParsedInvite> {
         let content_type = part.content_type();
         let is_calendar = content_type
             .map(|ct| {
-                ct.ctype() == "text"
-                    && ct.subtype().map(|s| s == "calendar").unwrap_or(false)
+                ct.ctype() == "text" && ct.subtype().map(|s| s == "calendar").unwrap_or(false)
             })
             .unwrap_or(false);
 
@@ -90,11 +89,11 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
     // unfold both forms — CRLF folds first, then anything remaining
     // after CRLF→LF normalization is treated as LF folding.
     let normalized = ical_text
-        .replace("\r\n ", "")   // Unfold CRLF + space
-        .replace("\r\n\t", "")  // Unfold CRLF + tab
-        .replace("\r\n", "\n")  // Normalize remaining CRLF to LF
-        .replace("\n ", "")     // Unfold LF + space
-        .replace("\n\t", "");   // Unfold LF + tab
+        .replace("\r\n ", "") // Unfold CRLF + space
+        .replace("\r\n\t", "") // Unfold CRLF + tab
+        .replace("\r\n", "\n") // Normalize remaining CRLF to LF
+        .replace("\n ", "") // Unfold LF + space
+        .replace("\n\t", ""); // Unfold LF + tab
 
     // Exchange/Outlook emit DESCRIPTION;ALTREP="data:text/html,...":plain text
     // where the quoted value contains raw unescaped " chars (RFC-violating but
@@ -119,8 +118,7 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
             continue;
         }
 
-        let method = find_property_value(vcal, "METHOD")
-            .unwrap_or_else(|| "REQUEST".to_string());
+        let method = find_property_value(vcal, "METHOD").unwrap_or_else(|| "REQUEST".to_string());
 
         // Look for VEVENT sub-components
         for vevent in &vcal.components {
@@ -142,9 +140,7 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
             let recurrence_rule = find_property_value(vevent, "RRULE");
 
             let sequence_str = find_property_value(vevent, "SEQUENCE");
-            let sequence: u32 = sequence_str
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let sequence: u32 = sequence_str.and_then(|s| s.parse().ok()).unwrap_or(0);
 
             // Parse DTSTART and DTEND
             let (dtstart, all_day, timezone) = parse_dt_property(vevent, "DTSTART");
@@ -229,15 +225,29 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
         if let Some(ref tz) = invite.timezone {
             let local_start = crate::mail::caldav::utc_to_local(&invite.dtstart, tz);
             let local_end = crate::mail::caldav::utc_to_local(&invite.dtend, tz);
-            lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
-            lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+            lines.push(format!(
+                "DTSTART;TZID={}:{}",
+                tz,
+                to_ical_datetime(&local_start)
+            ));
+            lines.push(format!(
+                "DTEND;TZID={}:{}",
+                tz,
+                to_ical_datetime(&local_end)
+            ));
         } else {
             lines.push(format!("DTSTART:{}", to_ical_datetime(&invite.dtstart)));
             lines.push(format!("DTEND:{}", to_ical_datetime(&invite.dtend)));
         }
     } else {
-        lines.push(format!("DTSTART;VALUE=DATE:{}", invite.dtstart.split('T').next().unwrap_or(&invite.dtstart)));
-        lines.push(format!("DTEND;VALUE=DATE:{}", invite.dtend.split('T').next().unwrap_or(&invite.dtend)));
+        lines.push(format!(
+            "DTSTART;VALUE=DATE:{}",
+            invite.dtstart.split('T').next().unwrap_or(&invite.dtstart)
+        ));
+        lines.push(format!(
+            "DTEND;VALUE=DATE:{}",
+            invite.dtend.split('T').next().unwrap_or(&invite.dtend)
+        ));
     }
     lines.push(format!("SEQUENCE:{}", invite.sequence));
     lines.push(format!("DTSTAMP:{}", now));
@@ -296,8 +306,16 @@ pub fn generate_invite(
     if let Some(tz) = timezone {
         let local_start = crate::mail::caldav::utc_to_local(dtstart, tz);
         let local_end = crate::mail::caldav::utc_to_local(dtend, tz);
-        lines.push(format!("DTSTART;TZID={}:{}", tz, to_ical_datetime(&local_start)));
-        lines.push(format!("DTEND;TZID={}:{}", tz, to_ical_datetime(&local_end)));
+        lines.push(format!(
+            "DTSTART;TZID={}:{}",
+            tz,
+            to_ical_datetime(&local_start)
+        ));
+        lines.push(format!(
+            "DTEND;TZID={}:{}",
+            tz,
+            to_ical_datetime(&local_end)
+        ));
     } else {
         lines.push(format!("DTSTART:{}", to_ical_datetime(dtstart)));
         lines.push(format!("DTEND:{}", to_ical_datetime(dtend)));
@@ -439,10 +457,7 @@ fn altrep_value_end(bytes: &[u8], after_eq: usize) -> usize {
 }
 
 /// Find a property value by name on a parser component.
-fn find_property_value(
-    component: &icalendar::parser::Component<'_>,
-    name: &str,
-) -> Option<String> {
+fn find_property_value(component: &icalendar::parser::Component<'_>, name: &str) -> Option<String> {
     component
         .find_prop(name)
         .map(|p| p.val.as_str().to_string())
@@ -503,8 +518,12 @@ fn ical_datetime_to_iso(val: &str, all_day: bool, tzid: Option<&str>) -> String 
         let utc_suffix = if val.ends_with('Z') { "Z" } else { "" };
         let iso = format!(
             "{}-{}-{}T{}:{}:{}{}",
-            &val[0..4], &val[4..6], &val[6..8],
-            &val[9..11], &val[11..13], &val[13..15],
+            &val[0..4],
+            &val[4..6],
+            &val[6..8],
+            &val[9..11],
+            &val[11..13],
+            &val[13..15],
             utc_suffix,
         );
 
@@ -525,19 +544,20 @@ fn to_ical_datetime(iso: &str) -> String {
     // Convert ISO 8601 to iCalendar format: "2025-04-15T10:00:00.000Z" -> "20250415T100000Z"
     // Parse with chrono to normalize, then format as iCal UTC.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
-        return dt.with_timezone(&chrono::Utc).format("%Y%m%dT%H%M%SZ").to_string();
+        return dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
     }
     // Try parsing without timezone (treat as UTC)
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
-        iso.trim_end_matches('Z'),
-        "%Y-%m-%dT%H:%M:%S%.f",
-    ) {
+    if let Ok(dt) =
+        chrono::NaiveDateTime::parse_from_str(iso.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S%.f")
+    {
         return dt.format("%Y%m%dT%H%M%SZ").to_string();
     }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(
-        iso.trim_end_matches('Z'),
-        "%Y-%m-%dT%H:%M:%S",
-    ) {
+    if let Ok(dt) =
+        chrono::NaiveDateTime::parse_from_str(iso.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S")
+    {
         return dt.format("%Y%m%dT%H%M%SZ").to_string();
     }
     // Fallback: just strip dashes/colons
@@ -716,15 +736,27 @@ mod tests {
 
     #[test]
     fn test_extract_mailto() {
-        assert_eq!(extract_mailto("mailto:alice@example.com"), Some("alice@example.com".to_string()));
-        assert_eq!(extract_mailto("MAILTO:Bob@Example.com"), Some("Bob@Example.com".to_string()));
-        assert_eq!(extract_mailto("alice@example.com"), Some("alice@example.com".to_string()));
+        assert_eq!(
+            extract_mailto("mailto:alice@example.com"),
+            Some("alice@example.com".to_string())
+        );
+        assert_eq!(
+            extract_mailto("MAILTO:Bob@Example.com"),
+            Some("Bob@Example.com".to_string())
+        );
+        assert_eq!(
+            extract_mailto("alice@example.com"),
+            Some("alice@example.com".to_string())
+        );
         assert_eq!(extract_mailto("not-an-email"), None);
     }
 
     #[test]
     fn test_to_ical_datetime_from_rfc3339() {
-        assert_eq!(to_ical_datetime("2026-04-07T17:00:00.000Z"), "20260407T170000Z");
+        assert_eq!(
+            to_ical_datetime("2026-04-07T17:00:00.000Z"),
+            "20260407T170000Z"
+        );
         assert_eq!(to_ical_datetime("2026-04-07T17:00:00Z"), "20260407T170000Z");
     }
 
@@ -751,10 +783,7 @@ mod tests {
 
     #[test]
     fn test_ical_datetime_to_iso_allday() {
-        assert_eq!(
-            ical_datetime_to_iso("20260407", true, None),
-            "2026-04-07"
-        );
+        assert_eq!(ical_datetime_to_iso("20260407", true, None), "2026-04-07");
     }
 
     #[test]
@@ -828,7 +857,11 @@ END:VCALENDAR";
         let invites = parse_ical_data(ical);
         assert_eq!(invites.len(), 1);
         // dtend should be computed from dtstart + duration
-        assert!(invites[0].dtend.contains("17:30:00"), "dtend should be 30min after dtstart, got: {}", invites[0].dtend);
+        assert!(
+            invites[0].dtend.contains("17:30:00"),
+            "dtend should be 30min after dtstart, got: {}",
+            invites[0].dtend
+        );
     }
 
     #[test]
@@ -875,7 +908,11 @@ END:VCALENDAR";
         let ical = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nPRODID:Microsoft Exchange Server 2010\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:UTC\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0000\r\nTZOFFSETTO:+0000\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nORGANIZER;CN=kushal das:mailto:chithiapp@outlook.com\r\nATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=sdossec@gm\r\n ail.com:mailto:sdossec@gmail.com\r\nDESCRIPTION;LANGUAGE=en-US:This is yo food event.\r\nUID:040000008200E00074C5B7101A82E008000000009B9A10BF48CBDC01000000000000000\r\n 0100000009B9409D22D123D48BA2ABC0BABC17911\r\nSUMMARY;LANGUAGE=en-US:Yo food\r\nDTSTART;TZID=UTC:20260414T170000\r\nDTEND;TZID=UTC:20260414T180000\r\nCLASS:PUBLIC\r\nPRIORITY:5\r\nDTSTAMP:20260413T132342Z\r\nTRANSP:OPAQUE\r\nSTATUS:CONFIRMED\r\nSEQUENCE:0\r\nBEGIN:VALARM\r\nDESCRIPTION:REMINDER\r\nTRIGGER;RELATED=START:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
         let invites = parse_ical_data(ical);
-        assert_eq!(invites.len(), 1, "Should parse 1 invite from Microsoft Exchange iCal");
+        assert_eq!(
+            invites.len(),
+            1,
+            "Should parse 1 invite from Microsoft Exchange iCal"
+        );
         let inv = &invites[0];
         assert_eq!(inv.summary, Some("Yo food".to_string()));
         assert_eq!(inv.method, "REQUEST");
@@ -942,10 +979,17 @@ END:VEVENT\r\n\
 END:VCALENDAR\r\n";
 
         let invites = parse_ical_data(ical);
-        assert_eq!(invites.len(), 1, "Should parse 1 invite with ALTREP DESCRIPTION");
+        assert_eq!(
+            invites.len(),
+            1,
+            "Should parse 1 invite with ALTREP DESCRIPTION"
+        );
         let inv = &invites[0];
         assert_eq!(inv.uid, "altrep-test-uid");
-        assert_eq!(inv.summary, Some("Meeting with ALTREP description".to_string()));
+        assert_eq!(
+            inv.summary,
+            Some("Meeting with ALTREP description".to_string())
+        );
         assert_eq!(
             inv.description,
             Some("Plain text fallback description".to_string())
@@ -954,7 +998,8 @@ END:VCALENDAR\r\n";
 
     #[test]
     fn test_strip_altrep_quoted_with_inner_quotes() {
-        let line = "DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
+        let line =
+            "DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
         assert_eq!(
             strip_altrep_from_line(line).as_ref(),
             "DESCRIPTION;LANGUAGE=en-US:plain\n"
@@ -998,7 +1043,10 @@ END:VCALENDAR\r\n";
         let line = "SUMMARY:Team Standup\n";
         let out = strip_altrep_from_line(line);
         assert_eq!(out.as_ref(), line);
-        assert!(matches!(out, Cow::Borrowed(_)), "no-ALTREP lines must not allocate");
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "no-ALTREP lines must not allocate"
+        );
     }
 
     #[test]
@@ -1057,11 +1105,23 @@ END:VCALENDAR\r\n";
         let reply = generate_reply(&invite, "bob@example.com", "accepted");
 
         assert!(reply.contains("METHOD:REPLY"), "Should have METHOD:REPLY");
-        assert!(reply.contains("PARTSTAT=ACCEPTED"), "Should have ACCEPTED partstat");
-        assert!(reply.contains("mailto:bob@example.com"), "Should contain attendee email");
+        assert!(
+            reply.contains("PARTSTAT=ACCEPTED"),
+            "Should have ACCEPTED partstat"
+        );
+        assert!(
+            reply.contains("mailto:bob@example.com"),
+            "Should contain attendee email"
+        );
         assert!(reply.contains("UID:test-uid-123"), "Should preserve UID");
-        assert!(reply.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"), "Should preserve organizer");
-        assert!(reply.contains("SUMMARY:Team Standup"), "Should preserve summary");
+        assert!(
+            reply.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"),
+            "Should preserve organizer"
+        );
+        assert!(
+            reply.contains("SUMMARY:Team Standup"),
+            "Should preserve summary"
+        );
     }
 
     #[test]
@@ -1092,8 +1152,16 @@ END:VCALENDAR\r\n";
     #[test]
     fn test_generate_invite_with_attendees() {
         let attendees = vec![
-            Attendee { email: "bob@example.com".to_string(), name: Some("Bob".to_string()), status: "needs-action".to_string() },
-            Attendee { email: "carol@example.com".to_string(), name: None, status: "needs-action".to_string() },
+            Attendee {
+                email: "bob@example.com".to_string(),
+                name: Some("Bob".to_string()),
+                status: "needs-action".to_string(),
+            },
+            Attendee {
+                email: "carol@example.com".to_string(),
+                name: None,
+                status: "needs-action".to_string(),
+            },
         ];
 
         let ical = generate_invite(
@@ -1125,9 +1193,11 @@ END:VCALENDAR\r\n";
     #[test]
     fn test_generate_invite_roundtrip() {
         // Generate an invite, then parse it back
-        let attendees = vec![
-            Attendee { email: "bob@example.com".to_string(), name: None, status: "needs-action".to_string() },
-        ];
+        let attendees = vec![Attendee {
+            email: "bob@example.com".to_string(),
+            name: None,
+            status: "needs-action".to_string(),
+        }];
 
         let ical = generate_invite(
             "roundtrip-uid",
@@ -1148,7 +1218,10 @@ END:VCALENDAR\r\n";
         assert_eq!(parsed[0].uid, "roundtrip-uid");
         assert_eq!(parsed[0].summary, Some("Roundtrip Test".to_string()));
         assert_eq!(parsed[0].method, "REQUEST");
-        assert_eq!(parsed[0].organizer_email, Some("alice@example.com".to_string()));
+        assert_eq!(
+            parsed[0].organizer_email,
+            Some("alice@example.com".to_string())
+        );
         assert_eq!(parsed[0].attendees.len(), 1);
         assert_eq!(parsed[0].attendees[0].email, "bob@example.com");
     }
@@ -1163,15 +1236,19 @@ END:VCALENDAR\r\n";
             "Test Meeting",
             "2026-04-07T17:00:00Z",
             "2026-04-07T18:00:00Z",
-            None, None,
+            None,
+            None,
             "kushal@civilized.systems",
             None, // No organizer name
             &[],
             None,
             None,
         );
-        assert!(ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
-            "Should have ORGANIZER without CN, got: {}", ical);
+        assert!(
+            ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
+            "Should have ORGANIZER without CN, got: {}",
+            ical
+        );
         assert!(!ical.contains("CN="), "Should NOT have CN parameter");
     }
 
@@ -1182,7 +1259,8 @@ END:VCALENDAR\r\n";
             "Test Meeting",
             "2026-04-07T17:00:00Z",
             "2026-04-07T18:00:00Z",
-            None, None,
+            None,
+            None,
             "kushal@civilized.systems",
             Some("Kushal Das"),
             &[],
@@ -1194,12 +1272,20 @@ END:VCALENDAR\r\n";
 
     #[test]
     fn test_parse_ical_duration() {
-        assert_eq!(parse_ical_duration("PT1H"), Some(chrono::Duration::hours(1)));
-        assert_eq!(parse_ical_duration("PT30M"), Some(chrono::Duration::minutes(30)));
-        assert_eq!(parse_ical_duration("PT1H30M"), Some(chrono::Duration::minutes(90)));
+        assert_eq!(
+            parse_ical_duration("PT1H"),
+            Some(chrono::Duration::hours(1))
+        );
+        assert_eq!(
+            parse_ical_duration("PT30M"),
+            Some(chrono::Duration::minutes(30))
+        );
+        assert_eq!(
+            parse_ical_duration("PT1H30M"),
+            Some(chrono::Duration::minutes(90))
+        );
         assert_eq!(parse_ical_duration("P1D"), Some(chrono::Duration::days(1)));
         assert_eq!(parse_ical_duration("P1W"), Some(chrono::Duration::weeks(1)));
         assert_eq!(parse_ical_duration("invalid"), None);
     }
 }
-

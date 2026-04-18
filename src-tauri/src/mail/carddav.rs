@@ -88,7 +88,11 @@ impl CardDavClient {
         };
 
         log::info!("carddav: connected to {}", base_url);
-        Ok(Self { http, base_url, auth })
+        Ok(Self {
+            http,
+            base_url,
+            auth,
+        })
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -153,7 +157,9 @@ impl CardDavClient {
 
     /// Discover the current user's principal URL.
     pub async fn discover_principal(&self) -> Result<String> {
-        let resp = self.propfind(&self.base_url, "0", PROPFIND_PRINCIPAL).await?;
+        let resp = self
+            .propfind(&self.base_url, "0", PROPFIND_PRINCIPAL)
+            .await?;
         let principal = parse_href_from_xml(&resp, "current-user-principal")
             .ok_or_else(|| Error::Other("CardDAV: no current-user-principal".to_string()))?;
         self.resolve_url(&principal)
@@ -175,7 +181,9 @@ impl CardDavClient {
         let home = self.discover_addressbook_home(&principal).await?;
         log::debug!("carddav: listing address books at {}", home);
 
-        let resp = self.propfind(&home, "1", PROPFIND_LIST_ADDRESSBOOKS).await?;
+        let resp = self
+            .propfind(&home, "1", PROPFIND_LIST_ADDRESSBOOKS)
+            .await?;
         let books = parse_addressbooks_from_xml(&resp);
         log::info!("carddav: found {} address books", books.len());
         Ok(books)
@@ -213,12 +221,21 @@ impl CardDavClient {
         }
 
         let contacts = parse_contacts_from_xml(&body);
-        log::info!("carddav: fetched {} contacts from {}", contacts.len(), book_href);
+        log::info!(
+            "carddav: fetched {} contacts from {}",
+            contacts.len(),
+            book_href
+        );
         Ok(contacts)
     }
 
     /// PUT a vCard to the server. Returns the new etag.
-    pub async fn put_contact(&self, book_href: &str, uid: &str, vcard_data: &str) -> Result<String> {
+    pub async fn put_contact(
+        &self,
+        book_href: &str,
+        uid: &str,
+        vcard_data: &str,
+    ) -> Result<String> {
         let book_url = self.resolve_url(book_href)?;
         let url = format!("{}/{}.vcf", book_url.trim_end_matches('/'), uid);
         log::info!("carddav: PUT contact to {}", url);
@@ -234,21 +251,37 @@ impl CardDavClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("CardDAV PUT returned {}: {}", status, body.chars().take(500).collect::<String>())));
+            return Err(Error::Other(format!(
+                "CardDAV PUT returned {}: {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            )));
         }
 
-        Ok(resp.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_string())
+        Ok(resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string())
     }
 
     /// DELETE a contact from the server.
     pub async fn delete_contact(&self, contact_href: &str) -> Result<()> {
         let url = self.resolve_url(contact_href)?;
-        let resp = self.apply_auth(self.http.delete(&url)).send().await
+        let resp = self
+            .apply_auth(self.http.delete(&url))
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("CardDAV DELETE failed: {}", e)))?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("CardDAV DELETE returned {}: {}", status, body.chars().take(500).collect::<String>())));
+            return Err(Error::Other(format!(
+                "CardDAV DELETE returned {}: {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            )));
         }
         Ok(())
     }
@@ -360,11 +393,18 @@ fn parse_addressbooks_from_xml(xml: &str) -> Vec<CardDavAddressBook> {
     let root = doc.root();
     for response in &find_elements(&doc, root, "response") {
         let href = find_text_in(&doc, *response, "href").unwrap_or_default();
-        if href.is_empty() { continue; }
+        if href.is_empty() {
+            continue;
+        }
         let resourcetypes = find_elements(&doc, *response, "resourcetype");
-        let is_addressbook = resourcetypes.iter().any(|rt| has_descendant(&doc, *rt, "addressbook"));
-        if !is_addressbook { continue; }
-        let name = find_text_in(&doc, *response, "displayname").unwrap_or_else(|| "Address Book".to_string());
+        let is_addressbook = resourcetypes
+            .iter()
+            .any(|rt| has_descendant(&doc, *rt, "addressbook"));
+        if !is_addressbook {
+            continue;
+        }
+        let name = find_text_in(&doc, *response, "displayname")
+            .unwrap_or_else(|| "Address Book".to_string());
         books.push(CardDavAddressBook { href, name });
     }
     books
@@ -386,9 +426,16 @@ fn parse_contacts_from_xml(xml: &str) -> Vec<CardDavContact> {
             .map(|e| e.trim_matches('"').to_string())
             .unwrap_or_default();
         let vcard_data = find_text_in(&doc, *response, "address-data").unwrap_or_default();
-        if vcard_data.is_empty() { continue; }
+        if vcard_data.is_empty() {
+            continue;
+        }
         let uid = extract_uid_from_vcard(&vcard_data).unwrap_or_else(|| href.clone());
-        contacts.push(CardDavContact { href, etag, uid, vcard_data });
+        contacts.push(CardDavContact {
+            href,
+            etag,
+            uid,
+            vcard_data,
+        });
     }
     contacts
 }
@@ -435,19 +482,36 @@ pub fn parse_vcard(vcard: &str) -> ParsedVCard {
         } else if prop_upper == "UID" {
             result.uid = Some(value.to_string());
         } else if prop_upper.starts_with("EMAIL") {
-            let label = if params_lower.contains("work") { "work" }
-                else if params_lower.contains("home") { "home" }
-                else { "other" };
-            result.emails.push(VCardEmail { email: value.to_string(), label: label.to_string() });
+            let label = if params_lower.contains("work") {
+                "work"
+            } else if params_lower.contains("home") {
+                "home"
+            } else {
+                "other"
+            };
+            result.emails.push(VCardEmail {
+                email: value.to_string(),
+                label: label.to_string(),
+            });
         } else if prop_upper.starts_with("TEL") {
-            let label = if params_lower.contains("cell") || params_lower.contains("mobile") { "mobile" }
-                else if params_lower.contains("work") { "work" }
-                else if params_lower.contains("home") { "home" }
-                else { "other" };
-            result.phones.push(VCardPhone { number: value.to_string(), label: label.to_string() });
+            let label = if params_lower.contains("cell") || params_lower.contains("mobile") {
+                "mobile"
+            } else if params_lower.contains("work") {
+                "work"
+            } else if params_lower.contains("home") {
+                "home"
+            } else {
+                "other"
+            };
+            result.phones.push(VCardPhone {
+                number: value.to_string(),
+                label: label.to_string(),
+            });
         } else if prop_upper == "ORG" || prop_upper.starts_with("ORG;") {
             let org = value.split(';').next().unwrap_or(value).trim();
-            if !org.is_empty() { result.organization = Some(org.to_string()); }
+            if !org.is_empty() {
+                result.organization = Some(org.to_string());
+            }
         } else if (prop_upper == "TITLE" || prop_upper.starts_with("TITLE;")) && !value.is_empty() {
             result.title = Some(value.to_string());
         } else if (prop_upper == "NOTE" || prop_upper.starts_with("NOTE;")) && !value.is_empty() {
@@ -467,7 +531,12 @@ pub fn parse_vcard(vcard: &str) -> ParsedVCard {
                 let last = parts.first().unwrap_or(&"").trim();
                 let first = parts.get(1).unwrap_or(&"").trim();
                 let middle = parts.get(2).unwrap_or(&"").trim();
-                result.display_name = [first, middle, last].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" ");
+                result.display_name = [first, middle, last]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 break;
             }
         }
@@ -494,20 +563,45 @@ pub fn generate_vcard(
     ];
 
     let parts: Vec<&str> = display_name.splitn(2, ' ').collect();
-    let (first, last) = if parts.len() == 2 { (parts[0], parts[1]) } else { (display_name, "") };
+    let (first, last) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        (display_name, "")
+    };
     lines.push(format!("N:{};{};;;", last, first));
 
     for e in emails {
-        let t = match e.label.as_str() { "work" => "WORK", "home" => "HOME", _ => "OTHER" };
+        let t = match e.label.as_str() {
+            "work" => "WORK",
+            "home" => "HOME",
+            _ => "OTHER",
+        };
         lines.push(format!("EMAIL;TYPE={}:{}", t, e.email));
     }
     for p in phones {
-        let t = match p.label.as_str() { "mobile" => "CELL", "work" => "WORK", "home" => "HOME", _ => "OTHER" };
+        let t = match p.label.as_str() {
+            "mobile" => "CELL",
+            "work" => "WORK",
+            "home" => "HOME",
+            _ => "OTHER",
+        };
         lines.push(format!("TEL;TYPE={}:{}", t, p.number));
     }
-    if let Some(org) = organization { if !org.is_empty() { lines.push(format!("ORG:{}", org)); } }
-    if let Some(t) = title { if !t.is_empty() { lines.push(format!("TITLE:{}", t)); } }
-    if let Some(n) = note { if !n.is_empty() { lines.push(format!("NOTE:{}", n)); } }
+    if let Some(org) = organization {
+        if !org.is_empty() {
+            lines.push(format!("ORG:{}", org));
+        }
+    }
+    if let Some(t) = title {
+        if !t.is_empty() {
+            lines.push(format!("TITLE:{}", t));
+        }
+    }
+    if let Some(n) = note {
+        if !n.is_empty() {
+            lines.push(format!("NOTE:{}", n));
+        }
+    }
 
     lines.push("END:VCARD".to_string());
     lines.join("\r\n")
@@ -523,13 +617,8 @@ mod connect_tests {
 
     #[tokio::test]
     async fn connect_rejects_http_url() {
-        let msg = match CardDavClient::connect(
-            "http://example.com/dav/",
-            "u",
-            "p",
-            "u@example.com",
-        )
-        .await
+        let msg = match CardDavClient::connect("http://example.com/dav/", "u", "p", "u@example.com")
+            .await
         {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
@@ -591,7 +680,8 @@ mod tests {
 
     #[test]
     fn test_parse_vcard_fallback_to_n() {
-        let vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Doe;John;M;;\r\nEMAIL:john@example.com\r\nEND:VCARD";
+        let vcard =
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Doe;John;M;;\r\nEMAIL:john@example.com\r\nEND:VCARD";
         let parsed = parse_vcard(vcard);
         assert_eq!(parsed.display_name, "John M Doe");
         assert_eq!(parsed.emails[0].label, "other");
@@ -610,17 +700,37 @@ mod tests {
     fn test_parse_vcard_folded_lines() {
         let vcard = "BEGIN:VCARD\r\nFN:Alice\r\nNOTE:This is a long note\r\n  that continues here\r\nEND:VCARD";
         let parsed = parse_vcard(vcard);
-        assert_eq!(parsed.note, Some("This is a long note that continues here".to_string()));
+        assert_eq!(
+            parsed.note,
+            Some("This is a long note that continues here".to_string())
+        );
     }
 
     #[test]
     fn test_generate_vcard_roundtrip() {
         let emails = vec![
-            VCardEmail { email: "a@work.com".to_string(), label: "work".to_string() },
-            VCardEmail { email: "a@home.com".to_string(), label: "home".to_string() },
+            VCardEmail {
+                email: "a@work.com".to_string(),
+                label: "work".to_string(),
+            },
+            VCardEmail {
+                email: "a@home.com".to_string(),
+                label: "home".to_string(),
+            },
         ];
-        let phones = vec![VCardPhone { number: "+1-555".to_string(), label: "mobile".to_string() }];
-        let vcard = generate_vcard("uid-1", "Alice Smith", &emails, &phones, Some("Acme"), Some("CTO"), None);
+        let phones = vec![VCardPhone {
+            number: "+1-555".to_string(),
+            label: "mobile".to_string(),
+        }];
+        let vcard = generate_vcard(
+            "uid-1",
+            "Alice Smith",
+            &emails,
+            &phones,
+            Some("Acme"),
+            Some("CTO"),
+            None,
+        );
         let parsed = parse_vcard(&vcard);
         assert_eq!(parsed.display_name, "Alice Smith");
         assert_eq!(parsed.emails.len(), 2);

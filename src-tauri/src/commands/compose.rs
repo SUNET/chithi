@@ -66,18 +66,23 @@ pub async fn send_message(
     let smtp_creds = if account.mail_protocol != "jmap" && account.provider == "o365" {
         let tokens = crate::oauth::load_tokens(&account_id)?
             .ok_or_else(|| Error::Other("No O365 tokens for SMTP".into()))?;
-        let refresh_token = tokens.refresh_token
+        let refresh_token = tokens
+            .refresh_token
             .ok_or_else(|| Error::Other("No O365 refresh token for SMTP".into()))?;
         let smtp_tokens = crate::oauth::refresh_with_scopes(
             &crate::oauth::MICROSOFT,
             &refresh_token,
             crate::oauth::MICROSOFT_IMAP_SCOPES,
-        ).await?;
-        crate::oauth::store_tokens(&account_id, &crate::oauth::OAuthTokens {
-            access_token: smtp_tokens.access_token.clone(),
-            refresh_token: smtp_tokens.refresh_token,
-            expires_at: smtp_tokens.expires_at,
-        })?;
+        )
+        .await?;
+        crate::oauth::store_tokens(
+            &account_id,
+            &crate::oauth::OAuthTokens {
+                access_token: smtp_tokens.access_token.clone(),
+                refresh_token: smtp_tokens.refresh_token,
+                expires_at: smtp_tokens.expires_at,
+            },
+        )?;
         Some((account.username.clone(), smtp_tokens.access_token, true))
     } else {
         None
@@ -89,10 +94,14 @@ pub async fn send_message(
     } else {
         message.subject.clone()
     };
-    app.emit("send-started", serde_json::json!({
-        "account_id": account_id,
-        "subject": subject_display,
-    })).ok();
+    app.emit(
+        "send-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "subject": subject_display,
+        }),
+    )
+    .ok();
 
     // --- Persist to outbox before spawning background send ---
     // This ensures the message survives a crash during sending.
@@ -108,7 +117,11 @@ pub async fn send_message(
         let conn = state.db.writer().await;
         crate::ops::offline::queue_offline_op(&conn, &account_id, "send", &send_payload)?
     };
-    log::info!("Persisted send to outbox (id={}) for account {}", outbox_id, account_id);
+    log::info!(
+        "Persisted send to outbox (id={}) for account {}",
+        outbox_id,
+        account_id
+    );
 
     // --- Background: actual network send ---
     // The command returns Ok(()) here so the compose window can close.
@@ -116,7 +129,12 @@ pub async fn send_message(
     let account_id_bg = account_id.clone();
     let subject_bg = subject_display.clone();
     let db_bg = state.db.clone();
-    let recipients: Vec<String> = message.to.iter().chain(message.cc.iter()).cloned().collect();
+    let recipients: Vec<String> = message
+        .to
+        .iter()
+        .chain(message.cc.iter())
+        .cloned()
+        .collect();
 
     tokio::spawn(async move {
         let result: std::result::Result<(), Error> = async {
@@ -154,7 +172,8 @@ pub async fn send_message(
                 .await?;
             }
             Ok(())
-        }.await;
+        }
+        .await;
 
         match result {
             Ok(()) => {
@@ -164,15 +183,21 @@ pub async fn send_message(
                 if let Err(e) = crate::ops::offline::mark_completed(&conn, outbox_id) {
                     log::warn!("Failed to remove sent message from outbox: {}", e);
                 }
-                app_bg.emit("send-complete", serde_json::json!({
-                    "account_id": account_id_bg,
-                    "subject": subject_bg,
-                })).ok();
+                app_bg
+                    .emit(
+                        "send-complete",
+                        serde_json::json!({
+                            "account_id": account_id_bg,
+                            "subject": subject_bg,
+                        }),
+                    )
+                    .ok();
 
                 // Auto-collect recipients to "Collected Contacts"
                 let conn = db_bg.writer().await;
                 for addr in &recipients {
-                    if let Err(e) = db::contacts::collect_contact(&conn, &account_id_bg, addr, None) {
+                    if let Err(e) = db::contacts::collect_contact(&conn, &account_id_bg, addr, None)
+                    {
                         log::warn!("Failed to collect contact '{}': {}", addr, e);
                     }
                 }
@@ -182,11 +207,16 @@ pub async fn send_message(
                 // Leave the message in the outbox for retry (mark as failed)
                 let conn = db_bg.writer().await;
                 let _ = crate::ops::offline::mark_failed(&conn, outbox_id, &e.to_string());
-                app_bg.emit("send-failed", serde_json::json!({
-                    "account_id": account_id_bg,
-                    "subject": subject_bg,
-                    "error": e.to_string(),
-                })).ok();
+                app_bg
+                    .emit(
+                        "send-failed",
+                        serde_json::json!({
+                            "account_id": account_id_bg,
+                            "subject": subject_bg,
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .ok();
             }
         }
     });
@@ -233,16 +263,21 @@ pub async fn save_draft(
 
     if account.mail_protocol == "graph" {
         // Save draft via Graph API: POST /me/messages creates a draft without sending
-        log::info!("Saving draft via Microsoft Graph for account {}", account.email);
+        log::info!(
+            "Saving draft via Microsoft Graph for account {}",
+            account.email
+        );
         let token = crate::mail::graph::get_graph_token(&account_id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
-        client.save_draft(&crate::mail::graph::GraphSendMessage {
-            to: message.to.clone(),
-            cc: message.cc.clone(),
-            bcc: message.bcc.clone(),
-            subject: message.subject.clone(),
-            body_text: message.body_text.clone(),
-        }).await?;
+        client
+            .save_draft(&crate::mail::graph::GraphSendMessage {
+                to: message.to.clone(),
+                cc: message.cc.clone(),
+                bcc: message.bcc.clone(),
+                subject: message.subject.clone(),
+                body_text: message.body_text.clone(),
+            })
+            .await?;
     } else if account.mail_protocol == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
@@ -252,11 +287,15 @@ pub async fn save_draft(
         let (imap_password, imap_xoauth2) = if account.provider == "o365" {
             let tokens = crate::oauth::load_tokens(&account.id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens.refresh_token
+            let refresh = tokens
+                .refresh_token
                 .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
             let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-            ).await?;
+                &crate::oauth::MICROSOFT,
+                &refresh,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
             crate::oauth::store_tokens(&account.id, &new)?;
             (new.access_token, true)
         } else {
@@ -287,7 +326,9 @@ pub async fn save_draft(
                 }
             }
             if !saved {
-                return Err(crate::error::Error::Other("Could not find Drafts folder".into()));
+                return Err(crate::error::Error::Other(
+                    "Could not find Drafts folder".into(),
+                ));
             }
             conn.logout();
             Ok(())
@@ -308,7 +349,8 @@ fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::Attachme
         // Reject relative paths
         if !path.is_absolute() {
             return Err(crate::error::Error::Other(format!(
-                "Attachment path must be absolute: '{}'", att.path
+                "Attachment path must be absolute: '{}'",
+                att.path
             )));
         }
 
@@ -316,7 +358,8 @@ fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::Attachme
         for component in path.components() {
             if matches!(component, std::path::Component::ParentDir) {
                 return Err(crate::error::Error::Other(format!(
-                    "Attachment path must not contain '..': '{}'", att.path
+                    "Attachment path must not contain '..': '{}'",
+                    att.path
                 )));
             }
         }
@@ -330,19 +373,24 @@ fn read_attachments(attachments: &[FileAttachment]) -> Result<Vec<smtp::Attachme
                 || path_str.starts_with("/var/tmp/")
         } else {
             // Windows
-            path_str.starts_with("C:\\Users\\")
-                || path_str.starts_with("C:\\Temp\\")
+            path_str.starts_with("C:\\Users\\") || path_str.starts_with("C:\\Temp\\")
         };
         if !is_typical {
             log::warn!("Attachment from unusual path: '{}'", att.path);
         }
 
-        let data = std::fs::read(&att.path)
-            .map_err(|e| crate::error::Error::Other(format!("Failed to read attachment '{}': {}", att.path, e)))?;
+        let data = std::fs::read(&att.path).map_err(|e| {
+            crate::error::Error::Other(format!("Failed to read attachment '{}': {}", att.path, e))
+        })?;
         let content_type = mime_guess::from_path(&att.name)
             .first_or_octet_stream()
             .to_string();
-        log::info!("Attachment: {} ({}, {} bytes)", att.name, content_type, data.len());
+        log::info!(
+            "Attachment: {} ({}, {} bytes)",
+            att.name,
+            content_type,
+            data.len()
+        );
         result.push(smtp::AttachmentData {
             name: att.name.clone(),
             content_type,

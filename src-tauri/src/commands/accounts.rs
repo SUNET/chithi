@@ -7,9 +7,7 @@ use crate::error::Result;
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn list_accounts(
-    state: State<'_, AppState>,
-) -> Result<Vec<db::accounts::Account>> {
+pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<db::accounts::Account>> {
     log::debug!("Listing accounts");
     let conn = state.db.reader();
     let accounts = db::accounts::list_accounts(&conn)?;
@@ -56,7 +54,11 @@ pub async fn add_account(
         is_default: true,
     };
     db::calendar::insert_calendar(&conn, &cal_id, &default_calendar)?;
-    log::info!("Default calendar created with id={} for account={}", cal_id, id);
+    log::info!(
+        "Default calendar created with id={} for account={}",
+        cal_id,
+        id
+    );
 
     Ok(id)
 }
@@ -105,10 +107,7 @@ pub async fn update_account(
 }
 
 #[tauri::command]
-pub async fn delete_account(
-    state: State<'_, AppState>,
-    account_id: String,
-) -> Result<()> {
+pub async fn delete_account(state: State<'_, AppState>, account_id: String) -> Result<()> {
     log::info!("Deleting account {}", account_id);
     let conn = state.db.writer().await;
     db::accounts::delete_account(&conn, &account_id)?;

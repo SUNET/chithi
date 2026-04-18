@@ -159,10 +159,9 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
                 "target_folder": target_folder,
             }),
         )),
-        MailOp::DeleteMessages { by_folder } => Some((
-            "delete",
-            serde_json::json!({ "by_folder": by_folder }),
-        )),
+        MailOp::DeleteMessages { by_folder } => {
+            Some(("delete", serde_json::json!({ "by_folder": by_folder })))
+        }
         MailOp::SetFlags {
             by_folder,
             flags,
@@ -193,9 +192,9 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
 /// Validate that a folder path doesn't contain characters that could be
 /// injected into IMAP commands (null bytes, bare newlines).
 fn validate_folder_paths(by_folder: &std::collections::HashMap<String, Vec<u32>>) -> bool {
-    by_folder.keys().all(|path| {
-        !path.contains('\0') && !path.contains('\n') && !path.contains('\r')
-    })
+    by_folder
+        .keys()
+        .all(|path| !path.contains('\0') && !path.contains('\n') && !path.contains('\r'))
 }
 
 /// Convert an outbox entry back to a MailOp for replay.

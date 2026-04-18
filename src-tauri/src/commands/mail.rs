@@ -1,11 +1,10 @@
 use tauri::State;
 
+use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::commands::sync_cmd::{
-    resume_imap_idle_for_account,
-    should_suspend_idle_for_imap_operation,
+    resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
     suspend_imap_idle_for_account,
 };
-use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
@@ -24,7 +23,8 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
             || v4.is_link_local()       // 169.254.0.0/16
             || v4.is_broadcast()        // 255.255.255.255
             || v4.is_unspecified()      // 0.0.0.0
-            || v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127 // 100.64.0.0/10 (CGNAT)
+            || v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127
+            // 100.64.0.0/10 (CGNAT)
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()            // ::1
@@ -44,7 +44,11 @@ pub async fn list_folders(
     log::debug!("Listing folders for account {}", account_id);
     let conn = state.db.reader();
     let flat_folders = db::folders::list_folders(&conn, &account_id)?;
-    log::debug!("Found {} folders for account {}", flat_folders.len(), account_id);
+    log::debug!(
+        "Found {} folders for account {}",
+        flat_folders.len(),
+        account_id
+    );
     let tree = db::folders::build_folder_tree(flat_folders);
     Ok(tree)
 }
@@ -73,8 +77,16 @@ pub async fn get_messages(
         if asc { "asc" } else { "desc" }
     );
     let conn = state.db.reader();
-    let result =
-        db::messages::get_messages(&conn, &account_id, &folder_path, page, per_page, col, asc, &qf)?;
+    let result = db::messages::get_messages(
+        &conn,
+        &account_id,
+        &folder_path,
+        page,
+        per_page,
+        col,
+        asc,
+        &qf,
+    )?;
     log::debug!(
         "Returned {} messages (total={}) for folder {}",
         result.messages.len(),
@@ -118,7 +130,8 @@ pub async fn get_message_body(
             let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
                 gid.to_string()
             } else {
-                message_id.strip_prefix(&format!("{}_", account_id))
+                message_id
+                    .strip_prefix(&format!("{}_", account_id))
                     .unwrap_or(&message_id)
                     .to_string()
             };
@@ -130,10 +143,16 @@ pub async fn get_message_body(
             let maildir_base = data_dir.join(&account_id).join(&folder_dir);
             crate::mail::sync::create_maildir_dirs(&maildir_base)?;
 
-            let filename = format!("{}:2,{}", graph_msg_id, crate::mail::sync::flags_to_maildir_suffix(&flags));
+            let filename = format!(
+                "{}:2,{}",
+                graph_msg_id,
+                crate::mail::sync::flags_to_maildir_suffix(&flags)
+            );
             let msg_path = maildir_base.join("cur").join(&filename);
 
-            let bytes_written = client.download_mime_to_file(&graph_msg_id, &msg_path).await?;
+            let bytes_written = client
+                .download_mime_to_file(&graph_msg_id, &msg_path)
+                .await?;
             let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
             log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
             rp
@@ -171,11 +190,15 @@ pub async fn get_message_body(
             let (password, use_xoauth2) = if account.provider == "o365" {
                 let tokens = crate::oauth::load_tokens(&account_id)?
                     .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-                let refresh = tokens.refresh_token
+                let refresh = tokens
+                    .refresh_token
                     .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
                 let new = crate::oauth::refresh_with_scopes(
-                    &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-                ).await?;
+                    &crate::oauth::MICROSOFT,
+                    &refresh,
+                    crate::oauth::MICROSOFT_IMAP_SCOPES,
+                )
+                .await?;
                 crate::oauth::store_tokens(&account_id, &new)?;
                 (new.access_token, true)
             } else {
@@ -225,11 +248,7 @@ pub async fn get_message_body(
     let full_path = state.data_dir.join(&actual_maildir_path);
     log::debug!("Reading message from {}", full_path.display());
     let raw = std::fs::read(&full_path).map_err(|e| {
-        log::error!(
-            "Failed to read message file {}: {}",
-            full_path.display(),
-            e
-        );
+        log::error!("Failed to read message file {}: {}", full_path.display(), e);
         Error::Other(format!(
             "Failed to read message file {}: {}",
             full_path.display(),
@@ -276,13 +295,11 @@ pub async fn get_message_html_with_images(
     }
 
     let full_path = state.data_dir.join(&maildir_path);
-    let raw = std::fs::read(&full_path).map_err(|e| {
-        Error::Other(format!("Failed to read message file: {}", e))
-    })?;
+    let raw = std::fs::read(&full_path)
+        .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 
-    let html = parser::parse_html_with_images(&raw).ok_or_else(|| {
-        Error::MailParse("Failed to parse message HTML".to_string())
-    })?;
+    let html = parser::parse_html_with_images(&raw)
+        .ok_or_else(|| Error::MailParse("Failed to parse message HTML".to_string()))?;
 
     // Find all img src URLs and download them, replacing with data URIs.
     // This keeps the iframe sandbox at allow-scripts only (no allow-same-origin).
@@ -304,52 +321,67 @@ pub async fn get_message_html_with_images(
 
     // Download images in parallel (max 20 to avoid abuse)
     use base64::Engine;
-    let mut url_to_data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let futures: Vec<_> = urls.iter().take(20).map(|url| {
-        let client = client.clone();
-        let url = url.clone();
-        async move {
-            // SSRF protection: resolve hostname and reject private/internal IPs
-            if let Ok(parsed) = reqwest::Url::parse(&url) {
-                if let Some(host) = parsed.host_str() {
-                    // Block obvious private hostnames
-                    let h = host.to_lowercase();
-                    if h == "localhost" || h.ends_with(".local") || h.ends_with(".internal") {
-                        log::debug!("Image proxy: blocked private host {}", host);
-                        return None;
-                    }
-                    // Resolve DNS and check for private IPs
-                    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:{}", host, parsed.port_or_known_default().unwrap_or(443))).await {
-                        for addr in addrs {
-                            let ip = addr.ip();
-                            if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
-                                log::debug!("Image proxy: blocked private IP {} for {}", ip, host);
-                                return None;
+    let mut url_to_data: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let futures: Vec<_> = urls
+        .iter()
+        .take(20)
+        .map(|url| {
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                // SSRF protection: resolve hostname and reject private/internal IPs
+                if let Ok(parsed) = reqwest::Url::parse(&url) {
+                    if let Some(host) = parsed.host_str() {
+                        // Block obvious private hostnames
+                        let h = host.to_lowercase();
+                        if h == "localhost" || h.ends_with(".local") || h.ends_with(".internal") {
+                            log::debug!("Image proxy: blocked private host {}", host);
+                            return None;
+                        }
+                        // Resolve DNS and check for private IPs
+                        if let Ok(addrs) = tokio::net::lookup_host(format!(
+                            "{}:{}",
+                            host,
+                            parsed.port_or_known_default().unwrap_or(443)
+                        ))
+                        .await
+                        {
+                            for addr in addrs {
+                                let ip = addr.ip();
+                                if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                                    log::debug!(
+                                        "Image proxy: blocked private IP {} for {}",
+                                        ip,
+                                        host
+                                    );
+                                    return None;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let resp = client.get(&url).send().await.ok()?;
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("image/png")
-                .to_string();
-            // Only allow image content types, max 5MB
-            if !content_type.starts_with("image/") {
-                return None;
+                let resp = client.get(&url).send().await.ok()?;
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("image/png")
+                    .to_string();
+                // Only allow image content types, max 5MB
+                if !content_type.starts_with("image/") {
+                    return None;
+                }
+                let bytes = resp.bytes().await.ok()?;
+                if bytes.len() > 5 * 1024 * 1024 {
+                    return None;
+                }
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Some((url, format!("data:{};base64,{}", content_type, b64)))
             }
-            let bytes = resp.bytes().await.ok()?;
-            if bytes.len() > 5 * 1024 * 1024 {
-                return None;
-            }
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            Some((url, format!("data:{};base64,{}", content_type, b64)))
-        }
-    }).collect();
+        })
+        .collect();
 
     let results = futures::future::join_all(futures).await;
     for result in results.into_iter().flatten() {
@@ -437,10 +469,7 @@ pub async fn get_thread_messages(
 }
 
 #[tauri::command]
-pub async fn unthread_message(
-    state: State<'_, AppState>,
-    message_id: String,
-) -> Result<()> {
+pub async fn unthread_message(state: State<'_, AppState>, message_id: String) -> Result<()> {
     log::info!("Unthreading message: {}", message_id);
     let conn = state.db.writer().await;
     db::messages::unthread_message(&conn, &message_id)?;
@@ -455,7 +484,11 @@ pub async fn create_folder(
     account_id: String,
     folder_path: String,
 ) -> Result<()> {
-    log::info!("Creating folder '{}' for account {}", folder_path, account_id);
+    log::info!(
+        "Creating folder '{}' for account {}",
+        folder_path,
+        account_id
+    );
 
     let account = {
         let conn = state.db.reader();
@@ -469,21 +502,34 @@ pub async fn create_folder(
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
         // Split to get the parent mailbox ID and the new folder name.
         let (parent_id, mailbox_name) = if let Some((parent, name)) = folder_path.rsplit_once('/') {
-            (if parent.is_empty() { None } else { Some(parent) }, name)
+            (
+                if parent.is_empty() {
+                    None
+                } else {
+                    Some(parent)
+                },
+                name,
+            )
         } else {
             (None, folder_path.as_str())
         };
-        conn_jmap.create_mailbox(&jmap_config, mailbox_name, parent_id).await?;
+        conn_jmap
+            .create_mailbox(&jmap_config, mailbox_name, parent_id)
+            .await?;
     } else {
         // IMAP: CREATE (O365 uses XOAUTH2)
         let (imap_password, imap_xoauth2) = if account.provider == "o365" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens.refresh_token
+            let refresh = tokens
+                .refresh_token
                 .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
             let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-            ).await?;
+                &crate::oauth::MICROSOFT,
+                &refresh,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
             crate::oauth::store_tokens(&account_id, &new)?;
             (new.access_token, true)
         } else {
@@ -511,15 +557,16 @@ pub async fn create_folder(
     // Don't insert into local DB here — the next sync will discover the folder
     // with the correct server-side path/ID and register it properly.
 
-    log::info!("Folder '{}' created on server, will appear after sync", folder_path);
+    log::info!(
+        "Folder '{}' created on server, will appear after sync",
+        folder_path
+    );
     emit_folders_changed(&app, &account_id);
     Ok(())
 }
 
 /// System folder types that must never be deleted.
-const PROTECTED_FOLDER_TYPES: &[&str] = &[
-    "inbox", "sent", "drafts", "trash", "junk", "archive",
-];
+const PROTECTED_FOLDER_TYPES: &[&str] = &["inbox", "sent", "drafts", "trash", "junk", "archive"];
 
 /// Delete a folder on the mail server and remove it from local DB.
 /// Refuses to delete system folders (inbox, sent, drafts, trash, junk, archive).
@@ -530,7 +577,11 @@ pub async fn delete_folder(
     account_id: String,
     folder_path: String,
 ) -> Result<()> {
-    log::info!("Deleting folder '{}' for account {}", folder_path, account_id);
+    log::info!(
+        "Deleting folder '{}' for account {}",
+        folder_path,
+        account_id
+    );
 
     // Verify the folder exists in the local DB and is not a system folder
     let account = {
@@ -543,19 +594,25 @@ pub async fn delete_folder(
                 rusqlite::params![account_id, folder_path],
                 |row| row.get(0),
             )
-            .map_err(|_| Error::Other(format!(
-                "Folder '{}' not found for account {}", folder_path, account_id
-            )))?;
+            .map_err(|_| {
+                Error::Other(format!(
+                    "Folder '{}' not found for account {}",
+                    folder_path, account_id
+                ))
+            })?;
 
         // Reject deletion of system folders
         if let Some(ref ft) = folder_type {
             if PROTECTED_FOLDER_TYPES.contains(&ft.as_str()) {
                 log::warn!(
                     "Refusing to delete system folder '{}' (type={}) for account {}",
-                    folder_path, ft, account_id
+                    folder_path,
+                    ft,
+                    account_id
                 );
                 return Err(Error::Other(format!(
-                    "Cannot delete system folder '{}' ({})", folder_path, ft
+                    "Cannot delete system folder '{}' ({})",
+                    folder_path, ft
                 )));
             }
         }
@@ -579,25 +636,32 @@ pub async fn delete_folder(
         // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.destroy_mailbox(&jmap_config, &folder_path, true).await.map_err(|e| {
-            log::error!(
-                "Failed to delete JMAP folder '{}' for account {}: {}",
-                folder_path,
-                account_id,
+        conn_jmap
+            .destroy_mailbox(&jmap_config, &folder_path, true)
+            .await
+            .map_err(|e| {
+                log::error!(
+                    "Failed to delete JMAP folder '{}' for account {}: {}",
+                    folder_path,
+                    account_id,
+                    e
+                );
                 e
-            );
-            e
-        })?;
+            })?;
     } else {
         // IMAP: DELETE
         let (imap_password, imap_xoauth2) = if account.provider == "o365" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens.refresh_token
+            let refresh = tokens
+                .refresh_token
                 .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
             let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-            ).await?;
+                &crate::oauth::MICROSOFT,
+                &refresh,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
             crate::oauth::store_tokens(&account_id, &new)?;
             (new.access_token, true)
         } else {
@@ -628,7 +692,11 @@ pub async fn delete_folder(
         db::folders::delete_folder(&conn, &account_id, &folder_path)?;
     }
 
-    log::info!("Folder '{}' deleted for account {}", folder_path, account_id);
+    log::info!(
+        "Folder '{}' deleted for account {}",
+        folder_path,
+        account_id
+    );
     emit_folders_changed(&app, &account_id);
     emit_messages_changed(&app, &account_id);
     Ok(())
@@ -666,9 +734,8 @@ pub async fn save_attachment(
 
     // Extract attachment bytes first, before showing dialog
     let full_path = state.data_dir.join(&maildir_path);
-    let raw = std::fs::read(&full_path).map_err(|e| {
-        Error::Other(format!("Failed to read message file: {}", e))
-    })?;
+    let raw = std::fs::read(&full_path)
+        .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
 
     let parsed = mail_parser::MessageParser::default()
         .parse(&raw)
@@ -694,9 +761,9 @@ pub async fn save_attachment(
         None => return Ok(()), // user cancelled
     };
 
-    let dest_path = dest.as_path().ok_or_else(|| {
-        Error::Other("Invalid save path".to_string())
-    })?;
+    let dest_path = dest
+        .as_path()
+        .ok_or_else(|| Error::Other("Invalid save path".to_string()))?;
 
     // Refuse to follow symlinks
     if let Ok(metadata) = std::fs::symlink_metadata(dest_path) {
@@ -708,12 +775,12 @@ pub async fn save_attachment(
     }
 
     // Write atomically: temp file + fsync + rename
-    let dest_dir = dest_path.parent().ok_or_else(|| {
-        Error::Other("Save path must have a parent directory".to_string())
-    })?;
-    let dest_name = dest_path.file_name().ok_or_else(|| {
-        Error::Other("Save path must include a file name".to_string())
-    })?;
+    let dest_dir = dest_path
+        .parent()
+        .ok_or_else(|| Error::Other("Save path must have a parent directory".to_string()))?;
+    let dest_name = dest_path
+        .file_name()
+        .ok_or_else(|| Error::Other("Save path must include a file name".to_string()))?;
     let unique_suffix = format!(
         "{}-{}",
         std::process::id(),

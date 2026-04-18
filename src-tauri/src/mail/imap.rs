@@ -67,31 +67,44 @@ pub struct ImapConnection {
 impl ImapConnection {
     /// Connect and authenticate. Must be called from a blocking context.
     pub fn connect(config: &ImapConfig) -> Result<Self> {
-        log::info!("IMAP connecting to {}:{} (tls={})", config.host, config.port, config.use_tls);
+        log::info!(
+            "IMAP connecting to {}:{} (tls={})",
+            config.host,
+            config.port,
+            config.use_tls
+        );
 
-        let tls = native_tls::TlsConnector::builder()
-            .build()
-            .map_err(|e| {
-                log::error!("TLS connector build failed: {}", e);
-                Error::Imap(e.to_string())
-            })?;
+        let tls = native_tls::TlsConnector::builder().build().map_err(|e| {
+            log::error!("TLS connector build failed: {}", e);
+            Error::Imap(e.to_string())
+        })?;
 
         // Port 993 = implicit TLS (entire connection wrapped in TLS from start)
         // Port 143 = STARTTLS (connect plain, send STARTTLS command, upgrade to TLS)
         let client = if config.port == 993 {
             log::debug!("IMAP using implicit TLS");
-            imap::connect((&*config.host, config.port), &config.host, &tls)
-                .map_err(|e| {
-                    log::error!("IMAP TLS connection failed to {}:{}: {}", config.host, config.port, e);
-                    Error::Imap(e.to_string())
-                })?
+            imap::connect((&*config.host, config.port), &config.host, &tls).map_err(|e| {
+                log::error!(
+                    "IMAP TLS connection failed to {}:{}: {}",
+                    config.host,
+                    config.port,
+                    e
+                );
+                Error::Imap(e.to_string())
+            })?
         } else {
             log::debug!("IMAP using STARTTLS");
-            imap::connect_starttls((&*config.host, config.port), &config.host, &tls)
-                .map_err(|e| {
-                    log::error!("IMAP STARTTLS failed for {}:{}: {}", config.host, config.port, e);
+            imap::connect_starttls((&*config.host, config.port), &config.host, &tls).map_err(
+                |e| {
+                    log::error!(
+                        "IMAP STARTTLS failed for {}:{}: {}",
+                        config.host,
+                        config.port,
+                        e
+                    );
                     Error::Imap(e.to_string())
-                })?
+                },
+            )?
         };
 
         log::debug!("IMAP connected, authenticating as {}", config.username);
@@ -102,12 +115,10 @@ impl ImapConnection {
                 user: config.username.clone(),
                 token: config.password.clone(),
             };
-            client
-                .authenticate("XOAUTH2", &auth)
-                .map_err(|e| {
-                    log::error!("IMAP XOAUTH2 auth failed for {}: {}", config.username, e.0);
-                    Error::Imap(format!("XOAUTH2 auth failed: {}", e.0))
-                })?
+            client.authenticate("XOAUTH2", &auth).map_err(|e| {
+                log::error!("IMAP XOAUTH2 auth failed for {}: {}", config.username, e.0);
+                Error::Imap(format!("XOAUTH2 auth failed: {}", e.0))
+            })?
         } else {
             client
                 .login(&config.username, &config.password)
@@ -123,13 +134,10 @@ impl ImapConnection {
 
     pub fn list_folders(&mut self) -> Result<Vec<(String, String)>> {
         log::debug!("IMAP listing folders");
-        let mailboxes = self
-            .session
-            .list(None, Some("*"))
-            .map_err(|e| {
-                log::error!("IMAP LIST failed: {}", e);
-                Error::Imap(e.to_string())
-            })?;
+        let mailboxes = self.session.list(None, Some("*")).map_err(|e| {
+            log::error!("IMAP LIST failed: {}", e);
+            Error::Imap(e.to_string())
+        })?;
 
         let mut folders = Vec::new();
         for mb in mailboxes.iter() {
@@ -154,13 +162,10 @@ impl ImapConnection {
     /// SELECT a folder. Returns (exists, uid_validity, uid_next).
     pub fn select_folder(&mut self, folder: &str) -> Result<(u32, u32, u32)> {
         log::debug!("IMAP SELECT {}", folder);
-        let mailbox = self
-            .session
-            .select(folder)
-            .map_err(|e| {
-                log::error!("IMAP SELECT {} failed: {}", folder, e);
-                Error::Imap(e.to_string())
-            })?;
+        let mailbox = self.session.select(folder).map_err(|e| {
+            log::error!("IMAP SELECT {} failed: {}", folder, e);
+            Error::Imap(e.to_string())
+        })?;
         let exists = mailbox.exists;
         let uid_validity = mailbox.uid_validity.unwrap_or(0);
         let uid_next = mailbox.uid_next.unwrap_or(0);
@@ -183,13 +188,10 @@ impl ImapConnection {
         };
         log::debug!("IMAP UID FETCH {} (since_uid={})", range, since_uid);
 
-        let messages = self
-            .session
-            .uid_fetch(&range, "UID")
-            .map_err(|e| {
-                log::error!("IMAP UID FETCH failed: {}", e);
-                Error::Imap(e.to_string())
-            })?;
+        let messages = self.session.uid_fetch(&range, "UID").map_err(|e| {
+            log::error!("IMAP UID FETCH failed: {}", e);
+            Error::Imap(e.to_string())
+        })?;
 
         let uids: Vec<u32> = messages
             .iter()
@@ -241,10 +243,7 @@ impl ImapConnection {
             let envelope = fetch.envelope();
             let (subject, from_name, from_email, to_json, cc_json, date_str, msg_id, in_reply_to) =
                 if let Some(env) = envelope {
-                    let subject = env
-                        .subject
-                        .as_ref()
-                        .map(|s| decode_imap_str(s));
+                    let subject = env.subject.as_ref().map(|s| decode_imap_str(s));
 
                     let (fname, femail) = env
                         .from
@@ -253,16 +252,14 @@ impl ImapConnection {
                         .map(|a| {
                             (
                                 a.name.as_ref().map(|n| decode_imap_str(n)),
-                                a.mailbox
-                                    .as_ref()
-                                    .map(|m| {
-                                        let mb = decode_imap_str(m);
-                                        if let Some(host) = a.host.as_ref() {
-                                            format!("{}@{}", mb, decode_imap_str(host))
-                                        } else {
-                                            mb
-                                        }
-                                    }),
+                                a.mailbox.as_ref().map(|m| {
+                                    let mb = decode_imap_str(m);
+                                    if let Some(host) = a.host.as_ref() {
+                                        format!("{}@{}", mb, decode_imap_str(host))
+                                    } else {
+                                        mb
+                                    }
+                                }),
                             )
                         })
                         .unwrap_or((None, None));
@@ -276,7 +273,16 @@ impl ImapConnection {
 
                     (subject, fname, femail, to_list, cc_list, date, mid, irt)
                 } else {
-                    (None, None, None, "[]".to_string(), "[]".to_string(), None, None, None)
+                    (
+                        None,
+                        None,
+                        None,
+                        "[]".to_string(),
+                        "[]".to_string(),
+                        None,
+                        None,
+                        None,
+                    )
                 };
 
             // Check for attachments from BODYSTRUCTURE
@@ -299,10 +305,7 @@ impl ImapConnection {
                 has_attachments,
             });
         }
-        log::info!(
-            "IMAP envelope batch: {} envelopes fetched",
-            results.len()
-        );
+        log::info!("IMAP envelope batch: {} envelopes fetched", results.len());
         Ok(results)
     }
 
@@ -331,22 +334,26 @@ impl ImapConnection {
 
     /// Fetch bodies for multiple UIDs in a single IMAP command.
     /// Returns a map of UID → body bytes.
-    pub fn fetch_bodies_batch(&mut self, uids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<u8>>> {
+    pub fn fetch_bodies_batch(
+        &mut self,
+        uids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, Vec<u8>>> {
         if uids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        let uid_set: String = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let uid_set: String = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         log::debug!("IMAP batch fetching {} bodies", uids.len());
 
-        let fetches = self
-            .session
-            .uid_fetch(&uid_set, "BODY[]")
-            .map_err(|e| {
-                log::error!("IMAP batch FETCH bodies failed: {}", e);
-                Error::Imap(e.to_string())
-            })?;
+        let fetches = self.session.uid_fetch(&uid_set, "BODY[]").map_err(|e| {
+            log::error!("IMAP batch FETCH bodies failed: {}", e);
+            Error::Imap(e.to_string())
+        })?;
 
         let mut results = std::collections::HashMap::new();
         for msg in fetches.iter() {
@@ -363,7 +370,11 @@ impl ImapConnection {
     pub fn create_folder(&mut self, folder_path: &str) -> Result<()> {
         // Encode UTF-8 folder name to IMAP Modified UTF-7 (RFC 3501 §5.1.3)
         let encoded = utf7_imap::encode_utf7_imap(folder_path.to_string());
-        log::info!("IMAP creating folder: {} (encoded: {})", folder_path, encoded);
+        log::info!(
+            "IMAP creating folder: {} (encoded: {})",
+            folder_path,
+            encoded
+        );
         self.session.create(&encoded).map_err(|e| {
             log::error!("IMAP CREATE folder '{}' failed: {}", folder_path, e);
             Error::Imap(e.to_string())
@@ -401,12 +412,10 @@ impl ImapConnection {
         );
 
         // 1. Copy messages to destination
-        self.session
-            .uid_copy(&uid_set, dest_folder)
-            .map_err(|e| {
-                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-            })?;
+        self.session.uid_copy(&uid_set, dest_folder).map_err(|e| {
+            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+        })?;
         log::debug!("IMAP COPY to '{}' succeeded", dest_folder);
 
         // 2. Mark originals as deleted
@@ -423,7 +432,11 @@ impl ImapConnection {
             log::error!("IMAP EXPUNGE failed: {}", e);
             Error::Imap(format!("EXPUNGE failed: {}", e))
         })?;
-        log::info!("IMAP move complete: {} messages moved to '{}'", uids.len(), dest_folder);
+        log::info!(
+            "IMAP move complete: {} messages moved to '{}'",
+            uids.len(),
+            dest_folder
+        );
 
         Ok(())
     }
@@ -483,12 +496,10 @@ impl ImapConnection {
             &uid_set[..uid_set.len().min(80)]
         );
 
-        self.session
-            .uid_store(&uid_set, &store_cmd)
-            .map_err(|e| {
-                log::error!("IMAP UID STORE {} failed: {}", store_cmd, e);
-                Error::Imap(format!("STORE {} failed: {}", store_cmd, e))
-            })?;
+        self.session.uid_store(&uid_set, &store_cmd).map_err(|e| {
+            log::error!("IMAP UID STORE {} failed: {}", store_cmd, e);
+            Error::Imap(format!("STORE {} failed: {}", store_cmd, e))
+        })?;
 
         log::info!(
             "IMAP flags updated: {} {} on {} messages",
@@ -513,13 +524,10 @@ impl ImapConnection {
     /// Fetch current flags for all messages in the selected folder.
     /// Returns a map of UID → flags vec. Uses `1:*` to get everything.
     pub fn fetch_all_flags(&mut self) -> Result<Vec<(u32, Vec<String>)>> {
-        let fetches = self
-            .session
-            .uid_fetch("1:*", "(UID FLAGS)")
-            .map_err(|e| {
-                log::error!("IMAP UID FETCH FLAGS failed: {}", e);
-                Error::Imap(format!("FETCH FLAGS failed: {}", e))
-            })?;
+        let fetches = self.session.uid_fetch("1:*", "(UID FLAGS)").map_err(|e| {
+            log::error!("IMAP UID FETCH FLAGS failed: {}", e);
+            Error::Imap(format!("FETCH FLAGS failed: {}", e))
+        })?;
 
         let mut results = Vec::new();
         for fetch in fetches.iter() {
@@ -547,12 +555,10 @@ impl ImapConnection {
             dest_folder
         );
 
-        self.session
-            .uid_copy(&uid_set, dest_folder)
-            .map_err(|e| {
-                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-            })?;
+        self.session.uid_copy(&uid_set, dest_folder).map_err(|e| {
+            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+        })?;
 
         log::info!(
             "IMAP copy complete: {} messages copied to '{}'",
@@ -565,9 +571,17 @@ impl ImapConnection {
 
     /// Append a raw RFC5322 message to a folder (used for saving drafts).
     pub fn append_message(&mut self, folder: &str, message: &[u8]) -> Result<()> {
-        log::info!("IMAP appending message ({} bytes) to folder '{}'", message.len(), folder);
+        log::info!(
+            "IMAP appending message ({} bytes) to folder '{}'",
+            message.len(),
+            folder
+        );
         self.session
-            .append_with_flags(folder, message, &[imap::types::Flag::Seen, imap::types::Flag::Draft])
+            .append_with_flags(
+                folder,
+                message,
+                &[imap::types::Flag::Seen, imap::types::Flag::Draft],
+            )
             .map_err(|e| Error::Imap(format!("IMAP APPEND failed: {}", e)))?;
         log::info!("IMAP message appended to '{}'", folder);
         Ok(())
@@ -577,7 +591,11 @@ impl ImapConnection {
     /// (no extra flags). Used for cross-account moves where we want to keep
     /// the message as-is.
     pub fn append_message_raw(&mut self, folder: &str, message: &[u8]) -> Result<()> {
-        log::info!("IMAP appending raw message ({} bytes) to folder '{}'", message.len(), folder);
+        log::info!(
+            "IMAP appending raw message ({} bytes) to folder '{}'",
+            message.len(),
+            folder
+        );
         self.session
             .append(folder, message)
             .map_err(|e| Error::Imap(format!("IMAP APPEND failed: {}", e)))?;
@@ -590,7 +608,10 @@ impl ImapConnection {
     /// or the timeout expires. Returns true if there was a server notification.
     pub fn idle_wait(&mut self, timeout: std::time::Duration) -> Result<bool> {
         log::debug!("IMAP entering IDLE (timeout={}s)", timeout.as_secs());
-        let mut idle = self.session.idle().map_err(|e| Error::Imap(format!("IDLE setup failed: {}", e)))?;
+        let mut idle = self
+            .session
+            .idle()
+            .map_err(|e| Error::Imap(format!("IDLE setup failed: {}", e)))?;
         idle.set_keepalive(std::time::Duration::from_secs(300)); // 5 min keepalive
         let result = idle.wait_with_timeout(timeout);
         let had_notification = result.is_ok();

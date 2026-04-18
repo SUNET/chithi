@@ -55,7 +55,8 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
 };
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
-pub const MICROSOFT_GRAPH_SCOPES: &str = "User.Read Calendars.ReadWrite Contacts.ReadWrite offline_access";
+pub const MICROSOFT_GRAPH_SCOPES: &str =
+    "User.Read Calendars.ReadWrite Contacts.ReadWrite offline_access";
 
 /// Microsoft IMAP/SMTP scopes — used for token refresh for mail access.
 /// Uses outlook.office.com (works for both personal and work/school accounts).
@@ -114,10 +115,13 @@ impl OAuthTokens {
 /// The listener is kept open to prevent port hijacking between URL
 /// generation and callback handling (TOCTOU). The state parameter
 /// provides CSRF protection and must be validated in the callback.
-pub fn get_auth_url(provider: &OAuthProvider) -> Result<(String, TcpListener, Option<String>, String)> {
+pub fn get_auth_url(
+    provider: &OAuthProvider,
+) -> Result<(String, TcpListener, Option<String>, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| Error::Other(format!("Failed to bind local server: {}", e)))?;
-    let port = listener.local_addr()
+    let port = listener
+        .local_addr()
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
 
@@ -177,10 +181,14 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
 
     let timeout = Duration::from_secs(300);
     let deadline = Instant::now() + timeout;
-    listener.set_nonblocking(true)
+    listener
+        .set_nonblocking(true)
         .map_err(|e| Error::Other(format!("Failed to set non-blocking: {}", e)))?;
 
-    log::info!("OAuth2: waiting for callback (timeout={}s)", timeout.as_secs());
+    log::info!(
+        "OAuth2: waiting for callback (timeout={}s)",
+        timeout.as_secs()
+    );
 
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -200,11 +208,15 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         }
     };
 
-    let mut reader = BufReader::new(stream.try_clone()
-        .map_err(|e| Error::Other(format!("Stream clone failed: {}", e)))?);
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| Error::Other(format!("Stream clone failed: {}", e)))?,
+    );
 
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)
+    reader
+        .read_line(&mut request_line)
         .map_err(|e| Error::Other(format!("Failed to read request: {}", e)))?;
 
     // Parse query parameters from: GET /?code=xxx&state=yyy HTTP/1.1
@@ -213,7 +225,8 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         .nth(1)
         .and_then(|path| path.split('?').nth(1))
         .map(|query| {
-            query.split('&')
+            query
+                .split('&')
                 .filter_map(|param| {
                     let mut parts = param.splitn(2, '=');
                     let key = parts.next()?;
@@ -229,7 +242,8 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         .unwrap_or_default();
 
     let code = query_params.get("code").cloned().ok_or_else(|| {
-        let error = query_params.get("error")
+        let error = query_params
+            .get("error")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         Error::Other(format!("OAuth2 authorization failed: {}", error))
@@ -287,7 +301,9 @@ pub async fn exchange_code(
         return Err(Error::Other(format!("Token exchange error: {}", body)));
     }
 
-    let token_resp: serde_json::Value = resp.json().await
+    let token_resp: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("Token parse failed: {}", e)))?;
 
     let access_token = token_resp["access_token"]
@@ -295,14 +311,15 @@ pub async fn exchange_code(
         .ok_or_else(|| Error::Other("No access_token in response".into()))?
         .to_string();
 
-    let refresh_token = token_resp["refresh_token"]
-        .as_str()
-        .map(|s| s.to_string());
+    let refresh_token = token_resp["refresh_token"].as_str().map(|s| s.to_string());
 
     let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
     let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
-    log::info!("OAuth2: token exchange successful, expires in {}s", expires_in);
+    log::info!(
+        "OAuth2: token exchange successful, expires in {}s",
+        expires_in
+    );
 
     Ok(OAuthTokens {
         access_token,
@@ -338,7 +355,9 @@ pub async fn refresh_access_token(
         return Err(Error::Other(format!("Token refresh error: {}", body)));
     }
 
-    let token_resp: serde_json::Value = resp.json().await
+    let token_resp: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("Token refresh parse failed: {}", e)))?;
 
     let access_token = token_resp["access_token"]
@@ -394,7 +413,9 @@ pub async fn refresh_with_scopes(
         return Err(Error::Other(format!("Token refresh error: {}", body)));
     }
 
-    let token_resp: serde_json::Value = resp.json().await
+    let token_resp: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("Token refresh parse failed: {}", e)))?;
 
     let access_token = token_resp["access_token"]
@@ -411,7 +432,10 @@ pub async fn refresh_with_scopes(
         .map(|s| s.to_string())
         .unwrap_or_else(|| refresh_token.to_string());
 
-    log::info!("OAuth2: token refreshed with scopes, expires in {}s", expires_in);
+    log::info!(
+        "OAuth2: token refreshed with scopes, expires in {}s",
+        expires_in
+    );
 
     Ok(OAuthTokens {
         access_token,
@@ -434,7 +458,10 @@ pub struct OidcEndpoints {
 /// Discover OIDC endpoints from a JMAP server's .well-known/openid-configuration.
 /// `base_url` should be like "https://mail.example.com".
 pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
-    let url = format!("{}/.well-known/openid-configuration", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        base_url.trim_end_matches('/')
+    );
     log::info!("OIDC: discovering endpoints from {}", url);
 
     let client = reqwest::Client::builder()
@@ -442,17 +469,23 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
         .build()
         .map_err(|e| Error::Other(format!("HTTP client build error: {}", e)))?;
 
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| Error::Other(format!("OIDC discovery failed: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         return Err(Error::Other(format!(
-            "OIDC discovery returned {}: server may not support OIDC", status
+            "OIDC discovery returned {}: server may not support OIDC",
+            status
         )));
     }
 
-    let config: serde_json::Value = resp.json().await
+    let config: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("OIDC discovery parse error: {}", e)))?;
 
     let token_endpoint = config["token_endpoint"]
@@ -462,7 +495,8 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
 
     if !token_endpoint.starts_with("https://") {
         return Err(Error::Other(format!(
-            "OIDC: token_endpoint must use HTTPS, got: {}", token_endpoint
+            "OIDC: token_endpoint must use HTTPS, got: {}",
+            token_endpoint
         )));
     }
 
@@ -473,7 +507,8 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
     if let Some(ref ep) = device_authorization_endpoint {
         if !ep.starts_with("https://") {
             return Err(Error::Other(format!(
-                "OIDC: device_authorization_endpoint must use HTTPS, got: {}", ep
+                "OIDC: device_authorization_endpoint must use HTTPS, got: {}",
+                ep
             )));
         }
     }
@@ -485,13 +520,18 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
     if let Some(ref ep) = registration_endpoint {
         if !ep.starts_with("https://") {
             return Err(Error::Other(format!(
-                "OIDC: registration_endpoint must use HTTPS, got: {}", ep
+                "OIDC: registration_endpoint must use HTTPS, got: {}",
+                ep
             )));
         }
     }
 
-    log::info!("OIDC: discovered token={}, device_auth={:?}, registration={:?}",
-        token_endpoint, device_authorization_endpoint, registration_endpoint);
+    log::info!(
+        "OIDC: discovered token={}, device_auth={:?}, registration={:?}",
+        token_endpoint,
+        device_authorization_endpoint,
+        registration_endpoint
+    );
 
     Ok(OidcEndpoints {
         token_endpoint,
@@ -529,11 +569,14 @@ pub async fn register_oidc_client(registration_endpoint: &str) -> Result<String>
         let status = resp.status();
         let resp_body = resp.text().await.unwrap_or_default();
         return Err(Error::Other(format!(
-            "OIDC client registration returned {}: {}", status, resp_body
+            "OIDC client registration returned {}: {}",
+            status, resp_body
         )));
     }
 
-    let reg_resp: serde_json::Value = resp.json().await
+    let reg_resp: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("OIDC registration parse error: {}", e)))?;
 
     let client_id = reg_resp["client_id"]
@@ -566,8 +609,12 @@ pub struct DeviceAuthResponse {
     pub expires_in: u64,
 }
 
-fn default_interval() -> u64 { 5 }
-fn default_expires_in() -> u64 { 600 }
+fn default_interval() -> u64 {
+    5
+}
+fn default_expires_in() -> u64 {
+    600
+}
 
 /// Start the device authorization flow — POST to the device authorization endpoint.
 /// Returns the device code, user code, and verification URL to show to the user.
@@ -576,10 +623,15 @@ pub async fn device_auth_start(
     client_id: &str,
 ) -> Result<DeviceAuthResponse> {
     if client_id.trim().is_empty() {
-        return Err(Error::Other("Device authorization requires a client_id".into()));
+        return Err(Error::Other(
+            "Device authorization requires a client_id".into(),
+        ));
     }
 
-    log::info!("OIDC device flow: requesting device code from {}", device_auth_endpoint);
+    log::info!(
+        "OIDC device flow: requesting device code from {}",
+        device_auth_endpoint
+    );
 
     let mut params = HashMap::new();
     params.insert("client_id", client_id.to_string());
@@ -600,15 +652,20 @@ pub async fn device_auth_start(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(Error::Other(format!(
-            "Device auth endpoint returned {}: {}", status, body
+            "Device auth endpoint returned {}: {}",
+            status, body
         )));
     }
 
-    let auth_resp: DeviceAuthResponse = resp.json().await
+    let auth_resp: DeviceAuthResponse = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("Device auth response parse error: {}", e)))?;
 
-    log::info!("OIDC device flow: received user_code, verification_uri={}",
-        auth_resp.verification_uri);
+    log::info!(
+        "OIDC device flow: received user_code, verification_uri={}",
+        auth_resp.verification_uri
+    );
 
     Ok(auth_resp)
 }
@@ -633,7 +690,9 @@ pub async fn device_auth_poll(
 
     loop {
         if std::time::Instant::now() >= deadline {
-            return Err(Error::Other("Device authorization timed out — user did not complete sign-in".into()));
+            return Err(Error::Other(
+                "Device authorization timed out — user did not complete sign-in".into(),
+            ));
         }
 
         // Sleep before polling (skip on first attempt per RFC 8628 §3.5)
@@ -644,7 +703,10 @@ pub async fn device_auth_poll(
         }
 
         let mut params = HashMap::new();
-        params.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code".to_string());
+        params.insert(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+        );
         params.insert("device_code", device_code.to_string());
         if !client_id.is_empty() {
             params.insert("client_id", client_id.to_string());
@@ -658,7 +720,9 @@ pub async fn device_auth_poll(
             .map_err(|e| Error::Other(format!("Device token poll failed: {}", e)))?;
 
         if resp.status().is_success() {
-            let token_resp: serde_json::Value = resp.json().await
+            let token_resp: serde_json::Value = resp
+                .json()
+                .await
                 .map_err(|e| Error::Other(format!("Device token parse failed: {}", e)))?;
 
             let access_token = token_resp["access_token"]
@@ -666,14 +730,15 @@ pub async fn device_auth_poll(
                 .ok_or_else(|| Error::Other("No access_token in device token response".into()))?
                 .to_string();
 
-            let refresh_token = token_resp["refresh_token"]
-                .as_str()
-                .map(|s| s.to_string());
+            let refresh_token = token_resp["refresh_token"].as_str().map(|s| s.to_string());
 
             let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
             let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
-            log::info!("OIDC device flow: authorization complete, expires in {}s", expires_in);
+            log::info!(
+                "OIDC device flow: authorization complete, expires in {}s",
+                expires_in
+            );
 
             return Ok(OAuthTokens {
                 access_token,
@@ -694,18 +759,26 @@ pub async fn device_auth_poll(
             "slow_down" => {
                 // RFC 8628 §3.5: increase interval by 5 seconds
                 current_interval += std::time::Duration::from_secs(5);
-                log::debug!("OIDC device flow: slow_down, interval now {}s", current_interval.as_secs());
+                log::debug!(
+                    "OIDC device flow: slow_down, interval now {}s",
+                    current_interval.as_secs()
+                );
                 continue;
             }
             "access_denied" => {
                 return Err(Error::Other("Device authorization denied by user".into()));
             }
             "expired_token" => {
-                return Err(Error::Other("Device code expired — please try again".into()));
+                return Err(Error::Other(
+                    "Device code expired — please try again".into(),
+                ));
             }
             _ => {
                 let desc = body["error_description"].as_str().unwrap_or("");
-                return Err(Error::Other(format!("Device auth error: {} {}", error, desc)));
+                return Err(Error::Other(format!(
+                    "Device auth error: {} {}",
+                    error, desc
+                )));
             }
         }
     }
@@ -739,7 +812,9 @@ pub async fn refresh_token_dynamic(
         return Err(Error::Other(format!("OIDC token refresh error: {}", body)));
     }
 
-    let token_resp: serde_json::Value = resp.json().await
+    let token_resp: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| Error::Other(format!("OIDC token refresh parse failed: {}", e)))?;
 
     let access_token = token_resp["access_token"]
@@ -784,14 +859,18 @@ pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
         // Drop the stale credential and retry once with a fresh CreateItem.
         log::warn!(
             "OAuth2: keyring set_password failed for {} ({}); attempting recovery",
-            account_id, first,
+            account_id,
+            first,
         );
         let _ = entry.delete_credential();
         entry.set_password(&json).map_err(|e| {
             Error::Keyring(format!("Failed to store tokens (after recovery): {}", e))
         })?;
     }
-    log::info!("OAuth2: tokens stored in keyring for account {}", account_id);
+    log::info!(
+        "OAuth2: tokens stored in keyring for account {}",
+        account_id
+    );
     Ok(())
 }
 
@@ -830,8 +909,16 @@ mod tests {
     fn test_pkce_verifier_is_valid_length() {
         let verifier = generate_code_verifier();
         // RFC 7636: 43-128 characters
-        assert!(verifier.len() >= 43, "verifier too short: {}", verifier.len());
-        assert!(verifier.len() <= 128, "verifier too long: {}", verifier.len());
+        assert!(
+            verifier.len() >= 43,
+            "verifier too short: {}",
+            verifier.len()
+        );
+        assert!(
+            verifier.len() <= 128,
+            "verifier too long: {}",
+            verifier.len()
+        );
     }
 
     #[test]
@@ -841,7 +928,8 @@ mod tests {
         for c in verifier.chars() {
             assert!(
                 c.is_ascii_alphanumeric() || c == '-' || c == '_',
-                "invalid char in verifier: '{}'", c
+                "invalid char in verifier: '{}'",
+                c
             );
         }
     }
@@ -868,7 +956,8 @@ mod tests {
         for c in challenge.chars() {
             assert!(
                 c.is_ascii_alphanumeric() || c == '-' || c == '_',
-                "invalid char in challenge: '{}'", c
+                "invalid char in challenge: '{}'",
+                c
             );
         }
         // No padding

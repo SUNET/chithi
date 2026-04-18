@@ -22,8 +22,7 @@ fn redact_url(url: &str) -> String {
 /// development against test servers. Release builds reject all cleartext
 /// URLs unconditionally.
 pub fn require_https(url: &str) -> Result<()> {
-    let parsed = url::Url::parse(url)
-        .map_err(|e| Error::Other(format!("Invalid URL: {}", e)))?;
+    let parsed = url::Url::parse(url).map_err(|e| Error::Other(format!("Invalid URL: {}", e)))?;
 
     match parsed.scheme() {
         "https" => Ok(()),
@@ -118,7 +117,11 @@ mod tests {
             .to_string();
         assert!(!err.contains("secret"), "password leaked in error: {}", err);
         assert!(!err.contains("user:"), "userinfo leaked in error: {}", err);
-        assert!(err.contains("example.com"), "expected host in error: {}", err);
+        assert!(
+            err.contains("example.com"),
+            "expected host in error: {}",
+            err
+        );
     }
 
     #[test]

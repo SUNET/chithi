@@ -120,7 +120,11 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     match crate::keyring::get_password(&account.id) {
         Ok(pw) => account.password = pw,
         Err(e) => {
-            log::warn!("Could not read password from keyring for account {}: {}", account.id, e);
+            log::warn!(
+                "Could not read password from keyring for account {}: {}",
+                account.id,
+                e
+            );
         }
     }
 

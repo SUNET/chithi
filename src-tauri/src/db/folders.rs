@@ -128,16 +128,15 @@ pub fn build_folder_tree(mut folders: Vec<Folder>) -> Vec<Folder> {
 
     for parent_path in parent_paths {
         if let Some(child_indices) = children_map.remove(&parent_path) {
-            let children: Vec<Folder> = child_indices.iter()
-                .map(|&i| folders[i].clone())
-                .collect();
+            let children: Vec<Folder> = child_indices.iter().map(|&i| folders[i].clone()).collect();
             if let Some(&parent_idx) = by_path.get(&parent_path) {
                 folders[parent_idx].children = children;
             }
         }
     }
 
-    folders.into_iter()
+    folders
+        .into_iter()
         .enumerate()
         .filter(|(i, _)| !is_child[*i])
         .map(|(_, f)| f)
@@ -203,7 +202,11 @@ pub fn delete_folder(conn: &Connection, account_id: &str, path: &str) -> Result<
         }
     }
 
-    log::info!("Deleted folder '{}' from local DB for account {}", path, account_id);
+    log::info!(
+        "Deleted folder '{}' from local DB for account {}",
+        path,
+        account_id
+    );
     Ok(())
 }
 
@@ -244,7 +247,12 @@ pub fn get_folder_sync_state(
     let result = conn.query_row(
         "SELECT uid_next, total_count FROM folders WHERE account_id = ?1 AND path = ?2",
         params![account_id, path],
-        |row| Ok((row.get::<_, u32>(0).unwrap_or(0), row.get::<_, i64>(1).unwrap_or(0))),
+        |row| {
+            Ok((
+                row.get::<_, u32>(0).unwrap_or(0),
+                row.get::<_, i64>(1).unwrap_or(0),
+            ))
+        },
     );
     Ok(result.unwrap_or((0, 0)))
 }
@@ -467,10 +475,18 @@ mod tests {
         let inbox = tree.iter().find(|f| f.path == "INBOX").unwrap();
         assert_eq!(inbox.children.len(), 2);
 
-        let ietf = inbox.children.iter().find(|f| f.path == "INBOX/IETF").unwrap();
+        let ietf = inbox
+            .children
+            .iter()
+            .find(|f| f.path == "INBOX/IETF")
+            .unwrap();
         assert_eq!(ietf.children.len(), 1);
 
-        let infra = inbox.children.iter().find(|f| f.path == "INBOX/Infra").unwrap();
+        let infra = inbox
+            .children
+            .iter()
+            .find(|f| f.path == "INBOX/Infra")
+            .unwrap();
         assert_eq!(infra.children.len(), 1);
     }
 

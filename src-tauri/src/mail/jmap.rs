@@ -20,7 +20,7 @@ pub struct JmapCalendarEvent {
     pub title: String,
     pub description: Option<String>,
     pub location: Option<String>,
-    pub start: String,      // ISO 8601
+    pub start: String, // ISO 8601
     pub end: String,
     pub all_day: bool,
     pub timezone: Option<String>,
@@ -144,8 +144,13 @@ impl JmapConnection {
             url
         } else {
             // Auto-discover
-            let domain = config.email.rsplit_once('@').map(|(_, d)| d)
-                .ok_or_else(|| Error::Other(format!("Cannot extract domain from '{}'", config.email)))?;
+            let domain = config
+                .email
+                .rsplit_once('@')
+                .map(|(_, d)| d)
+                .ok_or_else(|| {
+                    Error::Other(format!("Cannot extract domain from '{}'", config.email))
+                })?;
             let candidates = [
                 format!("https://{}", domain),
                 format!("https://mail.{}", domain),
@@ -153,7 +158,8 @@ impl JmapConnection {
             ];
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build().map_err(|e| Error::Other(e.to_string()))?;
+                .build()
+                .map_err(|e| Error::Other(e.to_string()))?;
             let mut found = None;
             for c in &candidates {
                 let url = format!("{}/.well-known/jmap", c);
@@ -164,19 +170,23 @@ impl JmapConnection {
                     }
                 }
             }
-            found.ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
+            found
+                .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
         };
 
         log::info!("JMAP connecting to {} as {}", base_url, config.username);
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .build().map_err(|e| Error::Other(e.to_string()))?;
+            .build()
+            .map_err(|e| Error::Other(e.to_string()))?;
 
         // Fetch session with authentication
         let well_known = format!("{}/.well-known/jmap", base_url);
-        let resp = config.apply_auth(http.get(&well_known))
-            .send().await
+        let resp = config
+            .apply_auth(http.get(&well_known))
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP session fetch failed: {}", e)))?;
 
         if !resp.status().is_success() {
@@ -185,12 +195,16 @@ impl JmapConnection {
             return Err(Error::Other(format!("JMAP session: {} {}", status, body)));
         }
 
-        let session: JmapSession = resp.json().await
+        let session: JmapSession = resp
+            .json()
+            .await
             .map_err(|e| Error::Other(format!("JMAP session parse failed: {}", e)))?;
 
         // Get the default account ID
-        let account_id = session.primary_accounts
-            .values().next()
+        let account_id = session
+            .primary_accounts
+            .values()
+            .next()
             .cloned()
             .ok_or_else(|| Error::Other("No primary account in JMAP session".into()))?;
 
@@ -199,11 +213,17 @@ impl JmapConnection {
         let api_url = rewrite_url(&session.api_url, &base_url);
         let download_url = rewrite_url(&session.download_url, &base_url);
         let upload_url = rewrite_url(&session.upload_url, &base_url);
-        let event_source_url = session.event_source_url
+        let event_source_url = session
+            .event_source_url
             .as_deref()
             .map(|u| rewrite_url(u, &base_url));
 
-        log::info!("JMAP connected: account={}, api={}, eventSource={:?}", account_id, api_url, event_source_url);
+        log::info!(
+            "JMAP connected: account={}, api={}, eventSource={:?}",
+            account_id,
+            api_url,
+            event_source_url
+        );
 
         Ok(Self {
             http,
@@ -231,10 +251,16 @@ impl JmapConnection {
     }
 
     /// Send a JMAP API request and return the response JSON.
-    async fn api_request(&self, body: &serde_json::Value, config: &JmapConfig) -> Result<serde_json::Value> {
-        let resp = config.apply_auth(self.http.post(&self.api_url))
+    async fn api_request(
+        &self,
+        body: &serde_json::Value,
+        config: &JmapConfig,
+    ) -> Result<serde_json::Value> {
+        let resp = config
+            .apply_auth(self.http.post(&self.api_url))
             .json(body)
-            .send().await
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP request failed: {}", e)))?;
 
         if !resp.status().is_success() {
@@ -243,10 +269,15 @@ impl JmapConnection {
             return Err(Error::Other(format!("JMAP API error {}: {}", status, body)));
         }
 
-        resp.json().await.map_err(|e| Error::Other(format!("JMAP response parse error: {}", e)))
+        resp.json()
+            .await
+            .map_err(|e| Error::Other(format!("JMAP response parse error: {}", e)))
     }
 
-    pub async fn list_folders(&self, config: &JmapConfig) -> Result<Vec<(String, String, Option<&'static str>, Option<String>)>> {
+    pub async fn list_folders(
+        &self,
+        config: &JmapConfig,
+    ) -> Result<Vec<(String, String, Option<&'static str>, Option<String>)>> {
         log::debug!("JMAP listing mailboxes");
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
@@ -279,7 +310,13 @@ impl JmapConnection {
                 _ => None,
             };
             let parent_id = mb["parentId"].as_str().map(|s| s.to_string());
-            log::debug!("  mailbox: {} ({}) role={:?} parentId={:?}", name, id, role, parent_id);
+            log::debug!(
+                "  mailbox: {} ({}) role={:?} parentId={:?}",
+                name,
+                id,
+                role,
+                parent_id
+            );
             folders.push((name, id, folder_type, parent_id));
         }
         log::info!("JMAP found {} mailboxes", folders.len());
@@ -357,7 +394,11 @@ impl JmapConnection {
             position += page_count;
         }
 
-        log::info!("JMAP fetched {} emails from mailbox {}", all_emails.len(), mailbox_id);
+        log::info!(
+            "JMAP fetched {} emails from mailbox {}",
+            all_emails.len(),
+            mailbox_id
+        );
         Ok((all_emails, state))
     }
 
@@ -366,27 +407,33 @@ impl JmapConnection {
         let id = e["id"].as_str().unwrap_or("").to_string();
         let subject = e["subject"].as_str().map(|s| s.to_string());
 
-        let (from_name, from_email) = e["from"].as_array()
+        let (from_name, from_email) = e["from"]
+            .as_array()
             .and_then(|a| a.first())
-            .map(|f| (
-                f["name"].as_str().map(|s| s.to_string()),
-                f["email"].as_str().map(|s| s.to_string()),
-            ))
+            .map(|f| {
+                (
+                    f["name"].as_str().map(|s| s.to_string()),
+                    f["email"].as_str().map(|s| s.to_string()),
+                )
+            })
             .unwrap_or((None, None));
 
         let to_addresses = addresses_to_json(e["to"].as_array());
         let cc_addresses = addresses_to_json(e["cc"].as_array());
 
-        let date = e["receivedAt"].as_str()
+        let date = e["receivedAt"]
+            .as_str()
             .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
             .unwrap_or_default();
         let size = e["size"].as_u64().unwrap_or(0);
-        let message_id = e["messageId"].as_array()
+        let message_id = e["messageId"]
+            .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
             .map(|s| format!("<{}>", s));
-        let in_reply_to = e["inReplyTo"].as_array()
+        let in_reply_to = e["inReplyTo"]
+            .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
             .map(|s| format!("<{}>", s));
@@ -396,16 +443,34 @@ impl JmapConnection {
         let keywords = e["keywords"].as_object();
         let mut flags = Vec::new();
         if let Some(kw) = keywords {
-            if kw.contains_key("$seen") { flags.push("seen".to_string()); }
-            if kw.contains_key("$flagged") { flags.push("flagged".to_string()); }
-            if kw.contains_key("$answered") { flags.push("answered".to_string()); }
-            if kw.contains_key("$draft") { flags.push("draft".to_string()); }
+            if kw.contains_key("$seen") {
+                flags.push("seen".to_string());
+            }
+            if kw.contains_key("$flagged") {
+                flags.push("flagged".to_string());
+            }
+            if kw.contains_key("$answered") {
+                flags.push("answered".to_string());
+            }
+            if kw.contains_key("$draft") {
+                flags.push("draft".to_string());
+            }
         }
 
         JmapEmail {
-            id, subject, from_name, from_email,
-            to_addresses, cc_addresses, date, message_id,
-            in_reply_to, size, has_attachments, flags, preview,
+            id,
+            subject,
+            from_name,
+            from_email,
+            to_addresses,
+            cc_addresses,
+            date,
+            message_id,
+            in_reply_to,
+            size,
+            has_attachments,
+            flags,
+            preview,
         }
     }
 
@@ -434,24 +499,36 @@ impl JmapConnection {
             .ok_or_else(|| Error::Other(format!("No blobId for email {}", email_id)))?;
 
         // Download the blob
-        let download_url = self.download_url_template
+        let download_url = self
+            .download_url_template
             .replace("{accountId}", &self.account_id)
             .replace("{blobId}", blob_id)
             .replace("{name}", "message.eml")
             .replace("{type}", "application/octet-stream");
 
         log::debug!("JMAP downloading blob from {}", download_url);
-        let resp = config.apply_auth(self.http.get(&download_url))
-            .send().await
+        let resp = config
+            .apply_auth(self.http.get(&download_url))
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP download failed: {}", e)))?;
 
         if !resp.status().is_success() {
-            return Err(Error::Other(format!("JMAP download error: {}", resp.status())));
+            return Err(Error::Other(format!(
+                "JMAP download error: {}",
+                resp.status()
+            )));
         }
 
-        let bytes = resp.bytes().await
+        let bytes = resp
+            .bytes()
+            .await
             .map_err(|e| Error::Other(format!("JMAP download read error: {}", e)))?;
-        log::debug!("JMAP downloaded {} bytes for email {}", bytes.len(), email_id);
+        log::debug!(
+            "JMAP downloaded {} bytes for email {}",
+            bytes.len(),
+            email_id
+        );
         Ok(Some(bytes.to_vec()))
     }
 
@@ -462,7 +539,12 @@ impl JmapConnection {
         flags: &[&str],
         add: bool,
     ) -> Result<()> {
-        log::debug!("JMAP set_flags: {:?} add={} on {} emails", flags, add, email_ids.len());
+        log::debug!(
+            "JMAP set_flags: {:?} add={} on {} emails",
+            flags,
+            add,
+            email_ids.len()
+        );
 
         let mut update = serde_json::Map::new();
         for id in email_ids {
@@ -470,7 +552,14 @@ impl JmapConnection {
             for flag in flags {
                 let keyword = flag_to_keyword(flag);
                 let key = format!("keywords/{}", keyword);
-                patch.insert(key, if add { serde_json::json!(true) } else { serde_json::json!(null) });
+                patch.insert(
+                    key,
+                    if add {
+                        serde_json::json!(true)
+                    } else {
+                        serde_json::json!(null)
+                    },
+                );
             }
             update.insert(id.clone(), serde_json::Value::Object(patch));
         }
@@ -511,13 +600,21 @@ impl JmapConnection {
         from_mailbox: &str,
         to_mailbox: &str,
     ) -> Result<()> {
-        log::debug!("JMAP moving {} emails from {} to {}", email_ids.len(), from_mailbox, to_mailbox);
+        log::debug!(
+            "JMAP moving {} emails from {} to {}",
+            email_ids.len(),
+            from_mailbox,
+            to_mailbox
+        );
         let mut update = serde_json::Map::new();
         for id in email_ids {
-            update.insert(id.clone(), serde_json::json!({
-                format!("mailboxIds/{}", from_mailbox): null,
-                format!("mailboxIds/{}", to_mailbox): true,
-            }));
+            update.insert(
+                id.clone(),
+                serde_json::json!({
+                    format!("mailboxIds/{}", from_mailbox): null,
+                    format!("mailboxIds/{}", to_mailbox): true,
+                }),
+            );
         }
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
@@ -549,23 +646,32 @@ impl JmapConnection {
             mailbox_id
         );
 
-        let upload_url = self.upload_url_template
+        let upload_url = self
+            .upload_url_template
             .replace("{accountId}", &self.account_id);
-        let resp = config.apply_auth(self.http.post(&upload_url))
+        let resp = config
+            .apply_auth(self.http.post(&upload_url))
             .header("Content-Type", "message/rfc822")
             .body(raw_message.to_vec())
-            .send().await
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP upload failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP upload error {}: {}", status, body)));
+            return Err(Error::Other(format!(
+                "JMAP upload error {}: {}",
+                status, body
+            )));
         }
 
-        let upload_resp: serde_json::Value = resp.json().await
+        let upload_resp: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| Error::Other(format!("JMAP upload response parse error: {}", e)))?;
-        let blob_id = upload_resp["blobId"].as_str()
+        let blob_id = upload_resp["blobId"]
+            .as_str()
             .ok_or_else(|| Error::Other("No blobId in upload response".into()))?
             .to_string();
 
@@ -602,31 +708,42 @@ impl JmapConnection {
         log::info!("JMAP sending email ({} bytes)", raw_message.len());
 
         // Step 1: Upload the raw message as a blob
-        let upload_url = self.upload_url_template
+        let upload_url = self
+            .upload_url_template
             .replace("{accountId}", &self.account_id);
         log::debug!("JMAP uploading blob to {}", upload_url);
 
-        let resp = config.apply_auth(self.http.post(&upload_url))
+        let resp = config
+            .apply_auth(self.http.post(&upload_url))
             .header("Content-Type", "message/rfc822")
             .body(raw_message.to_vec())
-            .send().await
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP upload failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP upload error {}: {}", status, body)));
+            return Err(Error::Other(format!(
+                "JMAP upload error {}: {}",
+                status, body
+            )));
         }
 
-        let upload_resp: serde_json::Value = resp.json().await
+        let upload_resp: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| Error::Other(format!("JMAP upload response parse error: {}", e)))?;
-        let blob_id = upload_resp["blobId"].as_str()
+        let blob_id = upload_resp["blobId"]
+            .as_str()
             .ok_or_else(|| Error::Other("No blobId in upload response".into()))?
             .to_string();
         log::debug!("JMAP blob uploaded: {}", blob_id);
 
         // Step 2: Find the Sent mailbox (or Inbox as fallback) to store the email
-        let sent_mailbox_id = self.find_mailbox_by_role(config, "sent").await?
+        let sent_mailbox_id = self
+            .find_mailbox_by_role(config, "sent")
+            .await?
             .or(self.find_mailbox_by_role(config, "inbox").await?)
             .ok_or_else(|| Error::Other("No Sent or Inbox mailbox found".into()))?;
         log::debug!("JMAP using mailbox {} for sent email", sent_mailbox_id);
@@ -672,11 +789,17 @@ impl JmapConnection {
         });
 
         let resp = self.api_request(&request, config).await?;
-        log::debug!("JMAP send response: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+        log::debug!(
+            "JMAP send response: {}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
 
         // Check for import errors
         if let Some(err) = resp["methodResponses"][0][1]["notCreated"]["draft"].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
             return Err(Error::Other(format!("JMAP email import failed: {}", desc)));
         }
 
@@ -686,13 +809,24 @@ impl JmapConnection {
             .map(|s| s.to_string());
 
         // Check for submission errors — clean up imported email on failure
-        let submission_failed = if resp["methodResponses"].as_array().map(|a| a.len()).unwrap_or(0) > 1 {
+        let submission_failed = if resp["methodResponses"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+            > 1
+        {
             if resp["methodResponses"][1][0].as_str() == Some("error") {
                 let desc = resp["methodResponses"][1][1]["description"]
-                    .as_str().unwrap_or("Unknown error");
+                    .as_str()
+                    .unwrap_or("Unknown error");
                 Some(format!("JMAP submission failed: {}", desc))
-            } else if let Some(err) = resp["methodResponses"][1][1]["notCreated"]["sub1"].as_object() {
-                let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            } else if let Some(err) =
+                resp["methodResponses"][1][1]["notCreated"]["sub1"].as_object()
+            {
+                let desc = err
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("Unknown error");
                 Some(format!("JMAP submission failed: {}", desc))
             } else {
                 None
@@ -704,7 +838,10 @@ impl JmapConnection {
         if let Some(error_msg) = submission_failed {
             // Clean up the imported email that wasn't submitted
             if let Some(ref email_id) = imported_id {
-                log::warn!("JMAP cleaning up imported email {} after submission failure", email_id);
+                log::warn!(
+                    "JMAP cleaning up imported email {} after submission failure",
+                    email_id
+                );
                 let cleanup = serde_json::json!({
                     "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
                     "methodCalls": [
@@ -728,29 +865,40 @@ impl JmapConnection {
         log::info!("JMAP saving draft ({} bytes)", raw_message.len());
 
         // Upload the raw message as a blob
-        let upload_url = self.upload_url_template
+        let upload_url = self
+            .upload_url_template
             .replace("{accountId}", &self.account_id);
 
-        let resp = config.apply_auth(self.http.post(&upload_url))
+        let resp = config
+            .apply_auth(self.http.post(&upload_url))
             .header("Content-Type", "message/rfc822")
             .body(raw_message.to_vec())
-            .send().await
+            .send()
+            .await
             .map_err(|e| Error::Other(format!("JMAP draft upload failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP draft upload error {}: {}", status, body)));
+            return Err(Error::Other(format!(
+                "JMAP draft upload error {}: {}",
+                status, body
+            )));
         }
 
-        let upload_resp: serde_json::Value = resp.json().await
+        let upload_resp: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| Error::Other(format!("JMAP draft upload parse error: {}", e)))?;
-        let blob_id = upload_resp["blobId"].as_str()
+        let blob_id = upload_resp["blobId"]
+            .as_str()
             .ok_or_else(|| Error::Other("No blobId in draft upload response".into()))?
             .to_string();
 
         // Find the Drafts mailbox
-        let drafts_mailbox_id = self.find_mailbox_by_role(config, "drafts").await?
+        let drafts_mailbox_id = self
+            .find_mailbox_by_role(config, "drafts")
+            .await?
             .ok_or_else(|| Error::Other("No Drafts mailbox found".into()))?;
 
         // Import into Drafts with $draft keyword
@@ -773,7 +921,10 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notImported"]["draft"].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
             return Err(Error::Other(format!("JMAP draft import failed: {}", desc)));
         }
 
@@ -880,11 +1031,16 @@ impl JmapConnection {
         });
 
         let resp = self.api_request(&request, config).await?;
-        log::debug!("JMAP CalendarEvent response: {}", serde_json::to_string(&resp).unwrap_or_default());
+        log::debug!(
+            "JMAP CalendarEvent response: {}",
+            serde_json::to_string(&resp).unwrap_or_default()
+        );
 
         // Check if the query returned an error
         if resp["methodResponses"][0][0].as_str() == Some("error") {
-            let desc = resp["methodResponses"][0][1]["description"].as_str().unwrap_or("Unknown");
+            let desc = resp["methodResponses"][0][1]["description"]
+                .as_str()
+                .unwrap_or("Unknown");
             log::error!("JMAP CalendarEvent/query error: {}", desc);
             return Ok(vec![]);
         }
@@ -932,10 +1088,18 @@ impl JmapConnection {
             let duration_str = ev["duration"].as_str().unwrap_or("PT1H");
             let end = {
                 let e = compute_end_from_duration(start.trim_end_matches('Z'), duration_str);
-                if start.ends_with('Z') && !e.ends_with('Z') { format!("{}Z", e) } else { e }
+                if start.ends_with('Z') && !e.ends_with('Z') {
+                    format!("{}Z", e)
+                } else {
+                    e
+                }
             };
 
-            let event_tz_opt = if event_tz.is_empty() { None } else { Some(event_tz) };
+            let event_tz_opt = if event_tz.is_empty() {
+                None
+            } else {
+                Some(event_tz)
+            };
 
             // Recurrence rules: JSCalendar uses an array of recurrence rule objects
             let recurrence_rule = ev["recurrenceRules"]
@@ -949,15 +1113,22 @@ impl JmapConnection {
             if let Some(participants) = ev["participants"].as_object() {
                 for (_pid, p) in participants {
                     // Try calendarAddress (JSCalendar-bis), then sendTo.imip (old), then email
-                    let email = p["calendarAddress"].as_str()
+                    let email = p["calendarAddress"]
+                        .as_str()
                         .map(|s| s.trim_start_matches("mailto:").to_string())
-                        .or_else(|| p["sendTo"].as_object()
-                            .and_then(|s| s.get("imip"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.trim_start_matches("mailto:").to_string()))
+                        .or_else(|| {
+                            p["sendTo"]
+                                .as_object()
+                                .and_then(|s| s.get("imip"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim_start_matches("mailto:").to_string())
+                        })
                         .or_else(|| p["email"].as_str().map(|s| s.to_string()));
                     let name = p["name"].as_str().map(|s| s.to_string());
-                    let mut status = p["participationStatus"].as_str().unwrap_or("needs-action").to_string();
+                    let mut status = p["participationStatus"]
+                        .as_str()
+                        .unwrap_or("needs-action")
+                        .to_string();
                     let roles = p["roles"].as_object();
                     let is_owner = roles.map(|r| r.contains_key("owner")).unwrap_or(false);
 
@@ -977,11 +1148,20 @@ impl JmapConnection {
                     }
                 }
             }
-            let attendees_json = if attendees.is_empty() { None } else {
+            let attendees_json = if attendees.is_empty() {
+                None
+            } else {
                 Some(serde_json::to_string(&attendees).unwrap_or_default())
             };
 
-            log::debug!("  event: {} ({}) start={} end={} attendees={}", title, id, start, end, attendees.len());
+            log::debug!(
+                "  event: {} ({}) start={} end={} attendees={}",
+                title,
+                id,
+                start,
+                end,
+                attendees.len()
+            );
             events.push(JmapCalendarEvent {
                 id,
                 calendar_id: cal_id,
@@ -1001,7 +1181,10 @@ impl JmapConnection {
 
         // Client-side filter by calendar if requested
         let filtered = if let Some(cal_id) = calendar_id {
-            events.into_iter().filter(|e| e.calendar_id == cal_id).collect()
+            events
+                .into_iter()
+                .filter(|e| e.calendar_id == cal_id)
+                .collect()
         } else {
             events
         };
@@ -1017,12 +1200,17 @@ impl JmapConnection {
         config: &JmapConfig,
         event: &JmapCalendarEvent,
     ) -> Result<String> {
-        log::info!("JMAP creating calendar event: '{}' organizer={:?} attendees={:?}",
-            event.title, event.organizer_email, event.attendees_json);
+        log::info!(
+            "JMAP creating calendar event: '{}' organizer={:?} attendees={:?}",
+            event.title,
+            event.organizer_email,
+            event.attendees_json
+        );
 
-        let uid = event.uid.clone().unwrap_or_else(|| {
-            format!("{}@chithi", uuid::Uuid::new_v4())
-        });
+        let uid = event
+            .uid
+            .clone()
+            .unwrap_or_else(|| format!("{}@chithi", uuid::Uuid::new_v4()));
 
         let duration = compute_duration(&event.start, &event.end);
 
@@ -1057,13 +1245,16 @@ impl JmapConnection {
         let mut participants = serde_json::Map::new();
         if let Some(ref org_email) = event.organizer_email {
             if !org_email.is_empty() {
-                participants.insert("organizer".to_string(), serde_json::json!({
-                    "@type": "Participant",
-                    "calendarAddress": format!("mailto:{}", org_email),
-                    "roles": {"owner": true, "attendee": true},
-                    "participationStatus": "accepted",
-                    "expectReply": false,
-                }));
+                participants.insert(
+                    "organizer".to_string(),
+                    serde_json::json!({
+                        "@type": "Participant",
+                        "calendarAddress": format!("mailto:{}", org_email),
+                        "roles": {"owner": true, "attendee": true},
+                        "participationStatus": "accepted",
+                        "expectReply": false,
+                    }),
+                );
             }
         }
         if let Some(ref att_json) = event.attendees_json {
@@ -1072,13 +1263,16 @@ impl JmapConnection {
                     let email = att["email"].as_str().unwrap_or_default();
                     if !email.is_empty() {
                         let status = att["status"].as_str().unwrap_or("needs-action");
-                        participants.insert(format!("att{}", i), serde_json::json!({
-                            "@type": "Participant",
-                            "calendarAddress": format!("mailto:{}", email),
-                            "roles": {"attendee": true},
-                            "participationStatus": status,
-                            "expectReply": true,
-                        }));
+                        participants.insert(
+                            format!("att{}", i),
+                            serde_json::json!({
+                                "@type": "Participant",
+                                "calendarAddress": format!("mailto:{}", email),
+                                "roles": {"attendee": true},
+                                "participationStatus": status,
+                                "expectReply": true,
+                            }),
+                        );
                     }
                 }
             }
@@ -1106,8 +1300,14 @@ impl JmapConnection {
 
         // Check for creation errors
         if let Some(err) = resp["methodResponses"][0][1]["notCreated"]["new1"].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP create calendar event failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP create calendar event failed: {}",
+                desc
+            )));
         }
 
         let created_id = resp["methodResponses"][0][1]["created"]["new1"]["id"]
@@ -1170,8 +1370,14 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][event_id].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP update calendar event failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP update calendar event failed: {}",
+                desc
+            )));
         }
 
         log::info!("JMAP updated calendar event id={}", event_id);
@@ -1187,7 +1393,12 @@ impl JmapConnection {
         participant_key: &str,
         status: &str,
     ) -> Result<()> {
-        log::info!("JMAP updating participant {} status to {} on event {}", participant_key, status, event_id);
+        log::info!(
+            "JMAP updating participant {} status to {} on event {}",
+            participant_key,
+            status,
+            event_id
+        );
 
         let patch_key = format!("participants/{}/participationStatus", participant_key);
         let mut patch = serde_json::Map::new();
@@ -1209,8 +1420,14 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][event_id].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP update participant failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP update participant failed: {}",
+                desc
+            )));
         }
 
         log::info!("JMAP updated participant status on event {}", event_id);
@@ -1218,11 +1435,7 @@ impl JmapConnection {
     }
 
     /// Delete a calendar event on the server via CalendarEvent/set.
-    pub async fn delete_calendar_event(
-        &self,
-        config: &JmapConfig,
-        event_id: &str,
-    ) -> Result<()> {
+    pub async fn delete_calendar_event(&self, config: &JmapConfig, event_id: &str) -> Result<()> {
         log::info!("JMAP deleting calendar event: id={}", event_id);
 
         let request = serde_json::json!({
@@ -1241,8 +1454,14 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notDestroyed"][event_id].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP delete calendar event failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP delete calendar event failed: {}",
+                desc
+            )));
         }
 
         log::info!("JMAP deleted calendar event id={}", event_id);
@@ -1250,7 +1469,11 @@ impl JmapConnection {
     }
 
     /// Find a mailbox by its JMAP role (inbox, sent, drafts, trash, junk).
-    async fn find_mailbox_by_role(&self, config: &JmapConfig, role: &str) -> Result<Option<String>> {
+    async fn find_mailbox_by_role(
+        &self,
+        config: &JmapConfig,
+        role: &str,
+    ) -> Result<Option<String>> {
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             "methodCalls": [
@@ -1271,7 +1494,12 @@ impl JmapConnection {
         Ok(None)
     }
     /// Create a new mailbox on the JMAP server.
-    pub async fn create_mailbox(&self, config: &JmapConfig, name: &str, parent_id: Option<&str>) -> Result<String> {
+    pub async fn create_mailbox(
+        &self,
+        config: &JmapConfig,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
         log::info!("JMAP creating mailbox: {} (parent={:?})", name, parent_id);
         let create_id = "new-folder";
         let mut mailbox = serde_json::json!({ "name": name });
@@ -1298,14 +1526,26 @@ impl JmapConnection {
             let err = resp["methodResponses"][0][1]["notCreated"][create_id]["description"]
                 .as_str()
                 .unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP Mailbox/set create failed: {}", err)));
+            return Err(Error::Other(format!(
+                "JMAP Mailbox/set create failed: {}",
+                err
+            )));
         }
         log::info!("JMAP mailbox created: id={}", created_id);
         Ok(created_id)
     }
 
-    pub async fn destroy_mailbox(&self, config: &JmapConfig, mailbox_id: &str, remove_messages: bool) -> Result<()> {
-        log::info!("JMAP destroying mailbox: {} (remove_messages={})", mailbox_id, remove_messages);
+    pub async fn destroy_mailbox(
+        &self,
+        config: &JmapConfig,
+        mailbox_id: &str,
+        remove_messages: bool,
+    ) -> Result<()> {
+        log::info!(
+            "JMAP destroying mailbox: {} (remove_messages={})",
+            mailbox_id,
+            remove_messages
+        );
         let request = serde_json::json!({
             "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             "methodCalls": [
@@ -1317,7 +1557,9 @@ impl JmapConnection {
             ]
         });
         let resp = self.api_request(&request, config).await?;
-        let method_name = resp["methodResponses"][0][0].as_str().unwrap_or("<unknown>");
+        let method_name = resp["methodResponses"][0][0]
+            .as_str()
+            .unwrap_or("<unknown>");
         if method_name != "Mailbox/set" {
             log::error!("Unexpected JMAP response to mailbox destroy: {}", resp);
             return Err(Error::Other(format!(
@@ -1335,7 +1577,10 @@ impl JmapConnection {
                 .as_str()
                 .unwrap_or("Unknown error");
             log::error!("JMAP mailbox destroy failed for {}: {}", mailbox_id, err);
-            return Err(Error::Other(format!("JMAP Mailbox/set destroy failed: {}", err)));
+            return Err(Error::Other(format!(
+                "JMAP Mailbox/set destroy failed: {}",
+                err
+            )));
         }
         log::info!("JMAP mailbox destroyed: {}", mailbox_id);
         Ok(())
@@ -1365,7 +1610,11 @@ impl JmapConnection {
                 let id = ab["id"].as_str().unwrap_or_default().to_string();
                 let name = ab["name"].as_str().unwrap_or("Contacts").to_string();
                 let is_default = ab["isDefault"].as_bool().unwrap_or(false);
-                books.push(JmapAddressBook { id, name, is_default });
+                books.push(JmapAddressBook {
+                    id,
+                    name,
+                    is_default,
+                });
             }
         }
 
@@ -1374,7 +1623,11 @@ impl JmapConnection {
     }
 
     /// Fetch contacts from a JMAP address book.
-    pub async fn fetch_contacts(&self, config: &JmapConfig, address_book_id: Option<&str>) -> Result<Vec<JmapContact>> {
+    pub async fn fetch_contacts(
+        &self,
+        config: &JmapConfig,
+        address_book_id: Option<&str>,
+    ) -> Result<Vec<JmapContact>> {
         log::debug!("JMAP fetching contacts (addressBook={:?})", address_book_id);
 
         let request = serde_json::json!({
@@ -1387,7 +1640,10 @@ impl JmapConnection {
         });
 
         let resp = self.api_request(&request, config).await?;
-        log::debug!("JMAP ContactCard response: {}", serde_json::to_string(&resp).unwrap_or_default());
+        log::debug!(
+            "JMAP ContactCard response: {}",
+            serde_json::to_string(&resp).unwrap_or_default()
+        );
 
         let mut contacts = Vec::new();
 
@@ -1405,7 +1661,9 @@ impl JmapConnection {
                         full.to_string()
                     }
                     // Try "components" array (Stalwart JSContact format)
-                    else if let Some(components) = name_obj.get("components").and_then(|c| c.as_array()) {
+                    else if let Some(components) =
+                        name_obj.get("components").and_then(|c| c.as_array())
+                    {
                         let mut given = String::new();
                         let mut middle = String::new();
                         let mut surname = String::new();
@@ -1423,14 +1681,25 @@ impl JmapConnection {
                             .into_iter()
                             .filter(|s| !s.is_empty())
                             .collect();
-                        if parts.is_empty() { "(No name)".to_string() } else { parts.join(" ") }
+                        if parts.is_empty() {
+                            "(No name)".to_string()
+                        } else {
+                            parts.join(" ")
+                        }
                     }
                     // Try direct given/surname
                     else {
                         let given = name_obj.get("given").and_then(|g| g.as_str()).unwrap_or("");
-                        let surname = name_obj.get("surname").and_then(|s| s.as_str()).unwrap_or("");
+                        let surname = name_obj
+                            .get("surname")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
                         let name = format!("{} {}", given, surname).trim().to_string();
-                        if name.is_empty() { "(No name)".to_string() } else { name }
+                        if name.is_empty() {
+                            "(No name)".to_string()
+                        } else {
+                            name
+                        }
                     }
                 } else {
                     "(No name)".to_string()
@@ -1442,8 +1711,14 @@ impl JmapConnection {
                     for (_key, em) in emails_obj {
                         let addr = em["address"].as_str().unwrap_or_default().to_string();
                         // Try label, then contexts keys, then default to "work"
-                        let label = em["label"].as_str().map(|s| s.to_string())
-                            .or_else(|| em["contexts"].as_object().and_then(|c| c.keys().next().cloned()))
+                        let label = em["label"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                em["contexts"]
+                                    .as_object()
+                                    .and_then(|c| c.keys().next().cloned())
+                            })
                             .unwrap_or_else(|| "work".to_string());
                         if !addr.is_empty() {
                             emails.push(serde_json::json!({"email": addr, "label": label}));
@@ -1464,23 +1739,27 @@ impl JmapConnection {
                 }
 
                 // Parse organization
-                let organization = card["organizations"].as_object()
+                let organization = card["organizations"]
+                    .as_object()
                     .and_then(|orgs| orgs.values().next())
                     .and_then(|org| org["name"].as_str())
                     .map(|s| s.to_string());
 
-                let title = card["titles"].as_object()
+                let title = card["titles"]
+                    .as_object()
                     .and_then(|titles| titles.values().next())
                     .and_then(|t| t["name"].as_str())
                     .map(|s| s.to_string());
 
-                let notes = card["notes"].as_object()
+                let notes = card["notes"]
+                    .as_object()
                     .and_then(|n| n.values().next())
                     .and_then(|note| note["note"].as_str())
                     .map(|s| s.to_string());
 
                 // Determine which address book this belongs to
-                let ab_id = card["addressBookIds"].as_object()
+                let ab_id = card["addressBookIds"]
+                    .as_object()
                     .and_then(|abs| abs.keys().next())
                     .map(|s| s.to_string());
 
@@ -1497,8 +1776,10 @@ impl JmapConnection {
                     id,
                     uid,
                     display_name,
-                    emails_json: serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string()),
-                    phones_json: serde_json::to_string(&phones).unwrap_or_else(|_| "[]".to_string()),
+                    emails_json: serde_json::to_string(&emails)
+                        .unwrap_or_else(|_| "[]".to_string()),
+                    phones_json: serde_json::to_string(&phones)
+                        .unwrap_or_else(|_| "[]".to_string()),
                     organization,
                     title,
                     notes,
@@ -1531,11 +1812,12 @@ impl JmapConnection {
             components.push(serde_json::json!({"kind": "given", "value": first}));
         }
         if name_parts.len() > 2 {
-            let middle = name_parts[1..name_parts.len()-1].join(" ");
+            let middle = name_parts[1..name_parts.len() - 1].join(" ");
             components.push(serde_json::json!({"kind": "given2", "value": middle}));
         }
         if name_parts.len() >= 2 {
-            components.push(serde_json::json!({"kind": "surname", "value": name_parts.last().unwrap()}));
+            components
+                .push(serde_json::json!({"kind": "surname", "value": name_parts.last().unwrap()}));
         }
 
         let mut card = serde_json::json!({
@@ -1612,8 +1894,14 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notCreated"]["new1"].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP create contact failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP create contact failed: {}",
+                desc
+            )));
         }
 
         let remote_id = resp["methodResponses"][0][1]["created"]["new1"]["id"]
@@ -1646,11 +1934,12 @@ impl JmapConnection {
             components.push(serde_json::json!({"kind": "given", "value": first}));
         }
         if name_parts.len() > 2 {
-            let middle = name_parts[1..name_parts.len()-1].join(" ");
+            let middle = name_parts[1..name_parts.len() - 1].join(" ");
             components.push(serde_json::json!({"kind": "given2", "value": middle}));
         }
         if name_parts.len() >= 2 {
-            components.push(serde_json::json!({"kind": "surname", "value": name_parts.last().unwrap()}));
+            components
+                .push(serde_json::json!({"kind": "surname", "value": name_parts.last().unwrap()}));
         }
 
         let mut updates = serde_json::json!({
@@ -1715,8 +2004,14 @@ impl JmapConnection {
         let resp = self.api_request(&request, config).await?;
 
         if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][remote_id].as_object() {
-            let desc = err.get("description").and_then(|d| d.as_str()).unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP update contact failed: {}", desc)));
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP update contact failed: {}",
+                desc
+            )));
         }
 
         log::info!("JMAP updated contact '{}'", remote_id);
@@ -1724,11 +2019,7 @@ impl JmapConnection {
     }
 
     /// Delete a contact on the JMAP server via ContactCard/set destroy.
-    pub async fn delete_contact_card(
-        &self,
-        config: &JmapConfig,
-        remote_id: &str,
-    ) -> Result<()> {
+    pub async fn delete_contact_card(&self, config: &JmapConfig, remote_id: &str) -> Result<()> {
         log::info!("JMAP deleting contact: {}", remote_id);
 
         let request = serde_json::json!({
@@ -1805,7 +2096,7 @@ struct AddrJson {
 /// Handles simple cases like PT1H, PT30M, P1D, PT1H30M, etc.
 /// Falls back to start + 1 hour if parsing fails.
 fn compute_end_from_duration(start: &str, duration: &str) -> String {
-    use chrono::{NaiveDateTime, NaiveDate, Duration};
+    use chrono::{Duration, NaiveDate, NaiveDateTime};
 
     let total_seconds = parse_iso8601_duration_seconds(duration);
 
@@ -1881,44 +2172,54 @@ fn parse_iso8601_duration_seconds(dur: &str) -> i64 {
 
     for ch in dur.chars() {
         match ch {
-            'P' => {},
-            'T' => { in_time = true; },
-            '0'..='9' => { num_buf.push(ch); },
+            'P' => {}
+            'T' => {
+                in_time = true;
+            }
+            '0'..='9' => {
+                num_buf.push(ch);
+            }
             'D' => {
                 if let Ok(n) = num_buf.parse::<i64>() {
                     total += n * 86400;
                 }
                 num_buf.clear();
-            },
+            }
             'H' if in_time => {
                 if let Ok(n) = num_buf.parse::<i64>() {
                     total += n * 3600;
                 }
                 num_buf.clear();
-            },
+            }
             'M' if in_time => {
                 if let Ok(n) = num_buf.parse::<i64>() {
                     total += n * 60;
                 }
                 num_buf.clear();
-            },
+            }
             'S' if in_time => {
                 if let Ok(n) = num_buf.parse::<i64>() {
                     total += n;
                 }
                 num_buf.clear();
-            },
+            }
             'W' => {
                 if let Ok(n) = num_buf.parse::<i64>() {
                     total += n * 604800;
                 }
                 num_buf.clear();
-            },
-            _ => { num_buf.clear(); },
+            }
+            _ => {
+                num_buf.clear();
+            }
         }
     }
 
-    if total == 0 { 3600 } else { total } // default 1 hour
+    if total == 0 {
+        3600
+    } else {
+        total
+    } // default 1 hour
 }
 
 fn addresses_to_json(addrs: Option<&Vec<serde_json::Value>>) -> String {

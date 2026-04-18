@@ -166,7 +166,11 @@ impl CalDavClient {
 
         log::info!("caldav: connected to {}", base_url);
 
-        Ok(Self { http, base_url, auth })
+        Ok(Self {
+            http,
+            base_url,
+            auth,
+        })
     }
 
     /// Create a CalDAV client with OAuth2 bearer token authentication.
@@ -175,7 +179,9 @@ impl CalDavClient {
 
         let http = crate::mail::dav_http::build_client()?;
 
-        let auth = DavAuth::Bearer { token: token.to_string() };
+        let auth = DavAuth::Bearer {
+            token: token.to_string(),
+        };
 
         log::info!("caldav: connected with OAuth to {}", caldav_url);
 
@@ -202,11 +208,7 @@ impl CalDavClient {
     }
 
     /// Auto-discover CalDAV URL by trying `.well-known/caldav` on the email domain.
-    async fn auto_discover(
-        http: &reqwest::Client,
-        auth: &DavAuth,
-        email: &str,
-    ) -> Result<String> {
+    async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> Result<String> {
         let domain = email
             .rsplit('@')
             .next()
@@ -224,11 +226,11 @@ impl CalDavClient {
                 http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url),
                 auth,
             )
-                .header("Depth", "0")
-                .header("Content-Type", "application/xml; charset=utf-8")
-                .body(PROPFIND_CURRENT_USER_PRINCIPAL)
-                .send()
-                .await
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(PROPFIND_CURRENT_USER_PRINCIPAL)
+            .send()
+            .await
             {
                 Ok(resp) => {
                     let status = resp.status();
@@ -275,10 +277,9 @@ impl CalDavClient {
             .propfind(&self.base_url, "0", PROPFIND_CURRENT_USER_PRINCIPAL)
             .await?;
 
-        let principal = parse_href_from_xml(&resp, "current-user-principal")
-            .ok_or_else(|| {
-                Error::Other("CalDAV: could not find current-user-principal in response".to_string())
-            })?;
+        let principal = parse_href_from_xml(&resp, "current-user-principal").ok_or_else(|| {
+            Error::Other("CalDAV: could not find current-user-principal in response".to_string())
+        })?;
 
         let principal_url = self.resolve_url(&principal)?;
         log::info!("caldav: principal URL: {}", principal_url);
@@ -292,12 +293,9 @@ impl CalDavClient {
             .propfind(principal_url, "0", PROPFIND_CALENDAR_HOME_SET)
             .await?;
 
-        let home = parse_href_from_xml(&resp, "calendar-home-set")
-            .ok_or_else(|| {
-                Error::Other(
-                    "CalDAV: could not find calendar-home-set in response".to_string(),
-                )
-            })?;
+        let home = parse_href_from_xml(&resp, "calendar-home-set").ok_or_else(|| {
+            Error::Other("CalDAV: could not find calendar-home-set in response".to_string())
+        })?;
 
         let home_url = self.resolve_url(&home)?;
         log::info!("caldav: calendar home URL: {}", home_url);
@@ -339,9 +337,11 @@ impl CalDavClient {
         let url = self.resolve_url(calendar_href)?;
         log::debug!("caldav: fetching events from {}", url);
 
-        let resp = self.apply_auth(
-            self.http
-                .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), &url))
+        let resp = self
+            .apply_auth(
+                self.http
+                    .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), &url),
+            )
             .header("Depth", "1")
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(REPORT_CALENDAR_QUERY)
@@ -380,14 +380,11 @@ impl CalDavClient {
         ical_data: &str,
     ) -> Result<String> {
         let calendar_url = self.resolve_url(calendar_href)?;
-        let event_url = format!(
-            "{}/{}.ics",
-            calendar_url.trim_end_matches('/'),
-            uid
-        );
+        let event_url = format!("{}/{}.ics", calendar_url.trim_end_matches('/'), uid);
         log::info!("caldav: PUT event to {}", event_url);
 
-        let resp = self.apply_auth(self.http.put(&event_url))
+        let resp = self
+            .apply_auth(self.http.put(&event_url))
             .header("Content-Type", "text/calendar; charset=utf-8")
             .body(ical_data.to_string())
             .send()
@@ -424,7 +421,8 @@ impl CalDavClient {
         let url = self.resolve_url(event_href)?;
         log::info!("caldav: DELETE event at {}", url);
 
-        let resp = self.apply_auth(self.http.delete(&url))
+        let resp = self
+            .apply_auth(self.http.delete(&url))
             .send()
             .await
             .map_err(|e| Error::Other(format!("CalDAV DELETE failed: {}", e)))?;
@@ -452,8 +450,11 @@ impl CalDavClient {
 
     /// Send a PROPFIND request and return the response body.
     async fn propfind(&self, url: &str, depth: &str, body: &str) -> Result<String> {
-        let resp = self.apply_auth(
-            self.http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url))
+        let resp = self
+            .apply_auth(
+                self.http
+                    .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url),
+            )
             .header("Depth", depth)
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(body.to_string())
@@ -497,10 +498,7 @@ impl CalDavClient {
         } else if let Ok(base) = url::Url::parse(&self.base_url) {
             let scheme = base.scheme();
             let host = base.host_str().unwrap_or("");
-            let port_str = base
-                .port()
-                .map(|p| format!(":{}", p))
-                .unwrap_or_default();
+            let port_str = base.port().map(|p| format!(":{}", p)).unwrap_or_default();
             format!("{}://{}{}{}", scheme, host, port_str, href)
         } else {
             // Fallback: just concatenate
@@ -639,13 +637,15 @@ fn parse_calendars_from_xml(xml: &str) -> Vec<CalDavCalendar> {
         }
 
         let resourcetypes = find_elements(&doc, *response, "resourcetype");
-        let is_calendar = resourcetypes.iter().any(|rt| has_descendant(&doc, *rt, "calendar"));
+        let is_calendar = resourcetypes
+            .iter()
+            .any(|rt| has_descendant(&doc, *rt, "calendar"));
         if !is_calendar {
             continue;
         }
 
-        let name = find_text_in(&doc, *response, "displayname")
-            .unwrap_or_else(|| "Calendar".to_string());
+        let name =
+            find_text_in(&doc, *response, "displayname").unwrap_or_else(|| "Calendar".to_string());
 
         let color = find_text_in(&doc, *response, "calendar-color").map(|c| {
             let c = c.trim().to_string();
@@ -687,7 +687,12 @@ fn parse_events_from_xml(xml: &str) -> Vec<CalDavEvent> {
         }
 
         let uid = extract_uid_from_ical(&ical_data).unwrap_or_else(|| href.clone());
-        events.push(CalDavEvent { href, etag, uid, ical_data });
+        events.push(CalDavEvent {
+            href,
+            etag,
+            uid,
+            ical_data,
+        });
     }
 
     events
@@ -786,13 +791,19 @@ pub fn utc_to_local(utc_datetime: &str, tzid: &str) -> String {
     let dt = utc_datetime.trim();
     if let Ok(tz) = tzid.parse::<chrono_tz::Tz>() {
         if let Ok(utc) = chrono::DateTime::parse_from_rfc3339(dt) {
-            return utc.with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S").to_string();
+            return utc
+                .with_timezone(&tz)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
         }
         let bare = dt.trim_end_matches('Z');
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(bare, "%Y-%m-%dT%H:%M:%S") {
             use chrono::TimeZone;
             let utc = chrono::Utc.from_utc_datetime(&naive);
-            return utc.with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S").to_string();
+            return utc
+                .with_timezone(&tz)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
         }
     }
     dt.trim_end_matches('Z').to_string()

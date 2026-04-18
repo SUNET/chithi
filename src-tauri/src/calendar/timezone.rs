@@ -48,9 +48,7 @@ pub fn to_utc(datetime: &str, tzid: &str) -> String {
     // Naive datetime + IANA timezone → convert via chrono-tz
     if !tzid.is_empty() {
         if let Ok(tz) = tzid.parse::<chrono_tz::Tz>() {
-            if let Ok(naive) =
-                chrono::NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S")
-            {
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S") {
                 use chrono::TimeZone;
                 match tz.from_local_datetime(&naive) {
                     chrono::LocalResult::Single(local) => {
@@ -73,7 +71,9 @@ pub fn to_utc(datetime: &str, tzid: &str) -> String {
                         );
                         for mins in 1..=120 {
                             let shifted = naive + chrono::Duration::minutes(mins);
-                            if let chrono::LocalResult::Single(local) = tz.from_local_datetime(&shifted) {
+                            if let chrono::LocalResult::Single(local) =
+                                tz.from_local_datetime(&shifted)
+                            {
                                 return local
                                     .with_timezone(&chrono::Utc)
                                     .format("%Y-%m-%dT%H:%M:%SZ")
@@ -103,29 +103,44 @@ mod tests {
 
     #[test]
     fn test_already_utc_ignores_tzid() {
-        assert_eq!(to_utc("2026-04-14T12:00:00Z", "America/New_York"), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T12:00:00Z", "America/New_York"),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
     fn test_with_positive_offset() {
-        assert_eq!(to_utc("2026-04-14T14:00:00+02:00", ""), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T14:00:00+02:00", ""),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
     fn test_with_negative_offset() {
-        assert_eq!(to_utc("2026-04-14T08:00:00-04:00", ""), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T08:00:00-04:00", ""),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
     fn test_naive_with_tzid_stockholm() {
         // Stockholm is UTC+2 in April (CEST)
-        assert_eq!(to_utc("2026-04-14T14:00:00", "Europe/Stockholm"), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T14:00:00", "Europe/Stockholm"),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
     fn test_offset_datetime_tzid_ignored() {
         // Offset already present → parsed directly, tzid ignored
-        assert_eq!(to_utc("2026-04-14T08:00:00-04:00", "America/New_York"), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T08:00:00-04:00", "America/New_York"),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
@@ -135,7 +150,10 @@ mod tests {
 
     #[test]
     fn test_invalid_tzid_treated_as_utc() {
-        assert_eq!(to_utc("2026-04-14T14:00:00", "Not/A/Timezone"), "2026-04-14T14:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T14:00:00", "Not/A/Timezone"),
+            "2026-04-14T14:00:00Z"
+        );
     }
 
     #[test]
@@ -145,12 +163,18 @@ mod tests {
 
     #[test]
     fn test_with_fractional_seconds() {
-        assert_eq!(to_utc("2026-04-14T12:00:00.000Z", ""), "2026-04-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-04-14T12:00:00.000Z", ""),
+            "2026-04-14T12:00:00Z"
+        );
     }
 
     #[test]
     fn test_winter_time_stockholm() {
         // Stockholm is UTC+1 in January (CET)
-        assert_eq!(to_utc("2026-01-14T13:00:00", "Europe/Stockholm"), "2026-01-14T12:00:00Z");
+        assert_eq!(
+            to_utc("2026-01-14T13:00:00", "Europe/Stockholm"),
+            "2026-01-14T12:00:00Z"
+        );
     }
 }

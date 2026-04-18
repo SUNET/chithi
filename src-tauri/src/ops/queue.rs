@@ -5,13 +5,9 @@ use std::collections::HashMap;
 pub enum MailOp {
     // --- Sync (lower priority) ---
     /// Full account sync. The worker delegates to the existing sync engine.
-    SyncAll {
-        current_folder: Option<String>,
-    },
+    SyncAll { current_folder: Option<String> },
     /// Sync a single folder.
-    SyncFolder {
-        folder_path: String,
-    },
+    SyncFolder { folder_path: String },
 
     // --- User operations (higher priority) ---
     /// Move messages by IMAP UID, grouped by source folder.

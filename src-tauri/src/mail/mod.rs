@@ -7,7 +7,7 @@ pub mod imap;
 pub mod jmap;
 pub mod jmap_push;
 pub mod jmap_sync;
+pub mod parser;
 pub mod smtp;
 pub mod sync;
-pub mod parser;
 pub mod url_validation;

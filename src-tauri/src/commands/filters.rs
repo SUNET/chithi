@@ -24,11 +24,7 @@ pub async fn list_filters(
 /// Save (upsert) a filter rule. Inserts if the id is new, updates if it exists.
 #[tauri::command]
 pub async fn save_filter(state: State<'_, AppState>, rule: FilterRule) -> Result<()> {
-    log::info!(
-        "Save filter command: id={} name='{}'",
-        rule.id,
-        rule.name
-    );
+    log::info!("Save filter command: id={} name='{}'", rule.id, rule.name);
     let conn = state.db.writer().await;
 
     // Check if the rule already exists
@@ -97,11 +93,15 @@ pub async fn apply_filters_to_folder(
     let (imap_password, imap_xoauth2) = if account.provider == "o365" {
         let tokens = crate::oauth::load_tokens(&account_id)?
             .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens.refresh_token
+        let refresh = tokens
+            .refresh_token
             .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
         let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT, &refresh, crate::oauth::MICROSOFT_IMAP_SCOPES,
-        ).await?;
+            &crate::oauth::MICROSOFT,
+            &refresh,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        )
+        .await?;
         crate::oauth::store_tokens(&account_id, &new)?;
         (new.access_token, true)
     } else {
@@ -334,13 +334,23 @@ fn load_folder_messages(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut messages = Vec::with_capacity(rows.len());
-    for (id, uid, folder, from_name, from_email, to_json, cc_json, subject, size, has_attach, flags_json) in rows {
-        let to_addresses: Vec<AddressEntry> =
-            serde_json::from_str(&to_json).unwrap_or_default();
-        let cc_addresses: Vec<AddressEntry> =
-            serde_json::from_str(&cc_json).unwrap_or_default();
-        let flags: Vec<String> =
-            serde_json::from_str(&flags_json).unwrap_or_default();
+    for (
+        id,
+        uid,
+        folder,
+        from_name,
+        from_email,
+        to_json,
+        cc_json,
+        subject,
+        size,
+        has_attach,
+        flags_json,
+    ) in rows
+    {
+        let to_addresses: Vec<AddressEntry> = serde_json::from_str(&to_json).unwrap_or_default();
+        let cc_addresses: Vec<AddressEntry> = serde_json::from_str(&cc_json).unwrap_or_default();
+        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
 
         messages.push(MessageData {
             id,

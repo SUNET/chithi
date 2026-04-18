@@ -172,15 +172,23 @@ fn build_filter_clauses(filter: &QuickFilter, account_id: &str, use_fts: bool) -
 
         if use_fts {
             // FTS5 for fast full-text matching
-            let escaped = text
-                .replace('"', "\"\"")
-                .replace('\'', "''");
+            let escaped = text.replace('"', "\"\"").replace('\'', "''");
 
             let mut fts_columns = Vec::new();
-            if search_sender { fts_columns.push("from_name"); fts_columns.push("from_email"); }
-            if search_recipients { fts_columns.push("to_addresses"); fts_columns.push("cc_addresses"); }
-            if search_subject { fts_columns.push("subject"); }
-            if search_body { fts_columns.push("snippet"); }
+            if search_sender {
+                fts_columns.push("from_name");
+                fts_columns.push("from_email");
+            }
+            if search_recipients {
+                fts_columns.push("to_addresses");
+                fts_columns.push("cc_addresses");
+            }
+            if search_subject {
+                fts_columns.push("subject");
+            }
+            if search_body {
+                fts_columns.push("snippet");
+            }
 
             if !fts_columns.is_empty() {
                 let col_filter = format!("{{{}}}", fts_columns.join(" "));
@@ -203,8 +211,14 @@ fn build_filter_clauses(filter: &QuickFilter, account_id: &str, use_fts: bool) -
                 like_clauses.push(format!("from_email LIKE '%{}%' ESCAPE '\\'", like_escaped));
             }
             if search_recipients {
-                like_clauses.push(format!("to_addresses LIKE '%{}%' ESCAPE '\\'", like_escaped));
-                like_clauses.push(format!("cc_addresses LIKE '%{}%' ESCAPE '\\'", like_escaped));
+                like_clauses.push(format!(
+                    "to_addresses LIKE '%{}%' ESCAPE '\\'",
+                    like_escaped
+                ));
+                like_clauses.push(format!(
+                    "cc_addresses LIKE '%{}%' ESCAPE '\\'",
+                    like_escaped
+                ));
             }
             if search_subject {
                 like_clauses.push(format!("subject LIKE '%{}%' ESCAPE '\\'", like_escaped));
@@ -236,11 +250,31 @@ pub fn get_messages(
 ) -> Result<MessagePage> {
     // Try FTS5 first; on failure (bad query syntax), fall back to LIKE
     let has_text = !filter.text.trim().is_empty();
-    match get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
+    match get_messages_inner(
+        conn,
+        account_id,
+        folder_path,
+        page,
+        per_page,
+        sort_column,
+        sort_asc,
+        filter,
+        true,
+    ) {
         Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 query failed, retrying with LIKE fallback: {}", e);
-            get_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
+            get_messages_inner(
+                conn,
+                account_id,
+                folder_path,
+                page,
+                per_page,
+                sort_column,
+                sort_asc,
+                filter,
+                false,
+            )
         }
         Err(e) => Err(e),
     }
@@ -292,8 +326,7 @@ fn get_messages_inner(
     let messages = stmt
         .query_map(params![account_id, folder_path, per_page, offset], |row| {
             let flags_json: String = row.get(5)?;
-            let flags: Vec<String> =
-                serde_json::from_str(&flags_json).unwrap_or_default();
+            let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
             Ok(MessageSummary {
                 id: row.get(0)?,
                 subject: row.get(1)?,
@@ -347,7 +380,12 @@ pub fn get_message_metadata(
     })
 }
 
-pub fn message_exists(conn: &Connection, account_id: &str, folder_path: &str, uid: u32) -> Result<bool> {
+pub fn message_exists(
+    conn: &Connection,
+    account_id: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
         params![account_id, folder_path, uid],
@@ -533,7 +571,10 @@ pub fn sync_flags_by_uid(
     )?;
     let local: std::collections::HashMap<u32, (String, String)> = stmt
         .query_map(params![account_id, folder_path], |row| {
-            Ok((row.get::<_, u32>(0)?, (row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            Ok((
+                row.get::<_, u32>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -640,7 +681,8 @@ pub fn compute_thread_id(
     if let Some(subj) = subject {
         let trimmed = subj.trim();
         let lower = trimmed.to_lowercase();
-        let is_reply = lower.starts_with("re:") || lower.starts_with("fwd:") || lower.starts_with("fw:");
+        let is_reply =
+            lower.starts_with("re:") || lower.starts_with("fwd:") || lower.starts_with("fw:");
         if is_reply {
             let normalized = normalize_subject(trimmed);
             if !normalized.is_empty() {
@@ -736,11 +778,31 @@ pub fn get_threaded_messages(
     filter: &QuickFilter,
 ) -> Result<ThreadedPage> {
     let has_text = !filter.text.trim().is_empty();
-    match get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, true) {
+    match get_threaded_messages_inner(
+        conn,
+        account_id,
+        folder_path,
+        page,
+        per_page,
+        sort_column,
+        sort_asc,
+        filter,
+        true,
+    ) {
         Ok(page) => Ok(page),
         Err(e) if has_text => {
             log::warn!("FTS5 threaded query failed, retrying with LIKE: {}", e);
-            get_threaded_messages_inner(conn, account_id, folder_path, page, per_page, sort_column, sort_asc, filter, false)
+            get_threaded_messages_inner(
+                conn,
+                account_id,
+                folder_path,
+                page,
+                per_page,
+                sort_column,
+                sort_asc,
+                filter,
+                false,
+            )
         }
         Err(e) => Err(e),
     }
@@ -835,10 +897,7 @@ fn get_threaded_messages_inner(
                 .and_then(|f| serde_json::from_str(f).ok())
                 .unwrap_or_default();
 
-            let message_ids: Vec<String> = all_ids_str
-                .split("||")
-                .map(|s| s.to_string())
-                .collect();
+            let message_ids: Vec<String> = all_ids_str.split("||").map(|s| s.to_string()).collect();
 
             Ok(ThreadSummary {
                 thread_id: tid,
@@ -897,8 +956,7 @@ pub fn get_thread_messages(
     let messages = stmt
         .query_map(params![account_id, folder_path, thread_id], |row| {
             let flags_json: String = row.get(5)?;
-            let flags: Vec<String> =
-                serde_json::from_str(&flags_json).unwrap_or_default();
+            let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
             Ok(MessageSummary {
                 id: row.get(0)?,
                 subject: row.get(1)?,
@@ -925,7 +983,10 @@ pub fn get_thread_messages(
 /// Remove a message from its thread by setting its thread_id to its own message_id,
 /// effectively making it a standalone thread.
 pub fn unthread_message(conn: &Connection, message_id: &str) -> Result<()> {
-    log::info!("unthread_message: removing message '{}' from its thread", message_id);
+    log::info!(
+        "unthread_message: removing message '{}' from its thread",
+        message_id
+    );
 
     // Get the message's own message_id (the RFC 822 Message-ID header, stored in message_id column)
     let own_message_id: Option<String> = conn
@@ -1013,8 +1074,14 @@ mod tests {
 
         assert_eq!(paths.len(), 2);
         let map: std::collections::HashMap<_, _> = paths.into_iter().collect();
-        assert_eq!(map.get("msg1").map(String::as_str), Some("acc1/INBOX/cur/1:2,S"));
-        assert_eq!(map.get("msg3").map(String::as_str), Some("acc1/INBOX/cur/3:2,S"));
+        assert_eq!(
+            map.get("msg1").map(String::as_str),
+            Some("acc1/INBOX/cur/1:2,S")
+        );
+        assert_eq!(
+            map.get("msg3").map(String::as_str),
+            Some("acc1/INBOX/cur/3:2,S")
+        );
     }
 
     #[test]

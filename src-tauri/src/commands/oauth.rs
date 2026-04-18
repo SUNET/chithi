@@ -53,22 +53,24 @@ fn get_provider(name: &str) -> Result<&'static oauth::OAuthProvider> {
 
 /// Start the OAuth2 flow for a provider. Returns the auth URL to open in the browser.
 #[tauri::command]
-pub async fn oauth_start(
-    provider: String,
-) -> Result<OAuthStartResult> {
+pub async fn oauth_start(provider: String) -> Result<OAuthStartResult> {
     let prov = get_provider(&provider)?;
 
     let (url, listener, code_verifier, state) = oauth::get_auth_url(prov)?;
-    let port = listener.local_addr()
+    let port = listener
+        .local_addr()
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
 
-    store_session(port, OAuthSession {
-        verifier: code_verifier,
-        state,
-        listener,
-        created_at: Instant::now(),
-    });
+    store_session(
+        port,
+        OAuthSession {
+            verifier: code_verifier,
+            state,
+            listener,
+            created_at: Instant::now(),
+        },
+    );
 
     log::info!("OAuth2: started {} flow on port {}", provider, port);
     Ok(OAuthStartResult { url, port })
@@ -91,20 +93,20 @@ pub async fn oauth_complete(
 ) -> Result<()> {
     let prov = get_provider(&provider)?;
 
-    let session = take_session(port)
-        .ok_or_else(|| Error::Other(format!(
-            "No OAuth session found for port {} (expired or never started)", port
-        )))?;
+    let session = take_session(port).ok_or_else(|| {
+        Error::Other(format!(
+            "No OAuth session found for port {} (expired or never started)",
+            port
+        ))
+    })?;
 
     let expected_state = session.state.clone();
     let code_verifier = session.verifier.clone();
 
     // Wait for callback in a blocking thread (TcpListener::accept blocks)
-    let result = tokio::task::spawn_blocking(move || {
-        oauth::wait_for_callback(session.listener)
-    })
-    .await
-    .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
+    let result = tokio::task::spawn_blocking(move || oauth::wait_for_callback(session.listener))
+        .await
+        .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
     // Validate CSRF state parameter
     match result.state {
@@ -130,16 +132,17 @@ pub async fn oauth_complete(
     // Store tokens in keyring
     oauth::store_tokens(&account_id, &tokens)?;
 
-    log::info!("OAuth2: completed {} flow for account {}", provider, account_id);
+    log::info!(
+        "OAuth2: completed {} flow for account {}",
+        provider,
+        account_id
+    );
     Ok(())
 }
 
 /// Get a valid access token for an account, refreshing if needed.
 #[tauri::command]
-pub async fn oauth_get_token(
-    provider: String,
-    account_id: String,
-) -> Result<String> {
+pub async fn oauth_get_token(provider: String, account_id: String) -> Result<String> {
     let prov = get_provider(&provider)?;
 
     let tokens = oauth::load_tokens(&account_id)?
@@ -150,7 +153,8 @@ pub async fn oauth_get_token(
     }
 
     // Need to refresh
-    let refresh_token = tokens.refresh_token
+    let refresh_token = tokens
+        .refresh_token
         .ok_or_else(|| Error::Other("No refresh token. Please sign in again.".into()))?;
 
     let new_tokens = oauth::refresh_access_token(prov, &refresh_token).await?;
@@ -161,34 +165,36 @@ pub async fn oauth_get_token(
 
 /// Check if an account has OAuth tokens stored.
 #[tauri::command]
-pub async fn oauth_has_tokens(
-    account_id: String,
-) -> Result<bool> {
+pub async fn oauth_has_tokens(account_id: String) -> Result<bool> {
     Ok(oauth::load_tokens(&account_id)?.is_some())
 }
 
 /// Fetch the user's profile (display name + email) from Microsoft Graph.
 #[tauri::command]
-pub async fn oauth_get_ms_profile(
-    account_id: String,
-) -> Result<MsProfile> {
+pub async fn oauth_get_ms_profile(account_id: String) -> Result<MsProfile> {
     let tokens = oauth::load_tokens(&account_id)?
         .ok_or_else(|| Error::Other("No tokens for profile fetch".into()))?;
 
-    let refresh_token = tokens.refresh_token.as_deref()
+    let refresh_token = tokens
+        .refresh_token
+        .as_deref()
         .ok_or_else(|| Error::Other("No refresh token for profile fetch".into()))?;
 
     let graph_tokens = oauth::refresh_with_scopes(
         &oauth::MICROSOFT,
         refresh_token,
         oauth::MICROSOFT_GRAPH_SCOPES,
-    ).await?;
+    )
+    .await?;
 
-    oauth::store_tokens(&account_id, &oauth::OAuthTokens {
-        access_token: tokens.access_token,
-        refresh_token: graph_tokens.refresh_token,
-        expires_at: tokens.expires_at,
-    })?;
+    oauth::store_tokens(
+        &account_id,
+        &oauth::OAuthTokens {
+            access_token: tokens.access_token,
+            refresh_token: graph_tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        },
+    )?;
 
     let client = crate::mail::graph::GraphClient::new(&graph_tokens.access_token);
     let user = client.get_me().await?;
@@ -217,7 +223,8 @@ pub async fn jmap_oidc_start(
     let base_url = if !jmap_url.is_empty() {
         jmap_url.trim_end_matches('/').to_string()
     } else {
-        let domain = email.rsplit_once('@')
+        let domain = email
+            .rsplit_once('@')
             .map(|(_, d)| d)
             .ok_or_else(|| Error::Other(format!("Cannot extract domain from '{}'", email)))?;
         let candidates = [
@@ -227,7 +234,8 @@ pub async fn jmap_oidc_start(
         ];
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
-            .build().map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+            .build()
+            .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
         let mut found = None;
         for c in &candidates {
             let url = format!("{}/.well-known/openid-configuration", c);
@@ -238,18 +246,19 @@ pub async fn jmap_oidc_start(
                 }
             }
         }
-        found.ok_or_else(|| Error::Other(format!(
-            "OIDC auto-discovery failed for {} (tried {}, mail.{}, jmap.{})",
-            domain, domain, domain, domain
-        )))?
+        found.ok_or_else(|| {
+            Error::Other(format!(
+                "OIDC auto-discovery failed for {} (tried {}, mail.{}, jmap.{})",
+                domain, domain, domain, domain
+            ))
+        })?
     };
 
     let endpoints = crate::oauth::discover_oidc(&base_url).await?;
 
-    let device_auth_endpoint = endpoints.device_authorization_endpoint
-        .ok_or_else(|| Error::Other(
-            "Server does not support device authorization flow".into()
-        ))?;
+    let device_auth_endpoint = endpoints
+        .device_authorization_endpoint
+        .ok_or_else(|| Error::Other("Server does not support device authorization flow".into()))?;
 
     let effective_client_id = if !client_id.trim().is_empty() {
         client_id.trim().to_string()
@@ -261,7 +270,8 @@ pub async fn jmap_oidc_start(
         ));
     };
 
-    let device_resp = crate::oauth::device_auth_start(&device_auth_endpoint, &effective_client_id).await?;
+    let device_resp =
+        crate::oauth::device_auth_start(&device_auth_endpoint, &effective_client_id).await?;
 
     Ok(JmapOidcStartResult {
         verification_uri: device_resp.verification_uri.clone(),
@@ -303,10 +313,14 @@ pub async fn jmap_oidc_complete(
         interval,
         expires_in,
         &client_id,
-    ).await?;
+    )
+    .await?;
 
     crate::oauth::store_tokens(&account_id, &tokens)?;
 
-    log::info!("JMAP OIDC: device flow completed for account {}", account_id);
+    log::info!(
+        "JMAP OIDC: device flow completed for account {}",
+        account_id
+    );
     Ok(())
 }

@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
 
 use crate::error::{Error, Result};
-use crate::filters::rules::{FilterAction, FilterRule, MatchType, Condition};
+use crate::filters::rules::{Condition, FilterAction, FilterRule, MatchType};
 
 /// List all filter rules, optionally filtered by account_id.
 /// If account_id is None, returns all rules (including global ones).
@@ -65,10 +65,8 @@ pub fn list_filters(conn: &Connection, account_id: Option<&str>) -> Result<Vec<F
             "any" => MatchType::Any,
             _ => MatchType::All,
         };
-        let conditions: Vec<Condition> =
-            serde_json::from_str(&cond_json).unwrap_or_default();
-        let actions: Vec<FilterAction> =
-            serde_json::from_str(&act_json).unwrap_or_default();
+        let conditions: Vec<Condition> = serde_json::from_str(&cond_json).unwrap_or_default();
+        let actions: Vec<FilterAction> = serde_json::from_str(&act_json).unwrap_or_default();
 
         rules.push(FilterRule {
             id,
@@ -121,10 +119,8 @@ pub fn get_filter(conn: &Connection, id: &str) -> Result<FilterRule> {
         "any" => MatchType::Any,
         _ => MatchType::All,
     };
-    let conditions: Vec<Condition> =
-        serde_json::from_str(&cond_json).unwrap_or_default();
-    let actions: Vec<FilterAction> =
-        serde_json::from_str(&act_json).unwrap_or_default();
+    let conditions: Vec<Condition> = serde_json::from_str(&cond_json).unwrap_or_default();
+    let actions: Vec<FilterAction> = serde_json::from_str(&act_json).unwrap_or_default();
 
     Ok(FilterRule {
         id,
