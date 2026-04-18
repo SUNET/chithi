@@ -62,11 +62,12 @@ onMounted(async () => {
       <MenuBar />
       <main class="app-content">
         <router-view v-slot="{ Component }">
-          <!-- Keep instances alive across navigation so the calendar's
-               heavy WeekView/MonthView DOM tree is rendered once per
-               session (see #72). Standalone compose/reader windows use
-               the sibling router-view above and aren't affected. -->
-          <KeepAlive>
+          <!-- Only CalendarView is kept alive — its WeekView subtree is
+               the heavy one (see #72) and cold-mount is ~400ms. Other
+               views (ContactsView, FiltersView, SettingsView, MailView)
+               rely on onMounted/onUnmounted for listener and interval
+               cleanup, so caching them would leak background work. -->
+          <KeepAlive include="CalendarView">
             <component :is="Component" />
           </KeepAlive>
         </router-view>

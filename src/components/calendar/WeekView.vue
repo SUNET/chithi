@@ -51,7 +51,10 @@ const uiStore = useUiStore();
 const gridRef = ref<HTMLElement | null>(null);
 
 const hours = Array.from({ length: 24 }, (_, i) => i);
-const HOUR_HEIGHT = 52; // must match .day-column hour-step in CSS
+// Height (px) of one hour-row. Exposed to CSS via the --hour-height custom
+// property on .week-view (see the inline :style binding) so the scoped
+// styles and hit-testing math (hourFromEvent) share a single source.
+const HOUR_HEIGHT = 52;
 
 const days = computed(() => {
   const d = new Date(calendarStore.currentDate);
@@ -69,8 +72,7 @@ const days = computed(() => {
 });
 
 const now = ref(new Date());
-
-setInterval(() => { now.value = new Date(); }, 60000);
+let nowIntervalId: ReturnType<typeof setInterval> | null = null;
 
 function formatDayName(date: Date): string {
   return date.toLocaleDateString(undefined, { weekday: "short" }).toUpperCase();
@@ -432,9 +434,17 @@ function onColumnDrop(day: Date, e: MouseEvent) {
   });
 }
 
-// Scroll to current hour (or 8 AM if before that) on mount
+// Scroll to current hour (or 8 AM if before that) on mount, and refresh
+// the "now" ref once per minute so the red current-time line and
+// .current-hour label stay accurate. The interval is per-instance; stored
+// so we can clear it on unmount and not leak when the view toggles
+// between week/day and month.
 onMounted(async () => {
   now.value = new Date();
+  nowIntervalId = setInterval(() => {
+    now.value = new Date();
+  }, 60000);
+
   await nextTick();
   if (gridRef.value) {
     const scrollToHour = Math.max(getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) - 2, 0);
@@ -443,12 +453,20 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (nowIntervalId !== null) {
+    clearInterval(nowIntervalId);
+    nowIntervalId = null;
+  }
   if (dragCleanup) dragCleanup();
 });
 </script>
 
 <template>
-  <div class="week-view" :data-testid="singleDay ? 'cal-day-view' : 'cal-week-view'">
+  <div
+    class="week-view"
+    :data-testid="singleDay ? 'cal-day-view' : 'cal-week-view'"
+    :style="{ '--hour-height': `${HOUR_HEIGHT}px` }"
+  >
     <!-- All-day events banner -->
     <div class="all-day-row">
       <div class="time-gutter all-day-label">all-day</div>
@@ -672,7 +690,9 @@ onUnmounted(() => {
 }
 
 .hour-label {
-  height: 52px;
+  /* --hour-height is set inline on .week-view from the TS HOUR_HEIGHT
+     constant so cell layout and hourFromEvent() hit-testing stay in sync. */
+  height: var(--hour-height);
   font-size: 10px;
   color: var(--color-text-muted);
   padding: 0 12px 0 0;
@@ -701,16 +721,16 @@ onUnmounted(() => {
   position: relative;
   flex: 1;
   align-self: stretch;
-  height: calc(24 * 52px);
+  height: calc(24 * var(--hour-height));
   border-left: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
   cursor: pointer;
   background-color: var(--color-bg);
   background-image: repeating-linear-gradient(
     to bottom,
     transparent 0,
-    transparent calc(52px - 1px),
-    color-mix(in srgb, var(--color-border) 50%, transparent) calc(52px - 1px),
-    color-mix(in srgb, var(--color-border) 50%, transparent) 52px
+    transparent calc(var(--hour-height) - 1px),
+    color-mix(in srgb, var(--color-border) 50%, transparent) calc(var(--hour-height) - 1px),
+    color-mix(in srgb, var(--color-border) 50%, transparent) var(--hour-height)
   );
   transition: background-color 0.1s;
 }

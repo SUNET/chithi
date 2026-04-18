@@ -11,6 +11,9 @@ import MonthView from "@/components/calendar/MonthView.vue";
 import EventDetail from "@/components/calendar/EventDetail.vue";
 import EventForm from "@/components/calendar/EventForm.vue";
 
+// Explicit name so <KeepAlive include="CalendarView"> in App.vue matches.
+defineOptions({ name: "CalendarView" });
+
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const showEventForm = ref(false);
@@ -151,7 +154,9 @@ onMounted(() => {
   ready
     .then(() => calendarStore.syncCalendars())
     .catch((e) => console.error("Calendar sync error:", e));
-  ready.then(() => calendarStore.startCalendarSync());
+  ready
+    .then(() => calendarStore.startCalendarSync())
+    .catch((e) => console.error("startCalendarSync error:", e));
 });
 </script>
 
