@@ -863,18 +863,20 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_microsoft_provider_config() {
         assert_eq!(MICROSOFT.name, "microsoft");
-        const { assert!(MICROSOFT.use_pkce) };
+        assert!(MICROSOFT.use_pkce);
         assert!(MICROSOFT.client_secret.is_empty());
         assert!(MICROSOFT.auth_url.contains("login.microsoftonline.com"));
         assert!(MICROSOFT.token_url.contains("login.microsoftonline.com"));
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_google_provider_pkce() {
         assert_eq!(GOOGLE.name, "google");
-        const { assert!(GOOGLE.use_pkce) };
+        assert!(GOOGLE.use_pkce);
         // Google Desktop app clients have a secret (not truly confidential)
         assert!(!GOOGLE.client_secret.is_empty());
     }
