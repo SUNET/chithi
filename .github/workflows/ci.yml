@@ -51,6 +51,8 @@ jobs:
 
       # Tauri 2 system deps on Ubuntu. Required by the Rust build even for
       # check/clippy/test because tauri links against webkit2gtk at compile.
+      # gnome-keyring + dbus-x11 are needed by the db::accounts tests, which
+      # round-trip passwords through the real OS Secret Service.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -61,7 +63,9 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             build-essential \
-            pkg-config
+            pkg-config \
+            gnome-keyring \
+            dbus-x11
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch
@@ -82,6 +86,16 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # Some db::accounts tests store/retrieve passwords in the OS keyring,
+      # so they need a D-Bus session with an unlocked gnome-keyring Secret
+      # Service available. `dbus-run-session` gives us a throwaway bus; we
+      # unlock the keyring with an empty password on first use.
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --locked --all-targets
+        run: |
+          dbus-run-session -- bash -c '
+            echo -n "" | gnome-keyring-daemon --unlock
+            eval "$(echo -n "" | gnome-keyring-daemon --start --components=secrets)"
+            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            cargo test --locked --all-targets
+          '
