@@ -151,6 +151,8 @@ impl CalDavClient {
     pub async fn connect(config: &CalDavConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -178,6 +180,8 @@ impl CalDavClient {
 
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
 
