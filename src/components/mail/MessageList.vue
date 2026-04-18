@@ -216,7 +216,7 @@ async function ctxReply() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
   const body = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
   const quoted = body.split("\n").map((l: string) => `> ${l}`).join("\n");
   openComposeWindow({
@@ -239,7 +239,7 @@ async function ctxReplyAll() {
   const allTo = [msg.from.email, ...msg.to.map((a: { email: string }) => a.email).filter((e: string) => e !== myEmail)];
   const allCc = msg.cc.map((a: { email: string }) => a.email).filter((e: string) => e !== myEmail);
   const body = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
   const quoted = body.split("\n").map((l: string) => `> ${l}`).join("\n");
   openComposeWindow({
@@ -260,7 +260,7 @@ async function ctxForward() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
   const text = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
   const toStr = msg.to.map((a: { name: string | null; email: string }) => a.name || a.email).join(", ");
   openComposeWindow({

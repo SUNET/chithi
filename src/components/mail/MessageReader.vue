@@ -393,7 +393,7 @@ function quoteBody(): string {
   const msg = messagesStore.activeMessage;
   if (!msg) return "";
   const text = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
@@ -440,7 +440,7 @@ function forward() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
   const text = msg.body_text || "";
-  const date = new Date(msg.date).toLocaleString();
+  const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
@@ -594,7 +594,7 @@ async function markSpam() {
         </div>
         <div class="header-row" data-testid="reader-date">
           <span class="header-label">Date:</span>
-          <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString() }}</span>
+          <span class="header-value">{{ new Date(messagesStore.activeMessage.date).toLocaleString(undefined, { hour12: uiStore.hour12 }) }}</span>
         </div>
         <div v-if="messagesStore.activeMessage.list_id" class="header-row">
           <span class="header-label">List:</span>

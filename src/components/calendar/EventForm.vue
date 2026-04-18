@@ -7,6 +7,7 @@ import { localInputToUTC, toDateInTimezone, toTimeInTimezone } from "@/lib/datet
 import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
+import TimeInput from "@/components/common/TimeInput.vue";
 
 const props = defineProps<{
   initialStart?: string;
@@ -165,14 +166,14 @@ async function save() {
             <label>Start</label>
             <div class="datetime-inputs">
               <input v-model="startDate" type="date" class="date-input" data-testid="event-form-start" />
-              <input v-if="!allDay" v-model="startTime" type="time" class="time-input" data-testid="event-form-start-time" />
+              <TimeInput v-if="!allDay" v-model="startTime" class="time-input" testid="event-form-start-time" />
             </div>
           </div>
           <div class="form-group">
             <label>End</label>
             <div class="datetime-inputs">
               <input v-model="endDate" type="date" class="date-input" :min="minEndDate" data-testid="event-form-end" />
-              <input v-if="!allDay" v-model="endTime" type="time" class="time-input" :min="minEndTime" data-testid="event-form-end-time" />
+              <TimeInput v-if="!allDay" v-model="endTime" class="time-input" :min="minEndTime" testid="event-form-end-time" />
             </div>
           </div>
         </div>

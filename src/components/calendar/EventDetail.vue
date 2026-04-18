@@ -6,6 +6,7 @@ import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
+import TimeInput from "@/components/common/TimeInput.vue";
 
 const emit = defineEmits<{
   close: [];
@@ -60,7 +61,7 @@ const editLocation = ref(event.location || "");
 const editDescription = ref(event.description || "");
 
 function formatDateTime(iso: string): string {
-  return formatInTimezone(iso, uiStore.displayTimezone);
+  return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
 }
 
 function statusLabel(status: string | null): string {
@@ -274,7 +275,7 @@ async function handleDelete() {
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>Start time</label>
-            <input v-model="editStartTime" type="time" data-testid="event-form-start-time" />
+            <TimeInput v-model="editStartTime" testid="event-form-start-time" />
           </div>
         </div>
         <div class="edit-row">
@@ -284,7 +285,7 @@ async function handleDelete() {
           </div>
           <div v-if="!editAllDay" class="edit-group">
             <label>End time</label>
-            <input v-model="editEndTime" type="time" data-testid="event-form-end-time" />
+            <TimeInput v-model="editEndTime" testid="event-form-end-time" />
           </div>
         </div>
         <div class="edit-group">

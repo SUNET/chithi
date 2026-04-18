@@ -31,7 +31,7 @@ onMounted(async () => {
 });
 
 function formatDateTime(iso: string): string {
-  return formatInTimezone(iso, uiStore.displayTimezone);
+  return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
 }
 
 async function respond(response: string) {

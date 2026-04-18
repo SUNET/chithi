@@ -83,10 +83,23 @@ function formatDayNum(date: Date): string {
 }
 
 function formatHour(hour: number): string {
-  if (hour === 0) return "12 AM";
-  if (hour < 12) return `${hour} AM`;
-  if (hour === 12) return "12 PM";
-  return `${hour - 12} PM`;
+  // Honor the user's time-format preference. For 24-hour we render a
+  // zero-padded hour; for 12-hour we keep the old AM/PM labels; for "auto"
+  // we let Intl pick for the locale.
+  const h12 = uiStore.hour12;
+  if (h12 === false) {
+    return String(hour).padStart(2, "0");
+  }
+  if (h12 === true) {
+    if (hour === 0) return "12 AM";
+    if (hour < 12) return `${hour} AM`;
+    if (hour === 12) return "12 PM";
+    return `${hour - 12} PM`;
+  }
+  // auto / locale default
+  const d = new Date();
+  d.setHours(hour, 0, 0, 0);
+  return d.toLocaleTimeString(undefined, { hour: "numeric" });
 }
 
 function isToday(date: Date): boolean {
@@ -556,7 +569,7 @@ onUnmounted(() => {
         >
           <span class="event-title">{{ seg.event.title }}</span>
           <span class="event-time">
-            {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit' }) }}
+            {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit', hour12: uiStore.hour12 }) }}
           </span>
         </div>
       </div>
