@@ -3,6 +3,10 @@ name = "chithi"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "chithi_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-notification = "2"
@@ -48,6 +52,10 @@ rand = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Mobile (Android) — compile OpenSSL from source since the NDK doesn't ship one.
+[target.'cfg(target_os = "android")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

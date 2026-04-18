@@ -30,6 +30,9 @@ importers:
         specifier: ^5.0.4
         version: 5.0.4(@vue/compiler-sfc@3.5.32)(pinia@3.0.4(typescript@6.0.2)(vue@3.5.32(typescript@6.0.2)))(vue@3.5.32(typescript@6.0.2))
     devDependencies:
+      '@rolldown/binding-darwin-arm64':
+        specifier: 1.0.0-rc.13
+        version: 1.0.0-rc.13
       '@tauri-apps/cli':
         specifier: ^2.10.1
         version: 2.10.1
@@ -1147,8 +1150,7 @@ snapshots:
   '@rolldown/binding-android-arm64@1.0.0-rc.13':
     optional: true
 
-  '@rolldown/binding-darwin-arm64@1.0.0-rc.13':
-    optional: true
+  '@rolldown/binding-darwin-arm64@1.0.0-rc.13': {}
 
   '@rolldown/binding-darwin-x64@1.0.0-rc.13':
     optional: true
