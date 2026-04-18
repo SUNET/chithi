@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +90,13 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
         .replace("\r\n ", "")   // Unfold CRLF + space
         .replace("\r\n\t", "")  // Unfold CRLF + tab
         .replace("\r\n", "\n"); // Normalize remaining CRLF to LF
+
+    // Exchange/Outlook emit DESCRIPTION;ALTREP="data:text/html,...":plain text
+    // where the quoted value contains raw unescaped " chars (RFC-violating but
+    // common in the wild). The strict icalendar parser fails with
+    // "Satisfy at: BEGIN:VEVENT" when it encounters this. We don't use ALTREP,
+    // so strip the parameter entirely before parsing.
+    let normalized = strip_altrep_params(&normalized);
 
     // Use the icalendar parser to get structured components
     let components = match icalendar::parser::read_calendar_simple(&normalized) {
@@ -312,6 +321,118 @@ pub fn generate_invite(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Remove `;ALTREP=...` parameters from every property line.
+///
+/// Real-world Exchange/Outlook invites embed raw unescaped `"` characters
+/// inside `ALTREP="data:text/html,..."` (HTML attributes like `class="foo"`).
+/// This violates RFC 5545 §3.1 (`QSAFE-CHAR` excludes `"`) and causes strict
+/// parsers to reject the whole VEVENT. We don't use the ALTREP value, so it's
+/// simplest to drop the parameter before parsing.
+fn strip_altrep_params(ical: &str) -> String {
+    let mut out = String::with_capacity(ical.len());
+    for line in ical.split_inclusive('\n') {
+        out.push_str(&strip_altrep_from_line(line));
+    }
+    out
+}
+
+fn strip_altrep_from_line(line: &str) -> Cow<'_, str> {
+    // Only consider the parameter region (before the real property `:`
+    // separator). This keeps a literal `;ALTREP=` that happens to appear
+    // inside a property VALUE from being clobbered.
+    let search_end = property_value_separator(line).unwrap_or(line.len());
+    let bytes = line.as_bytes();
+    let Some(start) = find_altrep_param(&bytes[..search_end]) else {
+        return Cow::Borrowed(line);
+    };
+    let after_eq = start + b";ALTREP=".len();
+    let end = altrep_value_end(bytes, after_eq);
+    let mut result = String::with_capacity(line.len());
+    result.push_str(&line[..start]);
+    result.push_str(&line[end..]);
+    Cow::Owned(result)
+}
+
+/// Case-insensitive search for `;ALTREP=` in a byte slice. Avoids the
+/// per-line lowercasing allocation on the common (no-ALTREP) path.
+fn find_altrep_param(haystack: &[u8]) -> Option<usize> {
+    const NEEDLE: &[u8] = b";altrep=";
+    if haystack.len() < NEEDLE.len() {
+        return None;
+    }
+    haystack
+        .windows(NEEDLE.len())
+        .position(|w| w.iter().zip(NEEDLE).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
+/// Find the offset of the real property/value `:` separator on a content line.
+///
+/// Parameter values may be quoted; colons inside quotes don't count. This scan
+/// tolerates Exchange/Outlook's malformed quoted values that contain raw `"`
+/// chars by only treating a `"` as the closing quote when the next byte is
+/// `;`, `:`, `\r`, `\n`, or end-of-input.
+fn property_value_separator(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_quotes = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes {
+                    let next = bytes.get(i + 1).copied();
+                    if matches!(next, Some(b';' | b':' | b'\r' | b'\n') | None) {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                }
+            }
+            b':' if !in_quotes => return Some(i),
+            b'\r' | b'\n' if !in_quotes => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Given a line and the offset just after `;ALTREP=`, return the offset where
+/// the parameter value ends. Handles both quoted and unquoted forms and
+/// tolerates raw `"` inside the quoted value by only treating `"` followed by
+/// `;`, `:`, or end-of-line as the real closer.
+fn altrep_value_end(bytes: &[u8], after_eq: usize) -> usize {
+    if after_eq >= bytes.len() {
+        return bytes.len();
+    }
+    if bytes[after_eq] == b'"' {
+        let mut i = after_eq + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => match bytes.get(i + 1) {
+                    Some(b';') | Some(b':') | Some(b'\r') | Some(b'\n') | None => {
+                        return i + 1;
+                    }
+                    _ => {}
+                },
+                b'\n' => return i,
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
+    } else {
+        let mut i = after_eq;
+        while i < bytes.len() {
+            match bytes[i] {
+                b';' | b':' | b'\r' | b'\n' => return i,
+                _ => i += 1,
+            }
+        }
+        bytes.len()
+    }
+}
+
 /// Find a property value by name on a parser component.
 fn find_property_value(
     component: &icalendar::parser::Component<'_>,
@@ -503,6 +624,87 @@ fn extract_mailto(val: &str) -> Option<String> {
     }
 }
 
+/// Compute an end datetime from a start datetime and an iCalendar DURATION.
+///
+/// Handles simple durations like PT1H, PT30M, P1D, PT1H30M.
+fn compute_end_from_duration(dtstart: &str, duration: &str) -> String {
+    // Try to parse dtstart as a chrono DateTime
+    if let Ok(start) = chrono::DateTime::parse_from_rfc3339(dtstart) {
+        if let Some(dur) = parse_ical_duration(duration) {
+            let end = start + dur;
+            return end.to_rfc3339();
+        }
+    }
+
+    // Try parsing without timezone (e.g., "2025-04-15T10:00:00")
+    if let Ok(start) = chrono::NaiveDateTime::parse_from_str(dtstart, "%Y-%m-%dT%H:%M:%S") {
+        if let Some(dur) = parse_ical_duration(duration) {
+            let end = start + dur;
+            return end.format("%Y-%m-%dT%H:%M:%S").to_string();
+        }
+    }
+
+    // Fallback
+    dtstart.to_string()
+}
+
+/// Parse an iCalendar DURATION value like "PT1H30M", "P1D", "PT45M" into chrono::Duration.
+fn parse_ical_duration(duration: &str) -> Option<chrono::Duration> {
+    let s = duration.trim();
+    if !s.starts_with('P') {
+        return None;
+    }
+
+    let s = &s[1..]; // strip 'P'
+    let mut days = 0i64;
+    let mut hours = 0i64;
+    let mut minutes = 0i64;
+    let mut seconds = 0i64;
+
+    let mut in_time = false;
+    let mut num_buf = String::new();
+
+    for ch in s.chars() {
+        match ch {
+            'T' => {
+                in_time = true;
+            }
+            '0'..='9' => {
+                num_buf.push(ch);
+            }
+            'D' if !in_time => {
+                days = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'W' if !in_time => {
+                let weeks: i64 = num_buf.parse().unwrap_or(0);
+                days += weeks * 7;
+                num_buf.clear();
+            }
+            'H' if in_time => {
+                hours = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'M' if in_time => {
+                minutes = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            'S' if in_time => {
+                seconds = num_buf.parse().unwrap_or(0);
+                num_buf.clear();
+            }
+            _ => {}
+        }
+    }
+
+    Some(
+        chrono::Duration::days(days)
+            + chrono::Duration::hours(hours)
+            + chrono::Duration::minutes(minutes)
+            + chrono::Duration::seconds(seconds),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +878,124 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn test_parse_ical_with_altrep_description() {
+        // Regression for issue #46. Real Exchange/Outlook DESCRIPTION lines
+        // embed an ALTREP="data:text/html,..." payload whose HTML contains raw
+        // double-quote characters (e.g. <p class="foo">). The quoted param
+        // value therefore contains unescaped " chars, which the strict
+        // icalendar parser rejects with "Satisfy at: BEGIN:VEVENT". The event
+        // also uses RFC 5545 line folding (CRLF + space).
+        let ical = "BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+PRODID:Microsoft Exchange Server 2010\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:bob@exam\r\n ple.com\r\n\
+DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<html><body><p class=\"gre\r\n eting\">Hello, world: this is <b>bold</b></p></body></html>\":Plain text fall\r\n back description\r\n\
+UID:altrep-test-uid\r\n\
+SUMMARY:Meeting with ALTREP description\r\n\
+DTSTART;TZID=UTC:20260414T170000\r\n\
+DTEND;TZID=UTC:20260414T180000\r\n\
+DTSTAMP:20260413T132342Z\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let invites = parse_ical_data(ical);
+        assert_eq!(invites.len(), 1, "Should parse 1 invite with ALTREP DESCRIPTION");
+        let inv = &invites[0];
+        assert_eq!(inv.uid, "altrep-test-uid");
+        assert_eq!(inv.summary, Some("Meeting with ALTREP description".to_string()));
+        assert_eq!(
+            inv.description,
+            Some("Plain text fallback description".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_altrep_quoted_with_inner_quotes() {
+        let line = "DESCRIPTION;LANGUAGE=en-US;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION;LANGUAGE=en-US:plain\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_altrep_quoted_well_formed() {
+        let line = "DESCRIPTION;ALTREP=\"cid:part1\":hello\n";
+        assert_eq!(strip_altrep_from_line(line).as_ref(), "DESCRIPTION:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_followed_by_other_param() {
+        let line = "DESCRIPTION;ALTREP=\"cid:part1\";LANGUAGE=en:hello\n";
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION;LANGUAGE=en:hello\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_altrep_case_insensitive() {
+        let line = "DESCRIPTION;altrep=\"cid:part1\":hello\n";
+        assert_eq!(strip_altrep_from_line(line).as_ref(), "DESCRIPTION:hello\n");
+    }
+
+    #[test]
+    fn test_strip_altrep_unquoted() {
+        let line = "DESCRIPTION;ALTREP=cid:part1:hello\n";
+        // Unquoted terminates at first ':' per RFC 5545 §3.1, so we strip
+        // only ";ALTREP=cid" and the remainder becomes the property value.
+        assert_eq!(
+            strip_altrep_from_line(line).as_ref(),
+            "DESCRIPTION:part1:hello\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_altrep_line_without_altrep_is_borrowed() {
+        let line = "SUMMARY:Team Standup\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out.as_ref(), line);
+        assert!(matches!(out, Cow::Borrowed(_)), "no-ALTREP lines must not allocate");
+    }
+
+    #[test]
+    fn test_strip_altrep_leaves_value_substring_alone() {
+        // A literal `;ALTREP=` that appears inside the property VALUE
+        // (after the real `:` separator) must not be touched.
+        let line = "DESCRIPTION:look at ;ALTREP=example in the value\n";
+        let out = strip_altrep_from_line(line);
+        assert_eq!(out.as_ref(), line);
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_property_value_separator_plain() {
+        assert_eq!(property_value_separator("SUMMARY:hello\n"), Some(7));
+    }
+
+    #[test]
+    fn test_property_value_separator_with_quoted_param() {
+        // The first `:` is inside the quoted ALTREP value; the real separator
+        // is the one after the closing `"`.
+        let line = "DESCRIPTION;ALTREP=\"data:text/html,x\":plain\n";
+        let pos = property_value_separator(line).unwrap();
+        assert_eq!(&line[pos..pos + 1], ":");
+        assert_eq!(&line[pos + 1..].trim_end(), &"plain");
+    }
+
+    #[test]
+    fn test_property_value_separator_with_inner_quotes() {
+        // Malformed Exchange payload — raw `"` inside quoted ALTREP.
+        let line = "DESCRIPTION;ALTREP=\"data:text/html,<p class=\"a\">x</p>\":plain\n";
+        let pos = property_value_separator(line).unwrap();
+        assert_eq!(&line[pos + 1..].trim_end(), &"plain");
+    }
+
+    #[test]
     fn test_generate_reply_accepted() {
         let invite = ParsedInvite {
             method: "REQUEST".to_string(),
@@ -842,86 +1162,5 @@ END:VCALENDAR";
         assert_eq!(parse_ical_duration("P1W"), Some(chrono::Duration::weeks(1)));
         assert_eq!(parse_ical_duration("invalid"), None);
     }
-}
-
-/// Compute an end datetime from a start datetime and an iCalendar DURATION.
-///
-/// Handles simple durations like PT1H, PT30M, P1D, PT1H30M.
-fn compute_end_from_duration(dtstart: &str, duration: &str) -> String {
-    // Try to parse dtstart as a chrono DateTime
-    if let Ok(start) = chrono::DateTime::parse_from_rfc3339(dtstart) {
-        if let Some(dur) = parse_ical_duration(duration) {
-            let end = start + dur;
-            return end.to_rfc3339();
-        }
-    }
-
-    // Try parsing without timezone (e.g., "2025-04-15T10:00:00")
-    if let Ok(start) = chrono::NaiveDateTime::parse_from_str(dtstart, "%Y-%m-%dT%H:%M:%S") {
-        if let Some(dur) = parse_ical_duration(duration) {
-            let end = start + dur;
-            return end.format("%Y-%m-%dT%H:%M:%S").to_string();
-        }
-    }
-
-    // Fallback
-    dtstart.to_string()
-}
-
-/// Parse an iCalendar DURATION value like "PT1H30M", "P1D", "PT45M" into chrono::Duration.
-fn parse_ical_duration(duration: &str) -> Option<chrono::Duration> {
-    let s = duration.trim();
-    if !s.starts_with('P') {
-        return None;
-    }
-
-    let s = &s[1..]; // strip 'P'
-    let mut days = 0i64;
-    let mut hours = 0i64;
-    let mut minutes = 0i64;
-    let mut seconds = 0i64;
-
-    let mut in_time = false;
-    let mut num_buf = String::new();
-
-    for ch in s.chars() {
-        match ch {
-            'T' => {
-                in_time = true;
-            }
-            '0'..='9' => {
-                num_buf.push(ch);
-            }
-            'D' if !in_time => {
-                days = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'W' if !in_time => {
-                let weeks: i64 = num_buf.parse().unwrap_or(0);
-                days += weeks * 7;
-                num_buf.clear();
-            }
-            'H' if in_time => {
-                hours = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'M' if in_time => {
-                minutes = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            'S' if in_time => {
-                seconds = num_buf.parse().unwrap_or(0);
-                num_buf.clear();
-            }
-            _ => {}
-        }
-    }
-
-    Some(
-        chrono::Duration::days(days)
-            + chrono::Duration::hours(hours)
-            + chrono::Duration::minutes(minutes)
-            + chrono::Duration::seconds(seconds),
-    )
 }
 
