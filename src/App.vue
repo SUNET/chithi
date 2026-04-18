@@ -61,7 +61,15 @@ onMounted(async () => {
     <div class="app-main">
       <MenuBar />
       <main class="app-content">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <!-- Keep instances alive across navigation so the calendar's
+               heavy WeekView/MonthView DOM tree is rendered once per
+               session (see #72). Standalone compose/reader windows use
+               the sibling router-view above and aren't affected. -->
+          <KeepAlive>
+            <component :is="Component" />
+          </KeepAlive>
+        </router-view>
       </main>
       <OperationsPanel />
       <StatusBar />
