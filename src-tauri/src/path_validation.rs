@@ -45,7 +45,14 @@ pub fn resolve_under_canonical(canonical_base: &Path, rel: impl AsRef<Path>) -> 
             rel.display()
         )));
     }
-    if rel.components().any(|c| matches!(c, Component::ParentDir)) {
+    // Reject `..` segments and any Windows drive/UNC prefix. `C:foo` is
+    // not absolute on Windows (`Path::is_absolute` returns false) but
+    // carries a `Component::Prefix`, so `canonicalize()` would probe
+    // outside `canonical_base` before the containment check runs.
+    if rel
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
         return Err(Error::Other(format!(
             "Path traversal not allowed: {}",
             rel.display()
@@ -133,6 +140,26 @@ mod tests {
 
         let err = resolve_under(inner.path(), "escape").unwrap_err();
         assert!(format!("{}", err).to_lowercase().contains("escape"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_drive_prefix() {
+        let dir = tempdir();
+        // `C:foo` is drive-relative on Windows: Path::is_absolute is false,
+        // but the Prefix component means join/canonicalize will reach out to
+        // wherever the current directory of drive C: is. We must reject it.
+        let err = resolve_under(dir.path(), "C:foo").unwrap_err();
+        assert!(format!("{}", err).to_lowercase().contains("traversal"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_unc_prefix() {
+        let dir = tempdir();
+        let err = resolve_under(dir.path(), r"\\server\share\file").unwrap_err();
+        let msg = format!("{}", err).to_lowercase();
+        assert!(msg.contains("absolute") || msg.contains("traversal"));
     }
 
     #[test]
