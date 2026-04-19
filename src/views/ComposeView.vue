@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
+import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
@@ -316,27 +316,48 @@ onMounted(() => {
     event.preventDefault();
 
     try {
-      const result = await tauriMessage(
-        "You have unsaved changes. What would you like to do?",
+      // tauri-plugin-dialog does not expose a 3-button native prompt, so
+      // fake it with a two-step ask() flow. Step 1: save or not? Step 2 (if
+      // not saving): really discard? Cancel on the second step returns to
+      // the composer instead of destroying the window. Default on any
+      // exception is also stay-open so a dialog failure cannot silently
+      // drop the user's work.
+      const save = await tauriAsk(
+        "You have unsaved changes. Save this message as a draft?",
         {
           title: "Unsaved Changes",
           kind: "warning",
-          buttons: { yes: "Save Draft", no: "Discard", cancel: "Cancel" },
+          okLabel: "Save Draft",
+          cancelLabel: "No",
         },
       );
 
-      if (result === "Save Draft" || result === "Yes") {
+      if (save) {
         const saved = await saveDraft();
         if (saved) {
           await currentWindow.destroy();
         }
-      } else if (result === "Discard" || result === "No") {
+        // If save failed, saveDraft() already surfaced an error; stay open.
+        return;
+      }
+
+      const discard = await tauriAsk(
+        "Discard your changes and close without saving?",
+        {
+          title: "Discard Changes",
+          kind: "warning",
+          okLabel: "Discard",
+          cancelLabel: "Cancel",
+        },
+      );
+      if (discard) {
         await currentWindow.destroy();
       }
-      // "Cancel" — do nothing, return to compose
+      // Cancel on the second step: stay in the composer.
     } catch (e) {
       console.error("Close dialog error:", e);
-      await currentWindow.destroy();
+      error.value =
+        "Could not show the save prompt. Use the Save button or try closing again.";
     }
   });
 });
@@ -409,7 +430,7 @@ function parseAddresses(input: string): string[] {
 
 function mentionsAttachment(): boolean {
   const text = (bodyText.value + "\n" + subject.value).toLowerCase();
-  return /\battach(ed|ment|ments|ing)?\b/.test(text);
+  return /\battach(ed|ment|ments|ement|ements|ing)?\b/.test(text);
 }
 
 async function send() {
@@ -425,24 +446,32 @@ async function send() {
     return;
   }
 
-  // Check for missing attachments
+  // Check for missing attachments. tauri-plugin-dialog does not expose a
+  // three-button native prompt, so the previous Send/Attach/Cancel dialog
+  // was silently broken. Two buttons: the user can still attach manually
+  // via the toolbar after Cancel. On dialog failure, cancel the send so a
+  // broken prompt cannot turn into an accidental send-without-attachment.
   if (attachments.value.length === 0 && mentionsAttachment()) {
-    const result = await tauriMessage(
-      'Your message mentions an attachment, but no files are attached. Send anyway?',
-      {
-        title: "No Attachments",
-        kind: "warning",
-        buttons: { yes: "Send Anyway", no: "Attach Files", cancel: "Cancel" },
-      },
-    );
-    if (result === "Attach Files" || result === "No") {
-      await addAttachment();
+    let sendAnyway: boolean;
+    try {
+      sendAnyway = await tauriAsk(
+        "Your message mentions an attachment, but no files are attached. Send anyway?",
+        {
+          title: "No Attachments",
+          kind: "warning",
+          okLabel: "Send Anyway",
+          cancelLabel: "Cancel",
+        },
+      );
+    } catch (e) {
+      console.error("No-attachment dialog error:", e);
+      error.value =
+        "Could not show the attachment warning. Please attach files or remove the mention and try again.";
       return;
     }
-    if (result === "Cancel") {
+    if (!sendAnyway) {
       return;
     }
-    // "Send Anyway" / "Yes" — proceed
   }
 
   sending.value = true;
