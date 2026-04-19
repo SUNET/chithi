@@ -624,8 +624,10 @@ pub fn fetch_and_store_body(
     let canonical_maildir = std::fs::canonicalize(&maildir_base)
         .map_err(|e| Error::Other(format!("Failed to resolve maildir path: {}", e)))?;
     if !canonical_maildir.starts_with(&canonical_data_dir) {
-        // Clean up the directory we just created since it's outside our tree
-        let _ = std::fs::remove_dir_all(&canonical_maildir);
+        // Do NOT attempt to clean up: the canonical path is, by construction,
+        // outside our data tree, and removing it would follow the symlink an
+        // attacker used to cause the escape and recursively delete arbitrary
+        // user data. Leaving the stray dir is the safer failure mode.
         return Err(Error::Other(format!(
             "Path traversal detected: maildir path '{}' escapes data directory",
             maildir_base.display()
