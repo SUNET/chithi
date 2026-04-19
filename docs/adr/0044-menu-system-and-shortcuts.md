@@ -189,6 +189,59 @@ About Chithi…
 - Unknown shortcuts fall through to the browser default, so platform
   text-editing shortcuts in the compose textarea keep working.
 
+### Mobile chrome
+
+The `mobile` branch ships a separate chrome for small viewports. `App.vue`
+picks between `DesktopShell.vue` and `MobileShell.vue` based on the
+`platform` store (threshold at 720 px width, plus runtime platform
+detection via `@tauri-apps/plugin-os`). The menu spec above is
+**desktop-only**; mobile has no menu bar at all.
+
+On mobile the primary surfaces are:
+
+- `MobileAppBar` at the top of each screen: title plus `leading` and
+  `trailing` slots for per-screen action buttons. Anywhere the desktop
+  menus expose an action (Compose, Preferences, Filters) the mobile
+  equivalent is a button rendered into one of these slots by the active
+  screen.
+- `MobileTabBar` at the bottom: persistent navigation between Mail,
+  Calendar, Contacts, Filters, Settings.
+- `ComposeSheet` replaces the compose window. Compose is a sheet
+  presented over the current screen, not a separate Tauri window, so
+  the Compose-window File/Edit/View/Options/Help menus from this spec
+  do not apply there.
+- `FolderDrawer` replaces the sidebar folder tree.
+
+Mapping desktop menu items to mobile equivalents:
+
+| Desktop menu item | Mobile equivalent |
+| --- | --- |
+| File > Preferences… | Settings tab (`MobileTabBar`) |
+| File > Close Window / Quit | OS back gesture, system app switcher |
+| View > Show Message Pane | n/a: mobile is always single-pane |
+| View > Message Pane Position | n/a: no split layout on mobile |
+| View > Threaded View | Persistent preference, surfaced in Settings tab |
+| View > Message Filters… | Filters tab |
+| View > Hide Title Bar | n/a: native title bar is OS-managed |
+| Compose > File > Save Draft / Send | Buttons in the `ComposeSheet` header |
+| Compose > Edit > Cut / Copy / Paste | Native text-input gestures |
+| Compose > View > Show Cc / Show Bcc | Buttons/toggles inside `ComposeSheet` |
+| Compose > Options > Attach File… | Action button in `ComposeSheet` |
+
+Items with no mobile equivalent (layout toggles, window-chrome toggles)
+are simply absent from the mobile UI rather than being rendered and
+greyed out. The shared preferences that mean something on both
+platforms (theme, default threaded view, week start, time format,
+display timezone) live in the same Pinia stores and localStorage keys
+and are surfaced differently per platform.
+
+Keyboard shortcuts: the window-level `keydown` listener is still
+installed on mobile so that iPad / Android with an external keyboard
+keep working. Shortcuts that drive absent UI (for example the
+show-message-pane toggle) are registered as no-ops on mobile rather
+than conditionally skipped, so the dispatch table stays identical
+across platforms.
+
 ## Consequences
 
 - A new `PreferencesView.vue` component and `/preferences` route ship.
@@ -207,6 +260,11 @@ About Chithi…
 - Shortcuts are display-only on first render until the keydown listener
   wires up. We ship the listener and the display together; no
   half-state.
+- Mobile chrome (`MobileShell`, `MobileAppBar`, `MobileTabBar`,
+  `ComposeSheet`) is unaffected structurally, but every phase PR must
+  surface the corresponding mobile action in the right app-bar slot or
+  Settings tab so desktop and mobile stay in sync on what the user can
+  do.
 
 ## Alternatives considered
 
