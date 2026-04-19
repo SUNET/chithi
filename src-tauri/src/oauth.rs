@@ -889,7 +889,13 @@ mod android_store {
         // Sanitise so a crafted account id can't escape the directory.
         let safe: String = account_id
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         Ok(dir.join(format!("{safe}.json")))
     }
