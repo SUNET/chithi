@@ -444,6 +444,66 @@ impl CalDavClient {
         Ok(())
     }
 
+    /// PROPPATCH the `{DAV:}displayname` property to rename a calendar.
+    /// `calendar_href` is the calendar collection URL (as returned by
+    /// `list_calendars`).
+    pub async fn rename_calendar(&self, calendar_href: &str, new_name: &str) -> Result<()> {
+        let url = self.resolve_url(calendar_href)?;
+        log::info!("caldav: PROPPATCH rename calendar {} -> {}", url, new_name);
+
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:">
+  <D:set>
+    <D:prop>
+      <D:displayname>{}</D:displayname>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>"#,
+            xml_escape(new_name)
+        );
+
+        let resp = self
+            .apply_auth(
+                self.http
+                    .request(reqwest::Method::from_bytes(b"PROPPATCH").unwrap(), &url),
+            )
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("CalDAV PROPPATCH failed: {}", e)))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "(no body)".to_string());
+
+        // 207 Multi-Status is the canonical PROPPATCH success response; some
+        // servers reply with a plain 200. Any 2xx counts as OK provided the
+        // Multi-Status body doesn't flag the property as failed.
+        if !status.is_success() && status.as_u16() != 207 {
+            return Err(Error::Other(format!(
+                "CalDAV PROPPATCH returned {}: {}",
+                status,
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+
+        // Multi-Status body may report per-property failures even with a 207.
+        // Look for a non-2xx status inside the response XML.
+        if text.contains("HTTP/1.1 4") || text.contains("HTTP/1.1 5") {
+            return Err(Error::Other(format!(
+                "CalDAV PROPPATCH rejected displayname update: {}",
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+
+        log::info!("caldav: PROPPATCH success");
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -771,6 +831,23 @@ pub fn generate_ical_event(
     lines.push("END:VCALENDAR".to_string());
 
     lines.join("\r\n")
+}
+
+/// Escape `&`, `<`, `>`, `"`, `'` for safe interpolation into XML text or
+/// attribute values. Used by PROPPATCH to carry a user-supplied name.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Convert ISO 8601 datetime to iCalendar datetime format.

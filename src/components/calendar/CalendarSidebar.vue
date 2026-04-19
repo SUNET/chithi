@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick } from "vue";
+import { ref, computed, nextTick, onBeforeUnmount, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
@@ -42,6 +42,30 @@ function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
 function closeContextMenu() {
   contextMenu.value = null;
 }
+
+// Close the context menu on any LEFT-button click that lands outside the
+// teleported menu itself. WebKitGTK synthesises a click event on
+// right-mouse-release (button === 2), so without the button guard the
+// menu would close immediately when the user lets go of the right button.
+function onDocClickForMenu(e: MouseEvent) {
+  if (!contextMenu.value) return;
+  if (e.button !== 0) return;
+  const target = e.target as HTMLElement | null;
+  if (target?.closest(".cal-context-menu")) return;
+  closeContextMenu();
+}
+
+watch(contextMenu, (open) => {
+  if (open) {
+    document.addEventListener("click", onDocClickForMenu);
+  } else {
+    document.removeEventListener("click", onDocClickForMenu);
+  }
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocClickForMenu);
+});
 
 const dropTargetCalendarId = ref<string | null>(null);
 
@@ -158,6 +182,52 @@ function scrollHighlightedIntoView() {
   });
 }
 
+const renaming = ref<{ calendar: Calendar; value: string } | null>(null);
+const renameSaving = ref(false);
+const renameError = ref<string | null>(null);
+
+function startRename() {
+  if (!contextMenu.value) return;
+  const cal = calendarStore.calendars.find(
+    (c) => c.id === contextMenu.value!.calendarId,
+  );
+  closeContextMenu();
+  if (!cal) return;
+  renameError.value = null;
+  renaming.value = { calendar: cal, value: cal.name };
+}
+
+function cancelRename() {
+  renaming.value = null;
+  renameError.value = null;
+}
+
+async function confirmRename() {
+  if (!renaming.value) return;
+  const newName = renaming.value.value.trim();
+  if (!newName || newName === renaming.value.calendar.name) {
+    cancelRename();
+    return;
+  }
+  renameSaving.value = true;
+  renameError.value = null;
+  try {
+    await api.updateCalendar(
+      renaming.value.calendar.id,
+      newName,
+      renaming.value.calendar.color,
+    );
+    await calendarStore.fetchCalendars();
+    showToast(`Renamed to "${newName}"`, "success");
+    renaming.value = null;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    renameError.value = msg;
+  } finally {
+    renameSaving.value = false;
+  }
+}
+
 async function unsubscribeThisCalendar() {
   if (!contextMenu.value) return;
   const calendarId = contextMenu.value.calendarId;
@@ -178,7 +248,7 @@ async function unsubscribeThisCalendar() {
 </script>
 
 <template>
-  <div class="calendar-sidebar" @click="closeContextMenu">
+  <div class="calendar-sidebar">
     <div class="sidebar-header">CALENDARS</div>
     <div class="calendar-list">
       <div
@@ -301,7 +371,56 @@ async function unsubscribeThisCalendar() {
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
         <button class="ctx-item" @click="syncThisCalendar" data-testid="calendar-sync">Sync this calendar</button>
+        <button class="ctx-item" @click="startRename" data-testid="calendar-rename">Rename…</button>
         <button class="ctx-item" @click="unsubscribeThisCalendar" data-testid="calendar-unsubscribe">Unsubscribe</button>
+      </div>
+    </Teleport>
+
+    <!-- Rename modal -->
+    <Teleport to="body">
+      <div
+        v-if="renaming"
+        class="modal-overlay"
+        data-testid="calendar-rename-modal"
+        @click.self="cancelRename"
+      >
+        <div class="rename-modal">
+          <div class="rename-body">
+            <h3>Rename Calendar</h3>
+            <p class="rename-sub">Renaming will update the calendar on the server.</p>
+            <input
+              v-model="renaming.value"
+              type="text"
+              class="rename-input"
+              data-testid="calendar-rename-input"
+              :disabled="renameSaving"
+              placeholder="Calendar name"
+              @keyup.enter="confirmRename"
+              @keyup.escape="cancelRename"
+            />
+            <p v-if="renameError" class="rename-error" data-testid="calendar-rename-error">
+              {{ renameError }}
+            </p>
+          </div>
+          <div class="rename-footer">
+            <button
+              class="rename-btn-cancel"
+              :disabled="renameSaving"
+              data-testid="calendar-rename-cancel"
+              @click="cancelRename"
+            >
+              Cancel
+            </button>
+            <button
+              class="rename-btn-save"
+              :disabled="renameSaving || !renaming.value.trim()"
+              data-testid="calendar-rename-save"
+              @click="confirmRename"
+            >
+              {{ renameSaving ? "Renaming…" : "Rename" }}
+            </button>
+          </div>
+        </div>
       </div>
     </Teleport>
   </div>
@@ -580,5 +699,97 @@ async function unsubscribeThisCalendar() {
 
 .cal-context-menu .ctx-item:hover {
   background: var(--color-bg-hover);
+}
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+
+.rename-modal {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.rename-body {
+  padding: 18px 20px 4px;
+}
+
+.rename-body h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: var(--color-text);
+}
+
+.rename-sub {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.rename-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  font-size: 14px;
+}
+
+.rename-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+.rename-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #dc2626;
+}
+
+.rename-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+}
+
+.rename-btn-cancel,
+.rename-btn-save {
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.rename-btn-cancel {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+.rename-btn-save {
+  background: var(--color-accent);
+  color: white;
+  border: 1px solid var(--color-accent);
+}
+
+.rename-btn-save:disabled,
+.rename-btn-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 </style>

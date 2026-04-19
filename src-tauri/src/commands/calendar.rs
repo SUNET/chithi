@@ -83,9 +83,106 @@ pub async fn update_calendar(
         name,
         color
     );
+
+    // Load current calendar + account so we know whether the name changed
+    // and, if so, which protocol to push the rename through. Drop the
+    // reader before any await so the backend stays non-blocking.
+    let (existing, account) = {
+        let conn = state.db.reader();
+        let cal = db::calendar::get_calendar(&conn, &calendar_id)?;
+        let acct = db::accounts::get_account_full(&conn, &cal.account_id)?;
+        (cal, acct)
+    };
+
+    let name_changed = existing.name != name;
+    let remote_id = existing.remote_id.clone().filter(|r| !r.is_empty());
+    if name_changed {
+        if let Some(ref rid) = remote_id {
+            push_calendar_rename(&account, rid, &name).await?;
+        } else {
+            log::info!(
+                "update_calendar: skipping remote rename (no remote_id, local-only calendar)"
+            );
+        }
+    }
+
     let conn = state.db.writer().await;
     db::calendar::update_calendar(&conn, &calendar_id, &name, &color)?;
     Ok(())
+}
+
+/// Push a calendar rename to the account's remote server. Mirrors the
+/// per-protocol dispatch in [`sync_calendars`]. Errors here must propagate
+/// so the command leaves the local DB unchanged on remote failure.
+async fn push_calendar_rename(
+    account: &db::accounts::AccountFull,
+    remote_id: &str,
+    new_name: &str,
+) -> Result<()> {
+    if account.mail_protocol == "jmap" {
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap
+            .rename_calendar(&jmap_config, remote_id, new_name)
+            .await?;
+        return Ok(());
+    }
+
+    if account.provider == "o365" {
+        let token = crate::mail::graph::get_graph_token(&account.id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.rename_calendar(remote_id, new_name).await?;
+        return Ok(());
+    }
+
+    if account.provider == "gmail" {
+        // Prefer the Google Calendar REST endpoint; fall back to CalDAV
+        // PROPPATCH if REST fails (OAuth not configured, or remote_id is
+        // actually a CalDAV href).
+        if let Ok(token) = get_google_token(&account.id).await {
+            let url = format!(
+                "https://www.googleapis.com/calendar/v3/calendars/{}",
+                urlencoding::encode(remote_id)
+            );
+            let http = reqwest::Client::new();
+            let resp = http
+                .patch(&url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "summary": new_name }))
+                .send()
+                .await
+                .map_err(|e| {
+                    crate::error::Error::Other(format!("Google Calendar PATCH failed: {}", e))
+                })?;
+            if resp.status().is_success() {
+                return Ok(());
+            }
+            let body = resp.text().await.unwrap_or_default();
+            log::warn!(
+                "update_calendar: Google REST rename failed ({}), falling back to CalDAV",
+                body.chars().take(200).collect::<String>()
+            );
+        }
+        // Fall through to CalDAV below.
+    }
+
+    if !account.caldav_url.is_empty() {
+        use crate::mail::caldav::{CalDavClient, CalDavConfig};
+        let caldav_config = CalDavConfig {
+            caldav_url: account.caldav_url.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+            email: account.email.clone(),
+        };
+        let client = CalDavClient::connect(&caldav_config).await?;
+        client.rename_calendar(remote_id, new_name).await?;
+        return Ok(());
+    }
+
+    Err(crate::error::Error::Other(format!(
+        "No remote rename path configured for account {} (provider={}, protocol={})",
+        account.id, account.provider, account.mail_protocol
+    )))
 }
 
 #[tauri::command]

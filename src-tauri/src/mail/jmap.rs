@@ -998,6 +998,49 @@ impl JmapConnection {
         Ok(calendars)
     }
 
+    /// Rename a JMAP calendar. Uses Calendar/set with an update entry.
+    pub async fn rename_calendar(
+        &self,
+        config: &JmapConfig,
+        calendar_id: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        log::info!("JMAP rename calendar: id={} -> {}", calendar_id, new_name);
+
+        let update = serde_json::json!({
+            calendar_id: { "name": new_name }
+        });
+
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["Calendar/set", {
+                    "accountId": self.account_id,
+                    "update": update
+                }, "c1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][calendar_id].as_object() {
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP Calendar/set rejected rename: {}",
+                desc
+            )));
+        }
+
+        log::info!("JMAP renamed calendar {}", calendar_id);
+        Ok(())
+    }
+
     /// Fetch calendar events, optionally filtered by calendar_id.
     /// Uses CalendarEvent/query + CalendarEvent/get with JSCalendar format.
     pub async fn fetch_calendar_events(
