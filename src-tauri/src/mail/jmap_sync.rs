@@ -436,6 +436,27 @@ pub async fn sync_jmap_folder_public(
     result
 }
 
+/// Validate a JMAP email id per RFC 8620 §1.2: ASCII `[A-Za-z0-9_-]`,
+/// 1..=255 octets. The id flows into a maildir filename, so anything
+/// outside that charset (path separators, NUL, control chars, `..`) is
+/// rejected up front to stop a malicious or non-conforming server from
+/// smuggling filesystem escapes through the body-fetch path.
+fn validate_jmap_email_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 255 {
+        return Err(Error::Other(format!(
+            "Invalid JMAP email id length (expected 1..=255 bytes, got {})",
+            id.len()
+        )));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error::Other(format!("Invalid JMAP email id: {:?}", id)));
+    }
+    Ok(())
+}
+
 /// Fetch and store the body for a JMAP email on-demand.
 /// Called when the user opens a message whose body hasn't been downloaded yet.
 pub async fn fetch_and_store_jmap_body(
@@ -447,6 +468,8 @@ pub async fn fetch_and_store_jmap_body(
     flags: &[String],
 ) -> Result<String> {
     use crate::mail::sync::{create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name};
+
+    validate_jmap_email_id(jmap_email_id)?;
 
     log::info!(
         "JMAP on-demand body fetch: account={} folder={} jmap_id={}",
@@ -469,6 +492,21 @@ pub async fn fetch_and_store_jmap_body(
         .join(sanitize_folder_name(folder_path));
     create_maildir_dirs(&maildir_base)?;
 
+    // Defence-in-depth: canonical check that the maildir stays inside data_dir.
+    // The id charset check above already makes traversal via the filename
+    // impossible; this catches folder_path or symlink-based escapes.
+    let canonical_data_dir =
+        std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_maildir = std::fs::canonicalize(&maildir_base)
+        .map_err(|e| Error::Other(format!("Failed to resolve JMAP maildir path: {}", e)))?;
+    if !canonical_maildir.starts_with(&canonical_data_dir) {
+        let _ = std::fs::remove_dir_all(&canonical_maildir);
+        return Err(Error::Other(format!(
+            "Path traversal detected: JMAP maildir '{}' escapes data directory",
+            maildir_base.display()
+        )));
+    }
+
     let filename = format!("{}:2,{}", jmap_email_id, flags_to_maildir_suffix(flags));
     let msg_path = maildir_base.join("cur").join(&filename);
     std::fs::write(&msg_path, &body)?;
@@ -483,4 +521,54 @@ pub async fn fetch_and_store_jmap_body(
     log::info!("JMAP body saved: {} ({} bytes)", relative_path, body.len());
 
     Ok(relative_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_rfc8620_ids() {
+        validate_jmap_email_id("M12345").unwrap();
+        validate_jmap_email_id("abcDEF_-09").unwrap();
+        validate_jmap_email_id("a").unwrap();
+        validate_jmap_email_id(&"x".repeat(255)).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_jmap_email_id("").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        assert!(validate_jmap_email_id(&"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn rejects_path_separators() {
+        assert!(validate_jmap_email_id("../etc/passwd").is_err());
+        assert!(validate_jmap_email_id("a/b").is_err());
+        assert!(validate_jmap_email_id("a\\b").is_err());
+    }
+
+    #[test]
+    fn rejects_nul_and_control_chars() {
+        assert!(validate_jmap_email_id("a\0b").is_err());
+        assert!(validate_jmap_email_id("a\nb").is_err());
+    }
+
+    #[test]
+    fn rejects_dot_and_spaces() {
+        // Dots are not in the RFC 8620 charset and could form `..`.
+        assert!(validate_jmap_email_id(".").is_err());
+        assert!(validate_jmap_email_id("..").is_err());
+        assert!(validate_jmap_email_id("a.b").is_err());
+        assert!(validate_jmap_email_id("a b").is_err());
+    }
+
+    #[test]
+    fn rejects_non_ascii() {
+        assert!(validate_jmap_email_id("café").is_err());
+    }
 }
