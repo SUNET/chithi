@@ -691,6 +691,14 @@ pub async fn sync_calendars(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    if !account.calendar_sync_enabled {
+        log::info!(
+            "sync_calendars: skipping account {} (calendar sync disabled)",
+            account_id
+        );
+        return Ok(());
+    }
+
     if account.mail_protocol == "jmap" {
         sync_calendars_jmap(&state, &account_id, &account).await?;
     } else if account.provider == "gmail" {

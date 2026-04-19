@@ -36,10 +36,16 @@ pub struct AccountConfig {
     pub oidc_token_endpoint: String,
     #[serde(default)]
     pub oidc_client_id: String,
+    #[serde(default = "default_true")]
+    pub calendar_sync_enabled: bool,
 }
 
 fn default_basic() -> String {
     "basic".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +69,7 @@ pub struct AccountFull {
     pub jmap_auth_method: String,
     pub oidc_token_endpoint: String,
     pub oidc_client_id: String,
+    pub calendar_sync_enabled: bool,
 }
 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
@@ -86,7 +93,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id FROM accounts WHERE id = ?1",
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -109,6 +116,7 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 jmap_auth_method: row.get(15)?,
                 oidc_token_endpoint: row.get(16)?,
                 oidc_client_id: row.get(17)?,
+                calendar_sync_enabled: row.get(18)?,
             })
         },
     ).map_err(|e| match e {
@@ -141,8 +149,8 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
     }
 
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             id,
             config.display_name,
@@ -161,6 +169,7 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.jmap_auth_method,
             config.oidc_token_endpoint,
             config.oidc_client_id,
+            config.calendar_sync_enabled,
         ],
     )?;
     Ok(())
@@ -180,8 +189,9 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
          caldav_url=?10, username=?11, use_tls=?12, signature=?13,
          jmap_auth_method=?14, oidc_token_endpoint=?15, oidc_client_id=?16,
+         calendar_sync_enabled=?17,
          updated_at=CURRENT_TIMESTAMP
-         WHERE id=?17",
+         WHERE id=?18",
         params![
             config.display_name,
             config.email,
@@ -199,6 +209,7 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.jmap_auth_method,
             config.oidc_token_endpoint,
             config.oidc_client_id,
+            config.calendar_sync_enabled,
             id,
         ],
     )?;
@@ -246,6 +257,7 @@ mod tests {
                 jmap_auth_method TEXT NOT NULL DEFAULT 'basic',
                 oidc_token_endpoint TEXT NOT NULL DEFAULT '',
                 oidc_client_id TEXT NOT NULL DEFAULT '',
+                calendar_sync_enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -278,6 +290,7 @@ mod tests {
             jmap_auth_method: "basic".to_string(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
+            calendar_sync_enabled: true,
         }
     }
 
@@ -414,6 +427,26 @@ mod tests {
 
         let full = get_account_full(&conn, &id).unwrap();
         assert_eq!(full.signature, "-- \nAlice S.");
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    #[test]
+    fn test_calendar_sync_enabled_defaults_true_and_persists_toggle() {
+        let conn = setup_db();
+        let id = unique_id();
+        let config = make_config("alice@example.com", "Alice");
+        assert!(config.calendar_sync_enabled);
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert!(full.calendar_sync_enabled);
+
+        let mut updated = config.clone();
+        updated.calendar_sync_enabled = false;
+        update_account(&conn, &id, &updated).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert!(!full.calendar_sync_enabled);
         crate::keyring::delete_password(&id).ok();
     }
 

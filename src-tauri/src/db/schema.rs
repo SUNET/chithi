@@ -292,6 +292,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE folders ADD COLUMN uid_next INTEGER DEFAULT 0;")?;
     }
 
+    // Add calendar_sync_enabled column for per-account calendar-sync toggle
+    let has_calendar_sync_enabled: bool = conn
+        .prepare("SELECT calendar_sync_enabled FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_calendar_sync_enabled {
+        log::info!("Migration: adding calendar_sync_enabled column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN calendar_sync_enabled INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+
     // Populate FTS index for existing messages (one-time migration)
     if !has_migration(conn, "fts5_initial_populate") {
         log::info!("Migration: populating FTS5 index for existing messages");

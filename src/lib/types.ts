@@ -121,6 +121,7 @@ export interface AccountConfig {
   jmap_auth_method: "basic" | "oidc";
   oidc_token_endpoint: string;
   oidc_client_id: string;
+  calendar_sync_enabled: boolean;
 }
 
 export interface FilterRule {

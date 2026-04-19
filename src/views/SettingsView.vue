@@ -43,6 +43,7 @@ const defaultForm = (): AccountConfig => ({
   jmap_auth_method: "basic",
   oidc_token_endpoint: "",
   oidc_client_id: "",
+  calendar_sync_enabled: true,
 });
 
 const form = ref<AccountConfig>(defaultForm());
@@ -562,6 +563,20 @@ async function doDelete() {
                 placeholder="-- &#10;Your Name&#10;Your Title"
               ></textarea>
             </div>
+
+            <div class="form-group form-group-checkbox">
+              <label class="checkbox-label">
+                <input
+                  v-model="form.calendar_sync_enabled"
+                  type="checkbox"
+                  data-testid="calendar-sync-enabled"
+                />
+                Enable calendar sync for this account
+              </label>
+              <p class="form-help">
+                When off, calendars and events are not fetched from the server. Existing calendar data remains available offline.
+              </p>
+            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-secondary" @click="cancelForm">Cancel</button>
@@ -914,6 +929,29 @@ async function doDelete() {
   border-radius: 6px;
   font-size: 12px;
   color: var(--color-text-muted);
+}
+
+.form-group-checkbox .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  margin-bottom: 4px;
+}
+
+.form-group-checkbox .checkbox-label input[type="checkbox"] {
+  width: auto;
+  height: auto;
+  margin: 0;
+}
+
+.form-group-checkbox .form-help {
+  margin: 0 0 0 24px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
 }
 
 .btn-primary {
