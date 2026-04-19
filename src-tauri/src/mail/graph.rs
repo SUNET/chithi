@@ -555,6 +555,14 @@ impl GraphClient {
             .collect())
     }
 
+    /// Rename a calendar via PATCH /me/calendars/{id}.
+    pub async fn rename_calendar(&self, calendar_id: &str, new_name: &str) -> Result<()> {
+        log::info!("Graph rename calendar: id={} -> {}", calendar_id, new_name);
+        let path = format!("/me/calendars/{}", urlencoding::encode(calendar_id));
+        self.patch_json(&path, &serde_json::json!({ "name": new_name }))
+            .await
+    }
+
     /// Fetch events in a time range via calendarView.
     /// Uses `Prefer: outlook.timezone="UTC"` so all times come back in UTC.
     pub async fn list_events(&self, start: &str, end: &str) -> Result<Vec<GraphCalendarEvent>> {

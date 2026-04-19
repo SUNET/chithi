@@ -38,6 +38,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             unread_count INTEGER DEFAULT 0,
             total_count INTEGER DEFAULT 0,
             uid_next INTEGER DEFAULT 0,
+            parent_id TEXT,
             UNIQUE(account_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);
@@ -301,6 +302,19 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE accounts ADD COLUMN calendar_sync_enabled INTEGER NOT NULL DEFAULT 1;",
         )?;
+    }
+
+    // Add parent_id column to folders. Existing DBs that were populated by
+    // older JMAP sync builds already had it; fresh installs didn't because
+    // the CREATE TABLE in initialize() was never updated to match. Without
+    // this column the first JMAP folder upsert fails with "no column named
+    // parent_id".
+    let has_folder_parent_id: bool = conn
+        .prepare("SELECT parent_id FROM folders LIMIT 0")
+        .is_ok();
+    if !has_folder_parent_id {
+        log::info!("Migration: adding parent_id column to folders table");
+        conn.execute_batch("ALTER TABLE folders ADD COLUMN parent_id TEXT;")?;
     }
 
     // Populate FTS index for existing messages (one-time migration)
