@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
+import { ask as tauriAsk, message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
@@ -316,24 +316,27 @@ onMounted(() => {
     event.preventDefault();
 
     try {
-      const result = await tauriMessage(
-        "You have unsaved changes. What would you like to do?",
+      // tauri-plugin-dialog does not expose a 3-button native prompt. Use
+      // ask() with Save Draft as the primary action; Discard (cancel side)
+      // also fires on Esc / window-close, matching the native convention.
+      const save = await tauriAsk(
+        "You have unsaved changes. Save this message as a draft?",
         {
           title: "Unsaved Changes",
           kind: "warning",
-          buttons: { yes: "Save Draft", no: "Discard", cancel: "Cancel" },
+          okLabel: "Save Draft",
+          cancelLabel: "Discard",
         },
       );
 
-      if (result === "Save Draft" || result === "Yes") {
+      if (save) {
         const saved = await saveDraft();
         if (saved) {
           await currentWindow.destroy();
         }
-      } else if (result === "Discard" || result === "No") {
+      } else {
         await currentWindow.destroy();
       }
-      // "Cancel" — do nothing, return to compose
     } catch (e) {
       console.error("Close dialog error:", e);
       await currentWindow.destroy();
