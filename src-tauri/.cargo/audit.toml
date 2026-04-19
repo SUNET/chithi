@@ -3,6 +3,9 @@
 # upstream-blocked RUSTSEC advisories. When an upstream fix ships (e.g. Tauri
 # migrates wry to webkit6gtk, or a transitive dep bumps a nom/rand version),
 # remove the entry and let CI flag any regression.
+#
+# Note: 22 IDs cover 23 findings because RUSTSEC-2026-0097 matches two crate
+# versions (rand 0.7.3 and rand 0.8.5) under the same advisory.
 ignore = [
     # --- gtk-rs GTK3 bindings, unmaintained. Transitive via
     # tauri -> wry -> webkit2gtk / gtk 0.18. Blocked on Tauri/wry migrating
@@ -22,7 +25,8 @@ ignore = [
     # --- transitive unmaintained deps pulled in by upstream crates
     "RUSTSEC-2024-0370", # proc-macro-error, via multiple build-time macro crates
     "RUSTSEC-2024-0384", # instant, via parking_lot and friends
-    "RUSTSEC-2025-0057", # fxhash, via nostalgic deps; no fix in our dep graph
+    "RUSTSEC-2025-0057", # fxhash, via selectors 0.24 -> kuchikiki -> tauri-utils.
+                        # Drops when Tauri swaps kuchikiki for a maintained HTML parser.
     "RUSTSEC-2025-0075", # unic-char-range, via idna_adapter
     "RUSTSEC-2025-0080", # unic-common
     "RUSTSEC-2025-0081", # unic-char-property
@@ -37,8 +41,10 @@ ignore = [
     "RUSTSEC-2026-0002", # lru 0.12 IterMut Stacked Borrows, via tantivy.
                         # Tantivy does not call iter_mut on its LRU cache in
                         # the code paths we use.
-    "RUSTSEC-2026-0097", # rand 0.7/0.8 custom-logger reseed race. Only
-                        # triggers when a user-supplied log::Log impl calls
-                        # rand::rng() during reseed; our logger (env_logger
-                        # via logging.rs) does not touch rand.
+    "RUSTSEC-2026-0097", # rand 0.7/0.8 custom-logger reseed race. Both rand
+                        # versions are build-dependencies only (via phf_codegen
+                        # / phf_macros in tauri-utils codegen), never linked
+                        # into the binary. Our runtime logger is fern (see
+                        # logging.rs) with only chrono + log as deps; it does
+                        # not touch rand.
 ]
