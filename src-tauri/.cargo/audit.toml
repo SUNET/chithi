@@ -1,0 +1,44 @@
+[advisories]
+# Each ignored advisory must also be tracked in the GitHub tracking issue for
+# upstream-blocked RUSTSEC advisories. When an upstream fix ships (e.g. Tauri
+# migrates wry to webkit6gtk, or a transitive dep bumps a nom/rand version),
+# remove the entry and let CI flag any regression.
+ignore = [
+    # --- gtk-rs GTK3 bindings, unmaintained. Transitive via
+    # tauri -> wry -> webkit2gtk / gtk 0.18. Blocked on Tauri/wry migrating
+    # off GTK3; there is no GTK3 fork we can swap in.
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    "RUSTSEC-2024-0429", # glib::VariantStrIter unsoundness (gtk-rs family)
+
+    # --- transitive unmaintained deps pulled in by upstream crates
+    "RUSTSEC-2024-0370", # proc-macro-error, via multiple build-time macro crates
+    "RUSTSEC-2024-0384", # instant, via parking_lot and friends
+    "RUSTSEC-2025-0057", # fxhash, via nostalgic deps; no fix in our dep graph
+    "RUSTSEC-2025-0075", # unic-char-range, via idna_adapter
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+
+    # --- soundness in transitive deps, not exploitable in our threat model
+    "RUSTSEC-2023-0086", # lexical-core 0.7.6, via imap 2.x -> nom 5. The
+                        # unsound float parser is not reached by IMAP parsing
+                        # (no floats). A future migration to imap 3.x would
+                        # drop this transitively.
+    "RUSTSEC-2026-0002", # lru 0.12 IterMut Stacked Borrows, via tantivy.
+                        # Tantivy does not call iter_mut on its LRU cache in
+                        # the code paths we use.
+    "RUSTSEC-2026-0097", # rand 0.7/0.8 custom-logger reseed race. Only
+                        # triggers when a user-supplied log::Log impl calls
+                        # rand::rng() during reseed; our logger (env_logger
+                        # via logging.rs) does not touch rand.
+]
