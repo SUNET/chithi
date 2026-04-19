@@ -412,7 +412,7 @@ function parseAddresses(input: string): string[] {
 
 function mentionsAttachment(): boolean {
   const text = (bodyText.value + "\n" + subject.value).toLowerCase();
-  return /\battach(ed|ment|ments|ing)?\b/.test(text);
+  return /\battach(ed|ment|ments|ement|ements|ing)?\b/.test(text);
 }
 
 async function send() {

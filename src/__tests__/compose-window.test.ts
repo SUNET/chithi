@@ -256,7 +256,7 @@ describe("Compose dirty tracking", () => {
 describe("Attachment mention detection", () => {
   function mentionsAttachment(body: string, subject = ""): boolean {
     const text = (body + "\n" + subject).toLowerCase();
-    return /\battach(ed|ment|ments|ing)?\b/.test(text);
+    return /\battach(ed|ment|ments|ement|ements|ing)?\b/.test(text);
   }
 
   it("detects 'attached' in body", () => {
@@ -277,6 +277,14 @@ describe("Attachment mention detection", () => {
 
   it("detects 'attach' in body", () => {
     expect(mentionsAttachment("Let me attach the file.")).toBe(true);
+  });
+
+  it("detects 'attachement' misspelling", () => {
+    expect(mentionsAttachment("Please find the attachement below.")).toBe(true);
+  });
+
+  it("detects 'attachements' misspelling", () => {
+    expect(mentionsAttachment("The attachements are included.")).toBe(true);
   });
 
   it("detects mention in subject", () => {
