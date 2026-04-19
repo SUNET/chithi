@@ -668,6 +668,22 @@ pub async fn sync_calendars(
 ) -> Result<()> {
     log::info!("sync_calendars: account={}", account_id);
 
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    // Gate on the per-account toggle before any side effects. Running the
+    // force_full_sync token-clearing below for a disabled account would
+    // make the *next* sync after re-enabling do an unnecessary full sync.
+    if !account.calendar_sync_enabled {
+        log::info!(
+            "sync_calendars: skipping account {} (calendar sync disabled)",
+            account_id
+        );
+        return Ok(());
+    }
+
     // When force_full_sync is true (manual Sync button), clear Google/O365
     // sync tokens to force a full sync that reconciles server-side deletions.
     if force_full_sync.unwrap_or(false) {
@@ -685,11 +701,6 @@ pub async fn sync_calendars(
             account_id
         );
     }
-
-    let account = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)?
-    };
 
     if account.mail_protocol == "jmap" {
         sync_calendars_jmap(&state, &account_id, &account).await?;
