@@ -589,6 +589,7 @@ dependencies = [
  "imap",
  "imap-proto",
  "jmap-client",
+ "jni",
  "keyring",
  "lettre",
  "libc",

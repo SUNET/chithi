@@ -32,6 +32,8 @@ pub fn run() {
             log::info!("Starting Emails application");
             log::info!("Data directory: {}", data_dir.display());
 
+            oauth::init_token_store(&data_dir)?;
+
             let app_state = AppState::new(data_dir)?;
             app.manage(app_state);
             Ok(())
@@ -78,6 +80,7 @@ pub fn run() {
             commands::oauth::oauth_get_ms_profile,
             commands::oauth::jmap_oidc_start,
             commands::oauth::jmap_oidc_complete,
+            commands::oauth::open_oauth_url,
             commands::actions::move_messages,
             commands::actions::move_messages_cross_account,
             commands::actions::delete_messages,

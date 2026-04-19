@@ -56,6 +56,7 @@ libc = "0.2"
 # Mobile (Android) — compile OpenSSL from source since the NDK doesn't ship one.
 [target.'cfg(target_os = "android")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+jni = "0.21"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

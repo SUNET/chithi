@@ -518,6 +518,10 @@ export async function jmapOidcComplete(
   });
 }
 
+export async function openOauthUrl(url: string): Promise<void> {
+  return invoke("open_oauth_url", { url });
+}
+
 export async function listTimezones(): Promise<string[]> {
   return invoke("list_timezones");
 }

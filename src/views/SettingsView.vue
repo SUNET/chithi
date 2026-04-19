@@ -311,7 +311,15 @@ async function startJmapOidc() {
     if (!verificationUrl.startsWith("https://") && !verificationUrl.startsWith("http://")) {
       throw new Error(`Unexpected verification URL scheme: ${verificationUrl}`);
     }
-    await openUrl(verificationUrl);
+    // Android: hop through a Chrome Custom Tab so the app stays foreground.
+    // iOS / desktop: the JS plugin-opener path already goes through
+    // UIApplication/OS defaults correctly; its Rust free-function equivalent
+    // shells out to `uiopen` on iOS which doesn't exist on the simulator.
+    if (platformStore.kind === "android") {
+      await api.openOauthUrl(verificationUrl);
+    } else {
+      await openUrl(verificationUrl);
+    }
 
     // Poll until user completes authorization (this blocks)
     await api.jmapOidcComplete(

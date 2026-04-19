@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::State;
+use tauri::{AppHandle, Runtime, State};
+#[cfg(target_os = "android")]
+use tauri::Manager;
 
 use crate::error::{Error, Result};
 use crate::oauth;
@@ -323,4 +325,64 @@ pub async fn jmap_oidc_complete(
         account_id
     );
     Ok(())
+}
+
+/// Open an OAuth verification URL in a way that keeps the host app foreground.
+///
+/// Android: launches an `androidx.browser.customtabs.CustomTabsIntent` against
+/// the MainActivity, which overlays the tab on top of the app so the device
+/// process isn't paused while the user is authorizing.
+///
+/// Other platforms: defers to `tauri_plugin_opener::open_url`.
+#[tauri::command]
+pub async fn open_oauth_url<R: Runtime>(app: AppHandle<R>, url: String) -> Result<()> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(Error::Other(format!(
+            "Refusing to open non-http(s) URL: {}",
+            url
+        )));
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        use jni::objects::{JObject, JValue};
+        use jni::JNIEnv;
+
+        let webview_window = app
+            .get_webview_window("main")
+            .ok_or_else(|| Error::Other("No main webview window".into()))?;
+        let url_for_jni = url.clone();
+        webview_window
+            .with_webview(move |platform_webview| {
+                platform_webview.jni_handle().exec(
+                    move |env: &mut JNIEnv, activity: &JObject, _webview: &JObject| {
+                        let j_url = match env.new_string(&url_for_jni) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::error!("openCustomTab: new_string failed: {e}");
+                                return;
+                            }
+                        };
+                        let j_obj: &JObject = j_url.as_ref();
+                        if let Err(e) = env.call_method(
+                            activity,
+                            "openCustomTab",
+                            "(Ljava/lang/String;)V",
+                            &[JValue::Object(j_obj)],
+                        ) {
+                            log::error!("openCustomTab call failed: {e}");
+                        }
+                    },
+                );
+            })
+            .map_err(|e| Error::Other(format!("with_webview failed: {}", e)))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        tauri_plugin_opener::open_url(&url, None::<&str>)
+            .map_err(|e| Error::Other(format!("open_url failed: {}", e)))
+    }
 }
