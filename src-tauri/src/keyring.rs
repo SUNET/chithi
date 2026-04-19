@@ -24,7 +24,10 @@ pub fn get_password(account_id: &str) -> Result<Option<String>> {
     match entry.get_password() {
         Ok(pw) => Ok(Some(pw)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(Error::Keyring(format!("Failed to retrieve password: {}", e))),
+        Err(e) => Err(Error::Keyring(format!(
+            "Failed to retrieve password: {}",
+            e
+        ))),
     }
 }
 
