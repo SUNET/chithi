@@ -322,7 +322,7 @@ onUnmounted(() => {
       </template>
     </MobileAppBar>
     <div class="mobile-message-list">
-      <MessageList @open-message="onMobileOpenMessage" />
+      <MessageList mode="mobile" @open-message="onMobileOpenMessage" />
     </div>
     <button
       class="compose-fab"

@@ -64,6 +64,10 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   if (to.name === "onboarding") return true;
   if (to.name === "compose" || to.name === "reader") return true;
+  // Onboarding hands off to Settings with ?addAccount=<provider> — let it
+  // through even with zero accounts, otherwise the first-run provider tap
+  // would bounce right back to /onboarding.
+  if (to.name === "settings" && to.query.addAccount) return true;
 
   const params = new URLSearchParams(window.location.search);
   if (params.get("messageId") || params.get("draftId")) return true;
