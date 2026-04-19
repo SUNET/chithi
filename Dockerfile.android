@@ -1,0 +1,106 @@
+# Android APK build environment for Tauri mobile
+# Usage: docker build -f Dockerfile.android -t chithi-android .
+#        docker run --rm -v "$PWD/out:/out" chithi-android
+#
+# Output: the debug-signed APK(s) are copied to ./out on container exit.
+# Swap `--debug` below for release signing once a keystore is wired up.
+ARG BASE_IMAGE=debian:13
+FROM ${BASE_IMAGE}
+
+# Package version (can be overridden for proper versioning).
+ARG PKG_VERSION=""
+
+# Android toolchain pins. Bump these together; Tauri 2 needs the NDK and
+# SDK to sit side-by-side with a recent JDK.
+ARG ANDROID_CMDLINE_TOOLS_VERSION=11076708
+ARG ANDROID_PLATFORM=android-34
+ARG ANDROID_BUILD_TOOLS=34.0.0
+ARG ANDROID_NDK_VERSION=27.0.12077973
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CI=true
+
+# System packages: JDK, build essentials, and utilities for fetching and
+# extracting the Android SDK.
+RUN apt-get update && apt-get install -y \
+    openjdk-21-jdk-headless \
+    build-essential \
+    pkg-config \
+    curl \
+    wget \
+    unzip \
+    ca-certificates \
+    gnupg \
+    jq \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 from NodeSource so pnpm / vite don't hit the old system node.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g pnpm
+
+# Rust + Android cross-compile targets.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add \
+    aarch64-linux-android \
+    armv7-linux-androideabi \
+    i686-linux-android \
+    x86_64-linux-android
+
+# Android SDK + NDK, versions pinned above for reproducibility.
+ENV ANDROID_HOME="/opt/android-sdk"
+ENV ANDROID_SDK_ROOT="${ANDROID_HOME}"
+ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+
+RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
+    && cd "${ANDROID_HOME}/cmdline-tools" \
+    && wget -q "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" -O tools.zip \
+    && unzip -q tools.zip \
+    && mv cmdline-tools latest \
+    && rm tools.zip
+
+RUN yes | sdkmanager --licenses >/dev/null \
+    && sdkmanager \
+        "platform-tools" \
+        "platforms;${ANDROID_PLATFORM}" \
+        "build-tools;${ANDROID_BUILD_TOOLS}" \
+        "ndk;${ANDROID_NDK_VERSION}"
+
+ENV NDK_HOME="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+ENV ANDROID_NDK_HOME="${NDK_HOME}"
+ENV NDK_TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+ENV PATH="${NDK_TOOLCHAIN}/bin:${PATH}"
+
+# openssl-sys's vendored build calls the target-prefixed ar/ranlib/strip
+# (e.g. aarch64-linux-android-ranlib), but recent NDKs only ship generic
+# llvm-ar / llvm-ranlib / llvm-strip / llvm-nm. Symlink the expected names
+# so the OpenSSL Makefile doesn't fall over mid-build.
+RUN cd "${NDK_TOOLCHAIN}/bin" \
+    && for target in aarch64-linux-android armv7-linux-androideabi armv7a-linux-androideabi i686-linux-android x86_64-linux-android; do \
+        for tool in ar ranlib strip nm; do \
+            test -e "${target}-${tool}" || ln -s "llvm-${tool}" "${target}-${tool}"; \
+        done; \
+    done
+
+WORKDIR /app
+
+COPY . .
+
+RUN if [ -n "$PKG_VERSION" ]; then \
+        echo "Setting package version to: $PKG_VERSION"; \
+        jq --arg v "$PKG_VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json \
+        && mv tmp.json src-tauri/tauri.conf.json; \
+    fi
+
+RUN pnpm install
+
+# Build the Android APK(s). Debug-signed so the output is installable via
+# `adb install` without extra keystore setup.
+RUN pnpm tauri android build --apk --debug
+
+# Copy every APK the Android Gradle build produced into /out on run.
+CMD ["sh", "-c", "mkdir -p /out && find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -exec cp -v {} /out/ \\;"]
