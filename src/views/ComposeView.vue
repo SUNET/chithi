@@ -316,16 +316,19 @@ onMounted(() => {
     event.preventDefault();
 
     try {
-      // tauri-plugin-dialog does not expose a 3-button native prompt. Use
-      // ask() with Save Draft as the primary action; Discard (cancel side)
-      // also fires on Esc / window-close, matching the native convention.
+      // tauri-plugin-dialog does not expose a 3-button native prompt, so
+      // fake it with a two-step ask() flow. Step 1: save or not? Step 2 (if
+      // not saving): really discard? Cancel on the second step returns to
+      // the composer instead of destroying the window. Default on any
+      // exception is also stay-open so a dialog failure cannot silently
+      // drop the user's work.
       const save = await tauriAsk(
         "You have unsaved changes. Save this message as a draft?",
         {
           title: "Unsaved Changes",
           kind: "warning",
           okLabel: "Save Draft",
-          cancelLabel: "Discard",
+          cancelLabel: "No",
         },
       );
 
@@ -334,12 +337,27 @@ onMounted(() => {
         if (saved) {
           await currentWindow.destroy();
         }
-      } else {
+        // If save failed, saveDraft() already surfaced an error; stay open.
+        return;
+      }
+
+      const discard = await tauriAsk(
+        "Discard your changes and close without saving?",
+        {
+          title: "Discard Changes",
+          kind: "warning",
+          okLabel: "Discard",
+          cancelLabel: "Cancel",
+        },
+      );
+      if (discard) {
         await currentWindow.destroy();
       }
+      // Cancel on the second step: stay in the composer.
     } catch (e) {
       console.error("Close dialog error:", e);
-      await currentWindow.destroy();
+      error.value =
+        "Could not show the save prompt. Use the Save button or try closing again.";
     }
   });
 });
@@ -431,17 +449,26 @@ async function send() {
   // Check for missing attachments. tauri-plugin-dialog does not expose a
   // three-button native prompt, so the previous Send/Attach/Cancel dialog
   // was silently broken. Two buttons: the user can still attach manually
-  // via the toolbar after Cancel.
+  // via the toolbar after Cancel. On dialog failure, cancel the send so a
+  // broken prompt cannot turn into an accidental send-without-attachment.
   if (attachments.value.length === 0 && mentionsAttachment()) {
-    const sendAnyway = await tauriAsk(
-      "Your message mentions an attachment, but no files are attached. Send anyway?",
-      {
-        title: "No Attachments",
-        kind: "warning",
-        okLabel: "Send Anyway",
-        cancelLabel: "Cancel",
-      },
-    );
+    let sendAnyway: boolean;
+    try {
+      sendAnyway = await tauriAsk(
+        "Your message mentions an attachment, but no files are attached. Send anyway?",
+        {
+          title: "No Attachments",
+          kind: "warning",
+          okLabel: "Send Anyway",
+          cancelLabel: "Cancel",
+        },
+      );
+    } catch (e) {
+      console.error("No-attachment dialog error:", e);
+      error.value =
+        "Could not show the attachment warning. Please attach files or remove the mention and try again.";
+      return;
+    }
     if (!sendAnyway) {
       return;
     }
