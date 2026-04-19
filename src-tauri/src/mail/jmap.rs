@@ -1007,9 +1007,13 @@ impl JmapConnection {
     ) -> Result<()> {
         log::info!("JMAP rename calendar: id={} -> {}", calendar_id, new_name);
 
-        let update = serde_json::json!({
-            calendar_id: { "name": new_name }
-        });
+        // Build the update map by hand: `serde_json::json!({ calendar_id: ... })`
+        // would emit the literal key "calendar_id", not the id's value.
+        let mut update = serde_json::Map::new();
+        update.insert(
+            calendar_id.to_string(),
+            serde_json::json!({ "name": new_name }),
+        );
 
         let request = serde_json::json!({
             "using": [

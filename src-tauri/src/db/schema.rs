@@ -38,6 +38,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             unread_count INTEGER DEFAULT 0,
             total_count INTEGER DEFAULT 0,
             uid_next INTEGER DEFAULT 0,
+            parent_id TEXT,
             UNIQUE(account_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);

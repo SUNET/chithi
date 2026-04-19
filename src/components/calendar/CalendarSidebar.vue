@@ -380,7 +380,7 @@ async function unsubscribeThisCalendar() {
     <Teleport to="body">
       <div
         v-if="renaming"
-        class="modal-overlay"
+        class="cal-rename-overlay"
         data-testid="calendar-rename-modal"
         @click.self="cancelRename"
       >
@@ -701,7 +701,7 @@ async function unsubscribeThisCalendar() {
   background: var(--color-bg-hover);
 }
 
-.modal-overlay {
+.cal-rename-overlay {
   position: fixed;
   top: 0;
   left: 0;
