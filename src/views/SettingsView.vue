@@ -670,7 +670,7 @@ async function doDelete() {
   border: 1px solid var(--color-border);
   border-left: 4px solid var(--acct-color, var(--color-accent));
   border-radius: var(--radius);
-  background: #fff;
+  background: var(--color-bg-secondary);
   box-shadow: var(--shadow-sm);
   min-height: 100px;
 }
