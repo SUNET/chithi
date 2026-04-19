@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask as tauriAsk, message as tauriMessage } from "@tauri-apps/plugin-dialog";
+import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
 import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
@@ -428,24 +428,23 @@ async function send() {
     return;
   }
 
-  // Check for missing attachments
+  // Check for missing attachments. tauri-plugin-dialog does not expose a
+  // three-button native prompt, so the previous Send/Attach/Cancel dialog
+  // was silently broken. Two buttons: the user can still attach manually
+  // via the toolbar after Cancel.
   if (attachments.value.length === 0 && mentionsAttachment()) {
-    const result = await tauriMessage(
-      'Your message mentions an attachment, but no files are attached. Send anyway?',
+    const sendAnyway = await tauriAsk(
+      "Your message mentions an attachment, but no files are attached. Send anyway?",
       {
         title: "No Attachments",
         kind: "warning",
-        buttons: { yes: "Send Anyway", no: "Attach Files", cancel: "Cancel" },
+        okLabel: "Send Anyway",
+        cancelLabel: "Cancel",
       },
     );
-    if (result === "Attach Files" || result === "No") {
-      await addAttachment();
+    if (!sendAnyway) {
       return;
     }
-    if (result === "Cancel") {
-      return;
-    }
-    // "Send Anyway" / "Yes" — proceed
   }
 
   sending.value = true;
