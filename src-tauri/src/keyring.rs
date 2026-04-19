@@ -15,12 +15,17 @@ pub fn set_password(account_id: &str, password: &str) -> Result<()> {
 }
 
 /// Retrieve the password for the given account ID from the system keyring.
-pub fn get_password(account_id: &str) -> Result<String> {
+/// Returns `Ok(None)` when no entry exists (expected for OIDC/OAuth accounts
+/// whose credential material lives under a different service name), and
+/// `Err` only for real keyring failures (locked, IPC broken, etc.).
+pub fn get_password(account_id: &str) -> Result<Option<String>> {
     let entry = keyring::Entry::new(SERVICE, account_id)
         .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
-    entry
-        .get_password()
-        .map_err(|e| Error::Keyring(format!("Failed to retrieve password: {}", e)))
+    match entry.get_password() {
+        Ok(pw) => Ok(Some(pw)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(Error::Keyring(format!("Failed to retrieve password: {}", e))),
+    }
 }
 
 /// Delete the password for the given account ID from the system keyring.

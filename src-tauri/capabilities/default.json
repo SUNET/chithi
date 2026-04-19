@@ -11,7 +11,8 @@
     "core:window:allow-set-focus",
     "core:window:allow-set-decorations",
     "notification:default",
-    "shell:allow-open",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
     "dialog:allow-message",
     "os:allow-platform"
   ]

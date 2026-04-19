@@ -7,7 +7,7 @@ import { usePlatformStore } from "@/stores/platform";
 import { useUiStore } from "@/stores/ui";
 import type { AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
-import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import PasswordInput from "@/components/common/PasswordInput.vue";
 import { acctColor } from "@/lib/account-colors";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
@@ -236,7 +236,7 @@ async function startGoogleOAuth() {
     const { url, port } = await api.oauthStart("google");
 
     // Open browser
-    await shellOpen(url);
+    await openUrl(url);
 
     // Wait for callback (this blocks until user completes in browser)
     await api.oauthComplete("google", port, tempAccountId);
@@ -260,7 +260,7 @@ async function startMicrosoftOAuth() {
     const tempAccountId = editingAccountId.value ?? `o365-pending-${Date.now()}`;
 
     const { url, port } = await api.oauthStart("microsoft");
-    await shellOpen(url);
+    await openUrl(url);
     await api.oauthComplete("microsoft", port, tempAccountId);
 
     // Auto-fill display name and email from Microsoft Graph /me
@@ -307,11 +307,11 @@ async function startJmapOidc() {
 
     // Show the user code and open browser to verification URL
     oidcUserCode.value = result.user_code;
-    const openUrl = result.verification_uri_complete ?? result.verification_uri;
-    if (!openUrl.startsWith("https://") && !openUrl.startsWith("http://")) {
-      throw new Error(`Unexpected verification URL scheme: ${openUrl}`);
+    const verificationUrl = result.verification_uri_complete ?? result.verification_uri;
+    if (!verificationUrl.startsWith("https://") && !verificationUrl.startsWith("http://")) {
+      throw new Error(`Unexpected verification URL scheme: ${verificationUrl}`);
     }
-    await shellOpen(openUrl);
+    await openUrl(verificationUrl);
 
     // Poll until user completes authorization (this blocks)
     await api.jmapOidcComplete(
