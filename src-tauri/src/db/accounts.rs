@@ -431,6 +431,30 @@ mod tests {
     }
 
     #[test]
+    fn test_calendar_sync_enabled_serde_default_true() {
+        // Older renderers may send AccountConfig payloads without the new
+        // calendar_sync_enabled field; the serde default must yield true so
+        // existing accounts keep syncing calendars.
+        let json = r#"{
+            "display_name": "Alice",
+            "email": "a@example.com",
+            "provider": "generic",
+            "mail_protocol": "imap",
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "jmap_url": "",
+            "caldav_url": "",
+            "username": "u",
+            "password": "p",
+            "use_tls": true
+        }"#;
+        let cfg: AccountConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.calendar_sync_enabled);
+    }
+
+    #[test]
     fn test_calendar_sync_enabled_defaults_true_and_persists_toggle() {
         let conn = setup_db();
         let id = unique_id();
