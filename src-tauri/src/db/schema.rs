@@ -308,8 +308,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // the CREATE TABLE in initialize() was never updated to match. Without
     // this column the first JMAP folder upsert fails with "no column named
     // parent_id".
-    let has_folder_parent_id: bool =
-        conn.prepare("SELECT parent_id FROM folders LIMIT 0").is_ok();
+    let has_folder_parent_id: bool = conn
+        .prepare("SELECT parent_id FROM folders LIMIT 0")
+        .is_ok();
     if !has_folder_parent_id {
         log::info!("Migration: adding parent_id column to folders table");
         conn.execute_batch("ALTER TABLE folders ADD COLUMN parent_id TEXT;")?;
