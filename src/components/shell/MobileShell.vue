@@ -19,7 +19,7 @@ const hideTabBarRoutes = new Set(["reader", "compose", "onboarding"]);
 const showTabBar = computed(() => {
   if (composeOpen.value) return false;
   if (hideTabBarRoutes.has(String(route.name))) return false;
-  // The reader detail route uses `/mail/thread/:id` (name: "reader")
+  // The mobile thread detail route uses `/mail/thread/:id` (name: "mobile-reader")
   if (route.path.startsWith("/mail/thread/")) return false;
   return true;
 });
