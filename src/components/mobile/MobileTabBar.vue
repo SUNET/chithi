@@ -37,14 +37,13 @@ function onTabClick(tab: Tab) {
 </script>
 
 <template>
-  <nav class="mobile-tab-bar" role="tablist" aria-label="Primary">
+  <nav class="mobile-tab-bar" aria-label="Primary">
     <button
       v-for="t in tabs"
       :key="t.id"
       class="mobile-tab"
       :class="{ active: active === t.id }"
-      role="tab"
-      :aria-selected="active === t.id"
+      :aria-current="active === t.id ? 'page' : undefined"
       :aria-label="t.label"
       @click="onTabClick(t)"
     >
