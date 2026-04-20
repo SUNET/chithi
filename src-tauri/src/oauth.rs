@@ -158,9 +158,9 @@ pub fn get_auth_url(
         url.push_str("&access_type=offline&prompt=consent");
     }
 
-    // Microsoft needs prompt=consent for first-time consent
+    // Microsoft: show account picker but honor existing consent (admin or user).
     if provider.name == "microsoft" {
-        url.push_str("&prompt=consent");
+        url.push_str("&prompt=select_account");
     }
 
     Ok((url, listener, code_verifier, state))
