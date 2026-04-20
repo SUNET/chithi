@@ -34,9 +34,11 @@ async function onMobileSwipeArchive(messageId: string) {
   // disappears from the unread filter).
   const accountId = accountsStore.activeAccountId;
   if (!accountId) return;
-  const archive = foldersStore.folders.find(
-    (f) => f.path.toLowerCase() === "archive" || f.name.toLowerCase() === "archive",
-  );
+  // Use the backend-normalized folder_type so we match archive folders
+  // across providers/locales (e.g. "All Mail", "Archiv", nested paths).
+  const archive = foldersStore
+    .getFlatFolders()
+    .find((f) => f.folder_type === "archive");
   if (!archive) {
     // Fallback: mark as read.
     try {
