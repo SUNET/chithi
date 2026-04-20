@@ -1,15 +1,40 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { useRouter } from "vue-router";
+import { ref, computed, onMounted } from "vue";
+import { useRouter, useRoute } from "vue-router";
+import { storeToRefs } from "pinia";
 import { useAccountsStore } from "@/stores/accounts";
+import { usePlatformStore } from "@/stores/platform";
+import { useUiStore } from "@/stores/ui";
 import type { AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
-import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import PasswordInput from "@/components/common/PasswordInput.vue";
 import { acctColor } from "@/lib/account-colors";
+import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 
 const router = useRouter();
+const route = useRoute();
 const accountsStore = useAccountsStore();
+const platformStore = usePlatformStore();
+const uiStore = useUiStore();
+const { isMobile } = storeToRefs(platformStore);
+
+function accountTypeLabel(acc: { provider?: string; mail_protocol?: string }): string {
+  if (acc.provider === "gmail") return "GMAIL";
+  if (acc.provider === "o365") return "MICROSOFT 365";
+  return (acc.mail_protocol ?? "").toUpperCase();
+}
+
+// Mobile toggles — persist to localStorage so they survive reloads.
+const blockRemoteImages = ref(localStorage.getItem("chithi-block-remote-images") !== "false");
+function setBlockRemoteImages(v: boolean) {
+  blockRemoteImages.value = v;
+  localStorage.setItem("chithi-block-remote-images", String(v));
+}
+
+const themeLabel = computed(() =>
+  uiStore.theme === "dark" ? "Dark" : "Light",
+);
 const showForm = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingAccountId = ref<string | null>(null);
@@ -211,7 +236,7 @@ async function startGoogleOAuth() {
     const { url, port } = await api.oauthStart("google");
 
     // Open browser
-    await shellOpen(url);
+    await openUrl(url);
 
     // Wait for callback (this blocks until user completes in browser)
     await api.oauthComplete("google", port, tempAccountId);
@@ -235,7 +260,7 @@ async function startMicrosoftOAuth() {
     const tempAccountId = editingAccountId.value ?? `o365-pending-${Date.now()}`;
 
     const { url, port } = await api.oauthStart("microsoft");
-    await shellOpen(url);
+    await openUrl(url);
     await api.oauthComplete("microsoft", port, tempAccountId);
 
     // Auto-fill display name and email from Microsoft Graph /me
@@ -282,11 +307,19 @@ async function startJmapOidc() {
 
     // Show the user code and open browser to verification URL
     oidcUserCode.value = result.user_code;
-    const openUrl = result.verification_uri_complete ?? result.verification_uri;
-    if (!openUrl.startsWith("https://") && !openUrl.startsWith("http://")) {
-      throw new Error(`Unexpected verification URL scheme: ${openUrl}`);
+    const verificationUrl = result.verification_uri_complete ?? result.verification_uri;
+    if (!verificationUrl.startsWith("https://") && !verificationUrl.startsWith("http://")) {
+      throw new Error(`Unexpected verification URL scheme: ${verificationUrl}`);
     }
-    await shellOpen(openUrl);
+    // Android: hop through a Chrome Custom Tab so the app stays foreground.
+    // iOS / desktop: the JS plugin-opener path already goes through
+    // UIApplication/OS defaults correctly; its Rust free-function equivalent
+    // shells out to `uiopen` on iOS which doesn't exist on the simulator.
+    if (platformStore.kind === "android") {
+      await api.openOauthUrl(verificationUrl);
+    } else {
+      await openUrl(verificationUrl);
+    }
 
     // Poll until user completes authorization (this blocks)
     await api.jmapOidcComplete(
@@ -321,10 +354,135 @@ async function doDelete() {
   showDeleteConfirm.value = false;
   deletingAccountId.value = null;
 }
+
+// Onboarding hands off via ?addAccount=<provider>. Auto-open the new-account
+// form with the matching provider preselected.
+onMounted(() => {
+  const want = route.query.addAccount;
+  if (typeof want !== "string") return;
+  const mapped: Record<string, AccountType> = {
+    jmap: "jmap",
+    microsoft365: "o365",
+    o365: "o365",
+    gmail: "gmail",
+    imap: "imap",
+    caldav: "caldav",
+  };
+  const type = mapped[want];
+  if (!type) return;
+  openNewForm();
+  selectAccountType(type);
+});
 </script>
 
 <template>
-  <div class="settings-view">
+  <!-- Mobile: section-card layout with uppercase muted labels -->
+  <div v-if="isMobile" class="settings-view mobile">
+    <MobileAppBar large title="Settings" />
+
+    <div class="mobile-scroll">
+      <!-- Accounts -->
+      <div class="section">
+        <div class="section-label">Accounts</div>
+        <div class="section-card">
+          <button
+            v-for="account in accountsStore.accounts"
+            :key="account.id"
+            class="mobile-account-row"
+            :style="{ ['--acct-color']: acctColor(account.id).fill }"
+            @click="openEditForm(account.id)"
+          >
+            <span class="mobile-account-avatar" :style="{ background: acctColor(account.id).fill }">
+              {{ getInitials(account.display_name) }}
+            </span>
+            <span class="mobile-account-info">
+              <span class="mobile-account-name">{{ account.display_name }}</span>
+              <span class="mobile-account-email">{{ account.email }}</span>
+              <span class="mobile-account-type" :style="{ color: acctColor(account.id).fill }">
+                {{ accountTypeLabel(account) }}
+              </span>
+            </span>
+            <svg class="mobile-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+          <button class="mobile-add-account" @click="openNewForm">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="8.5" cy="7" r="4" />
+              <line x1="20" y1="8" x2="20" y2="14" />
+              <line x1="23" y1="11" x2="17" y2="11" />
+            </svg>
+            <span>Add account</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- General -->
+      <div class="section">
+        <div class="section-label">General</div>
+        <div class="section-card">
+          <button class="mobile-setting-row" @click="uiStore.setTheme(uiStore.theme === 'dark' ? 'light' : 'dark')">
+            <span class="mobile-setting-label">Appearance</span>
+            <span class="mobile-setting-value">{{ themeLabel }}</span>
+            <svg class="mobile-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+          <div class="mobile-setting-row static">
+            <span class="mobile-setting-label">Time format</span>
+            <span class="mobile-setting-value">
+              {{ uiStore.timeFormat === "auto" ? "Auto" : uiStore.timeFormat === "12" ? "12-hour" : "24-hour" }}
+            </span>
+          </div>
+          <div class="mobile-setting-row static">
+            <span class="mobile-setting-label">Default account</span>
+            <span class="mobile-setting-value">
+              {{ accountsStore.activeAccount()?.email ?? "—" }}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Privacy & storage -->
+      <div class="section">
+        <div class="section-label">Privacy &amp; storage</div>
+        <div class="section-card">
+          <label class="mobile-setting-row toggle">
+            <span class="mobile-setting-label">Block remote images</span>
+            <input
+              type="checkbox"
+              class="toggle-input"
+              :checked="blockRemoteImages"
+              @change="setBlockRemoteImages(($event.target as HTMLInputElement).checked)"
+            />
+            <span class="toggle-pill" :class="{ on: blockRemoteImages }">
+              <span class="toggle-thumb"></span>
+            </span>
+          </label>
+          <div class="mobile-setting-row static">
+            <span class="mobile-setting-label">Cache size</span>
+            <span class="mobile-setting-value">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- About -->
+      <div class="section">
+        <div class="section-label">About</div>
+        <div class="section-card">
+          <div class="mobile-setting-row static">
+            <span class="mobile-setting-label">Version</span>
+            <span class="mobile-setting-value">0.1.0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Desktop -->
+  <div v-else class="settings-view">
     <div class="settings-content">
       <h1 class="settings-title">Settings</h1>
 
@@ -367,9 +525,10 @@ async function doDelete() {
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- Add/Edit Account Modal -->
-    <Teleport to="body">
+  <!-- Add/Edit Account Modal (shared by mobile + desktop) -->
+  <Teleport to="body">
       <div v-if="showForm" class="modal-overlay" @click.self="cancelForm">
         <div class="modal">
           <div class="modal-header">
@@ -603,7 +762,6 @@ async function doDelete() {
         </div>
       </div>
     </Teleport>
-  </div>
 </template>
 
 <style scoped>
@@ -1099,5 +1257,278 @@ async function doDelete() {
 .device-code-hint {
   font-size: 12px;
   color: var(--color-text-muted);
+}
+
+/* ============================================================
+   Mobile layout
+   ============================================================ */
+.settings-view.mobile {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  background: var(--color-bg-secondary);
+  overflow: hidden;
+}
+
+.mobile-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 14px 40px;
+}
+
+.section {
+  margin-top: 18px;
+}
+
+.section:first-child {
+  margin-top: 4px;
+}
+
+.section-label {
+  padding: 0 4px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.section-card {
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.mobile-account-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 68px;
+  padding: 10px 14px;
+  border: 0;
+  border-left: 4px solid var(--acct-color, var(--color-accent));
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-account-row:last-child {
+  border-bottom: 0;
+}
+
+.mobile-account-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.mobile-account-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mobile-account-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-account-email {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-account-type {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.mobile-row-chevron {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  stroke-width: 1.8;
+  color: var(--color-text-muted);
+}
+
+.mobile-add-account {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 44px;
+  background: var(--color-accent-light);
+  border: 1px dashed var(--color-accent);
+  color: var(--color-accent);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-add-account svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.8;
+}
+
+.mobile-setting-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 14px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--color-border-soft, var(--color-border));
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--color-text);
+}
+
+.mobile-setting-row:last-child {
+  border-bottom: 0;
+}
+
+.mobile-setting-row.static {
+  cursor: default;
+}
+
+.mobile-setting-row.toggle {
+  position: relative;
+  cursor: pointer;
+}
+
+.mobile-setting-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.mobile-setting-value {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.toggle-input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.toggle-pill {
+  position: relative;
+  width: 46px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--color-border);
+  transition: background 0.18s;
+  flex-shrink: 0;
+}
+
+.toggle-pill.on {
+  background: var(--color-accent);
+}
+
+.toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.18s cubic-bezier(.2,.8,.2,1);
+}
+
+.toggle-pill.on .toggle-thumb {
+  transform: translateX(18px);
+}
+
+/* ============================================================
+   Edit-account modal: sheet presentation on mobile (§13)
+   ============================================================ */
+@media (max-width: 720px) {
+  .modal-overlay {
+    align-items: flex-end;
+    background: rgba(20, 14, 6, 0.4);
+  }
+
+  .modal {
+    width: 100%;
+    max-width: 100%;
+    height: calc(100vh - 48px);
+    max-height: calc(100vh - 48px);
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    border-top-left-radius: var(--radius-sheet, 16px);
+    border-top-right-radius: var(--radius-sheet, 16px);
+    box-shadow: var(--shadow-sheet, 0 -12px 30px rgba(30, 20, 10, 0.18));
+    position: relative;
+  }
+
+  /* Grabber at the top of the sheet. */
+  .modal::before {
+    content: "";
+    display: block;
+    width: 38px;
+    height: 5px;
+    border-radius: 100px;
+    background: var(--color-border);
+    margin: 8px auto 4px;
+    flex-shrink: 0;
+  }
+
+  .modal-header {
+    justify-content: center;
+    padding: 4px 16px 10px;
+  }
+
+  .modal-header h3 {
+    font-size: 15px;
+    font-weight: 600;
+    flex: 1;
+    text-align: center;
+  }
+
+  .modal-close {
+    position: absolute;
+    top: 16px;
+    right: 12px;
+  }
+
+  /* Dedicated "Remove account" action mobile pattern (§13 footer). */
+  .btn-danger {
+    background: #fff;
+    color: #8a3a24;
+    border: 1px solid #d4a89a;
+  }
 }
 </style>

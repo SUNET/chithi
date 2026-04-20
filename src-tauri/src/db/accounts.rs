@@ -124,9 +124,14 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
         other => crate::error::Error::Database(other),
     })?;
 
-    // Fetch password from the system keyring
+    // Fetch password from the system keyring. OIDC/OAuth accounts don't
+    // store a keyring password here — their tokens live under the
+    // `.oauth` service — so a missing entry is expected, not an error.
     match crate::keyring::get_password(&account.id) {
-        Ok(pw) => account.password = pw,
+        Ok(Some(pw)) => account.password = pw,
+        Ok(None) => {
+            log::debug!("No keyring password for account {}", account.id);
+        }
         Err(e) => {
             log::warn!(
                 "Could not read password from keyring for account {}: {}",

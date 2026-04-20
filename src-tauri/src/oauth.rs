@@ -718,12 +718,26 @@ pub async fn device_auth_poll(
             params.insert("client_id", client_id.to_string());
         }
 
-        let resp = client
-            .post(token_endpoint)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Device token poll failed: {}", e)))?;
+        let resp = match client.post(token_endpoint).form(&params).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // `.send()` only returns network/body errors — no HTTP status
+                // errors (those surface via `resp.status()` below). On mobile
+                // these are virtually always transient: the app gets
+                // backgrounded while the user is authorizing in Safari /
+                // Custom Tabs and the in-flight socket gets torn down by the
+                // OS. Keep polling until the overall device-code deadline.
+                log::info!(
+                    "OIDC device flow: poll send error ({e}) [timeout={} connect={} request={} body={} decode={}], retrying",
+                    e.is_timeout(),
+                    e.is_connect(),
+                    e.is_request(),
+                    e.is_body(),
+                    e.is_decode(),
+                );
+                continue;
+            }
+        };
 
         if resp.status().is_success() {
             let token_resp: serde_json::Value = resp
@@ -852,7 +866,107 @@ pub async fn refresh_token_dynamic(
 
 const KEYRING_SERVICE: &str = "in.kushaldas.chithi.oauth";
 
+// Android note: the `keyring` crate v3 has no Android backend and silently
+// falls back to an in-memory mock that doesn't persist across `Entry::new`
+// calls. Every read returns NoEntry, which breaks the temp→real account-id
+// migration in `commands::accounts::add_account`. Until we wire a real
+// EncryptedSharedPreferences-backed credential store via JNI, fall back to
+// a JSON file under `app_data_dir/oauth_tokens/`. The Android app sandbox
+// scopes that directory to this UID.
+#[cfg(target_os = "android")]
+mod android_store {
+    use super::{Error, OAuthTokens, Result};
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    static TOKEN_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    pub fn init(data_dir: &Path) -> std::io::Result<()> {
+        let dir = data_dir.join("oauth_tokens");
+        std::fs::create_dir_all(&dir)?;
+        let _ = TOKEN_DIR.set(dir);
+        Ok(())
+    }
+
+    fn path_for(account_id: &str) -> Result<PathBuf> {
+        let dir = TOKEN_DIR
+            .get()
+            .ok_or_else(|| Error::Other("oauth token store uninitialised".into()))?;
+        // Sanitise so a crafted account id can't escape the directory.
+        let safe: String = account_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Ok(dir.join(format!("{safe}.json")))
+    }
+
+    pub fn store(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+        let json = serde_json::to_string(tokens)
+            .map_err(|e| Error::Other(format!("Token serialize failed: {}", e)))?;
+        let path = path_for(account_id)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes())
+            .map_err(|e| Error::Other(format!("Token file write failed: {}", e)))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Other(format!("Token file rename failed: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn load(account_id: &str) -> Result<Option<OAuthTokens>> {
+        let path = path_for(account_id)?;
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let tokens: OAuthTokens = serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Other(format!("Token deserialize failed: {}", e)))?;
+                Ok(Some(tokens))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Other(format!("Token file read failed: {}", e))),
+        }
+    }
+
+    pub fn delete(account_id: &str) -> Result<()> {
+        let path = path_for(account_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Other(format!("Token file delete failed: {}", e))),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn init_token_store(data_dir: &std::path::Path) -> std::io::Result<()> {
+    android_store::init(data_dir)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn init_token_store(_data_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        android_store::store(account_id, tokens)?;
+        log::info!(
+            "OAuth2: tokens stored in file store for account {}",
+            account_id
+        );
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    store_tokens_keyring(account_id, tokens)
+}
+
+#[cfg(not(target_os = "android"))]
+fn store_tokens_keyring(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
     let json = serde_json::to_string(tokens)
         .map_err(|e| Error::Other(format!("Token serialize failed: {}", e)))?;
     let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
@@ -881,29 +995,43 @@ pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
 }
 
 pub fn load_tokens(account_id: &str) -> Result<Option<OAuthTokens>> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
-        .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
-    match entry.get_password() {
-        Ok(json) => {
-            let tokens: OAuthTokens = serde_json::from_str(&json)
-                .map_err(|e| Error::Other(format!("Token deserialize failed: {}", e)))?;
-            Ok(Some(tokens))
-        }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => {
-            log::warn!("OAuth2: keyring read failed for {}: {}", account_id, e);
-            Ok(None)
+    #[cfg(target_os = "android")]
+    {
+        return android_store::load(account_id);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
+            .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
+        match entry.get_password() {
+            Ok(json) => {
+                let tokens: OAuthTokens = serde_json::from_str(&json)
+                    .map_err(|e| Error::Other(format!("Token deserialize failed: {}", e)))?;
+                Ok(Some(tokens))
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => {
+                log::warn!("OAuth2: keyring read failed for {}: {}", account_id, e);
+                Ok(None)
+            }
         }
     }
 }
 
 pub fn delete_tokens(account_id: &str) -> Result<()> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
-        .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(Error::Keyring(format!("Failed to delete tokens: {}", e))),
+    #[cfg(target_os = "android")]
+    {
+        return android_store::delete(account_id);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
+            .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(Error::Keyring(format!("Failed to delete tokens: {}", e))),
+        }
     }
 }
 

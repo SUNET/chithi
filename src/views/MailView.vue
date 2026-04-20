@@ -1,22 +1,44 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useRouter } from "vue-router";
+import { storeToRefs } from "pinia";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
+import { usePlatformStore } from "@/stores/platform";
 import * as api from "@/lib/tauri";
 import { openReaderWindow } from "@/lib/reader-window";
 import Toolbar from "@/components/mail/Toolbar.vue";
 import FolderTree from "@/components/mail/FolderTree.vue";
 import MessageList from "@/components/mail/MessageList.vue";
 import MessageReader from "@/components/mail/MessageReader.vue";
+import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
+import MobileIconButton from "@/components/mobile/MobileIconButton.vue";
 
 const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const messagesStore = useMessagesStore();
 const uiStore = useUiStore();
+const platformStore = usePlatformStore();
+const router = useRouter();
+
+const { isMobile } = storeToRefs(platformStore);
+const activeFolderName = computed(
+  () =>
+    foldersStore.folders.find(
+      (f) => f.path === foldersStore.activeFolderPath,
+    )?.name ?? "Inbox",
+);
+const activeAccountEmail = computed(
+  () => accountsStore.activeAccount()?.email ?? "",
+);
+
+function onMobileOpenMessage(messageId: string) {
+  router.push(`/mail/thread/${encodeURIComponent(messageId)}`);
+}
 
 // Right mode: inline reader pane next to the message list
 const showRightReader = computed(() =>
@@ -274,7 +296,56 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="mail-view">
+  <div v-if="isMobile" class="mail-view mobile">
+    <MobileAppBar
+      large
+      :title="activeFolderName"
+      :subtitle="activeAccountEmail"
+    >
+      <template #leading>
+        <MobileIconButton
+          aria-label="Open folders"
+          @click="uiStore.openDrawer()"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <line x1="4" y1="7" x2="20" y2="7" />
+            <line x1="4" y1="12" x2="20" y2="12" />
+            <line x1="4" y1="17" x2="20" y2="17" />
+          </svg>
+        </MobileIconButton>
+      </template>
+    </MobileAppBar>
+    <div class="mobile-message-list">
+      <MessageList mode="mobile" @open-message="onMobileOpenMessage" />
+    </div>
+    <button
+      class="compose-fab"
+      aria-label="Compose new message"
+      @click="uiStore.openCompose()"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        width="22"
+        height="22"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M12 20h9" />
+        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+      </svg>
+    </button>
+  </div>
+
+  <div v-else class="mail-view">
     <Toolbar />
     <div class="mail-panes">
       <!-- Folder pane -->
@@ -542,5 +613,46 @@ onUnmounted(() => {
   min-height: 200px;
   overflow: auto;
   border-top: 1px solid var(--color-border);
+}
+
+/* === Mobile layout === */
+.mail-view.mobile {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--color-bg);
+}
+
+.mail-view.mobile .mobile-message-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--color-email-body-bg);
+}
+
+.compose-fab {
+  position: fixed;
+  right: 16px;
+  bottom: calc(var(--mobile-tab-bar-h) + 16px + env(safe-area-inset-bottom));
+  width: 56px;
+  height: 56px;
+  border-radius: 28px;
+  border: 0;
+  background: var(--color-accent);
+  color: #fff;
+  box-shadow: var(--shadow-fab);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  cursor: pointer;
+}
+
+:global([data-platform="android"]) .compose-fab {
+  border-radius: 16px;
+  bottom: calc(
+    var(--mobile-tab-bar-h-android) + 16px + env(safe-area-inset-bottom)
+  );
 }
 </style>

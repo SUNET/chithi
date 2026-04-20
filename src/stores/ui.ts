@@ -6,6 +6,7 @@ import * as api from "@/lib/tauri";
 export type MessageViewMode = "right" | "bottom" | "tab";
 export type Theme = "dark" | "light";
 export type TimeFormat = "auto" | "12" | "24";
+export type ComposeKind = "new" | "reply" | "reply-all" | "forward";
 
 export const useUiStore = defineStore("ui", () => {
   const threadingEnabled = ref(
@@ -147,6 +148,33 @@ export const useUiStore = defineStore("ui", () => {
     operationsPanelOpen.value = !operationsPanelOpen.value;
   }
 
+  // Mobile chrome state — used by MobileShell and friends.
+  const composeOpen = ref(false);
+  const drawerOpen = ref(false);
+  // Compose context: when a reply/forward is initiated from MobileThreadView
+  // we stash the source message id + intent here so the sheet can prefill
+  // subject / recipients once the rest of the form is built (§8).
+  const composeContext = ref<{ replyTo: string | null; kind: ComposeKind }>(
+    { replyTo: null, kind: "new" },
+  );
+
+  function openCompose(params?: { replyTo?: string | null; kind?: ComposeKind }) {
+    composeContext.value = {
+      replyTo: params?.replyTo ?? null,
+      kind: params?.kind ?? "new",
+    };
+    composeOpen.value = true;
+  }
+  function closeCompose() {
+    composeOpen.value = false;
+  }
+  function openDrawer() {
+    drawerOpen.value = true;
+  }
+  function closeDrawer() {
+    drawerOpen.value = false;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -175,5 +203,12 @@ export const useUiStore = defineStore("ui", () => {
     timeFormat,
     hour12,
     setTimeFormat,
+    composeOpen,
+    composeContext,
+    drawerOpen,
+    openCompose,
+    closeCompose,
+    openDrawer,
+    closeDrawer,
   };
 });

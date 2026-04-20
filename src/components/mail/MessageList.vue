@@ -23,6 +23,48 @@ const emit = defineEmits<{
   openMessage: [messageId: string];
 }>();
 
+const props = withDefaults(
+  defineProps<{ mode?: "desktop" | "mobile" }>(),
+  { mode: "desktop" },
+);
+
+async function onMobileSwipeArchive(messageId: string) {
+  // Move the single message to the account's Archive folder (best-effort:
+  // if there is no archive folder we just mark it as read so the row
+  // disappears from the unread filter).
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId) return;
+  // Use the backend-normalized folder_type so we match archive folders
+  // across providers/locales (e.g. "All Mail", "Archiv", nested paths).
+  const archive = foldersStore
+    .getFlatFolders()
+    .find((f) => f.folder_type === "archive");
+  if (!archive) {
+    // Fallback: mark as read.
+    try {
+      await api.setMessageFlags(accountId, [messageId], ["seen"], true);
+      messagesStore.fetchMessages();
+    } catch (e) {
+      console.error("swipe archive fallback failed", e);
+    }
+    return;
+  }
+  try {
+    await api.moveMessages(accountId, [messageId], archive.path);
+    messagesStore.fetchMessages();
+  } catch (e) {
+    console.error("swipe archive failed", e);
+  }
+}
+
+async function onMobileSwipeDelete(messageId: string) {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId) return;
+  // Route through deleteSelected so thread cleanup + optimistic removal runs.
+  messagesStore.selectedIds.splice(0, messagesStore.selectedIds.length, messageId);
+  await messagesStore.deleteSelected();
+}
+
 // Track modifier keys independently via keydown/keyup since
 // WebKitGTK can lose event.shiftKey on click events.
 const shiftHeld = ref(false);
@@ -498,9 +540,12 @@ const displayedCount = () => {
               :message="msg"
               :active="messagesStore.activeMessageId === msg.id"
               :selected="messagesStore.isSelected(msg.id)"
+              :mode="props.mode"
               @toggle="messagesStore.toggleSelectMessage(msg.id)"
               @open="onOpen(msg.id)"
               @toggle-star="messagesStore.toggleStar(msg.id)"
+              @archive="onMobileSwipeArchive(msg.id)"
+              @delete="onMobileSwipeDelete(msg.id)"
             />
           </div>
         </template>
@@ -521,9 +566,12 @@ const displayedCount = () => {
           :message="msg"
           :active="messagesStore.activeMessageId === msg.id"
           :selected="messagesStore.isSelected(msg.id)"
+          :mode="props.mode"
           @toggle="messagesStore.toggleSelectMessage(msg.id)"
           @open="onOpen(msg.id)"
           @toggle-star="messagesStore.toggleStar(msg.id)"
+          @archive="onMobileSwipeArchive(msg.id)"
+          @delete="onMobileSwipeDelete(msg.id)"
         />
       </div>
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>
