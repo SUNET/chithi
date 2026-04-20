@@ -13,7 +13,6 @@
   },
   "packageManager": "pnpm@10.27.0",
   "devDependencies": {
-    "@rolldown/binding-darwin-arm64": "1.0.0-rc.13",
     "@tauri-apps/cli": "^2.10.1",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/test-utils": "^2.4.6",
