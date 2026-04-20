@@ -61,9 +61,19 @@ watch(
 </script>
 
 <template>
-  <div class="folder-drawer" :class="{ open: drawerOpen }" aria-hidden="false">
+  <div
+    class="folder-drawer"
+    :class="{ open: drawerOpen }"
+    :aria-hidden="!drawerOpen"
+    :inert="!drawerOpen"
+  >
     <div class="scrim" @click="onScrimClick" />
-    <aside class="pane" role="dialog" aria-label="Folders">
+    <aside
+      class="pane"
+      role="dialog"
+      aria-label="Folders"
+      :aria-modal="drawerOpen"
+    >
       <header class="brand">
         <span class="brand-wordmark">Chithi</span>
       </header>
