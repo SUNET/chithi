@@ -43,9 +43,15 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
     // Request all scopes during authorization for consent.
     // IMAP/SMTP use outlook.office.com (not office365.com) for personal accounts.
     // Graph scopes use short form (resolved to graph.microsoft.com automatically).
+    // All Graph scopes here must also appear in MICROSOFT_GRAPH_SCOPES or token
+    // refresh will fail with AADSTS65001 (consent_required).
     scopes: &[
         "https://outlook.office.com/IMAP.AccessAsUser.All",
         "https://outlook.office.com/SMTP.Send",
+        "User.Read",
+        "Mail.ReadWrite",
+        "Calendars.ReadWrite",
+        "Contacts.ReadWrite",
         "offline_access",
         "openid",
         "profile",
@@ -56,7 +62,7 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
 pub const MICROSOFT_GRAPH_SCOPES: &str =
-    "User.Read Calendars.ReadWrite Contacts.ReadWrite offline_access";
+    "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite offline_access";
 
 /// Microsoft IMAP/SMTP scopes — used for token refresh for mail access.
 /// Uses outlook.office.com (works for both personal and work/school accounts).
@@ -158,9 +164,9 @@ pub fn get_auth_url(
         url.push_str("&access_type=offline&prompt=consent");
     }
 
-    // Microsoft needs prompt=consent for first-time consent
+    // Microsoft: show account picker but honor existing consent (admin or user).
     if provider.name == "microsoft" {
-        url.push_str("&prompt=consent");
+        url.push_str("&prompt=select_account");
     }
 
     Ok((url, listener, code_verifier, state))
