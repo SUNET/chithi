@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Runtime, State};
 #[cfg(target_os = "android")]
 use tauri::Manager;
+use tauri::{AppHandle, Runtime, State};
 
 use crate::error::{Error, Result};
 use crate::oauth;
