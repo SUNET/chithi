@@ -26,8 +26,8 @@ export const usePlatformStore = defineStore("platform", () => {
   async function detectPlatform() {
     // Tauri v2 mobile build exposes platform via plugin-os.
     try {
-      const mod = await import("@tauri-apps/plugin-os");
-      const p = mod.platform();
+      const { platform } = await import("@tauri-apps/plugin-os");
+      const p = await platform();
       if (p === "ios") kind.value = "ios";
       else if (p === "android") kind.value = "android";
       else kind.value = "desktop";
