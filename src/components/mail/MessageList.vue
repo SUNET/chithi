@@ -465,18 +465,6 @@ interface ThreadChildEntry {
 }
 
 /**
- * Build a depth-annotated, in-order list of a thread's children
- * (everything except the root message). Depth comes from walking
- * `in_reply_to` against `message_id` of other messages in the same
- * thread; messages whose parent isn't in the chain — including all
- * Microsoft Graph messages, since the Graph sync stores
- * `in_reply_to: None` — collapse to depth 0 alongside other roots.
- *
- * Children are emitted depth-first under each parent (a parent's
- * subtree comes before the next sibling) so the visual tree
- * matches the conversation flow.
- */
-/**
  * Strip surrounding angle brackets and whitespace so a Message-ID
  * stored as `<mid@host>` by one backend lines up with the same id
  * stored as `mid@host` by another. Matching is case-sensitive
@@ -489,6 +477,18 @@ function normMid(s: string | null | undefined): string | null {
   return trimmed.replace(/^<+/, "").replace(/>+$/, "");
 }
 
+/**
+ * Build a depth-annotated, in-order list of a thread's children
+ * (everything except the root message). Depth comes from walking
+ * `in_reply_to` against `message_id` of other messages in the same
+ * thread; messages whose parent isn't in the chain — including all
+ * Microsoft Graph messages, since the Graph sync stores
+ * `in_reply_to: None` — collapse to depth 0 alongside other roots.
+ *
+ * Children are emitted depth-first under each parent (a parent's
+ * subtree comes before the next sibling) so the visual tree
+ * matches the conversation flow.
+ */
 function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   const all = messagesStore.threadMessages[threadId] ?? [];
   if (all.length <= 1) return [];
