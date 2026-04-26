@@ -186,6 +186,18 @@ async function syncThisFolder() {
   }
 }
 
+/**
+ * Microsoft 365 (Graph) syncs at the account level — there is no
+ * cheap per-folder fetch like there is for IMAP/JMAP. Hiding the
+ * "Sync this folder" entry for Graph accounts avoids the surprise
+ * where a right-click on Inbox kicks off a multi-minute full-account
+ * sync that looks like the UI has hung.
+ */
+function isGraphAccount(accountId: string): boolean {
+  const acc = accountsStore.accounts.find((a) => a.id === accountId);
+  return acc?.mail_protocol === "graph";
+}
+
 
 function openNewFolderModal() {
   if (!contextMenu.value) return;
@@ -506,7 +518,12 @@ async function doDeleteFolder() {
         <button class="ctx-item danger" data-testid="ctx-delete-folder" @click="confirmDeleteFolder">Delete Folder</button>
         <div class="ctx-separator"></div>
         <button class="ctx-item disabled">Properties</button>
-        <button class="ctx-item" data-testid="ctx-sync-folder" @click="syncThisFolder">
+        <button
+          v-if="!isGraphAccount(contextMenu.accountId)"
+          class="ctx-item"
+          data-testid="ctx-sync-folder"
+          @click="syncThisFolder"
+        >
           Sync "{{ contextMenu.folder.name }}"
         </button>
       </div>
