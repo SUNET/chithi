@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "@/lib/tauri";
 
@@ -8,11 +8,6 @@ export type MessageViewMode = "right" | "bottom" | "tab" | "none";
 const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
 
 const VALID_THEMES: Theme[] = ["system", "light", "dark"];
-
-function resolveSystemTheme(): "light" | "dark" {
-  if (typeof window === "undefined" || !window.matchMedia) return "light";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-}
 export type Theme = "system" | "light" | "dark";
 export type TimeFormat = "auto" | "12" | "24";
 export type ComposeKind = "new" | "reply" | "reply-all" | "forward";
@@ -37,9 +32,18 @@ export const useUiStore = defineStore("ui", () => {
     })(),
   );
 
+  // Reactive mirror of the OS dark-mode preference. The matchMedia handler
+  // writes to this ref so `resolvedTheme` recomputes when the OS toggles
+  // light/dark — without this, the computed would cache the first read.
+  const systemDark = ref(
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+
   /** The actually-applied theme. Tracks the OS preference when theme === "system". */
   const resolvedTheme = computed<"light" | "dark">(() => {
-    if (theme.value === "system") return resolveSystemTheme();
+    if (theme.value === "system") return systemDark.value ? "dark" : "light";
     return theme.value;
   });
   const decorationsEnabled = ref(
@@ -105,7 +109,8 @@ export const useUiStore = defineStore("ui", () => {
   function setTheme(t: Theme) {
     theme.value = t;
     localStorage.setItem("chithi-theme", t);
-    document.documentElement.setAttribute("data-theme", resolvedTheme.value);
+    // The data-theme attribute is updated reactively by the watch on
+    // resolvedTheme; no manual DOM write needed here.
   }
 
   function setThreading(enabled: boolean) {
@@ -162,18 +167,26 @@ export const useUiStore = defineStore("ui", () => {
 
   function initTheme() {
     document.documentElement.setAttribute("data-theme", resolvedTheme.value);
-    // Re-apply when the OS preference changes while theme === "system".
+    // Subscribe to OS dark-mode changes so `systemDark` (and therefore
+    // `resolvedTheme`) updates live; the watch below applies the new
+    // value to the DOM whenever the resolved theme actually changes.
     if (typeof window !== "undefined" && window.matchMedia && !mediaQueryUnsub) {
       const mql = window.matchMedia("(prefers-color-scheme: dark)");
-      const onChange = () => {
-        if (theme.value === "system") {
-          document.documentElement.setAttribute("data-theme", resolvedTheme.value);
-        }
+      const onChange = (e: MediaQueryListEvent) => {
+        systemDark.value = e.matches;
       };
       mql.addEventListener("change", onChange);
       mediaQueryUnsub = () => mql.removeEventListener("change", onChange);
     }
   }
+
+  // Keep the document attribute in sync with whatever resolvedTheme yields.
+  // Fires for both user-driven (setTheme) and OS-driven (systemDark) changes.
+  watch(resolvedTheme, (next) => {
+    if (typeof document !== "undefined") {
+      document.documentElement.setAttribute("data-theme", next);
+    }
+  });
 
   function initDecorations() {
     if (!decorationsEnabled.value) {
