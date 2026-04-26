@@ -394,8 +394,16 @@ export const useMessagesStore = defineStore("messages", () => {
         const accountId = accountsStore.activeAccountId;
         const folderPath = foldersStore.activeFolderPath;
         if (accountId && folderPath) {
-          const msgs = await api.getThreadMessages(accountId, folderPath, threadId);
-          threadMessages.value = { ...threadMessages.value, [threadId]: msgs };
+          try {
+            const msgs = await api.getThreadMessages(accountId, folderPath, threadId);
+            threadMessages.value = { ...threadMessages.value, [threadId]: msgs };
+          } catch (err) {
+            // The lazy fetch failed (network/IPC error). Roll the expansion
+            // back so the row state matches the "no children loaded" reality
+            // and the user can retry.
+            console.error("toggleThread: failed to load thread children", err);
+            collapsedThreads.value = [...collapsedThreads.value, threadId];
+          }
         }
       }
     } else {
