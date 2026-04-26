@@ -68,6 +68,10 @@ export interface MessageSummary {
   is_encrypted: boolean;
   is_signed: boolean;
   snippet: string | null;
+  /** RFC 5322 Message-ID with angle brackets, used to build reply trees. */
+  message_id: string | null;
+  /** Parent Message-ID for in-thread hierarchical rendering. */
+  in_reply_to: string | null;
 }
 
 export interface MessageBody {

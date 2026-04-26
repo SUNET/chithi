@@ -459,6 +459,95 @@ function formatHitDate(secs: number): string {
   return new Date(secs * 1000).toLocaleDateString();
 }
 
+interface ThreadChildEntry {
+  message: import("@/lib/types").MessageSummary;
+  depth: number;
+}
+
+/**
+ * Build a depth-annotated, in-order list of a thread's children
+ * (everything except the root message). Depth comes from walking
+ * `in_reply_to` against `message_id` of other messages in the same
+ * thread; messages whose parent isn't in the chain — including all
+ * Microsoft Graph messages, since the Graph sync stores
+ * `in_reply_to: None` — collapse to depth 0 alongside other roots.
+ *
+ * Children are emitted depth-first under each parent (a parent's
+ * subtree comes before the next sibling) so the visual tree
+ * matches the conversation flow.
+ */
+function childrenWithDepth(threadId: string): ThreadChildEntry[] {
+  const all = messagesStore.threadMessages[threadId] ?? [];
+  if (all.length <= 1) return [];
+
+  const root = all[0];
+  const rest = all.slice(1);
+
+  // Index every message in the thread (including the root) by its
+  // Message-ID so children can find their parent.
+  const byMid = new Map<string, import("@/lib/types").MessageSummary>();
+  for (const m of all) {
+    if (m.message_id) byMid.set(m.message_id, m);
+  }
+
+  // depthFor caches per id.
+  const depthCache = new Map<string, number>();
+  function depthFor(m: import("@/lib/types").MessageSummary, seen: Set<string>): number {
+    const cached = depthCache.get(m.id);
+    if (cached !== undefined) return cached;
+    if (!m.in_reply_to) {
+      depthCache.set(m.id, 0);
+      return 0;
+    }
+    const parent = byMid.get(m.in_reply_to);
+    if (!parent || parent.id === m.id || seen.has(parent.id)) {
+      depthCache.set(m.id, 0);
+      return 0;
+    }
+    seen.add(parent.id);
+    const parentDepth = parent.id === root.id ? 0 : depthFor(parent, seen) + 1;
+    depthCache.set(m.id, parentDepth);
+    return parentDepth;
+  }
+
+  // Group children by their direct parent for depth-first emission.
+  const childrenByParent = new Map<string, import("@/lib/types").MessageSummary[]>();
+  const orphans: import("@/lib/types").MessageSummary[] = [];
+  for (const m of rest) {
+    const parentMid = m.in_reply_to;
+    if (parentMid && byMid.has(parentMid)) {
+      const arr = childrenByParent.get(parentMid) ?? [];
+      arr.push(m);
+      childrenByParent.set(parentMid, arr);
+    } else {
+      orphans.push(m);
+    }
+  }
+
+  const out: ThreadChildEntry[] = [];
+  function emitChildrenOf(parentMid: string | null, depth: number) {
+    const set = parentMid === null ? orphans : childrenByParent.get(parentMid) ?? [];
+    for (const m of set) {
+      out.push({ message: m, depth });
+      if (m.message_id) emitChildrenOf(m.message_id, depth + 1);
+    }
+  }
+  // Root's direct children at depth 0; orphans (no parent in thread)
+  // also at depth 0 so Graph threads render flat.
+  if (root.message_id) emitChildrenOf(root.message_id, 0);
+  emitChildrenOf(null, 0);
+
+  // Fall back to the precomputed depth map for any leftover
+  // (shouldn't happen with the emission above, but it's a safety net).
+  for (const m of rest) {
+    if (!out.some((e) => e.message.id === m.id)) {
+      out.push({ message: m, depth: depthFor(m, new Set()) });
+    }
+  }
+
+  return out;
+}
+
 // JMAP and Graph hits report the backend's folder/mailbox ID, which is
 // opaque to the user. Build a path -> name index once per folder-tree
 // change so rendering N hits stays O(N) instead of O(N * folder_count).
@@ -543,26 +632,27 @@ function resolveFolderName(path: string): string {
             @toggle-star="messagesStore.toggleStar(thread.message_ids[0])"
           />
         </div>
-        <!-- Expanded thread messages -->
+        <!-- Expanded thread messages, indented by reply-depth -->
         <template v-if="messagesStore.isThreadExpanded(thread.thread_id)">
           <div
-            v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? []).slice(1)"
-            :key="msg.id"
+            v-for="entry in childrenWithDepth(thread.thread_id)"
+            :key="entry.message.id"
             class="thread-child"
-            @click.stop="onChildSelect(msg.id)"
-            @contextmenu.prevent.stop="onRowRightClick($event, msg.id)"
-            @mousedown="onDragMouseDown($event, msg.id)"
+            :style="{ paddingLeft: 16 + entry.depth * 18 + 'px' }"
+            @click.stop="onChildSelect(entry.message.id)"
+            @contextmenu.prevent.stop="onRowRightClick($event, entry.message.id)"
+            @mousedown="onDragMouseDown($event, entry.message.id)"
           >
             <MessageListItem
-              :message="msg"
-              :active="messagesStore.activeMessageId === msg.id"
-              :selected="messagesStore.isSelected(msg.id)"
+              :message="entry.message"
+              :active="messagesStore.activeMessageId === entry.message.id"
+              :selected="messagesStore.isSelected(entry.message.id)"
               :mode="props.mode"
-              @toggle="messagesStore.toggleSelectMessage(msg.id)"
-              @open="onOpen(msg.id)"
-              @toggle-star="messagesStore.toggleStar(msg.id)"
-              @archive="onMobileSwipeArchive(msg.id)"
-              @delete="onMobileSwipeDelete(msg.id)"
+              @toggle="messagesStore.toggleSelectMessage(entry.message.id)"
+              @open="onOpen(entry.message.id)"
+              @toggle-star="messagesStore.toggleStar(entry.message.id)"
+              @archive="onMobileSwipeArchive(entry.message.id)"
+              @delete="onMobileSwipeDelete(entry.message.id)"
             />
           </div>
         </template>

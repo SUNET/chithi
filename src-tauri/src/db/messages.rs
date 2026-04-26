@@ -34,6 +34,13 @@ pub struct MessageSummary {
     pub is_encrypted: bool,
     pub is_signed: bool,
     pub snippet: Option<String>,
+    /// RFC 5322 Message-ID, with angle brackets, exactly as stored.
+    /// Used by the frontend to build the in-thread reply hierarchy.
+    pub message_id: Option<String>,
+    /// In-Reply-To header pointing at this message's parent within the
+    /// thread. Empty for the thread root or for backends that don't
+    /// expose it (Microsoft Graph stores conversationId only).
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,7 +321,8 @@ fn get_messages_inner(
     let offset = page * per_page;
     let query = format!(
         "SELECT id, subject, from_name, from_email, date, flags,
-                has_attachments, is_encrypted, is_signed, snippet
+                has_attachments, is_encrypted, is_signed, snippet,
+                message_id, in_reply_to
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2{}
          ORDER BY {} {}
@@ -338,6 +346,8 @@ fn get_messages_inner(
                 is_encrypted: row.get(7)?,
                 is_signed: row.get(8)?,
                 snippet: row.get(9)?,
+                message_id: row.get(10)?,
+                in_reply_to: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -989,7 +999,8 @@ pub fn get_thread_messages(
 
     let mut stmt = conn.prepare(
         "SELECT id, subject, from_name, from_email, date, flags,
-                has_attachments, is_encrypted, is_signed, snippet
+                has_attachments, is_encrypted, is_signed, snippet,
+                message_id, in_reply_to
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2
            AND (thread_id = ?3 OR (thread_id IS NULL AND id = ?3))
@@ -1011,6 +1022,8 @@ pub fn get_thread_messages(
                 is_encrypted: row.get(7)?,
                 is_signed: row.get(8)?,
                 snippet: row.get(9)?,
+                message_id: row.get(10)?,
+                in_reply_to: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
