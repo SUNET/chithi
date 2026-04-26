@@ -58,15 +58,21 @@ pub struct SearchHit {
 
 /// Build an IMAP `UID SEARCH` argument from a query.
 ///
-/// Quotes are doubled rather than escaped (IMAP atoms don't support backslash
-/// escapes inside quoted strings except for `\` and `"` themselves).
+/// Inside an IMAP quoted string only `"` and `\` are special and are escaped
+/// with a leading backslash (RFC 3501 §4.3). Control characters (CR, LF, NUL)
+/// are forbidden in quoted strings and would break command framing if a user
+/// query contained them, so they are stripped before quoting.
 /// Returns `None` if no fields are enabled or the text is empty.
 pub fn build_imap_search(query: &SearchQuery) -> Option<String> {
     let text = query.text.trim();
     if text.is_empty() || !query.fields.any_enabled() {
         return None;
     }
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
 
     let mut keys: Vec<String> = Vec::new();
     if query.fields.subject {
@@ -282,6 +288,19 @@ mod tests {
     fn imap_empty_returns_none() {
         assert!(build_imap_search(&q("")).is_none());
         assert!(build_imap_search(&q("   ")).is_none());
+    }
+
+    #[test]
+    fn imap_strips_control_chars() {
+        let s = build_imap_search(&q("foo\r\nA001 LOGOUT")).unwrap();
+        assert!(!s.contains('\r'));
+        assert!(!s.contains('\n'));
+        assert!(s.contains("fooA001 LOGOUT"));
+    }
+
+    #[test]
+    fn imap_only_control_chars_returns_none() {
+        assert!(build_imap_search(&q("\r\n\t")).is_none());
     }
 
     #[test]
