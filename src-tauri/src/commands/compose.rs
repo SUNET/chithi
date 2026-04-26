@@ -212,6 +212,8 @@ pub async fn send_message(
                     &message.body_text,
                     message.body_html.as_deref(),
                     &attachment_data,
+                    in_reply_to.as_deref(),
+                    &references,
                 )
                 .await?;
             }
