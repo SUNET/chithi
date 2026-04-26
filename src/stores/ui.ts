@@ -3,7 +3,9 @@ import { computed, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "@/lib/tauri";
 
-export type MessageViewMode = "right" | "bottom" | "tab";
+export type MessageViewMode = "right" | "bottom" | "tab" | "none";
+
+const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
 export type Theme = "dark" | "light";
 export type TimeFormat = "auto" | "12" | "24";
 export type ComposeKind = "new" | "reply" | "reply-all" | "forward";
@@ -16,7 +18,10 @@ export const useUiStore = defineStore("ui", () => {
   const messageListWidth = ref(400);
   const readerVisible = ref(true);
   const messageViewMode = ref<MessageViewMode>(
-    (localStorage.getItem("chithi-message-view-mode") as MessageViewMode) || "right",
+    (() => {
+      const stored = localStorage.getItem("chithi-message-view-mode") as MessageViewMode | null;
+      return stored && VALID_VIEW_MODES.includes(stored) ? stored : "right";
+    })(),
   );
   const theme = ref<Theme>(
     (localStorage.getItem("chithi-theme") as Theme) || "light",
@@ -73,6 +78,12 @@ export const useUiStore = defineStore("ui", () => {
   function setMessageViewMode(mode: MessageViewMode) {
     messageViewMode.value = mode;
     localStorage.setItem("chithi-message-view-mode", mode);
+    // Picking a non-"none" mode re-enables the reader pane so the user
+    // sees their selection take effect immediately. The reader's close
+    // button still toggles `readerVisible` for per-session dismissal.
+    if (mode !== "none") {
+      readerVisible.value = true;
+    }
   }
 
   function setTheme(t: Theme) {

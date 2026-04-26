@@ -2,7 +2,6 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUiStore, type MessageViewMode } from "@/stores/ui";
 import {
   dispatch,
@@ -32,11 +31,6 @@ function openPreferences() {
   router.push("/settings");
 }
 
-async function closeWindow() {
-  closeMenus();
-  await getCurrentWindow().close();
-}
-
 async function quitApp() {
   closeMenus();
   await invoke("quit_app");
@@ -44,11 +38,6 @@ async function quitApp() {
 
 function setViewMode(mode: MessageViewMode) {
   uiStore.setMessageViewMode(mode);
-  closeMenus();
-}
-
-function toggleReader() {
-  uiStore.toggleReader();
   closeMenus();
 }
 
@@ -73,17 +62,13 @@ function toggleTitleBar() {
 
 const sc = {
   preferences: { key: ",", ctrl: true } satisfies ShortcutDef,
-  closeWindow: { key: "w", ctrl: true } satisfies ShortcutDef,
   quit: { key: "q", ctrl: true } satisfies ShortcutDef,
-  toggleReader: { key: "\\", ctrl: true } satisfies ShortcutDef,
   toggleThreading: { key: "t", ctrl: true } satisfies ShortcutDef,
 } as const;
 
 const bindings: readonly ShortcutBinding[] = [
   { ...sc.preferences, handler: openPreferences },
-  { ...sc.closeWindow, handler: closeWindow },
   { ...sc.quit, handler: quitApp },
-  { ...sc.toggleReader, handler: toggleReader },
   { ...sc.toggleThreading, handler: toggleThreading },
 ];
 
@@ -111,10 +96,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
           <span class="action-shortcut">{{ formatShortcut(sc.preferences) }}</span>
         </button>
         <div class="menu-separator"></div>
-        <button class="menu-action" data-testid="menu-file-close-window" @click="closeWindow">
-          <span class="action-label">Close Window</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.closeWindow) }}</span>
-        </button>
         <button class="menu-action" data-testid="menu-file-quit" @click="quitApp">
           <span class="action-label">Quit</span>
           <span class="action-shortcut">{{ formatShortcut(sc.quit) }}</span>
@@ -126,13 +107,15 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
     <div class="menu-item" @click.stop="toggleMenu('view')">
       <span class="menu-label">View</span>
       <div v-if="openMenu === 'view'" class="menu-dropdown" data-testid="menu-view-dropdown">
-        <button class="menu-action" data-testid="menu-view-show-pane" @click="toggleReader">
-          <span class="action-prefix">{{ uiStore.readerVisible ? '\u2713' : '\u00A0' }}</span>
-          <span class="action-label">Show Message Pane</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.toggleReader) }}</span>
-        </button>
-
         <div class="menu-group-heading">Message Pane Position</div>
+        <button
+          class="menu-action menu-action-radio"
+          data-testid="menu-view-position-none"
+          @click="setViewMode('none')"
+        >
+          <span class="action-prefix">{{ uiStore.messageViewMode === 'none' ? '\u25CF' : '\u00A0' }}</span>
+          <span class="action-label">None</span>
+        </button>
         <button
           class="menu-action menu-action-radio"
           data-testid="menu-view-position-right"
