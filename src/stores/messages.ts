@@ -162,6 +162,24 @@ export const useMessagesStore = defineStore("messages", () => {
     serverSearchError.value = null;
   }
 
+  /**
+   * Open a server-search hit. The hit may not be in the local messages
+   * table yet, so we first ask the backend to upsert a stub row (the
+   * existing get_message_body flow then fetches the body on demand) and
+   * then drive the regular load-and-display path.
+   */
+  async function openServerHit(hit: SearchHit) {
+    const accountId = accountsStore.activeAccountId;
+    if (!accountId) return;
+    try {
+      const messageId = await api.importSearchHit(accountId, hit);
+      await loadMessage(messageId);
+    } catch (e) {
+      console.error("Failed to open server hit:", e);
+      serverSearchError.value = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   async function runServerSearch() {
     const accountId = accountsStore.activeAccountId;
     const text = quickFilterText.value.trim();
@@ -752,5 +770,6 @@ export const useMessagesStore = defineStore("messages", () => {
     serverSearchError,
     runServerSearch,
     clearServerSearch,
+    openServerHit,
   };
 });

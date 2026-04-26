@@ -42,7 +42,7 @@ impl SearchFields {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
     pub account_id: String,
     pub folder_path: String,

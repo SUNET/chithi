@@ -74,6 +74,13 @@ export async function searchMessagesServer(
   return invoke("search_messages_server", { accountId, query });
 }
 
+export async function importSearchHit(
+  accountId: string,
+  hit: SearchHit,
+): Promise<string> {
+  return invoke("import_search_hit", { accountId, hit });
+}
+
 export async function getMessageHtmlWithImages(
   accountId: string,
   messageId: string,

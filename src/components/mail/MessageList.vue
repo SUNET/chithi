@@ -605,6 +605,11 @@ function resolveFolderName(path: string): string {
         :key="hit.backend_id"
         class="server-hit-row"
         data-testid="server-hit-row"
+        role="button"
+        tabindex="0"
+        @click="messagesStore.openServerHit(hit)"
+        @keydown.enter.prevent="messagesStore.openServerHit(hit)"
+        @keydown.space.prevent="messagesStore.openServerHit(hit)"
       >
         <div class="hit-line">
           <span class="hit-from">{{ hit.from_name || hit.from_email || "(unknown sender)" }}</span>
@@ -858,6 +863,14 @@ function resolveFolderName(path: string): string {
   padding: 8px 12px;
   border-bottom: 1px solid var(--color-border);
   font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.server-hit-row:hover,
+.server-hit-row:focus-visible {
+  background: var(--color-bg-hover);
+  outline: none;
 }
 
 .hit-line {
