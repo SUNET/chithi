@@ -132,15 +132,18 @@ function stopResize() {
 }
 
 // Double-click behavior depends on view mode:
-//  - right:  ensure the inline reader pane is visible
-//  - bottom: open the message in a new standalone window
-//  - tab:    open the message in a new tab (or focus existing)
+//  - right, bottom: ensure the inline reader pane is visible
+//  - none:          open the message in a new standalone window
+//  - tab:           open the message in a new tab (or focus existing)
 function onOpenMessage(messageId: string) {
-  if (uiStore.messageViewMode === "right") {
+  if (
+    uiStore.messageViewMode === "right" ||
+    uiStore.messageViewMode === "bottom"
+  ) {
     uiStore.showReader();
     return;
   }
-  if (uiStore.messageViewMode === "bottom") {
+  if (uiStore.messageViewMode === "none") {
     const accountId = accountsStore.activeAccountId;
     if (!accountId) return;
     const subject = messagesStore.subjectForMessage(messageId) ?? undefined;
@@ -383,6 +386,11 @@ onUnmounted(() => {
             <MessageReader @close="uiStore.hideReader()" />
           </div>
         </div>
+      </template>
+
+      <!-- None mode: list only, no reader. Double-click opens a window. -->
+      <template v-else-if="uiStore.messageViewMode === 'none'">
+        <MessageList data-testid="none-mode-list" @open-message="onOpenMessage" />
       </template>
 
       <!-- Tab mode: tab bar on top, list or reader content below -->
