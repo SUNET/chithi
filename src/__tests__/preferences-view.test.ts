@@ -135,4 +135,31 @@ describe("UI store theme system", () => {
     const ui = useUiStore();
     expect(ui.theme).toBe("system");
   });
+
+  it("resolvedTheme reacts when the OS preference flips while theme === 'system'", () => {
+    setActivePinia(createPinia());
+    let changeHandler: ((e: { matches: boolean }) => void) | null = null;
+    const mql = {
+      matches: false, // OS starts in light mode
+      addEventListener: (_evt: string, h: (e: { matches: boolean }) => void) => {
+        changeHandler = h;
+      },
+      removeEventListener: vi.fn(),
+    };
+    vi.stubGlobal("matchMedia", () => mql);
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: () => mql,
+    });
+    const ui = useUiStore();
+    ui.setTheme("system");
+    ui.initTheme();
+    expect(ui.resolvedTheme).toBe("light");
+
+    // Simulate the OS flipping to dark.
+    expect(changeHandler).not.toBeNull();
+    changeHandler!({ matches: true });
+    expect(ui.resolvedTheme).toBe("dark");
+    vi.unstubAllGlobals();
+  });
 });
