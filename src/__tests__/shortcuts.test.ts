@@ -65,7 +65,7 @@ describe("matchesShortcut", () => {
       .toBe(true);
   });
 
-  it("ignores extra modifier presses that aren't requested", () => {
+  it("requires modifier flags to match exactly (no extras allowed)", () => {
     __setPlatformForTests(false);
     expect(
       matchesShortcut(ev("s", { ctrl: true, shift: true }), {

@@ -88,10 +88,11 @@ export type ShortcutBinding = ShortcutDef & {
 };
 
 /**
- * Build a keydown handler from a list of bindings. Returns `undefined` for
- * unmatched events so the browser default keeps working (text editing,
- * focus navigation, etc.). The first matching binding wins; later ones are
- * ignored.
+ * Run the first matching binding for a keydown event and return whether
+ * one fired. When no binding matches the function returns `false` and
+ * does NOT preventDefault, so the browser's default behaviour (text
+ * editing, focus navigation, etc.) keeps working. Later matching
+ * bindings after the first are ignored.
  */
 export function dispatch(
   event: KeyboardEvent,
