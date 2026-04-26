@@ -476,6 +476,19 @@ interface ThreadChildEntry {
  * subtree comes before the next sibling) so the visual tree
  * matches the conversation flow.
  */
+/**
+ * Strip surrounding angle brackets and whitespace so a Message-ID
+ * stored as `<mid@host>` by one backend lines up with the same id
+ * stored as `mid@host` by another. Matching is case-sensitive
+ * (Message-IDs are technically case-sensitive per RFC 5322).
+ */
+function normMid(s: string | null | undefined): string | null {
+  if (!s) return null;
+  const trimmed = s.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.replace(/^<+/, "").replace(/>+$/, "");
+}
+
 function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   const all = messagesStore.threadMessages[threadId] ?? [];
   if (all.length <= 1) return [];
@@ -483,38 +496,21 @@ function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   const root = all[0];
   const rest = all.slice(1);
 
-  // Index every message in the thread (including the root) by its
-  // Message-ID so children can find their parent.
+  // Index every message in the thread by its normalised Message-ID so
+  // children can find their parent regardless of angle-bracket
+  // conventions on either side.
   const byMid = new Map<string, import("@/lib/types").MessageSummary>();
   for (const m of all) {
-    if (m.message_id) byMid.set(m.message_id, m);
+    const mid = normMid(m.message_id);
+    if (mid) byMid.set(mid, m);
   }
 
-  // depthFor caches per id.
-  const depthCache = new Map<string, number>();
-  function depthFor(m: import("@/lib/types").MessageSummary, seen: Set<string>): number {
-    const cached = depthCache.get(m.id);
-    if (cached !== undefined) return cached;
-    if (!m.in_reply_to) {
-      depthCache.set(m.id, 0);
-      return 0;
-    }
-    const parent = byMid.get(m.in_reply_to);
-    if (!parent || parent.id === m.id || seen.has(parent.id)) {
-      depthCache.set(m.id, 0);
-      return 0;
-    }
-    seen.add(parent.id);
-    const parentDepth = parent.id === root.id ? 0 : depthFor(parent, seen) + 1;
-    depthCache.set(m.id, parentDepth);
-    return parentDepth;
-  }
-
-  // Group children by their direct parent for depth-first emission.
+  // Group children by their direct parent's normalised Message-ID so
+  // depth-first emission keeps the conversation flow.
   const childrenByParent = new Map<string, import("@/lib/types").MessageSummary[]>();
   const orphans: import("@/lib/types").MessageSummary[] = [];
   for (const m of rest) {
-    const parentMid = m.in_reply_to;
+    const parentMid = normMid(m.in_reply_to);
     if (parentMid && byMid.has(parentMid)) {
       const arr = childrenByParent.get(parentMid) ?? [];
       arr.push(m);
@@ -524,24 +520,37 @@ function childrenWithDepth(threadId: string): ThreadChildEntry[] {
     }
   }
 
+  if (typeof window !== "undefined" && (window as { __THREAD_DEBUG__?: boolean }).__THREAD_DEBUG__) {
+    console.log("[thread]", threadId, {
+      total: all.length,
+      bymid_keys: Array.from(byMid.keys()),
+      childrenOf: Array.from(childrenByParent.entries()).map(([k, v]) => [k, v.length]),
+      orphans: orphans.length,
+      messages: all.map((m) => ({ id: m.id, mid: m.message_id, irt: m.in_reply_to })),
+    });
+  }
   const out: ThreadChildEntry[] = [];
+  const emitted = new Set<string>();
   function emitChildrenOf(parentMid: string | null, depth: number) {
     const set = parentMid === null ? orphans : childrenByParent.get(parentMid) ?? [];
     for (const m of set) {
+      if (emitted.has(m.id)) continue;
+      emitted.add(m.id);
       out.push({ message: m, depth });
-      if (m.message_id) emitChildrenOf(m.message_id, depth + 1);
+      const childMid = normMid(m.message_id);
+      if (childMid) emitChildrenOf(childMid, depth + 1);
     }
   }
-  // Root's direct children at depth 0; orphans (no parent in thread)
-  // also at depth 0 so Graph threads render flat.
-  if (root.message_id) emitChildrenOf(root.message_id, 0);
+  const rootMid = normMid(root.message_id);
+  if (rootMid) emitChildrenOf(rootMid, 0);
   emitChildrenOf(null, 0);
 
-  // Fall back to the precomputed depth map for any leftover
-  // (shouldn't happen with the emission above, but it's a safety net).
+  // Safety net: anything we somehow missed (cycle, unreachable parent)
+  // gets emitted at depth 0 so it's still visible.
   for (const m of rest) {
-    if (!out.some((e) => e.message.id === m.id)) {
-      out.push({ message: m, depth: depthFor(m, new Set()) });
+    if (!emitted.has(m.id)) {
+      emitted.add(m.id);
+      out.push({ message: m, depth: 0 });
     }
   }
 
@@ -912,7 +921,8 @@ function resolveFolderName(path: string): string {
 }
 
 .thread-child {
-  padding-left: 20px;
+  /* padding-left is computed per row from the reply depth (see
+     childrenWithDepth + the inline style on .thread-child rows). */
   background: var(--color-bg-tertiary);
 }
 
