@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::mail::search::{build_jmap_filter, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -591,6 +592,49 @@ impl JmapConnection {
         });
         self.api_request(&request, config).await?;
         Ok(())
+    }
+
+    /// Search emails across the account using `Email/query` + `Email/get`.
+    /// Folder scope: account-wide (no `inMailbox` filter). Cap: 200 hits.
+    pub async fn search_account(
+        &self,
+        config: &JmapConfig,
+        account_id: &str,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>> {
+        let filter = match build_jmap_filter(query) {
+            Some(f) => f,
+            None => return Ok(vec![]),
+        };
+
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [
+                ["Email/query", {
+                    "accountId": self.account_id,
+                    "filter": filter,
+                    "sort": [{ "property": "receivedAt", "isAscending": false }],
+                    "limit": 200u64,
+                }, "sq"],
+                ["Email/get", {
+                    "#ids": { "resultOf": "sq", "name": "Email/query", "path": "/ids" },
+                    "accountId": self.account_id,
+                    "properties": ["id", "subject", "from", "receivedAt", "preview", "messageId", "mailboxIds"]
+                }, "sg"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        let emails = resp["methodResponses"][1][1]["list"]
+            .as_array()
+            .ok_or_else(|| Error::Other("Invalid Email/get response in search".into()))?;
+
+        let mut hits = Vec::with_capacity(emails.len());
+        for e in emails {
+            hits.push(parse_jmap_search_hit(account_id, e));
+        }
+        Ok(hits)
     }
 
     pub async fn move_emails(
@@ -2279,4 +2323,55 @@ fn addresses_to_json(addrs: Option<&Vec<serde_json::Value>>) -> String {
         })
         .collect();
     serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
+    let id = e["id"].as_str().unwrap_or("").to_string();
+    let subject = e["subject"].as_str().unwrap_or("").to_string();
+
+    let (from_name, from_email) = e["from"]
+        .as_array()
+        .and_then(|a| a.first())
+        .map(|f| {
+            (
+                f["name"].as_str().map(|s| s.to_string()),
+                f["email"].as_str().map(|s| s.to_string()),
+            )
+        })
+        .unwrap_or((None, None));
+
+    let date = e["receivedAt"]
+        .as_str()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    let snippet = e["preview"].as_str().map(|s| s.to_string());
+
+    let message_id = e["messageId"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(|s| format!("<{}>", s));
+
+    // mailboxIds is an object whose keys are mailbox IDs that are true.
+    // Pick the first one as the canonical folder for this hit.
+    let folder_path = e["mailboxIds"]
+        .as_object()
+        .and_then(|m| m.iter().find(|(_, v)| v.as_bool().unwrap_or(false)))
+        .map(|(k, _)| k.to_string())
+        .unwrap_or_default();
+
+    SearchHit {
+        account_id: account_id.to_string(),
+        folder_path,
+        uid: None,
+        message_id,
+        backend_id: id,
+        subject,
+        from_name,
+        from_email,
+        date,
+        snippet,
+    }
 }

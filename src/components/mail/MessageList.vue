@@ -453,6 +453,11 @@ const displayedCount = () => {
   }
   return `${messagesStore.messages.length} of ${messagesStore.total}`;
 };
+
+function formatHitDate(secs: number): string {
+  if (!secs) return "";
+  return new Date(secs * 1000).toLocaleDateString();
+}
 </script>
 
 <template>
@@ -575,6 +580,31 @@ const displayedCount = () => {
         />
       </div>
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>
+    </div>
+
+    <!-- Server-side search results: rendered after local list when present -->
+    <div
+      v-if="messagesStore.serverHits.length > 0"
+      class="server-results"
+      data-testid="server-results"
+    >
+      <div class="server-results-header">
+        Server results ({{ messagesStore.serverHits.length }})
+      </div>
+      <div
+        v-for="hit in messagesStore.serverHits"
+        :key="hit.backend_id"
+        class="server-hit-row"
+        data-testid="server-hit-row"
+      >
+        <div class="hit-line">
+          <span class="hit-from">{{ hit.from_name || hit.from_email || "(unknown sender)" }}</span>
+          <span class="hit-date">{{ formatHitDate(hit.date) }}</span>
+        </div>
+        <div class="hit-subject">{{ hit.subject || "(no subject)" }}</div>
+        <div v-if="hit.snippet" class="hit-snippet">{{ hit.snippet }}</div>
+        <div class="hit-folder">in {{ hit.folder_path || "(unknown folder)" }}</div>
+      </div>
     </div>
 
     <div class="list-footer">
@@ -795,6 +825,76 @@ const displayedCount = () => {
   font-size: 11px;
   color: var(--color-text-muted);
   flex-shrink: 0;
+}
+
+.server-results {
+  border-top: 2px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  max-height: 40vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.server-results-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.server-hit-row {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 12px;
+}
+
+.hit-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--color-text);
+}
+
+.hit-from {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-date {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.hit-subject {
+  color: var(--color-text);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hit-snippet {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.hit-folder {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  margin-top: 4px;
+  font-style: italic;
 }
 
 .quick-filter-toggle {

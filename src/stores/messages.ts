@@ -1,7 +1,15 @@
 import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import type { MessageSummary, MessageBody, ThreadSummary, QuickFilter } from "@/lib/types";
+import type {
+  MessageSummary,
+  MessageBody,
+  ThreadSummary,
+  QuickFilter,
+  SearchHit,
+  SearchQuery,
+  SearchFields,
+} from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useFoldersStore } from "./folders";
@@ -52,6 +60,11 @@ export const useMessagesStore = defineStore("messages", () => {
   const quickFilterText = ref("");
   const quickFilterVisible = ref(false);
   const quickFilterFields = ref<string[]>([]); // empty = all fields
+
+  // Server-side search state (separate from local quick-filter)
+  const serverHits = ref<SearchHit[]>([]);
+  const serverSearchLoading = ref(false);
+  const serverSearchError = ref<string | null>(null);
 
   const accountsStore = useAccountsStore();
   const foldersStore = useFoldersStore();
@@ -105,6 +118,9 @@ export const useMessagesStore = defineStore("messages", () => {
   let textSearchTimer: ReturnType<typeof setTimeout> | null = null;
   function onFilterTextChange() {
     if (textSearchTimer) clearTimeout(textSearchTimer);
+    // The server-search results are tied to the *previous* query, so clear
+    // them as soon as the user changes the input.
+    clearServerSearch();
     textSearchTimer = setTimeout(() => {
       fetchMessages(true);
     }, 300);
@@ -115,7 +131,53 @@ export const useMessagesStore = defineStore("messages", () => {
     quickFilterText.value = "";
     quickFilterFields.value = [];
     if (textSearchTimer) clearTimeout(textSearchTimer);
+    clearServerSearch();
     fetchMessages(true);
+  }
+
+  function fieldsForServerSearch(): SearchFields {
+    // QuickFilterBar uses `quickFilterFields` with values 'sender', 'recipients',
+    // 'subject', 'body'. Empty array means "all fields" (matches the bar's UI).
+    const f = quickFilterFields.value;
+    if (f.length === 0) {
+      return { subject: true, from: true, to: true, body: true };
+    }
+    return {
+      subject: f.includes("subject"),
+      from: f.includes("sender"),
+      to: f.includes("recipients"),
+      body: f.includes("body"),
+    };
+  }
+
+  function clearServerSearch() {
+    serverHits.value = [];
+    serverSearchLoading.value = false;
+    serverSearchError.value = null;
+  }
+
+  async function runServerSearch() {
+    const accountId = accountsStore.activeAccountId;
+    const text = quickFilterText.value.trim();
+    if (!accountId || !text) return;
+
+    const query: SearchQuery = {
+      text,
+      fields: fieldsForServerSearch(),
+      has_attachment: quickFilter.value.has_attachment ? true : undefined,
+    };
+
+    serverSearchLoading.value = true;
+    serverSearchError.value = null;
+    try {
+      serverHits.value = await api.searchMessagesServer(accountId, query);
+    } catch (e) {
+      console.error("Server search failed:", e);
+      serverSearchError.value = String(e);
+      serverHits.value = [];
+    } finally {
+      serverSearchLoading.value = false;
+    }
   }
 
   // Computed for quick lookup
@@ -558,6 +620,7 @@ export const useMessagesStore = defineStore("messages", () => {
       activeMessageId.value = null;
       selectedIds.value = [];
       lastClickedId.value = null;
+      clearServerSearch();
       fetchMessages();
     },
   );
@@ -671,5 +734,10 @@ export const useMessagesStore = defineStore("messages", () => {
     markAsUnread,
     setReadStatus,
     subjectForMessage,
+    serverHits,
+    serverSearchLoading,
+    serverSearchError,
+    runServerSearch,
+    clearServerSearch,
   };
 });

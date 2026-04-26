@@ -16,6 +16,33 @@ export interface QuickFilter {
   text_fields?: string[];
 }
 
+export interface SearchFields {
+  subject: boolean;
+  from: boolean;
+  to: boolean;
+  body: boolean;
+}
+
+export interface SearchQuery {
+  text: string;
+  fields: SearchFields;
+  has_attachment?: boolean;
+  since_days?: number;
+}
+
+export interface SearchHit {
+  account_id: string;
+  folder_path: string;
+  uid: number | null;
+  message_id: string | null;
+  backend_id: string;
+  subject: string;
+  from_name: string | null;
+  from_email: string | null;
+  date: number;
+  snippet: string | null;
+}
+
 export interface Folder {
   name: string;
   path: string;

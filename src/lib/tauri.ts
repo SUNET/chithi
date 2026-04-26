@@ -7,6 +7,8 @@ import type {
   MessageBody,
   SyncStatus,
   QuickFilter,
+  SearchQuery,
+  SearchHit,
 } from "./types";
 
 export async function listAccounts(): Promise<Account[]> {
@@ -63,6 +65,13 @@ export async function getMessageBody(
   messageId: string,
 ): Promise<MessageBody> {
   return invoke("get_message_body", { accountId, messageId });
+}
+
+export async function searchMessagesServer(
+  accountId: string,
+  query: SearchQuery,
+): Promise<SearchHit[]> {
+  return invoke("search_messages_server", { accountId, query });
 }
 
 export async function getMessageHtmlWithImages(
