@@ -481,9 +481,11 @@ function normMid(s: string | null | undefined): string | null {
  * Build a depth-annotated, in-order list of a thread's children
  * (everything except the root message). Depth comes from walking
  * `in_reply_to` against `message_id` of other messages in the same
- * thread; messages whose parent isn't in the chain — including all
- * Microsoft Graph messages, since the Graph sync stores
- * `in_reply_to: None` — collapse to depth 0 alongside other roots.
+ * thread; messages whose parent isn't in the chain collapse to
+ * depth 0 alongside other roots. This can still happen for
+ * Microsoft Graph messages when `in_reply_to` could not be
+ * backfilled from `internetMessageHeaders` or when the parent
+ * message is unavailable in the thread.
  *
  * Children are emitted depth-first under each parent (a parent's
  * subtree comes before the next sibling) so the visual tree
