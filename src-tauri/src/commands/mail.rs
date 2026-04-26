@@ -106,10 +106,10 @@ pub async fn search_messages_server(
     query: SearchQuery,
 ) -> Result<Vec<SearchHit>> {
     log::info!(
-        "Server search: account={} text={:?} fields={:?}",
+        "Server search: account={} fields={:?} text_len={}",
         account_id,
-        query.text,
         query.fields,
+        query.text.len(),
     );
 
     let account = {
