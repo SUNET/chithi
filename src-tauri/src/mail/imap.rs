@@ -56,6 +56,10 @@ pub struct EnvelopeData {
     pub date: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Full RFC 5322 References chain, oldest (root) first. Empty when the
+    /// header is missing. Used at insert time to thread mailing-list patch
+    /// series back to their parent discussion.
+    pub references: Vec<String>,
     pub flags: Vec<String>,
     pub size: u64,
     pub has_attachments: bool,
@@ -223,9 +227,15 @@ impl ImapConnection {
             &uid_set[..uid_set.len().min(80)]
         );
 
+        // BODY.PEEK[HEADER.FIELDS (REFERENCES)] pulls only the References
+        // line without marking the message Seen. We parse it locally to
+        // feed thread computation; the bytes are not stored.
         let fetches = self
             .session
-            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
+            .uid_fetch(
+                &uid_set,
+                "(UID ENVELOPE FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (REFERENCES)])",
+            )
             .map_err(|e| {
                 log::error!("IMAP FETCH envelopes failed: {}", e);
                 Error::Imap(e.to_string())
@@ -291,6 +301,13 @@ impl ImapConnection {
             // More accurate: check if it's multipart/mixed (indicates attachments)
             let has_attachments = size > 10000; // rough heuristic; will improve later
 
+            // Pull the References header bytes back out of the fetch and
+            // parse the angle-bracketed Message-IDs into a list.
+            let references = fetch
+                .header()
+                .map(parse_references_header)
+                .unwrap_or_default();
+
             results.push(EnvelopeData {
                 uid,
                 subject,
@@ -301,6 +318,7 @@ impl ImapConnection {
                 date: date_str,
                 message_id: msg_id,
                 in_reply_to,
+                references,
                 flags,
                 size,
                 has_attachments,
@@ -763,6 +781,40 @@ fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
         imap::types::Flag::MayCreate => "maycreate".to_string(),
         imap::types::Flag::Custom(s) => s.to_string(),
     }
+}
+
+/// Parse a `References:` header byte slice as a list of `<message-id>`
+/// strings (without the angle brackets), root first. Tolerates folded
+/// header lines and missing-header cases (returns an empty list).
+fn parse_references_header(bytes: &[u8]) -> Vec<String> {
+    let raw = String::from_utf8_lossy(bytes);
+    // Strip the leading "References:" if present (BODY.PEEK[HEADER.FIELDS]
+    // includes the field name).
+    let body = match raw.split_once(':') {
+        Some((_, rest)) => rest.to_string(),
+        None => raw.to_string(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut inside = false;
+    for c in body.chars() {
+        match c {
+            '<' => {
+                inside = true;
+                buf.clear();
+            }
+            '>' if inside => {
+                if !buf.is_empty() {
+                    out.push(buf.clone());
+                }
+                inside = false;
+                buf.clear();
+            }
+            _ if inside => buf.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Decode a potentially MIME-encoded IMAP string to a Rust String.

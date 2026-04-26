@@ -104,6 +104,9 @@ pub struct JmapEmail {
     pub date: String,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Full RFC 5322 References chain, root first. Used at insert time
+    /// to thread mailing-list patch series back to their root discussion.
+    pub references: Vec<String>,
     pub size: u64,
     pub has_attachments: bool,
     pub flags: Vec<String>,
@@ -355,7 +358,7 @@ impl JmapConnection {
                         "accountId": self.account_id,
                         "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
                                        "size", "keywords", "messageId", "inReplyTo",
-                                       "hasAttachment", "preview"]
+                                       "references", "hasAttachment", "preview"]
                     }, "g1"]
                 ]
             });
@@ -438,6 +441,18 @@ impl JmapConnection {
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
             .map(|s| format!("<{}>", s));
+        // JMAP stores Message-IDs without angle brackets; wrap each so the
+        // chain matches what the DB stores for IMAP envelopes.
+        let references: Vec<String> = e["references"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("<{}>", s))
+                    .collect()
+            })
+            .unwrap_or_default();
         let has_attachments = e["hasAttachment"].as_bool().unwrap_or(false);
         let preview = e["preview"].as_str().map(|s| s.to_string());
 
@@ -468,6 +483,7 @@ impl JmapConnection {
             date,
             message_id,
             in_reply_to,
+            references,
             size,
             has_attachments,
             flags,

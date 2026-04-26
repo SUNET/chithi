@@ -245,12 +245,18 @@ async fn sync_jmap_folder(
                 .map(|s| s.chars().take(200).collect());
 
             // Compute thread_id
+            let refs_slice: Option<&[String]> = if email.references.is_empty() {
+                None
+            } else {
+                Some(email.references.as_slice())
+            };
             let thread_id = db::messages::compute_thread_id(
                 &conn,
                 account_id,
                 email.message_id.as_deref(),
                 email.in_reply_to.as_deref(),
                 email.subject.as_deref(),
+                refs_slice,
             );
             if let Some(ref tid) = thread_id {
                 log::debug!("JMAP assigned thread_id '{}' to email {}", tid, email.id);
