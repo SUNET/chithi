@@ -54,6 +54,11 @@ fn build_body(
 }
 
 /// Send an email message via SMTP.
+///
+/// `in_reply_to` and `references` carry RFC 5322 threading headers,
+/// already wrapped in angle brackets. Without these the receiving
+/// client cannot link the new message to its parent.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     smtp_host: &str,
     smtp_port: u16,
@@ -69,21 +74,30 @@ pub async fn send_message(
     body_text: &str,
     body_html: Option<&str>,
     attachments: &[AttachmentData],
+    in_reply_to: Option<&str>,
+    references: &[String],
 ) -> Result<()> {
     log::info!(
-        "SMTP sending message from {} to {:?} via {}:{} ({} attachments)",
+        "SMTP sending message from {} to {:?} via {}:{} ({} attachments, threading={})",
         from,
         to,
         smtp_host,
         smtp_port,
-        attachments.len()
+        attachments.len(),
+        in_reply_to.is_some(),
     );
 
     let from_mailbox: Mailbox = from
         .parse()
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
-    let mut builder = Message::builder().from(from_mailbox).subject(subject);
+    // `message_id(None)` makes lettre emit a generated <UUID@host>;
+    // without it lettre never adds the header and the next reply
+    // has nothing to point In-Reply-To at.
+    let mut builder = Message::builder()
+        .from(from_mailbox)
+        .subject(subject)
+        .message_id(None);
 
     for addr in to {
         let mailbox: Mailbox = addr
@@ -102,6 +116,24 @@ pub async fn send_message(
             .parse()
             .map_err(|e| Error::Other(format!("Invalid 'bcc' address '{}': {}", addr, e)))?;
         builder = builder.bcc(mailbox);
+    }
+
+    if let Some(irt) = in_reply_to {
+        let trimmed = irt.trim();
+        if !trimmed.is_empty() {
+            builder = builder.in_reply_to(trimmed.to_string());
+        }
+    }
+    if !references.is_empty() {
+        let joined = references
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            builder = builder.references(joined);
+        }
     }
 
     let body = build_body(body_text, body_html, attachments)
@@ -181,7 +213,14 @@ pub fn build_raw_message(
         .parse()
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
-    let mut builder = Message::builder().from(from_mailbox).subject(subject);
+    // Always emit a Message-ID. Lettre's `build()` does NOT add one
+    // automatically, so without this, our outgoing replies have no
+    // Message-ID for the next reply to thread off of. `message_id(None)`
+    // generates `<UUID@hostname>` per RFC 5322 §3.6.4.
+    let mut builder = Message::builder()
+        .from(from_mailbox)
+        .subject(subject)
+        .message_id(None);
 
     for addr in to {
         let mailbox: Mailbox = addr
