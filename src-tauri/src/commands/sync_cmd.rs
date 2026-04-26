@@ -981,23 +981,33 @@ async fn sync_graph_account(
         };
 
         // Backfill: existing rows synced before threading worked have an
-        // empty thread_id. The Graph response gives us the live
-        // conversationId for free, so we fix them up here without a
+        // empty thread_id. We also have a fresh In-Reply-To from
+        // internetMessageHeaders, which lets the frontend render the
+        // reply hierarchy for already-stored Graph messages without a
         // re-download.
         {
             let conn = db_arc.writer().await;
-            let mut stmt = conn.prepare(
+            let mut update_thread = conn.prepare(
                 "UPDATE messages SET thread_id = ?1
                  WHERE id = ?2 AND (thread_id IS NULL OR thread_id = '')",
             )?;
+            let mut update_irt = conn.prepare(
+                "UPDATE messages SET in_reply_to = ?1
+                 WHERE id = ?2 AND (in_reply_to IS NULL OR in_reply_to = '')",
+            )?;
             for msg in &messages {
+                let id = format!("{}_{}", account_id, msg.id);
+                if !existing_ids.contains(&id) {
+                    continue;
+                }
                 if let Some(cid) = msg.conversation_id.as_deref() {
-                    if cid.is_empty() {
-                        continue;
+                    if !cid.is_empty() {
+                        update_thread.execute(rusqlite::params![cid, id])?;
                     }
-                    let id = format!("{}_{}", account_id, msg.id);
-                    if existing_ids.contains(&id) {
-                        stmt.execute(rusqlite::params![cid, id])?;
+                }
+                if let Some(irt) = msg.in_reply_to.as_deref() {
+                    if !irt.is_empty() {
+                        update_irt.execute(rusqlite::params![irt, id])?;
                     }
                 }
             }
@@ -1072,7 +1082,7 @@ async fn sync_graph_account(
                 folder_path: gf.id.clone(),
                 uid: 0,
                 message_id: msg.internet_message_id.clone(),
-                in_reply_to: None,
+                in_reply_to: msg.in_reply_to.clone(),
                 thread_id,
                 subject: msg.subject.clone(),
                 from_name: msg.from_name.clone(),
