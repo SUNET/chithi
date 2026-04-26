@@ -4,6 +4,12 @@ import { createPinia, setActivePinia } from "pinia";
 import { createMemoryHistory, createRouter } from "vue-router";
 import { __setPlatformForTests } from "@/lib/shortcuts";
 import MenuBar from "@/components/common/MenuBar.vue";
+import pkg from "../../package.json";
+
+// `__APP_VERSION__` is injected by Vite's `define` from package.json (see
+// vite.config.ts). Asserting against package.json keeps the test in sync
+// with whatever the build pipeline actually inlines.
+const APP_VERSION = pkg.version as string;
 
 const { invokeMock, setDecorationsMock, openUrlMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -17,7 +23,6 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: openUrlMock }));
 
-(globalThis as { __APP_VERSION__?: string }).__APP_VERSION__ = "0.0.0-test";
 vi.mock("@/lib/tauri", () => ({
   listTimezones: vi.fn().mockResolvedValue([]),
   getDefaultTimezone: vi.fn().mockResolvedValue("UTC"),
@@ -60,7 +65,7 @@ describe("MenuBar", () => {
     await wrapper.find('[data-testid="menu-help-about"]').trigger("click");
     await wrapper.vm.$nextTick();
     expect(document.querySelector('[data-testid="about-overlay"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("0.0.0-test");
+    expect(document.body.textContent).toContain(APP_VERSION);
   });
 
   it("File menu shows Preferences / Quit with shortcut labels", async () => {

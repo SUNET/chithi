@@ -5,9 +5,12 @@ import { __setPlatformForTests } from "@/lib/shortcuts";
 const { openUrlMock } = vi.hoisted(() => ({ openUrlMock: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: openUrlMock }));
 
-(globalThis as { __APP_VERSION__?: string }).__APP_VERSION__ = "0.0.0-test";
-
 import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
+import pkg from "../../package.json";
+
+// `__APP_VERSION__` is injected by Vite's `define` from package.json
+// (see vite.config.ts); the test asserts against the same source.
+const APP_VERSION = pkg.version as string;
 
 beforeEach(() => {
   __setPlatformForTests(false);
@@ -116,7 +119,7 @@ describe("ComposeMenuBar", () => {
 
     const overlay = document.querySelector('[data-testid="about-overlay"]');
     expect(overlay).not.toBeNull();
-    expect(document.body.textContent).toContain("0.0.0-test");
+    expect(document.body.textContent).toContain(APP_VERSION);
 
     const sourceLink = document.querySelector(
       '[data-testid="about-source-link"]',
