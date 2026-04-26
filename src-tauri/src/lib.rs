@@ -39,6 +39,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::app::quit_app,
             commands::accounts::list_accounts,
             commands::accounts::add_account,
             commands::accounts::get_account_config,
