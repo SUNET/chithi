@@ -458,6 +458,15 @@ function formatHitDate(secs: number): string {
   if (!secs) return "";
   return new Date(secs * 1000).toLocaleDateString();
 }
+
+// JMAP and Graph hits report the backend's folder/mailbox ID, which is
+// opaque to the user. Resolve to the folder's display name when we have it
+// in the tree; fall back to the raw path otherwise.
+function resolveFolderName(path: string): string {
+  if (!path) return "(unknown folder)";
+  const folder = foldersStore.getFlatFolders().find((f) => f.path === path);
+  return folder?.name ?? path;
+}
 </script>
 
 <template>
@@ -603,7 +612,7 @@ function formatHitDate(secs: number): string {
         </div>
         <div class="hit-subject">{{ hit.subject || "(no subject)" }}</div>
         <div v-if="hit.snippet" class="hit-snippet">{{ hit.snippet }}</div>
-        <div class="hit-folder">in {{ hit.folder_path || "(unknown folder)" }}</div>
+        <div class="hit-folder">in {{ resolveFolderName(hit.folder_path) }}</div>
       </div>
     </div>
 
