@@ -647,7 +647,7 @@ function resolveFolderName(path: string): string {
             v-for="entry in childrenWithDepth(thread.thread_id)"
             :key="entry.message.id"
             class="thread-child"
-            :style="{ paddingLeft: 16 + entry.depth * 18 + 'px' }"
+            :style="`--reply-depth: ${entry.depth}`"
             @click.stop="onChildSelect(entry.message.id)"
             @contextmenu.prevent.stop="onRowRightClick($event, entry.message.id)"
             @mousedown="onDragMouseDown($event, entry.message.id)"
@@ -921,9 +921,14 @@ function resolveFolderName(path: string): string {
 }
 
 .thread-child {
-  /* padding-left is computed per row from the reply depth (see
-     childrenWithDepth + the inline style on .thread-child rows). */
   background: var(--color-bg-tertiary);
+  /* `--reply-depth` is set as an inline custom property per row from
+     childrenWithDepth(). margin-left pushes the row's box, which is
+     more robust than padding when MessageListItem's own layout
+     constrains its content. The 22px step lines up with the typical
+     row height so the indentation tree reads cleanly. */
+  margin-left: calc(20px + var(--reply-depth, 0) * 22px);
+  border-left: 2px solid var(--color-border);
 }
 
 .loading-more {
