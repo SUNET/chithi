@@ -628,7 +628,9 @@ impl ImapConnection {
     /// and return matching UIDs. The query string is the raw search key
     /// (e.g., `CHARSET UTF-8 SUBJECT "foo"`).
     pub fn uid_search(&mut self, query: &str) -> Result<Vec<u32>> {
-        log::debug!("IMAP UID SEARCH {}", query);
+        // The query string carries user-provided search text; log only its
+        // shape so debug output is safe to share.
+        log::debug!("IMAP UID SEARCH (query_len={})", query.len());
         let uids = self.session.uid_search(query).map_err(|e| {
             log::error!("IMAP UID SEARCH failed: {}", e);
             Error::Imap(e.to_string())
