@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::mail::msgid::normalize_message_id;
 
 /// Quick filter options for the message list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -664,8 +665,19 @@ pub fn compute_thread_id(
     subject: Option<&str>,
     references: Option<&[String]>,
 ) -> Option<String> {
+    // Defensive: callers in older code paths may still pass non-canonical
+    // forms (leading whitespace, missing brackets). Normalize once so the
+    // exact-match SQL below has a consistent comparand on both sides.
+    let message_id_norm = message_id.and_then(normalize_message_id);
+    let in_reply_to_norm = in_reply_to.and_then(normalize_message_id);
+    let references_norm: Option<Vec<String>> = references.map(|refs| {
+        refs.iter()
+            .filter_map(|r| normalize_message_id(r))
+            .collect::<Vec<_>>()
+    });
+
     // Step 1: Look up thread_id of the message we are replying to
-    if let Some(irt) = in_reply_to {
+    if let Some(irt) = in_reply_to_norm.as_deref() {
         let result: std::result::Result<Option<String>, _> = conn.query_row(
             "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
             params![account_id, irt],
@@ -684,13 +696,10 @@ pub fn compute_thread_id(
     // Step 2: Walk References from newest to oldest. The chain is ordered
     // root-first per RFC 5322 §3.6.4, so the most recent ancestor — the one
     // most likely already synced — is at the tail.
-    if let Some(refs) = references {
+    if let Some(refs) = references_norm.as_deref() {
         for r in refs.iter().rev() {
-            if r.is_empty() {
-                continue;
-            }
             // Skip the in_reply_to we already checked.
-            if in_reply_to == Some(r.as_str()) {
+            if in_reply_to_norm.as_deref() == Some(r.as_str()) {
                 continue;
             }
             let result: std::result::Result<Option<String>, _> = conn.query_row(
@@ -712,14 +721,12 @@ pub fn compute_thread_id(
         // (the root of the conversation) as a synthetic thread_id; later
         // siblings whose chain shares the same root will land in this thread.
         if let Some(root) = refs.first() {
-            if !root.is_empty() {
-                return Some(root.clone());
-            }
+            return Some(root.clone());
         }
     }
 
     // Step 3: Reverse lookup — does any existing message reply to us?
-    if let Some(mid) = message_id {
+    if let Some(mid) = message_id_norm.as_deref() {
         let result: std::result::Result<Option<String>, _> = conn.query_row(
             "SELECT thread_id FROM messages WHERE account_id = ?1 AND in_reply_to = ?2 AND thread_id IS NOT NULL AND thread_id != '' LIMIT 1",
             params![account_id, mid],
@@ -755,12 +762,12 @@ pub fn compute_thread_id(
     }
 
     // Step 4: New thread root
-    if let Some(mid) = message_id {
-        return Some(mid.to_string());
+    if let Some(mid) = message_id_norm {
+        return Some(mid);
     }
 
-    if let Some(irt) = in_reply_to {
-        return Some(irt.to_string());
+    if let Some(irt) = in_reply_to_norm {
+        return Some(irt);
     }
 
     None

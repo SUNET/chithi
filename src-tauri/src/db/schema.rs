@@ -328,6 +328,88 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         log::info!("Migration: FTS5 index populated");
     }
 
+    // Canonicalize Message-ID / In-Reply-To and rethread.
+    //
+    // Older builds stored these strings verbatim from the IMAP envelope,
+    // which on some servers (notably Microsoft Exchange/M365) included a
+    // leading whitespace inside the bracketed value. Exact-match thread
+    // joins (`WHERE message_id = ?`) then silently failed and replies
+    // landed in their own one-message threads. Trim+wrap once, then
+    // recompute thread_id for every message so existing mail heals
+    // without waiting for a fresh full sync.
+    if !has_migration(conn, "messageid_normalize_v1") {
+        log::info!("Migration: normalizing message_id / in_reply_to and rethreading");
+        normalize_message_ids_and_rethread(conn)?;
+        set_migration(conn, "messageid_normalize_v1")?;
+        log::info!("Migration: message-id normalization complete");
+    }
+
+    Ok(())
+}
+
+/// One-time backfill: rewrite stored message_id / in_reply_to to their
+/// canonical `<core>` form, then propagate ancestor thread_ids down so
+/// existing fragmented threads heal. Pure SQL — no per-row Rust loop —
+/// so even tens of thousands of messages finish in well under a second
+/// on commodity hardware. Wrapped in a single transaction.
+fn normalize_message_ids_and_rethread(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    // 1) Canonicalize message_id and in_reply_to.
+    //
+    // SQLite doesn't have a built-in regex, so we use REPLACE chains to
+    // strip every `<`, `>`, ASCII space, and tab from the existing value,
+    // then re-wrap. The `WHERE` guards skip already-canonical rows so we
+    // don't rewrite the entire table on every startup.
+    tx.execute_batch(
+        "UPDATE messages
+         SET message_id = '<' || REPLACE(REPLACE(REPLACE(REPLACE(message_id, '<', ''), '>', ''), ' ', ''), CHAR(9), '') || '>'
+         WHERE message_id IS NOT NULL
+           AND TRIM(message_id) != ''
+           AND message_id != '<' || REPLACE(REPLACE(REPLACE(REPLACE(message_id, '<', ''), '>', ''), ' ', ''), CHAR(9), '') || '>';
+
+         UPDATE messages
+         SET in_reply_to = '<' || REPLACE(REPLACE(REPLACE(REPLACE(in_reply_to, '<', ''), '>', ''), ' ', ''), CHAR(9), '') || '>'
+         WHERE in_reply_to IS NOT NULL
+           AND TRIM(in_reply_to) != ''
+           AND in_reply_to != '<' || REPLACE(REPLACE(REPLACE(REPLACE(in_reply_to, '<', ''), '>', ''), ' ', ''), CHAR(9), '') || '>';",
+    )?;
+
+    // 2) Propagate parent thread_ids. Each iteration runs one indexed
+    // self-join on (account_id, message_id) — the existing
+    // `idx_msg_message_id` index makes this a cheap lookup. Each pass
+    // pushes thread_ids one generation deeper, so a chain of depth N
+    // converges in N-1 passes. Cap at 32 (matching the compose-side
+    // chain cap) so a pathological cycle can't spin forever.
+    for _ in 0..32 {
+        let changed = tx.execute(
+            "UPDATE messages
+             SET thread_id = (
+                 SELECT parent.thread_id FROM messages AS parent
+                 WHERE parent.account_id = messages.account_id
+                   AND parent.message_id = messages.in_reply_to
+                   AND parent.thread_id IS NOT NULL
+                   AND parent.thread_id != ''
+             )
+             WHERE in_reply_to IS NOT NULL
+               AND in_reply_to != ''
+               AND EXISTS (
+                 SELECT 1 FROM messages AS parent
+                 WHERE parent.account_id = messages.account_id
+                   AND parent.message_id = messages.in_reply_to
+                   AND parent.thread_id IS NOT NULL
+                   AND parent.thread_id != ''
+                   AND parent.thread_id IS NOT messages.thread_id
+               )",
+            [],
+        )?;
+        if changed == 0 {
+            break;
+        }
+    }
+
+    tx.commit()?;
+    log::info!("Migration messageid_normalize_v1: canonicalized + rethreaded");
     Ok(())
 }
 
