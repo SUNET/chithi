@@ -460,12 +460,15 @@ function formatHitDate(secs: number): string {
 }
 
 // JMAP and Graph hits report the backend's folder/mailbox ID, which is
-// opaque to the user. Resolve to the folder's display name when we have it
-// in the tree; fall back to the raw path otherwise.
+// opaque to the user. Build a path -> name index once per folder-tree
+// change so rendering N hits stays O(N) instead of O(N * folder_count).
+const folderNameByPath = computed(
+  () => new Map(foldersStore.getFlatFolders().map((f) => [f.path, f.name])),
+);
+
 function resolveFolderName(path: string): string {
   if (!path) return "(unknown folder)";
-  const folder = foldersStore.getFlatFolders().find((f) => f.path === path);
-  return folder?.name ?? path;
+  return folderNameByPath.value.get(path) ?? path;
 }
 </script>
 
