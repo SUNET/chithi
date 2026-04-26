@@ -380,6 +380,7 @@ async function saveDraft(): Promise<boolean> {
       body_text: bodyText.value,
       body_html: null,
       attachments: attachments.value,
+      reply_to_message_id: replyToMessageId || null,
     });
     markDraftStateAsClean();
     // Trigger a sync so the draft appears in the local mailbox
@@ -489,6 +490,7 @@ async function send() {
       body_text: bodyText.value,
       body_html: null,
       attachments: attachments.value,
+      reply_to_message_id: replyToMessageId || null,
     });
     if (replyToMessageId) {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)

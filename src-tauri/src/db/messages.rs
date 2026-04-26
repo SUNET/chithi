@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::mail::msgid::normalize_message_id;
 
 /// Quick filter options for the message list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -34,6 +35,14 @@ pub struct MessageSummary {
     pub is_encrypted: bool,
     pub is_signed: bool,
     pub snippet: Option<String>,
+    /// RFC 5322 Message-ID, with angle brackets, exactly as stored.
+    /// Used by the frontend to build the in-thread reply hierarchy.
+    pub message_id: Option<String>,
+    /// In-Reply-To header pointing at this message's parent within the
+    /// thread. Empty for the thread root or when the source message/backend
+    /// does not provide the header; Microsoft Graph populates this from
+    /// `internetMessageHeaders` when available.
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,7 +323,8 @@ fn get_messages_inner(
     let offset = page * per_page;
     let query = format!(
         "SELECT id, subject, from_name, from_email, date, flags,
-                has_attachments, is_encrypted, is_signed, snippet
+                has_attachments, is_encrypted, is_signed, snippet,
+                message_id, in_reply_to
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2{}
          ORDER BY {} {}
@@ -338,6 +348,8 @@ fn get_messages_inner(
                 is_encrypted: row.get(7)?,
                 is_signed: row.get(8)?,
                 snippet: row.get(9)?,
+                message_id: row.get(10)?,
+                in_reply_to: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -623,20 +635,25 @@ pub fn get_unfetched_messages(
 /// Compute a thread_id for a message using a multi-step strategy:
 ///
 /// 1. **In-Reply-To lookup**: If the message has an `In-Reply-To` header, find the
-///    referenced message in the DB and reuse its `thread_id`. This is the most
-///    reliable threading signal.
+///    referenced message in the DB and reuse its `thread_id`.
 ///
-/// 2. **Reverse lookup**: Check if any existing message has `In-Reply-To` pointing
+/// 2. **References chain walk**: The full RFC 5322 `References:` chain lists the
+///    ancestry from root to direct parent. Walk it from the closest ancestor
+///    backwards; the first id we find in our DB hands us its thread. This is
+///    what stitches mailing-list patch series (`[PATCH n/m]`, `Re: [PATCH n/m]`)
+///    back to the original discussion they're replying to.
+///
+/// 3. **Reverse lookup**: Check if any existing message has `In-Reply-To` pointing
 ///    to our `Message-ID` — if so, we're the parent and should join their thread.
 ///
-/// 3. **Subject-based fallback**: Only for messages whose subject starts with
+/// 4. **Subject-based fallback**: Only for messages whose subject starts with
 ///    `Re:`, `Fwd:`, or `FW:` (explicit replies/forwards). Strip the prefix and
 ///    find an existing thread with the matching base subject. This catches cases
 ///    where `In-Reply-To` doesn't match (e.g., replies from different clients,
 ///    or Gmail conversations). Plain subjects like "OSSEC Notification" are NOT
 ///    matched to avoid false threading of automated/notification emails.
 ///
-/// 4. **New thread root**: If no existing thread is found, use the message's own
+/// 5. **New thread root**: If no existing thread is found, use the message's own
 ///    `Message-ID` as a new `thread_id`.
 ///
 /// Thread IDs are stored in the `thread_id` column of the `messages` table.
@@ -647,9 +664,21 @@ pub fn compute_thread_id(
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     subject: Option<&str>,
+    references: Option<&[String]>,
 ) -> Option<String> {
+    // Defensive: callers in older code paths may still pass non-canonical
+    // forms (leading whitespace, missing brackets). Normalize once so the
+    // exact-match SQL below has a consistent comparand on both sides.
+    let message_id_norm = message_id.and_then(normalize_message_id);
+    let in_reply_to_norm = in_reply_to.and_then(normalize_message_id);
+    let references_norm: Option<Vec<String>> = references.map(|refs| {
+        refs.iter()
+            .filter_map(|r| normalize_message_id(r))
+            .collect::<Vec<_>>()
+    });
+
     // Step 1: Look up thread_id of the message we are replying to
-    if let Some(irt) = in_reply_to {
+    if let Some(irt) = in_reply_to_norm.as_deref() {
         let result: std::result::Result<Option<String>, _> = conn.query_row(
             "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
             params![account_id, irt],
@@ -665,8 +694,40 @@ pub fn compute_thread_id(
         }
     }
 
-    // Step 2: Reverse lookup — does any existing message reply to us?
-    if let Some(mid) = message_id {
+    // Step 2: Walk References from newest to oldest. The chain is ordered
+    // root-first per RFC 5322 §3.6.4, so the most recent ancestor — the one
+    // most likely already synced — is at the tail.
+    if let Some(refs) = references_norm.as_deref() {
+        for r in refs.iter().rev() {
+            // Skip the in_reply_to we already checked.
+            if in_reply_to_norm.as_deref() == Some(r.as_str()) {
+                continue;
+            }
+            let result: std::result::Result<Option<String>, _> = conn.query_row(
+                "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
+                params![account_id, r],
+                |row| row.get(0),
+            );
+            match result {
+                Ok(Some(tid)) if !tid.is_empty() => return Some(tid),
+                Ok(_) => return Some(r.clone()),
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                Err(e) => {
+                    log::error!("compute_thread_id: DB error walking References: {}", e);
+                    continue;
+                }
+            }
+        }
+        // None of the ancestors are in our DB yet. Use the oldest reference
+        // (the root of the conversation) as a synthetic thread_id; later
+        // siblings whose chain shares the same root will land in this thread.
+        if let Some(root) = refs.first() {
+            return Some(root.clone());
+        }
+    }
+
+    // Step 3: Reverse lookup — does any existing message reply to us?
+    if let Some(mid) = message_id_norm.as_deref() {
         let result: std::result::Result<Option<String>, _> = conn.query_row(
             "SELECT thread_id FROM messages WHERE account_id = ?1 AND in_reply_to = ?2 AND thread_id IS NOT NULL AND thread_id != '' LIMIT 1",
             params![account_id, mid],
@@ -702,12 +763,12 @@ pub fn compute_thread_id(
     }
 
     // Step 4: New thread root
-    if let Some(mid) = message_id {
-        return Some(mid.to_string());
+    if let Some(mid) = message_id_norm {
+        return Some(mid);
     }
 
-    if let Some(irt) = in_reply_to {
-        return Some(irt.to_string());
+    if let Some(irt) = in_reply_to_norm {
+        return Some(irt);
     }
 
     None
@@ -946,7 +1007,8 @@ pub fn get_thread_messages(
 
     let mut stmt = conn.prepare(
         "SELECT id, subject, from_name, from_email, date, flags,
-                has_attachments, is_encrypted, is_signed, snippet
+                has_attachments, is_encrypted, is_signed, snippet,
+                message_id, in_reply_to
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2
            AND (thread_id = ?3 OR (thread_id IS NULL AND id = ?3))
@@ -968,6 +1030,8 @@ pub fn get_thread_messages(
                 is_encrypted: row.get(7)?,
                 is_signed: row.get(8)?,
                 snippet: row.get(9)?,
+                message_id: row.get(10)?,
+                in_reply_to: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1116,5 +1180,77 @@ mod tests {
         let conn = setup_db();
         let paths = get_maildir_paths(&conn, "acc1", &[]).unwrap();
         assert!(paths.is_empty());
+    }
+
+    fn insert_threaded_row(
+        conn: &Connection,
+        id: &str,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO messages
+             (id, account_id, folder_path, uid, message_id, thread_id, date, from_email, maildir_path)
+             VALUES (?1, 'acc1', 'INBOX', 1, ?2, ?3, '2026-04-26T00:00:00Z', 'x@y', '')",
+            params![id, message_id, thread_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn compute_thread_id_walks_references_to_existing_ancestor() {
+        let conn = setup_db();
+        // Original [BUG] message is already synced with its own thread_id.
+        insert_threaded_row(&conn, "row1", Some("<bug@list>"), Some("<bug@list>"));
+
+        // A [PATCH 1/2] message arrives. Its In-Reply-To points at a child
+        // we don't yet have, but its References chain goes back to the BUG.
+        let refs = vec![
+            "<bug@list>".to_string(),
+            "<re-bug-1@list>".to_string(),
+            "<unknown-parent@list>".to_string(),
+        ];
+        let tid = compute_thread_id(
+            &conn,
+            "acc1",
+            Some("<patch1@list>"),
+            Some("<unknown-parent@list>"),
+            Some("[PATCH 1/2] foo"),
+            Some(&refs),
+        );
+        assert_eq!(tid.as_deref(), Some("<bug@list>"));
+    }
+
+    #[test]
+    fn compute_thread_id_uses_root_reference_when_no_ancestor_synced() {
+        let conn = setup_db();
+        // Nothing in the DB yet — the new message is the first arrival.
+        let refs = vec!["<bug@list>".to_string(), "<re-bug-1@list>".to_string()];
+        let tid = compute_thread_id(
+            &conn,
+            "acc1",
+            Some("<patch1@list>"),
+            Some("<re-bug-1@list>"),
+            Some("[PATCH 1/2] foo"),
+            Some(&refs),
+        );
+        // Falls back to the root of the chain so future siblings join it.
+        assert_eq!(tid.as_deref(), Some("<bug@list>"));
+    }
+
+    #[test]
+    fn compute_thread_id_works_without_references() {
+        let conn = setup_db();
+        // Plain root message, no in_reply_to, no references — uses its own
+        // Message-ID as the thread root.
+        let tid = compute_thread_id(
+            &conn,
+            "acc1",
+            Some("<bug@list>"),
+            None,
+            Some("[BUG] foo"),
+            None,
+        );
+        assert_eq!(tid.as_deref(), Some("<bug@list>"));
     }
 }

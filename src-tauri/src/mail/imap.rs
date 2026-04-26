@@ -3,6 +3,7 @@ use native_tls::TlsStream;
 use std::net::TcpStream;
 
 use crate::error::{Error, Result};
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
 
 #[derive(Clone)]
@@ -56,6 +57,10 @@ pub struct EnvelopeData {
     pub date: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Full RFC 5322 References chain, oldest (root) first. Empty when the
+    /// header is missing. Used at insert time to thread mailing-list patch
+    /// series back to their parent discussion.
+    pub references: Vec<String>,
     pub flags: Vec<String>,
     pub size: u64,
     pub has_attachments: bool,
@@ -269,8 +274,19 @@ impl ImapConnection {
                     let cc_list = addresses_to_json(env.cc.as_deref());
 
                     let date = env.date.as_ref().map(|d| decode_imap_str(d));
-                    let mid = env.message_id.as_ref().map(|m| decode_imap_str(m));
-                    let irt = env.in_reply_to.as_ref().map(|r| decode_imap_str(r));
+                    // Some servers (notably Microsoft Exchange/M365) emit a
+                    // leading space inside the envelope's MessageId/InReplyTo
+                    // octet-string. Storing that verbatim breaks the exact-
+                    // match `WHERE message_id = ?` lookup in `compute_thread_id`,
+                    // so canonicalize at the seam.
+                    let mid = env
+                        .message_id
+                        .as_ref()
+                        .and_then(|m| normalize_message_id(&decode_imap_str(m)));
+                    let irt = env
+                        .in_reply_to
+                        .as_ref()
+                        .and_then(|r| normalize_message_id(&decode_imap_str(r)));
 
                     (subject, fname, femail, to_list, cc_list, date, mid, irt)
                 } else {
@@ -301,13 +317,68 @@ impl ImapConnection {
                 date: date_str,
                 message_id: msg_id,
                 in_reply_to,
+                references: Vec::new(),
                 flags,
                 size,
                 has_attachments,
             });
         }
         log::info!("IMAP envelope batch: {} envelopes fetched", results.len());
+
+        // References travels in a second, header-only fetch. Combining it
+        // with ENVELOPE in one FETCH triggers an imap-proto parse error on
+        // some servers (the literal-string framing of the body fetch leaks
+        // into the next command's response). A second pass is one extra
+        // round-trip per batch but keeps the connection state clean.
+        if !results.is_empty() {
+            self.populate_references(&mut results, &uid_set);
+        }
+
         Ok(results)
+    }
+
+    /// Best-effort: fetch the References and In-Reply-To headers for every
+    /// envelope in `results` and write them back. References fills
+    /// `env.references`. In-Reply-To is used to backfill `env.in_reply_to`
+    /// only when the envelope itself didn't carry it (some servers return
+    /// NIL even when the header is in the body). Failures here do not abort
+    /// the sync.
+    fn populate_references(&mut self, results: &mut [EnvelopeData], uid_set: &str) {
+        let fetches = match self.session.uid_fetch(
+            uid_set,
+            "(UID BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("IMAP fetch References/In-Reply-To failed (skipping): {}", e);
+                return;
+            }
+        };
+        let mut refs_by_uid: std::collections::HashMap<u32, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut irt_by_uid: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        for fetch in fetches.iter() {
+            if let (Some(uid), Some(bytes)) = (fetch.uid, fetch.header()) {
+                let (irt, refs) = parse_threading_headers(bytes);
+                if !refs.is_empty() {
+                    refs_by_uid.insert(uid, refs);
+                }
+                if let Some(irt) = irt {
+                    irt_by_uid.insert(uid, irt);
+                }
+            }
+        }
+        for env in results.iter_mut() {
+            if let Some(refs) = refs_by_uid.remove(&env.uid) {
+                env.references = refs;
+            }
+            if env.in_reply_to.is_none() {
+                if let Some(irt) = irt_by_uid.remove(&env.uid) {
+                    env.in_reply_to = Some(irt);
+                }
+            }
+        }
     }
 
     /// Fetch the full body (RFC822) for a single message by UID.
@@ -765,6 +836,60 @@ fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
     }
 }
 
+/// Extract `<message-id>` tokens from a single header value (the part
+/// after `Field-Name:`). Returned ids are canonical form.
+fn extract_msgids(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut inside = false;
+    for c in value.chars() {
+        match c {
+            '<' => {
+                inside = true;
+                buf.clear();
+            }
+            '>' if inside => {
+                if let Some(id) = normalize_message_id(&buf) {
+                    out.push(id);
+                }
+                inside = false;
+                buf.clear();
+            }
+            _ if inside => buf.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Split a `BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)]` block into
+/// `(in_reply_to, references)`, applying RFC 5322 §2.2.3 unfolding so
+/// folded continuation lines don't split a single id in half.
+fn parse_threading_headers(bytes: &[u8]) -> (Option<String>, Vec<String>) {
+    let raw = String::from_utf8_lossy(bytes);
+    // Unfold: a CRLF followed by WSP is part of the same header value.
+    let unfolded = raw
+        .replace("\r\n ", " ")
+        .replace("\r\n\t", " ")
+        .replace("\n ", " ")
+        .replace("\n\t", " ");
+
+    let mut in_reply_to: Option<String> = None;
+    let mut references: Vec<String> = Vec::new();
+    for line in unfolded.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name_lc = name.trim().to_ascii_lowercase();
+        if name_lc == "references" {
+            references = extract_msgids(value);
+        } else if name_lc == "in-reply-to" && in_reply_to.is_none() {
+            in_reply_to = extract_msgids(value).into_iter().next();
+        }
+    }
+    (in_reply_to, references)
+}
+
 /// Decode a potentially MIME-encoded IMAP string to a Rust String.
 /// Handles =?charset?encoding?text?= encoded words (RFC 2047).
 fn decode_imap_str(s: &[u8]) -> String {
@@ -829,5 +954,43 @@ mod tests {
     fn test_utf7_imap_ascii_passthrough() {
         let decoded = utf7_imap::decode_utf7_imap("INBOX".to_string());
         assert_eq!(decoded, "INBOX");
+    }
+
+    #[test]
+    fn parse_threading_headers_extracts_both() {
+        let bytes = b"References: <root@h> <mid@h>\r\nIn-Reply-To: <mid@h>\r\n\r\n";
+        let (irt, refs) = super::parse_threading_headers(bytes);
+        assert_eq!(irt.as_deref(), Some("<mid@h>"));
+        assert_eq!(refs, vec!["<root@h>".to_string(), "<mid@h>".to_string()]);
+    }
+
+    #[test]
+    fn parse_threading_headers_unfolds_continuations() {
+        let bytes = b"References: <root@h>\r\n <mid@h>\r\n\r\n";
+        let (_, refs) = super::parse_threading_headers(bytes);
+        assert_eq!(refs, vec!["<root@h>".to_string(), "<mid@h>".to_string()]);
+    }
+
+    #[test]
+    fn parse_threading_headers_handles_only_references() {
+        let bytes = b"References: <root@h>\r\n\r\n";
+        let (irt, refs) = super::parse_threading_headers(bytes);
+        assert!(irt.is_none());
+        assert_eq!(refs, vec!["<root@h>".to_string()]);
+    }
+
+    #[test]
+    fn parse_threading_headers_normalizes_whitespace() {
+        // Server emits a leading space inside the bracketed id.
+        let bytes = b"In-Reply-To:  < mid@h >\r\n\r\n";
+        let (irt, _) = super::parse_threading_headers(bytes);
+        assert_eq!(irt.as_deref(), Some("<mid@h>"));
+    }
+
+    #[test]
+    fn parse_threading_headers_empty_block() {
+        let (irt, refs) = super::parse_threading_headers(b"");
+        assert!(irt.is_none());
+        assert!(refs.is_empty());
     }
 }

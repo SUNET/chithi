@@ -459,6 +459,106 @@ function formatHitDate(secs: number): string {
   return new Date(secs * 1000).toLocaleDateString();
 }
 
+interface ThreadChildEntry {
+  message: import("@/lib/types").MessageSummary;
+  depth: number;
+}
+
+/**
+ * Strip surrounding angle brackets and whitespace so a Message-ID
+ * stored as `<mid@host>` by one backend lines up with the same id
+ * stored as `mid@host` by another. Matching is case-sensitive
+ * (Message-IDs are technically case-sensitive per RFC 5322).
+ */
+function normMid(s: string | null | undefined): string | null {
+  if (!s) return null;
+  const trimmed = s.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.replace(/^<+/, "").replace(/>+$/, "");
+}
+
+/**
+ * Build a depth-annotated, in-order list of a thread's children
+ * (everything except the root message). Depth comes from walking
+ * `in_reply_to` against `message_id` of other messages in the same
+ * thread; messages whose parent isn't in the chain collapse to
+ * depth 0 alongside other roots. This can still happen for
+ * Microsoft Graph messages when `in_reply_to` could not be
+ * backfilled from `internetMessageHeaders` or when the parent
+ * message is unavailable in the thread.
+ *
+ * Children are emitted depth-first under each parent (a parent's
+ * subtree comes before the next sibling) so the visual tree
+ * matches the conversation flow.
+ */
+function childrenWithDepth(threadId: string): ThreadChildEntry[] {
+  const all = messagesStore.threadMessages[threadId] ?? [];
+  if (all.length <= 1) return [];
+
+  const root = all[0];
+  const rest = all.slice(1);
+
+  // Index every message in the thread by its normalised Message-ID so
+  // children can find their parent regardless of angle-bracket
+  // conventions on either side.
+  const byMid = new Map<string, import("@/lib/types").MessageSummary>();
+  for (const m of all) {
+    const mid = normMid(m.message_id);
+    if (mid) byMid.set(mid, m);
+  }
+
+  // Group children by their direct parent's normalised Message-ID so
+  // depth-first emission keeps the conversation flow.
+  const childrenByParent = new Map<string, import("@/lib/types").MessageSummary[]>();
+  const orphans: import("@/lib/types").MessageSummary[] = [];
+  for (const m of rest) {
+    const parentMid = normMid(m.in_reply_to);
+    if (parentMid && byMid.has(parentMid)) {
+      const arr = childrenByParent.get(parentMid) ?? [];
+      arr.push(m);
+      childrenByParent.set(parentMid, arr);
+    } else {
+      orphans.push(m);
+    }
+  }
+
+  if (typeof window !== "undefined" && (window as { __THREAD_DEBUG__?: boolean }).__THREAD_DEBUG__) {
+    console.log("[thread]", threadId, {
+      total: all.length,
+      bymid_keys: Array.from(byMid.keys()),
+      childrenOf: Array.from(childrenByParent.entries()).map(([k, v]) => [k, v.length]),
+      orphans: orphans.length,
+      messages: all.map((m) => ({ id: m.id, mid: m.message_id, irt: m.in_reply_to })),
+    });
+  }
+  const out: ThreadChildEntry[] = [];
+  const emitted = new Set<string>();
+  function emitChildrenOf(parentMid: string | null, depth: number) {
+    const set = parentMid === null ? orphans : childrenByParent.get(parentMid) ?? [];
+    for (const m of set) {
+      if (emitted.has(m.id)) continue;
+      emitted.add(m.id);
+      out.push({ message: m, depth });
+      const childMid = normMid(m.message_id);
+      if (childMid) emitChildrenOf(childMid, depth + 1);
+    }
+  }
+  const rootMid = normMid(root.message_id);
+  if (rootMid) emitChildrenOf(rootMid, 0);
+  emitChildrenOf(null, 0);
+
+  // Safety net: anything we somehow missed (cycle, unreachable parent)
+  // gets emitted at depth 0 so it's still visible.
+  for (const m of rest) {
+    if (!emitted.has(m.id)) {
+      emitted.add(m.id);
+      out.push({ message: m, depth: 0 });
+    }
+  }
+
+  return out;
+}
+
 // JMAP and Graph hits report the backend's folder/mailbox ID, which is
 // opaque to the user. Build a path -> name index once per folder-tree
 // change so rendering N hits stays O(N) instead of O(N * folder_count).
@@ -534,7 +634,7 @@ function resolveFolderName(path: string): string {
         >
           <ThreadRow
             :thread="thread"
-            :expanded="messagesStore.expandedThreads.includes(thread.thread_id)"
+            :expanded="messagesStore.isThreadExpanded(thread.thread_id)"
             :active="thread.message_ids.includes(messagesStore.activeMessageId ?? '')"
             :selected="messagesStore.isSelected(thread.message_ids[0])"
             @toggle="messagesStore.toggleThread(thread.thread_id)"
@@ -543,26 +643,27 @@ function resolveFolderName(path: string): string {
             @toggle-star="messagesStore.toggleStar(thread.message_ids[0])"
           />
         </div>
-        <!-- Expanded thread messages -->
-        <template v-if="messagesStore.expandedThreads.includes(thread.thread_id)">
+        <!-- Expanded thread messages, indented by reply-depth -->
+        <template v-if="messagesStore.isThreadExpanded(thread.thread_id)">
           <div
-            v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? []).slice(1)"
-            :key="msg.id"
+            v-for="entry in childrenWithDepth(thread.thread_id)"
+            :key="entry.message.id"
             class="thread-child"
-            @click.stop="onChildSelect(msg.id)"
-            @contextmenu.prevent.stop="onRowRightClick($event, msg.id)"
-            @mousedown="onDragMouseDown($event, msg.id)"
+            :style="`--reply-depth: ${entry.depth}`"
+            @click.stop="onChildSelect(entry.message.id)"
+            @contextmenu.prevent.stop="onRowRightClick($event, entry.message.id)"
+            @mousedown="onDragMouseDown($event, entry.message.id)"
           >
             <MessageListItem
-              :message="msg"
-              :active="messagesStore.activeMessageId === msg.id"
-              :selected="messagesStore.isSelected(msg.id)"
+              :message="entry.message"
+              :active="messagesStore.activeMessageId === entry.message.id"
+              :selected="messagesStore.isSelected(entry.message.id)"
               :mode="props.mode"
-              @toggle="messagesStore.toggleSelectMessage(msg.id)"
-              @open="onOpen(msg.id)"
-              @toggle-star="messagesStore.toggleStar(msg.id)"
-              @archive="onMobileSwipeArchive(msg.id)"
-              @delete="onMobileSwipeDelete(msg.id)"
+              @toggle="messagesStore.toggleSelectMessage(entry.message.id)"
+              @open="onOpen(entry.message.id)"
+              @toggle-star="messagesStore.toggleStar(entry.message.id)"
+              @archive="onMobileSwipeArchive(entry.message.id)"
+              @delete="onMobileSwipeDelete(entry.message.id)"
             />
           </div>
         </template>
@@ -822,8 +923,14 @@ function resolveFolderName(path: string): string {
 }
 
 .thread-child {
-  padding-left: 20px;
   background: var(--color-bg-tertiary);
+  /* `--reply-depth` is set as an inline custom property per row from
+     childrenWithDepth(). margin-left pushes the row's box, which is
+     more robust than padding when MessageListItem's own layout
+     constrains its content. The 22px step lines up with the typical
+     row height so the indentation tree reads cleanly. */
+  margin-left: calc(20px + var(--reply-depth, 0) * 22px);
+  border-left: 2px solid var(--color-border);
 }
 
 .loading-more {

@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_jmap_filter, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +105,9 @@ pub struct JmapEmail {
     pub date: String,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Full RFC 5322 References chain, root first. Used at insert time
+    /// to thread mailing-list patch series back to their root discussion.
+    pub references: Vec<String>,
     pub size: u64,
     pub has_attachments: bool,
     pub flags: Vec<String>,
@@ -355,7 +359,7 @@ impl JmapConnection {
                         "accountId": self.account_id,
                         "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
                                        "size", "keywords", "messageId", "inReplyTo",
-                                       "hasAttachment", "preview"]
+                                       "references", "hasAttachment", "preview"]
                     }, "g1"]
                 ]
             });
@@ -428,16 +432,28 @@ impl JmapConnection {
             .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
             .unwrap_or_default();
         let size = e["size"].as_u64().unwrap_or(0);
+        // JMAP returns Message-IDs without angle brackets; canonicalize each
+        // through `normalize_message_id` so the stored form matches what the
+        // IMAP and Graph paths produce.
         let message_id = e["messageId"]
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
-            .map(|s| format!("<{}>", s));
+            .and_then(normalize_message_id);
         let in_reply_to = e["inReplyTo"]
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
-            .map(|s| format!("<{}>", s));
+            .and_then(normalize_message_id);
+        let references: Vec<String> = e["references"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(normalize_message_id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let has_attachments = e["hasAttachment"].as_bool().unwrap_or(false);
         let preview = e["preview"].as_str().map(|s| s.to_string());
 
@@ -468,6 +484,7 @@ impl JmapConnection {
             date,
             message_id,
             in_reply_to,
+            references,
             size,
             has_attachments,
             flags,

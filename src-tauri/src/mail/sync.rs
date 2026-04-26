@@ -483,12 +483,18 @@ fn sync_folder_envelopes(
 
             // Thread computation still needs DB queries for cross-references,
             // but the in_reply_to lookup is fast with index.
+            let refs_slice: Option<&[String]> = if env.references.is_empty() {
+                None
+            } else {
+                Some(env.references.as_slice())
+            };
             let thread_id = db::messages::compute_thread_id(
                 &conn,
                 account_id,
                 env.message_id.as_deref(),
                 env.in_reply_to.as_deref(),
                 env.subject.as_deref(),
+                refs_slice,
             );
 
             let new_msg = db::messages::NewMessage {

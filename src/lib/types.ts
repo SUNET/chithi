@@ -68,6 +68,10 @@ export interface MessageSummary {
   is_encrypted: boolean;
   is_signed: boolean;
   snippet: string | null;
+  /** RFC 5322 Message-ID with angle brackets, used to build reply trees. */
+  message_id: string | null;
+  /** Parent Message-ID for in-thread hierarchical rendering. */
+  in_reply_to: string | null;
 }
 
 export interface MessageBody {
@@ -261,6 +265,9 @@ export interface ComposeMessage {
   body_text: string;
   body_html: string | null;
   attachments: ComposeAttachment[];
+  /** chithi's internal id of the message being replied to. Drives
+   *  In-Reply-To / References on the outgoing email. Omit for new mails. */
+  reply_to_message_id?: string | null;
 }
 
 export interface ComposeAttachment {

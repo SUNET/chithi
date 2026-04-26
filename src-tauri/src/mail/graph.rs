@@ -4,6 +4,7 @@
 //! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
 
 use crate::error::{Error, Result};
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
@@ -353,7 +354,7 @@ impl GraphClient {
         let resp = self.get(
             &format!("/me/mailFolders/{}/messages", folder_id),
             &[
-                ("$select", "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,flag,internetMessageId,conversationId,bodyPreview,importance"),
+                ("$select", "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,flag,internetMessageId,conversationId,bodyPreview,importance,internetMessageHeaders"),
                 ("$top", &top.to_string()),
                 ("$skip", &skip.to_string()),
                 ("$orderby", "receivedDateTime desc"),
@@ -902,6 +903,12 @@ pub struct GraphMessage {
     pub internet_message_id: Option<String>,
     pub conversation_id: Option<String>,
     pub preview: Option<String>,
+    /// Pulled from internetMessageHeaders (In-Reply-To). Wrapped in
+    /// angle brackets to match how IMAP/JMAP store it.
+    pub in_reply_to: Option<String>,
+    /// Pulled from internetMessageHeaders (References), root first,
+    /// each id wrapped in angle brackets.
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -961,7 +968,9 @@ fn parse_graph_search_hit(account_id: &str, m: &serde_json::Value) -> SearchHit 
 
     let snippet = m["bodyPreview"].as_str().map(|s| s.to_string());
     let folder_path = m["parentFolderId"].as_str().unwrap_or("").to_string();
-    let message_id = m["internetMessageId"].as_str().map(|s| s.to_string());
+    let message_id = m["internetMessageId"]
+        .as_str()
+        .and_then(normalize_message_id);
 
     SearchHit {
         account_id: account_id.to_string(),
@@ -991,6 +1000,8 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
         .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_default();
 
+    let (in_reply_to, references) = parse_message_headers(&m["internetMessageHeaders"]);
+
     GraphMessage {
         id: m["id"].as_str().unwrap_or("").to_string(),
         subject: m["subject"].as_str().map(|s| s.to_string()),
@@ -1001,10 +1012,63 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
         date,
         is_read: m["isRead"].as_bool().unwrap_or(false),
         has_attachments: m["hasAttachments"].as_bool().unwrap_or(false),
-        internet_message_id: m["internetMessageId"].as_str().map(|s| s.to_string()),
+        internet_message_id: m["internetMessageId"]
+            .as_str()
+            .and_then(normalize_message_id),
         conversation_id: m["conversationId"].as_str().map(|s| s.to_string()),
         preview: m["bodyPreview"].as_str().map(|s| s.to_string()),
+        in_reply_to,
+        references,
     }
+}
+
+/// Walk Graph's `internetMessageHeaders` array (each entry is
+/// `{ "name": "...", "value": "..." }`) and pull out In-Reply-To and
+/// References as the wrapped Message-IDs the rest of chithi expects.
+fn parse_message_headers(arr: &serde_json::Value) -> (Option<String>, Vec<String>) {
+    let Some(items) = arr.as_array() else {
+        return (None, Vec::new());
+    };
+    let mut in_reply_to: Option<String> = None;
+    let mut references: Vec<String> = Vec::new();
+    for item in items {
+        let name = item["name"].as_str().unwrap_or("");
+        let value = item["value"].as_str().unwrap_or("");
+        if value.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("In-Reply-To") && in_reply_to.is_none() {
+            in_reply_to = extract_message_ids(value).into_iter().next();
+        } else if name.eq_ignore_ascii_case("References") {
+            references = extract_message_ids(value);
+        }
+    }
+    (in_reply_to, references)
+}
+
+/// Pull every `<message-id>` token from a header value.
+fn extract_message_ids(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut inside = false;
+    for c in s.chars() {
+        match c {
+            '<' => {
+                inside = true;
+                buf.clear();
+            }
+            '>' if inside => {
+                if let Some(id) = normalize_message_id(&buf) {
+                    out.push(id);
+                }
+                inside = false;
+                buf.clear();
+            }
+            _ if inside => buf.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn parse_recipients(arr: &serde_json::Value) -> String {

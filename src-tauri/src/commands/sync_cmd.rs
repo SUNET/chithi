@@ -404,11 +404,35 @@ pub async fn sync_folder(
     let resume_account = account.clone();
 
     let sync_result: Result<u32> = if account.mail_protocol == "graph" {
-        // Graph sync is whole-account, not per-folder — just run the full sync
-        match sync_graph_account(app.clone(), state.db.clone(), &account_id).await {
-            Ok(()) => Ok(0),
-            Err(e) => Err(e),
-        }
+        // Microsoft Graph has no cheap per-folder fetch — every sync runs
+        // against the whole account. Spawn it in the background and return
+        // immediately so the UI's per-folder spinner doesn't sit there for
+        // multiple minutes. The per-account `_guard` rides along into the
+        // spawned task so the flag stays held for the real work and is
+        // released exactly once when the sync finishes.
+        let app_bg = app.clone();
+        let db_bg = state.db.clone();
+        let account_id_bg = account_id.clone();
+        tokio::spawn(async move {
+            let _hold_guard = _guard;
+            let result = sync_graph_account(app_bg.clone(), db_bg, &account_id_bg).await;
+            match result {
+                Ok(()) => log::info!("Background Graph sync done for {}", account_id_bg),
+                Err(e) => {
+                    log::error!("Background Graph sync failed for {}: {}", account_id_bg, e);
+                    app_bg
+                        .emit(
+                            "sync-error",
+                            serde_json::json!({
+                                "account_id": account_id_bg,
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .ok();
+                }
+            }
+        });
+        return Ok(0);
     } else if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
         jmap_sync::sync_jmap_folder_public(
@@ -956,6 +980,39 @@ async fn sync_graph_account(
             ids
         };
 
+        // Backfill: existing rows synced before threading worked have an
+        // empty thread_id. We also have a fresh In-Reply-To from
+        // internetMessageHeaders, which lets the frontend render the
+        // reply hierarchy for already-stored Graph messages without a
+        // re-download.
+        {
+            let conn = db_arc.writer().await;
+            let mut update_thread = conn.prepare(
+                "UPDATE messages SET thread_id = ?1
+                 WHERE id = ?2 AND (thread_id IS NULL OR thread_id = '')",
+            )?;
+            let mut update_irt = conn.prepare(
+                "UPDATE messages SET in_reply_to = ?1
+                 WHERE id = ?2 AND (in_reply_to IS NULL OR in_reply_to = '')",
+            )?;
+            for msg in &messages {
+                let id = format!("{}_{}", account_id, msg.id);
+                if !existing_ids.contains(&id) {
+                    continue;
+                }
+                if let Some(cid) = msg.conversation_id.as_deref() {
+                    if !cid.is_empty() {
+                        update_thread.execute(rusqlite::params![cid, id])?;
+                    }
+                }
+                if let Some(irt) = msg.in_reply_to.as_deref() {
+                    if !irt.is_empty() {
+                        update_irt.execute(rusqlite::params![irt, id])?;
+                    }
+                }
+            }
+        }
+
         // Collect new messages
         let mut new_messages = Vec::new();
         for msg in &messages {
@@ -1025,7 +1082,7 @@ async fn sync_graph_account(
                 folder_path: gf.id.clone(),
                 uid: 0,
                 message_id: msg.internet_message_id.clone(),
-                in_reply_to: None,
+                in_reply_to: msg.in_reply_to.clone(),
                 thread_id,
                 subject: msg.subject.clone(),
                 from_name: msg.from_name.clone(),
