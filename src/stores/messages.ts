@@ -150,7 +150,13 @@ export const useMessagesStore = defineStore("messages", () => {
     };
   }
 
+  // Monotonically increases on each server-search dispatch (and on each
+  // clear). Late results from a stale request are dropped if their token
+  // no longer matches.
+  let serverSearchToken = 0;
+
   function clearServerSearch() {
+    serverSearchToken++;
     serverHits.value = [];
     serverSearchLoading.value = false;
     serverSearchError.value = null;
@@ -167,16 +173,23 @@ export const useMessagesStore = defineStore("messages", () => {
       has_attachment: quickFilter.value.has_attachment ? true : undefined,
     };
 
+    const myToken = ++serverSearchToken;
     serverSearchLoading.value = true;
     serverSearchError.value = null;
     try {
-      serverHits.value = await api.searchMessagesServer(accountId, query);
+      const hits = await api.searchMessagesServer(accountId, query);
+      // Drop the result if a newer search/clear has happened in the meantime.
+      if (myToken !== serverSearchToken) return;
+      serverHits.value = hits;
     } catch (e) {
+      if (myToken !== serverSearchToken) return;
       console.error("Server search failed:", e);
-      serverSearchError.value = String(e);
+      serverSearchError.value = e instanceof Error ? e.message : String(e);
       serverHits.value = [];
     } finally {
-      serverSearchLoading.value = false;
+      if (myToken === serverSearchToken) {
+        serverSearchLoading.value = false;
+      }
     }
   }
 
