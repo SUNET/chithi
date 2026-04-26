@@ -159,6 +159,54 @@ describe("server-side search", () => {
     expect(messagesStore.serverSearchError).toContain("timeout");
   });
 
+  it("drops stale results when filter text changes mid-flight", async () => {
+    withActiveAccount();
+    let resolveSearch: ((hits: unknown[]) => void) | undefined;
+    mockedSearch.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSearch = resolve as (hits: unknown[]) => void;
+        }),
+    );
+
+    const messagesStore = useMessagesStore();
+    messagesStore.quickFilterText = "old";
+    const search = messagesStore.runServerSearch();
+
+    // User types again before the in-flight search resolves.
+    messagesStore.onFilterTextChange();
+
+    // Now the late response arrives with stale data — must NOT repopulate.
+    resolveSearch!([
+      {
+        account_id: "acc1",
+        folder_path: "INBOX",
+        uid: 1,
+        message_id: null,
+        backend_id: "stale",
+        subject: "stale",
+        from_name: null,
+        from_email: null,
+        date: 0,
+        snippet: null,
+      },
+    ]);
+    await search;
+    expect(messagesStore.serverHits).toHaveLength(0);
+    expect(messagesStore.serverSearchLoading).toBe(false);
+  });
+
+  it("uses Error.message for human-readable error display", async () => {
+    withActiveAccount();
+    mockedSearch.mockRejectedValueOnce(new Error("server unreachable"));
+
+    const messagesStore = useMessagesStore();
+    messagesStore.quickFilterText = "hi";
+    await messagesStore.runServerSearch();
+
+    expect(messagesStore.serverSearchError).toBe("server unreachable");
+  });
+
   it("clears prior hits as soon as the user types again", async () => {
     withActiveAccount();
     const messagesStore = useMessagesStore();
