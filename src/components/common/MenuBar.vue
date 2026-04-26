@@ -107,7 +107,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
     <div class="menu-item" @click.stop="toggleMenu('view')">
       <span class="menu-label">View</span>
       <div v-if="openMenu === 'view'" class="menu-dropdown" data-testid="menu-view-dropdown">
-        <div class="menu-group-heading">Message Pane Position</div>
+        <div class="menu-group-heading">Message Pane</div>
         <button
           class="menu-action menu-action-radio"
           data-testid="menu-view-position-none"

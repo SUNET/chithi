@@ -80,7 +80,7 @@ describe("MenuBar", () => {
     const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
     await wrapper.find('.menu-item:nth-of-type(2)').trigger("click");
     const dropdown = wrapper.find('[data-testid="menu-view-dropdown"]');
-    expect(dropdown.text()).toContain("Message Pane Position");
+    expect(dropdown.text()).toContain("Message Pane");
     expect(dropdown.text()).toContain("None");
     expect(dropdown.text()).toContain("Right");
     expect(dropdown.text()).toContain("Bottom");
