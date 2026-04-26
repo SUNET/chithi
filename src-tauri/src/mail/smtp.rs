@@ -159,6 +159,12 @@ pub async fn send_message(
 }
 
 /// Build a raw RFC5322 message (for JMAP submission).
+///
+/// `in_reply_to` and `references` carry the threading headers. The id
+/// strings should arrive WITH their angle brackets — lettre stores them
+/// verbatim in the In-Reply-To / References header values. References
+/// is rendered as a single space-separated header value.
+#[allow(clippy::too_many_arguments)]
 pub fn build_raw_message(
     from: &str,
     to: &[String],
@@ -168,6 +174,8 @@ pub fn build_raw_message(
     body_text: &str,
     body_html: Option<&str>,
     attachments: &[AttachmentData],
+    in_reply_to: Option<&str>,
+    references: &[String],
 ) -> Result<Vec<u8>> {
     let from_mailbox: Mailbox = from
         .parse()
@@ -192,6 +200,26 @@ pub fn build_raw_message(
             .parse()
             .map_err(|e| Error::Other(format!("Invalid 'bcc' address '{}': {}", addr, e)))?;
         builder = builder.bcc(mailbox);
+    }
+
+    if let Some(irt) = in_reply_to {
+        let trimmed = irt.trim();
+        if !trimmed.is_empty() {
+            builder = builder.in_reply_to(trimmed.to_string());
+        }
+    }
+    if !references.is_empty() {
+        // RFC 5322 References is a single header whose value is the chain
+        // of message-ids separated by whitespace, oldest first.
+        let joined = references
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            builder = builder.references(joined);
+        }
     }
 
     let body = build_body(body_text, body_html, attachments)

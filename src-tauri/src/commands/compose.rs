@@ -17,6 +17,12 @@ pub struct ComposeMessage {
     pub body_html: Option<String>,
     #[serde(default)]
     pub attachments: Vec<FileAttachment>,
+    /// chithi's internal id of the message we're replying to. The backend
+    /// looks up the original's RFC 5322 Message-ID and References chain
+    /// and writes proper In-Reply-To / References headers on the outgoing
+    /// message. None for new conversations.
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
 }
 
 /// An attachment referenced by the renderer. `token` is the opaque handle
@@ -74,6 +80,13 @@ pub async fn send_message(
     let names: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
     let paths = crate::commands::attachments::peek_tokens(&state, &tokens)?;
     let attachment_data = build_attachment_data(&paths, &names)?;
+
+    // Resolve threading headers from the original message we're replying
+    // to (if any). This is what makes the next sync render the new
+    // message under its parent in the thread tree.
+    let (in_reply_to, references) =
+        resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
+
     let raw_message = smtp::build_raw_message(
         &account.email,
         &message.to,
@@ -83,6 +96,8 @@ pub async fn send_message(
         &message.body_text,
         message.body_html.as_deref(),
         &attachment_data,
+        in_reply_to.as_deref(),
+        &references,
     )?;
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
@@ -288,6 +303,12 @@ pub async fn save_draft(
         message.to.clone()
     };
 
+    // Drafts also carry the threading headers so that, once sent, the
+    // outgoing message threads correctly without requiring the user to
+    // re-trigger reply context.
+    let (in_reply_to, references) =
+        resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
+
     let raw_message = smtp::build_raw_message(
         &account.email,
         &draft_to,
@@ -297,6 +318,8 @@ pub async fn save_draft(
         &message.body_text,
         message.body_html.as_deref(),
         &attachment_data,
+        in_reply_to.as_deref(),
+        &references,
     )?;
 
     if account.mail_protocol == "graph" {
@@ -377,6 +400,87 @@ pub async fn save_draft(
 
     log::info!("Draft saved successfully for account {}", account_id);
     Ok(())
+}
+
+/// Resolve the In-Reply-To and References values for a reply.
+///
+/// `reply_to_id` is chithi's internal id of the message being replied to.
+/// We look up its RFC 5322 Message-ID and walk the in_reply_to chain
+/// backwards until we either run out or hit a cycle, building the
+/// References list root-first. `In-Reply-To` is the immediate parent's
+/// Message-ID. Both come back already wrapped in angle brackets when
+/// the underlying database row is wrapped that way.
+///
+/// Returns (None, []) if `reply_to_id` is absent, the row is missing,
+/// or the original has no Message-ID we can chain off.
+fn resolve_reply_headers(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    reply_to_id: Option<&str>,
+) -> (Option<String>, Vec<String>) {
+    let Some(reply_to_id) = reply_to_id else {
+        return (None, Vec::new());
+    };
+    if reply_to_id.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let conn = state.db.reader();
+    // Fetch (message_id, in_reply_to) for the original.
+    let parent: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT message_id, in_reply_to FROM messages
+             WHERE account_id = ?1 AND id = ?2 LIMIT 1",
+            rusqlite::params![account_id, reply_to_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    let Some((Some(parent_mid), parent_irt)) = parent else {
+        return (None, Vec::new());
+    };
+
+    let mut chain: Vec<String> = Vec::new();
+    if let Some(irt) = parent_irt {
+        if !irt.is_empty() {
+            chain.push(irt);
+        }
+    }
+
+    // Walk backwards via in_reply_to. Cap depth to keep the header
+    // bounded; mailing-list threads occasionally chain very long.
+    let mut current = chain.first().cloned();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(mid) = current {
+        if !visited.insert(mid.clone()) {
+            break;
+        }
+        if visited.len() > 32 {
+            break;
+        }
+        let next: Option<Option<String>> = conn
+            .query_row(
+                "SELECT in_reply_to FROM messages
+                 WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
+                rusqlite::params![account_id, mid],
+                |row| row.get(0),
+            )
+            .ok();
+        match next {
+            Some(Some(irt)) if !irt.is_empty() => {
+                chain.push(irt.clone());
+                current = Some(irt);
+            }
+            _ => break,
+        }
+    }
+
+    // Chain is collected youngest-first; reverse so References reads
+    // root-first per RFC 5322 §3.6.4. The immediate parent's
+    // Message-ID always sits at the end of References.
+    chain.reverse();
+    chain.push(parent_mid.clone());
+
+    (Some(parent_mid), chain)
 }
 
 /// Read each resolved attachment path, pair it with its display name and
