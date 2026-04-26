@@ -184,6 +184,13 @@ pub async fn import_search_hit(
     account_id: String,
     hit: SearchHit,
 ) -> Result<String> {
+    if hit.account_id != account_id {
+        return Err(Error::Other(format!(
+            "search hit account_id mismatch: command got {:?}, hit was tagged {:?}",
+            account_id, hit.account_id
+        )));
+    }
+
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
