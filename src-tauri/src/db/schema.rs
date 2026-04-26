@@ -381,6 +381,12 @@ fn normalize_message_ids_and_rethread(conn: &Connection) -> Result<()> {
     // pushes thread_ids one generation deeper, so a chain of depth N
     // converges in N-1 passes. Cap at 32 (matching the compose-side
     // chain cap) so a pathological cycle can't spin forever.
+    // Gmail label folders mean the same Message-ID can sit in several
+    // `messages` rows for one account. The scalar subquery in SET would
+    // then have multiple candidates and SQLite picks one non-deterministically;
+    // pin it down with `ORDER BY thread_id LIMIT 1` so the migration is
+    // reproducible (and so a future SQLite that tightens scalar-subquery
+    // semantics doesn't error out at startup).
     for _ in 0..32 {
         let changed = tx.execute(
             "UPDATE messages
@@ -390,6 +396,8 @@ fn normalize_message_ids_and_rethread(conn: &Connection) -> Result<()> {
                    AND parent.message_id = messages.in_reply_to
                    AND parent.thread_id IS NOT NULL
                    AND parent.thread_id != ''
+                 ORDER BY parent.thread_id
+                 LIMIT 1
              )
              WHERE in_reply_to IS NOT NULL
                AND in_reply_to != ''
