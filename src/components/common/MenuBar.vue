@@ -86,11 +86,13 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
       <span class="menu-label">File</span>
       <div v-if="openMenu === 'file'" class="menu-dropdown" @click.stop data-testid="menu-file-dropdown">
         <button class="menu-action" data-testid="menu-file-preferences" @click="openPreferences">
+          <span class="action-prefix">&#160;</span>
           <span class="action-label">Preferences&hellip;</span>
           <span class="action-shortcut">{{ formatShortcut(sc.preferences) }}</span>
         </button>
         <div class="menu-separator"></div>
         <button class="menu-action" data-testid="menu-file-quit" @click="quitApp">
+          <span class="action-prefix">&#160;</span>
           <span class="action-label">Quit</span>
           <span class="action-shortcut">{{ formatShortcut(sc.quit) }}</span>
         </button>
