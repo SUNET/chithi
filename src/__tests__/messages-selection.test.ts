@@ -213,7 +213,8 @@ describe("Mark as read", () => {
     store.threadMessages = {
       t1: [makeSummary("msg1", []), makeSummary("msg2", ["seen"])],
     };
-    store.expandedThreads = ["t1"];
+    // Threads are expanded by default; clear any persisted collapse state.
+    store.collapsedThreads = [];
 
     store.selectMessage("msg1", noMod);
 

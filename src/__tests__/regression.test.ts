@@ -152,10 +152,10 @@ describe("Regression: selection", () => {
     expect(container.exists()).toBe(true);
   });
 
-  it("BUG: expandedThreads and threadMessages must use array/object not Set/Map", () => {
+  it("BUG: collapsedThreads and threadMessages must use array/object not Set/Map", () => {
     // Previously used Set/Map which caused Vue reactivity issues.
     const store = setupStores(true);
-    expect(Array.isArray(store.expandedThreads)).toBe(true);
+    expect(Array.isArray(store.collapsedThreads)).toBe(true);
     expect(typeof store.threadMessages).toBe("object");
     expect(store.threadMessages).not.toBeInstanceOf(Map);
   });
