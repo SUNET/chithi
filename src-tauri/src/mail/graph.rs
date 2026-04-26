@@ -4,6 +4,7 @@
 //! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
 
 use crate::error::{Error, Result};
+use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
@@ -370,6 +371,83 @@ impl GraphClient {
         }
 
         Ok((messages, total))
+    }
+
+    /// Search messages across all folders using `$search` (KQL).
+    /// Graph requires `ConsistencyLevel: eventual` for `$search`. Cannot be
+    /// combined with `$orderby` or `$filter`. On HTTP 429 (throttled),
+    /// honors `Retry-After` once and returns whatever was retrieved.
+    pub async fn search_messages(
+        &self,
+        account_id: &str,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>> {
+        let kql = match build_graph_kql(query) {
+            Some(k) => k,
+            None => return Ok(vec![]),
+        };
+
+        let url = format!("{}/me/messages", GRAPH_BASE);
+        // Graph $search REQUIRES the value to be wrapped in double quotes,
+        // exactly once. `build_graph_kql` returns the bare KQL.
+        let search_value = format!("\"{}\"", kql);
+        let params = [
+            (
+                "$select",
+                "id,subject,from,receivedDateTime,bodyPreview,internetMessageId,parentFolderId",
+            ),
+            ("$top", "50"),
+            ("$search", search_value.as_str()),
+        ];
+
+        let mut attempts = 0u8;
+        let body = loop {
+            attempts += 1;
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&self.access_token)
+                .header("ConsistencyLevel", "eventual")
+                .query(&params)
+                .send()
+                .await
+                .map_err(|e| Error::Other(format!("Graph $search failed: {}", e)))?;
+
+            let status = resp.status();
+            if status.as_u16() == 429 && attempts < 2 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2)
+                    .min(10);
+                log::warn!("Graph $search throttled, retrying after {}s", retry_after);
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Error::Other(format!(
+                    "Graph $search returned {}: {}",
+                    status,
+                    truncate(&text, 500)
+                )));
+            }
+            break text;
+        };
+
+        let resp: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::Other(format!("Graph $search parse failed: {}", e)))?;
+
+        let mut hits = Vec::new();
+        if let Some(values) = resp["value"].as_array() {
+            for m in values {
+                hits.push(parse_graph_search_hit(account_id, m));
+            }
+        }
+        Ok(hits)
     }
 
     /// Fetch the full body of a message.
@@ -864,6 +942,37 @@ pub struct GraphCalendarEvent {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn parse_graph_search_hit(account_id: &str, m: &serde_json::Value) -> SearchHit {
+    let id = m["id"].as_str().unwrap_or("").to_string();
+    let subject = m["subject"].as_str().unwrap_or("").to_string();
+    let from = &m["from"]["emailAddress"];
+    let from_name = from["name"].as_str().map(|s| s.to_string());
+    let from_email = from["address"].as_str().map(|s| s.to_string());
+
+    let date = m["receivedDateTime"]
+        .as_str()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    let snippet = m["bodyPreview"].as_str().map(|s| s.to_string());
+    let folder_path = m["parentFolderId"].as_str().unwrap_or("").to_string();
+    let message_id = m["internetMessageId"].as_str().map(|s| s.to_string());
+
+    SearchHit {
+        account_id: account_id.to_string(),
+        folder_path,
+        uid: None,
+        message_id,
+        backend_id: id,
+        subject,
+        from_name,
+        from_email,
+        date,
+        snippet,
+    }
+}
 
 fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
     let from = &m["from"]["emailAddress"];

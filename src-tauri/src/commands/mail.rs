@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
 use crate::mail::jmap_sync;
 use crate::mail::parser;
+use crate::mail::search::{SearchHit, SearchQuery};
 use crate::mail::sync as mail_sync;
 use crate::state::AppState;
 
@@ -94,6 +95,80 @@ pub async fn get_messages(
         folder_path
     );
     Ok(result)
+}
+
+/// Run a server-side search across all folders of an account.
+/// Dispatches to the IMAP, JMAP, or Graph backend based on `mail_protocol`.
+#[tauri::command]
+pub async fn search_messages_server(
+    state: State<'_, AppState>,
+    account_id: String,
+    query: SearchQuery,
+) -> Result<Vec<SearchHit>> {
+    log::info!(
+        "Server search: account={} text={:?} fields={:?}",
+        account_id,
+        query.text,
+        query.fields,
+    );
+
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    let hits = if account.mail_protocol == "graph" {
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.search_messages(&account_id, &query).await?
+    } else if account.mail_protocol == "jmap" {
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap
+            .search_account(&jmap_config, &account_id, &query)
+            .await?
+    } else {
+        let (password, use_xoauth2) = if account.provider == "o365" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens
+                .refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT,
+                &refresh,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
+            crate::oauth::store_tokens(&account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password.clone(), false)
+        };
+        let imap_config = ImapConfig {
+            host: account.imap_host.clone(),
+            port: account.imap_port,
+            username: account.username.clone(),
+            password,
+            use_tls: account.use_tls,
+            use_xoauth2,
+        };
+
+        let account_id_for_blocking = account_id.clone();
+        let query_for_blocking = query.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::mail::imap::search_account_blocking(
+                &imap_config,
+                &account_id_for_blocking,
+                &query_for_blocking,
+            )
+        })
+        .await
+        .map_err(|e| Error::Other(format!("IMAP search task panicked: {}", e)))??
+    };
+
+    log::info!("Server search returned {} hits", hits.len());
+    Ok(hits)
 }
 
 #[tauri::command]

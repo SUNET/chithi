@@ -97,6 +97,23 @@ function onTextInput() {
         @click="messagesStore.toggleTextField('body')"
       >Body</button>
     </div>
+    <div v-if="messagesStore.quickFilterText.trim()" class="server-row">
+      <button
+        class="server-btn"
+        data-testid="search-server-trigger"
+        :disabled="messagesStore.serverSearchLoading"
+        @click="messagesStore.runServerSearch()"
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <span v-if="messagesStore.serverSearchLoading" data-testid="search-server-loading">Searching server&hellip;</span>
+        <span v-else>Search server for &ldquo;{{ messagesStore.quickFilterText.trim() }}&rdquo;</span>
+      </button>
+      <span
+        v-if="messagesStore.serverSearchError"
+        class="server-error"
+        data-testid="search-server-error"
+      >{{ messagesStore.serverSearchError }}</span>
+    </div>
   </div>
 </template>
 
@@ -228,5 +245,42 @@ function onTextInput() {
 .field-btn.active {
   border-color: var(--color-accent);
   color: var(--color-accent);
+}
+
+.server-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px 6px;
+}
+
+.server-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.server-btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+  border-color: var(--color-accent);
+}
+
+.server-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.server-error {
+  font-size: 11px;
+  color: var(--color-danger);
 }
 </style>

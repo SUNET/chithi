@@ -3,6 +3,7 @@ use native_tls::TlsStream;
 use std::net::TcpStream;
 
 use crate::error::{Error, Result};
+use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
 
 #[derive(Clone)]
 pub struct ImapConfig {
@@ -623,9 +624,117 @@ impl ImapConnection {
         Ok(had_notification)
     }
 
+    /// Issue a `UID SEARCH` command against the currently selected mailbox
+    /// and return matching UIDs. The query string is the raw search key
+    /// (e.g., `CHARSET UTF-8 SUBJECT "foo"`).
+    pub fn uid_search(&mut self, query: &str) -> Result<Vec<u32>> {
+        log::debug!("IMAP UID SEARCH {}", query);
+        let uids = self.session.uid_search(query).map_err(|e| {
+            log::error!("IMAP UID SEARCH failed: {}", e);
+            Error::Imap(e.to_string())
+        })?;
+        Ok(uids.into_iter().collect())
+    }
+
     pub fn logout(mut self) {
         log::debug!("IMAP logging out");
         self.session.logout().ok();
+    }
+}
+
+/// Folders that contain duplicate copies of mail (Gmail virtual folders).
+/// Skipping them avoids returning the same hit multiple times.
+const SEARCH_SKIP_FOLDERS: &[&str] = &["[Gmail]/All Mail", "[Gmail]/Important", "[Gmail]"];
+
+/// Cap on per-folder search hits, to bound work on huge mailboxes.
+const SEARCH_PER_FOLDER_LIMIT: usize = 200;
+/// Cap on total hits returned across all folders for one query.
+const SEARCH_TOTAL_LIMIT: usize = 500;
+
+/// Search across every folder of an IMAP account. Runs synchronously inside
+/// a `spawn_blocking` because the `imap` crate uses a blocking session.
+pub fn search_account_blocking(
+    config: &ImapConfig,
+    account_id: &str,
+    query: &SearchQuery,
+) -> Result<Vec<SearchHit>> {
+    let search_arg = match build_imap_search(query) {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+
+    let mut conn = ImapConnection::connect(config)?;
+    let folders = conn.list_folders()?;
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for (_display, path) in folders {
+        if hits.len() >= SEARCH_TOTAL_LIMIT {
+            break;
+        }
+        if SEARCH_SKIP_FOLDERS
+            .iter()
+            .any(|skip| path.eq_ignore_ascii_case(skip))
+        {
+            continue;
+        }
+
+        if let Err(e) = conn.select_folder(&path) {
+            log::warn!("IMAP search: SELECT {} failed: {}", path, e);
+            continue;
+        }
+
+        let uids = match conn.uid_search(&search_arg) {
+            Ok(u) => u,
+            Err(e) => {
+                log::warn!("IMAP search: UID SEARCH in {} failed: {}", path, e);
+                continue;
+            }
+        };
+
+        if uids.is_empty() {
+            continue;
+        }
+
+        let take_n = uids.len().min(SEARCH_PER_FOLDER_LIMIT);
+        let envelopes = match conn.fetch_envelopes_batch(&uids[..take_n]) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("IMAP search: envelope fetch in {} failed: {}", path, e);
+                continue;
+            }
+        };
+
+        for env in envelopes {
+            if hits.len() >= SEARCH_TOTAL_LIMIT {
+                break;
+            }
+            hits.push(envelope_to_hit(account_id, &path, env));
+        }
+    }
+
+    conn.logout();
+    Ok(hits)
+}
+
+fn envelope_to_hit(account_id: &str, folder_path: &str, env: EnvelopeData) -> SearchHit {
+    let date_secs = env
+        .date
+        .as_deref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    SearchHit {
+        account_id: account_id.to_string(),
+        folder_path: folder_path.to_string(),
+        uid: Some(env.uid),
+        message_id: env.message_id,
+        backend_id: format!("{}:{}", folder_path, env.uid),
+        subject: env.subject.unwrap_or_default(),
+        from_name: env.from_name,
+        from_email: env.from_email,
+        date: date_secs,
+        snippet: None,
     }
 }
 
