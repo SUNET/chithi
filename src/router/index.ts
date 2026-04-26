@@ -45,6 +45,11 @@ const router = createRouter({
       component: () => import("@/views/SettingsView.vue"),
     },
     {
+      path: "/preferences",
+      name: "preferences",
+      component: () => import("@/views/PreferencesView.vue"),
+    },
+    {
       // Mobile-only thread detail (pushed from MailView on tap).
       path: "/mail/thread/:id",
       name: "mobile-reader",

@@ -26,9 +26,7 @@ function closeMenus() {
 
 function openPreferences() {
   closeMenus();
-  // ADR 0044 Phase 2 will introduce a dedicated Preferences window. Until
-  // then, route to the existing /settings page so the menu item works.
-  router.push("/settings");
+  router.push("/preferences");
 }
 
 async function quitApp() {
@@ -43,18 +41,6 @@ function setViewMode(mode: MessageViewMode) {
 
 function toggleThreading() {
   uiStore.setThreading(!uiStore.threadingEnabled);
-  closeMenus();
-}
-
-function openFilters() {
-  closeMenus();
-  router.push("/filters");
-}
-
-function toggleTitleBar() {
-  // `decorationsEnabled = false` means the title bar is hidden. The menu
-  // label "Hide Title Bar" reads as a toggle — checked when hidden.
-  uiStore.setDecorations(!uiStore.decorationsEnabled);
   closeMenus();
 }
 
@@ -147,17 +133,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
           <span class="action-prefix">{{ uiStore.threadingEnabled ? '\u2713' : '\u00A0' }}</span>
           <span class="action-label">Threaded View</span>
           <span class="action-shortcut">{{ formatShortcut(sc.toggleThreading) }}</span>
-        </button>
-        <button class="menu-action" data-testid="menu-view-filters" @click="openFilters">
-          <span class="action-prefix">&#160;</span>
-          <span class="action-label">Message Filters&hellip;</span>
-        </button>
-
-        <div class="menu-separator"></div>
-
-        <button class="menu-action" data-testid="menu-view-hide-title-bar" @click="toggleTitleBar">
-          <span class="action-prefix">{{ !uiStore.decorationsEnabled ? '\u2713' : '\u00A0' }}</span>
-          <span class="action-label">Hide Title Bar</span>
         </button>
       </div>
     </div>

@@ -6,7 +6,14 @@ import * as api from "@/lib/tauri";
 export type MessageViewMode = "right" | "bottom" | "tab" | "none";
 
 const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
-export type Theme = "dark" | "light";
+
+const VALID_THEMES: Theme[] = ["system", "light", "dark"];
+
+function resolveSystemTheme(): "light" | "dark" {
+  if (typeof window === "undefined" || !window.matchMedia) return "light";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+export type Theme = "system" | "light" | "dark";
 export type TimeFormat = "auto" | "12" | "24";
 export type ComposeKind = "new" | "reply" | "reply-all" | "forward";
 
@@ -24,8 +31,17 @@ export const useUiStore = defineStore("ui", () => {
     })(),
   );
   const theme = ref<Theme>(
-    (localStorage.getItem("chithi-theme") as Theme) || "light",
+    (() => {
+      const stored = localStorage.getItem("chithi-theme") as Theme | null;
+      return stored && VALID_THEMES.includes(stored) ? stored : "system";
+    })(),
   );
+
+  /** The actually-applied theme. Tracks the OS preference when theme === "system". */
+  const resolvedTheme = computed<"light" | "dark">(() => {
+    if (theme.value === "system") return resolveSystemTheme();
+    return theme.value;
+  });
   const decorationsEnabled = ref(
     localStorage.getItem("chithi-decorations") !== "false",
   );
@@ -89,7 +105,7 @@ export const useUiStore = defineStore("ui", () => {
   function setTheme(t: Theme) {
     theme.value = t;
     localStorage.setItem("chithi-theme", t);
-    document.documentElement.setAttribute("data-theme", t);
+    document.documentElement.setAttribute("data-theme", resolvedTheme.value);
   }
 
   function setThreading(enabled: boolean) {
@@ -142,8 +158,21 @@ export const useUiStore = defineStore("ui", () => {
     }
   }
 
+  let mediaQueryUnsub: (() => void) | null = null;
+
   function initTheme() {
-    document.documentElement.setAttribute("data-theme", theme.value);
+    document.documentElement.setAttribute("data-theme", resolvedTheme.value);
+    // Re-apply when the OS preference changes while theme === "system".
+    if (typeof window !== "undefined" && window.matchMedia && !mediaQueryUnsub) {
+      const mql = window.matchMedia("(prefers-color-scheme: dark)");
+      const onChange = () => {
+        if (theme.value === "system") {
+          document.documentElement.setAttribute("data-theme", resolvedTheme.value);
+        }
+      };
+      mql.addEventListener("change", onChange);
+      mediaQueryUnsub = () => mql.removeEventListener("change", onChange);
+    }
   }
 
   function initDecorations() {
@@ -193,6 +222,7 @@ export const useUiStore = defineStore("ui", () => {
     readerVisible,
     messageViewMode,
     theme,
+    resolvedTheme,
     toggleReader,
     showReader,
     hideReader,
