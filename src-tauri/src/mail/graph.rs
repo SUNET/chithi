@@ -422,6 +422,9 @@ impl GraphClient {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(2)
                     .min(10);
+                // Drain the body so reqwest can return the connection to the
+                // pool; otherwise the next request opens a fresh socket.
+                let _ = resp.bytes().await;
                 log::warn!("Graph $search throttled, retrying after {}s", retry_after);
                 tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
                 continue;
