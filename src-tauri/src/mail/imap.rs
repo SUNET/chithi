@@ -695,8 +695,12 @@ pub fn search_account_blocking(
             continue;
         }
 
+        // UIDs are server-assigned monotonically per mailbox, so the tail of
+        // the SEARCH response is the most recent slice — match the
+        // newest-first ordering used by the JMAP and Graph providers.
         let take_n = uids.len().min(SEARCH_PER_FOLDER_LIMIT);
-        let envelopes = match conn.fetch_envelopes_batch(&uids[..take_n]) {
+        let recent_uids = &uids[uids.len() - take_n..];
+        let envelopes = match conn.fetch_envelopes_batch(recent_uids) {
             Ok(e) => e,
             Err(e) => {
                 log::warn!("IMAP search: envelope fetch in {} failed: {}", path, e);
