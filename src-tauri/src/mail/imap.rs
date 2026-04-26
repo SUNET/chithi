@@ -227,15 +227,9 @@ impl ImapConnection {
             &uid_set[..uid_set.len().min(80)]
         );
 
-        // BODY.PEEK[HEADER.FIELDS (REFERENCES)] pulls only the References
-        // line without marking the message Seen. We parse it locally to
-        // feed thread computation; the bytes are not stored.
         let fetches = self
             .session
-            .uid_fetch(
-                &uid_set,
-                "(UID ENVELOPE FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (REFERENCES)])",
-            )
+            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
             .map_err(|e| {
                 log::error!("IMAP FETCH envelopes failed: {}", e);
                 Error::Imap(e.to_string())
@@ -301,13 +295,6 @@ impl ImapConnection {
             // More accurate: check if it's multipart/mixed (indicates attachments)
             let has_attachments = size > 10000; // rough heuristic; will improve later
 
-            // Pull the References header bytes back out of the fetch and
-            // parse the angle-bracketed Message-IDs into a list.
-            let references = fetch
-                .header()
-                .map(parse_references_header)
-                .unwrap_or_default();
-
             results.push(EnvelopeData {
                 uid,
                 subject,
@@ -318,14 +305,55 @@ impl ImapConnection {
                 date: date_str,
                 message_id: msg_id,
                 in_reply_to,
-                references,
+                references: Vec::new(),
                 flags,
                 size,
                 has_attachments,
             });
         }
         log::info!("IMAP envelope batch: {} envelopes fetched", results.len());
+
+        // References travels in a second, header-only fetch. Combining it
+        // with ENVELOPE in one FETCH triggers an imap-proto parse error on
+        // some servers (the literal-string framing of the body fetch leaks
+        // into the next command's response). A second pass is one extra
+        // round-trip per batch but keeps the connection state clean.
+        if !results.is_empty() {
+            self.populate_references(&mut results, &uid_set);
+        }
+
         Ok(results)
+    }
+
+    /// Best-effort: fetch the References header for every envelope in
+    /// `results` and write the parsed chain back. A failure here does not
+    /// fail the sync — threading just falls back to the In-Reply-To path.
+    fn populate_references(&mut self, results: &mut [EnvelopeData], uid_set: &str) {
+        let fetches = match self
+            .session
+            .uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])")
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("IMAP fetch References failed (skipping): {}", e);
+                return;
+            }
+        };
+        let mut by_uid: std::collections::HashMap<u32, Vec<String>> =
+            std::collections::HashMap::new();
+        for fetch in fetches.iter() {
+            if let (Some(uid), Some(bytes)) = (fetch.uid, fetch.header()) {
+                let refs = parse_references_header(bytes);
+                if !refs.is_empty() {
+                    by_uid.insert(uid, refs);
+                }
+            }
+        }
+        for env in results.iter_mut() {
+            if let Some(refs) = by_uid.remove(&env.uid) {
+                env.references = refs;
+            }
+        }
     }
 
     /// Fetch the full body (RFC822) for a single message by UID.
