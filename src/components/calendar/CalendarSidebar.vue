@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onBeforeUnmount, watch } from "vue";
+import { ref, onBeforeUnmount, watch } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
-import { useUiStore } from "@/stores/ui";
 import type { Calendar } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 import { showToast } from "@/lib/toast";
@@ -20,7 +19,6 @@ const emit = defineEmits<{
 
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
-const uiStore = useUiStore();
 
 function getAccountLabel(accountId: string): string {
   const acc = accountsStore.accounts.find((a) => a.id === accountId);
@@ -113,73 +111,6 @@ async function syncThisCalendar() {
   } finally {
     syncing.value = null;
   }
-}
-
-const tzSearch = ref("");
-const tzDropdownOpen = ref(false);
-const tzHighlightIndex = ref(-1);
-const tzDropdownRef = ref<HTMLElement | null>(null);
-
-const filteredTimezones = computed(() => {
-  const query = tzSearch.value.toLowerCase();
-  if (!query) return uiStore.timezoneList;
-  return uiStore.timezoneList.filter((tz: string) => tz.toLowerCase().includes(query));
-});
-
-function selectTimezone(tz: string) {
-  uiStore.setDisplayTimezone(tz);
-  tzSearch.value = "";
-  tzDropdownOpen.value = false;
-  tzHighlightIndex.value = -1;
-}
-
-function onTzInput(e: Event) {
-  tzSearch.value = (e.target as HTMLInputElement).value;
-  tzHighlightIndex.value = 0;
-}
-
-function onTzInputFocus() {
-  tzDropdownOpen.value = true;
-  tzSearch.value = "";
-  tzHighlightIndex.value = -1;
-}
-
-function onTzInputBlur() {
-  setTimeout(() => {
-    tzDropdownOpen.value = false;
-    tzSearch.value = "";
-    tzHighlightIndex.value = -1;
-  }, 200);
-}
-
-function onTzKeydown(e: KeyboardEvent) {
-  if (!tzDropdownOpen.value) return;
-  const list = filteredTimezones.value;
-  if (e.key === "ArrowDown") {
-    e.preventDefault();
-    tzHighlightIndex.value = Math.min(tzHighlightIndex.value + 1, list.length - 1);
-    scrollHighlightedIntoView();
-  } else if (e.key === "ArrowUp") {
-    e.preventDefault();
-    tzHighlightIndex.value = Math.max(tzHighlightIndex.value - 1, 0);
-    scrollHighlightedIntoView();
-  } else if (e.key === "Enter") {
-    e.preventDefault();
-    if (tzHighlightIndex.value >= 0 && tzHighlightIndex.value < list.length) {
-      selectTimezone(list[tzHighlightIndex.value]);
-      (e.target as HTMLInputElement)?.blur();
-    }
-  } else if (e.key === "Escape") {
-    tzDropdownOpen.value = false;
-    (e.target as HTMLInputElement)?.blur();
-  }
-}
-
-function scrollHighlightedIntoView() {
-  nextTick(() => {
-    const el = tzDropdownRef.value?.querySelector(".tz-option.highlighted");
-    if (el) el.scrollIntoView({ block: "nearest" });
-  });
 }
 
 const renaming = ref<{ calendar: Calendar; value: string } | null>(null);
@@ -282,84 +213,6 @@ async function unsubscribeThisCalendar() {
       </div>
       <div v-if="calendarStore.calendars.length === 0" class="empty">
         No calendars
-      </div>
-    </div>
-
-    <div class="week-start-section">
-      <div class="section-header">Week starts on</div>
-      <div class="week-start-options">
-        <button
-          v-for="opt in [{ day: 0, label: 'Sunday' }, { day: 1, label: 'Monday' }, { day: 6, label: 'Saturday' }]"
-          :key="opt.day"
-          class="week-start-btn"
-          :class="{ active: uiStore.weekStartDay === opt.day }"
-          :data-testid="`week-start-${opt.day}`"
-          @click="uiStore.setWeekStartDay(opt.day)"
-        >{{ opt.label }}</button>
-      </div>
-    </div>
-
-    <div class="time-format-section">
-      <div class="section-header">Time format</div>
-      <div class="time-format-options">
-        <button
-          v-for="opt in [{ value: 'auto' as const, label: 'Auto' }, { value: '12' as const, label: '12h' }, { value: '24' as const, label: '24h' }]"
-          :key="opt.value"
-          class="time-format-btn"
-          :class="{ active: uiStore.timeFormat === opt.value }"
-          :data-testid="`time-format-${opt.value}`"
-          @click="uiStore.setTimeFormat(opt.value)"
-        >{{ opt.label }}</button>
-      </div>
-    </div>
-
-    <div class="timezone-section">
-      <div class="section-header">Use timezone</div>
-      <div class="timezone-picker">
-        <input
-          type="text"
-          class="tz-search-input"
-          :placeholder="uiStore.displayTimezone"
-          :value="tzDropdownOpen ? tzSearch : ''"
-          @input="onTzInput($event)"
-          @focus="onTzInputFocus"
-          @blur="onTzInputBlur"
-          @keydown="onTzKeydown"
-          aria-label="Display timezone"
-          role="combobox"
-          :aria-expanded="tzDropdownOpen"
-          aria-controls="tz-listbox"
-          aria-autocomplete="list"
-          :aria-activedescendant="tzHighlightIndex >= 0 ? `tz-opt-${tzHighlightIndex}` : undefined"
-          data-testid="timezone-search"
-        />
-        <div
-          v-if="tzDropdownOpen"
-          ref="tzDropdownRef"
-          id="tz-listbox"
-          role="listbox"
-          aria-label="Timezones"
-          class="tz-dropdown"
-          data-testid="timezone-dropdown"
-        >
-          <button
-            v-for="(tz, idx) in filteredTimezones"
-            :key="tz"
-            :id="`tz-opt-${idx}`"
-            role="option"
-            :aria-selected="tz === uiStore.displayTimezone"
-            class="tz-option"
-            :class="{ active: tz === uiStore.displayTimezone, highlighted: idx === tzHighlightIndex }"
-            @mousedown.prevent="selectTimezone(tz)"
-            @mouseenter="tzHighlightIndex = idx"
-            :data-testid="`timezone-option-${tz}`"
-          >
-            {{ tz }}
-          </button>
-          <div v-if="filteredTimezones.length === 0" class="tz-empty">
-            No matching timezones
-          </div>
-        </div>
       </div>
     </div>
 
@@ -524,153 +377,6 @@ async function unsubscribeThisCalendar() {
   padding: 8px 4px;
 }
 
-.week-start-section {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--color-border);
-}
-
-.section-header {
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--color-text-muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  padding: 0 4px 8px;
-}
-
-.week-start-options {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.week-start-btn {
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  text-align: left;
-  border-radius: 4px;
-  transition: background 0.1s;
-}
-
-.week-start-btn:hover {
-  background: var(--color-bg-hover);
-}
-
-.week-start-btn.active {
-  color: var(--color-accent);
-  font-weight: 600;
-}
-
-.time-format-section {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--color-border);
-}
-
-.time-format-options {
-  display: flex;
-  gap: 4px;
-  padding: 0 4px;
-}
-
-.time-format-btn {
-  flex: 1;
-  padding: 4px 0;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  text-align: center;
-  border-radius: 4px;
-  border: 1px solid var(--color-border);
-  background: transparent;
-  transition: background 0.1s, border-color 0.1s;
-}
-
-.time-format-btn:hover {
-  background: var(--color-bg-hover);
-}
-
-.time-format-btn.active {
-  color: var(--color-accent);
-  border-color: var(--color-accent);
-  font-weight: 600;
-}
-
-.timezone-section {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--color-border);
-}
-
-.timezone-picker {
-  position: relative;
-  padding: 0 4px;
-}
-
-.tz-search-input {
-  width: 100%;
-  padding: 4px 8px;
-  font-size: 12px;
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg);
-  color: var(--color-text);
-  outline: none;
-  box-sizing: border-box;
-}
-
-.tz-search-input:focus {
-  border-color: var(--color-accent);
-}
-
-.tz-search-input::placeholder {
-  color: var(--color-text-secondary);
-}
-
-.tz-dropdown {
-  position: absolute;
-  bottom: 100%;
-  left: 4px;
-  right: 4px;
-  max-height: 200px;
-  overflow-y: auto;
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  margin-bottom: 2px;
-  z-index: 50;
-  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
-}
-
-.tz-option {
-  display: block;
-  width: 100%;
-  padding: 4px 8px;
-  text-align: left;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  background: none;
-  border: none;
-  cursor: pointer;
-}
-
-.tz-option:hover,
-.tz-option.highlighted {
-  background: var(--color-bg-hover);
-}
-
-.tz-option.active {
-  color: var(--color-accent);
-  font-weight: 600;
-}
-
-.tz-empty {
-  padding: 8px;
-  font-size: 12px;
-  color: var(--color-text-muted);
-  text-align: center;
-}
 </style>
 
 <style>

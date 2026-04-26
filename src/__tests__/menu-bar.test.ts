@@ -24,8 +24,7 @@ function makeRouter() {
     history: createMemoryHistory(),
     routes: [
       { path: "/", component: { template: "<div/>" } },
-      { path: "/settings", component: { template: "<div/>" } },
-      { path: "/filters", component: { template: "<div/>" } },
+      { path: "/preferences", component: { template: "<div/>" } },
     ],
   });
 }
@@ -67,13 +66,13 @@ describe("MenuBar", () => {
     expect(invokeMock).toHaveBeenCalledWith("quit_app");
   });
 
-  it("File > Preferences routes to /settings", async () => {
+  it("File > Preferences routes to /preferences", async () => {
     const router = makeRouter();
     const push = vi.spyOn(router, "push");
     const wrapper = mount(MenuBar, { global: { plugins: [router] } });
     await wrapper.find('.menu-item:nth-of-type(1)').trigger("click");
     await wrapper.find('[data-testid="menu-file-preferences"]').trigger("click");
-    expect(push).toHaveBeenCalledWith("/settings");
+    expect(push).toHaveBeenCalledWith("/preferences");
   });
 
   it("View menu shows the four-way radio with None / Right / Bottom / Tabs", async () => {
