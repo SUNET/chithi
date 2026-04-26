@@ -4,6 +4,7 @@ use tauri::{Emitter, State};
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::jmap::JmapConnection;
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::smtp;
 use crate::state::AppState;
 
@@ -437,15 +438,20 @@ fn resolve_reply_headers(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
-    let Some((Some(parent_mid), parent_irt)) = parent else {
+    let Some((Some(parent_mid_raw), parent_irt_raw)) = parent else {
+        return (None, Vec::new());
+    };
+    // Older DB rows can carry leading whitespace or be missing brackets.
+    // Canonicalize before we hand the value to lettre's header builder so
+    // the outgoing In-Reply-To / References match what receiving clients
+    // and our own thread-id lookups will expect.
+    let Some(parent_mid) = normalize_message_id(&parent_mid_raw) else {
         return (None, Vec::new());
     };
 
     let mut chain: Vec<String> = Vec::new();
-    if let Some(irt) = parent_irt {
-        if !irt.is_empty() {
-            chain.push(irt);
-        }
+    if let Some(irt) = parent_irt_raw.as_deref().and_then(normalize_message_id) {
+        chain.push(irt);
     }
 
     // Walk backwards via in_reply_to. Cap depth to keep the header
@@ -468,9 +474,13 @@ fn resolve_reply_headers(
             )
             .ok();
         match next {
-            Some(Some(irt)) if !irt.is_empty() => {
-                chain.push(irt.clone());
-                current = Some(irt);
+            Some(Some(irt_raw)) => {
+                if let Some(irt) = normalize_message_id(&irt_raw) {
+                    chain.push(irt.clone());
+                    current = Some(irt);
+                } else {
+                    break;
+                }
             }
             _ => break,
         }

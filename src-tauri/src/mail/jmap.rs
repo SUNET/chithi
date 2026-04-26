@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_jmap_filter, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
@@ -431,25 +432,25 @@ impl JmapConnection {
             .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
             .unwrap_or_default();
         let size = e["size"].as_u64().unwrap_or(0);
+        // JMAP returns Message-IDs without angle brackets; canonicalize each
+        // through `normalize_message_id` so the stored form matches what the
+        // IMAP and Graph paths produce.
         let message_id = e["messageId"]
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
-            .map(|s| format!("<{}>", s));
+            .and_then(normalize_message_id);
         let in_reply_to = e["inReplyTo"]
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
-            .map(|s| format!("<{}>", s));
-        // JMAP stores Message-IDs without angle brackets; wrap each so the
-        // chain matches what the DB stores for IMAP envelopes.
+            .and_then(normalize_message_id);
         let references: Vec<String> = e["references"]
             .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| format!("<{}>", s))
+                    .filter_map(normalize_message_id)
                     .collect()
             })
             .unwrap_or_default();

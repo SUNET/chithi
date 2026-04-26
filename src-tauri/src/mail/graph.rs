@@ -4,6 +4,7 @@
 //! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
 
 use crate::error::{Error, Result};
+use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
@@ -967,7 +968,9 @@ fn parse_graph_search_hit(account_id: &str, m: &serde_json::Value) -> SearchHit 
 
     let snippet = m["bodyPreview"].as_str().map(|s| s.to_string());
     let folder_path = m["parentFolderId"].as_str().unwrap_or("").to_string();
-    let message_id = m["internetMessageId"].as_str().map(|s| s.to_string());
+    let message_id = m["internetMessageId"]
+        .as_str()
+        .and_then(normalize_message_id);
 
     SearchHit {
         account_id: account_id.to_string(),
@@ -1009,7 +1012,9 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
         date,
         is_read: m["isRead"].as_bool().unwrap_or(false),
         has_attachments: m["hasAttachments"].as_bool().unwrap_or(false),
-        internet_message_id: m["internetMessageId"].as_str().map(|s| s.to_string()),
+        internet_message_id: m["internetMessageId"]
+            .as_str()
+            .and_then(normalize_message_id),
         conversation_id: m["conversationId"].as_str().map(|s| s.to_string()),
         preview: m["bodyPreview"].as_str().map(|s| s.to_string()),
         in_reply_to,
@@ -1051,12 +1056,10 @@ fn extract_message_ids(s: &str) -> Vec<String> {
             '<' => {
                 inside = true;
                 buf.clear();
-                buf.push('<');
             }
             '>' if inside => {
-                buf.push('>');
-                if buf.len() > 2 {
-                    out.push(buf.clone());
+                if let Some(id) = normalize_message_id(&buf) {
+                    out.push(id);
                 }
                 inside = false;
                 buf.clear();
