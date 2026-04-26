@@ -39,8 +39,9 @@ pub struct MessageSummary {
     /// Used by the frontend to build the in-thread reply hierarchy.
     pub message_id: Option<String>,
     /// In-Reply-To header pointing at this message's parent within the
-    /// thread. Empty for the thread root or for backends that don't
-    /// expose it (Microsoft Graph stores conversationId only).
+    /// thread. Empty for the thread root or when the source message/backend
+    /// does not provide the header; Microsoft Graph populates this from
+    /// `internetMessageHeaders` when available.
     pub in_reply_to: Option<String>,
 }
 
