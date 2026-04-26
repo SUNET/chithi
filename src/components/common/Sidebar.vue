@@ -1,27 +1,15 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from "vue-router";
-import { useAccountsStore } from "@/stores/accounts";
-import { openComposeWindow } from "@/lib/compose-window";
 
 const router = useRouter();
 const route = useRoute();
-const accountsStore = useAccountsStore();
 
 const topItems = [
   { path: "/", label: "Mail", name: "mail" },
   { path: "/calendar", label: "Calendar", name: "calendar" },
-  { path: "", label: "Compose", name: "compose" },
   { path: "/contacts", label: "Contacts", name: "contacts" },
   { path: "/filters", label: "Filters", name: "filters" },
 ];
-
-function handleNavClick(item: typeof topItems[0]) {
-  if (item.name === "compose") {
-    openComposeWindow({ accountId: accountsStore.activeAccountId ?? undefined });
-  } else {
-    router.push(item.path);
-  }
-}
 </script>
 
 <template>
@@ -31,10 +19,10 @@ function handleNavClick(item: typeof topItems[0]) {
         v-for="item in topItems"
         :key="item.name"
         class="sidebar-item"
-        :class="{ active: item.name !== 'compose' && route.name === item.name }"
+        :class="{ active: route.name === item.name }"
         :title="item.label"
         :data-testid="`nav-${item.name}`"
-        @click="handleNavClick(item)"
+        @click="router.push(item.path)"
       >
         <!-- Mail icon -->
         <svg v-if="item.name === 'mail'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -45,10 +33,6 @@ function handleNavClick(item: typeof topItems[0]) {
         <svg v-else-if="item.name === 'calendar'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="4" width="18" height="18" rx="2" />
           <path d="M16 2v4M8 2v4M3 10h18" />
-        </svg>
-        <!-- Compose icon -->
-        <svg v-else-if="item.name === 'compose'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
         </svg>
         <!-- Contacts icon -->
         <svg v-else-if="item.name === 'contacts'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
