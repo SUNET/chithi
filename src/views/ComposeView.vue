@@ -8,6 +8,7 @@ import type { Account, ComposeAttachment } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import Select from "@/components/common/Select.vue";
+import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
@@ -56,19 +57,21 @@ onMounted(async () => {
 
 // WebKitGTK on Linux doesn't forward standard editing shortcuts (Ctrl+Z,
 // Ctrl+Shift+Z, Ctrl+A, Ctrl+X/C/V) to secondary WebviewWindows.
-// Intercept them and delegate to document.execCommand.
+// Intercept them and delegate to document.execCommand. Note `e.key` is
+// uppercase whenever Shift is held, so we normalise before matching.
 function onEditShortcut(e: KeyboardEvent) {
   if (!(e.ctrlKey || e.metaKey)) return;
   const tag = (e.target as HTMLElement)?.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA") return;
 
+  const key = e.key.toLowerCase();
   let cmd: string | null = null;
-  if (e.key === "z" && e.shiftKey) cmd = "redo";
-  else if (e.key === "z") cmd = "undo";
-  else if (e.key === "a") cmd = "selectAll";
-  else if (e.key === "x") cmd = "cut";
-  else if (e.key === "c") cmd = "copy";
-  else if (e.key === "v") cmd = "paste";
+  if (key === "z" && e.shiftKey) cmd = "redo";
+  else if (key === "z") cmd = "undo";
+  else if (key === "a") cmd = "selectAll";
+  else if (key === "x") cmd = "cut";
+  else if (key === "c") cmd = "copy";
+  else if (key === "v") cmd = "paste";
   if (cmd) {
     document.execCommand(cmd);
   }
@@ -505,14 +508,16 @@ async function send() {
 <template>
   <div class="compose-view">
     <!-- Menu Bar -->
-    <div class="compose-menubar">
-      <span class="menu-item">File</span>
-      <span class="menu-item">Edit</span>
-      <span class="menu-item">View</span>
-      <span class="menu-item">Options</span>
-      <span class="menu-item">Tools</span>
-      <span class="menu-item">Help</span>
-    </div>
+    <ComposeMenuBar
+      :show-cc="showCc"
+      :show-bcc="showBcc"
+      @save-draft="saveDraft"
+      @send="send"
+      @close-window="currentWindow.close()"
+      @attach="addAttachment"
+      @toggle-cc="showCc = !showCc"
+      @toggle-bcc="showBcc = !showBcc"
+    />
 
     <!-- Toolbar -->
     <div class="compose-toolbar">
@@ -711,31 +716,6 @@ async function send() {
   flex-direction: column;
   height: 100vh;
   background: var(--color-bg);
-}
-
-/* Menu Bar */
-.compose-menubar {
-  display: flex;
-  align-items: center;
-  height: 32px;
-  padding: 0 8px;
-  background: var(--color-bg-secondary);
-  border-bottom: 0.8px solid var(--color-border);
-  flex-shrink: 0;
-  gap: 0;
-}
-
-.menu-item {
-  padding: 4px 12px;
-  font-size: 16px;
-  font-weight: 500;
-  color: var(--color-text);
-  cursor: pointer;
-  border-radius: 4px;
-}
-
-.menu-item:hover {
-  background: var(--color-bg-hover);
 }
 
 /* Toolbar */
