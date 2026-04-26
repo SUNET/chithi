@@ -956,6 +956,29 @@ async fn sync_graph_account(
             ids
         };
 
+        // Backfill: existing rows synced before threading worked have an
+        // empty thread_id. The Graph response gives us the live
+        // conversationId for free, so we fix them up here without a
+        // re-download.
+        {
+            let conn = db_arc.writer().await;
+            let mut stmt = conn.prepare(
+                "UPDATE messages SET thread_id = ?1
+                 WHERE id = ?2 AND (thread_id IS NULL OR thread_id = '')",
+            )?;
+            for msg in &messages {
+                if let Some(cid) = msg.conversation_id.as_deref() {
+                    if cid.is_empty() {
+                        continue;
+                    }
+                    let id = format!("{}_{}", account_id, msg.id);
+                    if existing_ids.contains(&id) {
+                        stmt.execute(rusqlite::params![cid, id])?;
+                    }
+                }
+            }
+        }
+
         // Collect new messages
         let mut new_messages = Vec::new();
         for msg in &messages {
