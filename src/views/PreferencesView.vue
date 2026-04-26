@@ -61,7 +61,9 @@ function selectTimezone(tz: string) {
 
 function onTzInput(e: Event) {
   tzSearch.value = (e.target as HTMLInputElement).value;
-  tzHighlightIndex.value = 0;
+  // Reset to the first match, or clear the highlight when nothing matches
+  // so aria-activedescendant doesn't point at a non-existent option.
+  tzHighlightIndex.value = filteredTimezones.value.length > 0 ? 0 : -1;
 }
 
 function onTzInputFocus() {
@@ -113,7 +115,12 @@ function scrollHighlightedIntoView() {
   <div class="preferences-view" data-testid="preferences-view">
     <header class="prefs-header">
       <h1>Preferences</h1>
-      <button class="prefs-close" data-testid="prefs-close" @click="close">&times;</button>
+      <button
+        class="prefs-close"
+        data-testid="prefs-close"
+        aria-label="Close Preferences"
+        @click="close"
+      >&times;</button>
     </header>
 
     <div class="prefs-body">
@@ -148,9 +155,10 @@ function scrollHighlightedIntoView() {
             </div>
           </div>
           <div class="prefs-row">
-            <label class="prefs-label">Hide title bar</label>
+            <label class="prefs-label" for="prefs-hide-title-bar">Hide title bar</label>
             <div class="prefs-toggle">
               <input
+                id="prefs-hide-title-bar"
                 type="checkbox"
                 :checked="!uiStore.decorationsEnabled"
                 data-testid="prefs-hide-title-bar"
@@ -207,7 +215,11 @@ function scrollHighlightedIntoView() {
                 :aria-expanded="tzDropdownOpen"
                 aria-controls="prefs-tz-listbox"
                 aria-autocomplete="list"
-                :aria-activedescendant="tzHighlightIndex >= 0 ? `prefs-tz-opt-${tzHighlightIndex}` : undefined"
+                :aria-activedescendant="
+                  tzHighlightIndex >= 0 && tzHighlightIndex < filteredTimezones.length
+                    ? `prefs-tz-opt-${tzHighlightIndex}`
+                    : undefined
+                "
                 data-testid="prefs-timezone-search"
               />
               <div
