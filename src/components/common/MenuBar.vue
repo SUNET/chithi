@@ -1,7 +1,15 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUiStore, type MessageViewMode } from "@/stores/ui";
+import {
+  dispatch,
+  formatShortcut,
+  type ShortcutBinding,
+  type ShortcutDef,
+} from "@/lib/shortcuts";
 
 const router = useRouter();
 const uiStore = useUiStore();
@@ -15,23 +23,27 @@ function closeMenus() {
   openMenu.value = null;
 }
 
-function goSettings() {
+// --- Actions ----------------------------------------------------------------
+
+function openPreferences() {
   closeMenus();
+  // ADR 0044 Phase 2 will introduce a dedicated Preferences window. Until
+  // then, route to the existing /settings page so the menu item works.
   router.push("/settings");
 }
 
-function goFilters() {
+async function closeWindow() {
   closeMenus();
-  router.push("/filters");
+  await getCurrentWindow().close();
+}
+
+async function quitApp() {
+  closeMenus();
+  await invoke("quit_app");
 }
 
 function setViewMode(mode: MessageViewMode) {
   uiStore.setMessageViewMode(mode);
-  closeMenus();
-}
-
-function setTheme(theme: "dark" | "light") {
-  uiStore.setTheme(theme);
   closeMenus();
 }
 
@@ -40,85 +52,129 @@ function toggleReader() {
   closeMenus();
 }
 
-function toggleDecorations() {
+function toggleThreading() {
+  uiStore.setThreading(!uiStore.threadingEnabled);
+  closeMenus();
+}
+
+function openFilters() {
+  closeMenus();
+  router.push("/filters");
+}
+
+function toggleTitleBar() {
+  // `decorationsEnabled = false` means the title bar is hidden. The menu
+  // label "Hide Title Bar" reads as a toggle — checked when hidden.
   uiStore.setDecorations(!uiStore.decorationsEnabled);
   closeMenus();
 }
+
+// --- Shortcut definitions ---------------------------------------------------
+
+const sc = {
+  preferences: { key: ",", ctrl: true } satisfies ShortcutDef,
+  closeWindow: { key: "w", ctrl: true } satisfies ShortcutDef,
+  quit: { key: "q", ctrl: true } satisfies ShortcutDef,
+  toggleReader: { key: "\\", ctrl: true } satisfies ShortcutDef,
+  toggleThreading: { key: "t", ctrl: true } satisfies ShortcutDef,
+} as const;
+
+const bindings: readonly ShortcutBinding[] = [
+  { ...sc.preferences, handler: openPreferences },
+  { ...sc.closeWindow, handler: closeWindow },
+  { ...sc.quit, handler: quitApp },
+  { ...sc.toggleReader, handler: toggleReader },
+  { ...sc.toggleThreading, handler: toggleThreading },
+];
+
+function onKeyDown(event: KeyboardEvent) {
+  const target = event.target;
+  // Don't fight text-editing shortcuts in inputs / textareas / contenteditables.
+  if (target instanceof HTMLElement && target.isContentEditable) return;
+  if (target instanceof HTMLInputElement) return;
+  if (target instanceof HTMLTextAreaElement) return;
+  dispatch(event, bindings);
+}
+
+onMounted(() => window.addEventListener("keydown", onKeyDown));
+onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
 </script>
 
 <template>
-  <div class="menu-bar" @mouseleave="closeMenus">
+  <div class="menu-bar" @mouseleave="closeMenus" data-testid="menu-bar">
     <!-- File menu -->
     <div class="menu-item" @click.stop="toggleMenu('file')">
       <span class="menu-label">File</span>
-      <div v-if="openMenu === 'file'" class="menu-dropdown">
-        <button class="menu-action" @click="goSettings">Settings</button>
+      <div v-if="openMenu === 'file'" class="menu-dropdown" data-testid="menu-file-dropdown">
+        <button class="menu-action" data-testid="menu-file-preferences" @click="openPreferences">
+          <span class="action-label">Preferences&hellip;</span>
+          <span class="action-shortcut">{{ formatShortcut(sc.preferences) }}</span>
+        </button>
         <div class="menu-separator"></div>
-        <button class="menu-action" @click="closeMenus">Close</button>
+        <button class="menu-action" data-testid="menu-file-close-window" @click="closeWindow">
+          <span class="action-label">Close Window</span>
+          <span class="action-shortcut">{{ formatShortcut(sc.closeWindow) }}</span>
+        </button>
+        <button class="menu-action" data-testid="menu-file-quit" @click="quitApp">
+          <span class="action-label">Quit</span>
+          <span class="action-shortcut">{{ formatShortcut(sc.quit) }}</span>
+        </button>
       </div>
     </div>
 
     <!-- View menu -->
     <div class="menu-item" @click.stop="toggleMenu('view')">
       <span class="menu-label">View</span>
-      <div v-if="openMenu === 'view'" class="menu-dropdown">
-        <button class="menu-action" @click="toggleReader">
-          {{ uiStore.readerVisible ? 'Hide' : 'Show' }} Message Pane
+      <div v-if="openMenu === 'view'" class="menu-dropdown" data-testid="menu-view-dropdown">
+        <button class="menu-action" data-testid="menu-view-show-pane" @click="toggleReader">
+          <span class="action-prefix">{{ uiStore.readerVisible ? '\u2713' : '\u00A0' }}</span>
+          <span class="action-label">Show Message Pane</span>
+          <span class="action-shortcut">{{ formatShortcut(sc.toggleReader) }}</span>
         </button>
+
+        <div class="menu-group-heading">Message Pane Position</div>
         <button
-          class="menu-action"
-          @click="uiStore.setThreading(!uiStore.threadingEnabled); closeMenus()"
-        >
-          {{ uiStore.threadingEnabled ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Threading
-        </button>
-        <button class="menu-action" @click="goFilters">Message Filters</button>
-        <div class="menu-separator"></div>
-        <div class="menu-group-label">Message View Position</div>
-        <button
-          class="menu-action"
-          :class="{ checked: uiStore.messageViewMode === 'right' }"
+          class="menu-action menu-action-radio"
+          data-testid="menu-view-position-right"
           @click="setViewMode('right')"
         >
-          {{ uiStore.messageViewMode === 'right' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Right Side
+          <span class="action-prefix">{{ uiStore.messageViewMode === 'right' ? '\u25CF' : '\u00A0' }}</span>
+          <span class="action-label">Right</span>
         </button>
         <button
-          class="menu-action"
-          :class="{ checked: uiStore.messageViewMode === 'bottom' }"
+          class="menu-action menu-action-radio"
+          data-testid="menu-view-position-bottom"
           @click="setViewMode('bottom')"
-          data-testid="menu-view-bottom"
         >
-          {{ uiStore.messageViewMode === 'bottom' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Bottom
+          <span class="action-prefix">{{ uiStore.messageViewMode === 'bottom' ? '\u25CF' : '\u00A0' }}</span>
+          <span class="action-label">Bottom</span>
         </button>
         <button
-          class="menu-action"
-          :class="{ checked: uiStore.messageViewMode === 'tab' }"
+          class="menu-action menu-action-radio"
+          data-testid="menu-view-position-tabs"
           @click="setViewMode('tab')"
         >
-          {{ uiStore.messageViewMode === 'tab' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Tabs
+          <span class="action-prefix">{{ uiStore.messageViewMode === 'tab' ? '\u25CF' : '\u00A0' }}</span>
+          <span class="action-label">Tabs</span>
         </button>
+
         <div class="menu-separator"></div>
-        <div class="menu-group-label">Theme</div>
-        <button
-          class="menu-action"
-          :class="{ checked: uiStore.theme === 'dark' }"
-          @click="setTheme('dark')"
-        >
-          {{ uiStore.theme === 'dark' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Dark
+
+        <button class="menu-action" data-testid="menu-view-threaded" @click="toggleThreading">
+          <span class="action-prefix">{{ uiStore.threadingEnabled ? '\u2713' : '\u00A0' }}</span>
+          <span class="action-label">Threaded View</span>
+          <span class="action-shortcut">{{ formatShortcut(sc.toggleThreading) }}</span>
         </button>
-        <button
-          class="menu-action"
-          :class="{ checked: uiStore.theme === 'light' }"
-          @click="setTheme('light')"
-        >
-          {{ uiStore.theme === 'light' ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Light
+        <button class="menu-action" data-testid="menu-view-filters" @click="openFilters">
+          <span class="action-prefix">&#160;</span>
+          <span class="action-label">Message Filters&hellip;</span>
         </button>
+
         <div class="menu-separator"></div>
-        <button
-          class="menu-action"
-          :class="{ checked: !uiStore.decorationsEnabled }"
-          @click="toggleDecorations"
-        >
-          {{ !uiStore.decorationsEnabled ? '\u2713 ' : '\u00A0\u00A0\u00A0' }}Hide Window Decorations
+
+        <button class="menu-action" data-testid="menu-view-hide-title-bar" @click="toggleTitleBar">
+          <span class="action-prefix">{{ !uiStore.decorationsEnabled ? '\u2713' : '\u00A0' }}</span>
+          <span class="action-label">Hide Title Bar</span>
         </button>
       </div>
     </div>
@@ -157,7 +213,7 @@ function toggleDecorations() {
   position: absolute;
   top: 100%;
   left: 0;
-  min-width: 200px;
+  min-width: 240px;
   background: var(--color-bg-secondary);
   border: 1px solid var(--color-border);
   border-radius: 6px;
@@ -167,21 +223,48 @@ function toggleDecorations() {
 }
 
 .menu-action {
-  display: block;
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
   width: 100%;
   padding: 6px 16px;
   text-align: left;
   font-size: 12px;
   color: var(--color-text);
   white-space: nowrap;
+  background: transparent;
+  border: none;
+  cursor: pointer;
 }
 
 .menu-action:hover {
   background: var(--color-bg-hover);
 }
 
-.menu-action.checked {
+.action-prefix {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
   color: var(--color-accent);
+  text-align: center;
+}
+
+.action-label {
+  /* takes the middle column */
+}
+
+.action-shortcut {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-left: 24px;
+}
+
+.menu-action-radio {
+  padding-left: 28px;
+}
+
+.menu-action-radio .action-prefix {
+  /* nudge so the dot aligns visually inside the indented radio cluster */
+  margin-left: -12px;
 }
 
 .menu-separator {
@@ -190,11 +273,10 @@ function toggleDecorations() {
   margin: 4px 0;
 }
 
-.menu-group-label {
-  padding: 4px 16px 2px;
-  font-size: 10px;
-  color: var(--color-text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+.menu-group-heading {
+  padding: 6px 16px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text);
 }
 </style>
