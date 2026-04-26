@@ -404,11 +404,35 @@ pub async fn sync_folder(
     let resume_account = account.clone();
 
     let sync_result: Result<u32> = if account.mail_protocol == "graph" {
-        // Graph sync is whole-account, not per-folder — just run the full sync
-        match sync_graph_account(app.clone(), state.db.clone(), &account_id).await {
-            Ok(()) => Ok(0),
-            Err(e) => Err(e),
-        }
+        // Microsoft Graph has no cheap per-folder fetch — every sync runs
+        // against the whole account. Spawn it in the background and return
+        // immediately so the UI's per-folder spinner doesn't sit there for
+        // multiple minutes. The per-account `_guard` rides along into the
+        // spawned task so the flag stays held for the real work and is
+        // released exactly once when the sync finishes.
+        let app_bg = app.clone();
+        let db_bg = state.db.clone();
+        let account_id_bg = account_id.clone();
+        tokio::spawn(async move {
+            let _hold_guard = _guard;
+            let result = sync_graph_account(app_bg.clone(), db_bg, &account_id_bg).await;
+            match result {
+                Ok(()) => log::info!("Background Graph sync done for {}", account_id_bg),
+                Err(e) => {
+                    log::error!("Background Graph sync failed for {}: {}", account_id_bg, e);
+                    app_bg
+                        .emit(
+                            "sync-error",
+                            serde_json::json!({
+                                "account_id": account_id_bg,
+                                "error": e.to_string(),
+                            }),
+                        )
+                        .ok();
+                }
+            }
+        });
+        return Ok(0);
     } else if account.mail_protocol == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
         jmap_sync::sync_jmap_folder_public(
