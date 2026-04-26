@@ -534,7 +534,7 @@ function resolveFolderName(path: string): string {
         >
           <ThreadRow
             :thread="thread"
-            :expanded="messagesStore.expandedThreads.includes(thread.thread_id)"
+            :expanded="messagesStore.isThreadExpanded(thread.thread_id)"
             :active="thread.message_ids.includes(messagesStore.activeMessageId ?? '')"
             :selected="messagesStore.isSelected(thread.message_ids[0])"
             @toggle="messagesStore.toggleThread(thread.thread_id)"
@@ -544,7 +544,7 @@ function resolveFolderName(path: string): string {
           />
         </div>
         <!-- Expanded thread messages -->
-        <template v-if="messagesStore.expandedThreads.includes(thread.thread_id)">
+        <template v-if="messagesStore.isThreadExpanded(thread.thread_id)">
           <div
             v-for="msg in (messagesStore.threadMessages[thread.thread_id] ?? []).slice(1)"
             :key="msg.id"

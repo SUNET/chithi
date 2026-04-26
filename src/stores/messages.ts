@@ -35,10 +35,38 @@ export type SortColumn = "subject" | "from" | "date" | "flagged";
 export const useMessagesStore = defineStore("messages", () => {
   // Flat mode state
   const messages = ref<MessageSummary[]>([]);
-  // Threaded mode state
+  // Threaded mode state.
+  // `collapsedThreads` is the inverse of an expansion list: every visible
+  // thread is treated as expanded by default, and only ids the user has
+  // explicitly collapsed are tracked. The list survives folder/account
+  // changes and incremental syncs so toggling stays sticky. Persisted to
+  // localStorage so it also survives app restart.
+  const COLLAPSED_KEY = "chithi-collapsed-threads";
   const threads = ref<ThreadSummary[]>([]);
-  const expandedThreads = ref<string[]>([]);
+  const collapsedThreads = ref<string[]>(loadCollapsedThreads());
   const threadMessages = ref<Record<string, MessageSummary[]>>({});
+
+  function loadCollapsedThreads(): string[] {
+    try {
+      const raw = localStorage.getItem(COLLAPSED_KEY);
+      const parsed: unknown = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function persistCollapsedThreads() {
+    try {
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(collapsedThreads.value));
+    } catch {
+      // ignore quota / private-mode failures; in-memory state still works
+    }
+  }
+
+  function isThreadExpanded(threadId: string): boolean {
+    return !collapsedThreads.value.includes(threadId);
+  }
 
   const activeMessage = ref<MessageBody | null>(null);
   const activeMessageId = ref<string | null>(null);
@@ -232,7 +260,8 @@ export const useMessagesStore = defineStore("messages", () => {
       page.value = 0;
       // Don't clear messages/threads here — causes UI flicker.
       // They get replaced atomically after the API call returns.
-      expandedThreads.value = [];
+      // collapsedThreads is intentionally preserved across syncs and
+      // folder/account switches so the user's toggle state is sticky.
       threadMessages.value = {};
     }
     loading.value = true;
@@ -254,6 +283,10 @@ export const useMessagesStore = defineStore("messages", () => {
         }
         totalThreads.value = result.total_threads;
         total.value = result.total_messages;
+        // Threads are expanded by default. Pre-fetch children for every
+        // multi-message thread that the user hasn't collapsed so the rows
+        // render without a per-thread loading flash.
+        await prefetchExpandedChildren(accountId, folderPath, result.threads);
       } else {
         const result = await api.getMessages(
           accountId,
@@ -274,6 +307,41 @@ export const useMessagesStore = defineStore("messages", () => {
     } finally {
       loading.value = false;
     }
+  }
+
+  /**
+   * Fetch child message lists for every visible multi-message thread the
+   * user has not explicitly collapsed. Existing entries in
+   * `threadMessages` are skipped so re-renders don't refetch.
+   */
+  async function prefetchExpandedChildren(
+    accountId: string,
+    folderPath: string,
+    targets: ThreadSummary[],
+  ) {
+    const todo = targets.filter(
+      (t) =>
+        t.message_count > 1 &&
+        !collapsedThreads.value.includes(t.thread_id) &&
+        !threadMessages.value[t.thread_id],
+    );
+    if (todo.length === 0) return;
+    const fetched = await Promise.all(
+      todo.map(async (t): Promise<[string, MessageSummary[]]> => {
+        try {
+          const msgs = await api.getThreadMessages(accountId, folderPath, t.thread_id);
+          return [t.thread_id, msgs];
+        } catch (e) {
+          console.error(`Failed to prefetch thread ${t.thread_id}:`, e);
+          return [t.thread_id, []];
+        }
+      }),
+    );
+    const next = { ...threadMessages.value };
+    for (const [id, msgs] of fetched) {
+      if (msgs.length > 0) next[id] = msgs;
+    }
+    threadMessages.value = next;
   }
 
   async function loadNextPage() {
@@ -298,6 +366,7 @@ export const useMessagesStore = defineStore("messages", () => {
         threads.value = [...threads.value, ...result.threads];
         totalThreads.value = result.total_threads;
         total.value = result.total_messages;
+        await prefetchExpandedChildren(accountId, folderPath, result.threads);
       } else {
         const result = await api.getMessages(
           accountId,
@@ -317,19 +386,22 @@ export const useMessagesStore = defineStore("messages", () => {
   }
 
   async function toggleThread(threadId: string) {
-    const idx = expandedThreads.value.indexOf(threadId);
+    const idx = collapsedThreads.value.indexOf(threadId);
     if (idx !== -1) {
-      expandedThreads.value.splice(idx, 1);
-    } else {
+      // Currently collapsed -> expand. Make sure children are loaded.
+      collapsedThreads.value.splice(idx, 1);
       if (!threadMessages.value[threadId]) {
         const accountId = accountsStore.activeAccountId;
         const folderPath = foldersStore.activeFolderPath;
-        if (!accountId || !folderPath) return;
-        const msgs = await api.getThreadMessages(accountId, folderPath, threadId);
-        threadMessages.value = { ...threadMessages.value, [threadId]: msgs };
+        if (accountId && folderPath) {
+          const msgs = await api.getThreadMessages(accountId, folderPath, threadId);
+          threadMessages.value = { ...threadMessages.value, [threadId]: msgs };
+        }
       }
-      expandedThreads.value.push(threadId);
+    } else {
+      collapsedThreads.value = [...collapsedThreads.value, threadId];
     }
+    persistCollapsedThreads();
   }
 
   async function showAsThread(messageId: string) {
@@ -341,8 +413,12 @@ export const useMessagesStore = defineStore("messages", () => {
     const threadMsgs = await api.getThreadMessages(accountId, folderPath, messageId);
     if (threadMsgs.length > 1) {
       threadMessages.value = { ...threadMessages.value, [messageId]: threadMsgs };
-      if (!expandedThreads.value.includes(messageId)) {
-        expandedThreads.value.push(messageId);
+      // Threads are expanded by default — make sure this one is too,
+      // even if the user had it on their collapsed list.
+      const idx = collapsedThreads.value.indexOf(messageId);
+      if (idx !== -1) {
+        collapsedThreads.value.splice(idx, 1);
+        persistCollapsedThreads();
       }
     }
   }
@@ -496,7 +572,7 @@ export const useMessagesStore = defineStore("messages", () => {
       const ids: string[] = [];
       for (const thread of threads.value) {
         ids.push(thread.message_ids[0]);
-        if (expandedThreads.value.includes(thread.thread_id)) {
+        if (isThreadExpanded(thread.thread_id)) {
           const children = threadMessages.value[thread.thread_id] ?? [];
           for (const msg of children) {
             ids.push(msg.id);
@@ -723,7 +799,8 @@ export const useMessagesStore = defineStore("messages", () => {
   return {
     messages,
     threads,
-    expandedThreads,
+    collapsedThreads,
+    isThreadExpanded,
     threadMessages,
     activeMessage,
     activeMessageId,
