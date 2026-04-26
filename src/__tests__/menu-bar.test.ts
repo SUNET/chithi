@@ -5,15 +5,14 @@ import { createMemoryHistory, createRouter } from "vue-router";
 import { __setPlatformForTests } from "@/lib/shortcuts";
 import MenuBar from "@/components/common/MenuBar.vue";
 
-const { invokeMock, closeMock, setDecorationsMock } = vi.hoisted(() => ({
+const { invokeMock, setDecorationsMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
-  closeMock: vi.fn(),
   setDecorationsMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ close: closeMock, setDecorations: setDecorationsMock }),
+  getCurrentWindow: () => ({ setDecorations: setDecorationsMock }),
 }));
 vi.mock("@/lib/tauri", () => ({
   listTimezones: vi.fn().mockResolvedValue([]),
@@ -34,7 +33,6 @@ function makeRouter() {
 beforeEach(() => {
   setActivePinia(createPinia());
   invokeMock.mockReset();
-  closeMock.mockReset();
   setDecorationsMock.mockReset();
   __setPlatformForTests(false);
 });
@@ -50,17 +48,16 @@ describe("MenuBar", () => {
     expect(wrapper.text()).toContain("View");
   });
 
-  it("File menu shows Preferences / Close Window / Quit with shortcut labels", async () => {
+  it("File menu shows Preferences / Quit with shortcut labels", async () => {
     const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
     await wrapper.find('.menu-item:nth-of-type(1)').trigger("click");
     const dropdown = wrapper.find('[data-testid="menu-file-dropdown"]');
     expect(dropdown.exists()).toBe(true);
     expect(dropdown.text()).toContain("Preferences");
     expect(dropdown.text()).toContain("Ctrl+,");
-    expect(dropdown.text()).toContain("Close Window");
-    expect(dropdown.text()).toContain("Ctrl+W");
     expect(dropdown.text()).toContain("Quit");
     expect(dropdown.text()).toContain("Ctrl+Q");
+    expect(dropdown.text()).not.toContain("Close Window");
   });
 
   it("File > Quit invokes the quit_app command", async () => {
@@ -68,13 +65,6 @@ describe("MenuBar", () => {
     await wrapper.find('.menu-item:nth-of-type(1)').trigger("click");
     await wrapper.find('[data-testid="menu-file-quit"]').trigger("click");
     expect(invokeMock).toHaveBeenCalledWith("quit_app");
-  });
-
-  it("File > Close Window calls getCurrentWindow().close()", async () => {
-    const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
-    await wrapper.find('.menu-item:nth-of-type(1)').trigger("click");
-    await wrapper.find('[data-testid="menu-file-close-window"]').trigger("click");
-    expect(closeMock).toHaveBeenCalled();
   });
 
   it("File > Preferences routes to /settings", async () => {
@@ -86,19 +76,40 @@ describe("MenuBar", () => {
     expect(push).toHaveBeenCalledWith("/settings");
   });
 
-  it("View menu shows the radio group with the active position prefixed", async () => {
+  it("View menu shows the four-way radio with None / Right / Bottom / Tabs", async () => {
     const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
     await wrapper.find('.menu-item:nth-of-type(2)').trigger("click");
     const dropdown = wrapper.find('[data-testid="menu-view-dropdown"]');
     expect(dropdown.text()).toContain("Message Pane Position");
+    expect(dropdown.text()).toContain("None");
     expect(dropdown.text()).toContain("Right");
     expect(dropdown.text()).toContain("Bottom");
     expect(dropdown.text()).toContain("Tabs");
+    // The standalone "Show Message Pane" toggle is gone.
+    expect(dropdown.text()).not.toContain("Show Message Pane");
     // Default messageViewMode is "right"; that row should carry the bullet.
     const right = wrapper.find('[data-testid="menu-view-position-right"]');
     expect(right.text()).toContain("\u25CF");
-    const bottom = wrapper.find('[data-testid="menu-view-position-bottom"]');
-    expect(bottom.text()).not.toContain("\u25CF");
+    const none = wrapper.find('[data-testid="menu-view-position-none"]');
+    expect(none.text()).not.toContain("\u25CF");
+  });
+
+  it("Selecting None hides the pane via setMessageViewMode", async () => {
+    const { useUiStore } = await import("@/stores/ui");
+    const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
+    await wrapper.find('.menu-item:nth-of-type(2)').trigger("click");
+    await wrapper.find('[data-testid="menu-view-position-none"]').trigger("click");
+    const ui = useUiStore();
+    expect(ui.messageViewMode).toBe("none");
+  });
+
+  it("Selecting Right after None re-enables the reader pane", async () => {
+    const { useUiStore } = await import("@/stores/ui");
+    const ui = useUiStore();
+    ui.setMessageViewMode("none");
+    ui.hideReader();
+    ui.setMessageViewMode("right");
+    expect(ui.readerVisible).toBe(true);
   });
 
   it("Ctrl+T toggles threading via the keydown listener", async () => {
