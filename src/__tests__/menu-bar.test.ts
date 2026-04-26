@@ -5,15 +5,19 @@ import { createMemoryHistory, createRouter } from "vue-router";
 import { __setPlatformForTests } from "@/lib/shortcuts";
 import MenuBar from "@/components/common/MenuBar.vue";
 
-const { invokeMock, setDecorationsMock } = vi.hoisted(() => ({
+const { invokeMock, setDecorationsMock, openUrlMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   setDecorationsMock: vi.fn(),
+  openUrlMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ setDecorations: setDecorationsMock }),
 }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: openUrlMock }));
+
+(globalThis as { __APP_VERSION__?: string }).__APP_VERSION__ = "0.0.0-test";
 vi.mock("@/lib/tauri", () => ({
   listTimezones: vi.fn().mockResolvedValue([]),
   getDefaultTimezone: vi.fn().mockResolvedValue("UTC"),
@@ -33,6 +37,8 @@ beforeEach(() => {
   setActivePinia(createPinia());
   invokeMock.mockReset();
   setDecorationsMock.mockReset();
+  openUrlMock.mockReset();
+  document.body.innerHTML = "";
   __setPlatformForTests(false);
 });
 
@@ -41,10 +47,20 @@ afterEach(() => {
 });
 
 describe("MenuBar", () => {
-  it("renders File and View menu labels", () => {
+  it("renders File / View / Help menu labels", () => {
     const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
     expect(wrapper.text()).toContain("File");
     expect(wrapper.text()).toContain("View");
+    expect(wrapper.text()).toContain("Help");
+  });
+
+  it("Help > About opens the About dialog", async () => {
+    const wrapper = mount(MenuBar, { global: { plugins: [makeRouter()] } });
+    await wrapper.find('.menu-item:nth-of-type(3)').trigger("click");
+    await wrapper.find('[data-testid="menu-help-about"]').trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(document.querySelector('[data-testid="about-overlay"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("0.0.0-test");
   });
 
   it("File menu shows Preferences / Quit with shortcut labels", async () => {

@@ -9,6 +9,7 @@ import {
   type ShortcutBinding,
   type ShortcutDef,
 } from "@/lib/shortcuts";
+import AboutDialog from "@/components/common/AboutDialog.vue";
 
 const router = useRouter();
 const uiStore = useUiStore();
@@ -44,6 +45,13 @@ function toggleThreading() {
   closeMenus();
 }
 
+const aboutOpen = ref(false);
+
+function openAbout() {
+  closeMenus();
+  aboutOpen.value = true;
+}
+
 // --- Shortcut definitions ---------------------------------------------------
 
 const sc = {
@@ -76,7 +84,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
     <!-- File menu -->
     <div class="menu-item" @click.stop="toggleMenu('file')">
       <span class="menu-label">File</span>
-      <div v-if="openMenu === 'file'" class="menu-dropdown" data-testid="menu-file-dropdown">
+      <div v-if="openMenu === 'file'" class="menu-dropdown" @click.stop data-testid="menu-file-dropdown">
         <button class="menu-action" data-testid="menu-file-preferences" @click="openPreferences">
           <span class="action-label">Preferences&hellip;</span>
           <span class="action-shortcut">{{ formatShortcut(sc.preferences) }}</span>
@@ -92,7 +100,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
     <!-- View menu -->
     <div class="menu-item" @click.stop="toggleMenu('view')">
       <span class="menu-label">View</span>
-      <div v-if="openMenu === 'view'" class="menu-dropdown" data-testid="menu-view-dropdown">
+      <div v-if="openMenu === 'view'" class="menu-dropdown" @click.stop data-testid="menu-view-dropdown">
         <div class="menu-group-heading">Message Pane</div>
         <button
           class="menu-action menu-action-radio"
@@ -136,6 +144,19 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
         </button>
       </div>
     </div>
+
+    <!-- Help menu -->
+    <div class="menu-item" @click.stop="toggleMenu('help')">
+      <span class="menu-label">Help</span>
+      <div v-if="openMenu === 'help'" class="menu-dropdown" @click.stop data-testid="menu-help-dropdown">
+        <button class="menu-action" data-testid="menu-help-about" @click="openAbout">
+          <span class="action-prefix">&#160;</span>
+          <span class="action-label">About Chithi&hellip;</span>
+        </button>
+      </div>
+    </div>
+
+    <AboutDialog :open="aboutOpen" @close="aboutOpen = false" />
   </div>
 </template>
 
