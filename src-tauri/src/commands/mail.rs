@@ -171,6 +171,87 @@ pub async fn search_messages_server(
     Ok(hits)
 }
 
+/// Insert (or upsert) a server-search hit into the local messages table so
+/// the existing `get_message_body` flow can fetch and render it. Returns the
+/// synthetic database id, which the frontend then passes to `loadMessage`.
+///
+/// We don't have the full envelope (size, to/cc, encryption flags) from the
+/// search response, so we fill in reasonable defaults — the next sync of
+/// that folder will reconcile them.
+#[tauri::command]
+pub async fn import_search_hit(
+    state: State<'_, AppState>,
+    account_id: String,
+    hit: SearchHit,
+) -> Result<String> {
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    let (id, uid, maildir_path) = if account.mail_protocol == "graph" {
+        // Format matches sync_cmd::sync_graph_account: `{account_id}_{graph_id}`,
+        // and `graph:{graph_id}` in maildir_path triggers the on-demand stream
+        // path in get_message_body.
+        let id = format!("{}_{}", account_id, hit.backend_id);
+        let maildir = format!("graph:{}", hit.backend_id);
+        (id, 0u32, maildir)
+    } else if account.mail_protocol == "jmap" {
+        // Format matches jmap_sync: `{account_id}_{mailbox_id}_{email_id}`.
+        let id = format!("{}_{}_{}", account_id, hit.folder_path, hit.backend_id);
+        (id, 0u32, String::new())
+    } else {
+        // IMAP: `{account_id}_{folder_path}_{uid}`.
+        let uid = hit
+            .uid
+            .ok_or_else(|| Error::Other("IMAP search hit is missing UID".into()))?;
+        let id = format!("{}_{}_{}", account_id, hit.folder_path, uid);
+        (id, uid, String::new())
+    };
+
+    let date_str = if hit.date > 0 {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(hit.date, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default()
+    } else {
+        chrono::Utc::now().to_rfc3339()
+    };
+
+    let new_msg = db::messages::NewMessage {
+        id: id.clone(),
+        account_id: account_id.clone(),
+        folder_path: hit.folder_path,
+        uid,
+        message_id: hit.message_id,
+        in_reply_to: None,
+        thread_id: None,
+        subject: if hit.subject.is_empty() {
+            None
+        } else {
+            Some(hit.subject)
+        },
+        from_name: hit.from_name,
+        from_email: hit.from_email.unwrap_or_else(|| "unknown".to_string()),
+        to_addresses: "[]".to_string(),
+        cc_addresses: "[]".to_string(),
+        date: date_str,
+        size: 0,
+        has_attachments: false,
+        is_encrypted: false,
+        is_signed: false,
+        flags: "[]".to_string(),
+        maildir_path,
+        snippet: hit.snippet,
+    };
+
+    {
+        let conn = state.db.writer().await;
+        db::messages::insert_message(&conn, &new_msg)?;
+    }
+
+    Ok(id)
+}
+
 #[tauri::command]
 pub async fn get_message_body(
     app: tauri::AppHandle,

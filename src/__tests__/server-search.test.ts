@@ -26,6 +26,7 @@ vi.mock("@/lib/tauri", () => ({
   }),
   getThreadMessages: vi.fn().mockResolvedValue([]),
   getMessageBody: vi.fn().mockResolvedValue(null),
+  importSearchHit: vi.fn(),
   setMessageFlags: vi.fn().mockResolvedValue(undefined),
   deleteMessages: vi.fn().mockResolvedValue(undefined),
   backfillThreads: vi.fn().mockResolvedValue(0),
@@ -205,6 +206,48 @@ describe("server-side search", () => {
     await messagesStore.runServerSearch();
 
     expect(messagesStore.serverSearchError).toBe("server unreachable");
+  });
+
+  it("opening a hit imports it then loads the message body", async () => {
+    withActiveAccount();
+    const importMock = vi.mocked(api.importSearchHit);
+    const bodyMock = vi.mocked(api.getMessageBody);
+    importMock.mockResolvedValueOnce("acc1_INBOX_42");
+    bodyMock.mockResolvedValueOnce({
+      id: "acc1_INBOX_42",
+      subject: "hello",
+      from: { name: null, email: "x@y" },
+      to: [],
+      cc: [],
+      date: "",
+      flags: [],
+      body_html: null,
+      body_text: "hi",
+      attachments: [],
+      is_encrypted: false,
+      is_signed: false,
+      list_id: null,
+      has_remote_images: false,
+    });
+
+    const messagesStore = useMessagesStore();
+    await messagesStore.openServerHit({
+      account_id: "acc1",
+      folder_path: "INBOX",
+      uid: 42,
+      message_id: null,
+      backend_id: "INBOX:42",
+      subject: "hello",
+      from_name: null,
+      from_email: "x@y",
+      date: 1_700_000_000,
+      snippet: null,
+    });
+
+    expect(importMock).toHaveBeenCalledTimes(1);
+    expect(importMock.mock.calls[0][1].backend_id).toBe("INBOX:42");
+    expect(bodyMock).toHaveBeenCalledWith("acc1", "acc1_INBOX_42");
+    expect(messagesStore.activeMessageId).toBe("acc1_INBOX_42");
   });
 
   it("clears prior hits as soon as the user types again", async () => {

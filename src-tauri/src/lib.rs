@@ -47,6 +47,7 @@ pub fn run() {
             commands::mail::list_folders,
             commands::mail::get_messages,
             commands::mail::search_messages_server,
+            commands::mail::import_search_hit,
             commands::mail::get_message_body,
             commands::mail::get_message_html_with_images,
             commands::mail::get_threaded_messages,
