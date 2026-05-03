@@ -217,8 +217,12 @@ impl CalDavClient {
             .rsplit('@')
             .next()
             .ok_or_else(|| Error::Other("Invalid email for CalDAV discovery".to_string()))?;
-        Self::auto_discover_hosts(http, auth, &[domain.to_string(), format!("mail.{}", domain)])
-            .await
+        Self::auto_discover_hosts(
+            http,
+            auth,
+            &[domain.to_string(), format!("mail.{}", domain)],
+        )
+        .await
     }
 
     /// Same as `auto_discover`, but probes a caller-supplied list of

@@ -257,10 +257,7 @@ impl AccountFull {
             self.use_tls = true;
         }
 
-        self.jmap_url = self
-            .mail_jmap_config()
-            .map(|c| c.url)
-            .unwrap_or_default();
+        self.jmap_url = self.mail_jmap_config().map(|c| c.url).unwrap_or_default();
 
         // The legacy `caldav_url` column was a single string used for both
         // CalDAV and CardDAV (same server in practice). Phase 3 splits it into
@@ -271,27 +268,19 @@ impl AccountFull {
             .or_else(|| self.contacts_dav_url())
             .unwrap_or_default();
 
-        self.calendar_sync_enabled = self
-            .calendar_binding()
-            .map(|b| b.enabled)
-            .unwrap_or(true);
+        self.calendar_sync_enabled = self.calendar_binding().map(|b| b.enabled).unwrap_or(true);
 
         // Phase-4: surface per-binding state on the wire format so the
         // Settings edit form sees the toggles' current value.
-        self.mail_sync_enabled = self
-            .mail_binding()
-            .map(|b| b.enabled)
-            .unwrap_or(true);
-        self.contacts_sync_enabled = self
+        self.mail_sync_enabled = self.mail_binding().map(|b| b.enabled).unwrap_or(true);
+        self.contacts_sync_enabled = self.contacts_binding().map(|b| b.enabled).unwrap_or(true);
+        self.mail_sync_interval_seconds = self.mail_binding().and_then(|b| b.sync_interval_seconds);
+        self.calendar_sync_interval_seconds = self
+            .calendar_binding()
+            .and_then(|b| b.sync_interval_seconds);
+        self.contacts_sync_interval_seconds = self
             .contacts_binding()
-            .map(|b| b.enabled)
-            .unwrap_or(true);
-        self.mail_sync_interval_seconds =
-            self.mail_binding().and_then(|b| b.sync_interval_seconds);
-        self.calendar_sync_interval_seconds =
-            self.calendar_binding().and_then(|b| b.sync_interval_seconds);
-        self.contacts_sync_interval_seconds =
-            self.contacts_binding().and_then(|b| b.sync_interval_seconds);
+            .and_then(|b| b.sync_interval_seconds);
     }
 }
 
@@ -352,47 +341,51 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 }
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
-    let mut account = conn.query_row(
-        "SELECT id, display_name, email, username, enabled, signature,
+    let mut account = conn
+        .query_row(
+            "SELECT id, display_name, email, username, enabled, signature,
                 oidc_token_endpoint, oidc_client_id, auth_method
          FROM accounts WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok(AccountFull {
-                id: row.get(0)?,
-                display_name: row.get(1)?,
-                email: row.get(2)?,
-                username: row.get(3)?,
-                enabled: row.get(4)?,
-                signature: row.get(5)?,
-                oidc_token_endpoint: row.get(6)?,
-                oidc_client_id: row.get(7)?,
-                auth_method: row.get(8)?,
-                // Legacy fields populated below from bindings + auth_method.
-                provider: String::new(),
-                mail_protocol: String::new(),
-                jmap_auth_method: String::new(),
-                imap_host: String::new(),
-                imap_port: 993,
-                smtp_host: String::new(),
-                smtp_port: 587,
-                jmap_url: String::new(),
-                caldav_url: String::new(),
-                password: String::new(),
-                use_tls: true,
-                calendar_sync_enabled: true,
-                bindings: Vec::new(),
-                mail_sync_enabled: true,
-                contacts_sync_enabled: true,
-                mail_sync_interval_seconds: None,
-                calendar_sync_interval_seconds: None,
-                contacts_sync_interval_seconds: None,
-            })
-        },
-    ).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => crate::error::Error::AccountNotFound(id.to_string()),
-        other => crate::error::Error::Database(other),
-    })?;
+            params![id],
+            |row| {
+                Ok(AccountFull {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    email: row.get(2)?,
+                    username: row.get(3)?,
+                    enabled: row.get(4)?,
+                    signature: row.get(5)?,
+                    oidc_token_endpoint: row.get(6)?,
+                    oidc_client_id: row.get(7)?,
+                    auth_method: row.get(8)?,
+                    // Legacy fields populated below from bindings + auth_method.
+                    provider: String::new(),
+                    mail_protocol: String::new(),
+                    jmap_auth_method: String::new(),
+                    imap_host: String::new(),
+                    imap_port: 993,
+                    smtp_host: String::new(),
+                    smtp_port: 587,
+                    jmap_url: String::new(),
+                    caldav_url: String::new(),
+                    password: String::new(),
+                    use_tls: true,
+                    calendar_sync_enabled: true,
+                    bindings: Vec::new(),
+                    mail_sync_enabled: true,
+                    contacts_sync_enabled: true,
+                    mail_sync_interval_seconds: None,
+                    calendar_sync_interval_seconds: None,
+                    contacts_sync_interval_seconds: None,
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                crate::error::Error::AccountNotFound(id.to_string())
+            }
+            other => crate::error::Error::Database(other),
+        })?;
 
     // Phase-3: bindings are the source of truth. Load them, then populate
     // the legacy AccountFull fields from the bindings + auth_method so the

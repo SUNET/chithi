@@ -70,18 +70,19 @@ pub async fn move_messages(
 
     // Gather data needed for the server operation before we modify the DB.
     // For IMAP we need UIDs grouped by folder; for JMAP/Graph we need the IDs.
-    let imap_by_folder = if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
-        let conn = state.db.reader();
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-        if grouped.is_empty() {
-            log::warn!("No messages found for move operation");
-            return Ok(());
-        }
-        Some(grouped)
-    } else {
-        None
-    };
+    let imap_by_folder =
+        if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
+            let conn = state.db.reader();
+            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let grouped = group_by_folder(uid_rows);
+            if grouped.is_empty() {
+                log::warn!("No messages found for move operation");
+                return Ok(());
+            }
+            Some(grouped)
+        } else {
+            None
+        };
 
     // --- Optimistic: update local DB and notify UI immediately ---
     {
@@ -240,18 +241,19 @@ pub async fn delete_messages(
     };
 
     // Gather IMAP UIDs before modifying the DB
-    let imap_by_folder = if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
-        let conn = state.db.reader();
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-        let grouped = group_by_folder(uid_rows);
-        if grouped.is_empty() {
-            log::warn!("No messages found for delete operation");
-            return Ok(());
-        }
-        Some(grouped)
-    } else {
-        None
-    };
+    let imap_by_folder =
+        if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
+            let conn = state.db.reader();
+            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let grouped = group_by_folder(uid_rows);
+            if grouped.is_empty() {
+                log::warn!("No messages found for delete operation");
+                return Ok(());
+            }
+            Some(grouped)
+        } else {
+            None
+        };
 
     // --- Optimistic: update local DB and notify UI immediately ---
     {

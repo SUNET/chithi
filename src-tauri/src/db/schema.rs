@@ -568,10 +568,11 @@ fn populate_service_bindings(conn: &Connection) -> Result<()> {
     // a fresh-install DB created with the Phase 3 schema). The migration
     // marker logic below normally prevents this branch from running, but
     // an out-of-order replay shouldn't error out the app.
-    if conn.prepare("SELECT mail_protocol FROM accounts LIMIT 0").is_err() {
-        log::info!(
-            "populate_service_bindings: legacy columns absent, skipping (Phase 3+ schema)"
-        );
+    if conn
+        .prepare("SELECT mail_protocol FROM accounts LIMIT 0")
+        .is_err()
+    {
+        log::info!("populate_service_bindings: legacy columns absent, skipping (Phase 3+ schema)");
         return Ok(());
     }
 
