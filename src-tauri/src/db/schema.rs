@@ -176,6 +176,26 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
 
+        -- Per-service binding for an account. One identity (accounts row)
+        -- can have one mail binding, one calendar binding, and one contacts
+        -- binding, each with its own protocol and protocol-specific config.
+        -- Phase 1: populated alongside the legacy per-protocol columns on
+        -- accounts; nothing reads from here yet. Phases 2/3 migrate the
+        -- dispatch reads and drop the legacy columns.
+        CREATE TABLE IF NOT EXISTS service_bindings (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            service TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sync_interval_seconds INTEGER,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(account_id, service, protocol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bindings_account ON service_bindings(account_id);
+
         -- FTS5 virtual table for fast message text search (quick filter)
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             subject,
@@ -328,6 +348,39 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         log::info!("Migration: FTS5 index populated");
     }
 
+    // Add auth_method column on accounts. Phase 1 of the service-bindings
+    // refactor: stored alongside the legacy `provider` column so dispatch
+    // code keeps working. Phase 2 starts reading auth_method instead;
+    // Phase 3 drops `provider`.
+    let has_auth_method: bool = conn
+        .prepare("SELECT auth_method FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_auth_method {
+        log::info!("Migration: adding auth_method column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN auth_method TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
+    // Backfill auth_method for any rows that haven't been populated yet
+    // (covers both fresh-from-migration rows above and any older rows that
+    // were created before this migration ran). Idempotent.
+    if !has_migration(conn, "auth_method_backfill_v1") {
+        log::info!("Migration: backfilling auth_method from provider/jmap_auth_method");
+        backfill_auth_method(conn)?;
+        set_migration(conn, "auth_method_backfill_v1")?;
+    }
+
+    // One-time populate of service_bindings from legacy account columns.
+    // Re-runnable (it deletes existing rows for an account before inserting),
+    // but gated by a marker so the common-case startup is a single SELECT.
+    if !has_migration(conn, "service_bindings_initial_populate") {
+        log::info!("Migration: deriving service_bindings from existing accounts");
+        populate_service_bindings(conn)?;
+        set_migration(conn, "service_bindings_initial_populate")?;
+        log::info!("Migration: service_bindings populated");
+    }
+
     // Canonicalize Message-ID / In-Reply-To and rethread.
     //
     // Older builds stored these strings verbatim from the IMAP envelope,
@@ -418,6 +471,82 @@ fn normalize_message_ids_and_rethread(conn: &Connection) -> Result<()> {
 
     tx.commit()?;
     log::info!("Migration messageid_normalize_v1: canonicalized + rethreaded");
+    Ok(())
+}
+
+/// Backfill `accounts.auth_method` from the legacy (`provider`,
+/// `jmap_auth_method`) pair. Single UPDATE that only touches rows whose
+/// `auth_method` is still empty, so re-running is harmless.
+fn backfill_auth_method(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE accounts
+         SET auth_method = CASE
+             WHEN provider = 'gmail' THEN 'oauth-google'
+             WHEN provider = 'o365'  THEN 'oauth-microsoft'
+             WHEN jmap_auth_method = 'oidc' THEN 'oauth-jmap-oidc'
+             ELSE 'password'
+         END
+         WHERE auth_method IS NULL OR auth_method = '';",
+    )?;
+    Ok(())
+}
+
+/// Read every existing account, derive its bindings, and INSERT them.
+/// Wipes any pre-existing bindings for each account first so re-running
+/// after a code-side rule change converges to the latest mapping.
+fn populate_service_bindings(conn: &Connection) -> Result<()> {
+    use crate::db::accounts::list_accounts;
+    use crate::db::service_bindings::{
+        delete_for_account, derive_bindings_from_account, insert,
+    };
+
+    // The summary list_accounts only carries the few columns shown in the
+    // sidebar; we need the full set to derive bindings, so re-query each
+    // row through get_account_full.
+    let summaries = list_accounts(conn)?;
+    for summary in summaries {
+        // Fetch full row directly via SQL — get_account_full pulls the
+        // password from the keyring as a side effect, which we don't want
+        // during a startup migration on headless hosts. Read just the
+        // columns we need.
+        let account = conn.query_row(
+            "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port,
+                    smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls,
+                    enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id,
+                    calendar_sync_enabled
+             FROM accounts WHERE id = ?1",
+            rusqlite::params![summary.id],
+            |row| {
+                Ok(crate::db::accounts::AccountFull {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    email: row.get(2)?,
+                    provider: row.get(3)?,
+                    mail_protocol: row.get(4)?,
+                    imap_host: row.get(5)?,
+                    imap_port: row.get::<_, u32>(6)? as u16,
+                    smtp_host: row.get(7)?,
+                    smtp_port: row.get::<_, u32>(8)? as u16,
+                    jmap_url: row.get(9)?,
+                    caldav_url: row.get(10)?,
+                    username: row.get(11)?,
+                    password: String::new(),
+                    use_tls: row.get(12)?,
+                    enabled: row.get(13)?,
+                    signature: row.get(14)?,
+                    jmap_auth_method: row.get(15)?,
+                    oidc_token_endpoint: row.get(16)?,
+                    oidc_client_id: row.get(17)?,
+                    calendar_sync_enabled: row.get(18)?,
+                })
+            },
+        )?;
+
+        delete_for_account(conn, &account.id)?;
+        for binding in derive_bindings_from_account(&account) {
+            insert(conn, &binding)?;
+        }
+    }
     Ok(())
 }
 
