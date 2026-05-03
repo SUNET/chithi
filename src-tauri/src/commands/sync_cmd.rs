@@ -231,7 +231,7 @@ pub async fn trigger_sync(
         }
     };
 
-    let suspended_idle = if account.mail_protocol == "imap"
+    let suspended_idle = if account.mail_protocol_str() == "imap"
         && should_suspend_idle_for_imap_operation(&account.provider)
     {
         log::info!(
@@ -244,7 +244,7 @@ pub async fn trigger_sync(
     };
     let resume_account = account.clone();
 
-    let sync_result = if account.mail_protocol == "graph" {
+    let sync_result = if account.mail_protocol_str() == "graph" {
         log::info!(
             "Syncing account {} ({}) via Microsoft Graph",
             account.display_name,
@@ -255,7 +255,7 @@ pub async fn trigger_sync(
         } else {
             Ok(())
         }
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         log::info!(
             "Syncing account {} ({}) via JMAP (url={})",
             account.display_name,
@@ -292,7 +292,7 @@ pub async fn trigger_sync(
         );
 
         // For O365 accounts, get an IMAP-scoped OAuth token
-        let (password, use_xoauth2) = if account.provider == "o365" {
+        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account_id)?.ok_or_else(|| {
                 Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
             })?;
@@ -384,7 +384,7 @@ pub async fn sync_folder(
     // activity store sees exactly one start per sync (sync_graph_account,
     // sync_jmap_folder_public, and the IMAP branch each emit their own).
 
-    let suspended_idle = if account.mail_protocol == "imap"
+    let suspended_idle = if account.mail_protocol_str() == "imap"
         && should_suspend_idle_for_imap_operation(&account.provider)
     {
         log::info!(
@@ -397,7 +397,7 @@ pub async fn sync_folder(
     };
     let resume_account = account.clone();
 
-    let sync_result: Result<u32> = if account.mail_protocol == "graph" {
+    let sync_result: Result<u32> = if account.mail_protocol_str() == "graph" {
         // Microsoft Graph has no cheap per-folder fetch — every sync runs
         // against the whole account. Spawn it in the background and return
         // immediately so the UI's per-folder spinner doesn't sit there for
@@ -427,7 +427,7 @@ pub async fn sync_folder(
             }
         });
         return Ok(0);
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         let jmap_config = build_jmap_config(&account).await?;
         jmap_sync::sync_jmap_folder_public(
             app.clone(),
@@ -451,7 +451,7 @@ pub async fn sync_folder(
         .ok();
 
         // For O365, refresh IMAP-scoped token
-        let (password, use_xoauth2) = if account.provider == "o365" {
+        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens
@@ -675,7 +675,7 @@ pub async fn prefetch_bodies(
     {
         let conn = state.db.reader();
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        if account.mail_protocol == "jmap" {
+        if account.mail_protocol_str() == "jmap" {
             log::debug!("Prefetch: skipping JMAP account {}", account_id);
             return Ok(0);
         }
@@ -698,7 +698,7 @@ pub async fn prefetch_bodies(
     let resume_account = account.clone();
 
     // For O365: get IMAP-scoped OAuth token
-    let (password, use_xoauth2) = if account.provider == "o365" {
+    let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
         let tokens = crate::oauth::load_tokens(&account_id)?
             .ok_or_else(|| Error::Other("No O365 tokens for prefetch".into()))?;
         let refresh_token = tokens
@@ -1173,6 +1173,8 @@ pub async fn start_idle(app: AppHandle, state: State<'_, AppState>) -> Result<()
             continue;
         }
 
+        // Account summary still carries mail_protocol directly; dispatch
+        // here without going through AccountFull to avoid an extra DB hop.
         if account.mail_protocol == "imap" {
             start_imap_idle(&app, &state, account).await?;
         } else if account.mail_protocol == "jmap" {
@@ -1203,7 +1205,7 @@ async fn start_imap_idle(
     };
 
     // For O365: get IMAP-scoped OAuth token
-    let (password, use_xoauth2) = if full_account.provider == "o365" {
+    let (password, use_xoauth2) = if full_account.auth_method == "oauth-microsoft" {
         let tokens = crate::oauth::load_tokens(&account.id)?
             .ok_or_else(|| crate::error::Error::Other("No O365 tokens for IDLE".into()))?;
         let refresh_token = tokens

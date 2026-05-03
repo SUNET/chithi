@@ -27,7 +27,7 @@ impl ImapConfig {
             username: account.username.clone(),
             password: account.password.clone(),
             use_tls: account.use_tls,
-            use_xoauth2: account.provider == "o365",
+            use_xoauth2: account.auth_method == "oauth-microsoft",
         }
     }
 }

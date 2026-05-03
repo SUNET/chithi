@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::db::service_bindings::ServiceBinding;
 use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,57 @@ pub struct AccountFull {
     pub oidc_token_endpoint: String,
     pub oidc_client_id: String,
     pub calendar_sync_enabled: bool,
+    /// Phase-2 field: how the user authenticates with this identity.
+    /// One of "password" | "oauth-google" | "oauth-microsoft" |
+    /// "oauth-jmap-oidc". Populated by the auth_method backfill migration.
+    pub auth_method: String,
+    /// Phase-2 field: bindings for this account, loaded via
+    /// `service_bindings::list_for_account` during `get_account_full`.
+    /// Dispatch code uses the helper methods below rather than reading
+    /// this field directly.
+    pub bindings: Vec<ServiceBinding>,
+}
+
+impl AccountFull {
+    /// Look up the binding for a given service ("mail" | "calendar" |
+    /// "contacts"). Returns `None` if the account has no binding for that
+    /// service (e.g. a CalDAV-only account has no mail binding).
+    pub fn binding_for(&self, service: &str) -> Option<&ServiceBinding> {
+        self.bindings.iter().find(|b| b.service == service)
+    }
+
+    pub fn mail_binding(&self) -> Option<&ServiceBinding> {
+        self.binding_for("mail")
+    }
+
+    pub fn calendar_binding(&self) -> Option<&ServiceBinding> {
+        self.binding_for("calendar")
+    }
+
+    pub fn contacts_binding(&self) -> Option<&ServiceBinding> {
+        self.binding_for("contacts")
+    }
+
+    /// Mail protocol as a string slice. Returns `""` for accounts with no
+    /// mail binding (calendar-only / contacts-only). Replaces direct reads
+    /// of `account.mail_protocol` at dispatch sites.
+    pub fn mail_protocol_str(&self) -> &str {
+        self.mail_binding()
+            .map(|b| b.protocol.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn calendar_protocol_str(&self) -> &str {
+        self.calendar_binding()
+            .map(|b| b.protocol.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn contacts_protocol_str(&self) -> &str {
+        self.contacts_binding()
+            .map(|b| b.protocol.as_str())
+            .unwrap_or("")
+    }
 }
 
 pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
@@ -93,7 +145,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled FROM accounts WHERE id = ?1",
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled, auth_method FROM accounts WHERE id = ?1",
         params![id],
         |row| {
             Ok(AccountFull {
@@ -117,12 +169,19 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 oidc_token_endpoint: row.get(16)?,
                 oidc_client_id: row.get(17)?,
                 calendar_sync_enabled: row.get(18)?,
+                auth_method: row.get(19)?,
+                bindings: Vec::new(),
             })
         },
     ).map_err(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => crate::error::Error::AccountNotFound(id.to_string()),
         other => crate::error::Error::Database(other),
     })?;
+
+    // Phase-2: load service_bindings so dispatch helpers can read the
+    // protocol-of-record. A missing or incomplete binding row falls back
+    // to whatever the legacy column says via the *_str helpers.
+    account.bindings = crate::db::service_bindings::list_for_account(conn, id)?;
 
     // Fetch password from the system keyring. OIDC/OAuth accounts don't
     // store a keyring password here — their tokens live under the
@@ -153,9 +212,12 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         crate::keyring::set_password(id, &config.password)?;
     }
 
+    let auth_method =
+        crate::db::service_bindings::auth_method_for(&config.provider, &config.jmap_auth_method);
+
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT INTO accounts (id, display_name, email, provider, mail_protocol, imap_host, imap_port, smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id, calendar_sync_enabled, auth_method)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             id,
             config.display_name,
@@ -175,8 +237,10 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             config.calendar_sync_enabled,
+            auth_method,
         ],
     )?;
+    crate::db::service_bindings::rebuild_for_account(conn, id)?;
     Ok(())
 }
 
@@ -189,14 +253,17 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         crate::keyring::set_password(id, &config.password)?;
     }
 
+    let auth_method =
+        crate::db::service_bindings::auth_method_for(&config.provider, &config.jmap_auth_method);
+
     let rows = conn.execute(
         "UPDATE accounts SET display_name=?1, email=?2, provider=?3, mail_protocol=?4,
          imap_host=?5, imap_port=?6, smtp_host=?7, smtp_port=?8, jmap_url=?9,
          caldav_url=?10, username=?11, use_tls=?12, signature=?13,
          jmap_auth_method=?14, oidc_token_endpoint=?15, oidc_client_id=?16,
-         calendar_sync_enabled=?17,
+         calendar_sync_enabled=?17, auth_method=?18,
          updated_at=CURRENT_TIMESTAMP
-         WHERE id=?18",
+         WHERE id=?19",
         params![
             config.display_name,
             config.email,
@@ -215,12 +282,14 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             config.calendar_sync_enabled,
+            auth_method,
             id,
         ],
     )?;
     if rows == 0 {
         return Err(crate::error::Error::AccountNotFound(id.to_string()));
     }
+    crate::db::service_bindings::rebuild_for_account(conn, id)?;
     log::info!("Updated account {}", id);
     Ok(())
 }
@@ -263,8 +332,21 @@ mod tests {
                 oidc_token_endpoint TEXT NOT NULL DEFAULT '',
                 oidc_client_id TEXT NOT NULL DEFAULT '',
                 calendar_sync_enabled INTEGER NOT NULL DEFAULT 1,
+                auth_method TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE service_bindings (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                service TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sync_interval_seconds INTEGER,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(account_id, service, protocol)
             );
             ",
         )

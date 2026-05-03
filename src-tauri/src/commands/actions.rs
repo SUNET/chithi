@@ -14,7 +14,7 @@ use crate::state::AppState;
 
 /// Build an ImapConfig for an account, handling O365 XOAUTH2 token refresh.
 async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapConfig> {
-    let (password, use_xoauth2) = if account.provider == "o365" {
+    let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
         let tokens = crate::oauth::load_tokens(&account.id)?
             .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
         let refresh = tokens
@@ -69,7 +69,7 @@ pub async fn move_messages(
 
     // Gather data needed for the server operation before we modify the DB.
     // For IMAP we need UIDs grouped by folder; for JMAP/Graph we need the IDs.
-    let imap_by_folder = if account.mail_protocol != "graph" && account.mail_protocol != "jmap" {
+    let imap_by_folder = if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
         let conn = state.db.reader();
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
         let grouped = group_by_folder(uid_rows);
@@ -92,7 +92,7 @@ pub async fn move_messages(
     emit_folders_changed(&app, &account_id);
 
     // --- Background: send to worker queue (IMAP) or spawn ad-hoc (JMAP/Graph) ---
-    if account.mail_protocol == "imap" {
+    if account.mail_protocol_str() == "imap" {
         if let Some(by_folder) = imap_by_folder {
             let sender = state.get_op_sender(&account_id, &app);
             if let Err(e) = sender
@@ -127,7 +127,7 @@ pub async fn move_messages(
 
         tokio::spawn(async move {
             let result: std::result::Result<(), Error> = async {
-                if account.mail_protocol == "graph" {
+                if account.mail_protocol_str() == "graph" {
                     let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
                     let client = crate::mail::graph::GraphClient::new(&token);
                     let mut errors: Vec<String> = Vec::new();
@@ -147,7 +147,7 @@ pub async fn move_messages(
                             errors.join("; ")
                         )));
                     }
-                } else if account.mail_protocol == "jmap" {
+                } else if account.mail_protocol_str() == "jmap" {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
@@ -239,7 +239,7 @@ pub async fn delete_messages(
     };
 
     // Gather IMAP UIDs before modifying the DB
-    let imap_by_folder = if account.mail_protocol != "graph" && account.mail_protocol != "jmap" {
+    let imap_by_folder = if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
         let conn = state.db.reader();
         let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
         let grouped = group_by_folder(uid_rows);
@@ -262,7 +262,7 @@ pub async fn delete_messages(
     emit_folders_changed(&app, &account_id);
 
     // --- Background: send to worker queue (IMAP) or spawn ad-hoc (JMAP/Graph) ---
-    if account.mail_protocol == "imap" {
+    if account.mail_protocol_str() == "imap" {
         // Worker has its own connection — no IDLE suspend needed
         if let Some(by_folder) = imap_by_folder {
             let sender = state.get_op_sender(&account_id, &app);
@@ -298,7 +298,7 @@ pub async fn delete_messages(
 
         tokio::spawn(async move {
             let result: std::result::Result<(), Error> = async {
-                if account.mail_protocol == "graph" {
+                if account.mail_protocol_str() == "graph" {
                     let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
                     let client = crate::mail::graph::GraphClient::new(&token);
                     let mut errors: Vec<String> = Vec::new();
@@ -318,7 +318,7 @@ pub async fn delete_messages(
                             errors.join("; ")
                         )));
                     }
-                } else if account.mail_protocol == "jmap" {
+                } else if account.mail_protocol_str() == "jmap" {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     let jmap_ids: Vec<String> = message_ids_bg
@@ -594,7 +594,7 @@ pub async fn set_message_flags(
     }
 
     // Now perform the remote operation (slow, network I/O)
-    if account.mail_protocol == "graph" {
+    if account.mail_protocol_str() == "graph" {
         // Graph path: use PATCH to update isRead
         let token = crate::mail::graph::get_graph_token(&account_id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
@@ -610,7 +610,7 @@ pub async fn set_message_flags(
                 .collect();
             client.set_read_status(&graph_ids, add).await?;
         }
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         // JMAP path: extract JMAP email IDs and set flags via JMAP API
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
@@ -709,7 +709,7 @@ pub async fn copy_messages(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol != "imap" {
+    if account.mail_protocol_str() != "imap" {
         log::warn!(
             "Copy not implemented for protocol '{}' (account {}). Skipping.",
             account.mail_protocol,
@@ -781,7 +781,7 @@ pub async fn mark_account_read(
     };
 
     // Mark read on the server first
-    if account.mail_protocol == "graph" {
+    if account.mail_protocol_str() == "graph" {
         let unread_ids = {
             let conn = state.db.reader();
             let mut stmt = conn
@@ -811,7 +811,7 @@ pub async fn mark_account_read(
                 .collect();
             client.set_read_status(&graph_ids, true).await?;
         }
-    } else if account.mail_protocol == "imap" {
+    } else if account.mail_protocol_str() == "imap" {
         // IMAP: SELECT each folder and STORE +FLAGS \Seen on all messages
         let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
             suspend_imap_idle_for_account(&state, &account_id).await?
@@ -845,7 +845,7 @@ pub async fn mark_account_read(
         // Always resume IDLE, even if the mark-read operation failed
         resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
         imap_result?;
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         // JMAP: bulk update all unread emails to $seen via Email/set
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
