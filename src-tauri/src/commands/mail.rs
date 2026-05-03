@@ -342,7 +342,7 @@ pub async fn get_message_body(
         } else {
             log::info!("Body not on disk for {}, fetching from IMAP", message_id);
 
-            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
                 suspend_imap_idle_for_account(&state, &account_id).await?
             } else {
                 false

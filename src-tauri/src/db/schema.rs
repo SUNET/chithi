@@ -8,20 +8,20 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
 
+        -- Phase 3: identity-only schema. Per-protocol settings (mail
+        -- host/port, JMAP url, CalDAV url, etc.) live in service_bindings.
+        -- Pre-Phase-3 databases keep their legacy columns until the
+        -- service_bindings_drop_legacy_columns migration drops them.
         CREATE TABLE IF NOT EXISTS accounts (
             id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
             email TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            mail_protocol TEXT NOT NULL DEFAULT 'imap',
-            imap_host TEXT NOT NULL DEFAULT '',
-            imap_port INTEGER NOT NULL DEFAULT 993,
-            smtp_host TEXT NOT NULL DEFAULT '',
-            smtp_port INTEGER NOT NULL DEFAULT 587,
-            jmap_url TEXT NOT NULL DEFAULT '',
             username TEXT NOT NULL,
-            use_tls INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 1,
+            signature TEXT NOT NULL DEFAULT '',
+            auth_method TEXT NOT NULL DEFAULT '',
+            oidc_token_endpoint TEXT NOT NULL DEFAULT '',
+            oidc_client_id TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -235,25 +235,37 @@ pub fn initialize(conn: &Connection) -> Result<()> {
 }
 
 fn run_migrations(conn: &Connection) -> Result<()> {
-    // Add jmap_url column if it doesn't exist (added in JMAP support)
-    let has_jmap_url: bool = conn
-        .prepare("SELECT jmap_url FROM accounts LIMIT 0")
-        .is_ok();
-    if !has_jmap_url {
-        log::info!("Migration: adding jmap_url column to accounts table");
-        conn.execute_batch("ALTER TABLE accounts ADD COLUMN jmap_url TEXT NOT NULL DEFAULT '';")?;
+    // Skip the legacy column-add and populate migrations on databases that
+    // already finished Phase 3. Without this gate, fresh installs would
+    // re-create columns we just dropped (the ADD COLUMN sequence below
+    // sees the column missing and tries to add it back).
+    let phase3_done = has_migration(conn, "service_bindings_drop_legacy_columns");
+
+    if !phase3_done {
+        // Add jmap_url column if it doesn't exist (added in JMAP support)
+        let has_jmap_url: bool = conn
+            .prepare("SELECT jmap_url FROM accounts LIMIT 0")
+            .is_ok();
+        if !has_jmap_url {
+            log::info!("Migration: adding jmap_url column to accounts table");
+            conn.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN jmap_url TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+
+        // Add caldav_url column if it doesn't exist (added in CalDAV support)
+        let has_caldav_url: bool = conn
+            .prepare("SELECT caldav_url FROM accounts LIMIT 0")
+            .is_ok();
+        if !has_caldav_url {
+            log::info!("Migration: adding caldav_url column to accounts table");
+            conn.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN caldav_url TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
     }
 
-    // Add caldav_url column if it doesn't exist (added in CalDAV support)
-    let has_caldav_url: bool = conn
-        .prepare("SELECT caldav_url FROM accounts LIMIT 0")
-        .is_ok();
-    if !has_caldav_url {
-        log::info!("Migration: adding caldav_url column to accounts table");
-        conn.execute_batch("ALTER TABLE accounts ADD COLUMN caldav_url TEXT NOT NULL DEFAULT '';")?;
-    }
-
-    // Add signature column if it doesn't exist
+    // Add signature column if it doesn't exist (still part of accounts post-Phase-3).
     let has_signature: bool = conn
         .prepare("SELECT signature FROM accounts LIMIT 0")
         .is_ok();
@@ -262,18 +274,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';")?;
     }
 
-    // Add jmap_auth_method column if it doesn't exist
-    let has_jmap_auth_method: bool = conn
-        .prepare("SELECT jmap_auth_method FROM accounts LIMIT 0")
-        .is_ok();
-    if !has_jmap_auth_method {
-        log::info!("Migration: adding jmap_auth_method column to accounts table");
-        conn.execute_batch(
-            "ALTER TABLE accounts ADD COLUMN jmap_auth_method TEXT NOT NULL DEFAULT 'basic';",
-        )?;
+    if !phase3_done {
+        // Add jmap_auth_method column if it doesn't exist
+        let has_jmap_auth_method: bool = conn
+            .prepare("SELECT jmap_auth_method FROM accounts LIMIT 0")
+            .is_ok();
+        if !has_jmap_auth_method {
+            log::info!("Migration: adding jmap_auth_method column to accounts table");
+            conn.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN jmap_auth_method TEXT NOT NULL DEFAULT 'basic';",
+            )?;
+        }
     }
 
-    // Add oidc_token_endpoint column if it doesn't exist
+    // Add oidc_token_endpoint column if it doesn't exist (kept post-Phase-3).
     let has_oidc_token_endpoint: bool = conn
         .prepare("SELECT oidc_token_endpoint FROM accounts LIMIT 0")
         .is_ok();
@@ -284,7 +298,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // Add oidc_client_id column if it doesn't exist
+    // Add oidc_client_id column if it doesn't exist (kept post-Phase-3).
     let has_oidc_client_id: bool = conn
         .prepare("SELECT oidc_client_id FROM accounts LIMIT 0")
         .is_ok();
@@ -313,15 +327,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE folders ADD COLUMN uid_next INTEGER DEFAULT 0;")?;
     }
 
-    // Add calendar_sync_enabled column for per-account calendar-sync toggle
-    let has_calendar_sync_enabled: bool = conn
-        .prepare("SELECT calendar_sync_enabled FROM accounts LIMIT 0")
-        .is_ok();
-    if !has_calendar_sync_enabled {
-        log::info!("Migration: adding calendar_sync_enabled column to accounts table");
-        conn.execute_batch(
-            "ALTER TABLE accounts ADD COLUMN calendar_sync_enabled INTEGER NOT NULL DEFAULT 1;",
-        )?;
+    if !phase3_done {
+        // Add calendar_sync_enabled column for per-account calendar-sync toggle
+        let has_calendar_sync_enabled: bool = conn
+            .prepare("SELECT calendar_sync_enabled FROM accounts LIMIT 0")
+            .is_ok();
+        if !has_calendar_sync_enabled {
+            log::info!("Migration: adding calendar_sync_enabled column to accounts table");
+            conn.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN calendar_sync_enabled INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
     }
 
     // Add parent_id column to folders. Existing DBs that were populated by
@@ -364,10 +380,13 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
     // Backfill auth_method for any rows that haven't been populated yet
     // (covers both fresh-from-migration rows above and any older rows that
-    // were created before this migration ran). Idempotent.
+    // were created before this migration ran). Idempotent. Reads legacy
+    // columns, so skip if Phase 3 already dropped them.
     if !has_migration(conn, "auth_method_backfill_v1") {
-        log::info!("Migration: backfilling auth_method from provider/jmap_auth_method");
-        backfill_auth_method(conn)?;
+        if !phase3_done {
+            log::info!("Migration: backfilling auth_method from provider/jmap_auth_method");
+            backfill_auth_method(conn)?;
+        }
         set_migration(conn, "auth_method_backfill_v1")?;
     }
 
@@ -375,10 +394,25 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Re-runnable (it deletes existing rows for an account before inserting),
     // but gated by a marker so the common-case startup is a single SELECT.
     if !has_migration(conn, "service_bindings_initial_populate") {
-        log::info!("Migration: deriving service_bindings from existing accounts");
-        populate_service_bindings(conn)?;
+        if !phase3_done {
+            log::info!("Migration: deriving service_bindings from existing accounts");
+            populate_service_bindings(conn)?;
+            log::info!("Migration: service_bindings populated");
+        }
         set_migration(conn, "service_bindings_initial_populate")?;
-        log::info!("Migration: service_bindings populated");
+    }
+
+    // Phase 3: drop the legacy per-protocol columns from accounts. Their
+    // data has already been mirrored into service_bindings by the populate
+    // migration above, so dropping them is safe. SQLite supports
+    // ALTER TABLE DROP COLUMN since 3.35 (March 2021). Run as a single
+    // batch in a transaction so a partial failure doesn't leave the
+    // schema half-dropped.
+    if !has_migration(conn, "service_bindings_drop_legacy_columns") {
+        log::info!("Migration: dropping legacy per-protocol columns from accounts");
+        drop_legacy_account_columns(conn)?;
+        set_migration(conn, "service_bindings_drop_legacy_columns")?;
+        log::info!("Migration: legacy columns dropped");
     }
 
     // Canonicalize Message-ID / In-Reply-To and rethread.
@@ -474,6 +508,39 @@ fn normalize_message_ids_and_rethread(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Drop every legacy per-protocol column from `accounts`. Each column is
+/// dropped only if it actually exists, so the function is safe to run
+/// against partially-migrated databases or fresh installs (where the
+/// columns might be present from the legacy ADD COLUMN migrations
+/// running before this gate flipped).
+fn drop_legacy_account_columns(conn: &Connection) -> Result<()> {
+    const LEGACY_COLUMNS: &[&str] = &[
+        "provider",
+        "mail_protocol",
+        "imap_host",
+        "imap_port",
+        "smtp_host",
+        "smtp_port",
+        "use_tls",
+        "jmap_url",
+        "jmap_auth_method",
+        "caldav_url",
+        "calendar_sync_enabled",
+    ];
+
+    let tx = conn.unchecked_transaction()?;
+    for col in LEGACY_COLUMNS {
+        let exists = tx
+            .prepare(&format!("SELECT {col} FROM accounts LIMIT 0"))
+            .is_ok();
+        if exists {
+            tx.execute_batch(&format!("ALTER TABLE accounts DROP COLUMN {col};"))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Backfill `accounts.auth_method` from the legacy (`provider`,
 /// `jmap_auth_method`) pair. Single UPDATE that only touches rows whose
 /// `auth_method` is still empty, so re-running is harmless.
@@ -492,62 +559,93 @@ fn backfill_auth_method(conn: &Connection) -> Result<()> {
 }
 
 /// Read every existing account, derive its bindings, and INSERT them.
-/// Wipes any pre-existing bindings for each account first so re-running
-/// after a code-side rule change converges to the latest mapping.
+/// Pulls legacy columns directly via SQL (intentionally bypassing
+/// get_account_full so the keyring is never touched at startup).
 fn populate_service_bindings(conn: &Connection) -> Result<()> {
-    use crate::db::accounts::list_accounts;
-    use crate::db::service_bindings::{
-        delete_for_account, derive_bindings_from_account, insert,
-    };
+    use crate::db::service_bindings::{rebuild_for_account, LegacyBindingFields};
 
-    // The summary list_accounts only carries the few columns shown in the
-    // sidebar; we need the full set to derive bindings, so re-query each
-    // row through get_account_full.
-    let summaries = list_accounts(conn)?;
-    for summary in summaries {
-        // Fetch full row directly via SQL — get_account_full pulls the
-        // password from the keyring as a side effect, which we don't want
-        // during a startup migration on headless hosts. Read just the
-        // columns we need.
-        let account = conn.query_row(
-            "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port,
-                    smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls,
-                    enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id,
-                    calendar_sync_enabled
-             FROM accounts WHERE id = ?1",
-            rusqlite::params![summary.id],
-            |row| {
-                Ok(crate::db::accounts::AccountFull {
-                    id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    email: row.get(2)?,
-                    provider: row.get(3)?,
-                    mail_protocol: row.get(4)?,
-                    imap_host: row.get(5)?,
-                    imap_port: row.get::<_, u32>(6)? as u16,
-                    smtp_host: row.get(7)?,
-                    smtp_port: row.get::<_, u32>(8)? as u16,
-                    jmap_url: row.get(9)?,
-                    caldav_url: row.get(10)?,
-                    username: row.get(11)?,
-                    password: String::new(),
-                    use_tls: row.get(12)?,
-                    enabled: row.get(13)?,
-                    signature: row.get(14)?,
-                    jmap_auth_method: row.get(15)?,
-                    oidc_token_endpoint: row.get(16)?,
-                    oidc_client_id: row.get(17)?,
-                    calendar_sync_enabled: row.get(18)?,
-                    auth_method: String::new(),
-                    bindings: Vec::new(),
-                })
+    // Fail-soft if the legacy columns have already been dropped (i.e.
+    // a fresh-install DB created with the Phase 3 schema). The migration
+    // marker logic below normally prevents this branch from running, but
+    // an out-of-order replay shouldn't error out the app.
+    if conn.prepare("SELECT mail_protocol FROM accounts LIMIT 0").is_err() {
+        log::info!(
+            "populate_service_bindings: legacy columns absent, skipping (Phase 3+ schema)"
+        );
+        return Ok(());
+    }
+
+    /// Tuple representation of the legacy column row. Named only to keep
+    /// clippy happy about the long type literal — it's not used elsewhere.
+    struct LegacyRow {
+        id: String,
+        provider: String,
+        mail_protocol: String,
+        imap_host: String,
+        imap_port: u16,
+        smtp_host: String,
+        smtp_port: u16,
+        jmap_url: String,
+        caldav_url: String,
+        use_tls: bool,
+        enabled: bool,
+        jmap_auth_method: String,
+        oidc_token_endpoint: String,
+        oidc_client_id: String,
+        calendar_sync_enabled: bool,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, provider, mail_protocol, imap_host, imap_port,
+                smtp_host, smtp_port, jmap_url, caldav_url, use_tls,
+                enabled, jmap_auth_method, oidc_token_endpoint, oidc_client_id,
+                calendar_sync_enabled
+         FROM accounts",
+    )?;
+    let rows: Vec<LegacyRow> = stmt
+        .query_map([], |row| {
+            Ok(LegacyRow {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                mail_protocol: row.get(2)?,
+                imap_host: row.get(3)?,
+                imap_port: row.get::<_, u32>(4)? as u16,
+                smtp_host: row.get(5)?,
+                smtp_port: row.get::<_, u32>(6)? as u16,
+                jmap_url: row.get(7)?,
+                caldav_url: row.get(8)?,
+                use_tls: row.get(9)?,
+                enabled: row.get(10)?,
+                jmap_auth_method: row.get(11)?,
+                oidc_token_endpoint: row.get(12)?,
+                oidc_client_id: row.get(13)?,
+                calendar_sync_enabled: row.get(14)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for r in &rows {
+        rebuild_for_account(
+            conn,
+            &r.id,
+            LegacyBindingFields {
+                account_id: &r.id,
+                enabled: r.enabled,
+                provider: &r.provider,
+                mail_protocol: &r.mail_protocol,
+                imap_host: &r.imap_host,
+                imap_port: r.imap_port,
+                smtp_host: &r.smtp_host,
+                smtp_port: r.smtp_port,
+                use_tls: r.use_tls,
+                jmap_url: &r.jmap_url,
+                jmap_auth_method: &r.jmap_auth_method,
+                oidc_token_endpoint: &r.oidc_token_endpoint,
+                oidc_client_id: &r.oidc_client_id,
+                caldav_url: &r.caldav_url,
+                calendar_sync_enabled: r.calendar_sync_enabled,
             },
         )?;
-
-        delete_for_account(conn, &account.id)?;
-        for binding in derive_bindings_from_account(&account) {
-            insert(conn, &binding)?;
-        }
     }
     Ok(())
 }

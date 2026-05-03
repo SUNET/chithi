@@ -1,8 +1,64 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::db::accounts::AccountFull;
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+// ---- Typed binding-config payloads ----------------------------------------
+//
+// Each binding stores its protocol-specific settings as JSON in `config_json`.
+// These structs let callers go through `serde_json::from_str` once and then
+// touch typed fields. A missing key falls through to its `Default`, so
+// partial / older config rows still parse.
+
+fn default_imap_port() -> u16 {
+    993
+}
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_use_tls() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImapBindingConfig {
+    #[serde(default)]
+    pub imap_host: String,
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default = "default_use_tls")]
+    pub use_tls: bool,
+}
+
+impl Default for ImapBindingConfig {
+    fn default() -> Self {
+        Self {
+            imap_host: String::new(),
+            imap_port: default_imap_port(),
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            use_tls: default_use_tls(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JmapBindingConfig {
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DavBindingConfig {
+    #[serde(default)]
+    pub url: String,
+}
 
 /// A per-service binding that says "this account talks to this protocol for
 /// this service". One identity in the `accounts` table can carry multiple
@@ -22,6 +78,35 @@ pub struct ServiceBinding {
     pub enabled: bool,
     pub sync_interval_seconds: Option<i64>,
     pub config_json: String,
+}
+
+impl ServiceBinding {
+    pub fn imap_config(&self) -> Result<ImapBindingConfig> {
+        serde_json::from_str(&self.config_json).map_err(|e| {
+            Error::Other(format!(
+                "binding {} has malformed imap config_json: {}",
+                self.id, e
+            ))
+        })
+    }
+
+    pub fn jmap_config(&self) -> Result<JmapBindingConfig> {
+        serde_json::from_str(&self.config_json).map_err(|e| {
+            Error::Other(format!(
+                "binding {} has malformed jmap config_json: {}",
+                self.id, e
+            ))
+        })
+    }
+
+    pub fn dav_config(&self) -> Result<DavBindingConfig> {
+        serde_json::from_str(&self.config_json).map_err(|e| {
+            Error::Other(format!(
+                "binding {} has malformed dav config_json: {}",
+                self.id, e
+            ))
+        })
+    }
 }
 
 pub fn list_for_account(conn: &Connection, account_id: &str) -> Result<Vec<ServiceBinding>> {
@@ -117,92 +202,103 @@ pub fn delete_for_account(conn: &Connection, account_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Derive the set of bindings implied by an existing `accounts` row.
-///
-/// Maps the provider + mail_protocol + caldav_url combinations that today's
-/// dispatch code reads from `AccountFull` directly into one binding per
-/// service. Used by the one-time `service_bindings_initial_populate`
-/// migration; fresh accounts created after Phase 3 will write bindings
-/// directly without going through this function.
-pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding> {
-    let mut out = Vec::new();
-    let aid = &account.id;
+/// Snapshot of the legacy per-protocol fields needed to derive bindings.
+/// `AccountFull` and `AccountConfig` both supply these; the migration
+/// reads them straight out of SQL.
+pub struct LegacyBindingFields<'a> {
+    pub account_id: &'a str,
+    pub enabled: bool,
+    pub provider: &'a str,
+    pub mail_protocol: &'a str,
+    pub imap_host: &'a str,
+    pub imap_port: u16,
+    pub smtp_host: &'a str,
+    pub smtp_port: u16,
+    pub use_tls: bool,
+    pub jmap_url: &'a str,
+    pub jmap_auth_method: &'a str,
+    pub oidc_token_endpoint: &'a str,
+    pub oidc_client_id: &'a str,
+    pub caldav_url: &'a str,
+    pub calendar_sync_enabled: bool,
+}
 
-    // --- Mail binding (one per account; matches mail_protocol exactly) ---
-    let mail_protocol = account.mail_protocol.as_str();
-    let mail_config = match mail_protocol {
+/// Derive the set of bindings implied by a `(provider, mail_protocol, ...)`
+/// tuple. Used both by the one-time Phase-1 populate migration (which
+/// reads the soon-to-be-dropped legacy columns) and by `insert_account` /
+/// `update_account` to build bindings from the wire-format `AccountConfig`.
+pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
+    let mut out = Vec::new();
+    let aid = f.account_id;
+
+    let mail_config = match f.mail_protocol {
         "imap" => serde_json::json!({
-            "imap_host": account.imap_host,
-            "imap_port": account.imap_port,
-            "smtp_host": account.smtp_host,
-            "smtp_port": account.smtp_port,
-            "use_tls": account.use_tls,
+            "imap_host": f.imap_host,
+            "imap_port": f.imap_port,
+            "smtp_host": f.smtp_host,
+            "smtp_port": f.smtp_port,
+            "use_tls": f.use_tls,
         }),
         "jmap" => serde_json::json!({
-            "url": account.jmap_url,
-            "auth_method": account.jmap_auth_method,
-            "oidc_token_endpoint": account.oidc_token_endpoint,
-            "oidc_client_id": account.oidc_client_id,
+            "url": f.jmap_url,
+            "auth_method": f.jmap_auth_method,
+            "oidc_token_endpoint": f.oidc_token_endpoint,
+            "oidc_client_id": f.oidc_client_id,
         }),
-        "graph" => serde_json::json!({}),
         _ => serde_json::json!({}),
     };
-    out.push(ServiceBinding {
-        id: format!("{aid}-mail"),
-        account_id: aid.clone(),
-        service: "mail".into(),
-        protocol: mail_protocol.into(),
-        enabled: account.enabled,
-        sync_interval_seconds: None,
-        config_json: mail_config.to_string(),
-    });
+    if !f.mail_protocol.is_empty() {
+        out.push(ServiceBinding {
+            id: format!("{aid}-mail"),
+            account_id: aid.into(),
+            service: "mail".into(),
+            protocol: f.mail_protocol.into(),
+            enabled: f.enabled,
+            sync_interval_seconds: None,
+            config_json: mail_config.to_string(),
+        });
+    }
 
-    // --- Calendar binding ---
-    // Mirrors the dispatch in commands/calendar.rs:sync_calendars.
-    let cal: Option<(&str, serde_json::Value)> = if account.mail_protocol == "jmap" {
+    // Calendar binding (mirrors the dispatch in commands/calendar.rs).
+    let cal: Option<(&str, serde_json::Value)> = if f.mail_protocol == "jmap" {
         Some(("jmap", serde_json::json!({})))
-    } else if account.provider == "gmail" {
+    } else if f.provider == "gmail" {
         Some(("google", serde_json::json!({})))
-    } else if account.provider == "o365" {
+    } else if f.provider == "o365" {
         Some(("graph", serde_json::json!({})))
-    } else if !account.caldav_url.is_empty() {
-        Some(("caldav", serde_json::json!({ "url": account.caldav_url })))
+    } else if !f.caldav_url.is_empty() {
+        Some(("caldav", serde_json::json!({ "url": f.caldav_url })))
     } else {
         None
     };
     if let Some((proto, cfg)) = cal {
         out.push(ServiceBinding {
             id: format!("{aid}-calendar"),
-            account_id: aid.clone(),
+            account_id: aid.into(),
             service: "calendar".into(),
             protocol: proto.into(),
-            enabled: account.calendar_sync_enabled,
+            enabled: f.calendar_sync_enabled,
             sync_interval_seconds: None,
             config_json: cfg.to_string(),
         });
     }
 
-    // --- Contacts binding ---
-    // Mirrors the dispatch in commands/contacts.rs:sync_contacts.
-    let contacts: Option<(&str, serde_json::Value)> = if account.mail_protocol == "jmap" {
+    // Contacts binding (mirrors the dispatch in commands/contacts.rs).
+    let contacts: Option<(&str, serde_json::Value)> = if f.mail_protocol == "jmap" {
         Some(("jmap", serde_json::json!({})))
-    } else if account.provider == "gmail" {
+    } else if f.provider == "gmail" {
         Some(("google", serde_json::json!({})))
-    } else if account.provider == "o365" {
-        // Graph contacts via Microsoft, even for legacy IMAP-mail O365 rows.
+    } else if f.provider == "o365" {
         Some(("graph", serde_json::json!({})))
-    } else if !account.caldav_url.is_empty() {
-        // Generic IMAP with a configured DAV URL: the same host serves CardDAV
-        // (ADR 0022). Store the URL on the binding so future edits don't
-        // reach back into the legacy column.
-        Some(("carddav", serde_json::json!({ "url": account.caldav_url })))
+    } else if !f.caldav_url.is_empty() {
+        Some(("carddav", serde_json::json!({ "url": f.caldav_url })))
     } else {
         None
     };
     if let Some((proto, cfg)) = contacts {
         out.push(ServiceBinding {
             id: format!("{aid}-contacts"),
-            account_id: aid.clone(),
+            account_id: aid.into(),
             service: "contacts".into(),
             protocol: proto.into(),
             enabled: true,
@@ -214,52 +310,40 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
     out
 }
 
-/// Re-derive the bindings for a single account from the legacy account
-/// columns. Wipes existing rows for `account_id` and inserts the freshly
-/// derived set. Called from `insert_account` / `update_account` so the
-/// bindings table tracks settings edits during the parallel-population
-/// phase, and from the one-time initial-populate migration.
-pub fn rebuild_for_account(conn: &Connection, account_id: &str) -> Result<()> {
-    // Pull just the columns derive_bindings_from_account needs. Avoid
-    // get_account_full because it touches the OS keyring, which we don't
-    // want during write paths that are already inside a DB transaction.
-    let account = conn.query_row(
-        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port,
-                smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls,
-                enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id,
-                calendar_sync_enabled
-         FROM accounts WHERE id = ?1",
-        params![account_id],
-        |row| {
-            Ok(AccountFull {
-                id: row.get(0)?,
-                display_name: row.get(1)?,
-                email: row.get(2)?,
-                provider: row.get(3)?,
-                mail_protocol: row.get(4)?,
-                imap_host: row.get(5)?,
-                imap_port: row.get::<_, u32>(6)? as u16,
-                smtp_host: row.get(7)?,
-                smtp_port: row.get::<_, u32>(8)? as u16,
-                jmap_url: row.get(9)?,
-                caldav_url: row.get(10)?,
-                username: row.get(11)?,
-                password: String::new(),
-                use_tls: row.get(12)?,
-                enabled: row.get(13)?,
-                signature: row.get(14)?,
-                jmap_auth_method: row.get(15)?,
-                oidc_token_endpoint: row.get(16)?,
-                oidc_client_id: row.get(17)?,
-                calendar_sync_enabled: row.get(18)?,
-                auth_method: String::new(),
-                bindings: Vec::new(),
-            })
-        },
-    )?;
+/// Convenience wrapper used by the unit tests that fed the previous API.
+#[cfg(test)]
+pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding> {
+    derive_bindings(LegacyBindingFields {
+        account_id: &account.id,
+        enabled: account.enabled,
+        provider: &account.provider,
+        mail_protocol: &account.mail_protocol,
+        imap_host: &account.imap_host,
+        imap_port: account.imap_port,
+        smtp_host: &account.smtp_host,
+        smtp_port: account.smtp_port,
+        use_tls: account.use_tls,
+        jmap_url: &account.jmap_url,
+        jmap_auth_method: &account.jmap_auth_method,
+        oidc_token_endpoint: &account.oidc_token_endpoint,
+        oidc_client_id: &account.oidc_client_id,
+        caldav_url: &account.caldav_url,
+        calendar_sync_enabled: account.calendar_sync_enabled,
+    })
+}
 
+/// Re-derive the bindings for a single account from the supplied legacy
+/// fields and persist them. Wipes existing rows for `account_id` first so
+/// the table converges to the latest derivation rules. Called from
+/// `insert_account` / `update_account` (which build the fields from the
+/// wire-format `AccountConfig`).
+pub fn rebuild_for_account(
+    conn: &Connection,
+    account_id: &str,
+    fields: LegacyBindingFields<'_>,
+) -> Result<()> {
     delete_for_account(conn, account_id)?;
-    for binding in derive_bindings_from_account(&account) {
+    for binding in derive_bindings(fields) {
         insert(conn, &binding)?;
     }
     Ok(())
