@@ -207,6 +207,9 @@ pub fn delete_for_account(conn: &Connection, account_id: &str) -> Result<()> {
 /// reads them straight out of SQL.
 pub struct LegacyBindingFields<'a> {
     pub account_id: &'a str,
+    /// Default for the mail binding's `enabled` flag when no explicit
+    /// `mail_sync_enabled` override is supplied. The migration sets this
+    /// to the row's `accounts.enabled` value to preserve old behavior.
     pub enabled: bool,
     pub provider: &'a str,
     pub mail_protocol: &'a str,
@@ -221,6 +224,13 @@ pub struct LegacyBindingFields<'a> {
     pub oidc_client_id: &'a str,
     pub caldav_url: &'a str,
     pub calendar_sync_enabled: bool,
+    /// Phase 4 additions. If `None`, falls back to `enabled` for the mail
+    /// binding (legacy behavior) or `true` for contacts.
+    pub mail_sync_enabled: Option<bool>,
+    pub contacts_sync_enabled: Option<bool>,
+    pub mail_sync_interval_seconds: Option<i64>,
+    pub calendar_sync_interval_seconds: Option<i64>,
+    pub contacts_sync_interval_seconds: Option<i64>,
 }
 
 /// Derive the set of bindings implied by a `(provider, mail_protocol, ...)`
@@ -253,8 +263,8 @@ pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
             account_id: aid.into(),
             service: "mail".into(),
             protocol: f.mail_protocol.into(),
-            enabled: f.enabled,
-            sync_interval_seconds: None,
+            enabled: f.mail_sync_enabled.unwrap_or(f.enabled),
+            sync_interval_seconds: f.mail_sync_interval_seconds,
             config_json: mail_config.to_string(),
         });
     }
@@ -278,7 +288,7 @@ pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
             service: "calendar".into(),
             protocol: proto.into(),
             enabled: f.calendar_sync_enabled,
-            sync_interval_seconds: None,
+            sync_interval_seconds: f.calendar_sync_interval_seconds,
             config_json: cfg.to_string(),
         });
     }
@@ -301,8 +311,8 @@ pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
             account_id: aid.into(),
             service: "contacts".into(),
             protocol: proto.into(),
-            enabled: true,
-            sync_interval_seconds: None,
+            enabled: f.contacts_sync_enabled.unwrap_or(true),
+            sync_interval_seconds: f.contacts_sync_interval_seconds,
             config_json: cfg.to_string(),
         });
     }
@@ -329,6 +339,11 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
         oidc_client_id: &account.oidc_client_id,
         caldav_url: &account.caldav_url,
         calendar_sync_enabled: account.calendar_sync_enabled,
+        mail_sync_enabled: None,
+        contacts_sync_enabled: None,
+        mail_sync_interval_seconds: None,
+        calendar_sync_interval_seconds: None,
+        contacts_sync_interval_seconds: None,
     })
 }
 
@@ -433,6 +448,11 @@ mod tests {
             calendar_sync_enabled: true,
             auth_method: String::new(),
             bindings: Vec::new(),
+            mail_sync_enabled: true,
+            contacts_sync_enabled: true,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
         }
     }
 
@@ -556,6 +576,102 @@ mod tests {
         assert_eq!(mail_cfg["auth_method"], "oidc");
         assert_eq!(mail_cfg["oidc_token_endpoint"], "https://idp.example.com/token");
         assert_eq!(mail_cfg["oidc_client_id"], "client-123");
+    }
+
+    #[test]
+    fn empty_mail_protocol_yields_no_mail_binding() {
+        // CalDAV-only Nextcloud-style account: no mail at all, just the
+        // shared dav URL. derive_bindings should still produce calendar +
+        // contacts but skip the mail binding entirely.
+        let mut acc = account_row("a1");
+        acc.mail_protocol = String::new();
+        acc.imap_host = String::new();
+        acc.imap_port = 0;
+        acc.smtp_host = String::new();
+        acc.smtp_port = 0;
+        acc.caldav_url = "https://nextcloud.example.com/dav".into();
+        let bindings = derive_bindings_from_account(&acc);
+        assert!(bindings.iter().all(|b| b.service != "mail"));
+        assert_eq!(
+            bindings.iter().find(|b| b.service == "calendar").unwrap().protocol,
+            "caldav"
+        );
+        assert_eq!(
+            bindings.iter().find(|b| b.service == "contacts").unwrap().protocol,
+            "carddav"
+        );
+    }
+
+    #[test]
+    fn mail_sync_enabled_override_disables_mail_binding() {
+        // JMAP cal-only: full JMAP account, but mail_sync_enabled=false
+        // marks the mail binding disabled while leaving cal/contacts on.
+        let mut acc = account_row("a1");
+        acc.mail_protocol = "jmap".into();
+        acc.jmap_url = "https://jmap.example.com".into();
+        let bindings = derive_bindings(LegacyBindingFields {
+            account_id: &acc.id,
+            enabled: true,
+            provider: &acc.provider,
+            mail_protocol: &acc.mail_protocol,
+            imap_host: &acc.imap_host,
+            imap_port: acc.imap_port,
+            smtp_host: &acc.smtp_host,
+            smtp_port: acc.smtp_port,
+            use_tls: acc.use_tls,
+            jmap_url: &acc.jmap_url,
+            jmap_auth_method: &acc.jmap_auth_method,
+            oidc_token_endpoint: &acc.oidc_token_endpoint,
+            oidc_client_id: &acc.oidc_client_id,
+            caldav_url: &acc.caldav_url,
+            calendar_sync_enabled: acc.calendar_sync_enabled,
+            mail_sync_enabled: Some(false),
+            contacts_sync_enabled: None,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
+        });
+        let mail = bindings.iter().find(|b| b.service == "mail").unwrap();
+        assert_eq!(mail.protocol, "jmap");
+        assert!(
+            !mail.enabled,
+            "mail_sync_enabled=false should disable the mail binding"
+        );
+        let cal = bindings.iter().find(|b| b.service == "calendar").unwrap();
+        assert!(cal.enabled);
+    }
+
+    #[test]
+    fn per_binding_sync_intervals_propagate() {
+        let acc = account_row("a1");
+        let bindings = derive_bindings(LegacyBindingFields {
+            account_id: &acc.id,
+            enabled: true,
+            provider: &acc.provider,
+            mail_protocol: &acc.mail_protocol,
+            imap_host: &acc.imap_host,
+            imap_port: acc.imap_port,
+            smtp_host: &acc.smtp_host,
+            smtp_port: acc.smtp_port,
+            use_tls: acc.use_tls,
+            jmap_url: &acc.jmap_url,
+            jmap_auth_method: &acc.jmap_auth_method,
+            oidc_token_endpoint: &acc.oidc_token_endpoint,
+            oidc_client_id: &acc.oidc_client_id,
+            caldav_url: "https://example.com/dav",
+            calendar_sync_enabled: true,
+            mail_sync_enabled: None,
+            contacts_sync_enabled: None,
+            mail_sync_interval_seconds: Some(120),
+            calendar_sync_interval_seconds: Some(900),
+            contacts_sync_interval_seconds: Some(1800),
+        });
+        let mail = bindings.iter().find(|b| b.service == "mail").unwrap();
+        let cal = bindings.iter().find(|b| b.service == "calendar").unwrap();
+        let con = bindings.iter().find(|b| b.service == "contacts").unwrap();
+        assert_eq!(mail.sync_interval_seconds, Some(120));
+        assert_eq!(cal.sync_interval_seconds, Some(900));
+        assert_eq!(con.sync_interval_seconds, Some(1800));
     }
 
     #[test]

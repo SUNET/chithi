@@ -644,6 +644,14 @@ fn populate_service_bindings(conn: &Connection) -> Result<()> {
                 oidc_client_id: &r.oidc_client_id,
                 caldav_url: &r.caldav_url,
                 calendar_sync_enabled: r.calendar_sync_enabled,
+                // Migration preserves legacy semantics: mail follows the
+                // row's enabled flag, contacts default to on, no per-binding
+                // intervals (use frontend defaults).
+                mail_sync_enabled: None,
+                contacts_sync_enabled: None,
+                mail_sync_interval_seconds: None,
+                calendar_sync_interval_seconds: None,
+                contacts_sync_interval_seconds: None,
             },
         )?;
     }

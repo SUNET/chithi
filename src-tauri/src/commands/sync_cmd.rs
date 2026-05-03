@@ -171,6 +171,9 @@ pub(crate) async fn resume_imap_idle_for_account(
         provider: account.provider.clone(),
         mail_protocol: account.mail_protocol.clone(),
         enabled: account.enabled,
+        mail_sync_interval_seconds: account.mail_sync_interval_seconds,
+        calendar_sync_interval_seconds: account.calendar_sync_interval_seconds,
+        contacts_sync_interval_seconds: account.contacts_sync_interval_seconds,
     };
 
     start_imap_idle(app, state, &account_summary).await

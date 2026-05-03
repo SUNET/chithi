@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   AccountConfig,
+  AutoconfigResult,
   Folder,
   MessagePage,
   MessageBody,
@@ -34,6 +35,26 @@ export async function updateAccount(
 
 export async function deleteAccount(accountId: string): Promise<void> {
   return invoke("delete_account", { accountId });
+}
+
+/// Run Thunderbird-style email autoconfig (Mozilla ISP DB + provider
+/// autoconfig + .well-known + MX fallback) and probe CalDAV / CardDAV
+/// across every candidate hostname. Empty fields in the result mean
+/// "not found" — frontend should only apply non-empty values.
+export async function probeDavEndpoints(
+  email: string,
+  username: string,
+  password: string,
+  imapHost?: string,
+  smtpHost?: string,
+): Promise<AutoconfigResult> {
+  return invoke("probe_dav_endpoints", {
+    email,
+    username,
+    password,
+    imapHost: imapHost || null,
+    smtpHost: smtpHost || null,
+  });
 }
 
 export async function listFolders(accountId: string): Promise<Folder[]> {

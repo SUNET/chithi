@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import type { Account, AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
@@ -10,6 +10,14 @@ export const useAccountsStore = defineStore("accounts", () => {
 
   const activeAccount = () =>
     accounts.value.find((a) => a.id === activeAccountId.value) ?? null;
+
+  // Phase 4 (#43): standalone CalDAV / CardDAV / JMAP-cal-only accounts
+  // surface with `mail_protocol === ""`. Mail screens iterate this
+  // getter so they don't try to list folders for an account that has no
+  // mail backend.
+  const mailAccounts = computed(() =>
+    accounts.value.filter((a) => a.mail_protocol !== ""),
+  );
 
   async function fetchAccounts() {
     loading.value = true;
@@ -49,6 +57,7 @@ export const useAccountsStore = defineStore("accounts", () => {
     activeAccountId,
     loading,
     activeAccount,
+    mailAccounts,
     fetchAccounts,
     addAccount,
     deleteAccount,

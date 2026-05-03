@@ -209,7 +209,8 @@ function buildParentOptions(): { label: string; value: string }[] {
     }
   }
 
-  for (const acc of accountsStore.accounts) {
+  // Folder picker is mail-only; calendar/contacts-only accounts have no folders to list.
+  for (const acc of accountsStore.mailAccounts) {
     options.push({ label: `${acc.display_name} (root)`, value: `${acc.id}|` });
     addFolders(foldersStore.getAccountFolders(acc.id), acc.id, acc.email, "");
   }
@@ -366,7 +367,7 @@ async function doDeleteFolder() {
 <template>
   <div class="folder-tree" @click="closeContextMenu">
     <div
-      v-for="account in accountsStore.accounts"
+      v-for="account in accountsStore.mailAccounts"
       :key="account.id"
       class="account-section"
     >

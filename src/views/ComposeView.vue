@@ -44,6 +44,9 @@ onMounted(async () => {
       error.value = `Failed to load accounts: ${errorMsg}`;
     }
   }
+  // Compose only works for accounts that can send mail. Calendar-/
+  // contacts-only accounts (#43) don't appear in the From dropdown.
+  accounts.value = accounts.value.filter((a) => a.mail_protocol !== "");
   // Set selected account from query param or first account
   if (initialAccountId && accounts.value.some(a => a.id === initialAccountId)) {
     selectedAccountId.value = initialAccountId;
