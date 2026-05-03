@@ -607,33 +607,34 @@ pub async fn sync_contacts(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
-        sync_contacts_jmap(&state, &account_id, &account).await?;
-    } else if account.provider == "gmail" {
-        match sync_contacts_google(&state, &account_id, &account).await {
+    match account.contacts_protocol_str() {
+        "jmap" => {
+            sync_contacts_jmap(&state, &account_id, &account).await?;
+        }
+        "google" => match sync_contacts_google(&state, &account_id, &account).await {
             Ok(()) => {}
             Err(e) => {
                 log::warn!(
-                    "sync_contacts: Gmail CardDAV failed (OAuth may not be set up): {}",
+                    "sync_contacts: Gmail People API failed (OAuth may not be set up): {}",
                     e
                 );
             }
+        },
+        "graph" => {
+            sync_contacts_graph(&state, &account_id).await?;
         }
-    } else if account.provider == "o365" {
-        sync_contacts_graph(&state, &account_id).await?;
-    } else if account.mail_protocol == "imap" {
-        // Generic IMAP account — try CardDAV sync
-        match sync_contacts_carddav(&state, &account_id, &account).await {
+        "carddav" => match sync_contacts_carddav(&state, &account_id, &account).await {
             Ok(()) => {}
             Err(e) => {
                 log::warn!("sync_contacts: CardDAV failed for {}: {}", account_id, e);
             }
+        },
+        _ => {
+            log::debug!(
+                "sync_contacts: skipping account {} (no contacts binding)",
+                account_id
+            );
         }
-    } else {
-        log::debug!(
-            "sync_contacts: skipping account {} (no supported sync)",
-            account_id
-        );
     }
 
     // Notify frontend that contact data has changed

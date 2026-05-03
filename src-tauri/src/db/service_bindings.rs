@@ -214,6 +214,57 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
     out
 }
 
+/// Re-derive the bindings for a single account from the legacy account
+/// columns. Wipes existing rows for `account_id` and inserts the freshly
+/// derived set. Called from `insert_account` / `update_account` so the
+/// bindings table tracks settings edits during the parallel-population
+/// phase, and from the one-time initial-populate migration.
+pub fn rebuild_for_account(conn: &Connection, account_id: &str) -> Result<()> {
+    // Pull just the columns derive_bindings_from_account needs. Avoid
+    // get_account_full because it touches the OS keyring, which we don't
+    // want during write paths that are already inside a DB transaction.
+    let account = conn.query_row(
+        "SELECT id, display_name, email, provider, mail_protocol, imap_host, imap_port,
+                smtp_host, smtp_port, jmap_url, caldav_url, username, use_tls,
+                enabled, signature, jmap_auth_method, oidc_token_endpoint, oidc_client_id,
+                calendar_sync_enabled
+         FROM accounts WHERE id = ?1",
+        params![account_id],
+        |row| {
+            Ok(AccountFull {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                email: row.get(2)?,
+                provider: row.get(3)?,
+                mail_protocol: row.get(4)?,
+                imap_host: row.get(5)?,
+                imap_port: row.get::<_, u32>(6)? as u16,
+                smtp_host: row.get(7)?,
+                smtp_port: row.get::<_, u32>(8)? as u16,
+                jmap_url: row.get(9)?,
+                caldav_url: row.get(10)?,
+                username: row.get(11)?,
+                password: String::new(),
+                use_tls: row.get(12)?,
+                enabled: row.get(13)?,
+                signature: row.get(14)?,
+                jmap_auth_method: row.get(15)?,
+                oidc_token_endpoint: row.get(16)?,
+                oidc_client_id: row.get(17)?,
+                calendar_sync_enabled: row.get(18)?,
+                auth_method: String::new(),
+                bindings: Vec::new(),
+            })
+        },
+    )?;
+
+    delete_for_account(conn, account_id)?;
+    for binding in derive_bindings_from_account(&account) {
+        insert(conn, &binding)?;
+    }
+    Ok(())
+}
+
 /// Map an old-schema `(provider, jmap_auth_method)` pair to the new
 /// `auth_method` value stored on `accounts`. Pure function so the migration
 /// and unit tests can both call it.
@@ -296,6 +347,8 @@ mod tests {
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
             calendar_sync_enabled: true,
+            auth_method: String::new(),
+            bindings: Vec::new(),
         }
     }
 

@@ -119,7 +119,8 @@ async fn push_calendar_rename(
     remote_id: &str,
     new_name: &str,
 ) -> Result<()> {
-    if account.mail_protocol == "jmap" {
+    let cal_proto = account.calendar_protocol_str();
+    if cal_proto == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap
@@ -128,14 +129,14 @@ async fn push_calendar_rename(
         return Ok(());
     }
 
-    if account.provider == "o365" {
+    if cal_proto == "graph" {
         let token = crate::mail::graph::get_graph_token(&account.id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
         client.rename_calendar(remote_id, new_name).await?;
         return Ok(());
     }
 
-    if account.provider == "gmail" {
+    if cal_proto == "google" {
         // Prefer the Google Calendar REST endpoint; fall back to CalDAV
         // PROPPATCH if REST fails (OAuth not configured, or remote_id is
         // actually a CalDAV href).
@@ -180,8 +181,9 @@ async fn push_calendar_rename(
     }
 
     Err(crate::error::Error::Other(format!(
-        "No remote rename path configured for account {} (provider={}, protocol={})",
-        account.id, account.provider, account.mail_protocol
+        "No remote rename path configured for account {} (calendar_protocol={})",
+        account.id,
+        account.calendar_protocol_str()
     )))
 }
 
@@ -289,7 +291,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         db::calendar::insert_event(&conn, &cal_event)?;
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
 
-        if account.provider == "gmail" {
+        if account.calendar_protocol_str() == "google" {
             // Create on Google Calendar via REST API
             drop(conn);
             if let Ok(token) = get_google_token(&cal_event.account_id).await {
@@ -375,7 +377,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                     Err(e) => log::error!("create_event: Google Calendar request failed: {}", e),
                 }
             }
-        } else if account.provider == "o365" {
+        } else if account.calendar_protocol_str() == "graph" {
             drop(conn);
             if let Ok(token) = crate::mail::graph::get_graph_token(&cal_event.account_id).await {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -461,7 +463,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                     Err(e) => log::error!("create_event: Graph Calendar push failed: {}", e),
                 }
             }
-        } else if account.mail_protocol == "jmap" {
+        } else if account.calendar_protocol_str() == "jmap" {
             // Look up the remote calendar ID from local calendar
             let calendar = db::calendar::get_calendar(&conn, &cal_event.calendar_id)?;
             let remote_cal_id = calendar.remote_id.clone().unwrap_or_default();
@@ -568,7 +570,7 @@ pub async fn update_event(
     // Push update to server
     let account = db::accounts::get_account_full(&conn, &existing.account_id)?;
     if let Some(ref remote_id) = existing.remote_id.filter(|r| !r.is_empty()) {
-        if account.provider == "gmail" {
+        if account.calendar_protocol_str() == "google" {
             drop(conn);
             if let Ok(token) = get_google_token(&existing.account_id).await {
                 let http = reqwest::Client::new();
@@ -617,7 +619,7 @@ pub async fn update_event(
                     Err(e) => log::error!("update_event: Google Calendar request failed: {}", e),
                 }
             }
-        } else if account.provider == "o365" {
+        } else if account.calendar_protocol_str() == "graph" {
             drop(conn);
             if let Ok(token) = crate::mail::graph::get_graph_token(&existing.account_id).await {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -664,7 +666,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
     // Delete from server if event has a remote_id
     if let Some(ref remote_id) = event.remote_id {
         if !remote_id.is_empty() {
-            if account.provider == "gmail" {
+            if account.calendar_protocol_str() == "google" {
                 // Delete via Google Calendar API
                 match get_google_token(&event.account_id).await {
                     Ok(token) => {
@@ -699,7 +701,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
                         e
                     ),
                 }
-            } else if account.provider == "o365" {
+            } else if account.calendar_protocol_str() == "graph" {
                 match crate::mail::graph::get_graph_token(&event.account_id).await {
                     Ok(token) => {
                         let client = crate::mail::graph::GraphClient::new(&token);
@@ -714,7 +716,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
                         e
                     ),
                 }
-            } else if account.mail_protocol == "jmap" {
+            } else if account.calendar_protocol_str() == "jmap" {
                 let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                 match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                     Ok(conn_jmap) => {
@@ -799,9 +801,9 @@ pub async fn sync_calendars(
         );
     }
 
-    if account.mail_protocol == "jmap" {
+    if account.calendar_protocol_str() == "jmap" {
         sync_calendars_jmap(&state, &account_id, &account).await?;
-    } else if account.provider == "gmail" {
+    } else if account.calendar_protocol_str() == "google" {
         // Gmail: use Google CalDAV with OAuth2 bearer token
         match sync_calendars_google(&state, &account_id, &account).await {
             Ok(()) => {}
@@ -816,7 +818,7 @@ pub async fn sync_calendars(
                 }
             }
         }
-    } else if account.provider == "o365" {
+    } else if account.calendar_protocol_str() == "graph" {
         sync_calendars_graph(&state, &account_id).await?;
     } else if !account.caldav_url.is_empty() {
         sync_calendars_caldav(&state, &account_id, &account).await?;
@@ -1755,7 +1757,7 @@ pub async fn respond_to_invite(
             invite.summary.as_deref().unwrap_or("Calendar Invite")
         );
 
-        if account.mail_protocol == "jmap" {
+        if account.calendar_protocol_str() == "jmap" {
             log::info!("respond_to_invite: sending reply via JMAP");
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
@@ -1882,7 +1884,7 @@ pub async fn respond_to_invite(
     }
 
     // Step 5: Update Google Calendar if this is a Gmail account with OAuth
-    if account.provider == "gmail" {
+    if account.calendar_protocol_str() == "google" {
         drop(conn); // Release DB lock before async
         if let Ok(token) = get_google_token(&account_id).await {
             let google_status = match response.to_lowercase().as_str() {
@@ -2011,7 +2013,7 @@ pub async fn respond_to_invite(
     }
 
     // Step 6: Update O365 calendar via Graph API RSVP
-    if account.provider == "o365" {
+    if account.calendar_protocol_str() == "graph" {
         match crate::mail::graph::get_graph_token(&account_id).await {
             Ok(token) => {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -2127,7 +2129,7 @@ fn build_calendar_reply_message(
 
 /// Get SMTP credentials for an account, refreshing OAuth tokens for O365.
 async fn get_smtp_credentials(account: &db::accounts::AccountFull) -> Result<(String, bool)> {
-    if account.provider == "o365" {
+    if account.calendar_protocol_str() == "graph" {
         let tokens = crate::oauth::load_tokens(&account.id)?
             .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
         let refresh_token = tokens
@@ -2296,10 +2298,10 @@ pub async fn send_invites(
     // Gmail and O365 handle sending invite emails server-side when
     // events are pushed via Google Calendar API (sendUpdates=all) or
     // Graph API. Sending our own SMTP invite would create duplicates.
-    if account.provider == "gmail" || account.provider == "o365" {
+    if account.calendar_protocol_str() == "google" || account.calendar_protocol_str() == "graph" {
         log::info!(
             "send_invites: skipping manual send for {} account (server handles invites)",
-            account.provider
+            account.calendar_protocol_str()
         );
         // Still update attendees in the local DB
         let conn = state.db.writer().await;
@@ -2374,7 +2376,7 @@ pub async fn send_invites(
             continue;
         }
 
-        if account.mail_protocol == "jmap" {
+        if account.calendar_protocol_str() == "jmap" {
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
@@ -2486,7 +2488,7 @@ pub async fn process_invite_reply(
             }
 
             // Update on JMAP server if applicable
-            if account.mail_protocol == "jmap" {
+            if account.calendar_protocol_str() == "jmap" {
                 if let Some(ref remote_id) = event.remote_id {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;

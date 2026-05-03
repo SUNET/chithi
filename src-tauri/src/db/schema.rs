@@ -538,6 +538,8 @@ fn populate_service_bindings(conn: &Connection) -> Result<()> {
                     oidc_token_endpoint: row.get(16)?,
                     oidc_client_id: row.get(17)?,
                     calendar_sync_enabled: row.get(18)?,
+                    auth_method: String::new(),
+                    bindings: Vec::new(),
                 })
             },
         )?;
