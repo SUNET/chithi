@@ -31,12 +31,13 @@ async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapCo
     } else {
         (account.password.clone(), false)
     };
+    let imap = account.mail_imap_config().unwrap_or_default();
     Ok(ImapConfig {
-        host: account.imap_host.clone(),
-        port: account.imap_port,
+        host: imap.imap_host,
+        port: imap.imap_port,
         username: account.username.clone(),
         password,
-        use_tls: account.use_tls,
+        use_tls: imap.use_tls,
         use_xoauth2,
     })
 }
@@ -813,7 +814,7 @@ pub async fn mark_account_read(
         }
     } else if account.mail_protocol_str() == "imap" {
         // IMAP: SELECT each folder and STORE +FLAGS \Seen on all messages
-        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
             suspend_imap_idle_for_account(&state, &account_id).await?
         } else {
             false

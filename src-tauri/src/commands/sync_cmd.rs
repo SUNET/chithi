@@ -116,12 +116,16 @@ pub async fn build_jmap_config(
     })
 }
 
-fn should_start_imap_idle(_provider: &str) -> bool {
+fn should_start_imap_idle(_auth_method: &str) -> bool {
     true
 }
 
-pub(crate) fn should_suspend_idle_for_imap_operation(provider: &str) -> bool {
-    provider == "o365"
+/// O365 IMAP needs IDLE suspended around any other operation because
+/// Microsoft's server only allows one connection per account at a time.
+/// Identifying O365 via auth_method is more accurate than the legacy
+/// `provider` string since Phase 3 dropped that column.
+pub(crate) fn should_suspend_idle_for_imap_operation(auth_method: &str) -> bool {
+    auth_method == "oauth-microsoft"
 }
 
 pub(crate) async fn suspend_imap_idle_for_account(
@@ -156,7 +160,7 @@ pub(crate) async fn resume_imap_idle_for_account(
     account: &db::accounts::AccountFull,
     suspended_idle: bool,
 ) -> Result<()> {
-    if !suspended_idle || !should_start_imap_idle(&account.provider) {
+    if !suspended_idle || !should_start_imap_idle(&account.auth_method) {
         return Ok(());
     }
 
@@ -232,7 +236,7 @@ pub async fn trigger_sync(
     };
 
     let suspended_idle = if account.mail_protocol_str() == "imap"
-        && should_suspend_idle_for_imap_operation(&account.provider)
+        && should_suspend_idle_for_imap_operation(&account.auth_method)
     {
         log::info!(
             "Suspending IMAP IDLE for account {} before sync",
@@ -385,7 +389,7 @@ pub async fn sync_folder(
     // sync_jmap_folder_public, and the IMAP branch each emit their own).
 
     let suspended_idle = if account.mail_protocol_str() == "imap"
-        && should_suspend_idle_for_imap_operation(&account.provider)
+        && should_suspend_idle_for_imap_operation(&account.auth_method)
     {
         log::info!(
             "Suspending IMAP IDLE for account {} before single-folder sync",
@@ -686,7 +690,7 @@ pub async fn prefetch_bodies(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+    let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
         log::info!(
             "Suspending IMAP IDLE for account {} before body prefetch",
             account_id
@@ -1367,8 +1371,14 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
 mod tests {
     #[test]
     fn o365_sync_suspends_idle_but_still_allows_idle_startup() {
-        assert!(super::should_start_imap_idle("o365"));
-        assert!(super::should_suspend_idle_for_imap_operation("o365"));
-        assert!(!super::should_suspend_idle_for_imap_operation("gmail"));
+        // Phase 3: these helpers now key off auth_method, not provider.
+        assert!(super::should_start_imap_idle("oauth-microsoft"));
+        assert!(super::should_suspend_idle_for_imap_operation(
+            "oauth-microsoft"
+        ));
+        assert!(!super::should_suspend_idle_for_imap_operation(
+            "oauth-google"
+        ));
+        assert!(!super::should_suspend_idle_for_imap_operation("password"));
     }
 }
