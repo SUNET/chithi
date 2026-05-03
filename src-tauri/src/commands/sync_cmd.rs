@@ -925,6 +925,24 @@ async fn sync_graph_account(
 
     let data_dir = app.state::<AppState>().data_dir.clone();
 
+    // Mirror sync_account / sync_jmap_account: emit sync-started so the
+    // activity store can mark the operation running and spin the StatusBar
+    // icon. Without this, Graph syncs are silent on the frontend.
+    let account_name = {
+        let conn = db_arc.reader();
+        db::accounts::get_account_full(&conn, account_id)
+            .map(|a| a.display_name)
+            .unwrap_or_else(|_| account_id.to_string())
+    };
+    app.emit(
+        "sync-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "account_name": account_name,
+        }),
+    )
+    .ok();
+
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);
 
