@@ -118,37 +118,56 @@ pub async fn discover(email: &str) -> Result<Option<(AutoconfigServers, &'static
 
 async fn try_fetch_and_parse(http: &reqwest::Client, url: &str) -> Option<AutoconfigServers> {
     log::debug!("autoconfig: GET {}", url);
-    match http.get(url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let body = match resp.bytes().await {
-                Ok(b) if b.len() <= MAX_BYTES => b,
-                Ok(_) => {
-                    log::warn!("autoconfig: response too large at {}", url);
-                    return None;
-                }
-                Err(e) => {
-                    log::debug!("autoconfig: body read failed at {}: {}", url, e);
-                    return None;
-                }
-            };
-            let xml = match std::str::from_utf8(&body) {
-                Ok(s) => s,
-                Err(_) => return None,
-            };
-            match parse_clientconfig_xml(xml) {
-                Some(s) => Some(s),
-                None => {
-                    log::debug!("autoconfig: response at {} did not parse", url);
-                    None
-                }
-            }
-        }
-        Ok(resp) => {
-            log::debug!("autoconfig: {} returned {}", url, resp.status());
-            None
+    let resp = match http.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            log::debug!("autoconfig: {} returned {}", url, r.status());
+            return None;
         }
         Err(e) => {
             log::debug!("autoconfig: GET failed for {}: {}", url, e);
+            return None;
+        }
+    };
+
+    // Cheap pre-check: if Content-Length is announced and exceeds the
+    // cap, abort before even allocating the buffer.
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_BYTES {
+            log::warn!(
+                "autoconfig: response Content-Length {} exceeds cap at {}",
+                len,
+                url
+            );
+            return None;
+        }
+    }
+
+    // Stream the body in chunks and bail as soon as we cross the cap.
+    // Servers that don't send Content-Length (or lie about it) can't
+    // force us into a large allocation this way.
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                log::debug!("autoconfig: chunk read failed at {}: {}", url, e);
+                return None;
+            }
+        };
+        if buf.len() + chunk.len() > MAX_BYTES {
+            log::warn!("autoconfig: response too large at {}", url);
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let xml = std::str::from_utf8(&buf).ok()?;
+    match parse_clientconfig_xml(xml) {
+        Some(s) => Some(s),
+        None => {
+            log::debug!("autoconfig: response at {} did not parse", url);
             None
         }
     }

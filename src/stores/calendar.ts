@@ -127,10 +127,11 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
     if (accountId) {
       // Single-account sync used by the per-binding tick (#43): one
-      // account per call so each can run on its own cadence.
+      // account per call so each can run on its own cadence. The
+      // backend emits `calendar-changed` when the sync completes, and
+      // the listener below already triggers fetchCalendars() +
+      // fetchEvents() — so don't run them inline or we'd refresh twice.
       await api.syncCalendars(accountId);
-      await fetchCalendars();
-      await fetchEvents();
       return;
     }
     // Sync all accounts in parallel so a hanging account doesn't block others.

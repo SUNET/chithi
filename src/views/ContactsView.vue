@@ -156,7 +156,15 @@ let stopContactsChangedListener: (() => void) | null = null;
 let disposed = false;
 
 async function contactsTick() {
+  // Skip the unconditional fetchBooks() at the end of every tick — it
+  // ran listContactBooks for each account once a minute even when no
+  // sync was due, which churned the UI for no reason. The
+  // `contacts-changed` listener registered in onMounted already
+  // refreshes books whenever the backend persists new data, so we only
+  // need to call fetchBooks here for the (rare) case where a sync ran
+  // *and* its event hasn't already fired refresh logic above.
   const now = Date.now();
+  let synced = false;
   for (const acc of accountsStore.accounts) {
     if (!acc.enabled) continue;
     const intervalMs =
@@ -168,11 +176,16 @@ async function contactsTick() {
     lastContactSync.set(acc.id, now);
     try {
       await api.syncContacts(acc.id);
+      synced = true;
     } catch (e) {
       console.error("Periodic contact sync failed for", acc.id, e);
     }
   }
-  await fetchBooks();
+  // If nothing actually synced this tick, the contacts-changed listener
+  // also has nothing to do — let it sleep.
+  if (synced) {
+    await fetchBooks();
+  }
 }
 
 onMounted(async () => {

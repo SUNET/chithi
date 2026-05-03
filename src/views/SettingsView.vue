@@ -59,7 +59,12 @@ function makeMinutesField(key: "calendar_sync_interval_seconds" | "contacts_sync
       if (m == null || Number.isNaN(m)) {
         form.value[key] = null;
       } else {
-        form.value[key] = Math.max(1, Math.round(m * 60));
+        // Clamp to a minimum of 1 minute. The browser already enforces
+        // `min="1"` on the input but a programmatic v-model write (or
+        // someone bypassing the input) could otherwise persist
+        // sub-minute values into *_sync_interval_seconds.
+        const minutes = Math.max(1, Math.round(m));
+        form.value[key] = minutes * 60;
       }
     },
   });
@@ -279,13 +284,30 @@ async function discoverDavEndpoints() {
     if (result.imap_host) {
       form.value.imap_host = result.imap_host;
       form.value.imap_port = result.imap_port || 993;
-      form.value.use_tls = result.imap_use_tls;
       filled.push("IMAP");
     }
     if (result.smtp_host) {
       form.value.smtp_host = result.smtp_host;
       form.value.smtp_port = result.smtp_port || 587;
       filled.push("SMTP");
+    }
+    // The wire format carries one shared `use_tls` flag while autoconfig
+    // returns IMAP- and SMTP-specific settings. Only apply it when both
+    // services agree; if they disagree, prefer the more secure value
+    // (don't silently downgrade TLS) and log it.
+    if (result.imap_host && result.smtp_host) {
+      if (result.imap_use_tls === result.smtp_use_tls) {
+        form.value.use_tls = result.imap_use_tls;
+      } else {
+        console.warn(
+          "autoconfig: imap_use_tls / smtp_use_tls disagree; keeping TLS on",
+        );
+        form.value.use_tls = true;
+      }
+    } else if (result.imap_host) {
+      form.value.use_tls = result.imap_use_tls;
+    } else if (result.smtp_host) {
+      form.value.use_tls = result.smtp_use_tls;
     }
     const davUrl = result.caldav_url || result.carddav_url;
     if (davUrl) {
