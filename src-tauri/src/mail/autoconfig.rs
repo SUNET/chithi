@@ -273,17 +273,41 @@ fn element_text(doc: &Document, parent: NodeId, local_name: &str) -> Option<Stri
 /// returned. Errors are logged at debug level — autoconfig isn't a
 /// must-succeed flow.
 async fn lookup_mx(domain: &str) -> Option<String> {
-    use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-    use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::proto::rr::rdata::MX;
+    use hickory_resolver::proto::rr::RData;
+    use hickory_resolver::Resolver;
 
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+    // hickory-resolver 0.26 replaced TokioAsyncResolver::tokio() with the
+    // builder-based `Resolver::builder_tokio().build()` flow. Both calls
+    // return Result, but failures here are unrecoverable (no system
+    // resolver) so we just log and bail.
+    let resolver = match Resolver::builder_tokio().and_then(|b| b.build()) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("autoconfig: resolver build failed: {}", e);
+            return None;
+        }
+    };
 
     match resolver.mx_lookup(domain).await {
-        Ok(answer) => {
-            let mut records: Vec<_> = answer.iter().collect();
-            records.sort_by_key(|r| r.preference());
+        Ok(lookup) => {
+            // Lookup::answers() returns the raw Record list; filter to
+            // the MX-typed RData payloads, then sort by preference.
+            // hickory 0.26 exposes Record::data as a public field rather
+            // than the 0.24-era accessor method.
+            let mut records: Vec<&MX> = lookup
+                .answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::MX(mx) => Some(mx),
+                    _ => None,
+                })
+                .collect();
+            // hickory 0.26 exposes preference / exchange as public fields
+            // on MX rather than the 0.24 accessor methods.
+            records.sort_by_key(|r| r.preference);
             for r in records {
-                let name = r.exchange().to_ascii().trim_end_matches('.').to_string();
+                let name = r.exchange.to_ascii().trim_end_matches('.').to_string();
                 if !name.is_empty() && is_valid_domain(&name) {
                     return Some(name);
                 }
