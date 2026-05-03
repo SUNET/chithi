@@ -380,15 +380,9 @@ pub async fn sync_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    // Emit sync-started for ALL protocols so the activity UI tracks every sync
-    app.emit(
-        "sync-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "account_name": account.display_name,
-        }),
-    )
-    .ok();
+    // sync-started is emitted by each protocol-specific path below, so the
+    // activity store sees exactly one start per sync (sync_graph_account,
+    // sync_jmap_folder_public, and the IMAP branch each emit their own).
 
     let suspended_idle = if account.mail_protocol == "imap"
         && should_suspend_idle_for_imap_operation(&account.provider)
@@ -445,7 +439,18 @@ pub async fn sync_folder(
         )
         .await
     } else {
-        // IMAP path — for O365, refresh IMAP-scoped token
+        // IMAP path — sync_folder_envelopes_public is a low-level helper and
+        // doesn't emit sync-started itself, so do it here.
+        app.emit(
+            "sync-started",
+            serde_json::json!({
+                "account_id": account_id,
+                "account_name": account.display_name,
+            }),
+        )
+        .ok();
+
+        // For O365, refresh IMAP-scoped token
         let (password, use_xoauth2) = if account.provider == "o365" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
