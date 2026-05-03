@@ -502,11 +502,19 @@ mod tests {
         let mail = bindings.iter().find(|b| b.service == "mail").unwrap();
         assert_eq!(mail.protocol, "imap");
         assert_eq!(
-            bindings.iter().find(|b| b.service == "calendar").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "calendar")
+                .unwrap()
+                .protocol,
             "google"
         );
         assert_eq!(
-            bindings.iter().find(|b| b.service == "contacts").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "contacts")
+                .unwrap()
+                .protocol,
             "google"
         );
     }
@@ -519,15 +527,27 @@ mod tests {
         let bindings = derive_bindings_from_account(&acc);
         assert_eq!(bindings.len(), 3);
         assert_eq!(
-            bindings.iter().find(|b| b.service == "mail").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "mail")
+                .unwrap()
+                .protocol,
             "imap"
         );
         assert_eq!(
-            bindings.iter().find(|b| b.service == "calendar").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "calendar")
+                .unwrap()
+                .protocol,
             "graph"
         );
         assert_eq!(
-            bindings.iter().find(|b| b.service == "contacts").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "contacts")
+                .unwrap()
+                .protocol,
             "graph"
         );
     }
@@ -555,7 +575,11 @@ mod tests {
             assert_eq!(b.protocol, "jmap", "service={}", b.service);
         }
         let mail_cfg: serde_json::Value = serde_json::from_str(
-            &bindings.iter().find(|b| b.service == "mail").unwrap().config_json,
+            &bindings
+                .iter()
+                .find(|b| b.service == "mail")
+                .unwrap()
+                .config_json,
         )
         .unwrap();
         assert_eq!(mail_cfg["url"], "https://jmap.example.com/jmap");
@@ -574,7 +598,10 @@ mod tests {
         let mail = bindings.iter().find(|b| b.service == "mail").unwrap();
         let mail_cfg: serde_json::Value = serde_json::from_str(&mail.config_json).unwrap();
         assert_eq!(mail_cfg["auth_method"], "oidc");
-        assert_eq!(mail_cfg["oidc_token_endpoint"], "https://idp.example.com/token");
+        assert_eq!(
+            mail_cfg["oidc_token_endpoint"],
+            "https://idp.example.com/token"
+        );
         assert_eq!(mail_cfg["oidc_client_id"], "client-123");
     }
 
@@ -593,11 +620,19 @@ mod tests {
         let bindings = derive_bindings_from_account(&acc);
         assert!(bindings.iter().all(|b| b.service != "mail"));
         assert_eq!(
-            bindings.iter().find(|b| b.service == "calendar").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "calendar")
+                .unwrap()
+                .protocol,
             "caldav"
         );
         assert_eq!(
-            bindings.iter().find(|b| b.service == "contacts").unwrap().protocol,
+            bindings
+                .iter()
+                .find(|b| b.service == "contacts")
+                .unwrap()
+                .protocol,
             "carddav"
         );
     }
@@ -683,7 +718,13 @@ mod tests {
         let cal = bindings.iter().find(|b| b.service == "calendar").unwrap();
         assert!(!cal.enabled);
         // Mail/contacts should still be enabled.
-        assert!(bindings.iter().find(|b| b.service == "mail").unwrap().enabled);
+        assert!(
+            bindings
+                .iter()
+                .find(|b| b.service == "mail")
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
@@ -738,7 +779,8 @@ mod tests {
             config_json: "{}".into(),
         };
         insert(&conn, &b).unwrap();
-        conn.execute("DELETE FROM accounts WHERE id = 'a1'", []).unwrap();
+        conn.execute("DELETE FROM accounts WHERE id = 'a1'", [])
+            .unwrap();
         assert!(list_for_account(&conn, "a1").unwrap().is_empty());
     }
 }

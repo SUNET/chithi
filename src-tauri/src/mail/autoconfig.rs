@@ -95,7 +95,11 @@ pub async fn discover(email: &str) -> Result<Option<(AutoconfigServers, &'static
     // the user's mail is already going through. We don't fabricate ports
     // beyond the IANA-assigned ones.
     if let Some(mx_host) = lookup_mx(domain).await {
-        log::info!("autoconfig: MX for {} -> {}, guessing IMAPS/submission", domain, mx_host);
+        log::info!(
+            "autoconfig: MX for {} -> {}, guessing IMAPS/submission",
+            domain,
+            mx_host
+        );
         return Ok(Some((
             AutoconfigServers {
                 imap_host: mx_host.clone(),
@@ -112,10 +116,7 @@ pub async fn discover(email: &str) -> Result<Option<(AutoconfigServers, &'static
     Ok(None)
 }
 
-async fn try_fetch_and_parse(
-    http: &reqwest::Client,
-    url: &str,
-) -> Option<AutoconfigServers> {
+async fn try_fetch_and_parse(http: &reqwest::Client, url: &str) -> Option<AutoconfigServers> {
     log::debug!("autoconfig: GET {}", url);
     match http.get(url).send().await {
         Ok(resp) if resp.status().is_success() => {

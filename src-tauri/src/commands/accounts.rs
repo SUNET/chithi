@@ -101,17 +101,16 @@ pub async fn probe_dav_endpoints(
                 String::new()
             }
         };
-    let carddav_url =
-        match crate::mail::carddav::auto_discover_hosts(&http, &auth, &hosts).await {
-            Ok(url) => {
-                log::info!("probe_dav_endpoints: carddav={}", url);
-                url
-            }
-            Err(e) => {
-                log::debug!("probe_dav_endpoints: carddav probe failed: {}", e);
-                String::new()
-            }
-        };
+    let carddav_url = match crate::mail::carddav::auto_discover_hosts(&http, &auth, &hosts).await {
+        Ok(url) => {
+            log::info!("probe_dav_endpoints: carddav={}", url);
+            url
+        }
+        Err(e) => {
+            log::debug!("probe_dav_endpoints: carddav probe failed: {}", e);
+            String::new()
+        }
+    };
 
     let s = servers.unwrap_or_default();
     Ok(AutoconfigResult {

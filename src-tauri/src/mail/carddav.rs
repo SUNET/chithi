@@ -300,7 +300,12 @@ pub(crate) async fn auto_discover(
         .rsplit('@')
         .next()
         .ok_or_else(|| Error::Other("Invalid email for CardDAV discovery".to_string()))?;
-    auto_discover_hosts(http, auth, &[domain.to_string(), format!("mail.{}", domain)]).await
+    auto_discover_hosts(
+        http,
+        auth,
+        &[domain.to_string(), format!("mail.{}", domain)],
+    )
+    .await
 }
 
 /// Same as `auto_discover`, but probes a caller-supplied list of
