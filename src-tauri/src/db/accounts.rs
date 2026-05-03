@@ -14,6 +14,15 @@ pub struct Account {
     pub provider: String,
     pub mail_protocol: String,
     pub enabled: bool,
+    /// Phase-4 (#43): per-binding sync intervals so the frontend timers
+    /// can honor user preferences without an extra get_account_config
+    /// round-trip. `None` means "use the service's default cadence".
+    #[serde(default)]
+    pub mail_sync_interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub calendar_sync_interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub contacts_sync_interval_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +30,8 @@ pub struct AccountConfig {
     pub display_name: String,
     pub email: String,
     pub provider: String,
+    /// Mail protocol. Empty string means "no mail binding" — used for
+    /// standalone CalDAV / CardDAV / JMAP-cal-only accounts.
     pub mail_protocol: String,
     pub imap_host: String,
     pub imap_port: u16,
@@ -41,6 +52,27 @@ pub struct AccountConfig {
     pub oidc_client_id: String,
     #[serde(default = "default_true")]
     pub calendar_sync_enabled: bool,
+    /// Whether the mail binding is enabled. Default `true`. Set `false` to
+    /// keep a JMAP account's calendar/contacts sync running while turning
+    /// off mail (the "JMAP cal-only" use case in #43). For a non-mail
+    /// account (mail_protocol == "") this field is ignored.
+    #[serde(default = "default_true")]
+    pub mail_sync_enabled: bool,
+    /// Whether the contacts binding is enabled. Default `true`. Lets the
+    /// user disable CardDAV / Google People / Graph contacts for an
+    /// account that has them otherwise.
+    #[serde(default = "default_true")]
+    pub contacts_sync_enabled: bool,
+    /// Optional per-binding sync interval in seconds. `None` falls back to
+    /// the default cadence for that service (see calendar / contacts
+    /// stores on the frontend). Each service has its own field so the
+    /// wire format stays explicit.
+    #[serde(default)]
+    pub mail_sync_interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub calendar_sync_interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub contacts_sync_interval_seconds: Option<i64>,
 }
 
 fn default_basic() -> String {
@@ -82,6 +114,14 @@ pub struct AccountFull {
     /// Dispatch code uses the helper methods below rather than reading
     /// this field directly.
     pub bindings: Vec<ServiceBinding>,
+    /// Phase-4 wire-format mirrors of binding state. Populated from
+    /// `bindings` on fetch so the Settings edit form can round-trip the
+    /// per-binding `enabled` flags and sync intervals.
+    pub mail_sync_enabled: bool,
+    pub contacts_sync_enabled: bool,
+    pub mail_sync_interval_seconds: Option<i64>,
+    pub calendar_sync_interval_seconds: Option<i64>,
+    pub contacts_sync_interval_seconds: Option<i64>,
 }
 
 impl AccountFull {
@@ -105,22 +145,28 @@ impl AccountFull {
     }
 
     /// Mail protocol as a string slice. Returns `""` for accounts with no
-    /// mail binding (calendar-only / contacts-only). Replaces direct reads
-    /// of `account.mail_protocol` at dispatch sites.
+    /// mail binding (calendar-only / contacts-only) AND for accounts whose
+    /// mail binding is explicitly disabled (e.g. a JMAP server used for
+    /// calendar/contacts only). Replaces direct reads of
+    /// `account.mail_protocol` at dispatch sites — a disabled binding
+    /// short-circuits every protocol-specific branch.
     pub fn mail_protocol_str(&self) -> &str {
         self.mail_binding()
+            .filter(|b| b.enabled)
             .map(|b| b.protocol.as_str())
             .unwrap_or("")
     }
 
     pub fn calendar_protocol_str(&self) -> &str {
         self.calendar_binding()
+            .filter(|b| b.enabled)
             .map(|b| b.protocol.as_str())
             .unwrap_or("")
     }
 
     pub fn contacts_protocol_str(&self) -> &str {
         self.contacts_binding()
+            .filter(|b| b.enabled)
             .map(|b| b.protocol.as_str())
             .unwrap_or("")
     }
@@ -229,6 +275,23 @@ impl AccountFull {
             .calendar_binding()
             .map(|b| b.enabled)
             .unwrap_or(true);
+
+        // Phase-4: surface per-binding state on the wire format so the
+        // Settings edit form sees the toggles' current value.
+        self.mail_sync_enabled = self
+            .mail_binding()
+            .map(|b| b.enabled)
+            .unwrap_or(true);
+        self.contacts_sync_enabled = self
+            .contacts_binding()
+            .map(|b| b.enabled)
+            .unwrap_or(true);
+        self.mail_sync_interval_seconds =
+            self.mail_binding().and_then(|b| b.sync_interval_seconds);
+        self.calendar_sync_interval_seconds =
+            self.calendar_binding().and_then(|b| b.sync_interval_seconds);
+        self.contacts_sync_interval_seconds =
+            self.contacts_binding().and_then(|b| b.sync_interval_seconds);
     }
 }
 
@@ -237,13 +300,29 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
     // calendar-only accounts show up with an empty mail_protocol).
     // provider is derived from auth_method on the way out so the wire
     // format stays compatible with the frontend.
+    // Pull the mail protocol and per-binding sync intervals via correlated
+    // subqueries against service_bindings so the lightweight Account
+    // summary doesn't need a separate per-account query for the
+    // periodic-sync timers.
     let mut stmt = conn.prepare(
         "SELECT a.id, a.display_name, a.email, a.auth_method, a.enabled,
                 COALESCE(
                     (SELECT b.protocol FROM service_bindings b
-                     WHERE b.account_id = a.id AND b.service = 'mail' LIMIT 1),
+                     WHERE b.account_id = a.id
+                       AND b.service = 'mail'
+                       AND b.enabled = 1
+                     LIMIT 1),
                     ''
-                ) AS mail_protocol
+                ) AS mail_protocol,
+                (SELECT b.sync_interval_seconds FROM service_bindings b
+                 WHERE b.account_id = a.id AND b.service = 'mail' LIMIT 1)
+                    AS mail_sync_interval,
+                (SELECT b.sync_interval_seconds FROM service_bindings b
+                 WHERE b.account_id = a.id AND b.service = 'calendar' LIMIT 1)
+                    AS calendar_sync_interval,
+                (SELECT b.sync_interval_seconds FROM service_bindings b
+                 WHERE b.account_id = a.id AND b.service = 'contacts' LIMIT 1)
+                    AS contacts_sync_interval
          FROM accounts a
          ORDER BY a.display_name",
     )?;
@@ -263,6 +342,9 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                 provider,
                 mail_protocol: row.get(5)?,
                 enabled: row.get(4)?,
+                mail_sync_interval_seconds: row.get(6)?,
+                calendar_sync_interval_seconds: row.get(7)?,
+                contacts_sync_interval_seconds: row.get(8)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -300,6 +382,11 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 use_tls: true,
                 calendar_sync_enabled: true,
                 bindings: Vec::new(),
+                mail_sync_enabled: true,
+                contacts_sync_enabled: true,
+                mail_sync_interval_seconds: None,
+                calendar_sync_interval_seconds: None,
+                contacts_sync_interval_seconds: None,
             })
         },
     ).map_err(|e| match e {
@@ -392,6 +479,11 @@ fn config_to_legacy_fields<'a>(
         oidc_client_id: &config.oidc_client_id,
         caldav_url: &config.caldav_url,
         calendar_sync_enabled: config.calendar_sync_enabled,
+        mail_sync_enabled: Some(config.mail_sync_enabled),
+        contacts_sync_enabled: Some(config.contacts_sync_enabled),
+        mail_sync_interval_seconds: config.mail_sync_interval_seconds,
+        calendar_sync_interval_seconds: config.calendar_sync_interval_seconds,
+        contacts_sync_interval_seconds: config.contacts_sync_interval_seconds,
     }
 }
 
@@ -520,6 +612,11 @@ mod tests {
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
             calendar_sync_enabled: true,
+            mail_sync_enabled: true,
+            contacts_sync_enabled: true,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
         }
     }
 

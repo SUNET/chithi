@@ -1,3 +1,4 @@
+pub mod autoconfig;
 pub mod caldav;
 pub mod carddav;
 pub mod dav_http;
