@@ -73,6 +73,16 @@ pub struct AccountConfig {
     pub calendar_sync_interval_seconds: Option<i64>,
     #[serde(default)]
     pub contacts_sync_interval_seconds: Option<i64>,
+    /// Whether a calendar / contacts binding actually exists for this
+    /// account, regardless of its enabled state. The Settings UI keys
+    /// off these to disambiguate standalone CalDAV-only vs CardDAV-only
+    /// accounts even after the user toggles the lone Sync-* flag off.
+    /// Read-only on save (the backend rebuilds bindings from the legacy
+    /// fields rather than these flags).
+    #[serde(default)]
+    pub has_calendar_binding: bool,
+    #[serde(default)]
+    pub has_contacts_binding: bool,
 }
 
 fn default_basic() -> String {
@@ -610,6 +620,8 @@ mod tests {
             mail_sync_interval_seconds: None,
             calendar_sync_interval_seconds: None,
             contacts_sync_interval_seconds: None,
+            has_calendar_binding: false,
+            has_contacts_binding: false,
         }
     }
 
