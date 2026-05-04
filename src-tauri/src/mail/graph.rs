@@ -647,6 +647,92 @@ impl GraphClient {
 
     /// Fetch events in a time range via calendarView.
     /// Uses `Prefer: outlook.timezone="UTC"` so all times come back in UTC.
+    /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
+    /// Same query semantics as `list_events`, just scoped to one
+    /// calendar so multi-calendar accounts (#47) can keep events
+    /// separated. Pagination follows `@odata.nextLink` exactly like
+    /// `list_events`.
+    pub async fn list_events_for_calendar(
+        &self,
+        calendar_id: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<GraphCalendarEvent>> {
+        let mut events = Vec::new();
+        let mut next_path: Option<String> = None;
+        loop {
+            let resp: serde_json::Value = match next_path.take() {
+                Some(path) => {
+                    let resp = self
+                        .http
+                        .get(&path)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .send()
+                        .await
+                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(Error::Other(format!(
+                            "Graph GET returned {}: {}",
+                            status,
+                            truncate(&body, 500)
+                        )));
+                    }
+                    serde_json::from_str(&body)
+                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
+                }
+                None => {
+                    let url = format!(
+                        "{}/me/calendars/{}/calendarView",
+                        GRAPH_BASE,
+                        urlencoding::encode(calendar_id)
+                    );
+                    let resp = self.http
+                        .get(&url)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .query(&[
+                            ("startDateTime", start),
+                            ("endDateTime", end),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence"),
+                            ("$top", "100"),
+                            ("$orderby", "start/dateTime"),
+                        ])
+                        .send()
+                        .await
+                        .map_err(|e| Error::Other(format!("Graph GET /me/calendars/{}/calendarView failed: {}", calendar_id, e)))?;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(Error::Other(format!(
+                            "Graph GET /me/calendars/{}/calendarView returned {}: {}",
+                            calendar_id,
+                            status,
+                            truncate(&body, 500)
+                        )));
+                    }
+                    serde_json::from_str(&body)
+                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
+                }
+            };
+            if let Some(items) = resp["value"].as_array() {
+                for e in items {
+                    events.push(parse_graph_event(e));
+                }
+            }
+            let next_link = resp["@odata.nextLink"]
+                .as_str()
+                .map(|s: &str| s.to_string());
+            match next_link {
+                Some(next) => next_path = Some(next),
+                None => break,
+            }
+        }
+        Ok(events)
+    }
+
     pub async fn list_events(&self, start: &str, end: &str) -> Result<Vec<GraphCalendarEvent>> {
         let mut events = Vec::new();
         let mut next_path: Option<String> = None;
