@@ -3,8 +3,17 @@ export interface Account {
   display_name: string;
   email: string;
   provider: "generic" | "gmail" | "microsoft365" | "o365";
-  mail_protocol: "imap" | "jmap" | "graph";
+  // Empty string means "no mail binding" — calendar-only / contacts-only
+  // accounts (#43). Existing screens that need a mail account should
+  // filter these out.
+  mail_protocol: "" | "imap" | "jmap" | "graph";
   enabled: boolean;
+  // Phase 4 (#43): per-binding sync intervals exposed on the summary
+  // so periodic-sync timers can pick the right cadence per account
+  // without a separate get_account_config call.
+  mail_sync_interval_seconds: number | null;
+  calendar_sync_interval_seconds: number | null;
+  contacts_sync_interval_seconds: number | null;
 }
 
 export interface QuickFilter {
@@ -138,7 +147,8 @@ export interface AccountConfig {
   display_name: string;
   email: string;
   provider: "generic" | "gmail" | "microsoft365" | "o365";
-  mail_protocol: "imap" | "jmap" | "graph";
+  /// Empty string means "no mail binding" (CalDAV-only / CardDAV-only).
+  mail_protocol: "" | "imap" | "jmap" | "graph";
   imap_host: string;
   imap_port: number;
   smtp_host: string;
@@ -152,8 +162,46 @@ export interface AccountConfig {
   jmap_auth_method: "basic" | "oidc";
   oidc_token_endpoint: string;
   oidc_client_id: string;
+  /// Whether the calendar binding is enabled. Mirrors mail_sync_enabled
+  /// for the calendar service.
   calendar_sync_enabled: boolean;
+  /// Phase 4 (#43): per-binding enabled flags + sync intervals.
+  mail_sync_enabled: boolean;
+  contacts_sync_enabled: boolean;
+  /// Override the default sync cadence (in seconds). `null` keeps the
+  /// service's default (mail handled by IDLE/push, calendar 5 min,
+  /// contacts 30 min).
+  mail_sync_interval_seconds: number | null;
+  calendar_sync_interval_seconds: number | null;
+  contacts_sync_interval_seconds: number | null;
+  /// Whether a calendar / contacts binding actually exists for this
+  /// account (regardless of its enabled state). Used by the Settings
+  /// edit form to disambiguate standalone CalDAV-only vs CardDAV-only
+  /// accounts even when the user has unchecked the matching Sync flag.
+  /// Backend-populated; treated as read-only in form state.
+  has_calendar_binding: boolean;
+  has_contacts_binding: boolean;
 }
+
+/// Combined result of Thunderbird-style autoconfig + DAV probing.
+/// Empty strings / zero ports mean "not found"; the frontend only
+/// applies non-empty fields to the form. `source` is informational:
+/// "isp-db" | "domain-autoconfig" | "well-known" | "mx" | "".
+export interface AutoconfigResult {
+  imap_host: string;
+  imap_port: number;
+  imap_use_tls: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_use_tls: boolean;
+  caldav_url: string;
+  carddav_url: string;
+  source: string;
+}
+
+// Old name kept as an alias so existing imports compile while we
+// migrate. New callers should use AutoconfigResult.
+export type DavProbeResult = AutoconfigResult;
 
 export interface FilterRule {
   id: string;

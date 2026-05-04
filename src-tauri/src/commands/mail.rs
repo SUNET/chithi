@@ -117,18 +117,18 @@ pub async fn search_messages_server(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    let hits = if account.mail_protocol == "graph" {
+    let hits = if account.mail_protocol_str() == "graph" {
         let token = crate::mail::graph::get_graph_token(&account_id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
         client.search_messages(&account_id, &query).await?
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap
             .search_account(&jmap_config, &account_id, &query)
             .await?
     } else {
-        let (password, use_xoauth2) = if account.provider == "o365" {
+        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens
@@ -196,14 +196,14 @@ pub async fn import_search_hit(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    let (id, uid, maildir_path) = if account.mail_protocol == "graph" {
+    let (id, uid, maildir_path) = if account.mail_protocol_str() == "graph" {
         // Format matches sync_cmd::sync_graph_account: `{account_id}_{graph_id}`,
         // and `graph:{graph_id}` in maildir_path triggers the on-demand stream
         // path in get_message_body.
         let id = format!("{}_{}", account_id, hit.backend_id);
         let maildir = format!("graph:{}", hit.backend_id);
         (id, 0u32, maildir)
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         // Format matches jmap_sync: `{account_id}_{mailbox_id}_{email_id}`.
         let id = format!("{}_{}_{}", account_id, hit.folder_path, hit.backend_id);
         (id, 0u32, String::new())
@@ -286,7 +286,7 @@ pub async fn get_message_body(
         let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
         let data_dir = state.data_dir.clone();
 
-        let relative_path = if account.mail_protocol == "graph" {
+        let relative_path = if account.mail_protocol_str() == "graph" {
             // Graph: stream raw MIME to disk via GET /me/messages/{id}/$value
             log::info!("Body not on disk for {}, streaming from Graph", message_id);
 
@@ -319,7 +319,7 @@ pub async fn get_message_body(
             let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
             log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
             rp
-        } else if account.mail_protocol == "jmap" {
+        } else if account.mail_protocol_str() == "jmap" {
             log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -342,7 +342,7 @@ pub async fn get_message_body(
         } else {
             log::info!("Body not on disk for {}, fetching from IMAP", message_id);
 
-            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.provider) {
+            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
                 suspend_imap_idle_for_account(&state, &account_id).await?
             } else {
                 false
@@ -350,7 +350,7 @@ pub async fn get_message_body(
             let resume_account = account.clone();
 
             // For O365, refresh IMAP-scoped token for XOAUTH2
-            let (password, use_xoauth2) = if account.provider == "o365" {
+            let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
                 let tokens = crate::oauth::load_tokens(&account_id)?
                     .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
                 let refresh = tokens
@@ -658,7 +658,7 @@ pub async fn create_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "jmap" {
+    if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set create
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
@@ -681,7 +681,7 @@ pub async fn create_folder(
             .await?;
     } else {
         // IMAP: CREATE (O365 uses XOAUTH2)
-        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens
@@ -783,7 +783,7 @@ pub async fn delete_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol == "graph" {
+    if account.mail_protocol_str() == "graph" {
         let token = crate::mail::graph::get_graph_token(&account_id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
         client.delete_mail_folder(&folder_path).await.map_err(|e| {
@@ -795,7 +795,7 @@ pub async fn delete_folder(
             );
             e
         })?;
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
@@ -813,7 +813,7 @@ pub async fn delete_folder(
             })?;
     } else {
         // IMAP: DELETE
-        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account_id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens

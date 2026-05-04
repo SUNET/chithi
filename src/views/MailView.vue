@@ -163,7 +163,8 @@ function onOpenMessage(messageId: string) {
 
 // Background prefetch after sync
 async function startBackgroundPrefetch() {
-  for (const account of accountsStore.accounts) {
+  // Skip calendar-/contacts-only accounts (mail_protocol === "" via #43).
+  for (const account of accountsStore.mailAccounts) {
     if (!account.enabled) continue;
     try {
       let fetched = 1;
@@ -206,7 +207,8 @@ function notifyNewMail(accountId: string, count: number) {
 let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 
 async function periodicSync() {
-  for (const account of accountsStore.accounts) {
+  // Skip calendar-/contacts-only accounts (mail_protocol === "" via #43).
+  for (const account of accountsStore.mailAccounts) {
     if (!account.enabled) continue;
     try {
       await api.triggerSync(

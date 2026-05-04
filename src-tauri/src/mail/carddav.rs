@@ -291,20 +291,39 @@ impl CardDavClient {
 // Auto-discovery
 // ---------------------------------------------------------------------------
 
-async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> Result<String> {
+pub(crate) async fn auto_discover(
+    http: &reqwest::Client,
+    auth: &DavAuth,
+    email: &str,
+) -> Result<String> {
     let domain = email
         .rsplit('@')
         .next()
         .ok_or_else(|| Error::Other("Invalid email for CardDAV discovery".to_string()))?;
+    auto_discover_hosts(
+        http,
+        auth,
+        &[domain.to_string(), format!("mail.{}", domain)],
+    )
+    .await
+}
 
-    let candidates = vec![
-        format!("https://{}/.well-known/carddav", domain),
-        format!("https://mail.{}/.well-known/carddav", domain),
-    ];
-
-    for url in &candidates {
+/// Same as `auto_discover`, but probes a caller-supplied list of
+/// hostnames. Used by the Settings auto-discover command (#43) so it
+/// can also try the IMAP and SMTP server hostnames the user already
+/// entered.
+pub(crate) async fn auto_discover_hosts(
+    http: &reqwest::Client,
+    auth: &DavAuth,
+    hosts: &[String],
+) -> Result<String> {
+    for host in hosts {
+        if host.is_empty() {
+            continue;
+        }
+        let url = format!("https://{}/.well-known/carddav", host);
         log::debug!("carddav: trying auto-discovery at {}", url);
-        let req = http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url);
+        let req = http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url);
         let req = match auth {
             DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
             DavAuth::Bearer { token } => req.bearer_auth(token),
@@ -327,7 +346,7 @@ async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> R
                     let discovered = format!(
                         "{}://{}{}{}",
                         final_url.scheme(),
-                        final_url.host_str().unwrap_or(domain),
+                        final_url.host_str().unwrap_or(host),
                         port_str,
                         final_url.path().trim_end_matches('/')
                     );

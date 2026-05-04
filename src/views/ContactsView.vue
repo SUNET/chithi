@@ -143,21 +143,60 @@ const error = ref<string | null>(null);
 
 const syncing = ref(false);
 
-// --- Independent contact sync (30-minute interval, matching Thunderbird) ---
-const CONTACT_SYNC_INTERVAL = 30 * 60 * 1000; // 30 minutes
+// --- Independent contact sync ---
+// Default to 30 minutes (Thunderbird's CardDAV default). Each account's
+// contacts binding can override via `contacts_sync_interval_seconds`
+// (#43). The timer ticks every minute and fires per-account when its
+// interval has elapsed.
+const DEFAULT_CONTACT_INTERVAL_MS = 30 * 60 * 1000;
+const CONTACT_TICK_MS = 60 * 1000;
 let contactSyncIntervalId: ReturnType<typeof setInterval> | null = null;
+const lastContactSync = new Map<string, number>();
 let stopContactsChangedListener: (() => void) | null = null;
 let disposed = false;
+
+async function contactsTick() {
+  // Skip the unconditional fetchBooks() at the end of every tick — it
+  // ran listContactBooks for each account once a minute even when no
+  // sync was due, which churned the UI for no reason. The
+  // `contacts-changed` listener registered in onMounted already
+  // refreshes books whenever the backend persists new data, so we only
+  // need to call fetchBooks here for the (rare) case where a sync ran
+  // *and* its event hasn't already fired refresh logic above.
+  const now = Date.now();
+  let synced = false;
+  for (const acc of accountsStore.accounts) {
+    if (!acc.enabled) continue;
+    const intervalMs =
+      (acc.contacts_sync_interval_seconds ?? 0) > 0
+        ? (acc.contacts_sync_interval_seconds as number) * 1000
+        : DEFAULT_CONTACT_INTERVAL_MS;
+    const last = lastContactSync.get(acc.id) ?? 0;
+    if (now - last < intervalMs) continue;
+    lastContactSync.set(acc.id, now);
+    try {
+      await api.syncContacts(acc.id);
+      synced = true;
+    } catch (e) {
+      console.error("Periodic contact sync failed for", acc.id, e);
+    }
+  }
+  // If nothing actually synced this tick, the contacts-changed listener
+  // also has nothing to do — let it sleep.
+  if (synced) {
+    await fetchBooks();
+  }
+}
 
 onMounted(async () => {
   // Load local data first, then sync in background
   await fetchBooks();
   syncAllContacts();
 
-  // Start periodic sync
+  // Start periodic sync (per-account cadence via contacts binding)
   contactSyncIntervalId = setInterval(() => {
-    syncAllContacts();
-  }, CONTACT_SYNC_INTERVAL);
+    contactsTick().catch((e) => console.error("Contacts tick failed:", e));
+  }, CONTACT_TICK_MS);
 
   // Listen for backend contacts-changed events
   listen<string>("contacts-changed", async () => {

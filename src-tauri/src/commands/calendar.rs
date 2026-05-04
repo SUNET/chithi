@@ -119,7 +119,8 @@ async fn push_calendar_rename(
     remote_id: &str,
     new_name: &str,
 ) -> Result<()> {
-    if account.mail_protocol == "jmap" {
+    let cal_proto = account.calendar_protocol_str();
+    if cal_proto == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap
@@ -128,14 +129,14 @@ async fn push_calendar_rename(
         return Ok(());
     }
 
-    if account.provider == "o365" {
+    if cal_proto == "graph" {
         let token = crate::mail::graph::get_graph_token(&account.id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
         client.rename_calendar(remote_id, new_name).await?;
         return Ok(());
     }
 
-    if account.provider == "gmail" {
+    if cal_proto == "google" {
         // Prefer the Google Calendar REST endpoint; fall back to CalDAV
         // PROPPATCH if REST fails (OAuth not configured, or remote_id is
         // actually a CalDAV href).
@@ -180,8 +181,9 @@ async fn push_calendar_rename(
     }
 
     Err(crate::error::Error::Other(format!(
-        "No remote rename path configured for account {} (provider={}, protocol={})",
-        account.id, account.provider, account.mail_protocol
+        "No remote rename path configured for account {} (calendar_protocol={})",
+        account.id,
+        account.calendar_protocol_str()
     )))
 }
 
@@ -289,7 +291,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         db::calendar::insert_event(&conn, &cal_event)?;
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
 
-        if account.provider == "gmail" {
+        if account.calendar_protocol_str() == "google" {
             // Create on Google Calendar via REST API
             drop(conn);
             if let Ok(token) = get_google_token(&cal_event.account_id).await {
@@ -375,7 +377,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                     Err(e) => log::error!("create_event: Google Calendar request failed: {}", e),
                 }
             }
-        } else if account.provider == "o365" {
+        } else if account.calendar_protocol_str() == "graph" {
             drop(conn);
             if let Ok(token) = crate::mail::graph::get_graph_token(&cal_event.account_id).await {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -461,7 +463,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                     Err(e) => log::error!("create_event: Graph Calendar push failed: {}", e),
                 }
             }
-        } else if account.mail_protocol == "jmap" {
+        } else if account.calendar_protocol_str() == "jmap" {
             // Look up the remote calendar ID from local calendar
             let calendar = db::calendar::get_calendar(&conn, &cal_event.calendar_id)?;
             let remote_cal_id = calendar.remote_id.clone().unwrap_or_default();
@@ -568,7 +570,7 @@ pub async fn update_event(
     // Push update to server
     let account = db::accounts::get_account_full(&conn, &existing.account_id)?;
     if let Some(ref remote_id) = existing.remote_id.filter(|r| !r.is_empty()) {
-        if account.provider == "gmail" {
+        if account.calendar_protocol_str() == "google" {
             drop(conn);
             if let Ok(token) = get_google_token(&existing.account_id).await {
                 let http = reqwest::Client::new();
@@ -617,7 +619,7 @@ pub async fn update_event(
                     Err(e) => log::error!("update_event: Google Calendar request failed: {}", e),
                 }
             }
-        } else if account.provider == "o365" {
+        } else if account.calendar_protocol_str() == "graph" {
             drop(conn);
             if let Ok(token) = crate::mail::graph::get_graph_token(&existing.account_id).await {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -664,7 +666,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
     // Delete from server if event has a remote_id
     if let Some(ref remote_id) = event.remote_id {
         if !remote_id.is_empty() {
-            if account.provider == "gmail" {
+            if account.calendar_protocol_str() == "google" {
                 // Delete via Google Calendar API
                 match get_google_token(&event.account_id).await {
                     Ok(token) => {
@@ -699,7 +701,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
                         e
                     ),
                 }
-            } else if account.provider == "o365" {
+            } else if account.calendar_protocol_str() == "graph" {
                 match crate::mail::graph::get_graph_token(&event.account_id).await {
                     Ok(token) => {
                         let client = crate::mail::graph::GraphClient::new(&token);
@@ -714,7 +716,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
                         e
                     ),
                 }
-            } else if account.mail_protocol == "jmap" {
+            } else if account.calendar_protocol_str() == "jmap" {
                 let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                 match crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
                     Ok(conn_jmap) => {
@@ -799,9 +801,9 @@ pub async fn sync_calendars(
         );
     }
 
-    if account.mail_protocol == "jmap" {
+    if account.calendar_protocol_str() == "jmap" {
         sync_calendars_jmap(&state, &account_id, &account).await?;
-    } else if account.provider == "gmail" {
+    } else if account.calendar_protocol_str() == "google" {
         // Gmail: use Google CalDAV with OAuth2 bearer token
         match sync_calendars_google(&state, &account_id, &account).await {
             Ok(()) => {}
@@ -816,7 +818,7 @@ pub async fn sync_calendars(
                 }
             }
         }
-    } else if account.provider == "o365" {
+    } else if account.calendar_protocol_str() == "graph" {
         sync_calendars_graph(&state, &account_id).await?;
     } else if !account.caldav_url.is_empty() {
         sync_calendars_caldav(&state, &account_id, &account).await?;
@@ -1755,7 +1757,7 @@ pub async fn respond_to_invite(
             invite.summary.as_deref().unwrap_or("Calendar Invite")
         );
 
-        if account.mail_protocol == "jmap" {
+        if account.calendar_protocol_str() == "jmap" {
             log::info!("respond_to_invite: sending reply via JMAP");
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
@@ -1882,7 +1884,7 @@ pub async fn respond_to_invite(
     }
 
     // Step 5: Update Google Calendar if this is a Gmail account with OAuth
-    if account.provider == "gmail" {
+    if account.calendar_protocol_str() == "google" {
         drop(conn); // Release DB lock before async
         if let Ok(token) = get_google_token(&account_id).await {
             let google_status = match response.to_lowercase().as_str() {
@@ -2011,7 +2013,7 @@ pub async fn respond_to_invite(
     }
 
     // Step 6: Update O365 calendar via Graph API RSVP
-    if account.provider == "o365" {
+    if account.calendar_protocol_str() == "graph" {
         match crate::mail::graph::get_graph_token(&account_id).await {
             Ok(token) => {
                 let client = crate::mail::graph::GraphClient::new(&token);
@@ -2127,7 +2129,7 @@ fn build_calendar_reply_message(
 
 /// Get SMTP credentials for an account, refreshing OAuth tokens for O365.
 async fn get_smtp_credentials(account: &db::accounts::AccountFull) -> Result<(String, bool)> {
-    if account.provider == "o365" {
+    if account.calendar_protocol_str() == "graph" {
         let tokens = crate::oauth::load_tokens(&account.id)?
             .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
         let refresh_token = tokens
@@ -2296,10 +2298,10 @@ pub async fn send_invites(
     // Gmail and O365 handle sending invite emails server-side when
     // events are pushed via Google Calendar API (sendUpdates=all) or
     // Graph API. Sending our own SMTP invite would create duplicates.
-    if account.provider == "gmail" || account.provider == "o365" {
+    if account.calendar_protocol_str() == "google" || account.calendar_protocol_str() == "graph" {
         log::info!(
             "send_invites: skipping manual send for {} account (server handles invites)",
-            account.provider
+            account.calendar_protocol_str()
         );
         // Still update attendees in the local DB
         let conn = state.db.writer().await;
@@ -2374,7 +2376,7 @@ pub async fn send_invites(
             continue;
         }
 
-        if account.mail_protocol == "jmap" {
+        if account.calendar_protocol_str() == "jmap" {
             let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
@@ -2486,7 +2488,7 @@ pub async fn process_invite_reply(
             }
 
             // Update on JMAP server if applicable
-            if account.mail_protocol == "jmap" {
+            if account.calendar_protocol_str() == "jmap" {
                 if let Some(ref remote_id) = event.remote_id {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;
@@ -2833,7 +2835,11 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
     };
     let client = crate::mail::graph::GraphClient::new(&token);
 
-    // 1. Sync calendar list
+    // 1. List Graph calendars and upsert each into the local table.
+    // Multi-calendar support (#47): we keep a remote_id -> (local_id,
+    // is_subscribed) map so the per-calendar event sync below can map
+    // events to the right local calendar AND skip calendars the user
+    // has unsubscribed from.
     let graph_calendars = match client.list_calendars().await {
         Ok(c) => c,
         Err(e) => {
@@ -2846,175 +2852,187 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
         graph_calendars.len()
     );
 
-    let conn = state.db.writer().await;
-    for gc in &graph_calendars {
-        // Check if calendar with this remote_id already exists
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM calendars WHERE account_id = ?1 AND remote_id = ?2",
-                rusqlite::params![account_id, gc.id],
-                |row| row.get(0),
-            )
-            .ok();
+    let mut remote_to_local: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
 
-        match existing {
-            Some(_) => {
-                // Calendar exists — update name/color
-                conn.execute(
-                    "UPDATE calendars SET name = ?1, color = ?2 WHERE account_id = ?3 AND remote_id = ?4",
-                    rusqlite::params![gc.name, gc.color, account_id, gc.id],
-                ).ok();
-            }
-            None => {
-                // New calendar — insert with remote_id
-                let cal_id = uuid::Uuid::new_v4().to_string();
-                let cal = NewCalendar {
-                    account_id: account_id.to_string(),
-                    name: gc.name.clone(),
-                    color: gc.color.clone(),
-                    is_default: gc.is_default,
-                };
-                db::calendar::insert_calendar(&conn, &cal_id, &cal)?;
-                // Set remote_id (insert_calendar doesn't handle it)
-                conn.execute(
-                    "UPDATE calendars SET remote_id = ?1 WHERE id = ?2",
-                    rusqlite::params![gc.id, cal_id],
+    {
+        let conn = state.db.writer().await;
+        for gc in &graph_calendars {
+            // Look up existing row to preserve the user's is_subscribed
+            // setting; if absent, we insert and default-subscribe.
+            let existing: Option<(String, bool)> = conn
+                .query_row(
+                    "SELECT id, is_subscribed FROM calendars WHERE account_id = ?1 AND remote_id = ?2",
+                    rusqlite::params![account_id, gc.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .ok();
-                log::info!(
-                    "sync_calendars_graph: created calendar '{}' ({})",
-                    gc.name,
-                    gc.id
-                );
-            }
+
+            let (local_id, subscribed) = match existing {
+                Some((local_id, subscribed)) => {
+                    conn.execute(
+                        "UPDATE calendars SET name = ?1, color = ?2 WHERE id = ?3",
+                        rusqlite::params![gc.name, gc.color, local_id],
+                    )
+                    .ok();
+                    (local_id, subscribed)
+                }
+                None => {
+                    let cal_id = uuid::Uuid::new_v4().to_string();
+                    let cal = NewCalendar {
+                        account_id: account_id.to_string(),
+                        name: gc.name.clone(),
+                        color: gc.color.clone(),
+                        is_default: gc.is_default,
+                    };
+                    db::calendar::insert_calendar(&conn, &cal_id, &cal)?;
+                    conn.execute(
+                        "UPDATE calendars SET remote_id = ?1 WHERE id = ?2",
+                        rusqlite::params![gc.id, cal_id],
+                    )
+                    .ok();
+                    log::info!(
+                        "sync_calendars_graph: created calendar '{}' ({})",
+                        gc.name,
+                        gc.id
+                    );
+                    (cal_id, true)
+                }
+            };
+            remote_to_local.insert(gc.id.clone(), (local_id, subscribed));
         }
     }
 
-    // 2. Fetch events for a 6-month window
+    // 2. Fetch events for each subscribed calendar individually
+    // (`/me/calendars/{id}/calendarView`) — the previous all-account
+    // `/me/calendarView` collapsed every calendar's events onto the
+    // default calendar.
     let now = chrono::Utc::now();
     let start =
         (now - chrono::Duration::days(90)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let end = (now + chrono::Duration::days(90)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    drop(conn); // Release lock before async call
 
-    let graph_events = match client.list_events(&start, &end).await {
-        Ok(e) => e,
-        Err(e) => {
-            log::error!("sync_calendars_graph: list_events failed: {}", e);
-            return Err(e);
-        }
-    };
-    log::info!(
-        "sync_calendars_graph: fetched {} events",
-        graph_events.len()
-    );
-
-    let conn = state.db.writer().await;
-
-    // Build a set of server event IDs for reconciliation
-    let server_ids: std::collections::HashSet<String> =
-        graph_events.iter().map(|e| e.id.clone()).collect();
-
-    // Find the default calendar's local ID
-    let default_cal = graph_calendars.iter().find(|c| c.is_default);
-    let default_cal_local_id: String = default_cal
-        .and_then(|dc| {
-            conn.query_row(
-                "SELECT id FROM calendars WHERE account_id = ?1 AND remote_id = ?2",
-                rusqlite::params![account_id, dc.id],
-                |row| row.get(0),
-            )
-            .ok()
-        })
-        .unwrap_or_default();
-
-    for ge in &graph_events {
-        // Find local calendar ID for this event
-        let cal_local_id = if default_cal_local_id.is_empty() {
-            String::new()
-        } else {
-            default_cal_local_id.clone()
+    for gc in &graph_calendars {
+        let Some((local_cal_id, subscribed)) = remote_to_local.get(&gc.id) else {
+            continue;
         };
-
-        let existing = conn.query_row(
-            "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-            rusqlite::params![account_id, ge.id],
-            |row| row.get::<_, String>(0),
-        );
-
-        match existing {
-            Ok(local_id) => {
-                // Update existing event
-                conn.execute(
-                    "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
-                     all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                     description = ?8, timezone = ?9 WHERE id = ?10",
-                    rusqlite::params![
-                        ge.subject,
-                        ge.start,
-                        ge.end,
-                        ge.all_day,
-                        ge.location,
-                        ge.organizer_email,
-                        ge.attendees_json,
-                        ge.body_preview,
-                        ge.timezone,
-                        local_id,
-                    ],
-                )
-                .ok();
-            }
-            Err(_) => {
-                // Insert new event
-                let event = CalendarEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    account_id: account_id.to_string(),
-                    calendar_id: cal_local_id,
-                    uid: ge.ical_uid.clone(),
-                    title: ge.subject.clone(),
-                    description: ge.body_preview.clone(),
-                    location: ge.location.clone(),
-                    start_time: ge.start.clone(),
-                    end_time: ge.end.clone(),
-                    all_day: ge.all_day,
-                    timezone: ge.timezone.clone(),
-                    recurrence_rule: None,
-                    organizer_email: ge.organizer_email.clone(),
-                    attendees_json: ge.attendees_json.clone(),
-                    my_status: None,
-                    source_message_id: None,
-                    ical_data: None,
-                    remote_id: Some(ge.id.clone()),
-                    etag: None,
-                };
-                db::calendar::insert_event(&conn, &event)?;
-            }
+        if !subscribed {
+            log::debug!(
+                "sync_calendars_graph: skipping unsubscribed calendar '{}'",
+                gc.name
+            );
+            continue;
         }
-    }
 
-    // 3. Remove events deleted on server
-    let local_events: Vec<(String, String)> = conn
-        .prepare(
-            "SELECT id, remote_id FROM calendar_events WHERE account_id = ?1 AND remote_id IS NOT NULL AND remote_id != ''",
-        )?
-        .query_map(rusqlite::params![account_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let mut deleted = 0;
-    for (local_id, remote_id) in &local_events {
-        if !server_ids.contains(remote_id) {
-            db::calendar::delete_event(&conn, local_id)?;
-            deleted += 1;
-        }
-    }
-    if deleted > 0 {
+        let calendar_events = match client.list_events_for_calendar(&gc.id, &start, &end).await {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!(
+                    "sync_calendars_graph: list_events_for_calendar('{}') failed: {}",
+                    gc.name,
+                    e
+                );
+                continue;
+            }
+        };
         log::info!(
-            "sync_calendars_graph: removed {} server-deleted events",
-            deleted
+            "sync_calendars_graph: fetched {} events for calendar '{}'",
+            calendar_events.len(),
+            gc.name
         );
+
+        let conn = state.db.writer().await;
+        let server_ids: std::collections::HashSet<String> =
+            calendar_events.iter().map(|e| e.id.clone()).collect();
+
+        for ge in &calendar_events {
+            let existing = conn.query_row(
+                "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
+                rusqlite::params![account_id, ge.id],
+                |row| row.get::<_, String>(0),
+            );
+
+            match existing {
+                Ok(local_id) => {
+                    // Update in place. Also re-pin calendar_id in case
+                    // the event moved between calendars on the server.
+                    conn.execute(
+                        "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
+                         all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
+                         description = ?8, timezone = ?9, calendar_id = ?10 WHERE id = ?11",
+                        rusqlite::params![
+                            ge.subject,
+                            ge.start,
+                            ge.end,
+                            ge.all_day,
+                            ge.location,
+                            ge.organizer_email,
+                            ge.attendees_json,
+                            ge.body_preview,
+                            ge.timezone,
+                            local_cal_id,
+                            local_id,
+                        ],
+                    )
+                    .ok();
+                }
+                Err(_) => {
+                    let event = CalendarEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        account_id: account_id.to_string(),
+                        calendar_id: local_cal_id.clone(),
+                        uid: ge.ical_uid.clone(),
+                        title: ge.subject.clone(),
+                        description: ge.body_preview.clone(),
+                        location: ge.location.clone(),
+                        start_time: ge.start.clone(),
+                        end_time: ge.end.clone(),
+                        all_day: ge.all_day,
+                        timezone: ge.timezone.clone(),
+                        recurrence_rule: None,
+                        organizer_email: ge.organizer_email.clone(),
+                        attendees_json: ge.attendees_json.clone(),
+                        my_status: None,
+                        source_message_id: None,
+                        ical_data: None,
+                        remote_id: Some(ge.id.clone()),
+                        etag: None,
+                    };
+                    db::calendar::insert_event(&conn, &event)?;
+                }
+            }
+        }
+
+        // Per-calendar reconciliation: drop events that this calendar
+        // used to carry but that the server no longer returns. Scoped
+        // to calendar_id so a deletion in one calendar doesn't wipe
+        // events still present in another.
+        let local_events: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, remote_id FROM calendar_events
+                 WHERE account_id = ?1 AND calendar_id = ?2
+                   AND remote_id IS NOT NULL AND remote_id != ''",
+            )?
+            .query_map(rusqlite::params![account_id, local_cal_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut deleted = 0;
+        for (local_id, remote_id) in &local_events {
+            if !server_ids.contains(remote_id) {
+                db::calendar::delete_event(&conn, local_id)?;
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            log::info!(
+                "sync_calendars_graph: removed {} server-deleted events from '{}'",
+                deleted,
+                gc.name
+            );
+        }
     }
 
     log::info!("sync_calendars_graph: completed for account {}", account_id);

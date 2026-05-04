@@ -121,9 +121,18 @@ export const useCalendarStore = defineStore("calendar", () => {
     await fetchEvents();
   }
 
-  async function syncCalendars() {
+  async function syncCalendars(accountId?: string) {
     if (accountsStore.accounts.length === 0) {
       await accountsStore.fetchAccounts();
+    }
+    if (accountId) {
+      // Single-account sync used by the per-binding tick (#43): one
+      // account per call so each can run on its own cadence. The
+      // backend emits `calendar-changed` when the sync completes, and
+      // the listener below already triggers fetchCalendars() +
+      // fetchEvents() — so don't run them inline or we'd refresh twice.
+      await api.syncCalendars(accountId);
+      return;
     }
     // Sync all accounts in parallel so a hanging account doesn't block others.
     // Each backend sync_calendars emits "calendar-changed" when done, which
@@ -318,19 +327,46 @@ export const useCalendarStore = defineStore("calendar", () => {
     selectedEvent.value = event;
   }
 
-  // --- Independent calendar sync (5-minute interval) ---
-  // Calendar sync is decoupled from mail sync. It runs on its own timer
-  // so calendar updates don't wait for mail sync to finish.
-  const CALENDAR_SYNC_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  // --- Independent calendar sync ---
+  // Calendar sync is decoupled from mail sync and runs on its own timer.
+  // The timer ticks every minute and evaluates each account's calendar
+  // binding interval (#43): an account whose binding has
+  // sync_interval_seconds=900 syncs every 15 minutes; one with `null`
+  // falls back to DEFAULT_CALENDAR_INTERVAL (5 minutes).
+  const DEFAULT_CALENDAR_INTERVAL_MS = 5 * 60 * 1000;
+  const TICK_MS = 60 * 1000;
   let calendarSyncIntervalId: ReturnType<typeof setInterval> | null = null;
+  const lastCalendarSync = new Map<string, number>();
+
+  // We need access to the accounts store inside the timer. Importing it
+  // at module scope would create a cycle (calendar -> accounts -> ...);
+  // resolve it lazily on first tick instead.
+  async function tick() {
+    const { useAccountsStore } = await import("@/stores/accounts");
+    const accounts = useAccountsStore();
+    const now = Date.now();
+    for (const acc of accounts.accounts) {
+      if (!acc.enabled) continue;
+      const intervalMs =
+        (acc.calendar_sync_interval_seconds ?? 0) > 0
+          ? (acc.calendar_sync_interval_seconds as number) * 1000
+          : DEFAULT_CALENDAR_INTERVAL_MS;
+      const last = lastCalendarSync.get(acc.id) ?? 0;
+      if (now - last < intervalMs) continue;
+      lastCalendarSync.set(acc.id, now);
+      try {
+        await syncCalendars(acc.id);
+      } catch (e) {
+        console.error(`Periodic calendar sync failed for ${acc.id}:`, e);
+      }
+    }
+  }
 
   function startCalendarSync() {
     if (calendarSyncIntervalId) return;
     calendarSyncIntervalId = setInterval(() => {
-      syncCalendars().catch((e) =>
-        console.error("Periodic calendar sync failed:", e),
-      );
-    }, CALENDAR_SYNC_INTERVAL);
+      tick().catch((e) => console.error("Calendar tick failed:", e));
+    }, TICK_MS);
   }
 
   function stopCalendarSync() {

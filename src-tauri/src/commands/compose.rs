@@ -102,30 +102,31 @@ pub async fn send_message(
     )?;
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
-    let smtp_creds = if account.mail_protocol != "jmap" && account.provider == "o365" {
-        let tokens = crate::oauth::load_tokens(&account_id)?
-            .ok_or_else(|| Error::Other("No O365 tokens for SMTP".into()))?;
-        let refresh_token = tokens
-            .refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token for SMTP".into()))?;
-        let smtp_tokens = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh_token,
-            crate::oauth::MICROSOFT_IMAP_SCOPES,
-        )
-        .await?;
-        crate::oauth::store_tokens(
-            &account_id,
-            &crate::oauth::OAuthTokens {
-                access_token: smtp_tokens.access_token.clone(),
-                refresh_token: smtp_tokens.refresh_token,
-                expires_at: smtp_tokens.expires_at,
-            },
-        )?;
-        Some((account.username.clone(), smtp_tokens.access_token, true))
-    } else {
-        None
-    };
+    let smtp_creds =
+        if account.mail_protocol_str() != "jmap" && account.auth_method == "oauth-microsoft" {
+            let tokens = crate::oauth::load_tokens(&account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens for SMTP".into()))?;
+            let refresh_token = tokens
+                .refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token for SMTP".into()))?;
+            let smtp_tokens = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT,
+                &refresh_token,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
+            crate::oauth::store_tokens(
+                &account_id,
+                &crate::oauth::OAuthTokens {
+                    access_token: smtp_tokens.access_token.clone(),
+                    refresh_token: smtp_tokens.refresh_token,
+                    expires_at: smtp_tokens.expires_at,
+                },
+            )?;
+            Some((account.username.clone(), smtp_tokens.access_token, true))
+        } else {
+            None
+        };
 
     // Notify main window that send is starting
     let subject_display = if message.subject.is_empty() {
@@ -183,7 +184,7 @@ pub async fn send_message(
 
     tokio::spawn(async move {
         let result: std::result::Result<(), Error> = async {
-            if account.mail_protocol == "jmap" {
+            if account.mail_protocol_str() == "jmap" {
                 log::info!("Sending via JMAP for account {}", account.email);
                 let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
                 let conn_jmap = JmapConnection::connect(&jmap_config).await?;
@@ -325,7 +326,7 @@ pub async fn save_draft(
         &references,
     )?;
 
-    if account.mail_protocol == "graph" {
+    if account.mail_protocol_str() == "graph" {
         // Save draft via Graph API: POST /me/messages creates a draft without sending
         log::info!(
             "Saving draft via Microsoft Graph for account {}",
@@ -342,13 +343,13 @@ pub async fn save_draft(
                 body_text: message.body_text.clone(),
             })
             .await?;
-    } else if account.mail_protocol == "jmap" {
+    } else if account.mail_protocol_str() == "jmap" {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
         conn_jmap.save_draft(&jmap_config, &raw_message).await?;
     } else {
         // IMAP: append to Drafts folder (O365 uses XOAUTH2)
-        let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account.id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens

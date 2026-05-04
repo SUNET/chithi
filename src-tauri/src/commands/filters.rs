@@ -90,7 +90,7 @@ pub async fn apply_filters_to_folder(
     };
 
     // Build IMAP config — O365 needs XOAUTH2 token refresh
-    let (imap_password, imap_xoauth2) = if account.provider == "o365" {
+    let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
         let tokens = crate::oauth::load_tokens(&account_id)?
             .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
         let refresh = tokens

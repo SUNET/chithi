@@ -313,10 +313,10 @@ impl AccountWorker {
 
         match op {
             MailOp::SyncAll { current_folder } => {
-                if account.mail_protocol == "graph" {
+                if account.mail_protocol_str() == "graph" {
                     // Graph sync handled by sync_cmd directly
                     return Ok(());
-                } else if account.mail_protocol == "jmap" {
+                } else if account.mail_protocol_str() == "jmap" {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     crate::mail::jmap_sync::sync_jmap_account(
@@ -348,7 +348,7 @@ impl AccountWorker {
                 }
             }
             MailOp::SyncFolder { folder_path } => {
-                if account.mail_protocol == "jmap" {
+                if account.mail_protocol_str() == "jmap" {
                     let jmap_config =
                         crate::commands::sync_cmd::build_jmap_config(&account).await?;
                     crate::mail::jmap_sync::sync_jmap_folder_public(
@@ -360,7 +360,7 @@ impl AccountWorker {
                         jmap_config,
                     )
                     .await?;
-                } else if account.mail_protocol == "imap" {
+                } else if account.mail_protocol_str() == "imap" {
                     let imap_config = self.build_imap_config(&account).await?;
                     let db = self.db.clone();
                     let account_id = self.account_id.clone();
@@ -472,7 +472,7 @@ impl AccountWorker {
         &mut self,
         account: &crate::db::accounts::AccountFull,
     ) -> Result<ImapConfig> {
-        let (password, use_xoauth2) = if account.provider == "o365" {
+        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
             let tokens = crate::oauth::load_tokens(&account.id)?
                 .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
             let refresh = tokens

@@ -47,6 +47,9 @@ function setupAccounts() {
     {
       id: "acc1", display_name: "Test", email: "test@test.com",
       provider: "generic", mail_protocol: "jmap" as const, enabled: true,
+      mail_sync_interval_seconds: null,
+      calendar_sync_interval_seconds: null,
+      contacts_sync_interval_seconds: null,
     },
   ];
   accountsStore.activeAccountId = "acc1";

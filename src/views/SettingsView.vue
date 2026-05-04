@@ -43,6 +43,50 @@ const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
 const oauthStatus = ref<string | null>(null);
 const oauthInProgress = ref(false);
+const discoveringDav = ref(false);
+const discoveryNote = ref<string | null>(null);
+
+// Wire form-side number inputs in minutes; convert to/from seconds when
+// reading and writing AccountConfig so the wire format keeps the
+// Tauri-friendly seconds unit.
+function makeMinutesField(key: "calendar_sync_interval_seconds" | "contacts_sync_interval_seconds" | "mail_sync_interval_seconds") {
+  return computed<number | null>({
+    get: () => {
+      const s = form.value[key];
+      return s == null ? null : Math.round(s / 60);
+    },
+    set: (m) => {
+      if (m == null || Number.isNaN(m)) {
+        form.value[key] = null;
+      } else {
+        // Clamp to a minimum of 1 minute. The browser already enforces
+        // `min="1"` on the input but a programmatic v-model write (or
+        // someone bypassing the input) could otherwise persist
+        // sub-minute values into *_sync_interval_seconds.
+        const minutes = Math.max(1, Math.round(m));
+        form.value[key] = minutes * 60;
+      }
+    },
+  });
+}
+
+const calendarIntervalMinutes = makeMinutesField("calendar_sync_interval_seconds");
+const contactsIntervalMinutes = makeMinutesField("contacts_sync_interval_seconds");
+
+// Whether the current form would result in a calendar / contacts
+// binding once saved. Mirrors derive_bindings on the backend:
+//  - JMAP mail accounts get JMAP calendar + JMAP contacts.
+//  - Gmail (auth_method oauth-google) gets Google APIs for both.
+//  - O365 gets Graph for both.
+//  - Generic IMAP only gets DAV bindings if a caldav_url has been
+//    discovered (or manually filled).
+const hasCalendarBinding = computed(() =>
+  form.value.mail_protocol === "jmap"
+  || form.value.provider === "gmail"
+  || form.value.provider === "o365"
+  || !!form.value.caldav_url,
+);
+const hasContactsBinding = computed(() => hasCalendarBinding.value);
 
 function getInitials(name: string): string {
   const words = name.split(/\s+/);
@@ -69,16 +113,33 @@ const defaultForm = (): AccountConfig => ({
   oidc_token_endpoint: "",
   oidc_client_id: "",
   calendar_sync_enabled: true,
+  mail_sync_enabled: true,
+  contacts_sync_enabled: true,
+  mail_sync_interval_seconds: null,
+  calendar_sync_interval_seconds: null,
+  contacts_sync_interval_seconds: null,
+  has_calendar_binding: false,
+  has_contacts_binding: false,
 });
 
 const form = ref<AccountConfig>(defaultForm());
 
-type AccountType = "gmail" | "imap" | "jmap" | "caldav" | "o365";
+type AccountType = "gmail" | "imap" | "jmap" | "caldav" | "carddav" | "o365";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
   accountType.value = type;
   const f = form.value;
+
+  // Reset per-service flags up front so switching tabs doesn't carry
+  // disabled-state from a previous selection (e.g. picking CardDAV-only
+  // turns calendar_sync_enabled off, then switching back to IMAP must
+  // turn it on again, otherwise the new account would silently skip
+  // calendar sync). Each branch below overrides only what it needs.
+  f.calendar_sync_enabled = true;
+  f.contacts_sync_enabled = true;
+  f.mail_sync_enabled = true;
+
   switch (type) {
     case "gmail":
       f.provider = "gmail";
@@ -116,14 +177,35 @@ function selectAccountType(type: AccountType) {
       f.use_tls = true;
       break;
     case "caldav":
+      // Standalone CalDAV calendar (#43). No mail backend; the bindings
+      // layer skips creating a mail binding when mail_protocol is empty.
       f.provider = "generic";
-      f.mail_protocol = "imap";
+      f.mail_protocol = "";
       f.imap_host = "";
       f.imap_port = 0;
       f.smtp_host = "";
       f.smtp_port = 0;
       f.jmap_url = "";
       f.use_tls = true;
+      // CalDAV-only accounts shouldn't also create a CardDAV contacts
+      // binding by default — disable it explicitly. The mail toggle
+      // doesn't matter (no mail binding will be derived) but keep it
+      // consistent.
+      f.contacts_sync_enabled = false;
+      break;
+    case "carddav":
+      // Standalone CardDAV address book (#43). Same shape as CalDAV but
+      // we toggle the inverse flags so derive_bindings creates only the
+      // contacts binding.
+      f.provider = "generic";
+      f.mail_protocol = "";
+      f.imap_host = "";
+      f.imap_port = 0;
+      f.smtp_host = "";
+      f.smtp_port = 0;
+      f.jmap_url = "";
+      f.use_tls = true;
+      f.calendar_sync_enabled = false;
       break;
   }
 }
@@ -177,14 +259,93 @@ async function openEditForm(id: string) {
       } else {
         oauthStatus.value = null;
       }
-    } else if (config.caldav_url && !config.imap_host) {
-      accountType.value = "caldav";
+    } else if (config.mail_protocol === "") {
+      // Standalone DAV account (#43). Pick the tab from the binding
+      // shape rather than the sync-enabled flags so toggling "Sync
+      // calendar" / "Sync contacts" doesn't reclassify the account
+      // back to "imap" and hide the URL field.
+      if (config.has_contacts_binding && !config.has_calendar_binding) {
+        accountType.value = "carddav";
+      } else {
+        accountType.value = "caldav";
+      }
     } else {
       accountType.value = "imap";
     }
     showForm.value = true;
   } catch (e) {
     error.value = String(e);
+  }
+}
+
+/// Run Thunderbird-style autoconfig + CalDAV/CardDAV probing for the
+/// current form (#43). Applies any discovered IMAP/SMTP host+port+TLS
+/// settings AND the DAV URL if found. Each piece is independent: a
+/// successful autoconfig with no DAV still pre-fills the mail servers
+/// and vice versa. A summary of what was filled in is shown below the
+/// button.
+async function discoverDavEndpoints() {
+  discoveringDav.value = true;
+  discoveryNote.value = null;
+  try {
+    const result = await api.probeDavEndpoints(
+      form.value.email,
+      form.value.username || form.value.email,
+      form.value.password,
+      form.value.imap_host,
+      form.value.smtp_host,
+    );
+
+    const filled: string[] = [];
+    if (result.imap_host) {
+      form.value.imap_host = result.imap_host;
+      form.value.imap_port = result.imap_port || 993;
+      filled.push("IMAP");
+    }
+    if (result.smtp_host) {
+      form.value.smtp_host = result.smtp_host;
+      form.value.smtp_port = result.smtp_port || 587;
+      filled.push("SMTP");
+    }
+    // The wire format carries one shared `use_tls` flag while autoconfig
+    // returns IMAP- and SMTP-specific settings. Only apply it when both
+    // services agree; if they disagree, prefer the more secure value
+    // (don't silently downgrade TLS) and log it.
+    if (result.imap_host && result.smtp_host) {
+      if (result.imap_use_tls === result.smtp_use_tls) {
+        form.value.use_tls = result.imap_use_tls;
+      } else {
+        console.warn(
+          "autoconfig: imap_use_tls / smtp_use_tls disagree; keeping TLS on",
+        );
+        form.value.use_tls = true;
+      }
+    } else if (result.imap_host) {
+      form.value.use_tls = result.imap_use_tls;
+    } else if (result.smtp_host) {
+      form.value.use_tls = result.smtp_use_tls;
+    }
+    const davUrl = result.caldav_url || result.carddav_url;
+    if (davUrl) {
+      form.value.caldav_url = davUrl;
+      if (result.caldav_url) filled.push("CalDAV");
+      if (result.carddav_url) filled.push("CardDAV");
+    }
+
+    if (filled.length === 0) {
+      discoveryNote.value = "No autoconfig data found for this domain.";
+    } else {
+      const sourceLabel = result.source ? ` (via ${result.source})` : "";
+      discoveryNote.value = `Filled ${filled.join(" + ")}${sourceLabel}.`;
+    }
+  } catch (e) {
+    // Match the rest of the UI: unwrap Error.message instead of
+    // template-stringifying the raw value, which can render
+    // "[object Object]" when the backend returns a structured error.
+    const msg = e instanceof Error ? e.message : String(e);
+    discoveryNote.value = `Discovery failed: ${msg}`;
+  } finally {
+    discoveringDav.value = false;
   }
 }
 
@@ -542,11 +703,12 @@ onMounted(() => {
               <label>Account Type</label>
               <div class="type-selector">
                 <button
-                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav'] as AccountType[])"
+                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav'] as AccountType[])"
                   :key="t"
                   class="type-btn"
                   :class="{ active: accountType === t }"
                   :disabled="!!editingAccountId"
+                  :data-testid="`account-type-${t}`"
                   @click="selectAccountType(t)"
                 >{{ t === 'gmail' ? 'Gmail' : t === 'o365' ? 'Microsoft 365' : t.toUpperCase() }}</button>
               </div>
@@ -702,10 +864,49 @@ onMounted(() => {
               </template>
             </template>
 
-            <template v-if="accountType === 'imap' || accountType === 'caldav'">
+            <!-- For standalone CalDAV / CardDAV the URL is the entire
+                 reason the account exists, so it stays as a manual
+                 input. IMAP accounts go through auto-discovery instead
+                 (button below); the discovered URL drives whether the
+                 calendar / contacts toggles appear in the per-service
+                 section. -->
+            <template v-if="accountType === 'caldav' || accountType === 'carddav'">
               <div class="form-group">
-                <label>CalDAV URL {{ accountType === 'caldav' ? '' : '(optional)' }}</label>
-                <input v-model="form.caldav_url" type="url" placeholder="https://mail.example.com/dav/cal" />
+                <label>{{ accountType === 'carddav' ? 'CardDAV URL' : 'CalDAV URL' }}</label>
+                <input
+                  v-model="form.caldav_url"
+                  type="url"
+                  :placeholder="accountType === 'carddav'
+                    ? 'https://contacts.example.com/dav'
+                    : 'https://mail.example.com/dav/cal'"
+                  :data-testid="`${accountType}-url`"
+                />
+              </div>
+            </template>
+
+            <template v-if="accountType === 'imap'">
+              <div class="form-group">
+                <label>Calendar &amp; Contacts (CalDAV / CardDAV)</label>
+                <div class="dav-discovery-row">
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    data-testid="dav-discover-btn"
+                    :disabled="discoveringDav || !form.email || !form.password"
+                    @click="discoverDavEndpoints"
+                  >
+                    {{ discoveringDav ? 'Searching...' : (form.caldav_url ? 'Re-run discovery' : 'Auto-discover') }}
+                  </button>
+                  <span v-if="form.caldav_url" class="field-hint dav-discovered-url" data-testid="dav-discovered-url">
+                    Found at {{ form.caldav_url }}
+                  </span>
+                  <span v-else-if="!form.email || !form.password" class="field-hint">
+                    Enter email and password first.
+                  </span>
+                </div>
+                <span v-if="discoveryNote" class="field-hint" data-testid="dav-discovery-note">
+                  {{ discoveryNote }}
+                </span>
               </div>
             </template>
 
@@ -723,18 +924,116 @@ onMounted(() => {
               ></textarea>
             </div>
 
-            <div class="form-group form-group-checkbox">
+            <!-- Per-binding sync controls. Only meaningful for accounts
+                 that have multiple bindings; the standalone CalDAV /
+                 CardDAV tabs hide the irrelevant rows. Visually a
+                 form-group that matches the other sections rather than
+                 a bordered fieldset. -->
+            <div
+              v-if="accountType !== 'caldav' && accountType !== 'carddav'"
+              class="form-group bindings-section"
+              data-testid="binding-controls"
+            >
+              <label class="bindings-section-title">Per-service sync</label>
+
+              <!-- Mail toggle + interval: only show when there's actually
+                   a mail binding. CalDAV/CardDAV-only accounts hide this. -->
+              <div v-if="form.mail_protocol" class="form-group form-group-checkbox">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.mail_sync_enabled"
+                    type="checkbox"
+                    data-testid="mail-sync-enabled"
+                  />
+                  Sync mail
+                </label>
+                <p class="form-help">
+                  Turn off to keep using calendars and contacts on this server without fetching mail. Useful for JMAP accounts you only treat as a calendar source.
+                </p>
+              </div>
+
+              <div v-if="hasCalendarBinding" class="form-group form-group-checkbox binding-row">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.calendar_sync_enabled"
+                    type="checkbox"
+                    data-testid="calendar-sync-enabled"
+                  />
+                  Sync calendar
+                </label>
+                <div class="interval-row">
+                  <span>Every</span>
+                  <input
+                    v-model="calendarIntervalMinutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    placeholder="5"
+                    class="interval-input"
+                    data-testid="calendar-sync-interval"
+                  />
+                  <span>minutes</span>
+                  <span class="field-hint inline-hint">default 5 if blank</span>
+                </div>
+              </div>
+
+              <div v-if="hasContactsBinding" class="form-group form-group-checkbox binding-row">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.contacts_sync_enabled"
+                    type="checkbox"
+                    data-testid="contacts-sync-enabled"
+                  />
+                  Sync contacts
+                </label>
+                <div class="interval-row">
+                  <span>Every</span>
+                  <input
+                    v-model="contactsIntervalMinutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    placeholder="30"
+                    class="interval-input"
+                    data-testid="contacts-sync-interval"
+                  />
+                  <span>minutes</span>
+                  <span class="field-hint inline-hint">default 30 if blank</span>
+                </div>
+              </div>
+
+              <p class="form-help bindings-footer">
+                When a service is off, the corresponding data is not fetched from the server. Already-synced data remains available offline.
+              </p>
+            </div>
+
+            <!-- For standalone CalDAV/CardDAV the only relevant toggle is
+                 the calendar/contacts one for the matching service. -->
+            <div
+              v-if="accountType === 'caldav'"
+              class="form-group form-group-checkbox"
+            >
               <label class="checkbox-label">
                 <input
                   v-model="form.calendar_sync_enabled"
                   type="checkbox"
                   data-testid="calendar-sync-enabled"
                 />
-                Enable calendar sync for this account
+                Sync calendar
               </label>
-              <p class="form-help">
-                When off, calendars and events are not fetched from the server. Existing calendar data remains available offline.
-              </p>
+            </div>
+            <div
+              v-if="accountType === 'carddav'"
+              class="form-group form-group-checkbox"
+            >
+              <label class="checkbox-label">
+                <input
+                  v-model="form.contacts_sync_enabled"
+                  type="checkbox"
+                  data-testid="contacts-sync-enabled"
+                />
+                Sync contacts
+              </label>
             </div>
           </div>
           <div class="modal-footer">
@@ -1110,6 +1409,67 @@ onMounted(() => {
   font-size: 12px;
   color: var(--color-text-muted);
   line-height: 1.4;
+}
+
+.bindings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bindings-section-title {
+  /* Mirror .form-group label so this section reads like a labelled field
+     (no border, no fieldset chrome). */
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.binding-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.interval-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 24px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.interval-input {
+  /* Override the full-width form input style — the timer field is a
+     short inline number input, not a text field. */
+  width: 64px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.inline-hint {
+  margin-left: 4px;
+  font-style: italic;
+}
+
+.bindings-footer {
+  margin: 4px 0 0 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.dav-discovery-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dav-discovered-url {
+  word-break: break-all;
 }
 
 .btn-primary {

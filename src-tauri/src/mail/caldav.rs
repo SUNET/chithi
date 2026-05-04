@@ -208,22 +208,41 @@ impl CalDavClient {
     }
 
     /// Auto-discover CalDAV URL by trying `.well-known/caldav` on the email domain.
-    async fn auto_discover(http: &reqwest::Client, auth: &DavAuth, email: &str) -> Result<String> {
+    pub(crate) async fn auto_discover(
+        http: &reqwest::Client,
+        auth: &DavAuth,
+        email: &str,
+    ) -> Result<String> {
         let domain = email
             .rsplit('@')
             .next()
             .ok_or_else(|| Error::Other("Invalid email for CalDAV discovery".to_string()))?;
+        Self::auto_discover_hosts(
+            http,
+            auth,
+            &[domain.to_string(), format!("mail.{}", domain)],
+        )
+        .await
+    }
 
-        // Try the bare domain first, then mail.<domain>
-        let candidates = vec![
-            format!("https://{}/.well-known/caldav", domain),
-            format!("https://mail.{}/.well-known/caldav", domain),
-        ];
-
-        for url in &candidates {
+    /// Same as `auto_discover`, but probes a caller-supplied list of
+    /// hostnames. Used by the Settings auto-discover command (#43) so it
+    /// can also try the IMAP and SMTP server hostnames the user already
+    /// entered, which often differ from the email domain (e.g. an
+    /// `@example.com` mailbox served by `coms.example.org`).
+    pub(crate) async fn auto_discover_hosts(
+        http: &reqwest::Client,
+        auth: &DavAuth,
+        hosts: &[String],
+    ) -> Result<String> {
+        for host in hosts {
+            if host.is_empty() {
+                continue;
+            }
+            let url = format!("https://{}/.well-known/caldav", host);
             log::debug!("caldav: trying auto-discovery at {}", url);
             match Self::apply_auth_static(
-                http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url),
+                http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url),
                 auth,
             )
             .header("Depth", "0")
@@ -236,7 +255,6 @@ impl CalDavClient {
                     let status = resp.status();
                     let final_url = resp.url().clone();
                     if status.is_success() || status.as_u16() == 207 {
-                        // The redirect target (or final URL) is our CalDAV base
                         let port_str = final_url
                             .port()
                             .map(|p| format!(":{}", p))
@@ -244,7 +262,7 @@ impl CalDavClient {
                         let discovered = format!(
                             "{}://{}{}{}",
                             final_url.scheme(),
-                            final_url.host_str().unwrap_or(domain),
+                            final_url.host_str().unwrap_or(host),
                             port_str,
                             final_url.path().trim_end_matches('/')
                         );
