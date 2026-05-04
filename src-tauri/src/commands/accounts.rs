@@ -205,6 +205,10 @@ pub async fn get_account_config(
     log::debug!("Getting config for account {}", account_id);
     let conn = state.db.reader();
     let full = db::accounts::get_account_full(&conn, &account_id)?;
+    // Compute binding-presence flags before we partial-move `full`'s
+    // String fields into the AccountConfig literal below.
+    let has_calendar_binding = full.calendar_binding().is_some();
+    let has_contacts_binding = full.contacts_binding().is_some();
     // Never return the actual password to the frontend.
     // The edit form shows a placeholder; empty on save means "keep existing".
     Ok(db::accounts::AccountConfig {
@@ -231,6 +235,8 @@ pub async fn get_account_config(
         mail_sync_interval_seconds: full.mail_sync_interval_seconds,
         calendar_sync_interval_seconds: full.calendar_sync_interval_seconds,
         contacts_sync_interval_seconds: full.contacts_sync_interval_seconds,
+        has_calendar_binding,
+        has_contacts_binding,
     })
 }
 

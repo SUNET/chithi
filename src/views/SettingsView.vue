@@ -118,6 +118,8 @@ const defaultForm = (): AccountConfig => ({
   mail_sync_interval_seconds: null,
   calendar_sync_interval_seconds: null,
   contacts_sync_interval_seconds: null,
+  has_calendar_binding: false,
+  has_contacts_binding: false,
 });
 
 const form = ref<AccountConfig>(defaultForm());
@@ -128,6 +130,16 @@ const accountType = ref<AccountType>("gmail");
 function selectAccountType(type: AccountType) {
   accountType.value = type;
   const f = form.value;
+
+  // Reset per-service flags up front so switching tabs doesn't carry
+  // disabled-state from a previous selection (e.g. picking CardDAV-only
+  // turns calendar_sync_enabled off, then switching back to IMAP must
+  // turn it on again, otherwise the new account would silently skip
+  // calendar sync). Each branch below overrides only what it needs.
+  f.calendar_sync_enabled = true;
+  f.contacts_sync_enabled = true;
+  f.mail_sync_enabled = true;
+
   switch (type) {
     case "gmail":
       f.provider = "gmail";
@@ -176,9 +188,10 @@ function selectAccountType(type: AccountType) {
       f.jmap_url = "";
       f.use_tls = true;
       // CalDAV-only accounts shouldn't also create a CardDAV contacts
-      // binding by default — disable it explicitly.
+      // binding by default — disable it explicitly. The mail toggle
+      // doesn't matter (no mail binding will be derived) but keep it
+      // consistent.
       f.contacts_sync_enabled = false;
-      f.calendar_sync_enabled = true;
       break;
     case "carddav":
       // Standalone CardDAV address book (#43). Same shape as CalDAV but
@@ -192,7 +205,6 @@ function selectAccountType(type: AccountType) {
       f.smtp_port = 0;
       f.jmap_url = "";
       f.use_tls = true;
-      f.contacts_sync_enabled = true;
       f.calendar_sync_enabled = false;
       break;
   }
@@ -247,12 +259,16 @@ async function openEditForm(id: string) {
       } else {
         oauthStatus.value = null;
       }
-    } else if (config.mail_protocol === "" && config.calendar_sync_enabled) {
-      // Standalone CalDAV calendar account (#43).
-      accountType.value = "caldav";
-    } else if (config.mail_protocol === "" && config.contacts_sync_enabled) {
-      // Standalone CardDAV contacts account (#43).
-      accountType.value = "carddav";
+    } else if (config.mail_protocol === "") {
+      // Standalone DAV account (#43). Pick the tab from the binding
+      // shape rather than the sync-enabled flags so toggling "Sync
+      // calendar" / "Sync contacts" doesn't reclassify the account
+      // back to "imap" and hide the URL field.
+      if (config.has_contacts_binding && !config.has_calendar_binding) {
+        accountType.value = "carddav";
+      } else {
+        accountType.value = "caldav";
+      }
     } else {
       accountType.value = "imap";
     }
@@ -323,7 +339,11 @@ async function discoverDavEndpoints() {
       discoveryNote.value = `Filled ${filled.join(" + ")}${sourceLabel}.`;
     }
   } catch (e) {
-    discoveryNote.value = `Discovery failed: ${e}`;
+    // Match the rest of the UI: unwrap Error.message instead of
+    // template-stringifying the raw value, which can render
+    // "[object Object]" when the backend returns a structured error.
+    const msg = e instanceof Error ? e.message : String(e);
+    discoveryNote.value = `Discovery failed: ${msg}`;
   } finally {
     discoveringDav.value = false;
   }

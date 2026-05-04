@@ -174,6 +174,13 @@ export interface AccountConfig {
   mail_sync_interval_seconds: number | null;
   calendar_sync_interval_seconds: number | null;
   contacts_sync_interval_seconds: number | null;
+  /// Whether a calendar / contacts binding actually exists for this
+  /// account (regardless of its enabled state). Used by the Settings
+  /// edit form to disambiguate standalone CalDAV-only vs CardDAV-only
+  /// accounts even when the user has unchecked the matching Sync flag.
+  /// Backend-populated; treated as read-only in form state.
+  has_calendar_binding: boolean;
+  has_contacts_binding: boolean;
 }
 
 /// Combined result of Thunderbird-style autoconfig + DAV probing.

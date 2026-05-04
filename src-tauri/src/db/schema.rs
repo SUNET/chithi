@@ -239,7 +239,27 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // already finished Phase 3. Without this gate, fresh installs would
     // re-create columns we just dropped (the ADD COLUMN sequence below
     // sees the column missing and tries to add it back).
-    let phase3_done = has_migration(conn, "service_bindings_drop_legacy_columns");
+    //
+    // Two ways to detect Phase 3:
+    // 1. The migration marker is set (existing DB that already migrated).
+    // 2. The CREATE TABLE in initialize() ran for a fresh install — i.e.
+    //    `provider` was never created, so the legacy column is absent.
+    //    Set the marker proactively so we skip the legacy add+drop dance
+    //    AND avoid relying on `ALTER TABLE ... DROP COLUMN` support on
+    //    fresh installs.
+    let mut phase3_done = has_migration(conn, "service_bindings_drop_legacy_columns");
+    if !phase3_done {
+        let legacy_provider_present = conn
+            .prepare("SELECT provider FROM accounts LIMIT 0")
+            .is_ok();
+        if !legacy_provider_present {
+            log::info!(
+                "Migration: detected Phase-3 schema (no `provider` column); marking drop-legacy migration done"
+            );
+            set_migration(conn, "service_bindings_drop_legacy_columns")?;
+            phase3_done = true;
+        }
+    }
 
     if !phase3_done {
         // Add jmap_url column if it doesn't exist (added in JMAP support)
