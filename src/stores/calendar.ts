@@ -57,7 +57,16 @@ export const useCalendarStore = defineStore("calendar", () => {
     const rangeEnd = new Date(range.end);
     const result: CalendarEvent[] = [];
 
+    // Drop events whose calendar isn't in the (subscribed-only)
+    // calendar list. Without this filter, events linger from
+    // calendars the user unsubscribed from in the past — the next
+    // backend sync re-pulls them and they become "ghost" events
+    // visible in the grid even though the calendar is hidden in the
+    // sidebar.
+    const visibleCalendarIds = new Set(calendars.value.map((c) => c.id));
+
     for (const e of events.value) {
+      if (!visibleCalendarIds.has(e.calendar_id)) continue;
       if (hiddenCalendarIds.value.includes(e.calendar_id)) continue;
 
       if (e.recurrence_rule) {

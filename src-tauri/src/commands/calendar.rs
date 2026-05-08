@@ -1425,8 +1425,15 @@ async fn sync_calendars_caldav(
         account_id
     );
 
-    // Build a mapping from remote calendar href to local calendar ID
-    let mut remote_to_local: std::collections::HashMap<String, String> =
+    // Build a mapping from remote calendar href to (local id, is_subscribed)
+    // — same shape as sync_calendars_graph (#47). The is_subscribed flag
+    // is preserved across re-syncs by upsert_calendar_by_remote_id, so
+    // we read it back from the DB after upserting and use it below to
+    // skip event sync for calendars the user has unsubscribed from.
+    // Without this skip, unsubscribing a calendar drops its events
+    // (via unsubscribe_calendar) but the very next sync re-pulls them
+    // and they show up as "ghost" events.
+    let mut remote_to_local: std::collections::HashMap<String, (String, bool)> =
         std::collections::HashMap::new();
 
     {
@@ -1437,12 +1444,29 @@ async fn sync_calendars_caldav(
             let local_id = db::calendar::upsert_calendar_by_remote_id(
                 &conn, account_id, &cal.href, &cal.name, color, is_default,
             )?;
-            remote_to_local.insert(cal.href.clone(), local_id);
+            let subscribed: bool = conn
+                .query_row(
+                    "SELECT is_subscribed FROM calendars WHERE id = ?1",
+                    rusqlite::params![local_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(true);
+            remote_to_local.insert(cal.href.clone(), (local_id, subscribed));
         }
     }
 
-    // Step 2: For each calendar, fetch events and upsert into local DB
+    // Step 2: For each subscribed calendar, fetch events and upsert into local DB
     for cal in &caldav_calendars {
+        let Some((local_cal_id, subscribed)) = remote_to_local.get(&cal.href) else {
+            continue;
+        };
+        if !subscribed {
+            log::debug!(
+                "sync_calendars_caldav: skipping unsubscribed calendar '{}'",
+                cal.name
+            );
+            continue;
+        }
         let caldav_events = match client.fetch_events(&cal.href).await {
             Ok(evts) => evts,
             Err(e) => {
@@ -1460,8 +1484,6 @@ async fn sync_calendars_caldav(
             caldav_events.len(),
             cal.name
         );
-
-        let local_cal_id = remote_to_local.get(&cal.href).cloned().unwrap_or_default();
 
         let conn = state.db.writer().await;
         for ev in &caldav_events {
@@ -1568,7 +1590,7 @@ async fn sync_calendars_caldav(
                 // Find the remote calendar href for this event's local calendar
                 let remote_cal_href = remote_to_local
                     .iter()
-                    .find(|(_, local_id)| **local_id == ev.calendar_id)
+                    .find(|(_, (local_id, _))| *local_id == ev.calendar_id)
                     .map(|(remote_href, _)| remote_href.clone())
                     .unwrap_or_default();
 
