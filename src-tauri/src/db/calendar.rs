@@ -271,6 +271,13 @@ pub fn list_events(
     start: &str,
     end: &str,
 ) -> Result<Vec<CalendarEvent>> {
+    // Single-shot events are filtered to those that overlap the visible
+    // window. Recurring events (`recurrence_rule` non-empty) ALWAYS pass
+    // through regardless of their master row's date range — their
+    // occurrences are computed by the frontend's expandRRule, and the
+    // master row's start_time can be years before the visible window.
+    // Without this carve-out, an event whose RRULE master sits in 2021
+    // never reaches expandRRule when the user views 2026.
     let (query, do_calendar_filter) = if calendar_id.is_some() {
         (
             "SELECT id, account_id, calendar_id, uid, title, description, location,
@@ -279,7 +286,8 @@ pub fn list_events(
                     ical_data, remote_id, etag
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
-               AND start_time < ?4 AND end_time > ?3
+               AND ((start_time < ?4 AND end_time > ?3)
+                    OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
             true,
         )
@@ -291,7 +299,8 @@ pub fn list_events(
                     ical_data, remote_id, etag
              FROM calendar_events
              WHERE account_id = ?1
-               AND start_time < ?3 AND end_time > ?2
+               AND ((start_time < ?3 AND end_time > ?2)
+                    OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
             false,
         )
