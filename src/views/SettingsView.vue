@@ -357,6 +357,22 @@ async function saveAccount() {
     if (!form.value.username.trim()) {
       form.value.username = form.value.email;
     }
+    // Mail-having accounts already require an email. The standalone
+    // CalDAV / CardDAV tabs hide the email field — but some calendar
+    // code paths still touch `account.email` (CalDAV connect uses it
+    // for domain extraction during auto-discovery, attendee match in
+    // ical.rs uses it as the local identity), so back-fill from
+    // username when it looks like one. Falls back to a deterministic
+    // local-only string so the field is never blank.
+    if (
+      (accountType.value === "caldav" || accountType.value === "carddav") &&
+      !form.value.email.trim()
+    ) {
+      const u = form.value.username.trim();
+      form.value.email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(u)
+        ? u
+        : `${u || "dav"}@local`;
+    }
     if (editingAccountId.value) {
       await api.updateAccount(editingAccountId.value, form.value);
       await accountsStore.fetchAccounts();

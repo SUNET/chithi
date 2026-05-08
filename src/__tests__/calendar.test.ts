@@ -211,6 +211,27 @@ describe("Calendar store", () => {
       expect(store.visibleEvents.length).toBe(2);
     });
 
+    it("should drop events whose calendar isn't in the subscribed list (ghost-event regression)", async () => {
+      // Reproduces the bug fixed in #134: a CalDAV calendar the user
+      // unsubscribed from no longer appears in `calendars`, but its
+      // events lingered in `events` from previous syncs and rendered
+      // anyway. visibleEvents must filter against the loaded
+      // (subscribed-only) calendar list.
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [
+        { id: "cal1", account_id: "acc1", name: "Subscribed", color: "#000", is_default: true, remote_id: null, is_subscribed: true },
+      ];
+      store.events = [
+        makeEvent("e1", "Live", "2026-04-07T10:00:00Z", "2026-04-07T11:00:00Z", { calendar_id: "cal1" }),
+        // Event whose calendar isn't in the sidebar list -> ghost.
+        makeEvent("ghost", "Phantom", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z", { calendar_id: "cal-removed" }),
+      ];
+      store.currentDate = "2026-04-07";
+
+      expect(store.visibleEvents.map(e => e.title)).toEqual(["Live"]);
+    });
+
     it("should persist hidden calendars to localStorage", () => {
       // Regression: hiddenCalendarIds must survive reloads.
       setupAccounts();
