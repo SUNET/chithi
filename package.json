@@ -31,5 +31,10 @@
     "@tauri-apps/plugin-os": "^2.3.2",
     "pinia": "^3.0.4",
     "vue-router": "^5.0.4"
+  },
+  "pnpm": {
+    "overrides": {
+      "postcss": ">=8.5.10"
+    }
   }
 }
