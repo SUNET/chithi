@@ -175,6 +175,14 @@ describe("Calendar store", () => {
     it("should filter out events from hidden calendars", async () => {
       setupAccounts();
       const store = useCalendarStore();
+      // visibleEvents now also drops events whose calendar isn't in
+      // the (subscribed-only) sidebar list — we have to populate
+      // `calendars` so the test's events have a matching entry to
+      // hit the hidden-id check below.
+      store.calendars = [
+        { id: "cal1", account_id: "acc1", name: "One", color: "#000", is_default: true, remote_id: null, is_subscribed: true },
+        { id: "cal2", account_id: "acc1", name: "Two", color: "#000", is_default: false, remote_id: null, is_subscribed: true },
+      ];
       store.events = [
         makeEvent("e1", "Visible", "2026-04-07T10:00:00Z", "2026-04-07T11:00:00Z", { calendar_id: "cal1" }),
         makeEvent("e2", "Hidden", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z", { calendar_id: "cal2" }),
@@ -188,6 +196,10 @@ describe("Calendar store", () => {
     it("should toggle visibility back on", async () => {
       setupAccounts();
       const store = useCalendarStore();
+      store.calendars = [
+        { id: "cal1", account_id: "acc1", name: "One", color: "#000", is_default: true, remote_id: null, is_subscribed: true },
+        { id: "cal2", account_id: "acc1", name: "Two", color: "#000", is_default: false, remote_id: null, is_subscribed: true },
+      ];
       store.events = [
         makeEvent("e1", "A", "2026-04-07T10:00:00Z", "2026-04-07T11:00:00Z", { calendar_id: "cal1" }),
         makeEvent("e2", "B", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z", { calendar_id: "cal2" }),

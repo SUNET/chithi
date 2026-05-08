@@ -45,9 +45,13 @@ pub fn to_utc(datetime: &str, tzid: &str) -> String {
         }
     }
 
-    // Naive datetime + IANA timezone → convert via chrono-tz
-    if !tzid.is_empty() {
-        if let Ok(tz) = tzid.parse::<chrono_tz::Tz>() {
+    // Naive datetime + IANA timezone → convert via chrono-tz.
+    // Microsoft Graph and Outlook iCal exports carry Windows timezone
+    // names (e.g. "W. Europe Standard Time") rather than IANA — map them
+    // to IANA before parsing so chrono-tz can pick the right zone.
+    let resolved_tzid = windows_to_iana(tzid).unwrap_or(tzid);
+    if !resolved_tzid.is_empty() {
+        if let Ok(tz) = resolved_tzid.parse::<chrono_tz::Tz>() {
             if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S") {
                 use chrono::TimeZone;
                 match tz.from_local_datetime(&naive) {
@@ -92,6 +96,27 @@ pub fn to_utc(datetime: &str, tzid: &str) -> String {
     format!("{}Z", dt)
 }
 
+/// Map a Windows timezone display name (as used by Microsoft Graph,
+/// Outlook iCal exports, and Exchange ActiveSync) to the equivalent
+/// IANA timezone identifier. Returns `None` for names that don't
+/// match any Windows zone — callers should fall back to passing the
+/// input straight through to chrono-tz so already-IANA strings still
+/// work.
+///
+/// Backed by the `windows-timezones` crate, which embeds the Unicode
+/// CLDR `windowsZones.xml` mapping. Bumping that crate picks up any
+/// new Windows zones automatically.
+pub(crate) fn windows_to_iana(name: &str) -> Option<&'static str> {
+    use std::str::FromStr;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    windows_timezones::WindowsTimezone::from_str(trimmed)
+        .ok()
+        .map(|wt| wt.tzdb_id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +157,34 @@ mod tests {
             to_utc("2026-04-14T14:00:00", "Europe/Stockholm"),
             "2026-04-14T12:00:00Z"
         );
+    }
+
+    #[test]
+    fn test_windows_w_europe_resolves_to_berlin() {
+        // Microsoft Graph / Outlook iCal exports use Windows zone names
+        // like "W. Europe Standard Time" which chrono-tz can't parse.
+        // The mapping should resolve them so 14:00 in Berlin (CEST in
+        // April) lands at 12:00 UTC.
+        assert_eq!(
+            to_utc("2026-04-14T14:00:00", "W. Europe Standard Time"),
+            "2026-04-14T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_windows_pacific_resolves_to_la() {
+        // Pacific Standard Time → Los Angeles (PDT in April = UTC-7).
+        assert_eq!(
+            to_utc("2026-04-14T05:00:00", "Pacific Standard Time"),
+            "2026-04-14T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_windows_utc_alias() {
+        // Plain "UTC" name from Graph (when Prefer header is set) just
+        // round-trips through Etc/UTC.
+        assert_eq!(to_utc("2026-04-14T12:00:00", "UTC"), "2026-04-14T12:00:00Z");
     }
 
     #[test]

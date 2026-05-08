@@ -238,6 +238,18 @@ pub async fn trigger_sync(
         }
     };
 
+    // Calendar-only / contacts-only / mail-disabled accounts have no
+    // mail binding, so there is nothing to dispatch here. Return early
+    // before the IMAP fallback at the bottom of the protocol chain
+    // tries to connect with an empty hostname.
+    if account.mail_protocol_str().is_empty() {
+        log::debug!(
+            "trigger_sync: account {} has no enabled mail binding, skipping",
+            account_id
+        );
+        return Ok(());
+    }
+
     let suspended_idle = if account.mail_protocol_str() == "imap"
         && should_suspend_idle_for_imap_operation(&account.auth_method)
     {
@@ -386,6 +398,17 @@ pub async fn sync_folder(
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
+
+    // Per-folder sync only makes sense for mail accounts. If there's no
+    // enabled mail binding (DAV-only / mail-disabled JMAP) just return
+    // a zero new-message count.
+    if account.mail_protocol_str().is_empty() {
+        log::debug!(
+            "sync_folder: account {} has no enabled mail binding, skipping",
+            account_id
+        );
+        return Ok(0);
+    }
 
     // sync-started is emitted by each protocol-specific path below, so the
     // activity store sees exactly one start per sync (sync_graph_account,

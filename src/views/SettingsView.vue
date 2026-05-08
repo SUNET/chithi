@@ -718,9 +718,37 @@ onMounted(() => {
               <label>Account Name</label>
               <input v-model="form.display_name" type="text" :placeholder="accountType === 'caldav' ? 'My Calendar' : 'e.g., Personal, Work'" />
             </div>
-            <div v-if="accountType !== 'caldav'" class="form-group">
+            <!-- DAV-only accounts have no mail identity, so they skip
+                 the email field and use an explicit username for the
+                 server's Basic auth. The mail tabs keep email as the
+                 default login (the saveAccount fallback fills
+                 username from email when blank). -->
+            <div
+              v-if="accountType !== 'caldav' && accountType !== 'carddav'"
+              class="form-group"
+            >
               <label>Email Address</label>
-              <input v-model="form.email" type="email" placeholder="user@example.com" />
+              <input
+                v-model="form.email"
+                type="email"
+                placeholder="user@example.com"
+                data-testid="account-email"
+              />
+            </div>
+            <div
+              v-if="accountType === 'caldav' || accountType === 'carddav'"
+              class="form-group"
+            >
+              <label>Username</label>
+              <input
+                v-model="form.username"
+                type="text"
+                placeholder="Login name on the DAV server"
+                data-testid="account-username"
+              />
+              <span class="field-hint">
+                Login name for the {{ accountType === 'carddav' ? 'CardDAV' : 'CalDAV' }} server.
+              </span>
             </div>
             <div v-if="accountType !== 'o365' && !(accountType === 'jmap' && form.jmap_auth_method === 'oidc')" class="form-group">
               <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>

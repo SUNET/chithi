@@ -50,6 +50,9 @@ base64 = "0.22"
 rand = "0.9"
 # Pure-Rust DNS resolver for MX-record lookup during email autoconfig (#43).
 hickory-resolver = "0.26"
+# CLDR windowsZones table for converting Microsoft display names
+# (e.g. "W. Europe Standard Time") to IANA timezone IDs.
+windows-timezones = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
