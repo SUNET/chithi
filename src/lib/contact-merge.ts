@@ -2,16 +2,20 @@
  * Contact-merge helpers (#129).
  *
  * Pure functions extracted from ContactsView.vue so the merge rules
- * can be unit-tested without mounting the component. The view imports
- * `mergeContacts` and uses its result as the input to
- * `api.updateContact` for the merge primary, then deletes the
- * secondary.
+ * can be unit-tested without mounting the component. The view's
+ * field-by-field picker imports `defaultChoices` (to seed the
+ * dialog) and `applyMergeChoices` (to derive the surviving record
+ * once the user confirms). `mergeContacts` is a legacy wrapper
+ * around `applyMergeChoices(defaultChoices(...))` kept for callers
+ * that just want the keeper-wins-with-dedup behaviour.
  *
- * Merge policy: "primary wins" on atomic fields, with empty-string
- * fallthrough to the secondary so the loser's value still surfaces
- * when the primary has nothing. Lists (emails, phones, addresses)
- * are unioned with case-folded dedup. Notes concatenate when both
- * sides differ.
+ * Merge policy: "keeper wins" on atomic fields, with empty-string
+ * fall-through to the loser so the picked side never produces a
+ * blank field as a side effect of the dialog default. Lists
+ * (emails, phones, addresses) are unioned with case-folded dedup
+ * on the canonical key, with each item flagged include/exclude in
+ * `MergeChoices`. Notes get a 3-way `keeper | loser | both` choice;
+ * "both" concatenates with a `\n---\n` separator.
  */
 
 import type { Contact } from "./types";

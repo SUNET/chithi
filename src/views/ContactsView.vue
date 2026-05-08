@@ -161,6 +161,9 @@ const selectedContactIds = ref<string[]>([]);
 const mergePair = ref<{ keeper: Contact; loser: Contact } | null>(null);
 const mergeChoices = ref<MergeChoices | null>(null);
 const merging = ref(false);
+// Dedicated error state so a stale `error` from the create/edit form
+// can't bleed into a freshly-opened merge dialog and vice versa.
+const mergeError = ref<string | null>(null);
 
 const syncing = ref(false);
 
@@ -310,6 +313,23 @@ watch(selectedBookId, async (bookId) => {
   if (bookId) {
     contacts.value = await api.listContacts(bookId);
     selectedContact.value = null;
+    // Multi-select state belongs to the previously-shown book; drop
+    // it on book switch so the merge toolbar can't sit visible with
+    // ids that aren't in the current list.
+    selectedContactIds.value = [];
+  }
+});
+
+// Prune `selectedContactIds` against the current contact list whenever
+// it changes (e.g. after a sync or a CRUD op deletes one of the picked
+// contacts). Without this the toolbar can stay visible referencing
+// gone-from-the-DOM rows, with `canMergeSelected` permanently false.
+watch(contacts, (next) => {
+  if (selectedContactIds.value.length === 0) return;
+  const visible = new Set(next.map((c) => c.id));
+  const pruned = selectedContactIds.value.filter((id) => visible.has(id));
+  if (pruned.length !== selectedContactIds.value.length) {
+    selectedContactIds.value = pruned;
   }
 });
 
@@ -389,6 +409,7 @@ function startMerge() {
   const keeper = contacts.value.find((c) => c.id === keeperId);
   const loser = contacts.value.find((c) => c.id === loserId);
   if (!keeper || !loser) return;
+  mergeError.value = null;
   mergePair.value = { keeper, loser };
   mergeChoices.value = defaultChoices(keeper, loser);
 }
@@ -516,6 +537,7 @@ function getAccountName(accountId: string): string {
 function cancelMerge() {
   mergePair.value = null;
   mergeChoices.value = null;
+  mergeError.value = null;
 }
 
 /// Compute the surviving contact from the user's choices. Lives as a
@@ -558,29 +580,46 @@ function addressItemDisplay(it: { item: Record<string, unknown> }): string {
 async function applyMerge() {
   if (!mergePair.value || !mergePreview.value) return;
   merging.value = true;
-  error.value = null;
+  mergeError.value = null;
+  const surviving = mergePreview.value;
+  const loserId = mergePair.value.loser.id;
   try {
-    const surviving = mergePreview.value;
-    const loserId = mergePair.value.loser.id;
     await api.updateContact(surviving);
     await api.deleteContact(loserId);
-    if (
-      selectedContact.value?.id === loserId
-      || selectedContact.value?.id === surviving.id
-    ) {
-      selectedContact.value = surviving;
-    }
-    selectedContactIds.value = [surviving.id];
-    if (selectedBookId.value) {
-      contacts.value = await api.listContacts(selectedBookId.value);
-    }
-    mergePair.value = null;
-    mergeChoices.value = null;
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
+    // Update or delete failed — keep the dialog open so the user
+    // can retry or cancel without losing the field choices.
+    mergeError.value = e instanceof Error ? e.message : String(e);
     merging.value = false;
+    return;
   }
+
+  // Network ops succeeded. Close the dialog *now* so a stuck refresh
+  // (or a refresh failure) can't leave the dialog open and tempt the
+  // user into clicking Merge a second time — which would attempt to
+  // delete the already-deleted loser.
+  mergePair.value = null;
+  mergeChoices.value = null;
+  if (
+    selectedContact.value?.id === loserId
+    || selectedContact.value?.id === surviving.id
+  ) {
+    selectedContact.value = surviving;
+  }
+  selectedContactIds.value = [surviving.id];
+
+  // Best-effort refresh of the visible list. If listContacts throws,
+  // log it but don't surface a user-facing error: the merge already
+  // committed on the server and the list will catch up on the next
+  // sync or book switch.
+  if (selectedBookId.value) {
+    try {
+      contacts.value = await api.listContacts(selectedBookId.value);
+    } catch (e) {
+      console.error("Post-merge refresh failed:", e);
+    }
+  }
+  merging.value = false;
 }
 </script>
 
@@ -1014,7 +1053,7 @@ async function applyMerge() {
             <p class="merge-picker-hint">
               Keeping <strong>{{ mergePair.keeper.display_name }}</strong>'s identity. <strong>{{ mergePair.loser.display_name }}</strong> will be deleted after the merge. Pick which value to keep for any field where the two disagree.
             </p>
-            <div v-if="error" class="form-error" data-testid="merge-error">{{ error }}</div>
+            <div v-if="mergeError" class="form-error" data-testid="merge-error">{{ mergeError }}</div>
 
             <!-- Atomic field rows. We only render a chooser when both
                  sides have non-empty differing values; if one side
