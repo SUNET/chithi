@@ -7,6 +7,11 @@ import { usePlatformStore } from "@/stores/platform";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import {
+  applyMergeChoices,
+  defaultChoices,
+  type MergeChoices,
+} from "@/lib/contact-merge";
 import Select from "@/components/common/Select.vue";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import MobileIconButton from "@/components/mobile/MobileIconButton.vue";
@@ -140,6 +145,22 @@ const formBookId = ref("");
 const editingContactId = ref<string | null>(null);
 const saving = ref(false);
 const error = ref<string | null>(null);
+
+// Multi-select state (#129). The detail panel still shows the
+// most-recently-clicked contact (`selectedContact`), but the contact
+// list also tracks an ordered set of selected ids so the user can
+// pick TWO entries with Ctrl/Cmd-click and merge them. The first id
+// in the array becomes the "keeper" — its identity (id, remote_id,
+// etag) survives the merge.
+const selectedContactIds = ref<string[]>([]);
+
+// Merge dialog state. `mergePair` is the keeper / loser pair the
+// user committed to (snapshotted from selectedContactIds when they
+// clicked the toolbar button), and `mergeChoices` drives every
+// radio / checkbox in the field-picker dialog.
+const mergePair = ref<{ keeper: Contact; loser: Contact } | null>(null);
+const mergeChoices = ref<MergeChoices | null>(null);
+const merging = ref(false);
 
 const syncing = ref(false);
 
@@ -311,8 +332,65 @@ function parsePhones(json: string): { number: string; label: string }[] {
   try { return JSON.parse(json); } catch { return []; }
 }
 
-function selectContact(contact: Contact) {
+function selectContact(contact: Contact, event?: MouseEvent) {
+  // Ctrl/Cmd-click toggles the contact in the multi-select set without
+  // disturbing the others. A plain click resets the selection to just
+  // this contact (matching the long-standing single-select behavior
+  // for users who never use the merge flow).
   selectedContact.value = contact;
+  if (event && (event.ctrlKey || event.metaKey)) {
+    const idx = selectedContactIds.value.indexOf(contact.id);
+    if (idx === -1) {
+      selectedContactIds.value = [...selectedContactIds.value, contact.id];
+    } else {
+      selectedContactIds.value = selectedContactIds.value.filter(
+        (id) => id !== contact.id,
+      );
+    }
+  } else {
+    selectedContactIds.value = [contact.id];
+  }
+}
+
+/// Whether the multi-select toolbar's "Merge" action is enabled.
+/// Only fires when exactly two contacts are selected AND both belong
+/// to the same address book — cross-book merges aren't supported
+/// because the loser's deletion would have to land on a different
+/// remote and the surviving vCard would have to be rewritten across
+/// two backends.
+const canMergeSelected = computed(() => {
+  if (selectedContactIds.value.length !== 2) return false;
+  const [a, b] = selectedContactIds.value
+    .map((id) => contacts.value.find((c) => c.id === id))
+    .filter((c): c is Contact => !!c);
+  if (!a || !b) return false;
+  return a.book_id === b.book_id;
+});
+
+const selectedContactNames = computed(() =>
+  selectedContactIds.value
+    .map((id) => contacts.value.find((c) => c.id === id)?.display_name ?? "")
+    .filter((s) => s.length > 0),
+);
+
+function clearSelection() {
+  selectedContactIds.value = selectedContact.value
+    ? [selectedContact.value.id]
+    : [];
+}
+
+/// Open the field-picker dialog for the two currently-selected
+/// contacts. The first selected becomes the keeper; the second is
+/// the loser. Snapshot the pair so subsequent selection changes
+/// don't yank the dialog out from under the user.
+function startMerge() {
+  if (!canMergeSelected.value) return;
+  const [keeperId, loserId] = selectedContactIds.value;
+  const keeper = contacts.value.find((c) => c.id === keeperId);
+  const loser = contacts.value.find((c) => c.id === loserId);
+  if (!keeper || !loser) return;
+  mergePair.value = { keeper, loser };
+  mergeChoices.value = defaultChoices(keeper, loser);
 }
 
 function splitDisplayName(name: string): { first: string; middle: string; last: string } {
@@ -431,6 +509,78 @@ async function doDelete() {
 
 function getAccountName(accountId: string): string {
   return accountsStore.accounts.find((a) => a.id === accountId)?.display_name ?? "";
+}
+
+// ---------- Merge (#129) ----------------------------------------------------
+
+function cancelMerge() {
+  mergePair.value = null;
+  mergeChoices.value = null;
+}
+
+/// Compute the surviving contact from the user's choices. Lives as a
+/// computed so the dialog reflects checkbox/radio changes
+/// immediately. Returns null while no pair is open.
+const mergePreview = computed(() => {
+  if (!mergePair.value || !mergeChoices.value) return null;
+  return applyMergeChoices(
+    mergePair.value.keeper,
+    mergePair.value.loser,
+    mergeChoices.value,
+  );
+});
+
+/// Whether the keeper / loser disagree on a given atomic field. The
+/// dialog only renders a radio when this is true; otherwise the
+/// resolved value is shown read-only.
+function fieldsDiffer(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  const at = (a ?? "").trim();
+  const bt = (b ?? "").trim();
+  return at.length > 0 && bt.length > 0 && at !== bt;
+}
+
+function emailItemKey(it: { item: Record<string, unknown> }): string {
+  return String((it.item as { email?: string }).email ?? "");
+}
+function phoneItemKey(it: { item: Record<string, unknown> }): string {
+  return String((it.item as { number?: string }).number ?? "");
+}
+function addressItemDisplay(it: { item: Record<string, unknown> }): string {
+  return JSON.stringify(it.item);
+}
+
+/// Apply the merge: push the surviving contact, then delete the
+/// loser. Order matters — if delete fired first and update failed
+/// we'd lose data with no merged target on the server.
+async function applyMerge() {
+  if (!mergePair.value || !mergePreview.value) return;
+  merging.value = true;
+  error.value = null;
+  try {
+    const surviving = mergePreview.value;
+    const loserId = mergePair.value.loser.id;
+    await api.updateContact(surviving);
+    await api.deleteContact(loserId);
+    if (
+      selectedContact.value?.id === loserId
+      || selectedContact.value?.id === surviving.id
+    ) {
+      selectedContact.value = surviving;
+    }
+    selectedContactIds.value = [surviving.id];
+    if (selectedBookId.value) {
+      contacts.value = await api.listContacts(selectedBookId.value);
+    }
+    mergePair.value = null;
+    mergeChoices.value = null;
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    merging.value = false;
+  }
 }
 </script>
 
@@ -651,14 +801,44 @@ function getAccountName(accountId: string): string {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
           <input v-model="searchQuery" type="text" placeholder="Search contacts..." data-testid="contacts-search" />
         </div>
+        <!-- Multi-select merge toolbar (#129). Visible whenever 2+
+             contacts are picked via Ctrl/Cmd-click; the Merge button
+             only enables when exactly two are selected within the
+             same book. -->
+        <div
+          v-if="selectedContactIds.length >= 2"
+          class="merge-toolbar"
+          data-testid="merge-toolbar"
+        >
+          <span class="merge-toolbar-text">
+            {{ selectedContactIds.length }} selected{{
+              selectedContactNames.length >= 2
+                ? `: ${selectedContactNames[0]} + ${selectedContactNames[1]}`
+                : ""
+            }}
+          </span>
+          <button
+            class="merge-toolbar-btn"
+            data-testid="merge-toolbar-btn"
+            :disabled="!canMergeSelected"
+            :title="canMergeSelected
+              ? 'Merge the two selected contacts'
+              : 'Pick two contacts in the same address book to merge'"
+            @click="startMerge"
+          >Merge</button>
+          <button class="merge-toolbar-cancel" @click="clearSelection">Clear</button>
+        </div>
         <div class="contact-list">
           <div
             v-for="contact in filteredContacts"
             :key="contact.id"
             class="contact-row"
-            :class="{ active: selectedContact?.id === contact.id }"
+            :class="{
+              active: selectedContact?.id === contact.id,
+              picked: selectedContactIds.includes(contact.id),
+            }"
             :data-testid="`contact-${contact.id}`"
-            @click="selectContact(contact)"
+            @click="selectContact(contact, $event)"
           >
             <div
               class="contact-avatar"
@@ -812,6 +992,177 @@ function getAccountName(accountId: string): string {
           <div class="modal-footer">
             <button class="btn-cancel" @click="showDeleteConfirm = false">Cancel</button>
             <button class="btn-delete" @click="doDelete">Delete</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Merge: field-by-field picker dialog (#129) -->
+    <Teleport to="body">
+      <div
+        v-if="mergePair && mergeChoices"
+        class="modal-overlay"
+        data-testid="merge-dialog"
+        @click.self="cancelMerge"
+      >
+        <div class="modal modal-lg">
+          <div class="modal-header">
+            <h3>Merge contacts</h3>
+            <button class="modal-close" @click="cancelMerge">&times;</button>
+          </div>
+          <div class="modal-body merge-dialog-body">
+            <p class="merge-picker-hint">
+              Keeping <strong>{{ mergePair.keeper.display_name }}</strong>'s identity. <strong>{{ mergePair.loser.display_name }}</strong> will be deleted after the merge. Pick which value to keep for any field where the two disagree.
+            </p>
+            <div v-if="error" class="form-error" data-testid="merge-error">{{ error }}</div>
+
+            <!-- Atomic field rows. We only render a chooser when both
+                 sides have non-empty differing values; if one side
+                 is empty the merged value is forced to the non-empty
+                 side and the row stays read-only. -->
+            <fieldset class="merge-field" data-testid="merge-field-name">
+              <legend>Name</legend>
+              <template v-if="fieldsDiffer(mergePair.keeper.display_name, mergePair.loser.display_name)">
+                <label class="merge-radio">
+                  <input
+                    type="radio"
+                    value="keeper"
+                    v-model="mergeChoices.display_name"
+                    data-testid="merge-name-keeper"
+                  />
+                  <span>{{ mergePair.keeper.display_name }}</span>
+                </label>
+                <label class="merge-radio">
+                  <input
+                    type="radio"
+                    value="loser"
+                    v-model="mergeChoices.display_name"
+                    data-testid="merge-name-loser"
+                  />
+                  <span>{{ mergePair.loser.display_name }}</span>
+                </label>
+              </template>
+              <span v-else class="merge-resolved">{{ mergePreview?.display_name || "—" }}</span>
+            </fieldset>
+
+            <fieldset class="merge-field" data-testid="merge-field-org">
+              <legend>Organization</legend>
+              <template v-if="fieldsDiffer(mergePair.keeper.organization, mergePair.loser.organization)">
+                <label class="merge-radio">
+                  <input type="radio" value="keeper" v-model="mergeChoices.organization" />
+                  <span>{{ mergePair.keeper.organization }}</span>
+                </label>
+                <label class="merge-radio">
+                  <input type="radio" value="loser" v-model="mergeChoices.organization" />
+                  <span>{{ mergePair.loser.organization }}</span>
+                </label>
+              </template>
+              <span v-else class="merge-resolved">{{ mergePreview?.organization || "—" }}</span>
+            </fieldset>
+
+            <fieldset class="merge-field" data-testid="merge-field-title">
+              <legend>Title</legend>
+              <template v-if="fieldsDiffer(mergePair.keeper.title, mergePair.loser.title)">
+                <label class="merge-radio">
+                  <input type="radio" value="keeper" v-model="mergeChoices.title" />
+                  <span>{{ mergePair.keeper.title }}</span>
+                </label>
+                <label class="merge-radio">
+                  <input type="radio" value="loser" v-model="mergeChoices.title" />
+                  <span>{{ mergePair.loser.title }}</span>
+                </label>
+              </template>
+              <span v-else class="merge-resolved">{{ mergePreview?.title || "—" }}</span>
+            </fieldset>
+
+            <fieldset class="merge-field" data-testid="merge-field-notes">
+              <legend>Notes</legend>
+              <template v-if="fieldsDiffer(mergePair.keeper.notes, mergePair.loser.notes)">
+                <label class="merge-radio">
+                  <input type="radio" value="keeper" v-model="mergeChoices.notes" />
+                  <span class="merge-notes-snippet">{{ mergePair.keeper.notes }}</span>
+                </label>
+                <label class="merge-radio">
+                  <input type="radio" value="loser" v-model="mergeChoices.notes" />
+                  <span class="merge-notes-snippet">{{ mergePair.loser.notes }}</span>
+                </label>
+                <label class="merge-radio">
+                  <input type="radio" value="both" v-model="mergeChoices.notes" />
+                  <span>Combine both</span>
+                </label>
+              </template>
+              <span v-else class="merge-resolved merge-notes-snippet">{{ mergePreview?.notes || "—" }}</span>
+            </fieldset>
+
+            <!-- List rows. Each item is a checkbox; default is "keep all".
+                 Source label shows which contact contributed it. -->
+            <fieldset
+              v-if="mergeChoices.emails.length"
+              class="merge-field"
+              data-testid="merge-field-emails"
+            >
+              <legend>Emails</legend>
+              <label
+                v-for="(it, idx) in mergeChoices.emails"
+                :key="emailItemKey(it) + '-' + idx"
+                class="merge-checkbox"
+              >
+                <input type="checkbox" v-model="it.include" />
+                <span class="merge-source-tag" :class="`source-${it.source}`">
+                  {{ it.source === "keeper" ? mergePair.keeper.display_name : mergePair.loser.display_name }}
+                </span>
+                <span>{{ String(it.item.label || "") }}: {{ String(it.item.email || "") }}</span>
+              </label>
+            </fieldset>
+
+            <fieldset
+              v-if="mergeChoices.phones.length"
+              class="merge-field"
+              data-testid="merge-field-phones"
+            >
+              <legend>Phones</legend>
+              <label
+                v-for="(it, idx) in mergeChoices.phones"
+                :key="phoneItemKey(it) + '-' + idx"
+                class="merge-checkbox"
+              >
+                <input type="checkbox" v-model="it.include" />
+                <span class="merge-source-tag" :class="`source-${it.source}`">
+                  {{ it.source === "keeper" ? mergePair.keeper.display_name : mergePair.loser.display_name }}
+                </span>
+                <span>{{ String(it.item.label || "") }}: {{ String(it.item.number || "") }}</span>
+              </label>
+            </fieldset>
+
+            <fieldset
+              v-if="mergeChoices.addresses.length"
+              class="merge-field"
+              data-testid="merge-field-addresses"
+            >
+              <legend>Addresses</legend>
+              <label
+                v-for="(it, idx) in mergeChoices.addresses"
+                :key="addressItemDisplay(it) + '-' + idx"
+                class="merge-checkbox"
+              >
+                <input type="checkbox" v-model="it.include" />
+                <span class="merge-source-tag" :class="`source-${it.source}`">
+                  {{ it.source === "keeper" ? mergePair.keeper.display_name : mergePair.loser.display_name }}
+                </span>
+                <span class="merge-address-snippet">{{ addressItemDisplay(it) }}</span>
+              </label>
+            </fieldset>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-cancel" :disabled="merging" @click="cancelMerge">Cancel</button>
+            <button
+              class="btn-save"
+              data-testid="merge-confirm-btn"
+              :disabled="merging"
+              @click="applyMerge"
+            >
+              {{ merging ? "Merging…" : "Merge" }}
+            </button>
           </div>
         </div>
       </div>
@@ -1422,5 +1773,134 @@ function getAccountName(accountId: string): string {
 
 .index-rail a:active {
   color: var(--color-accent);
+}
+
+/* Merge UI (#129) ---------------------------------------------------------*/
+
+/* Multi-select toolbar above the contact list. Flat strip that
+   appears the moment a second contact is picked via Ctrl/Cmd-click. */
+.merge-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--color-bg-secondary);
+  border-top: 0.8px solid var(--color-border);
+  border-bottom: 0.8px solid var(--color-border);
+  font-size: 13px;
+}
+.merge-toolbar-text {
+  flex: 1;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.merge-toolbar-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 4px;
+  background: var(--color-accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+}
+.merge-toolbar-btn:disabled {
+  background: var(--color-border);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+.merge-toolbar-cancel {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+.merge-toolbar-cancel:hover { color: var(--color-text); }
+
+/* Picked-state highlight for rows in the contact list. Distinct
+   from `.active` (which marks the row currently shown in the
+   detail panel) so multi-select state stays visible. */
+.contact-row.picked {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.merge-picker-hint {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+/* Field-picker dialog */
+.modal-lg { width: 640px; max-width: 96vw; }
+.merge-dialog-body {
+  max-height: 70vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.merge-field {
+  border: 0.8px solid var(--color-border);
+  border-radius: 6px;
+  padding: 8px 12px 10px 12px;
+  margin: 0;
+}
+.merge-field legend {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.merge-radio,
+.merge-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+}
+.merge-radio input,
+.merge-checkbox input {
+  margin-top: 2px;
+}
+.merge-resolved {
+  display: block;
+  font-size: 13px;
+  color: var(--color-text);
+  padding: 4px 0;
+  word-break: break-word;
+}
+.merge-notes-snippet {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.merge-source-tag {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.merge-source-tag.source-keeper {
+  background: rgba(21, 93, 252, 0.12);
+  color: var(--color-accent);
+}
+.merge-source-tag.source-loser {
+  background: rgba(140, 140, 140, 0.18);
+  color: var(--color-text-muted);
+}
+.merge-address-snippet {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 </style>
