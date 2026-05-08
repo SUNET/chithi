@@ -240,15 +240,27 @@ async function syncAllContacts() {
 }
 
 async function fetchBooks() {
-  contactBooks.value = [];
+  // Build the list in a local then commit it once at the end. Two
+  // concurrent fetchBooks calls (e.g. one from contacts-changed while
+  // another is mid-flight after a manual sync) used to interleave
+  // appends into the shared `contactBooks.value`, producing duplicates
+  // in the sidebar (#130). Dedupe by id along the way as a belt-and-
+  // braces guard.
+  const seen = new Set<string>();
+  const next: ContactBook[] = [];
   for (const account of accountsStore.accounts) {
     try {
       const books = await api.listContactBooks(account.id);
-      contactBooks.value = contactBooks.value.concat(books);
+      for (const b of books) {
+        if (seen.has(b.id)) continue;
+        seen.add(b.id);
+        next.push(b);
+      }
     } catch (e) {
       console.error("Failed to fetch contact books:", e);
     }
   }
+  contactBooks.value = next;
   if (contactBooks.value.length > 0 && !selectedBookId.value) {
     selectedBookId.value = contactBooks.value[0].id;
   }
