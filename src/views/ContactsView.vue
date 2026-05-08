@@ -239,6 +239,12 @@ async function syncAllContacts() {
   }
 }
 
+// Monotonic token: the latest fetchBooks() invocation wins. An
+// earlier-started call that resolves later is dropped before its
+// `contactBooks.value = next` write so stale data can't overwrite
+// fresh data.
+let fetchBooksSeq = 0;
+
 async function fetchBooks() {
   // Build the list in a local then commit it once at the end. Two
   // concurrent fetchBooks calls (e.g. one from contacts-changed while
@@ -246,6 +252,8 @@ async function fetchBooks() {
   // appends into the shared `contactBooks.value`, producing duplicates
   // in the sidebar (#130). Dedupe by id along the way as a belt-and-
   // braces guard.
+  fetchBooksSeq++;
+  const ourSeq = fetchBooksSeq;
   const seen = new Set<string>();
   const next: ContactBook[] = [];
   for (const account of accountsStore.accounts) {
@@ -260,9 +268,20 @@ async function fetchBooks() {
       console.error("Failed to fetch contact books:", e);
     }
   }
+  // Drop this result if a newer fetchBooks() has already started; the
+  // newer call's commit is authoritative.
+  if (ourSeq !== fetchBooksSeq) return;
   contactBooks.value = next;
-  if (contactBooks.value.length > 0 && !selectedBookId.value) {
-    selectedBookId.value = contactBooks.value[0].id;
+  // Validate the current selection against the new list — the user's
+  // previously-selected book might have been removed (unsubscribed,
+  // account deleted, etc). Fall back to the first available book or
+  // clear the selection so subsequent listContacts() calls don't fire
+  // against a dead id.
+  const stillExists =
+    selectedBookId.value !== null &&
+    next.some((b) => b.id === selectedBookId.value);
+  if (!stillExists) {
+    selectedBookId.value = next.length > 0 ? next[0].id : null;
   }
 }
 
