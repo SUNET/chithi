@@ -1444,13 +1444,16 @@ async fn sync_calendars_caldav(
             let local_id = db::calendar::upsert_calendar_by_remote_id(
                 &conn, account_id, &cal.href, &cal.name, color, is_default,
             )?;
-            let subscribed: bool = conn
-                .query_row(
-                    "SELECT is_subscribed FROM calendars WHERE id = ?1",
-                    rusqlite::params![local_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(true);
+            // Propagate the read error rather than swallowing it as
+            // `subscribed = true`: the row was just upserted above so a
+            // failure here means the DB itself is misbehaving and the
+            // sync should abort rather than blindly re-pull events the
+            // user has unsubscribed from.
+            let subscribed: bool = conn.query_row(
+                "SELECT is_subscribed FROM calendars WHERE id = ?1",
+                rusqlite::params![local_id],
+                |row| row.get(0),
+            )?;
             remote_to_local.insert(cal.href.clone(), (local_id, subscribed));
         }
     }
