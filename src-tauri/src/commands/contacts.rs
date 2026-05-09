@@ -1237,12 +1237,30 @@ pub async fn search_collected_contacts(
 /// Read the default contact book id for an account/service binding.
 /// Returns null if no default is set or the binding doesn't exist.
 /// Used by the settings UI to reflect current state.
+/// Validate the `service` argument at the Tauri-command boundary.
+/// Default-contact-book is only meaningful for `"mail"` (compose
+/// recipient autocomplete) and `"calendar"` (event-attendee
+/// autocomplete); anything else is rejected with a clear error
+/// rather than silently no-op'd, so a typo'd renderer call surfaces
+/// instead of writing junk into another binding's config_json.
+fn validate_default_book_service(service: &str) -> Result<()> {
+    if matches!(service, "mail" | "calendar") {
+        Ok(())
+    } else {
+        Err(crate::error::Error::Other(format!(
+            "default contact book only applies to mail or calendar bindings, got {:?}",
+            service
+        )))
+    }
+}
+
 #[tauri::command]
 pub async fn get_default_contact_book(
     state: State<'_, AppState>,
     account_id: String,
     service: String,
 ) -> Result<Option<String>> {
+    validate_default_book_service(&service)?;
     let conn = state.db.reader();
     db::service_bindings::get_default_contact_book(&conn, &account_id, &service)
 }
@@ -1259,6 +1277,7 @@ pub async fn set_default_contact_book(
     service: String,
     book_id: Option<String>,
 ) -> Result<()> {
+    validate_default_book_service(&service)?;
     let conn = state.db.writer().await;
     db::service_bindings::set_default_contact_book(&conn, &account_id, &service, book_id.as_deref())
 }
