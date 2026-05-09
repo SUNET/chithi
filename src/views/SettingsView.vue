@@ -88,19 +88,43 @@ type BookOption = { id: string; label: string };
 const availableBooks = ref<BookOption[]>([]);
 
 async function loadAvailableBooks() {
-  const out: BookOption[] = [];
-  for (const acc of accountsStore.accounts) {
-    try {
-      const books = await api.listContactBooks(acc.id);
-      const accLabel = acc.display_name || acc.email || acc.id;
-      for (const b of books) {
-        out.push({ id: b.id, label: `${accLabel} / ${b.name}` });
+  // Fetch all accounts' books in parallel — sequential awaits made the
+  // edit modal noticeably slow once you had three or four accounts,
+  // because each Tauri invoke serialised on the previous one. Per-
+  // account failures still degrade gracefully: a failed listContactBooks
+  // for one account leaves its books absent without aborting the rest.
+  const perAccount = await Promise.all(
+    accountsStore.accounts.map(async (acc) => {
+      try {
+        const books = await api.listContactBooks(acc.id);
+        const accLabel = acc.display_name || acc.email || acc.id;
+        return books.map((b) => ({
+          id: b.id,
+          label: `${accLabel} / ${b.name}`,
+        }));
+      } catch (e) {
+        console.warn("loadAvailableBooks: failed for", acc.id, e);
+        return [] as BookOption[];
       }
-    } catch (e) {
-      console.warn("loadAvailableBooks: failed for", acc.id, e);
-    }
-  }
-  availableBooks.value = out;
+    }),
+  );
+  // Stable ordering: keep books grouped by account, then alphabetical
+  // by label within each account, so the dropdown renders the same on
+  // every open.
+  availableBooks.value = perAccount
+    .flat()
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// Per-binding default-book state lives outside `form` because it
+// belongs to service_bindings.config_json, not AccountConfig. Reset
+// when the modal closes or opens fresh so a previously edited
+// account's selection can't leak into the next "Add account" / next
+// edit.
+function resetDefaultBookState() {
+  defaultMailBookId.value = null;
+  defaultCalendarBookId.value = null;
+  availableBooks.value = [];
 }
 
 // Whether the current form would result in a calendar / contacts
@@ -245,6 +269,11 @@ function openNewForm() {
   form.value = defaultForm();
   accountType.value = "gmail";
   selectAccountType("gmail");
+  resetDefaultBookState();
+  // Pre-load the cross-account book list so the create-flow dropdowns
+  // are populated for users who already have an account with synced
+  // books and want to point a new account at one of them.
+  loadAvailableBooks();
   showForm.value = true;
   error.value = null;
 }
@@ -449,6 +478,7 @@ async function saveAccount() {
     }
     showForm.value = false;
     editingAccountId.value = null;
+    resetDefaultBookState();
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -460,6 +490,7 @@ function cancelForm() {
   showForm.value = false;
   editingAccountId.value = null;
   error.value = null;
+  resetDefaultBookState();
 }
 
 function confirmDelete(id: string) {

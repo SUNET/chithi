@@ -16,6 +16,12 @@ const suggestions = ref<{ display: string; email: string }[]>([]);
 const acVisible = ref(false);
 const acIndex = ref(-1);
 let acDebounce: ReturnType<typeof setTimeout> | null = null;
+// Monotonic id of the latest user input. Each runSearch captures the
+// id at call time and discards its result if a newer input has
+// landed in the meantime — without this the IPC roundtrip can race
+// (type "alic", "alice", in quick succession, the older response
+// arrives second and overwrites the fresher results).
+let acRequestSeq = 0;
 
 const accountIdForSearch = computed(() => props.accountId ?? null);
 
@@ -34,11 +40,12 @@ function removeAttendee(email: string) {
   emit("update:modelValue", props.modelValue.filter((e) => e !== email));
 }
 
-async function runSearch(query: string) {
+async function runSearch(query: string, seq: number) {
   try {
     const contacts = accountIdForSearch.value
       ? await api.searchContactsForAccount(query, accountIdForSearch.value, "calendar")
       : await api.searchContacts(query);
+    if (seq !== acRequestSeq) return;
     const items: { display: string; email: string }[] = [];
     const seen = new Set<string>();
     for (const c of contacts) {
@@ -57,6 +64,7 @@ async function runSearch(query: string) {
     acVisible.value = items.length > 0;
     acIndex.value = -1;
   } catch (e) {
+    if (seq !== acRequestSeq) return;
     console.warn("AttendeeEditor: search failed", e);
     suggestions.value = [];
     acVisible.value = false;
@@ -64,14 +72,25 @@ async function runSearch(query: string) {
 }
 
 function onInput() {
+  // Always cancel any pending debounce — even on the short-query
+  // branch — so a search scheduled for an earlier longer query can't
+  // fire after the user has backspaced down to a too-short input
+  // and silently re-populate the dropdown they just dismissed.
+  if (acDebounce) {
+    clearTimeout(acDebounce);
+    acDebounce = null;
+  }
+  // Bump the request id so any in-flight runSearch from a previous
+  // keystroke discards its result on completion.
+  acRequestSeq += 1;
+  const seq = acRequestSeq;
   const q = newEmail.value.trim();
   if (q.length < 2) {
     suggestions.value = [];
     acVisible.value = false;
     return;
   }
-  if (acDebounce) clearTimeout(acDebounce);
-  acDebounce = setTimeout(() => runSearch(q), 150);
+  acDebounce = setTimeout(() => runSearch(q, seq), 150);
 }
 
 function onKeydown(event: KeyboardEvent) {

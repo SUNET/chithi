@@ -368,7 +368,21 @@ pub fn rebuild_for_account(
         insert(conn, &binding)?;
     }
     for (service, book_id) in preserved {
-        set_default_contact_book(conn, account_id, &service, Some(&book_id))?;
+        // Tolerate the binding having disappeared from the new
+        // derivation: e.g. switching a mail-having account to a
+        // standalone CalDAV / CardDAV shape drops the mail binding,
+        // and the preserved mail default has nowhere to land.
+        // Failing the whole rebuild here would block the account
+        // edit; logging and moving on lets the edit succeed and
+        // simply forgets the orphan default.
+        if let Err(e) = set_default_contact_book(conn, account_id, &service, Some(&book_id)) {
+            log::debug!(
+                "rebuild_for_account: drop preserved default for missing {} binding ({}): {}",
+                service,
+                account_id,
+                e
+            );
+        }
     }
     apply_default_contact_book_if_missing(conn, account_id)?;
     Ok(())
@@ -380,16 +394,28 @@ pub fn rebuild_for_account(
 /// to one book and event-attendee autocomplete to a different one.
 const DEFAULT_CONTACT_BOOK_KEY: &str = "default_contact_book_id";
 
+/// Services that can carry a `default_contact_book_id`. The contacts
+/// binding *is* the source of contact books, so a default-book field
+/// on it is meaningless; we reject it explicitly rather than allow a
+/// silent no-op write to its config_json.
+fn is_valid_default_book_service(service: &str) -> bool {
+    matches!(service, "mail" | "calendar")
+}
+
 /// Read the `default_contact_book_id` from a binding's `config_json`.
 /// Returns `Ok(None)` if there is no binding for the (account, service)
 /// pair, the field is absent, or the field is null/empty. Only valid
-/// for `service` values where a default makes sense — currently
-/// `"mail"` and `"calendar"`. Callers with `"contacts"` get `Ok(None)`.
+/// for `service` values where a default makes sense — `"mail"` or
+/// `"calendar"`. Other services (notably `"contacts"`) return
+/// `Ok(None)` without touching the DB.
 pub fn get_default_contact_book(
     conn: &Connection,
     account_id: &str,
     service: &str,
 ) -> Result<Option<String>> {
+    if !is_valid_default_book_service(service) {
+        return Ok(None);
+    }
     let cfg: Option<String> = conn
         .query_row(
             "SELECT config_json FROM service_bindings
@@ -410,14 +436,21 @@ pub fn get_default_contact_book(
 
 /// Write (or clear) the `default_contact_book_id` on a binding's
 /// `config_json`. Pass `book_id = None` to remove the field. Returns
-/// `Err` if no binding exists for the (account, service) pair —
-/// callers should only set defaults for services they know exist.
+/// `Err` if no binding exists for the (account, service) pair, or
+/// if `service` is not one of `"mail"` / `"calendar"` — callers
+/// should only set defaults for services they know exist.
 pub fn set_default_contact_book(
     conn: &Connection,
     account_id: &str,
     service: &str,
     book_id: Option<&str>,
 ) -> Result<()> {
+    if !is_valid_default_book_service(service) {
+        return Err(Error::Other(format!(
+            "service {:?} cannot carry a default contact book",
+            service
+        )));
+    }
     let cfg: Option<String> = conn
         .query_row(
             "SELECT config_json FROM service_bindings
