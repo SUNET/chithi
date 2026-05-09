@@ -41,10 +41,21 @@ export async function deleteAccount(accountId: string): Promise<void> {
 /// (Mozilla ISP DB / provider autoconfig / .well-known / MX). No
 /// CalDAV / CardDAV probing — those live on their own dedicated
 /// account types now. Empty fields = not found.
+///
+/// `imapHostHint` / `smtpHostHint` are the host values already typed
+/// in the form. When autoconfig has nothing to say for that service,
+/// the backend TCP-probes the hint's standard ports so the user can
+/// have the port + TLS flag filled in for a host they already know.
 export async function discoverMailServers(
   email: string,
+  imapHostHint?: string,
+  smtpHostHint?: string,
 ): Promise<AutoconfigResult> {
-  return invoke("discover_mail_servers", { email });
+  return invoke("discover_mail_servers", {
+    email,
+    imapHostHint: imapHostHint || null,
+    smtpHostHint: smtpHostHint || null,
+  });
 }
 
 export async function listFolders(accountId: string): Promise<Folder[]> {

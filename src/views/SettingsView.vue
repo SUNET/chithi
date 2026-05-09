@@ -388,7 +388,11 @@ async function discoverMailServers() {
   discoveringDav.value = true;
   discoveryNote.value = null;
   try {
-    const result = await api.discoverMailServers(form.value.email);
+    const result = await api.discoverMailServers(
+      form.value.email,
+      form.value.imap_host,
+      form.value.smtp_host,
+    );
 
     const filled: string[] = [];
     const skipped: string[] = [];

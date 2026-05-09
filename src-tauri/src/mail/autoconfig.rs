@@ -90,30 +90,96 @@ pub async fn discover(email: &str) -> Result<Option<(AutoconfigServers, &'static
         return Ok(Some((parsed, "well-known")));
     }
 
-    // 4. MX-derived guess. We trust the MX hostname enough to probe its
-    // standard IMAPS / submission ports because it's the same source
-    // the user's mail is already going through. We don't fabricate ports
-    // beyond the IANA-assigned ones.
+    // 4. MX-derived guess. The MX hostname is the inbound-mail router
+    // for the domain, *not* the submission / IMAP server: many setups
+    // route incoming mail through a relay or spam filter that has no
+    // open IMAP or submission ports. Trusting it blindly silently
+    // wires the user's account to the wrong host with hard-coded ports.
+    // Instead, we TCP-probe the standard IMAP / submission port
+    // candidates and only surface fields that actually accept
+    // connections; if nothing answers, we return None and let the user
+    // configure manually rather than save a broken account.
     if let Some(mx_host) = lookup_mx(domain).await {
         log::info!(
-            "autoconfig: MX for {} -> {}, guessing IMAPS/submission",
+            "autoconfig: MX for {} -> {}, probing ports",
             domain,
             mx_host
         );
-        return Ok(Some((
-            AutoconfigServers {
-                imap_host: mx_host.clone(),
-                imap_port: 993,
-                imap_use_tls: true,
-                smtp_host: mx_host,
-                smtp_port: 587,
-                smtp_use_tls: true,
-            },
-            "mx",
-        )));
+        let (imap_host, imap_port, imap_use_tls) = match probe_imap_port(&mx_host).await {
+            Some((p, tls)) => (mx_host.clone(), p, tls),
+            None => (String::new(), 0, false),
+        };
+        let (smtp_host, smtp_port, smtp_use_tls) = match probe_smtp_port(&mx_host).await {
+            Some((p, tls)) => (mx_host.clone(), p, tls),
+            None => (String::new(), 0, false),
+        };
+        if !imap_host.is_empty() || !smtp_host.is_empty() {
+            return Ok(Some((
+                AutoconfigServers {
+                    imap_host,
+                    imap_port,
+                    imap_use_tls,
+                    smtp_host,
+                    smtp_port,
+                    smtp_use_tls,
+                },
+                "mx",
+            )));
+        }
+        log::info!(
+            "autoconfig: MX host {} has no open IMAP/submission ports, giving up",
+            mx_host
+        );
     }
 
     Ok(None)
+}
+
+/// Probe IMAP candidate ports on `host` in preference order. 993 is
+/// implicit-TLS and the modern default; 143 is STARTTLS on the legacy
+/// plaintext port. We accept both; the form's single `use_tls` flag
+/// just records "TLS in some form" — the actual connection logic in
+/// `mail::imap` upgrades port-143 with STARTTLS at handshake time.
+pub async fn probe_imap_port(host: &str) -> Option<(u16, bool)> {
+    for &(port, use_tls) in &[(993u16, true), (143u16, true)] {
+        if probe_tcp(host, port).await {
+            log::info!("probe_imap_port: {}:{} reachable", host, port);
+            return Some((port, use_tls));
+        }
+    }
+    None
+}
+
+/// Probe SMTP submission candidate ports on `host` in preference
+/// order. 587 (RFC 6409 submission, STARTTLS) and 465 (implicit TLS,
+/// RFC 8314) are both flagged as TLS. Port 25 is intentionally not
+/// probed: that's MTA-to-MTA transport, not a user submission port,
+/// and accepting it here would silently pick a path most providers
+/// don't authenticate users on.
+pub async fn probe_smtp_port(host: &str) -> Option<(u16, bool)> {
+    for &(port, use_tls) in &[(587u16, true), (465u16, true)] {
+        if probe_tcp(host, port).await {
+            log::info!("probe_smtp_port: {}:{} reachable", host, port);
+            return Some((port, use_tls));
+        }
+    }
+    None
+}
+
+/// Best-effort TCP connect with a short timeout. Returns true iff a
+/// 3-way handshake completes; we don't speak IMAP / SMTP greetings
+/// here because (a) it would require credentials we don't have at
+/// discovery time and (b) the goal is just to rule out closed ports
+/// — anything that accepts TCP is plausibly the right service and
+/// the user can verify it on first sync.
+async fn probe_tcp(host: &str, port: u16) -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+    let addr = format!("{}:{}", host, port);
+    matches!(
+        timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn try_fetch_and_parse(http: &reqwest::Client, url: &str) -> Option<AutoconfigServers> {
