@@ -9,6 +9,7 @@ mod filters;
 mod keyring;
 mod logging;
 mod mail;
+mod meet;
 mod oauth;
 mod ops;
 mod path_validation;
@@ -78,6 +79,11 @@ pub fn run() {
             commands::contacts::get_default_contact_book,
             commands::contacts::set_default_contact_book,
             commands::contacts::sync_contacts,
+            commands::meet::meet_talk_login_start,
+            commands::meet::meet_talk_login_complete,
+            commands::meet::meet_matrix_login_start,
+            commands::meet::meet_matrix_login_complete,
+            commands::meet::meet_create_url,
             commands::sync_cmd::start_idle,
             commands::sync_cmd::stop_idle,
             commands::oauth::oauth_start,

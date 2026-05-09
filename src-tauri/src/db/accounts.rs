@@ -55,6 +55,15 @@ pub struct AccountConfig {
     pub smtp_port: u16,
     pub jmap_url: String,
     pub caldav_url: String,
+    /// Base URL for the meet binding's server (Nextcloud root for
+    /// Talk, homeserver for Matrix). Empty when the account has no
+    /// meet binding. Pairs with `meet_protocol`.
+    #[serde(default)]
+    pub meet_url: String,
+    /// `"talk"` (Nextcloud Talk) or `"matrix"` when the account has
+    /// a meet binding; empty otherwise.
+    #[serde(default)]
+    pub meet_protocol: String,
     pub username: String,
     pub password: String,
     pub use_tls: bool,
@@ -122,6 +131,10 @@ pub struct AccountFull {
     pub smtp_port: u16,
     pub jmap_url: String,
     pub caldav_url: String,
+    /// Server URL + protocol for the meet binding (Talk / Matrix).
+    /// Empty when the account has no meet service.
+    pub meet_url: String,
+    pub meet_protocol: String,
     pub username: String,
     pub password: String,
     pub use_tls: bool,
@@ -168,6 +181,22 @@ impl AccountFull {
 
     pub fn contacts_binding(&self) -> Option<&ServiceBinding> {
         self.binding_for("contacts")
+    }
+
+    /// Video-conferencing binding (Nextcloud Talk / Matrix / future
+    /// providers). #148.
+    pub fn meet_binding(&self) -> Option<&ServiceBinding> {
+        self.binding_for("meet")
+    }
+
+    /// Convenience: the `meet` binding's enabled protocol string,
+    /// or `""` when the account has no meet binding or it's been
+    /// disabled. Mirrors `mail_protocol_str` / `calendar_protocol_str`.
+    pub fn meet_protocol_str(&self) -> &str {
+        self.meet_binding()
+            .filter(|b| b.enabled)
+            .map(|b| b.protocol.as_str())
+            .unwrap_or("")
     }
 
     /// Mail protocol as a string slice. Returns `""` for accounts with no
@@ -294,6 +323,21 @@ impl AccountFull {
             .or_else(|| self.contacts_dav_url())
             .unwrap_or_default();
 
+        // #148: meet binding (Nextcloud Talk / Matrix). Surfaces the
+        // server URL + protocol so the Settings edit form can display
+        // them; the actual credential lives in the keyring under the
+        // account id. Read both up front so the borrow on `self`
+        // ends before the writes below.
+        let (meet_url, meet_protocol) = match self.meet_binding() {
+            Some(b) => (
+                b.meet_config().map(|c| c.url).unwrap_or_default(),
+                b.protocol.clone(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        self.meet_url = meet_url;
+        self.meet_protocol = meet_protocol;
+
         self.calendar_sync_enabled = self.calendar_binding().map(|b| b.enabled).unwrap_or(true);
 
         // Phase-4: surface per-binding state on the wire format so the
@@ -411,6 +455,8 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                     smtp_port: 587,
                     jmap_url: String::new(),
                     caldav_url: String::new(),
+                    meet_url: String::new(),
+                    meet_protocol: String::new(),
                     password: String::new(),
                     use_tls: true,
                     calendar_sync_enabled: true,
@@ -515,6 +561,8 @@ fn config_to_legacy_fields<'a>(
         oidc_client_id: &config.oidc_client_id,
         caldav_url: &config.caldav_url,
         calendar_sync_enabled: config.calendar_sync_enabled,
+        meet_url: &config.meet_url,
+        meet_protocol: &config.meet_protocol,
         mail_sync_enabled: Some(config.mail_sync_enabled),
         contacts_sync_enabled: Some(config.contacts_sync_enabled),
         mail_sync_interval_seconds: config.mail_sync_interval_seconds,
@@ -640,6 +688,8 @@ mod tests {
             smtp_port: 587,
             jmap_url: String::new(),
             caldav_url: String::new(),
+            meet_url: String::new(),
+            meet_protocol: String::new(),
             username: "user".to_string(),
             password: "secret123".to_string(),
             use_tls: true,

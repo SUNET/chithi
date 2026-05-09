@@ -182,6 +182,8 @@ const defaultForm = (): AccountConfig => ({
   smtp_port: 587,
   jmap_url: "",
   caldav_url: "",
+  meet_url: "",
+  meet_protocol: "",
   username: "",
   password: "",
   use_tls: true,

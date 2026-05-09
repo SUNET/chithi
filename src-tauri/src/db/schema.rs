@@ -664,6 +664,11 @@ fn populate_service_bindings(conn: &Connection) -> Result<()> {
                 oidc_token_endpoint: &r.oidc_token_endpoint,
                 oidc_client_id: &r.oidc_client_id,
                 caldav_url: &r.caldav_url,
+                // The Phase-1 populate migration runs against rows
+                // that pre-date the meet binding (#148), so emit
+                // nothing for them.
+                meet_url: "",
+                meet_protocol: "",
                 calendar_sync_enabled: r.calendar_sync_enabled,
                 // Migration preserves legacy semantics: mail follows the
                 // row's enabled flag, contacts default to on, no per-binding

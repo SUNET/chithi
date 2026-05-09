@@ -60,6 +60,15 @@ pub struct DavBindingConfig {
     pub url: String,
 }
 
+/// Config payload for a `meet` binding (#148). Talk and Matrix both
+/// store just a base URL here — the credential lives in the keyring
+/// under the account id, not in this config_json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeetBindingConfig {
+    #[serde(default)]
+    pub url: String,
+}
+
 /// A per-service binding that says "this account talks to this protocol for
 /// this service". One identity in the `accounts` table can carry multiple
 /// bindings: a Gmail account has bindings for `mail/imap`, `calendar/google`,
@@ -103,6 +112,15 @@ impl ServiceBinding {
         serde_json::from_str(&self.config_json).map_err(|e| {
             Error::Other(format!(
                 "binding {} has malformed dav config_json: {}",
+                self.id, e
+            ))
+        })
+    }
+
+    pub fn meet_config(&self) -> Result<MeetBindingConfig> {
+        serde_json::from_str(&self.config_json).map_err(|e| {
+            Error::Other(format!(
+                "binding {} has malformed meet config_json: {}",
                 self.id, e
             ))
         })
@@ -224,6 +242,10 @@ pub struct LegacyBindingFields<'a> {
     pub oidc_client_id: &'a str,
     pub caldav_url: &'a str,
     pub calendar_sync_enabled: bool,
+    /// #148: meet binding inputs. Both empty means no meet binding
+    /// is emitted; `meet_protocol` is one of `"talk"` / `"matrix"`.
+    pub meet_url: &'a str,
+    pub meet_protocol: &'a str,
     /// Phase 4 additions. If `None`, falls back to `enabled` for the mail
     /// binding (legacy behavior) or `true` for contacts.
     pub mail_sync_enabled: Option<bool>,
@@ -317,6 +339,23 @@ pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
         });
     }
 
+    // Meet binding (#148). Emitted only when both fields are set —
+    // an account that has neither (the common case) gets no meet
+    // binding, and an inconsistent half-set state is caught by the
+    // explicit guard rather than silently emitting a half-broken
+    // entry. Recognised protocols today are "talk" and "matrix".
+    if !f.meet_url.is_empty() && !f.meet_protocol.is_empty() {
+        out.push(ServiceBinding {
+            id: format!("{aid}-meet"),
+            account_id: aid.into(),
+            service: "meet".into(),
+            protocol: f.meet_protocol.into(),
+            enabled: f.enabled,
+            sync_interval_seconds: None,
+            config_json: serde_json::json!({ "url": f.meet_url }).to_string(),
+        });
+    }
+
     out
 }
 
@@ -339,6 +378,8 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
         oidc_client_id: &account.oidc_client_id,
         caldav_url: &account.caldav_url,
         calendar_sync_enabled: account.calendar_sync_enabled,
+        meet_url: &account.meet_url,
+        meet_protocol: &account.meet_protocol,
         mail_sync_enabled: None,
         contacts_sync_enabled: None,
         mail_sync_interval_seconds: None,
@@ -664,6 +705,8 @@ mod tests {
             smtp_port: 587,
             jmap_url: String::new(),
             caldav_url: String::new(),
+            meet_url: String::new(),
+            meet_protocol: String::new(),
             username: "user".into(),
             password: String::new(),
             use_tls: true,
@@ -887,6 +930,8 @@ mod tests {
             oidc_client_id: &acc.oidc_client_id,
             caldav_url: &acc.caldav_url,
             calendar_sync_enabled: acc.calendar_sync_enabled,
+            meet_url: &acc.meet_url,
+            meet_protocol: &acc.meet_protocol,
             mail_sync_enabled: Some(false),
             contacts_sync_enabled: None,
             mail_sync_interval_seconds: None,
@@ -922,6 +967,8 @@ mod tests {
             oidc_client_id: &acc.oidc_client_id,
             caldav_url: "https://example.com/dav",
             calendar_sync_enabled: true,
+            meet_url: "",
+            meet_protocol: "",
             mail_sync_enabled: None,
             contacts_sync_enabled: None,
             mail_sync_interval_seconds: Some(120),
