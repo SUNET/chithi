@@ -153,47 +153,73 @@ async fn push_calendar_color(
     if cal_proto == "graph" {
         // Microsoft Graph wants a constrained `calendarColor` enum.
         // The hex-to-nearest-named lookup lives in graph.rs so we can
-        // round-trip our own palette consistently. Local DB still
-        // keeps the user's exact hex so the sidebar shows what they
-        // picked even when Graph's enum landed on something a shade
-        // off.
+        // round-trip our own palette consistently. Some calendars
+        // (system / shared / read-only series like "Birthdays" and
+        // holiday subscriptions) reject color writes with a generic
+        // 500 ISE rather than a structured error, so we degrade to
+        // local-only on any Graph-side failure rather than rolling
+        // back the user's pick. Local DB keeps the user's exact hex
+        // so the sidebar shows what they picked.
         let token = crate::mail::graph::get_graph_token(&account.id).await?;
         let client = crate::mail::graph::GraphClient::new(&token);
-        client.set_calendar_color(remote_id, new_color).await?;
+        if let Err(e) = client.set_calendar_color(remote_id, new_color).await {
+            log::warn!(
+                "update_calendar: Graph color push failed (calendar may be read-only or shared), keeping local-only: {}",
+                e
+            );
+        }
         return Ok(());
     }
 
     if cal_proto == "google" {
-        // Google Calendar accepts arbitrary RGB on calendarList.update
-        // when `colorRgbFormat=true` is set. Use the per-user
-        // calendarList resource (rather than `/calendars/{id}`) — it's
-        // where the user-visible color lives.
-        let token = get_google_token(&account.id).await?;
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/users/me/calendarList/{}?colorRgbFormat=true",
-            urlencoding::encode(remote_id)
-        );
-        let http = reqwest::Client::new();
-        let resp = http
-            .patch(&url)
-            .bearer_auth(&token)
-            .json(&serde_json::json!({ "backgroundColor": new_color }))
-            .send()
-            .await
-            .map_err(|e| {
-                crate::error::Error::Other(format!(
-                    "Google calendarList PATCH (color) failed: {}",
-                    e
-                ))
-            })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(crate::error::Error::Other(format!(
-                "Google calendarList PATCH (color) returned {}: {}",
-                status,
-                body.chars().take(500).collect::<String>()
-            )));
+        // Google Calendar accepts arbitrary RGB on calendarList.patch
+        // when `colorRgbFormat=true` is set. The user-visible color
+        // lives on the per-user calendarList resource, not the
+        // underlying calendar (which only takes summary/description/
+        // location/timeZone). Send both backgroundColor AND
+        // foregroundColor — the docs say foregroundColor is optional
+        // but in practice omitting it resets the foreground to the
+        // default for the new background, which can produce
+        // unreadable text. Pick black or white based on the
+        // background's luminance.
+        match get_google_token(&account.id).await {
+            Ok(token) => {
+                let fg = readable_foreground(new_color);
+                let url = format!(
+                    "https://www.googleapis.com/calendar/v3/users/me/calendarList/{}?colorRgbFormat=true",
+                    urlencoding::encode(remote_id)
+                );
+                let http = reqwest::Client::new();
+                let outcome = http
+                    .patch(&url)
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({
+                        "backgroundColor": new_color,
+                        "foregroundColor": fg,
+                    }))
+                    .send()
+                    .await;
+                match outcome {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        log::warn!(
+                            "update_calendar: Google color push got {} (keeping local-only): {}",
+                            status,
+                            body.chars().take(500).collect::<String>()
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "update_calendar: Google color push request failed (keeping local-only): {}",
+                        e
+                    ),
+                }
+            }
+            Err(e) => log::warn!(
+                "update_calendar: Google color push skipped — no OAuth token: {}",
+                e
+            ),
         }
         return Ok(());
     }
@@ -2192,6 +2218,33 @@ pub async fn respond_to_invite(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pick a readable foreground color for the given background hex.
+/// Used when pushing a color to Google Calendar — the API takes a
+/// foreground/background pair and omitting the foreground leaves it
+/// at a default that can be unreadable on a dark background. The
+/// rule is the standard W3C luminance threshold: backgrounds with
+/// relative luminance > 0.5 get black text, darker ones get white.
+fn readable_foreground(bg_hex: &str) -> &'static str {
+    fn channel(hex: &str, lo: usize, hi: usize) -> Option<f64> {
+        let v = u8::from_str_radix(hex.get(lo..hi)?, 16).ok()? as f64;
+        Some(v / 255.0)
+    }
+    let h = bg_hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return "#000000";
+    }
+    // Quick sRGB luminance — fine for picking black vs. white text.
+    let r = channel(h, 0, 2).unwrap_or(0.0);
+    let g = channel(h, 2, 4).unwrap_or(0.0);
+    let b = channel(h, 4, 6).unwrap_or(0.0);
+    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if lum > 0.5 {
+        "#000000"
+    } else {
+        "#ffffff"
+    }
+}
 
 /// Pick a random color from a curated palette for new calendars.
 pub fn random_calendar_color() -> String {
