@@ -45,6 +45,22 @@ function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
   contextMenu.value = { x: event.clientX, y: event.clientY, calendarId: calId, accountId };
 }
 
+// Toggle visibility on left-click of the row. We use a plain <div>
+// (not <label>) because WebKitGTK's <label> autoactivates the wrapped
+// <input> on *any* mouse-button press, which means right-clicking
+// flips the checkbox before the contextmenu handler can run. With a
+// <div>, the click event itself only fires for the primary button,
+// and we additionally guard on `event.button` for safety.
+function onLabelClick(event: MouseEvent, calId: string) {
+  if (event.button !== 0) return;
+  // Direct clicks on the checkbox are handled by its own @change;
+  // @click.stop on the input prevents this branch from running, but
+  // keep the tag check as a belt-and-braces fallback.
+  const target = event.target as HTMLElement | null;
+  if (target?.tagName === "INPUT") return;
+  calendarStore.toggleCalendarVisibility(calId);
+}
+
 function closeContextMenu() {
   contextMenu.value = null;
 }
@@ -168,11 +184,22 @@ function cancelRecolor() {
   recolorError.value = null;
 }
 
+/// Match either `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`. Anything
+/// else is rejected before we hit the backend so we can't end up
+/// persisting a string the server will choke on (Graph returned an
+/// ISE on bogus inputs, CalDAV PROPPATCH'd a literal "blueish" into
+/// the calendar color).
+const HEX_COLOR_RE = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
 async function confirmRecolor() {
   if (!recoloring.value) return;
-  const newColor = recoloring.value.value.trim();
-  if (!newColor || newColor === recoloring.value.calendar.color) {
+  const newColor = recoloring.value.value.trim().toLowerCase();
+  if (!newColor || newColor === recoloring.value.calendar.color.toLowerCase()) {
     cancelRecolor();
+    return;
+  }
+  if (!HEX_COLOR_RE.test(newColor)) {
+    recolorError.value = "Color must be a hex value like #4285f4 or #4285f4ff.";
     return;
   }
   recolorSaving.value = true;
@@ -183,14 +210,21 @@ async function confirmRecolor() {
       recoloring.value.calendar.name,
       newColor,
     );
-    await calendarStore.fetchCalendars();
-    showToast(`Color updated`, "success");
-    recoloring.value = null;
   } catch (e) {
     recolorError.value = e instanceof Error ? e.message : String(e);
-  } finally {
     recolorSaving.value = false;
+    return;
   }
+  // Close the modal as soon as the backend returns — fetchCalendars
+  // can be slow when one account's listCalendars takes its time, and
+  // we don't want the dialog to sit there while the sidebar refreshes
+  // in the background.
+  recoloring.value = null;
+  recolorSaving.value = false;
+  showToast(`Color updated`, "success");
+  calendarStore
+    .fetchCalendars()
+    .catch((e) => console.error("post-recolor refresh failed:", e));
 }
 
 function startRename() {
@@ -269,10 +303,19 @@ async function unsubscribeThisCalendar() {
         @mouseleave="onCalendarItemLeave(cal.id)"
         @mouseup="onCalendarItemDrop(cal)"
       >
-        <label class="calendar-label">
+        <div
+          class="calendar-label"
+          role="checkbox"
+          tabindex="0"
+          :aria-checked="!calendarStore.hiddenCalendarIds.includes(cal.id)"
+          @click="onLabelClick($event, cal.id)"
+          @keydown.space.prevent="calendarStore.toggleCalendarVisibility(cal.id)"
+          @keydown.enter.prevent="calendarStore.toggleCalendarVisibility(cal.id)"
+        >
           <input
             type="checkbox"
             :checked="!calendarStore.hiddenCalendarIds.includes(cal.id)"
+            @click.stop
             @change="calendarStore.toggleCalendarVisibility(cal.id)"
             data-testid="calendar-toggle"
           />
@@ -285,7 +328,7 @@ async function unsubscribeThisCalendar() {
             <span class="calendar-account">{{ getAccountLabel(cal.account_id) }}</span>
           </span>
           <span v-if="syncing === cal.id" class="sync-spinner"></span>
-        </label>
+        </div>
       </div>
       <div v-if="calendarStore.calendars.length === 0" class="empty">
         No calendars
@@ -366,7 +409,7 @@ async function unsubscribeThisCalendar() {
           <div class="rename-body">
             <h3>Change color</h3>
             <p class="rename-sub">
-              Pick a color for "{{ recoloring.calendar.name }}". Where the server supports it (CalDAV, JMAP) the color is also pushed to the remote calendar.
+              Pick a color for "{{ recoloring.calendar.name }}". CalDAV / JMAP store the exact hex you pick. Microsoft 365 and Google use a fixed palette, so the picked color is approximated and may not match this swatch one-for-one. System calendars (Birthdays, Holidays, etc.) on Microsoft are read-only — the change is kept locally if the server rejects it.
             </p>
             <div class="color-swatches">
               <button
