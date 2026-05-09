@@ -56,15 +56,11 @@ async function addVideoLink(accountId: string) {
   meetError.value = null;
   try {
     const url = await api.meetCreateUrl(accountId, title.value || "Meeting");
-    // Convention: the URL goes into `location` (modern calendar
-    // clients render it as a clickable Join link there) and we
-    // also prepend a "Join: <url>" line to the description so
-    // calendars without rich location rendering still show it
-    // in the body. If location already has something, append
-    // newline-separated.
-    location.value = location.value
-      ? `${location.value}\n${url}`
-      : url;
+    // `location` is an <input type="text"> — newlines aren't
+    // preserved there, so we replace the field outright rather
+    // than appending. The full link history lives in
+    // `description` (a textarea), where multi-line works.
+    location.value = url;
     description.value = description.value
       ? `Join: ${url}\n\n${description.value}`
       : `Join: ${url}`;

@@ -482,6 +482,14 @@ async function openEditForm(id: string) {
       } else {
         oauthStatus.value = null;
       }
+    } else if (config.meet_protocol === "talk" || config.meet_protocol === "matrix") {
+      // Meet-only accounts (Talk / Matrix) come through the
+      // browser-assisted login and have no mail / calendar /
+      // contacts bindings. Detected before the DAV branch
+      // because both have `mail_protocol === ""` — without this
+      // a Matrix account would be misclassified as CalDAV and
+      // the form would hide the URL + Sign-in row. (#148)
+      accountType.value = config.meet_protocol;
     } else if (config.mail_protocol === "") {
       // Standalone DAV account (#43). Pick the tab from the binding
       // shape rather than the sync-enabled flags so toggling "Sync
@@ -1162,7 +1170,14 @@ onMounted(() => {
                     : 'Base URL of your Nextcloud server. Login Flow v2 will open in your browser.' }}
                 </span>
               </div>
-              <div class="form-group">
+              <!-- Sign-in button only shows on the new-account
+                   flow. The login flow always inserts a fresh
+                   account row (it can't update an existing one),
+                   so on edit we hide the button to avoid
+                   duplicating the account when the user clicks
+                   it. Re-auth of an existing meet account is a
+                   delete-and-add operation today. -->
+              <div v-if="!editingAccountId" class="form-group">
                 <button
                   type="button"
                   class="btn-oauth"
@@ -1177,6 +1192,11 @@ onMounted(() => {
                 </button>
                 <span class="field-hint">
                   Opens your browser to authenticate. Your real password never reaches Chithi — we keep a long-lived app token tied to this device.
+                </span>
+              </div>
+              <div v-else class="form-group">
+                <span class="field-hint">
+                  To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : 'Nextcloud' }} server.
                 </span>
               </div>
             </template>

@@ -24,12 +24,26 @@ use crate::error::{Error, Result};
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| Error::Other(format!("talk http client: {}", e)))
+/// Single shared `reqwest::Client` for the whole Talk module so
+/// the connection pool persists across the Login Flow v2 poll
+/// loop (every 2s for up to five minutes per login). Building a
+/// new `Client` for every call would discard the keep-alive
+/// pool and re-do TLS setup each time. Initialised lazily on
+/// first use; if it ever fails to build (TLS init catastrophe)
+/// every call returns the same error.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .user_agent(USER_AGENT)
+                .build()
+                .map_err(|e| format!("talk http client: {}", e))
+        })
+        .as_ref()
+        .map_err(|e| Error::Other(e.clone()))
 }
 
 /// Result of `POST /index.php/login/v2`. The `login` URL is what the

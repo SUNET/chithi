@@ -112,6 +112,20 @@ pub struct MatrixLoginStart {
     pub port: u16,
 }
 
+/// Matches the SSO callback timeout in `meet/matrix.rs`. Sessions
+/// older than this in `AppState.matrix_sso_listeners` are
+/// definitely abandoned (the user closed their browser, the app
+/// crashed, etc.) and get dropped on every fresh login_start
+/// call so the map can't grow unboundedly.
+const MATRIX_SSO_LISTENER_TTL: std::time::Duration = std::time::Duration::from_secs(360);
+
+fn evict_stale_matrix_sessions(
+    sessions: &mut std::collections::HashMap<u16, crate::state::MatrixSsoSession>,
+) {
+    let now = std::time::Instant::now();
+    sessions.retain(|_port, s| now.duration_since(s.created) < MATRIX_SSO_LISTENER_TTL);
+}
+
 /// Bind a local listener and return the SSO redirect URL the
 /// frontend should open. The listener is moved into a background
 /// task that waits for the callback (see `meet_matrix_login_complete`).
@@ -120,16 +134,23 @@ pub async fn meet_matrix_login_start(
     state: State<'_, AppState>,
     homeserver_url: String,
 ) -> Result<MatrixLoginStart> {
-    let (url, listener) = meet::matrix::sso_login_start(&homeserver_url)?;
+    let (url, listener, sso_state) = meet::matrix::sso_login_start(&homeserver_url)?;
     let port = listener
         .local_addr()
         .map_err(|e| Error::Other(format!("matrix listener port: {}", e)))?
         .port();
-    state
-        .matrix_sso_listeners
-        .lock()
-        .unwrap()
-        .insert(port, listener);
+    {
+        let mut map = state.matrix_sso_listeners.lock().unwrap();
+        evict_stale_matrix_sessions(&mut map);
+        map.insert(
+            port,
+            crate::state::MatrixSsoSession {
+                created: std::time::Instant::now(),
+                listener,
+                state: sso_state,
+            },
+        );
+    }
     Ok(MatrixLoginStart {
         login_url: url,
         port,
@@ -145,7 +166,7 @@ pub async fn meet_matrix_login_complete(
     port: u16,
     display_name: Option<String>,
 ) -> Result<String> {
-    let listener = state
+    let session = state
         .matrix_sso_listeners
         .lock()
         .unwrap()
@@ -156,9 +177,13 @@ pub async fn meet_matrix_login_complete(
                 port,
             ))
         })?;
-    let token = tokio::task::spawn_blocking(move || meet::matrix::await_login_token(listener))
-        .await
-        .map_err(|e| Error::Other(format!("matrix sso join: {}", e)))??;
+    let listener = session.listener;
+    let expected_state = session.state;
+    let token = tokio::task::spawn_blocking(move || {
+        meet::matrix::await_login_token(listener, &expected_state)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("matrix sso join: {}", e)))??;
     let result = meet::matrix::exchange_login_token(&homeserver_url, &token).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
