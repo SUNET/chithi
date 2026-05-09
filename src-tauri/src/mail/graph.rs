@@ -645,14 +645,16 @@ impl GraphClient {
             .await
     }
 
-    /// Set a calendar's color via PATCH /me/calendars/{id}. Microsoft
-    /// Graph only accepts a constrained `calendarColor` enum (auto,
-    /// lightBlue, lightGreen, …). Translate the user's hex to the
-    /// nearest of those names via simple RGB Euclidean distance — our
-    /// 10-color palette maps cleanly to 10 of the 11 enum values, and
-    /// off-palette hex still lands on something reasonable. The
-    /// caller is responsible for keeping the original hex in our
-    /// local DB so the UI shows what the user actually picked.
+    /// Set a calendar's color via PATCH /me/calendars/{id}. The
+    /// writable property is the `color` field, whose value comes
+    /// from the constrained `calendarColor` enum (`auto`,
+    /// `lightBlue`, `lightGreen`, …). Translate the user's hex to
+    /// the nearest of those names via simple RGB Euclidean distance.
+    /// `maxColor` is excluded from the candidate set — Microsoft
+    /// documents it as a sentinel ordinal and PATCHing with it
+    /// returns 500 ISE in practice. The caller keeps the original
+    /// hex in our local DB so the sidebar shows what the user
+    /// actually picked even when Graph snapped it to a neighbour.
     pub async fn set_calendar_color(&self, calendar_id: &str, hex: &str) -> Result<()> {
         let named = nearest_outlook_color(hex);
         log::info!(
@@ -1362,29 +1364,41 @@ fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
     }
 }
 
+/// Anchor hexes for the Microsoft `calendarColor` enum. Picked to
+/// match the app's UI palette in `random_calendar_color()` so that
+/// (a) freshly-synced Graph calendars get a hex that the picker
+/// already shows on its swatch row, and (b) `nearest_outlook_color`
+/// (the inverse direction) round-trips exactly when the user picks
+/// a palette colour. `maxColor` is intentionally absent — it's a
+/// sentinel ordinal that Graph rejects with 500 ISE on PATCH.
+const GRAPH_COLOR_ANCHORS: &[(&str, &str, (i32, i32, i32))] = &[
+    ("lightBlue", "#4285f4", (0x42, 0x85, 0xf4)),
+    ("lightGreen", "#0b8043", (0x0b, 0x80, 0x43)),
+    ("lightOrange", "#f4511e", (0xf4, 0x51, 0x1e)),
+    ("lightGray", "#616161", (0x61, 0x61, 0x61)),
+    ("lightYellow", "#f6bf26", (0xf6, 0xbf, 0x26)),
+    ("lightTeal", "#33b679", (0x33, 0xb6, 0x79)),
+    ("lightPink", "#e67c73", (0xe6, 0x7c, 0x73)),
+    ("lightBrown", "#8e24aa", (0x8e, 0x24, 0xaa)),
+    ("lightRed", "#d50000", (0xd5, 0x00, 0x00)),
+];
+
 fn graph_color_to_hex(color: &str) -> String {
-    match color {
-        "auto" | "lightBlue" => "#4285f4",
-        "lightGreen" => "#10b981",
-        "lightOrange" => "#f59e0b",
-        "lightGray" => "#6b7280",
-        "lightYellow" => "#eab308",
-        "lightTeal" => "#14b8a6",
-        "lightPink" => "#ec4899",
-        "lightBrown" => "#a16207",
-        "lightRed" => "#ef4444",
-        "maxColor" => "#8b5cf6",
-        _ => "#4285f4",
+    if color == "auto" {
+        return "#4285f4".to_string();
     }
-    .to_string()
+    GRAPH_COLOR_ANCHORS
+        .iter()
+        .find(|(name, _, _)| *name == color)
+        .map(|(_, hex, _)| (*hex).to_string())
+        .unwrap_or_else(|| "#4285f4".to_string())
 }
 
 /// Pick the closest Microsoft `calendarColor` enum name for a given
-/// CSS hex. Uses the same anchor hexes as `graph_color_to_hex`, so
-/// our palette round-trips when the user re-syncs against Graph.
-/// Plain Euclidean distance in RGB is "good enough" for a 10-bin
-/// nearest-neighbour over a small palette; perceptually-correct
-/// CIELAB would be overkill for this constrained mapping.
+/// CSS hex. Anchor hexes match the UI palette so a round-trip
+/// through Graph keeps colors recognisable. Plain Euclidean
+/// distance in RGB is "good enough" for a 9-bin nearest-neighbour
+/// over a small palette.
 fn nearest_outlook_color(hex: &str) -> &'static str {
     fn parse_hex(s: &str) -> Option<(i32, i32, i32)> {
         let h = s.trim().trim_start_matches('#');
@@ -1397,28 +1411,12 @@ fn nearest_outlook_color(hex: &str) -> &'static str {
             i32::from_str_radix(&h[4..6], 16).ok()?,
         ))
     }
-    // Same anchors as graph_color_to_hex above so the mapping is
-    // symmetric. "auto" intentionally absent — we want to pick a
-    // concrete color rather than fall back to the user's account
-    // default.
-    const ANCHORS: &[(&str, (i32, i32, i32))] = &[
-        ("lightBlue", (0x42, 0x85, 0xf4)),
-        ("lightGreen", (0x10, 0xb9, 0x81)),
-        ("lightOrange", (0xf5, 0x9e, 0x0b)),
-        ("lightGray", (0x6b, 0x72, 0x80)),
-        ("lightYellow", (0xea, 0xb3, 0x08)),
-        ("lightTeal", (0x14, 0xb8, 0xa6)),
-        ("lightPink", (0xec, 0x48, 0x99)),
-        ("lightBrown", (0xa1, 0x62, 0x07)),
-        ("lightRed", (0xef, 0x44, 0x44)),
-        ("maxColor", (0x8b, 0x5c, 0xf6)),
-    ];
     let Some((r, g, b)) = parse_hex(hex) else {
         return "auto";
     };
-    let mut best = ANCHORS[0].0;
+    let mut best = GRAPH_COLOR_ANCHORS[0].0;
     let mut best_d = i32::MAX;
-    for (name, (ar, ag, ab)) in ANCHORS {
+    for (name, _, (ar, ag, ab)) in GRAPH_COLOR_ANCHORS {
         let dr = r - ar;
         let dg = g - ag;
         let db = b - ab;
@@ -1468,21 +1466,30 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
 
 #[cfg(test)]
 mod color_tests {
-    use super::nearest_outlook_color;
+    use super::{graph_color_to_hex, nearest_outlook_color};
 
     #[test]
     fn anchor_round_trip() {
-        // Each anchor hex must map back to its own name.
-        assert_eq!(nearest_outlook_color("#4285f4"), "lightBlue");
-        assert_eq!(nearest_outlook_color("#10b981"), "lightGreen");
-        assert_eq!(nearest_outlook_color("#f59e0b"), "lightOrange");
-        assert_eq!(nearest_outlook_color("#6b7280"), "lightGray");
-        assert_eq!(nearest_outlook_color("#eab308"), "lightYellow");
-        assert_eq!(nearest_outlook_color("#14b8a6"), "lightTeal");
-        assert_eq!(nearest_outlook_color("#ec4899"), "lightPink");
-        assert_eq!(nearest_outlook_color("#a16207"), "lightBrown");
-        assert_eq!(nearest_outlook_color("#ef4444"), "lightRed");
-        assert_eq!(nearest_outlook_color("#8b5cf6"), "maxColor");
+        // Each UI-palette anchor must map to its expected enum name
+        // *and* enum-name → hex must round-trip back. This is the
+        // contract that keeps colors recognisable when the user
+        // picks one of the 10 swatches and it survives a Graph
+        // resync.
+        let cases = [
+            ("#4285f4", "lightBlue"),
+            ("#0b8043", "lightGreen"),
+            ("#f4511e", "lightOrange"),
+            ("#616161", "lightGray"),
+            ("#f6bf26", "lightYellow"),
+            ("#33b679", "lightTeal"),
+            ("#e67c73", "lightPink"),
+            ("#8e24aa", "lightBrown"),
+            ("#d50000", "lightRed"),
+        ];
+        for (hex, name) in cases {
+            assert_eq!(nearest_outlook_color(hex), name, "hex {} -> name", hex);
+            assert_eq!(graph_color_to_hex(name), hex, "name {} -> hex", name);
+        }
     }
 
     #[test]
@@ -1498,5 +1505,18 @@ mod color_tests {
         assert_eq!(nearest_outlook_color("not-a-color"), "auto");
         assert_eq!(nearest_outlook_color("#abc"), "auto");
         assert_eq!(nearest_outlook_color(""), "auto");
+    }
+
+    #[test]
+    fn maxcolor_is_not_a_target() {
+        // Graph rejects PATCH with `color: maxColor` (500 ISE in
+        // practice — Microsoft documents it as a sentinel ordinal).
+        // No input hex should produce it.
+        for &(_, hex, _) in super::GRAPH_COLOR_ANCHORS {
+            assert_ne!(nearest_outlook_color(hex), "maxColor");
+        }
+        assert_ne!(nearest_outlook_color("#000000"), "maxColor");
+        assert_ne!(nearest_outlook_color("#ffffff"), "maxColor");
+        assert_ne!(nearest_outlook_color("#8b5cf6"), "maxColor");
     }
 }
