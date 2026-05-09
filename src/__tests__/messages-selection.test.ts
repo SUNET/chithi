@@ -41,6 +41,9 @@ function setup(threading = false) {
       mail_sync_interval_seconds: null,
       calendar_sync_interval_seconds: null,
       contacts_sync_interval_seconds: null,
+      username: "",
+      has_calendar_binding: false,
+      has_contacts_binding: false,
     },
   ];
   accountsStore.activeAccountId = "acc1";

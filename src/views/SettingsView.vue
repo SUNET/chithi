@@ -19,10 +19,33 @@ const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
 
-function accountTypeLabel(acc: { provider?: string; mail_protocol?: string }): string {
+function accountTypeLabel(acc: {
+  provider?: string;
+  mail_protocol?: string;
+  has_calendar_binding?: boolean;
+  has_contacts_binding?: boolean;
+}): string {
   if (acc.provider === "gmail") return "GMAIL";
   if (acc.provider === "o365") return "MICROSOFT 365";
-  return (acc.mail_protocol ?? "").toUpperCase();
+  if (acc.mail_protocol) return acc.mail_protocol.toUpperCase();
+  // Standalone DAV accounts: name them by the user-visible service
+  // they provide rather than the protocol acronym. "Calendar" and
+  // "Contacts" mean something to a user; "CALDAV" and "CARDDAV"
+  // mean something to a protocol nerd.
+  const hasCal = !!acc.has_calendar_binding;
+  const hasCon = !!acc.has_contacts_binding;
+  if (hasCal && hasCon) return "Calendar and Contacts";
+  if (hasCal) return "Calendar";
+  if (hasCon) return "Contacts";
+  return "";
+}
+
+/// Secondary line for the settings account list. Standalone CalDAV /
+/// CardDAV accounts created before the email back-fill landed have
+/// `email = ""`; falling back to `username` means they still show
+/// something identifying instead of a blank gap.
+function accountSecondaryLabel(acc: { email: string; username: string }): string {
+  return acc.email || acc.username || "";
 }
 
 // Mobile toggles — persist to localStorage so they survive reloads.
@@ -419,6 +442,17 @@ async function saveAccount() {
     if (!form.value.username.trim()) {
       form.value.username = form.value.email;
     }
+    // Standalone DAV tabs are single-purpose: a CalDAV-tab account
+    // is for calendar, a CardDAV-tab account is for contacts. The
+    // form hides the other binding's sync toggle, so an existing
+    // account with the other flag stuck on `true` can't be cleaned
+    // up through the UI. Enforce the constraint at save time so
+    // the next round-trip clears it.
+    if (accountType.value === "caldav") {
+      form.value.contacts_sync_enabled = false;
+    } else if (accountType.value === "carddav") {
+      form.value.calendar_sync_enabled = false;
+    }
     // Mail-having accounts already require an email. The standalone
     // CalDAV / CardDAV tabs hide the email field — but some calendar
     // code paths still touch `account.email` (CalDAV connect uses it
@@ -636,7 +670,7 @@ onMounted(() => {
             </span>
             <span class="mobile-account-info">
               <span class="mobile-account-name">{{ account.display_name }}</span>
-              <span class="mobile-account-email">{{ account.email }}</span>
+              <span class="mobile-account-email">{{ accountSecondaryLabel(account) }}</span>
               <span class="mobile-account-type" :style="{ color: acctColor(account.id).fill }">
                 {{ accountTypeLabel(account) }}
               </span>
@@ -745,8 +779,8 @@ onMounted(() => {
             </span>
             <div class="account-card-info">
               <span class="account-card-name">{{ account.display_name }}</span>
-              <span class="account-card-email">{{ account.email }}</span>
-              <span class="account-card-type" :style="{ color: acctColor(account.id).fill }">{{ account.provider === 'gmail' ? 'Gmail' : account.provider === 'o365' ? 'Microsoft 365' : account.mail_protocol.toUpperCase() }}</span>
+              <span class="account-card-email">{{ accountSecondaryLabel(account) }}</span>
+              <span class="account-card-type" :style="{ color: acctColor(account.id).fill }">{{ accountTypeLabel(account) }}</span>
             </div>
           </div>
           <div class="account-card-actions">

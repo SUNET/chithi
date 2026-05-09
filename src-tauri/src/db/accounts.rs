@@ -11,6 +11,12 @@ pub struct Account {
     pub id: String,
     pub display_name: String,
     pub email: String,
+    /// Carried in the summary so the settings list can show *something*
+    /// for standalone CalDAV / CardDAV accounts whose `email` field
+    /// was never set (older accounts created before the DAV-tab
+    /// email back-fill landed).
+    #[serde(default)]
+    pub username: String,
     pub provider: String,
     pub mail_protocol: String,
     pub enabled: bool,
@@ -23,6 +29,13 @@ pub struct Account {
     pub calendar_sync_interval_seconds: Option<i64>,
     #[serde(default)]
     pub contacts_sync_interval_seconds: Option<i64>,
+    /// Whether the account has a calendar / contacts binding row.
+    /// Lets the UI label standalone CalDAV / CardDAV accounts in the
+    /// settings list without a second round-trip per row.
+    #[serde(default)]
+    pub has_calendar_binding: bool,
+    #[serde(default)]
+    pub has_contacts_binding: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,7 +317,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
     // summary doesn't need a separate per-account query for the
     // periodic-sync timers.
     let mut stmt = conn.prepare(
-        "SELECT a.id, a.display_name, a.email, a.auth_method, a.enabled,
+        "SELECT a.id, a.display_name, a.email, a.auth_method, a.enabled, a.username,
                 COALESCE(
                     (SELECT b.protocol FROM service_bindings b
                      WHERE b.account_id = a.id
@@ -321,7 +334,21 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                     AS calendar_sync_interval,
                 (SELECT b.sync_interval_seconds FROM service_bindings b
                  WHERE b.account_id = a.id AND b.service = 'contacts' LIMIT 1)
-                    AS contacts_sync_interval
+                    AS contacts_sync_interval,
+                -- Enabled-aware so a standalone CalDAV-tab account
+                -- (which derives a calendar binding enabled=1 plus a
+                -- disabled contacts binding) labels as Calendar, not
+                -- as both. Same for CardDAV.
+                EXISTS (SELECT 1 FROM service_bindings b
+                        WHERE b.account_id = a.id
+                          AND b.service = 'calendar'
+                          AND b.enabled = 1)
+                    AS has_calendar_binding,
+                EXISTS (SELECT 1 FROM service_bindings b
+                        WHERE b.account_id = a.id
+                          AND b.service = 'contacts'
+                          AND b.enabled = 1)
+                    AS has_contacts_binding
          FROM accounts a
          ORDER BY a.display_name",
     )?;
@@ -338,12 +365,15 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                 id: row.get(0)?,
                 display_name: row.get(1)?,
                 email: row.get(2)?,
+                username: row.get(5)?,
                 provider,
-                mail_protocol: row.get(5)?,
+                mail_protocol: row.get(6)?,
                 enabled: row.get(4)?,
-                mail_sync_interval_seconds: row.get(6)?,
-                calendar_sync_interval_seconds: row.get(7)?,
-                contacts_sync_interval_seconds: row.get(8)?,
+                mail_sync_interval_seconds: row.get(7)?,
+                calendar_sync_interval_seconds: row.get(8)?,
+                contacts_sync_interval_seconds: row.get(9)?,
+                has_calendar_binding: row.get(10)?,
+                has_contacts_binding: row.get(11)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
