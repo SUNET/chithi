@@ -39,6 +39,12 @@ pub struct Account {
     pub has_calendar_binding: bool,
     #[serde(default)]
     pub has_contacts_binding: bool,
+    /// Protocol of the account's enabled meet binding ("talk" /
+    /// "matrix"), or "" when there is none. Lets the calendar
+    /// event editor populate its "Add video link" dropdown with
+    /// just the accounts that can produce one. (#148)
+    #[serde(default)]
+    pub meet_protocol: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,7 +401,15 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                         WHERE b.account_id = a.id
                           AND b.service = 'contacts'
                           AND b.enabled = 1)
-                    AS has_contacts_binding
+                    AS has_contacts_binding,
+                COALESCE(
+                    (SELECT b.protocol FROM service_bindings b
+                     WHERE b.account_id = a.id
+                       AND b.service = 'meet'
+                       AND b.enabled = 1
+                     LIMIT 1),
+                    ''
+                ) AS meet_protocol
          FROM accounts a
          ORDER BY a.display_name",
     )?;
@@ -421,6 +435,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                 contacts_sync_interval_seconds: row.get(9)?,
                 has_calendar_binding: row.get(10)?,
                 has_contacts_binding: row.get(11)?,
+                meet_protocol: row.get(12)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

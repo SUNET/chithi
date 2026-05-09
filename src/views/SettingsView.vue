@@ -43,6 +43,7 @@ function accountTypeLabel(acc: {
   mail_protocol?: string;
   has_calendar_binding?: boolean;
   has_contacts_binding?: boolean;
+  meet_protocol?: string;
 }): string {
   if (acc.provider === "gmail") return "GMAIL";
   if (acc.provider === "o365") return "MICROSOFT 365";
@@ -56,7 +57,15 @@ function accountTypeLabel(acc: {
   if (hasCal && hasCon) return "Calendar and Contacts";
   if (hasCal) return "Calendar";
   if (hasCon) return "Contacts";
-  return "";
+  // Meet-only accounts (#148). Same user-visible naming approach.
+  switch (acc.meet_protocol) {
+    case "talk":
+      return "Nextcloud Talk";
+    case "matrix":
+      return "Matrix";
+    default:
+      return "";
+  }
 }
 
 /// Secondary line for the settings account list. Standalone CalDAV /

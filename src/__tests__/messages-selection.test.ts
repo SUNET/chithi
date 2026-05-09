@@ -44,6 +44,7 @@ function setup(threading = false) {
       username: "",
       has_calendar_binding: false,
       has_contacts_binding: false,
+      meet_protocol: "",
     },
   ];
   accountsStore.activeAccountId = "acc1";

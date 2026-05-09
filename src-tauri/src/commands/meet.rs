@@ -59,9 +59,12 @@ pub async fn meet_talk_login_complete(
     let display = display_name
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("Talk @ {}", short_host(&creds.server)));
+    // Talk's loginName is a Nextcloud username, not an email. Keep
+    // it in `username`; leave `email` empty so the listing falls
+    // back to the username + "NEXTCLOUD TALK" label.
     let config = db::accounts::AccountConfig {
         display_name: display,
-        email: creds.login_name.clone(),
+        email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),
         imap_host: String::new(),
@@ -162,9 +165,11 @@ pub async fn meet_matrix_login_complete(
     let display = display_name
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("Matrix ({})", result.user_id));
+    // Matrix MXIDs (`@user:server.tld`) aren't emails. Same
+    // treatment as Talk: empty email, MXID lives in `username`.
     let config = db::accounts::AccountConfig {
         display_name: display,
-        email: result.user_id.clone(),
+        email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),
         imap_host: String::new(),

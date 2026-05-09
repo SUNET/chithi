@@ -25,6 +25,11 @@ export interface Account {
   // existence-only flags would always say true for both).
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
+  // #148. Protocol of the account's enabled meet binding ("talk" /
+  // "matrix"), empty when there is none. Lets the calendar event
+  // editor populate its "Add video link" dropdown without an
+  // extra round-trip per row.
+  meet_protocol: "" | "talk" | "matrix";
 }
 
 export interface QuickFilter {
