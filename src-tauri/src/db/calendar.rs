@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(id1, id2, "Should return same local ID");
         let updated = get_calendar(&conn, &id2).unwrap();
         assert_eq!(updated.name, "Work Updated");
-        assert_eq!(updated.is_default, false);
+        assert!(!updated.is_default);
         assert_eq!(
             updated.color, "#4285f4",
             "color must be preserved across resync"

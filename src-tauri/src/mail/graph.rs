@@ -645,6 +645,27 @@ impl GraphClient {
             .await
     }
 
+    /// Set a calendar's color via PATCH /me/calendars/{id}. Microsoft
+    /// Graph only accepts a constrained `calendarColor` enum (auto,
+    /// lightBlue, lightGreen, …). Translate the user's hex to the
+    /// nearest of those names via simple RGB Euclidean distance — our
+    /// 10-color palette maps cleanly to 10 of the 11 enum values, and
+    /// off-palette hex still lands on something reasonable. The
+    /// caller is responsible for keeping the original hex in our
+    /// local DB so the UI shows what the user actually picked.
+    pub async fn set_calendar_color(&self, calendar_id: &str, hex: &str) -> Result<()> {
+        let named = nearest_outlook_color(hex);
+        log::info!(
+            "Graph set color: id={} hex={} -> {}",
+            calendar_id,
+            hex,
+            named
+        );
+        let path = format!("/me/calendars/{}", urlencoding::encode(calendar_id));
+        self.patch_json(&path, &serde_json::json!({ "color": named }))
+            .await
+    }
+
     /// Fetch events in a time range via calendarView.
     /// Uses `Prefer: outlook.timezone="UTC"` so all times come back in UTC.
     /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
@@ -1358,6 +1379,58 @@ fn graph_color_to_hex(color: &str) -> String {
     .to_string()
 }
 
+/// Pick the closest Microsoft `calendarColor` enum name for a given
+/// CSS hex. Uses the same anchor hexes as `graph_color_to_hex`, so
+/// our palette round-trips when the user re-syncs against Graph.
+/// Plain Euclidean distance in RGB is "good enough" for a 10-bin
+/// nearest-neighbour over a small palette; perceptually-correct
+/// CIELAB would be overkill for this constrained mapping.
+fn nearest_outlook_color(hex: &str) -> &'static str {
+    fn parse_hex(s: &str) -> Option<(i32, i32, i32)> {
+        let h = s.trim().trim_start_matches('#');
+        if h.len() != 6 {
+            return None;
+        }
+        Some((
+            i32::from_str_radix(&h[0..2], 16).ok()?,
+            i32::from_str_radix(&h[2..4], 16).ok()?,
+            i32::from_str_radix(&h[4..6], 16).ok()?,
+        ))
+    }
+    // Same anchors as graph_color_to_hex above so the mapping is
+    // symmetric. "auto" intentionally absent — we want to pick a
+    // concrete color rather than fall back to the user's account
+    // default.
+    const ANCHORS: &[(&str, (i32, i32, i32))] = &[
+        ("lightBlue", (0x42, 0x85, 0xf4)),
+        ("lightGreen", (0x10, 0xb9, 0x81)),
+        ("lightOrange", (0xf5, 0x9e, 0x0b)),
+        ("lightGray", (0x6b, 0x72, 0x80)),
+        ("lightYellow", (0xea, 0xb3, 0x08)),
+        ("lightTeal", (0x14, 0xb8, 0xa6)),
+        ("lightPink", (0xec, 0x48, 0x99)),
+        ("lightBrown", (0xa1, 0x62, 0x07)),
+        ("lightRed", (0xef, 0x44, 0x44)),
+        ("maxColor", (0x8b, 0x5c, 0xf6)),
+    ];
+    let Some((r, g, b)) = parse_hex(hex) else {
+        return "auto";
+    };
+    let mut best = ANCHORS[0].0;
+    let mut best_d = i32::MAX;
+    for (name, (ar, ag, ab)) in ANCHORS {
+        let dr = r - ar;
+        let dg = g - ag;
+        let db = b - ab;
+        let d = dr * dr + dg * dg + db * db;
+        if d < best_d {
+            best_d = d;
+            best = name;
+        }
+    }
+    best
+}
+
 /// Get a valid Graph API access token for an O365 account.
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
@@ -1391,4 +1464,39 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
     }
 
     Ok(new_tokens.access_token)
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::nearest_outlook_color;
+
+    #[test]
+    fn anchor_round_trip() {
+        // Each anchor hex must map back to its own name.
+        assert_eq!(nearest_outlook_color("#4285f4"), "lightBlue");
+        assert_eq!(nearest_outlook_color("#10b981"), "lightGreen");
+        assert_eq!(nearest_outlook_color("#f59e0b"), "lightOrange");
+        assert_eq!(nearest_outlook_color("#6b7280"), "lightGray");
+        assert_eq!(nearest_outlook_color("#eab308"), "lightYellow");
+        assert_eq!(nearest_outlook_color("#14b8a6"), "lightTeal");
+        assert_eq!(nearest_outlook_color("#ec4899"), "lightPink");
+        assert_eq!(nearest_outlook_color("#a16207"), "lightBrown");
+        assert_eq!(nearest_outlook_color("#ef4444"), "lightRed");
+        assert_eq!(nearest_outlook_color("#8b5cf6"), "maxColor");
+    }
+
+    #[test]
+    fn off_palette_picks_a_neighbour() {
+        // Pure red should pick lightRed (the closest anchor).
+        assert_eq!(nearest_outlook_color("#ff0000"), "lightRed");
+        // Pure white falls equidistant-ish but never panics.
+        let _ = nearest_outlook_color("#ffffff");
+    }
+
+    #[test]
+    fn invalid_hex_returns_auto() {
+        assert_eq!(nearest_outlook_color("not-a-color"), "auto");
+        assert_eq!(nearest_outlook_color("#abc"), "auto");
+        assert_eq!(nearest_outlook_color(""), "auto");
+    }
 }
