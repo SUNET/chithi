@@ -8,5 +8,6 @@ pub mod contacts;
 pub mod events;
 pub mod filters;
 pub mod mail;
+pub mod meet;
 pub mod oauth;
 pub mod sync_cmd;

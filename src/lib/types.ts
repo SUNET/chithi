@@ -166,6 +166,14 @@ export interface AccountConfig {
   smtp_port: number;
   jmap_url: string;
   caldav_url: string;
+  /// #148. Server URL for the video-conferencing binding
+  /// (Nextcloud Talk root or Matrix homeserver). Empty when the
+  /// account has no meet binding. Pairs with `meet_protocol`.
+  meet_url: string;
+  /// One of `"talk"` / `"matrix"` when the account has a meet
+  /// binding, empty otherwise. Picked by which Settings tab the
+  /// user signed in through.
+  meet_protocol: "" | "talk" | "matrix";
   username: string;
   password: string;
   use_tls: boolean;

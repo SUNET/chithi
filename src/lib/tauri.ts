@@ -507,6 +507,68 @@ export async function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }
 
+// Meet (video conferencing — #148). Two browser-assisted login
+// flows + one provider-agnostic create-URL. Talk uses Nextcloud
+// Login Flow v2 (poll-based), Matrix uses SSO redirect to a local
+// listener. Both end with a stored account row + keyring entry.
+
+export interface TalkLoginStart {
+  login_url: string;
+  poll_endpoint: string;
+  poll_token: string;
+}
+
+export async function meetTalkLoginStart(
+  serverUrl: string,
+): Promise<TalkLoginStart> {
+  return invoke("meet_talk_login_start", { serverUrl });
+}
+
+export async function meetTalkLoginComplete(
+  pollEndpoint: string,
+  pollToken: string,
+  displayName?: string,
+): Promise<string> {
+  return invoke("meet_talk_login_complete", {
+    pollEndpoint,
+    pollToken,
+    displayName: displayName ?? null,
+  });
+}
+
+export interface MatrixLoginStart {
+  login_url: string;
+  port: number;
+}
+
+export async function meetMatrixLoginStart(
+  homeserverUrl: string,
+): Promise<MatrixLoginStart> {
+  return invoke("meet_matrix_login_start", { homeserverUrl });
+}
+
+export async function meetMatrixLoginComplete(
+  homeserverUrl: string,
+  port: number,
+  displayName?: string,
+): Promise<string> {
+  return invoke("meet_matrix_login_complete", {
+    homeserverUrl,
+    port,
+    displayName: displayName ?? null,
+  });
+}
+
+/// Provider-agnostic create — picks the registry entry matching
+/// the account's meet binding. Returns the join URL the event
+/// editor should drop into the event's location field.
+export async function meetCreateUrl(
+  accountId: string,
+  name: string,
+): Promise<string> {
+  return invoke("meet_create_url", { accountId, name });
+}
+
 // IDLE
 export async function startIdle(): Promise<void> {
   return invoke("start_idle");

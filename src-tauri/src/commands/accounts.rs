@@ -228,6 +228,8 @@ pub async fn get_account_config(
         smtp_port: full.smtp_port,
         jmap_url: full.jmap_url,
         caldav_url: full.caldav_url,
+        meet_url: full.meet_url,
+        meet_protocol: full.meet_protocol,
         username: full.username,
         password: String::new(),
         use_tls: full.use_tls,

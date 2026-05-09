@@ -42,6 +42,12 @@ pub struct AppState {
     /// dialog. The renderer only ever sees the token, so a compromised
     /// renderer cannot ask the backend to read arbitrary files.
     pub attachments: std::sync::Mutex<HashMap<String, PathBuf>>,
+    /// In-flight Matrix SSO listeners, keyed by the local-port the
+    /// frontend will pass back to `meet_matrix_login_complete`.
+    /// `meet_matrix_login_start` parks one here when it returns the
+    /// SSO redirect URL; the complete call removes and consumes it.
+    /// (#148)
+    pub matrix_sso_listeners: std::sync::Mutex<HashMap<u16, std::net::TcpListener>>,
 }
 
 impl AppState {
@@ -66,6 +72,7 @@ impl AppState {
             op_senders: std::sync::Mutex::new(HashMap::new()),
             data_dir,
             attachments: std::sync::Mutex::new(HashMap::new()),
+            matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
