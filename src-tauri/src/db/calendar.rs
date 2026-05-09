@@ -170,8 +170,15 @@ pub fn delete_calendar(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Upsert a calendar by remote_id. If a calendar with the same (account_id, remote_id)
-/// already exists, update its name and color. Otherwise insert a new row.
+/// Upsert a calendar by remote_id. If a calendar with the same
+/// (account_id, remote_id) already exists, update its name and
+/// is_default flag — but **preserve the user-customized color**.
+/// CalDAV / JMAP / Google rarely expose a stable "calendar color"
+/// property, so on every resync the caller would otherwise hand us
+/// a fallback colour like `#4285f4` and stomp the user's pick from
+/// the sidebar's color picker (#132). On INSERT the supplied color
+/// is what gets stored.
+///
 /// Returns the local calendar ID.
 pub fn upsert_calendar_by_remote_id(
     conn: &Connection,
@@ -181,7 +188,6 @@ pub fn upsert_calendar_by_remote_id(
     color: &str,
     is_default: bool,
 ) -> Result<String> {
-    // Check if we already have this calendar
     let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM calendars WHERE account_id = ?1 AND remote_id = ?2",
@@ -192,8 +198,8 @@ pub fn upsert_calendar_by_remote_id(
 
     if let Some(id) = existing {
         conn.execute(
-            "UPDATE calendars SET name = ?1, color = ?2, is_default = ?3 WHERE id = ?4",
-            params![name, color, is_default, id],
+            "UPDATE calendars SET name = ?1, is_default = ?2 WHERE id = ?3",
+            params![name, is_default, id],
         )?;
         Ok(id)
     } else {
@@ -754,16 +760,19 @@ mod tests {
     fn test_upsert_calendar_by_remote_id() {
         let conn = setup_db();
 
-        // First upsert creates a new calendar
+        // First upsert creates a new calendar with the supplied color.
         let id1 =
             upsert_calendar_by_remote_id(&conn, "acc1", "remote-cal", "Work", "#4285f4", true)
                 .unwrap();
 
         let cal = get_calendar(&conn, &id1).unwrap();
         assert_eq!(cal.name, "Work");
+        assert_eq!(cal.color, "#4285f4");
         assert_eq!(cal.remote_id, Some("remote-cal".to_string()));
 
-        // Second upsert with same remote_id updates
+        // Second upsert with same remote_id updates name + is_default
+        // but **must preserve the existing color** so a resync doesn't
+        // stomp the user's manual pick (#132).
         let id2 = upsert_calendar_by_remote_id(
             &conn,
             "acc1",
@@ -777,7 +786,11 @@ mod tests {
         assert_eq!(id1, id2, "Should return same local ID");
         let updated = get_calendar(&conn, &id2).unwrap();
         assert_eq!(updated.name, "Work Updated");
-        assert_eq!(updated.color, "#ff0000");
+        assert_eq!(updated.is_default, false);
+        assert_eq!(
+            updated.color, "#4285f4",
+            "color must be preserved across resync"
+        );
     }
 
     #[test]

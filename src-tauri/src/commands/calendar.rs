@@ -95,6 +95,7 @@ pub async fn update_calendar(
     };
 
     let name_changed = existing.name != name;
+    let color_changed = existing.color != color;
     let remote_id = existing.remote_id.clone().filter(|r| !r.is_empty());
     if name_changed {
         if let Some(ref rid) = remote_id {
@@ -105,9 +106,74 @@ pub async fn update_calendar(
             );
         }
     }
+    if color_changed {
+        if let Some(ref rid) = remote_id {
+            // Best-effort: protocols that can't push a color (Graph,
+            // Google) log a debug line and we keep the local change
+            // anyway so the user's pick takes effect in our UI.
+            push_calendar_color(&account, rid, &color).await?;
+        } else {
+            log::info!(
+                "update_calendar: skipping remote color push (no remote_id, local-only calendar)"
+            );
+        }
+    }
 
     let conn = state.db.writer().await;
     db::calendar::update_calendar(&conn, &calendar_id, &name, &color)?;
+    Ok(())
+}
+
+/// Push a calendar color change to the account's remote server.
+/// Mirrors `push_calendar_rename` per-protocol dispatch.
+///
+/// CalDAV (incl. Radicale, Nextcloud, Sabre/dav, Apple Calendar
+/// Server) and JMAP both have a standard color property and surface
+/// any push failure as an error. Microsoft Graph and Google Calendar
+/// expose only a constrained color enum / numeric id; we'd need a
+/// hex-to-named lookup to translate, so for now we log a debug line
+/// and let the local DB keep the user's hex unchanged. Local-only
+/// calendars (no `remote_id`) never reach this function — caller
+/// short-circuits.
+async fn push_calendar_color(
+    account: &db::accounts::AccountFull,
+    remote_id: &str,
+    new_color: &str,
+) -> Result<()> {
+    let cal_proto = account.calendar_protocol_str();
+    if cal_proto == "jmap" {
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        conn_jmap
+            .set_calendar_color(&jmap_config, remote_id, new_color)
+            .await?;
+        return Ok(());
+    }
+
+    if cal_proto == "caldav"
+        || (!account.caldav_url.is_empty() && cal_proto != "google" && cal_proto != "graph")
+    {
+        use crate::mail::caldav::{CalDavClient, CalDavConfig};
+        let caldav_config = CalDavConfig {
+            caldav_url: account.caldav_url.clone(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+            email: account.email.clone(),
+        };
+        let client = CalDavClient::connect(&caldav_config).await?;
+        client.set_calendar_color(remote_id, new_color).await?;
+        return Ok(());
+    }
+
+    // Graph / Google use named color enums (and a numeric id, in
+    // Google's case); writing arbitrary hex isn't supported on the
+    // public APIs without a mapping table. Log and keep the change
+    // local-only — the user still gets the new color in the sidebar.
+    log::info!(
+        "update_calendar: protocol '{}' has no hex-color push, keeping color local-only for {}",
+        cal_proto,
+        account.id
+    );
     Ok(())
 }
 
