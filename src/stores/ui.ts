@@ -8,8 +8,8 @@ export type MessageViewMode = "right" | "bottom" | "tab" | "none";
 const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
 
 /// Where the contact card renders relative to the contact list. Mirrors
-/// MessageViewMode but with a smaller set: contacts don't have a tabs
-/// or none mode (selecting a contact always shows it somewhere).
+/// MessageViewMode but with a smaller set: contacts don't have tabs
+/// or a "none" mode (selecting a contact always shows it somewhere).
 export type ContactViewMode = "right" | "bottom";
 
 const VALID_CONTACT_VIEW_MODES: ContactViewMode[] = ["right", "bottom"];

@@ -126,9 +126,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
       </div>
     </div>
 
-    <!-- View menu \u2014 context-aware. Hidden entirely on routes whose
-         view has no toggles (contacts, filters, settings, reader,
-         compose) so the user doesn't open a menu with nothing in it. -->
+    <!-- View menu \u2014 context-aware. Mail and contacts each have
+         their own per-pane toggles; everywhere else (calendar uses
+         its own toolbar, filters / settings / preferences / reader /
+         compose have nothing to toggle) the View top-level button
+         is hidden so the user doesn't open a menu with nothing in it. -->
     <div
       v-if="viewMenuContext"
       class="menu-item"
