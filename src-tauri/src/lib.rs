@@ -45,7 +45,7 @@ pub fn run() {
             commands::accounts::get_account_config,
             commands::accounts::update_account,
             commands::accounts::delete_account,
-            commands::accounts::probe_dav_endpoints,
+            commands::accounts::discover_mail_servers,
             commands::mail::list_folders,
             commands::mail::get_messages,
             commands::mail::search_messages_server,

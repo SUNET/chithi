@@ -7,13 +7,21 @@ use crate::db::calendar::NewCalendar;
 use crate::error::Result;
 use crate::state::AppState;
 
-/// Combined autoconfig result returned to the Settings UI when the user
-/// clicks "Auto-discover". Carries both the IMAP/SMTP server settings
-/// (Thunderbird-style autoconfig + MX fallback) and the CalDAV/CardDAV
-/// URLs from `.well-known` probing. Empty strings on any field mean
-/// "not found" — the UI keeps whatever was already in the form. The
-/// `source` string is purely informational ("isp-db", "domain-autoconfig",
-/// "well-known", "mx", or "" if no autoconfig source matched).
+/// Result of a Thunderbird-style mail-server discovery on the IMAP
+/// tab. Empty strings / zero ports mean "not found" — the UI keeps
+/// whatever was already in the form. `source` is informational
+/// ("isp-db", "domain-autoconfig", "well-known", "mx", or empty when
+/// no source matched).
+///
+/// Note that this struct used to carry CalDAV / CardDAV URLs too,
+/// but mixing those into an "IMAP account" turned out to be a
+/// footgun: the discovered URL silently turned a mail-only IMAP
+/// account into a calendar+contacts account, which then collided
+/// with the dedicated CalDAV / CardDAV account types and produced
+/// duplicate calendars on sync. IMAP / CalDAV / CardDAV are now
+/// strictly separate accounts; if you want all three on one
+/// identity, use the JMAP / Gmail / O365 tabs which natively
+/// bundle them.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AutoconfigResult {
     pub imap_host: String,
@@ -22,93 +30,24 @@ pub struct AutoconfigResult {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub smtp_use_tls: bool,
-    pub caldav_url: String,
-    pub carddav_url: String,
     pub source: String,
 }
 
-/// Run Thunderbird-style email autoconfig (Mozilla ISP DB / provider
-/// autoconfig / `.well-known` / MX fallback) followed by CalDAV /
-/// CardDAV `.well-known` probing across every candidate hostname we
-/// know about (#43). Returns an `AutoconfigResult` with whichever
-/// fields could be discovered; failures degrade to empty strings so
-/// the UI can still save the account without auto-fill.
+/// Run Thunderbird-style email autoconfig (Mozilla ISP DB /
+/// provider autoconfig / `.well-known` / MX fallback) and return
+/// the discovered IMAP / SMTP host+port+TLS settings. Mail-only;
+/// no CalDAV / CardDAV probing here — see the doc comment on
+/// `AutoconfigResult` for why.
 #[tauri::command]
-pub async fn probe_dav_endpoints(
-    email: String,
-    username: String,
-    password: String,
-    imap_host: Option<String>,
-    smtp_host: Option<String>,
-) -> Result<AutoconfigResult> {
-    log::info!(
-        "probe_dav_endpoints: email={} imap_host={:?} smtp_host={:?}",
-        email,
-        imap_host,
-        smtp_host
-    );
+pub async fn discover_mail_servers(email: String) -> Result<AutoconfigResult> {
+    log::info!("discover_mail_servers: email={}", email);
 
-    // 1. Mail-server autoconfig. Soft-fails to None.
     let (servers, source) = match crate::mail::autoconfig::discover(&email).await {
         Ok(Some((s, src))) => (Some(s), src.to_string()),
         Ok(None) => (None, String::new()),
         Err(e) => {
             log::debug!("autoconfig: discover errored: {}", e);
             (None, String::new())
-        }
-    };
-
-    // 2. Build the DAV-probe hostname list. Order matters: we try the
-    // email domain first (cheapest, standards-compliant setups), then
-    // mail.<domain>, then any host autoconfig surfaced, then the user's
-    // entered IMAP / SMTP hosts. Dedup along the way.
-    let domain = email.rsplit('@').next().unwrap_or("").to_string();
-    let mut hosts: Vec<String> = Vec::new();
-    let mut push = |h: String| {
-        if !h.is_empty() && !hosts.contains(&h) {
-            hosts.push(h);
-        }
-    };
-    if !domain.is_empty() {
-        push(domain.clone());
-        push(format!("mail.{}", domain));
-    }
-    if let Some(s) = &servers {
-        push(s.imap_host.clone());
-        push(s.smtp_host.clone());
-    }
-    if let Some(h) = imap_host {
-        push(h);
-    }
-    if let Some(h) = smtp_host {
-        push(h);
-    }
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| crate::error::Error::Other(format!("http client: {}", e)))?;
-    let auth = crate::mail::caldav::DavAuth::Basic { username, password };
-
-    let caldav_url =
-        match crate::mail::caldav::CalDavClient::auto_discover_hosts(&http, &auth, &hosts).await {
-            Ok(url) => {
-                log::info!("probe_dav_endpoints: caldav={}", url);
-                url
-            }
-            Err(e) => {
-                log::debug!("probe_dav_endpoints: caldav probe failed: {}", e);
-                String::new()
-            }
-        };
-    let carddav_url = match crate::mail::carddav::auto_discover_hosts(&http, &auth, &hosts).await {
-        Ok(url) => {
-            log::info!("probe_dav_endpoints: carddav={}", url);
-            url
-        }
-        Err(e) => {
-            log::debug!("probe_dav_endpoints: carddav probe failed: {}", e);
-            String::new()
         }
     };
 
@@ -120,8 +59,6 @@ pub async fn probe_dav_endpoints(
         smtp_host: s.smtp_host,
         smtp_port: s.smtp_port,
         smtp_use_tls: s.smtp_use_tls,
-        caldav_url,
-        carddav_url,
         source,
     })
 }

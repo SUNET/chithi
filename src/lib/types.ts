@@ -183,7 +183,6 @@ export interface AccountConfig {
   has_contacts_binding: boolean;
 }
 
-/// Combined result of Thunderbird-style autoconfig + DAV probing.
 /// Empty strings / zero ports mean "not found"; the frontend only
 /// applies non-empty fields to the form. `source` is informational:
 /// "isp-db" | "domain-autoconfig" | "well-known" | "mx" | "".
@@ -194,14 +193,8 @@ export interface AutoconfigResult {
   smtp_host: string;
   smtp_port: number;
   smtp_use_tls: boolean;
-  caldav_url: string;
-  carddav_url: string;
   source: string;
 }
-
-// Old name kept as an alias so existing imports compile while we
-// migrate. New callers should use AutoconfigResult.
-export type DavProbeResult = AutoconfigResult;
 
 export interface FilterRule {
   id: string;
