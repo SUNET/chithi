@@ -66,7 +66,7 @@ const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
 const oauthStatus = ref<string | null>(null);
 const oauthInProgress = ref(false);
-const discoveringDav = ref(false);
+const discoveringMail = ref(false);
 const discoveryNote = ref<string | null>(null);
 
 // Wire form-side number inputs in minutes; convert to/from seconds when
@@ -408,7 +408,7 @@ async function openEditForm(id: string) {
 /// applies to higher-quality sources too — if the user typed a
 /// value, they have context the autoconfig database doesn't.
 async function discoverMailServers() {
-  discoveringDav.value = true;
+  discoveringMail.value = true;
   discoveryNote.value = null;
   try {
     const result = await api.discoverMailServers(
@@ -503,7 +503,7 @@ async function discoverMailServers() {
     const msg = e instanceof Error ? e.message : String(e);
     discoveryNote.value = `Discovery failed: ${msg}`;
   } finally {
-    discoveringDav.value = false;
+    discoveringMail.value = false;
   }
 }
 
@@ -1125,28 +1125,28 @@ onMounted(() => {
             <template v-if="accountType === 'imap'">
               <div class="form-group">
                 <label>Mail server auto-discovery</label>
-                <div class="dav-discovery-row">
+                <div class="mail-discovery-row">
                   <button
                     type="button"
                     class="btn-secondary"
-                    data-testid="dav-discover-btn"
-                    :disabled="discoveringDav || !form.email"
+                    data-testid="mail-discover-btn"
+                    :disabled="discoveringMail || !form.email"
                     @click="discoverMailServers"
                   >
-                    {{ discoveringDav ? 'Searching...' : 'Auto-discover IMAP / SMTP' }}
+                    {{ discoveringMail ? 'Searching...' : 'Auto-discover IMAP / SMTP' }}
                   </button>
                   <span v-if="!form.email" class="field-hint">
                     Enter your email address first.
                   </span>
                 </div>
-                <span v-if="discoveryNote" class="field-hint" data-testid="dav-discovery-note">
+                <span v-if="discoveryNote" class="field-hint" data-testid="mail-discovery-note">
                   {{ discoveryNote }}
                 </span>
                 <span class="field-hint">
                   Looks up the IMAP / SMTP host, port and TLS settings for your domain via Thunderbird-style autoconfig. Calendars and contacts are added as separate accounts on the CalDAV / CardDAV tabs.
                 </span>
-                <div v-if="editingAccountId && form.caldav_url" class="dav-cleanup-row">
-                  <span class="field-hint dav-discovered-url" data-testid="dav-discovered-url">
+                <div v-if="editingAccountId && form.caldav_url" class="dav-link-cleanup-row">
+                  <span class="field-hint dav-link-hint" data-testid="dav-link-hint">
                     This account is also linked to {{ form.caldav_url }}.
                   </span>
                   <button
@@ -1738,14 +1738,14 @@ onMounted(() => {
   line-height: 1.4;
 }
 
-.dav-discovery-row {
+.mail-discovery-row {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
 
-.dav-discovered-url {
+.dav-link-hint {
   word-break: break-all;
 }
 
