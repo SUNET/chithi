@@ -42,12 +42,22 @@ pub struct AppState {
     /// dialog. The renderer only ever sees the token, so a compromised
     /// renderer cannot ask the backend to read arbitrary files.
     pub attachments: std::sync::Mutex<HashMap<String, PathBuf>>,
-    /// In-flight Matrix SSO listeners, keyed by the local-port the
+    /// In-flight Matrix SSO sessions, keyed by the local-port the
     /// frontend will pass back to `meet_matrix_login_complete`.
-    /// `meet_matrix_login_start` parks one here when it returns the
-    /// SSO redirect URL; the complete call removes and consumes it.
-    /// (#148)
-    pub matrix_sso_listeners: std::sync::Mutex<HashMap<u16, std::net::TcpListener>>,
+    /// Each entry carries the bound `TcpListener`, a creation
+    /// timestamp (so abandoned flows are evicted on next insert),
+    /// and the random state nonce that the legitimate SSO
+    /// callback must echo back. (#148)
+    pub matrix_sso_listeners: std::sync::Mutex<HashMap<u16, MatrixSsoSession>>,
+}
+
+/// One in-flight Matrix SSO login. Lives in
+/// `AppState.matrix_sso_listeners` between the `_start` and
+/// `_complete` Tauri commands.
+pub struct MatrixSsoSession {
+    pub created: std::time::Instant,
+    pub listener: std::net::TcpListener,
+    pub state: String,
 }
 
 impl AppState {

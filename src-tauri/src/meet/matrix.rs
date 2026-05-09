@@ -29,12 +29,21 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
 const SSO_CALLBACK_TIMEOUT_SECS: u64 = 300;
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| Error::Other(format!("matrix http client: {}", e)))
+/// Single shared `reqwest::Client` for the Matrix module — same
+/// rationale as in `talk.rs`. Lazily initialised on first call.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .user_agent(USER_AGENT)
+                .build()
+                .map_err(|e| format!("matrix http client: {}", e))
+        })
+        .as_ref()
+        .map_err(|e| Error::Other(e.clone()))
 }
 
 /// Result of `m.login.token` exchange. Only carries fields the rest
@@ -51,33 +60,54 @@ pub struct LoginResult {
 
 /// Start the SSO flow against `homeserver_url` (e.g.
 /// `https://matrix.sunet.se`). Binds a local listener on a random
-/// port, returns the SSO redirect URL the caller should open in the
-/// user's browser plus the listener that will pick up the
-/// `loginToken` callback. The listener is returned so caller code
-/// can hand it to `await_login_token` after telling the frontend
-/// to open the URL.
-pub fn sso_login_start(homeserver_url: &str) -> Result<(String, TcpListener)> {
+/// port, generates a random state nonce, and returns the SSO
+/// redirect URL the caller should open in the user's browser
+/// plus the listener and state that will pick up the
+/// `loginToken` callback.
+///
+/// The state nonce is appended to the redirect URL as a query
+/// parameter and validated by `await_login_token` against the
+/// callback's matching `state=` parameter. Without this, any
+/// local process that can guess the callback port could race a
+/// genuine SSO completion by sending its own `loginToken=` and
+/// have us exchange it. The nonce is unguessable (16 random
+/// bytes via the same generator OAuth uses for PKCE verifiers)
+/// so a TOCTOU between `meet_matrix_login_start` (which races
+/// the listener registration) and the legitimate redirect is
+/// what we're actually defending against.
+pub fn sso_login_start(homeserver_url: &str) -> Result<(String, TcpListener, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| Error::Other(format!("matrix sso bind: {}", e)))?;
     let port = listener
         .local_addr()
         .map_err(|e| Error::Other(format!("matrix sso port: {}", e)))?
         .port();
+    let state = crate::oauth::generate_code_verifier();
     // Matrix requires `localhost` in the Redirect URL to route back
     // through the SSO IdP cleanly; some IdPs reject 127.0.0.1.
-    let redirect = format!("http://localhost:{}/", port);
+    // The state lives as a query param on the redirect URL so it
+    // round-trips back to us as `?loginToken=...&state=<nonce>`.
+    let redirect = format!(
+        "http://localhost:{}/?state={}",
+        port,
+        urlencoding::encode(&state),
+    );
     let url = format!(
         "{}/_matrix/client/v3/login/sso/redirect?redirectUrl={}",
         normalize_base_url(homeserver_url),
         urlencoding::encode(&redirect),
     );
-    Ok((url, listener))
+    Ok((url, listener, state))
 }
 
 /// Wait for the browser to come back with a `loginToken` query
-/// parameter. Five-minute timeout matches the OAuth path so a user
-/// who walked away doesn't leave the listener wedged forever.
-pub fn await_login_token(listener: TcpListener) -> Result<String> {
+/// parameter, validating that its `state=` matches the value we
+/// embedded in `sso_login_start`. Five-minute timeout matches
+/// the OAuth path so a user who walked away doesn't leave the
+/// listener wedged forever. A mismatched / missing state is
+/// surfaced as an error rather than silently exchanged — see
+/// the doc on `sso_login_start` for why this matters.
+pub fn await_login_token(listener: TcpListener, expected_state: &str) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(SSO_CALLBACK_TIMEOUT_SECS);
     listener
         .set_nonblocking(true)
@@ -127,6 +157,17 @@ pub fn await_login_token(listener: TcpListener) -> Result<String> {
         })
         .unwrap_or_default();
 
+    // Validate state before pulling the loginToken. A missing or
+    // mismatched state means the callback didn't originate from
+    // our `sso_login_start` — possibly a local process racing the
+    // listener. Return an error rather than exchange an attacker-
+    // supplied loginToken.
+    let got_state = params.get("state").map(|s| s.as_str()).unwrap_or("");
+    if got_state != expected_state {
+        return Err(Error::Other(
+            "Matrix SSO: state mismatch on callback (cancelled or replay)".into(),
+        ));
+    }
     let token = params.get("loginToken").cloned().ok_or_else(|| {
         Error::Other(format!(
             "Matrix SSO: callback did not carry loginToken (got: {:?})",
