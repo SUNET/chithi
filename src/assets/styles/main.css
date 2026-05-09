@@ -198,6 +198,13 @@ select {
   background: var(--color-bg-secondary);
   flex-shrink: 0;
   box-sizing: border-box;
+  /* The mail FolderTree and contacts books-sidebar both have
+     overflow-y: auto, so the heading would otherwise scroll away
+     with the list. Stick it to the top of the scroll container so
+     it stays aligned with the right-pane toolbar at all times. */
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 /* === Mobile overrides (<= 720px) === */

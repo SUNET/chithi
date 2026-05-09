@@ -222,15 +222,20 @@ async function contactsTick() {
 }
 
 onMounted(async () => {
-  // Load local data first, then sync in background
+  // Load local data first, then sync in background.
+  const idBefore = selectedBookId.value;
   await fetchBooks();
   // fetchBooks only mutates selectedBookId when the previously-saved
-  // id is gone, in which case the watcher above triggers the contacts
-  // fetch. When the selection survives (the common case on remount
-  // after navigating back to the contacts view), the value didn't
-  // change so the watcher doesn't fire — call the load explicitly so
-  // the user lands on the same contact they left. (#150)
-  await loadContactsForSelectedBook();
+  // id is gone, in which case the watcher above already fires off
+  // the contacts fetch. When the selection survives (the common
+  // case on remount after navigating back to contacts), the value
+  // didn't change so the watcher doesn't fire — call the load
+  // explicitly so the user lands on the same contact they left.
+  // (#150) Skipping it when the id changed avoids an extra
+  // listContacts() round-trip on first-ever mount.
+  if (selectedBookId.value === idBefore) {
+    await loadContactsForSelectedBook();
+  }
   syncAllContacts();
 
   // Start periodic sync (per-account cadence via contacts binding)
@@ -1350,7 +1355,6 @@ async function applyMerge() {
 .books-sidebar .empty-text {
   margin: 0 8px;
 }
-.books-sidebar > .book-item:first-of-type,
 .books-sidebar > .app-sidebar-header + .book-item {
   margin-top: 8px;
 }
