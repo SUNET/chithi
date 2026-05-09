@@ -8,6 +8,32 @@ use crate::filters::rules::{FilterAction, FilterRule};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::state::AppState;
 
+/// Strip the `{account_id}_` prefix from a composite DB id to recover the Graph message id.
+fn graph_id_from_db_id<'a>(account_id: &str, db_id: &'a str) -> &'a str {
+    db_id
+        .strip_prefix(&format!("{}_", account_id))
+        .unwrap_or(db_id)
+}
+
+/// Detect Graph "item not found" errors — i.e. the local id is stale because
+/// the message was moved or deleted server-side. Matches both the HTTP 404
+/// status and the Graph-specific `ErrorItemNotFound` error code so we don't
+/// false-positive on other "not found" responses (e.g. folder not found).
+fn is_graph_item_not_found(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("404") && s.contains("ErrorItemNotFound")
+}
+
+/// Extract the JMAP email id from a composite DB id of form `{account_id}_{mailbox}_{email_id}`.
+fn jmap_id_from_db_id(db_id: &str) -> Option<String> {
+    let parts: Vec<&str> = db_id.splitn(3, '_').collect();
+    if parts.len() == 3 {
+        Some(parts[2].to_string())
+    } else {
+        None
+    }
+}
+
 /// List all filter rules for an account (plus global rules).
 #[tauri::command]
 pub async fn list_filters(
@@ -89,38 +115,12 @@ pub async fn apply_filters_to_folder(
         (enabled_rules, messages, account)
     };
 
-    // Build IMAP config — O365 needs XOAUTH2 token refresh
-    let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
-        let tokens = crate::oauth::load_tokens(&account_id)?
-            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens
-            .refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-        let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh,
-            crate::oauth::MICROSOFT_IMAP_SCOPES,
-        )
-        .await?;
-        crate::oauth::store_tokens(&account_id, &new)?;
-        (new.access_token, true)
-    } else {
-        (account.password, false)
-    };
-    let imap_config = ImapConfig {
-        host: account.imap_host,
-        port: account.imap_port,
-        username: account.username,
-        password: imap_password,
-        use_tls: account.use_tls,
-        use_xoauth2: imap_xoauth2,
-    };
-
     log::info!(
-        "Running {} filters against {} messages in '{}'",
+        "Running {} filters against {} messages in '{}' (protocol={})",
         rules.len(),
         messages.len(),
-        folder_path
+        folder_path,
+        account.mail_protocol_str()
     );
 
     // 3. For each message, run filter engine to get actions
@@ -144,7 +144,106 @@ pub async fn apply_filters_to_folder(
         affected_count
     );
 
-    // 4. Group IMAP actions by type and execute
+    // 4. Execute server-side actions per protocol. Each execute function
+    //    returns the set of DB ids actually moved or deleted (so the caller
+    //    only cleans up rows whose server-side state really changed). The
+    //    Graph path tolerates per-message failures so one stale id can't
+    //    block the rest of the batch.
+    let result = match account.mail_protocol_str() {
+        "graph" => execute_graph_filter_actions(&account_id, &action_plan).await?,
+        "jmap" => execute_jmap_filter_actions(&account, &folder_path, &action_plan).await?,
+        _ => execute_imap_filter_actions(&account_id, &account, &folder_path, &action_plan).await?,
+    };
+
+    // 5. Update local DB: remove server-confirmed moved/deleted messages
+    {
+        let conn = state.db.writer().await;
+        let mut to_remove = result.moved_db_ids;
+        to_remove.extend(result.deleted_db_ids);
+        to_remove.sort();
+        to_remove.dedup();
+        if !to_remove.is_empty() {
+            log::info!(
+                "Removing {} moved/deleted messages from local DB",
+                to_remove.len()
+            );
+            db::messages::delete_messages_by_ids(&conn, &to_remove)?;
+        }
+    }
+
+    if !result.errors.is_empty() {
+        log::warn!(
+            "Apply filters to folder finished with {} failure(s); first: {}",
+            result.errors.len(),
+            result.errors[0]
+        );
+        // Surface a partial-failure error message so the UI shows it. We
+        // intentionally still return Ok-like behavior (Result with the
+        // affected count) only when the entire batch succeeded.
+        return Err(Error::Other(format!(
+            "{} of {} actions failed (first: {})",
+            result.errors.len(),
+            affected_count,
+            result.errors[0]
+        )));
+    }
+
+    log::info!(
+        "Apply filters to folder complete: {} messages affected",
+        affected_count
+    );
+
+    Ok(affected_count)
+}
+
+/// Result of executing a filter action plan against the server.
+/// Contains the DB ids whose server-side state was actually changed (so the
+/// caller can prune those rows locally) plus any per-message errors that
+/// occurred during execution.
+#[derive(Default)]
+struct ExecutionResult {
+    moved_db_ids: Vec<String>,
+    deleted_db_ids: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Execute filter actions over IMAP using a blocking connection.
+/// IMAP move/delete are batched per folder, so partial success is not
+/// represented here — either the whole batch op succeeds or the function
+/// returns Err.
+async fn execute_imap_filter_actions(
+    account_id: &str,
+    account: &db::accounts::AccountFull,
+    folder_path: &str,
+    action_plan: &[(MessageData, Vec<FilterAction>)],
+) -> Result<ExecutionResult> {
+    // Build IMAP config — O365 needs XOAUTH2 token refresh
+    let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
+        let tokens = crate::oauth::load_tokens(account_id)?
+            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+        let refresh = tokens
+            .refresh_token
+            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+        let new = crate::oauth::refresh_with_scopes(
+            &crate::oauth::MICROSOFT,
+            &refresh,
+            crate::oauth::MICROSOFT_IMAP_SCOPES,
+        )
+        .await?;
+        crate::oauth::store_tokens(account_id, &new)?;
+        (new.access_token, true)
+    } else {
+        (account.password.clone(), false)
+    };
+    let imap_config = ImapConfig {
+        host: account.imap_host.clone(),
+        port: account.imap_port,
+        username: account.username.clone(),
+        password: imap_password,
+        use_tls: account.use_tls,
+        use_xoauth2: imap_xoauth2,
+    };
+
     let mut move_targets: HashMap<String, Vec<u32>> = HashMap::new();
     let mut copy_targets: HashMap<String, Vec<u32>> = HashMap::new();
     let mut delete_uids: Vec<u32> = Vec::new();
@@ -153,11 +252,7 @@ pub async fn apply_filters_to_folder(
     let mut mark_read_uids: Vec<u32> = Vec::new();
     let mut mark_unread_uids: Vec<u32> = Vec::new();
 
-    // Track which message DB ids get moved/deleted so we can clean up local DB
-    let mut moved_message_ids: Vec<String> = Vec::new();
-    let mut deleted_message_ids: Vec<String> = Vec::new();
-
-    for (msg, actions) in &action_plan {
+    for (msg, actions) in action_plan {
         for action in actions {
             match action {
                 FilterAction::Move { target } => {
@@ -165,7 +260,6 @@ pub async fn apply_filters_to_folder(
                         .entry(target.clone())
                         .or_default()
                         .push(msg.uid);
-                    moved_message_ids.push(msg.id.clone());
                 }
                 FilterAction::Copy { target } => {
                     copy_targets
@@ -175,7 +269,6 @@ pub async fn apply_filters_to_folder(
                 }
                 FilterAction::Delete => {
                     delete_uids.push(msg.uid);
-                    deleted_message_ids.push(msg.id.clone());
                 }
                 FilterAction::Flag { value } => {
                     flag_add
@@ -189,63 +282,43 @@ pub async fn apply_filters_to_folder(
                         .or_default()
                         .push(msg.uid);
                 }
-                FilterAction::MarkRead => {
-                    mark_read_uids.push(msg.uid);
-                }
-                FilterAction::MarkUnread => {
-                    mark_unread_uids.push(msg.uid);
-                }
-                FilterAction::Stop => {
-                    // Stop is handled by the engine; no IMAP action needed
-                }
+                FilterAction::MarkRead => mark_read_uids.push(msg.uid),
+                FilterAction::MarkUnread => mark_unread_uids.push(msg.uid),
+                FilterAction::Stop => {}
             }
         }
     }
 
-    let folder = folder_path.clone();
-
-    // 5. Execute IMAP actions in a blocking thread
+    let folder = folder_path.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = ImapConnection::connect(&imap_config)?;
         conn.select_folder(&folder)?;
 
-        // Mark read
         if !mark_read_uids.is_empty() {
             log::info!("Marking {} messages as read", mark_read_uids.len());
             conn.set_flags(&mark_read_uids, &["\\Seen"], true)?;
         }
-
-        // Mark unread
         if !mark_unread_uids.is_empty() {
             log::info!("Marking {} messages as unread", mark_unread_uids.len());
             conn.set_flags(&mark_unread_uids, &["\\Seen"], false)?;
         }
-
-        // Add flags
         for (flag, uids) in &flag_add {
             log::info!("Adding flag '{}' to {} messages", flag, uids.len());
             conn.set_flags(uids, &[flag.as_str()], true)?;
         }
-
-        // Remove flags
         for (flag, uids) in &flag_remove {
             log::info!("Removing flag '{}' from {} messages", flag, uids.len());
             conn.set_flags(uids, &[flag.as_str()], false)?;
         }
-
-        // Copy (before move/delete which may expunge)
+        // Copy before move/delete (which may expunge)
         for (target, uids) in &copy_targets {
             log::info!("Copying {} messages to '{}'", uids.len(), target);
             conn.copy_messages(uids, target)?;
         }
-
-        // Move
         for (target, uids) in &move_targets {
             log::info!("Moving {} messages to '{}'", uids.len(), target);
             conn.move_messages(uids, target)?;
         }
-
-        // Delete (only messages not already moved)
         let delete_remaining: Vec<u32> = delete_uids
             .iter()
             .filter(|uid| {
@@ -259,35 +332,275 @@ pub async fn apply_filters_to_folder(
             log::info!("Deleting {} messages", delete_remaining.len());
             conn.delete_messages(&delete_remaining)?;
         }
-
         conn.logout();
         Ok(())
     })
     .await
     .map_err(|e| Error::Other(format!("Filter action task panicked: {}", e)))??;
 
-    // 6. Update local DB: remove moved/deleted messages
-    {
-        let conn = state.db.writer().await;
-        let mut to_remove = moved_message_ids;
-        to_remove.extend(deleted_message_ids);
-        to_remove.sort();
-        to_remove.dedup();
-        if !to_remove.is_empty() {
-            log::info!(
-                "Removing {} moved/deleted messages from local DB",
-                to_remove.len()
-            );
-            db::messages::delete_messages_by_ids(&conn, &to_remove)?;
+    // IMAP ops above are batched and atomic; on success every planned move
+    // and delete is taken to have applied.
+    let mut result = ExecutionResult::default();
+    for (msg, actions) in action_plan {
+        for action in actions {
+            match action {
+                FilterAction::Move { .. } => result.moved_db_ids.push(msg.id.clone()),
+                FilterAction::Delete => result.deleted_db_ids.push(msg.id.clone()),
+                _ => {}
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Execute filter actions against Microsoft Graph for an O365 account using
+/// the Graph mail protocol. Per-message Move and Delete failures (e.g. a
+/// stale id whose message was already moved server-side, returning 404
+/// `ErrorItemNotFound`) are logged and skipped so one bad id does not block
+/// the rest of the batch. Copy and non-Seen flag changes are unsupported.
+async fn execute_graph_filter_actions(
+    account_id: &str,
+    action_plan: &[(MessageData, Vec<FilterAction>)],
+) -> Result<ExecutionResult> {
+    let token = crate::mail::graph::get_graph_token(account_id).await?;
+    let client = crate::mail::graph::GraphClient::new(&token);
+
+    // Pair every operation with its DB id so we can report which messages
+    // really changed server-side.
+    let mut moves: Vec<(String, String, String)> = Vec::new(); // (db_id, graph_id, target)
+    let mut deletes: Vec<(String, String)> = Vec::new(); // (db_id, graph_id)
+    let mut mark_read_ids: Vec<String> = Vec::new();
+    let mut mark_unread_ids: Vec<String> = Vec::new();
+
+    for (msg, actions) in action_plan {
+        let graph_id = graph_id_from_db_id(account_id, &msg.id).to_string();
+        for action in actions {
+            match action {
+                FilterAction::Move { target } => {
+                    moves.push((msg.id.clone(), graph_id.clone(), target.clone()));
+                }
+                FilterAction::Delete => {
+                    deletes.push((msg.id.clone(), graph_id.clone()));
+                }
+                FilterAction::MarkRead => mark_read_ids.push(graph_id.clone()),
+                FilterAction::MarkUnread => mark_unread_ids.push(graph_id.clone()),
+                FilterAction::Flag { value } if value.eq_ignore_ascii_case("seen") => {
+                    mark_read_ids.push(graph_id.clone());
+                }
+                FilterAction::Unflag { value } if value.eq_ignore_ascii_case("seen") => {
+                    mark_unread_ids.push(graph_id.clone());
+                }
+                FilterAction::Flag { value } | FilterAction::Unflag { value } => {
+                    log::warn!(
+                        "Filter flag action '{}' not supported on Graph protocol; skipping",
+                        value
+                    );
+                }
+                FilterAction::Copy { target } => {
+                    log::warn!(
+                        "Filter copy action to '{}' not supported on Graph protocol; skipping",
+                        target
+                    );
+                }
+                FilterAction::Stop => {}
+            }
         }
     }
 
-    log::info!(
-        "Apply filters to folder complete: {} messages affected",
-        affected_count
-    );
+    let mut result = ExecutionResult::default();
 
-    Ok(affected_count)
+    if !mark_read_ids.is_empty() {
+        log::info!("Graph: marking {} messages as read", mark_read_ids.len());
+        if let Err(e) = client.set_read_status(&mark_read_ids, true).await {
+            log::warn!("Graph mark-read batch failed: {}", e);
+            result.errors.push(format!("mark-read: {}", e));
+        }
+    }
+    if !mark_unread_ids.is_empty() {
+        log::info!(
+            "Graph: marking {} messages as unread",
+            mark_unread_ids.len()
+        );
+        if let Err(e) = client.set_read_status(&mark_unread_ids, false).await {
+            log::warn!("Graph mark-unread batch failed: {}", e);
+            result.errors.push(format!("mark-unread: {}", e));
+        }
+    }
+
+    log::info!("Graph: moving {} messages", moves.len());
+    let mut moved_db_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stale_count = 0u32;
+    for (db_id, graph_id, target) in &moves {
+        match client.move_message(graph_id, target).await {
+            Ok(_) => {
+                moved_db_set.insert(db_id.clone());
+                result.moved_db_ids.push(db_id.clone());
+            }
+            Err(e) if is_graph_item_not_found(&e) => {
+                // Message no longer exists at this id — treat the local row
+                // as stale and prune it. A sync will repopulate the folder
+                // with current server state.
+                log::info!(
+                    "Graph move 404 for id={}: pruning stale local row",
+                    graph_id
+                );
+                result.deleted_db_ids.push(db_id.clone());
+                stale_count += 1;
+            }
+            Err(e) => {
+                log::warn!("Graph move failed for id={}: {}", graph_id, e);
+                result.errors.push(format!("move: {}", e));
+            }
+        }
+    }
+
+    // Delete only messages that weren't already moved (a Move action
+    // implicitly deletes from source). On per-message error keep going.
+    let to_delete: Vec<&(String, String)> = deletes
+        .iter()
+        .filter(|(db_id, _)| !moved_db_set.contains(db_id))
+        .collect();
+    if !to_delete.is_empty() {
+        log::info!("Graph: deleting {} messages", to_delete.len());
+        for (db_id, graph_id) in &to_delete {
+            match client.delete_message(graph_id).await {
+                Ok(_) => result.deleted_db_ids.push(db_id.clone()),
+                Err(e) if is_graph_item_not_found(&e) => {
+                    log::info!(
+                        "Graph delete 404 for id={}: pruning stale local row",
+                        graph_id
+                    );
+                    result.deleted_db_ids.push(db_id.clone());
+                    stale_count += 1;
+                }
+                Err(e) => {
+                    log::warn!("Graph delete failed for id={}: {}", graph_id, e);
+                    result.errors.push(format!("delete: {}", e));
+                }
+            }
+        }
+    }
+
+    if stale_count > 0 {
+        log::warn!(
+            "Graph: pruned {} stale local row(s); a folder sync will repopulate",
+            stale_count
+        );
+    }
+
+    Ok(result)
+}
+
+/// Execute filter actions against a JMAP server. Each JMAP method call is
+/// batched so partial-failure reporting from the server is not propagated;
+/// either a batch succeeds and every planned id in it is taken to have
+/// applied, or the function returns Err. Copy is unsupported.
+async fn execute_jmap_filter_actions(
+    account: &db::accounts::AccountFull,
+    folder_path: &str,
+    action_plan: &[(MessageData, Vec<FilterAction>)],
+) -> Result<ExecutionResult> {
+    let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
+    let conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+
+    // (db_id, jmap_id, target) for moves; (db_id, jmap_id) for deletes
+    let mut moves: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut deletes: Vec<(String, String)> = Vec::new();
+    let mut flag_add: HashMap<String, Vec<String>> = HashMap::new();
+    let mut flag_remove: HashMap<String, Vec<String>> = HashMap::new();
+    let mut mark_read_ids: Vec<String> = Vec::new();
+    let mut mark_unread_ids: Vec<String> = Vec::new();
+
+    for (msg, actions) in action_plan {
+        let Some(jmap_id) = jmap_id_from_db_id(&msg.id) else {
+            log::warn!(
+                "Skipping JMAP filter action for message '{}' with unexpected id format",
+                msg.id
+            );
+            continue;
+        };
+        for action in actions {
+            match action {
+                FilterAction::Move { target } => {
+                    moves
+                        .entry(target.clone())
+                        .or_default()
+                        .push((msg.id.clone(), jmap_id.clone()));
+                }
+                FilterAction::Delete => deletes.push((msg.id.clone(), jmap_id.clone())),
+                FilterAction::Flag { value } => {
+                    flag_add
+                        .entry(value.clone())
+                        .or_default()
+                        .push(jmap_id.clone());
+                }
+                FilterAction::Unflag { value } => {
+                    flag_remove
+                        .entry(value.clone())
+                        .or_default()
+                        .push(jmap_id.clone());
+                }
+                FilterAction::MarkRead => mark_read_ids.push(jmap_id.clone()),
+                FilterAction::MarkUnread => mark_unread_ids.push(jmap_id.clone()),
+                FilterAction::Copy { target } => {
+                    log::warn!(
+                        "Filter copy action to '{}' not supported on JMAP protocol; skipping",
+                        target
+                    );
+                }
+                FilterAction::Stop => {}
+            }
+        }
+    }
+
+    if !mark_read_ids.is_empty() {
+        log::info!("JMAP: marking {} messages as read", mark_read_ids.len());
+        conn.set_flags(&jmap_config, &mark_read_ids, &["seen"], true)
+            .await?;
+    }
+    if !mark_unread_ids.is_empty() {
+        log::info!("JMAP: marking {} messages as unread", mark_unread_ids.len());
+        conn.set_flags(&jmap_config, &mark_unread_ids, &["seen"], false)
+            .await?;
+    }
+    for (flag, ids) in &flag_add {
+        log::info!("JMAP: adding flag '{}' to {} messages", flag, ids.len());
+        conn.set_flags(&jmap_config, ids, &[flag.as_str()], true)
+            .await?;
+    }
+    for (flag, ids) in &flag_remove {
+        log::info!("JMAP: removing flag '{}' from {} messages", flag, ids.len());
+        conn.set_flags(&jmap_config, ids, &[flag.as_str()], false)
+            .await?;
+    }
+
+    let mut result = ExecutionResult::default();
+    let mut moved_db_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (target, pairs) in &moves {
+        let jmap_ids: Vec<String> = pairs.iter().map(|(_, jid)| jid.clone()).collect();
+        log::info!("JMAP: moving {} messages to '{}'", jmap_ids.len(), target);
+        conn.move_emails(&jmap_config, &jmap_ids, folder_path, target)
+            .await?;
+        for (db_id, _) in pairs {
+            moved_db_set.insert(db_id.clone());
+            result.moved_db_ids.push(db_id.clone());
+        }
+    }
+
+    let to_delete: Vec<&(String, String)> = deletes
+        .iter()
+        .filter(|(db_id, _)| !moved_db_set.contains(db_id))
+        .collect();
+    if !to_delete.is_empty() {
+        let jmap_ids: Vec<String> = to_delete.iter().map(|(_, jid)| jid.clone()).collect();
+        log::info!("JMAP: deleting {} messages", jmap_ids.len());
+        conn.delete_emails(&jmap_config, &jmap_ids).await?;
+        for (db_id, _) in &to_delete {
+            result.deleted_db_ids.push(db_id.clone());
+        }
+    }
+
+    Ok(result)
 }
 
 /// Load all messages in a folder as MessageData structs for filter matching.
@@ -376,5 +689,72 @@ fn capitalize_flag(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_graph_id_from_db_id_strips_account_prefix() {
+        let acc = "acc123";
+        let db_id = "acc123_AAMkAGI2T-foo_bar";
+        assert_eq!(graph_id_from_db_id(acc, db_id), "AAMkAGI2T-foo_bar");
+    }
+
+    #[test]
+    fn test_graph_id_from_db_id_returns_input_when_prefix_missing() {
+        assert_eq!(
+            graph_id_from_db_id("acc123", "raw_graph_id"),
+            "raw_graph_id"
+        );
+    }
+
+    #[test]
+    fn test_jmap_id_from_db_id_extracts_third_segment() {
+        // Format: {account_id}_{mailbox_id}_{jmap_email_id}
+        let id = jmap_id_from_db_id("acc1_inbox_M123");
+        assert_eq!(id.as_deref(), Some("M123"));
+    }
+
+    #[test]
+    fn test_jmap_id_from_db_id_keeps_underscores_in_email_id() {
+        let id = jmap_id_from_db_id("acc1_box_email_with_underscores");
+        assert_eq!(id.as_deref(), Some("email_with_underscores"));
+    }
+
+    #[test]
+    fn test_jmap_id_from_db_id_returns_none_for_short_id() {
+        assert!(jmap_id_from_db_id("only_two").is_none());
+        assert!(jmap_id_from_db_id("oneonly").is_none());
+    }
+
+    #[test]
+    fn test_is_graph_item_not_found_matches_404_with_code() {
+        let e = Error::Other(
+            "Graph POST /me/messages/AAA=/move returned 404 Not Found: \
+             {\"error\":{\"code\":\"ErrorItemNotFound\",\"message\":\"...\"}}"
+                .into(),
+        );
+        assert!(is_graph_item_not_found(&e));
+    }
+
+    #[test]
+    fn test_is_graph_item_not_found_rejects_other_404s() {
+        // 404 without the Graph error code (e.g. folder lookup) should not
+        // be treated as a stale message id.
+        let e = Error::Other("Graph GET /me/mailFolders/X returned 404 Not Found: {}".into());
+        assert!(!is_graph_item_not_found(&e));
+    }
+
+    #[test]
+    fn test_is_graph_item_not_found_rejects_other_statuses() {
+        let e = Error::Other(
+            "Graph POST /me/messages/AAA=/move returned 403 Forbidden: \
+             {\"error\":{\"code\":\"ErrorItemNotFound\"}}"
+                .into(),
+        );
+        assert!(!is_graph_item_not_found(&e));
     }
 }
