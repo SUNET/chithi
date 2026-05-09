@@ -199,6 +199,15 @@ const hasCalendarBinding = computed(() =>
 );
 const hasContactsBinding = computed(() => hasCalendarBinding.value);
 
+/// Convenience: this account-type tab has no email identity and
+/// no password — auth is browser-assisted, the loginName / MXID
+/// goes into `username`. Lets the form hide email / password /
+/// signature / per-service-sync sections that are meaningless
+/// for these accounts. (#148)
+const isMeetTab = computed(
+  () => accountType.value === "talk" || accountType.value === "matrix",
+);
+
 function getInitials(name: string): string {
   const words = name.split(/\s+/);
   if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
@@ -1172,13 +1181,15 @@ onMounted(() => {
               </div>
             </template>
 
-            <!-- DAV-only accounts have no mail identity, so they skip
-                 the email field and use an explicit username for the
-                 server's Basic auth. The mail tabs keep email as the
-                 default login (the saveAccount fallback fills
-                 username from email when blank). -->
+            <!-- DAV-only and meet-only accounts have no mail
+                 identity, so they skip the email field. DAV uses an
+                 explicit username for Basic auth; meet (Talk /
+                 Matrix) gets the loginName / MXID via its
+                 browser-assisted login. The mail tabs keep email
+                 as the default login (the saveAccount fallback
+                 fills username from email when blank). -->
             <div
-              v-if="accountType !== 'caldav' && accountType !== 'carddav'"
+              v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
               class="form-group"
             >
               <label>Email Address</label>
@@ -1204,7 +1215,7 @@ onMounted(() => {
                 Login name for the {{ accountType === 'carddav' ? 'CardDAV' : 'CalDAV' }} server.
               </span>
             </div>
-            <div v-if="accountType !== 'o365' && !(accountType === 'jmap' && form.jmap_auth_method === 'oidc')" class="form-group">
+            <div v-if="accountType !== 'o365' && !(accountType === 'jmap' && form.jmap_auth_method === 'oidc') && !isMeetTab" class="form-group">
               <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
               <PasswordInput
                 v-model="form.password"
@@ -1409,7 +1420,7 @@ onMounted(() => {
               <div class="info-box">Gmail uses IMAP (imap.gmail.com:993) and SMTP (smtp.gmail.com:587). Sign in with Google above to authorize access.</div>
             </template>
 
-            <div class="form-group">
+            <div v-if="!isMeetTab" class="form-group">
               <label>Email Signature</label>
               <textarea
                 v-model="form.signature"
@@ -1425,7 +1436,7 @@ onMounted(() => {
                  form-group that matches the other sections rather than
                  a bordered fieldset. -->
             <div
-              v-if="accountType !== 'caldav' && accountType !== 'carddav'"
+              v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
               class="form-group bindings-section"
               data-testid="binding-controls"
             >
@@ -1559,7 +1570,15 @@ onMounted(() => {
           </div>
           <div class="modal-footer">
             <button class="btn-secondary" @click="cancelForm">Cancel</button>
-            <button class="btn-primary" :disabled="saving" @click="saveAccount">
+            <!-- New meet accounts persist through the Sign-in
+                 button above; no separate Save step. Editing
+                 keeps Save so the user can rename the account. -->
+            <button
+              v-if="!isMeetTab || editingAccountId"
+              class="btn-primary"
+              :disabled="saving"
+              @click="saveAccount"
+            >
               {{ saving ? "Saving..." : (editingAccountId ? "Save" : "Add Account") }}
             </button>
           </div>
