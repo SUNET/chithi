@@ -38,27 +38,91 @@ pub struct AutoconfigResult {
 /// the discovered IMAP / SMTP host+port+TLS settings. Mail-only;
 /// no CalDAV / CardDAV probing here — see the doc comment on
 /// `AutoconfigResult` for why.
+///
+/// `imap_host_hint` / `smtp_host_hint` are the host values already
+/// typed in the form. **Hints win over autoconfig** for any service
+/// they cover — the user knows their actual IMAP / submission host;
+/// autoconfig's MX fallback only knows the inbound-mail routing and
+/// can name a totally different relay. So we probe the hints first,
+/// and only run autoconfig for sides where no hint was supplied. If
+/// a hint is set but its standard ports are unreachable, we leave
+/// that side blank rather than substitute a different host the user
+/// didn't ask for.
 #[tauri::command]
-pub async fn discover_mail_servers(email: String) -> Result<AutoconfigResult> {
-    log::info!("discover_mail_servers: email={}", email);
+pub async fn discover_mail_servers(
+    email: String,
+    imap_host_hint: Option<String>,
+    smtp_host_hint: Option<String>,
+) -> Result<AutoconfigResult> {
+    log::info!(
+        "discover_mail_servers: email={} imap_hint={:?} smtp_hint={:?}",
+        email,
+        imap_host_hint,
+        smtp_host_hint
+    );
 
-    let (servers, source) = match crate::mail::autoconfig::discover(&email).await {
-        Ok(Some((s, src))) => (Some(s), src.to_string()),
-        Ok(None) => (None, String::new()),
-        Err(e) => {
-            log::debug!("autoconfig: discover errored: {}", e);
-            (None, String::new())
+    let imap_hint = imap_host_hint.as_deref().filter(|h| !h.is_empty());
+    let smtp_hint = smtp_host_hint.as_deref().filter(|h| !h.is_empty());
+
+    let mut result = crate::mail::autoconfig::AutoconfigServers::default();
+    let mut source = String::new();
+
+    // Step 1: probe user-typed hosts first.
+    if let Some(host) = imap_hint {
+        if let Some((port, use_tls)) = crate::mail::autoconfig::probe_imap_port(host).await {
+            result.imap_host = host.to_string();
+            result.imap_port = port;
+            result.imap_use_tls = use_tls;
+            source = "host-probe".into();
         }
-    };
+    }
+    if let Some(host) = smtp_hint {
+        if let Some((port, use_tls)) = crate::mail::autoconfig::probe_smtp_port(host).await {
+            result.smtp_host = host.to_string();
+            result.smtp_port = port;
+            result.smtp_use_tls = use_tls;
+            if source.is_empty() {
+                source = "host-probe".into();
+            }
+        }
+    }
 
-    let s = servers.unwrap_or_default();
+    // Step 2: run autoconfig only for sides with no hint at all.
+    // Pre-filled or unreachable-hint sides are left as-is.
+    let need_autoconfig_imap = imap_hint.is_none() && result.imap_host.is_empty();
+    let need_autoconfig_smtp = smtp_hint.is_none() && result.smtp_host.is_empty();
+    if need_autoconfig_imap || need_autoconfig_smtp {
+        match crate::mail::autoconfig::discover(&email).await {
+            Ok(Some((s, src))) => {
+                if need_autoconfig_imap && !s.imap_host.is_empty() {
+                    result.imap_host = s.imap_host;
+                    result.imap_port = s.imap_port;
+                    result.imap_use_tls = s.imap_use_tls;
+                    if source.is_empty() {
+                        source = src.to_string();
+                    }
+                }
+                if need_autoconfig_smtp && !s.smtp_host.is_empty() {
+                    result.smtp_host = s.smtp_host;
+                    result.smtp_port = s.smtp_port;
+                    result.smtp_use_tls = s.smtp_use_tls;
+                    if source.is_empty() {
+                        source = src.to_string();
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::debug!("autoconfig: discover errored: {}", e),
+        }
+    }
+
     Ok(AutoconfigResult {
-        imap_host: s.imap_host,
-        imap_port: s.imap_port,
-        imap_use_tls: s.imap_use_tls,
-        smtp_host: s.smtp_host,
-        smtp_port: s.smtp_port,
-        smtp_use_tls: s.smtp_use_tls,
+        imap_host: result.imap_host,
+        imap_port: result.imap_port,
+        imap_use_tls: result.imap_use_tls,
+        smtp_host: result.smtp_host,
+        smtp_port: result.smtp_port,
+        smtp_use_tls: result.smtp_use_tls,
         source,
     })
 }
