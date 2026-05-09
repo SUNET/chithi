@@ -303,6 +303,14 @@ async function openEditForm(id: string) {
 /// otherwise turned out to silently glue mail and DAV bindings
 /// onto the same row, then collide with the dedicated CalDAV /
 /// CardDAV account types and produce duplicate calendars on sync.
+///
+/// Discovery never overwrites a value the user has already typed.
+/// MX-derived hosts in particular are an inbound-routing hint that
+/// frequently differs from the actual submission/IMAP servers
+/// (relay providers, hosted spam filters), so trusting them over
+/// user input would silently break the account; the same principle
+/// applies to higher-quality sources too — if the user typed a
+/// value, they have context the autoconfig database doesn't.
 async function discoverMailServers() {
   discoveringDav.value = true;
   discoveryNote.value = null;
@@ -310,21 +318,58 @@ async function discoverMailServers() {
     const result = await api.discoverMailServers(form.value.email);
 
     const filled: string[] = [];
-    if (result.imap_host) {
+    const skipped: string[] = [];
+
+    // Each field (host, port) is checked independently so a user
+    // who has the host typed but cleared the port can fill in just
+    // the port via discovery, and vice versa. Port `0` from the
+    // form (cleared <input type="number">) counts as empty.
+    const imapAvailable = !!result.imap_host;
+    const smtpAvailable = !!result.smtp_host;
+    const imapHostEmpty = !form.value.imap_host;
+    const imapPortEmpty = !form.value.imap_port;
+    const smtpHostEmpty = !form.value.smtp_host;
+    const smtpPortEmpty = !form.value.smtp_port;
+
+    let filledImapHost = false;
+    if (imapAvailable && imapHostEmpty) {
       form.value.imap_host = result.imap_host;
-      form.value.imap_port = result.imap_port || 993;
+      filledImapHost = true;
+    }
+    let filledImapPort = false;
+    if (imapPortEmpty && result.imap_port) {
+      form.value.imap_port = result.imap_port;
+      filledImapPort = true;
+    }
+    if (filledImapHost || filledImapPort) {
       filled.push("IMAP");
+    } else if (imapAvailable) {
+      skipped.push("IMAP");
     }
-    if (result.smtp_host) {
+
+    let filledSmtpHost = false;
+    if (smtpAvailable && smtpHostEmpty) {
       form.value.smtp_host = result.smtp_host;
-      form.value.smtp_port = result.smtp_port || 587;
-      filled.push("SMTP");
+      filledSmtpHost = true;
     }
-    // The wire format carries one shared `use_tls` flag while autoconfig
-    // returns IMAP- and SMTP-specific settings. Only apply it when both
-    // services agree; if they disagree, prefer the more secure value
-    // (don't silently downgrade TLS) and log it.
-    if (result.imap_host && result.smtp_host) {
+    let filledSmtpPort = false;
+    if (smtpPortEmpty && result.smtp_port) {
+      form.value.smtp_port = result.smtp_port;
+      filledSmtpPort = true;
+    }
+    if (filledSmtpHost || filledSmtpPort) {
+      filled.push("SMTP");
+    } else if (smtpAvailable) {
+      skipped.push("SMTP");
+    }
+
+    // Apply use_tls only when we filled the matching *host* — the
+    // TLS setting belongs to the host, not the port, so adjusting
+    // it after only filling a port could silently flip a user's
+    // intent on a host they typed manually. If both hosts were
+    // filled and disagree, prefer the more secure setting rather
+    // than silently downgrade.
+    if (filledImapHost && filledSmtpHost) {
       if (result.imap_use_tls === result.smtp_use_tls) {
         form.value.use_tls = result.imap_use_tls;
       } else {
@@ -333,17 +378,23 @@ async function discoverMailServers() {
         );
         form.value.use_tls = true;
       }
-    } else if (result.imap_host) {
+    } else if (filledImapHost) {
       form.value.use_tls = result.imap_use_tls;
-    } else if (result.smtp_host) {
+    } else if (filledSmtpHost) {
       form.value.use_tls = result.smtp_use_tls;
     }
 
-    if (filled.length === 0) {
+    const sourceLabel = result.source ? ` (via ${result.source})` : "";
+    if (filled.length === 0 && skipped.length === 0) {
       discoveryNote.value = "No autoconfig data found for this domain.";
-    } else {
-      const sourceLabel = result.source ? ` (via ${result.source})` : "";
+    } else if (filled.length === 0) {
+      discoveryNote.value =
+        `Kept your existing ${skipped.join(" + ")} settings; autoconfig${sourceLabel} also returned values but did not overwrite.`;
+    } else if (skipped.length === 0) {
       discoveryNote.value = `Filled ${filled.join(" + ")}${sourceLabel}.`;
+    } else {
+      discoveryNote.value =
+        `Filled ${filled.join(" + ")}${sourceLabel}. Kept your existing ${skipped.join(" + ")} settings.`;
     }
   } catch (e) {
     // Match the rest of the UI: unwrap Error.message instead of
