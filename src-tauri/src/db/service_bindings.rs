@@ -352,16 +352,210 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
 /// the table converges to the latest derivation rules. Called from
 /// `insert_account` / `update_account` (which build the fields from the
 /// wire-format `AccountConfig`).
+///
+/// User-set fields stored in `config_json` that the legacy derivation
+/// doesn't know about (currently `default_contact_book_id`) are
+/// snapshotted before the wipe and re-applied after the re-insert so a
+/// trivial account-edit doesn't drop them.
 pub fn rebuild_for_account(
     conn: &Connection,
     account_id: &str,
     fields: LegacyBindingFields<'_>,
 ) -> Result<()> {
+    let preserved = snapshot_user_set_config(conn, account_id)?;
     delete_for_account(conn, account_id)?;
     for binding in derive_bindings(fields) {
         insert(conn, &binding)?;
     }
+    for (service, book_id) in preserved {
+        set_default_contact_book(conn, account_id, &service, Some(&book_id))?;
+    }
+    apply_default_contact_book_if_missing(conn, account_id)?;
     Ok(())
+}
+
+/// Field name in `config_json` that holds the default contact book
+/// id for a mail or calendar binding. Stored under the binding (not
+/// the account) so the same identity can route compose autocomplete
+/// to one book and event-attendee autocomplete to a different one.
+const DEFAULT_CONTACT_BOOK_KEY: &str = "default_contact_book_id";
+
+/// Read the `default_contact_book_id` from a binding's `config_json`.
+/// Returns `Ok(None)` if there is no binding for the (account, service)
+/// pair, the field is absent, or the field is null/empty. Only valid
+/// for `service` values where a default makes sense — currently
+/// `"mail"` and `"calendar"`. Callers with `"contacts"` get `Ok(None)`.
+pub fn get_default_contact_book(
+    conn: &Connection,
+    account_id: &str,
+    service: &str,
+) -> Result<Option<String>> {
+    let cfg: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = ?2",
+            params![account_id, service],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let v: serde_json::Value = serde_json::from_str(&cfg).unwrap_or(serde_json::json!({}));
+    Ok(v.get(DEFAULT_CONTACT_BOOK_KEY)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string()))
+}
+
+/// Write (or clear) the `default_contact_book_id` on a binding's
+/// `config_json`. Pass `book_id = None` to remove the field. Returns
+/// `Err` if no binding exists for the (account, service) pair —
+/// callers should only set defaults for services they know exist.
+pub fn set_default_contact_book(
+    conn: &Connection,
+    account_id: &str,
+    service: &str,
+    book_id: Option<&str>,
+) -> Result<()> {
+    let cfg: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = ?2",
+            params![account_id, service],
+            |row| row.get(0),
+        )
+        .ok();
+    let cfg = cfg.ok_or_else(|| {
+        Error::Other(format!(
+            "no {} binding for account {} — cannot set default contact book",
+            service, account_id
+        ))
+    })?;
+    let mut v: serde_json::Value = serde_json::from_str(&cfg).unwrap_or(serde_json::json!({}));
+    let obj = v.as_object_mut().ok_or_else(|| {
+        Error::Other(format!(
+            "binding for account {} service {} has non-object config_json",
+            account_id, service
+        ))
+    })?;
+    match book_id {
+        Some(id) => {
+            obj.insert(
+                DEFAULT_CONTACT_BOOK_KEY.into(),
+                serde_json::Value::String(id.to_string()),
+            );
+        }
+        None => {
+            obj.remove(DEFAULT_CONTACT_BOOK_KEY);
+        }
+    }
+    let new_cfg = serde_json::to_string(&v)
+        .map_err(|e| Error::Other(format!("re-serialize config_json: {}", e)))?;
+    let rows = conn.execute(
+        "UPDATE service_bindings
+         SET config_json = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = ?2 AND service = ?3",
+        params![new_cfg, account_id, service],
+    )?;
+    if rows == 0 {
+        return Err(Error::Other(format!(
+            "no {} binding for account {} (race?)",
+            service, account_id
+        )));
+    }
+    Ok(())
+}
+
+/// For each mail/calendar binding on `account_id` that has no
+/// `default_contact_book_id`, pick one from the same account's
+/// contact books and store it. Idempotent: bindings that already
+/// have a default are left alone, so the user's manual pick from
+/// the settings UI sticks. Safe to call from any path that might
+/// have just created bindings or synced books — currently
+/// `rebuild_for_account` and the end of `sync_contacts`.
+///
+/// "Same account" is intentional: when the user wires a different
+/// account's book as the default, they do that explicitly through
+/// the settings dropdown and we never touch it here.
+pub fn apply_default_contact_book_if_missing(conn: &Connection, account_id: &str) -> Result<()> {
+    let Some(primary) = pick_primary_contact_book(conn, account_id)? else {
+        return Ok(());
+    };
+    for service in ["mail", "calendar"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM service_bindings WHERE account_id = ?1 AND service = ?2",
+                params![account_id, service],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        if get_default_contact_book(conn, account_id, service)?.is_some() {
+            continue;
+        }
+        set_default_contact_book(conn, account_id, service, Some(&primary))?;
+    }
+    Ok(())
+}
+
+/// Pick the most natural "default" contact book for an account.
+/// Synced books beat the local "Collected Contacts" silo because
+/// the latter is auto-populated from outgoing mail and isn't where
+/// the user keeps curated entries; alphabetical order picks the
+/// same book on every machine when multiple synced books exist.
+fn pick_primary_contact_book(conn: &Connection, account_id: &str) -> Result<Option<String>> {
+    let synced: Option<String> = conn
+        .query_row(
+            "SELECT id FROM contact_books
+             WHERE account_id = ?1 AND sync_type != 'local'
+             ORDER BY name LIMIT 1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if synced.is_some() {
+        return Ok(synced);
+    }
+    let any: Option<String> = conn
+        .query_row(
+            "SELECT id FROM contact_books WHERE account_id = ?1 ORDER BY name LIMIT 1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(any)
+}
+
+/// Snapshot of `(service, default_contact_book_id)` pairs for an
+/// account. Used by `rebuild_for_account` to carry user-set defaults
+/// across the wipe-and-rederive cycle.
+fn snapshot_user_set_config(conn: &Connection, account_id: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT service, config_json FROM service_bindings
+         WHERE account_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            let service: String = row.get(0)?;
+            let cfg: String = row.get(1)?;
+            Ok((service, cfg))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out = Vec::new();
+    for (service, cfg) in rows {
+        let v: serde_json::Value = serde_json::from_str(&cfg).unwrap_or(serde_json::json!({}));
+        if let Some(id) = v
+            .get(DEFAULT_CONTACT_BOOK_KEY)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            out.push((service, id.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// Map an old-schema `(provider, jmap_auth_method)` pair to the new
@@ -782,5 +976,159 @@ mod tests {
         conn.execute("DELETE FROM accounts WHERE id = 'a1'", [])
             .unwrap();
         assert!(list_for_account(&conn, "a1").unwrap().is_empty());
+    }
+
+    fn setup_db_with_books() -> Connection {
+        let conn = setup_db();
+        conn.execute_batch(
+            "CREATE TABLE contact_books (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                remote_id TEXT,
+                sync_type TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_account(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO accounts (id, email) VALUES (?1, ?1)",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    fn insert_binding(conn: &Connection, account_id: &str, service: &str, protocol: &str) {
+        let id = format!("{account_id}-{service}");
+        let b = ServiceBinding {
+            id,
+            account_id: account_id.into(),
+            service: service.into(),
+            protocol: protocol.into(),
+            enabled: true,
+            sync_interval_seconds: None,
+            config_json: "{}".into(),
+        };
+        insert(conn, &b).unwrap();
+    }
+
+    fn insert_book(conn: &Connection, id: &str, account_id: &str, name: &str, sync_type: &str) {
+        conn.execute(
+            "INSERT INTO contact_books (id, account_id, name, sync_type) VALUES (?1, ?2, ?3, ?4)",
+            params![id, account_id, name, sync_type],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_book_round_trip() {
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        insert_binding(&conn, "a1", "mail", "imap");
+        // Round-trip: write, read, clear.
+        assert!(get_default_contact_book(&conn, "a1", "mail")
+            .unwrap()
+            .is_none());
+        set_default_contact_book(&conn, "a1", "mail", Some("book-1")).unwrap();
+        assert_eq!(
+            get_default_contact_book(&conn, "a1", "mail").unwrap(),
+            Some("book-1".into())
+        );
+        set_default_contact_book(&conn, "a1", "mail", None).unwrap();
+        assert!(get_default_contact_book(&conn, "a1", "mail")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn default_book_set_errors_when_no_binding() {
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        // No binding inserted — set must fail rather than silently no-op.
+        let res = set_default_contact_book(&conn, "a1", "mail", Some("book-1"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn default_book_preserves_other_config_fields() {
+        // Writing the default must not trample existing keys (imap host etc).
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        let b = ServiceBinding {
+            id: "a1-mail".into(),
+            account_id: "a1".into(),
+            service: "mail".into(),
+            protocol: "imap".into(),
+            enabled: true,
+            sync_interval_seconds: None,
+            config_json: r#"{"imap_host":"imap.example.com","imap_port":993}"#.into(),
+        };
+        insert(&conn, &b).unwrap();
+
+        set_default_contact_book(&conn, "a1", "mail", Some("book-1")).unwrap();
+
+        let after = list_for_account(&conn, "a1").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&after[0].config_json).unwrap();
+        assert_eq!(cfg["imap_host"], "imap.example.com");
+        assert_eq!(cfg["imap_port"], 993);
+        assert_eq!(cfg["default_contact_book_id"], "book-1");
+    }
+
+    #[test]
+    fn apply_default_picks_synced_book_over_collected() {
+        // Mail+contacts bindings exist, account has both a "Collected
+        // Contacts" local book and a synced book. Auto-default should
+        // pick the synced one.
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        insert_binding(&conn, "a1", "mail", "imap");
+        insert_binding(&conn, "a1", "contacts", "carddav");
+        insert_book(&conn, "collected", "a1", "Collected Contacts", "local");
+        insert_book(&conn, "personal", "a1", "Personal", "carddav");
+
+        apply_default_contact_book_if_missing(&conn, "a1").unwrap();
+
+        assert_eq!(
+            get_default_contact_book(&conn, "a1", "mail").unwrap(),
+            Some("personal".into())
+        );
+    }
+
+    #[test]
+    fn apply_default_does_not_overwrite_user_pick() {
+        // If a default is already set, idempotent reapply must leave it.
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        insert_binding(&conn, "a1", "mail", "imap");
+        insert_binding(&conn, "a1", "contacts", "carddav");
+        insert_book(&conn, "personal", "a1", "Personal", "carddav");
+        insert_book(&conn, "work", "a1", "Work", "carddav");
+
+        // Pretend the user picked "work" through the settings UI.
+        set_default_contact_book(&conn, "a1", "mail", Some("work")).unwrap();
+
+        apply_default_contact_book_if_missing(&conn, "a1").unwrap();
+
+        assert_eq!(
+            get_default_contact_book(&conn, "a1", "mail").unwrap(),
+            Some("work".into())
+        );
+    }
+
+    #[test]
+    fn apply_default_skips_when_no_books_exist_yet() {
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        insert_binding(&conn, "a1", "mail", "imap");
+
+        apply_default_contact_book_if_missing(&conn, "a1").unwrap();
+        // No books → nothing to set, no error.
+        assert!(get_default_contact_book(&conn, "a1", "mail")
+            .unwrap()
+            .is_none());
     }
 }

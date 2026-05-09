@@ -233,6 +233,41 @@ pub fn search_all_contacts(conn: &Connection, query: &str) -> Result<Vec<Contact
     Ok(rows)
 }
 
+/// Like `search_all_contacts` but biases ordering: matches whose
+/// `book_id` equals `preferred_book_id` come first, the rest
+/// follow. This is the search the compose / event-attendee
+/// autocompletes use when an account has a default contact book
+/// configured (#137). Within each group results are ordered by
+/// `display_name` so behavior stays stable across runs.
+///
+/// `preferred_book_id = None` degenerates to plain alphabetical
+/// order, equivalent to `search_all_contacts`.
+pub fn search_all_contacts_ranked(
+    conn: &Connection,
+    query: &str,
+    preferred_book_id: Option<&str>,
+) -> Result<Vec<Contact>> {
+    let pattern = format!("%{}%", query);
+    // `CASE WHEN book_id = ? THEN 0 ELSE 1 END` puts the preferred
+    // book first; `COALESCE(?, '')` handles the None case by making
+    // the comparison never match.
+    let preferred = preferred_book_id.unwrap_or("");
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.book_id, c.uid, c.display_name, c.emails_json, c.phones_json,
+                c.addresses_json, c.organization, c.title, c.notes, c.vcard_data,
+                c.remote_id, c.etag
+         FROM contacts c
+         WHERE c.display_name LIKE ?1 OR c.emails_json LIKE ?1
+         ORDER BY (CASE WHEN c.book_id = ?2 AND ?2 != '' THEN 0 ELSE 1 END),
+                  c.display_name
+         LIMIT 50",
+    )?;
+    let rows = stmt
+        .query_map(params![pattern, preferred], map_contact_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // Collected Contacts
 // ---------------------------------------------------------------------------
@@ -435,6 +470,61 @@ mod tests {
         let results = search_all_contacts(&conn, "bob").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].display_name, "Bob Jones");
+    }
+
+    #[test]
+    fn test_search_all_contacts_ranked_prefers_book() {
+        // Two contacts with the same matching token, in different books.
+        // Plain alphabetical search would put "Alice Other" first; the
+        // ranked variant should put the preferred-book hit first instead.
+        let conn = setup_db();
+        for id in ["primary", "secondary"] {
+            insert_contact_book(
+                &conn,
+                &ContactBook {
+                    id: id.to_string(),
+                    account_id: "acc1".to_string(),
+                    name: id.to_string(),
+                    remote_id: None,
+                    sync_type: "local".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        insert_contact(&conn, &make_contact("c1", "Alice Other", "secondary")).unwrap();
+        insert_contact(&conn, &make_contact("c2", "Alice Preferred", "primary")).unwrap();
+
+        // Without preference: alphabetical.
+        let plain = search_all_contacts_ranked(&conn, "alice", None).unwrap();
+        assert_eq!(plain[0].display_name, "Alice Other");
+        assert_eq!(plain[1].display_name, "Alice Preferred");
+
+        // With preference: preferred-book hit jumps to the top, the
+        // other still appears below it (we *prefer*, not *restrict*).
+        let ranked = search_all_contacts_ranked(&conn, "alice", Some("primary")).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].display_name, "Alice Preferred");
+        assert_eq!(ranked[1].display_name, "Alice Other");
+    }
+
+    #[test]
+    fn test_search_all_contacts_ranked_empty_preferred() {
+        // Empty preferred id should behave like no preference.
+        let conn = setup_db();
+        insert_contact_book(
+            &conn,
+            &ContactBook {
+                id: "b1".to_string(),
+                account_id: "acc1".to_string(),
+                name: "Work".to_string(),
+                remote_id: None,
+                sync_type: "local".to_string(),
+            },
+        )
+        .unwrap();
+        insert_contact(&conn, &make_contact("c1", "Alice", "b1")).unwrap();
+        let r = search_all_contacts_ranked(&conn, "alice", Some("")).unwrap();
+        assert_eq!(r.len(), 1);
     }
 
     #[test]
