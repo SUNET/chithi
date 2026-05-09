@@ -290,7 +290,7 @@ async function unsubscribeThisCalendar() {
 
 <template>
   <div class="calendar-sidebar">
-    <div class="sidebar-header">CALENDARS</div>
+    <div class="app-sidebar-header">Calendars</div>
     <div class="calendar-list">
       <div
         v-for="cal in calendarStore.calendars"
@@ -469,23 +469,15 @@ async function unsubscribeThisCalendar() {
   display: flex;
   flex-direction: column;
   background: var(--color-bg-secondary);
-  padding: 16px 12px;
 }
 
-.sidebar-header {
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--color-text-muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  padding: 0 4px 12px;
-  border-bottom: 1px solid var(--color-border);
-  margin-bottom: 12px;
-}
-
+/* The sidebar heading is 48px and full-width (no horizontal padding
+   from the parent), matching the right-pane toolbar. Items below get
+   their own padding via .calendar-list. */
 .calendar-list {
   flex: 1;
   overflow-y: auto;
+  padding: 12px;
 }
 
 .calendar-item {

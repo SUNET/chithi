@@ -366,6 +366,7 @@ async function doDeleteFolder() {
 
 <template>
   <div class="folder-tree" @click="closeContextMenu">
+    <div class="app-sidebar-header">Mailboxes</div>
     <div
       v-for="account in accountsStore.mailAccounts"
       :key="account.id"

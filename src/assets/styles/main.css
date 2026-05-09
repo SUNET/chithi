@@ -179,6 +179,27 @@ select {
   color: inherit;
 }
 
+/* === Shared layout: left-pane header (#150) ===
+   Small uppercase label that sits at the top of the calendar /
+   mail / contacts / filters left sidebar. Sized to match the
+   right-pane toolbar height so the bottom border across the two
+   panes forms one continuous strip across the view. */
+.app-sidebar-header {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  border-bottom: 0.8px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
 /* === Mobile overrides (<= 720px) === */
 @media (max-width: 720px) {
   body {

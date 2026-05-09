@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { useRouter, useRoute } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
-import { useUiStore, type MessageViewMode } from "@/stores/ui";
+import { useUiStore, type ContactViewMode, type MessageViewMode } from "@/stores/ui";
 import {
   dispatch,
   formatShortcut,
@@ -12,8 +12,30 @@ import {
 import AboutDialog from "@/components/common/AboutDialog.vue";
 
 const router = useRouter();
+const route = useRoute();
 const uiStore = useUiStore();
 const openMenu = ref<string | null>(null);
+
+// Which contents the View menu should render — driven by the active
+// route. Mail and contacts both have meaningful per-view toggles
+// (message-pane layout / threading; contact-pane layout). The
+// calendar route deliberately doesn't get a View menu — its toolbar
+// already exposes Day / Week / Month, and surfacing the same options
+// here would just duplicate that selector. Other views (filters,
+// settings, reader, compose) have no view-menu items, so the View
+// top-level button is hidden entirely rather than show an empty
+// dropdown.
+type ViewMenuContext = "mail" | "contacts" | null;
+const viewMenuContext = computed<ViewMenuContext>(() => {
+  switch (route.name) {
+    case "mail":
+      return "mail";
+    case "contacts":
+      return "contacts";
+    default:
+      return null;
+  }
+});
 
 function toggleMenu(name: string) {
   openMenu.value = openMenu.value === name ? null : name;
@@ -42,6 +64,11 @@ function setViewMode(mode: MessageViewMode) {
 
 function toggleThreading() {
   uiStore.setThreading(!uiStore.threadingEnabled);
+  closeMenus();
+}
+
+function setContactViewMode(mode: ContactViewMode) {
+  uiStore.setContactViewMode(mode);
   closeMenus();
 }
 
@@ -99,51 +126,80 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
       </div>
     </div>
 
-    <!-- View menu -->
-    <div class="menu-item" @click.stop="toggleMenu('view')">
+    <!-- View menu \u2014 context-aware. Hidden entirely on routes whose
+         view has no toggles (contacts, filters, settings, reader,
+         compose) so the user doesn't open a menu with nothing in it. -->
+    <div
+      v-if="viewMenuContext"
+      class="menu-item"
+      data-testid="menu-view"
+      @click.stop="toggleMenu('view')"
+    >
       <span class="menu-label">View</span>
       <div v-if="openMenu === 'view'" class="menu-dropdown" @click.stop data-testid="menu-view-dropdown">
-        <div class="menu-group-heading">Message Pane</div>
-        <button
-          class="menu-action menu-action-radio"
-          data-testid="menu-view-position-none"
-          @click="setViewMode('none')"
-        >
-          <span class="action-prefix">{{ uiStore.messageViewMode === 'none' ? '\u25CF' : '\u00A0' }}</span>
-          <span class="action-label">None</span>
-        </button>
-        <button
-          class="menu-action menu-action-radio"
-          data-testid="menu-view-position-right"
-          @click="setViewMode('right')"
-        >
-          <span class="action-prefix">{{ uiStore.messageViewMode === 'right' ? '\u25CF' : '\u00A0' }}</span>
-          <span class="action-label">Right</span>
-        </button>
-        <button
-          class="menu-action menu-action-radio"
-          data-testid="menu-view-position-bottom"
-          @click="setViewMode('bottom')"
-        >
-          <span class="action-prefix">{{ uiStore.messageViewMode === 'bottom' ? '\u25CF' : '\u00A0' }}</span>
-          <span class="action-label">Bottom</span>
-        </button>
-        <button
-          class="menu-action menu-action-radio"
-          data-testid="menu-view-position-tabs"
-          @click="setViewMode('tab')"
-        >
-          <span class="action-prefix">{{ uiStore.messageViewMode === 'tab' ? '\u25CF' : '\u00A0' }}</span>
-          <span class="action-label">Tabs</span>
-        </button>
+        <template v-if="viewMenuContext === 'mail'">
+          <div class="menu-group-heading">Message Pane</div>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-position-none"
+            @click="setViewMode('none')"
+          >
+            <span class="action-prefix">{{ uiStore.messageViewMode === 'none' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">None</span>
+          </button>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-position-right"
+            @click="setViewMode('right')"
+          >
+            <span class="action-prefix">{{ uiStore.messageViewMode === 'right' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">Right</span>
+          </button>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-position-bottom"
+            @click="setViewMode('bottom')"
+          >
+            <span class="action-prefix">{{ uiStore.messageViewMode === 'bottom' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">Bottom</span>
+          </button>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-position-tabs"
+            @click="setViewMode('tab')"
+          >
+            <span class="action-prefix">{{ uiStore.messageViewMode === 'tab' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">Tabs</span>
+          </button>
 
-        <div class="menu-separator"></div>
+          <div class="menu-separator"></div>
 
-        <button class="menu-action" data-testid="menu-view-threaded" @click="toggleThreading">
-          <span class="action-prefix">{{ uiStore.threadingEnabled ? '\u2713' : '\u00A0' }}</span>
-          <span class="action-label">Threaded View</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.toggleThreading) }}</span>
-        </button>
+          <button class="menu-action" data-testid="menu-view-threaded" @click="toggleThreading">
+            <span class="action-prefix">{{ uiStore.threadingEnabled ? '\u2713' : '\u00A0' }}</span>
+            <span class="action-label">Threaded View</span>
+            <span class="action-shortcut">{{ formatShortcut(sc.toggleThreading) }}</span>
+          </button>
+        </template>
+
+        <template v-else-if="viewMenuContext === 'contacts'">
+          <div class="menu-group-heading">Contact Pane</div>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-contact-position-right"
+            @click="setContactViewMode('right')"
+          >
+            <span class="action-prefix">{{ uiStore.contactViewMode === 'right' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">Right</span>
+          </button>
+          <button
+            class="menu-action menu-action-radio"
+            data-testid="menu-view-contact-position-bottom"
+            @click="setContactViewMode('bottom')"
+          >
+            <span class="action-prefix">{{ uiStore.contactViewMode === 'bottom' ? '\u25CF' : '\u00A0' }}</span>
+            <span class="action-label">Bottom</span>
+          </button>
+        </template>
       </div>
     </div>
 

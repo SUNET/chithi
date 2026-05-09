@@ -351,13 +351,21 @@ onUnmounted(() => {
   </div>
 
   <div v-else class="mail-view">
-    <Toolbar />
     <div class="mail-panes">
       <!-- Folder pane -->
       <div class="folder-pane" :style="{ width: uiStore.folderPaneWidth + 'px' }">
         <FolderTree />
       </div>
       <div class="resize-handle" @mousedown="startResize('folder', $event)"></div>
+
+      <!-- Main pane (#150). Toolbar with Compose lives here so the
+           "Compose" button sits above the message list, mirroring how
+           Calendar's "+ Event" sits above the calendar grid. The
+           "MAILBOXES" header inside the folder tree is the visual
+           partner on the left. -->
+      <div class="mail-main">
+        <Toolbar />
+        <div class="mail-content">
 
       <!-- Right mode: message list + reader side by side -->
       <template v-if="uiStore.messageViewMode === 'right'">
@@ -449,6 +457,8 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
+        </div><!-- /.mail-content -->
+      </div><!-- /.mail-main -->
     </div>
   </div>
 </template>
@@ -464,6 +474,22 @@ onUnmounted(() => {
 .mail-panes {
   display: flex;
   flex: 1;
+  min-height: 0;
+}
+
+/* Right side of the folder pane. Stacks the toolbar (with Compose)
+   on top of the message-list / reader content. (#150) */
+.mail-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.mail-content {
+  flex: 1;
+  display: flex;
+  min-width: 0;
   min-height: 0;
 }
 
