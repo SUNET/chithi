@@ -150,9 +150,55 @@ async fn push_calendar_color(
         return Ok(());
     }
 
-    if cal_proto == "caldav"
-        || (!account.caldav_url.is_empty() && cal_proto != "google" && cal_proto != "graph")
-    {
+    if cal_proto == "graph" {
+        // Microsoft Graph wants a constrained `calendarColor` enum.
+        // The hex-to-nearest-named lookup lives in graph.rs so we can
+        // round-trip our own palette consistently. Local DB still
+        // keeps the user's exact hex so the sidebar shows what they
+        // picked even when Graph's enum landed on something a shade
+        // off.
+        let token = crate::mail::graph::get_graph_token(&account.id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.set_calendar_color(remote_id, new_color).await?;
+        return Ok(());
+    }
+
+    if cal_proto == "google" {
+        // Google Calendar accepts arbitrary RGB on calendarList.update
+        // when `colorRgbFormat=true` is set. Use the per-user
+        // calendarList resource (rather than `/calendars/{id}`) — it's
+        // where the user-visible color lives.
+        let token = get_google_token(&account.id).await?;
+        let url = format!(
+            "https://www.googleapis.com/calendar/v3/users/me/calendarList/{}?colorRgbFormat=true",
+            urlencoding::encode(remote_id)
+        );
+        let http = reqwest::Client::new();
+        let resp = http
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "backgroundColor": new_color }))
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::Error::Other(format!(
+                    "Google calendarList PATCH (color) failed: {}",
+                    e
+                ))
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::Error::Other(format!(
+                "Google calendarList PATCH (color) returned {}: {}",
+                status,
+                body.chars().take(500).collect::<String>()
+            )));
+        }
+        return Ok(());
+    }
+
+    if cal_proto == "caldav" || !account.caldav_url.is_empty() {
         use crate::mail::caldav::{CalDavClient, CalDavConfig};
         let caldav_config = CalDavConfig {
             caldav_url: account.caldav_url.clone(),
@@ -165,12 +211,8 @@ async fn push_calendar_color(
         return Ok(());
     }
 
-    // Graph / Google use named color enums (and a numeric id, in
-    // Google's case); writing arbitrary hex isn't supported on the
-    // public APIs without a mapping table. Log and keep the change
-    // local-only — the user still gets the new color in the sidebar.
     log::info!(
-        "update_calendar: protocol '{}' has no hex-color push, keeping color local-only for {}",
+        "update_calendar: no remote color-push path for protocol '{}', keeping color local-only for {}",
         cal_proto,
         account.id
     );
