@@ -168,12 +168,15 @@ pub(crate) async fn resume_imap_idle_for_account(
         id: account.id.clone(),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
+        username: account.username.clone(),
         provider: account.provider.clone(),
         mail_protocol: account.mail_protocol.clone(),
         enabled: account.enabled,
         mail_sync_interval_seconds: account.mail_sync_interval_seconds,
         calendar_sync_interval_seconds: account.calendar_sync_interval_seconds,
         contacts_sync_interval_seconds: account.contacts_sync_interval_seconds,
+        has_calendar_binding: account.calendar_binding().is_some(),
+        has_contacts_binding: account.contacts_binding().is_some(),
     };
 
     start_imap_idle(app, state, &account_summary).await

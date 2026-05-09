@@ -208,8 +208,13 @@ pub async fn get_account_config(
     let full = db::accounts::get_account_full(&conn, &account_id)?;
     // Compute binding-presence flags before we partial-move `full`'s
     // String fields into the AccountConfig literal below.
-    let has_calendar_binding = full.calendar_binding().is_some();
-    let has_contacts_binding = full.contacts_binding().is_some();
+    // Enabled-aware so the edit form reopens on the right tab for
+    // CalDAV-only / CardDAV-only accounts — those carry both
+    // bindings (one disabled) under the legacy single-`caldav_url`
+    // schema, and existence-only flags would always pick the same
+    // branch.
+    let has_calendar_binding = full.calendar_binding().is_some_and(|b| b.enabled);
+    let has_contacts_binding = full.contacts_binding().is_some_and(|b| b.enabled);
     // Never return the actual password to the frontend.
     // The edit form shows a placeholder; empty on save means "keep existing".
     Ok(db::accounts::AccountConfig {

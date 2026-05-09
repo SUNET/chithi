@@ -2,6 +2,10 @@ export interface Account {
   id: string;
   display_name: string;
   email: string;
+  // Carried in the summary so the settings list can show *something*
+  // for standalone CalDAV / CardDAV accounts whose `email` was never
+  // set (older accounts created before the DAV-tab email back-fill).
+  username: string;
   provider: "generic" | "gmail" | "microsoft365" | "o365";
   // Empty string means "no mail binding" — calendar-only / contacts-only
   // accounts (#43). Existing screens that need a mail account should
@@ -14,6 +18,10 @@ export interface Account {
   mail_sync_interval_seconds: number | null;
   calendar_sync_interval_seconds: number | null;
   contacts_sync_interval_seconds: number | null;
+  // Lets the settings list label standalone CalDAV / CardDAV accounts
+  // without a per-row round-trip.
+  has_calendar_binding: boolean;
+  has_contacts_binding: boolean;
 }
 
 export interface QuickFilter {
@@ -183,6 +191,7 @@ export interface AccountConfig {
   has_contacts_binding: boolean;
 }
 
+/// Combined result of Thunderbird-style autoconfig + DAV probing.
 /// Empty strings / zero ports mean "not found"; the frontend only
 /// applies non-empty fields to the form. `source` is informational:
 /// "isp-db" | "domain-autoconfig" | "well-known" | "mx" | "".
