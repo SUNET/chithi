@@ -83,6 +83,8 @@ pub fn run() {
             commands::meet::meet_talk_login_complete,
             commands::meet::meet_matrix_login_start,
             commands::meet::meet_matrix_login_complete,
+            commands::meet::meet_zoom_login_start,
+            commands::meet::meet_zoom_login_complete,
             commands::meet::meet_create_url,
             commands::sync_cmd::start_idle,
             commands::sync_cmd::stop_idle,

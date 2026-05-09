@@ -19,6 +19,11 @@ pub struct OAuthProvider {
     pub scopes: &'static [&'static str],
     /// Use PKCE (required for Microsoft public clients)
     pub use_pkce: bool,
+    /// Loopback host the provider expects in the redirect URI.
+    /// Microsoft requires `localhost`; Google accepts either;
+    /// Zoom registers `http://127.0.0.1` and rejects `localhost`.
+    /// Defaults to `"localhost"` for legacy providers.
+    pub redirect_host: &'static str,
 }
 
 pub const GOOGLE: OAuthProvider = OAuthProvider {
@@ -32,6 +37,7 @@ pub const GOOGLE: OAuthProvider = OAuthProvider {
         "https://www.googleapis.com/auth/contacts",
     ],
     use_pkce: true,
+    redirect_host: "localhost",
 };
 
 pub const MICROSOFT: OAuthProvider = OAuthProvider {
@@ -58,11 +64,36 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
         "email",
     ],
     use_pkce: true,
+    redirect_host: "localhost",
 };
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
 pub const MICROSOFT_GRAPH_SCOPES: &str =
     "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite offline_access";
+
+/// Zoom OAuth (#148, video conferencing). Native app with PKCE —
+/// no client_secret ships in the binary. Registered on Zoom
+/// Marketplace as a "User-managed app" with redirect URI
+/// `http://127.0.0.1` (loopback wildcard — Zoom matches the host
+/// and ignores the port at runtime). Note that Zoom rejects
+/// `http://localhost:N` callbacks, hence `redirect_host` is
+/// `127.0.0.1` here while Microsoft demands `localhost`.
+///
+/// Scope is the granular Zoom 2024+ name for "create user
+/// meetings"; if the Marketplace registration only enabled the
+/// classic `meeting:write:meeting`, the OAuth consent screen
+/// will still work but `create_url` will 401 — flip the scope
+/// name in that case.
+pub const ZOOM: OAuthProvider = OAuthProvider {
+    name: "zoom",
+    client_id: "CxRwHStNQkqPBztEsvSDnA",
+    client_secret: "", // Public client — PKCE only
+    auth_url: "https://zoom.us/oauth/authorize",
+    token_url: "https://zoom.us/oauth/token",
+    scopes: &["meeting:write:meeting:user"],
+    use_pkce: true,
+    redirect_host: "127.0.0.1",
+};
 
 /// Microsoft IMAP/SMTP scopes — used for token refresh for mail access.
 /// Uses outlook.office.com (works for both personal and work/school accounts).
@@ -131,9 +162,10 @@ pub fn get_auth_url(
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
 
-    // Microsoft requires http://localhost (not 127.0.0.1) for native client redirect.
-    // Google works with either. Use localhost for both.
-    let redirect_uri = format!("http://localhost:{}", port);
+    // Per-provider loopback host (see `OAuthProvider.redirect_host`):
+    // Microsoft demands `localhost`, Zoom demands `127.0.0.1`,
+    // Google accepts either.
+    let redirect_uri = format!("http://{}:{}", provider.redirect_host, port);
 
     // Generate a random state parameter for CSRF protection
     let state = generate_code_verifier();
@@ -276,9 +308,10 @@ pub async fn exchange_code(
     port: u16,
     code_verifier: Option<&str>,
 ) -> Result<OAuthTokens> {
-    // Microsoft requires http://localhost (not 127.0.0.1) for native client redirect.
-    // Google works with either. Use localhost for both.
-    let redirect_uri = format!("http://localhost:{}", port);
+    // Per-provider loopback host (see `OAuthProvider.redirect_host`):
+    // Microsoft demands `localhost`, Zoom demands `127.0.0.1`,
+    // Google accepts either.
+    let redirect_uri = format!("http://{}:{}", provider.redirect_host, port);
 
     let mut params = HashMap::new();
     params.insert("client_id", provider.client_id.to_string());

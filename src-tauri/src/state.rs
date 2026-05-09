@@ -49,6 +49,11 @@ pub struct AppState {
     /// and the random state nonce that the legitimate SSO
     /// callback must echo back. (#148)
     pub matrix_sso_listeners: std::sync::Mutex<HashMap<u16, MatrixSsoSession>>,
+    /// In-flight Zoom OAuth sessions. Same shape as the Matrix
+    /// SSO map but additionally carries the PKCE code verifier
+    /// (Zoom is a public OAuth client and uses PKCE rather than
+    /// a client_secret). (#148)
+    pub zoom_oauth_sessions: std::sync::Mutex<HashMap<u16, ZoomOAuthSession>>,
 }
 
 /// One in-flight Matrix SSO login. Lives in
@@ -57,6 +62,16 @@ pub struct AppState {
 pub struct MatrixSsoSession {
     pub created: std::time::Instant,
     pub listener: std::net::TcpListener,
+    pub state: String,
+}
+
+/// One in-flight Zoom OAuth login. Same shape as the Matrix
+/// session but with the PKCE code verifier alongside the state
+/// nonce, since Zoom is a public OAuth client.
+pub struct ZoomOAuthSession {
+    pub created: std::time::Instant,
+    pub listener: std::net::TcpListener,
+    pub verifier: Option<String>,
     pub state: String,
 }
 
@@ -83,6 +98,7 @@ impl AppState {
             data_dir,
             attachments: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
+            zoom_oauth_sessions: std::sync::Mutex::new(HashMap::new()),
         })
     }
 

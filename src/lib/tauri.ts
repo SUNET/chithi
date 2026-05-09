@@ -559,6 +559,28 @@ export async function meetMatrixLoginComplete(
   });
 }
 
+/// Zoom OAuth (#148). Hosted by Zoom — no per-user server URL,
+/// just an OAuth Authorization Code + PKCE round-trip against
+/// the Marketplace-registered app.
+export interface ZoomLoginStart {
+  login_url: string;
+  port: number;
+}
+
+export async function meetZoomLoginStart(): Promise<ZoomLoginStart> {
+  return invoke("meet_zoom_login_start");
+}
+
+export async function meetZoomLoginComplete(
+  port: number,
+  displayName?: string,
+): Promise<string> {
+  return invoke("meet_zoom_login_complete", {
+    port,
+    displayName: displayName ?? null,
+  });
+}
+
 /// Provider-agnostic create — picks the registry entry matching
 /// the account's meet binding. Returns the join URL the event
 /// editor should drop into the event's location field.

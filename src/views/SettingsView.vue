@@ -33,6 +33,8 @@ function accountTypeLabelLong(t: AccountType): string {
       return "Nextcloud Talk";
     case "matrix":
       return "Matrix";
+    case "zoom":
+      return "Zoom";
     default:
       return t.toUpperCase();
   }
@@ -63,6 +65,8 @@ function accountTypeLabel(acc: {
       return "Nextcloud Talk";
     case "matrix":
       return "Matrix";
+    case "zoom":
+      return "Zoom";
     default:
       return "";
   }
@@ -205,7 +209,10 @@ const hasContactsBinding = computed(() => hasCalendarBinding.value);
 /// signature / per-service-sync sections that are meaningless
 /// for these accounts. (#148)
 const isMeetTab = computed(
-  () => accountType.value === "talk" || accountType.value === "matrix",
+  () =>
+    accountType.value === "talk"
+    || accountType.value === "matrix"
+    || accountType.value === "zoom",
 );
 
 function getInitials(name: string): string {
@@ -254,7 +261,8 @@ type AccountType =
   | "carddav"
   | "o365"
   | "talk"
-  | "matrix";
+  | "matrix"
+  | "zoom";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
@@ -357,11 +365,14 @@ function selectAccountType(type: AccountType) {
       break;
     case "talk":
     case "matrix":
+    case "zoom":
       // Video-conferencing accounts (#148). No mail / calendar /
       // contacts bindings — only meet. The actual creation goes
       // through a browser-assisted login flow rather than the
-      // shared modal save path, so the form data here is only used
-      // to seed defaults for the URL input.
+      // shared modal save path, so the form data here is only
+      // used to seed defaults for the URL input. Zoom in
+      // particular has no per-user server URL (Zoom hosts it),
+      // so the URL input doesn't render for that tab.
       f.provider = "generic";
       f.mail_protocol = "";
       f.imap_host = "";
@@ -425,6 +436,8 @@ function accountTypeDescription(t: AccountType): string {
       return "Video conferencing on a Nextcloud server";
     case "matrix":
       return "Video conferencing via Matrix / Element Call";
+    case "zoom":
+      return "Video conferencing via Zoom";
   }
 }
 
@@ -482,13 +495,17 @@ async function openEditForm(id: string) {
       } else {
         oauthStatus.value = null;
       }
-    } else if (config.meet_protocol === "talk" || config.meet_protocol === "matrix") {
-      // Meet-only accounts (Talk / Matrix) come through the
-      // browser-assisted login and have no mail / calendar /
+    } else if (
+      config.meet_protocol === "talk"
+      || config.meet_protocol === "matrix"
+      || config.meet_protocol === "zoom"
+    ) {
+      // Meet-only accounts (Talk / Matrix / Zoom) come through
+      // the browser-assisted login and have no mail / calendar /
       // contacts bindings. Detected before the DAV branch
-      // because both have `mail_protocol === ""` — without this
-      // a Matrix account would be misclassified as CalDAV and
-      // the form would hide the URL + Sign-in row. (#148)
+      // because all have `mail_protocol === ""` — without this
+      // a meet account would be misclassified as CalDAV and the
+      // form would hide the URL + Sign-in row. (#148)
       accountType.value = config.meet_protocol;
     } else if (config.mail_protocol === "") {
       // Standalone DAV account (#43). Pick the tab from the binding
@@ -915,6 +932,34 @@ async function signInWithMatrix() {
   }
 }
 
+async function signInWithZoom() {
+  // Zoom is hosted by Zoom — there's no per-user URL to type in
+  // first. Just kick off the OAuth flow against the Marketplace-
+  // registered Chithi app and store the resulting tokens. (#148)
+  if (meetSigningIn.value) return;
+  meetSigningIn.value = true;
+  error.value = null;
+  try {
+    const start = await api.meetZoomLoginStart();
+    await openUrl(start.login_url);
+    const accountId = await api.meetZoomLoginComplete(
+      start.port,
+      form.value.display_name || undefined,
+    );
+    await accountsStore.fetchAccounts();
+    showForm.value = false;
+    editingAccountId.value = null;
+    resetDefaultBookState();
+    router.push("/");
+    void accountId;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    error.value = `Zoom sign-in failed: ${msg}`;
+  } finally {
+    meetSigningIn.value = false;
+  }
+}
+
 // Onboarding hands off via ?addAccount=<provider>. Auto-open the new-account
 // form with the matching provider preselected.
 onMounted(() => {
@@ -930,6 +975,7 @@ onMounted(() => {
     carddav: "carddav",
     talk: "talk",
     matrix: "matrix",
+    zoom: "zoom",
   };
   const type = mapped[want];
   if (!type) return;
@@ -1103,7 +1149,7 @@ onMounted(() => {
           <p class="picker-help">Pick the kind of account you want to add. You can add more later.</p>
           <div class="picker-grid">
             <button
-              v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix'] as AccountType[])"
+              v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix', 'zoom'] as AccountType[])"
               :key="t"
               class="picker-card"
               :data-testid="`picker-${t}`"
@@ -1153,8 +1199,11 @@ onMounted(() => {
                  of the form, since neither account type has any
                  mail / calendar / contacts surface to configure
                  here. -->
-            <template v-if="accountType === 'talk' || accountType === 'matrix'">
-              <div class="form-group">
+            <template v-if="accountType === 'talk' || accountType === 'matrix' || accountType === 'zoom'">
+              <!-- URL input hidden on Zoom because Zoom is hosted —
+                   there's no per-user server to type. Talk and
+                   Matrix both need the user's instance URL. -->
+              <div v-if="accountType !== 'zoom'" class="form-group">
                 <label>{{ accountType === 'matrix' ? 'Homeserver URL' : 'Nextcloud URL' }}</label>
                 <input
                   v-model="form.meet_url"
@@ -1181,22 +1230,40 @@ onMounted(() => {
                 <button
                   type="button"
                   class="btn-oauth"
-                  :disabled="meetSigningIn || !form.meet_url"
+                  :disabled="meetSigningIn || (accountType !== 'zoom' && !form.meet_url)"
                   :data-testid="`${accountType}-signin-btn`"
-                  @click="accountType === 'talk' ? signInWithTalk() : signInWithMatrix()"
+                  @click="
+                    accountType === 'talk'
+                      ? signInWithTalk()
+                      : accountType === 'matrix'
+                        ? signInWithMatrix()
+                        : signInWithZoom()
+                  "
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
                   </svg>
-                  {{ meetSigningIn ? 'Waiting for browser…' : (accountType === 'matrix' ? 'Sign in with Matrix' : 'Sign in with Nextcloud') }}
+                  {{
+                    meetSigningIn
+                      ? 'Waiting for browser…'
+                      : accountType === 'matrix'
+                        ? 'Sign in with Matrix'
+                        : accountType === 'zoom'
+                          ? 'Sign in with Zoom'
+                          : 'Sign in with Nextcloud'
+                  }}
                 </button>
                 <span class="field-hint">
-                  Opens your browser to authenticate. Your real password never reaches Chithi — we keep a long-lived app token tied to this device.
+                  Opens your browser to authenticate. {{
+                    accountType === 'zoom'
+                      ? 'Chithi receives an OAuth token tied to your Zoom account.'
+                      : 'Your real password never reaches Chithi — we keep a long-lived app token tied to this device.'
+                  }}
                 </span>
               </div>
               <div v-else class="form-group">
                 <span class="field-hint">
-                  To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : 'Nextcloud' }} server.
+                  To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : accountType === 'zoom' ? 'Zoom' : 'Nextcloud' }} server.
                 </span>
               </div>
             </template>
