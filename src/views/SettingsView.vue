@@ -19,6 +19,25 @@ const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
 
+/// Long-form label for the type-selector buttons in the modal.
+/// Mostly the same as `accountTypeLabel` for the listing, but the
+/// modal is wider and benefits from "Nextcloud Talk" and "Matrix"
+/// spelled out instead of an upper-case acronym.
+function accountTypeLabelLong(t: AccountType): string {
+  switch (t) {
+    case "gmail":
+      return "Gmail";
+    case "o365":
+      return "Microsoft 365";
+    case "talk":
+      return "Nextcloud Talk";
+    case "matrix":
+      return "Matrix";
+    default:
+      return t.toUpperCase();
+  }
+}
+
 function accountTypeLabel(acc: {
   provider?: string;
   mail_protocol?: string;
@@ -203,7 +222,15 @@ const defaultForm = (): AccountConfig => ({
 
 const form = ref<AccountConfig>(defaultForm());
 
-type AccountType = "gmail" | "imap" | "jmap" | "caldav" | "carddav" | "o365";
+type AccountType =
+  | "gmail"
+  | "imap"
+  | "jmap"
+  | "caldav"
+  | "carddav"
+  | "o365"
+  | "talk"
+  | "matrix";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
@@ -303,6 +330,28 @@ function selectAccountType(type: AccountType) {
       f.jmap_url = "";
       f.use_tls = true;
       f.calendar_sync_enabled = false;
+      break;
+    case "talk":
+    case "matrix":
+      // Video-conferencing accounts (#148). No mail / calendar /
+      // contacts bindings — only meet. The actual creation goes
+      // through a browser-assisted login flow rather than the
+      // shared modal save path, so the form data here is only used
+      // to seed defaults for the URL input.
+      f.provider = "generic";
+      f.mail_protocol = "";
+      f.imap_host = "";
+      f.imap_port = 0;
+      f.smtp_host = "";
+      f.smtp_port = 0;
+      f.jmap_url = "";
+      f.caldav_url = "";
+      f.use_tls = true;
+      f.calendar_sync_enabled = false;
+      f.contacts_sync_enabled = false;
+      f.mail_sync_enabled = false;
+      f.meet_url = "";
+      f.meet_protocol = type;
       break;
   }
 }
@@ -728,6 +777,78 @@ async function doDelete() {
   deletingAccountId.value = null;
 }
 
+// --- Video conferencing (#148) -------------------------------------------
+//
+// Both providers use a browser-assisted login flow. The two-step
+// pattern matches what we already do for Gmail / O365 OAuth: start
+// returns a URL, we open it via the shell-opener, then a second
+// call drives the flow to completion and persists the account.
+const meetSigningIn = ref(false);
+
+async function signInWithTalk() {
+  if (meetSigningIn.value) return;
+  if (!form.value.meet_url.trim()) {
+    error.value = "Enter your Nextcloud server URL first";
+    return;
+  }
+  meetSigningIn.value = true;
+  error.value = null;
+  try {
+    const start = await api.meetTalkLoginStart(form.value.meet_url.trim());
+    await openUrl(start.login_url);
+    const accountId = await api.meetTalkLoginComplete(
+      start.poll_endpoint,
+      start.poll_token,
+      form.value.display_name || undefined,
+    );
+    await accountsStore.fetchAccounts();
+    showForm.value = false;
+    editingAccountId.value = null;
+    resetDefaultBookState();
+    // Drop the user back on the main app with the new account's
+    // calendars / contacts visible (Talk has neither, but the
+    // listing still updates).
+    router.push("/");
+    void accountId;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    error.value = `Nextcloud Talk sign-in failed: ${msg}`;
+  } finally {
+    meetSigningIn.value = false;
+  }
+}
+
+async function signInWithMatrix() {
+  if (meetSigningIn.value) return;
+  if (!form.value.meet_url.trim()) {
+    error.value = "Enter your Matrix homeserver URL first";
+    return;
+  }
+  meetSigningIn.value = true;
+  error.value = null;
+  try {
+    const homeserver = form.value.meet_url.trim();
+    const start = await api.meetMatrixLoginStart(homeserver);
+    await openUrl(start.login_url);
+    const accountId = await api.meetMatrixLoginComplete(
+      homeserver,
+      start.port,
+      form.value.display_name || undefined,
+    );
+    await accountsStore.fetchAccounts();
+    showForm.value = false;
+    editingAccountId.value = null;
+    resetDefaultBookState();
+    router.push("/");
+    void accountId;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    error.value = `Matrix sign-in failed: ${msg}`;
+  } finally {
+    meetSigningIn.value = false;
+  }
+}
+
 // Onboarding hands off via ?addAccount=<provider>. Auto-open the new-account
 // form with the matching provider preselected.
 onMounted(() => {
@@ -915,14 +1036,14 @@ onMounted(() => {
               <label>Account Type</label>
               <div class="type-selector">
                 <button
-                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav'] as AccountType[])"
+                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix'] as AccountType[])"
                   :key="t"
                   class="type-btn"
                   :class="{ active: accountType === t }"
                   :disabled="!!editingAccountId"
                   :data-testid="`account-type-${t}`"
                   @click="selectAccountType(t)"
-                >{{ t === 'gmail' ? 'Gmail' : t === 'o365' ? 'Microsoft 365' : t.toUpperCase() }}</button>
+                >{{ accountTypeLabelLong(t) }}</button>
               </div>
             </div>
 
@@ -930,6 +1051,48 @@ onMounted(() => {
               <label>Account Name</label>
               <input v-model="form.display_name" type="text" :placeholder="accountType === 'caldav' ? 'My Calendar' : 'e.g., Personal, Work'" />
             </div>
+
+            <!-- Video-conferencing tabs (#148). One URL field + a
+                 browser-assisted sign-in button replaces the rest
+                 of the form, since neither account type has any
+                 mail / calendar / contacts surface to configure
+                 here. -->
+            <template v-if="accountType === 'talk' || accountType === 'matrix'">
+              <div class="form-group">
+                <label>{{ accountType === 'matrix' ? 'Homeserver URL' : 'Nextcloud URL' }}</label>
+                <input
+                  v-model="form.meet_url"
+                  type="url"
+                  :placeholder="accountType === 'matrix'
+                    ? 'https://matrix.example.org'
+                    : 'https://cloud.example.org'"
+                  :data-testid="`${accountType}-url`"
+                />
+                <span class="field-hint">
+                  {{ accountType === 'matrix'
+                    ? 'Base URL of your Matrix homeserver. SSO will open in your browser.'
+                    : 'Base URL of your Nextcloud server. Login Flow v2 will open in your browser.' }}
+                </span>
+              </div>
+              <div class="form-group">
+                <button
+                  type="button"
+                  class="btn-oauth"
+                  :disabled="meetSigningIn || !form.meet_url"
+                  :data-testid="`${accountType}-signin-btn`"
+                  @click="accountType === 'talk' ? signInWithTalk() : signInWithMatrix()"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                  </svg>
+                  {{ meetSigningIn ? 'Waiting for browser…' : (accountType === 'matrix' ? 'Sign in with Matrix' : 'Sign in with Nextcloud') }}
+                </button>
+                <span class="field-hint">
+                  Opens your browser to authenticate. Your real password never reaches Chithi — we keep a long-lived app token tied to this device.
+                </span>
+              </div>
+            </template>
+
             <!-- DAV-only accounts have no mail identity, so they skip
                  the email field and use an explicit username for the
                  server's Basic auth. The mail tabs keep email as the
