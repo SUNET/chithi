@@ -108,9 +108,14 @@ pub async fn update_calendar(
     }
     if color_changed {
         if let Some(ref rid) = remote_id {
-            // Best-effort: protocols that can't push a color (Graph,
-            // Google) log a debug line and we keep the local change
-            // anyway so the user's pick takes effect in our UI.
+            // CalDAV / JMAP propagate failures: a server reject rolls
+            // back the local DB write below and surfaces an error.
+            // Graph / Google swallow failures internally and log —
+            // system calendars and read-only subscriptions return a
+            // generic 500/403 rather than a structured error, and
+            // refusing to apply *any* local color change for those
+            // accounts would be worse than letting the local pick
+            // stick.
             push_calendar_color(&account, rid, &color).await?;
         } else {
             log::info!(
@@ -125,16 +130,22 @@ pub async fn update_calendar(
 }
 
 /// Push a calendar color change to the account's remote server.
-/// Mirrors `push_calendar_rename` per-protocol dispatch.
+/// Mirrors `push_calendar_rename`'s per-protocol dispatch.
 ///
-/// CalDAV (incl. Radicale, Nextcloud, Sabre/dav, Apple Calendar
-/// Server) and JMAP both have a standard color property and surface
-/// any push failure as an error. Microsoft Graph and Google Calendar
-/// expose only a constrained color enum / numeric id; we'd need a
-/// hex-to-named lookup to translate, so for now we log a debug line
-/// and let the local DB keep the user's hex unchanged. Local-only
-/// calendars (no `remote_id`) never reach this function — caller
-/// short-circuits.
+/// - **CalDAV** (Radicale, Nextcloud, Sabre/dav, Apple Calendar
+///   Server) and **JMAP** (Stalwart, Cyrus) both expose a writable
+///   color property and propagate failures — the caller's local DB
+///   write rolls back on error.
+/// - **Microsoft Graph** writes a named-enum approximation (see
+///   `nearest_outlook_color`) but Graph is allergic to PATCH on
+///   system / shared calendars and surfaces a generic 500 there.
+///   Failures are logged and the function returns Ok so the local
+///   DB write can still apply.
+/// - **Google Calendar** writes arbitrary RGB on the calendarList
+///   resource via `colorRgbFormat=true`. Same best-effort behavior
+///   as Graph.
+/// - Local-only calendars (no `remote_id`) never reach this
+///   function — caller short-circuits.
 async fn push_calendar_color(
     account: &db::accounts::AccountFull,
     remote_id: &str,
@@ -3056,9 +3067,15 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
 
             let (local_id, subscribed) = match existing {
                 Some((local_id, subscribed)) => {
+                    // Preserve the locally stored color: it may have been set
+                    // via the sidebar's color picker, and Graph sometimes
+                    // refuses the PATCH (shared / system calendars return 500
+                    // ISE), so the *only* place that pick exists is locally.
+                    // Stomping it with `gc.color` here resets shared calendars
+                    // back to their Graph default on every resync (#132).
                     conn.execute(
-                        "UPDATE calendars SET name = ?1, color = ?2 WHERE id = ?3",
-                        rusqlite::params![gc.name, gc.color, local_id],
+                        "UPDATE calendars SET name = ?1 WHERE id = ?2",
+                        rusqlite::params![gc.name, local_id],
                     )
                     .ok();
                     (local_id, subscribed)
