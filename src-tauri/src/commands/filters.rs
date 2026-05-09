@@ -24,14 +24,14 @@ fn is_graph_item_not_found(err: &Error) -> bool {
     s.contains("404") && s.contains("ErrorItemNotFound")
 }
 
-/// Extract the JMAP email id from a composite DB id of form `{account_id}_{mailbox}_{email_id}`.
-fn jmap_id_from_db_id(db_id: &str) -> Option<String> {
-    let parts: Vec<&str> = db_id.splitn(3, '_').collect();
-    if parts.len() == 3 {
-        Some(parts[2].to_string())
-    } else {
-        None
-    }
+/// Extract the JMAP email id from a composite DB id of form
+/// `{account_id}_{mailbox_id}_{email_id}` by stripping the known
+/// `{account_id}_{mailbox_id}_` prefix. Splitting on `_` is unsafe because
+/// JMAP mailbox ids and email ids are server-opaque and may legally contain
+/// underscores.
+fn jmap_id_from_db_id(account_id: &str, mailbox_id: &str, db_id: &str) -> Option<String> {
+    let prefix = format!("{}_{}_", account_id, mailbox_id);
+    db_id.strip_prefix(&prefix).map(|s| s.to_string())
 }
 
 /// List all filter rules for an account (plus global rules).
@@ -152,8 +152,32 @@ pub async fn apply_filters_to_folder(
     let result = match account.mail_protocol_str() {
         "graph" => execute_graph_filter_actions(&account_id, &action_plan).await?,
         "jmap" => execute_jmap_filter_actions(&account, &folder_path, &action_plan).await?,
-        _ => execute_imap_filter_actions(&account_id, &account, &folder_path, &action_plan).await?,
+        "imap" => {
+            execute_imap_filter_actions(&account_id, &account, &folder_path, &action_plan).await?
+        }
+        "" => {
+            // Mail binding disabled (DAV-only account, etc.). There should be
+            // no messages in `messages` for this account, but guard the
+            // dispatch explicitly so we never fall through to IMAP with
+            // bogus host/port.
+            log::info!(
+                "Account {} has no mail protocol configured; skipping filter actions",
+                account_id
+            );
+            return Ok(0);
+        }
+        other => {
+            return Err(Error::Other(format!(
+                "Unknown mail protocol '{}' for account {}",
+                other, account_id
+            )));
+        }
     };
+
+    // Capture counts before consuming the result for DB cleanup so we can
+    // report them in the partial-failure message below.
+    let succeeded = result.moved_db_ids.len() + result.deleted_db_ids.len();
+    let errors = result.errors;
 
     // 5. Update local DB: remove server-confirmed moved/deleted messages
     {
@@ -171,20 +195,24 @@ pub async fn apply_filters_to_folder(
         }
     }
 
-    if !result.errors.is_empty() {
+    if !errors.is_empty() {
         log::warn!(
             "Apply filters to folder finished with {} failure(s); first: {}",
-            result.errors.len(),
-            result.errors[0]
+            errors.len(),
+            errors[0]
         );
-        // Surface a partial-failure error message so the UI shows it. We
-        // intentionally still return Ok-like behavior (Result with the
-        // affected count) only when the entire batch succeeded.
+        // Surface a partial-failure error message so the UI shows it.
+        // `errors` mixes per-message (Graph move/delete) and per-batch
+        // (Graph mark-read, JMAP set_flags) entries, and `affected_count`
+        // counts matched messages, not attempted actions — so we report
+        // the failure count plus the first error verbatim rather than
+        // claiming a precise denominator.
         return Err(Error::Other(format!(
-            "{} of {} actions failed (first: {})",
-            result.errors.len(),
+            "{} failure(s) across {} matched message(s) ({} server-confirmed change(s)); first: {}",
+            errors.len(),
             affected_count,
-            result.errors[0]
+            succeeded,
+            errors[0]
         )));
     }
 
@@ -512,7 +540,10 @@ async fn execute_jmap_filter_actions(
     let mut mark_unread_ids: Vec<String> = Vec::new();
 
     for (msg, actions) in action_plan {
-        let Some(jmap_id) = jmap_id_from_db_id(&msg.id) else {
+        // The JMAP mailbox id is stored as `folder_path`; use that to strip
+        // the exact prefix instead of splitting on `_`, which is unsafe
+        // because mailbox ids and email ids are server-opaque.
+        let Some(jmap_id) = jmap_id_from_db_id(&account.id, &msg.folder_path, &msg.id) else {
             log::warn!(
                 "Skipping JMAP filter action for message '{}' with unexpected id format",
                 msg.id
@@ -712,22 +743,32 @@ mod tests {
     }
 
     #[test]
-    fn test_jmap_id_from_db_id_extracts_third_segment() {
-        // Format: {account_id}_{mailbox_id}_{jmap_email_id}
-        let id = jmap_id_from_db_id("acc1_inbox_M123");
+    fn test_jmap_id_from_db_id_strips_known_prefix() {
+        let id = jmap_id_from_db_id("acc1", "inbox", "acc1_inbox_M123");
         assert_eq!(id.as_deref(), Some("M123"));
     }
 
     #[test]
-    fn test_jmap_id_from_db_id_keeps_underscores_in_email_id() {
-        let id = jmap_id_from_db_id("acc1_box_email_with_underscores");
+    fn test_jmap_id_from_db_id_preserves_underscores_in_email_id() {
+        // Email id contains underscores; previous splitn(3, '_') would have
+        // truncated this. Prefix-strip handles it correctly.
+        let id = jmap_id_from_db_id("acc1", "box", "acc1_box_email_with_underscores");
         assert_eq!(id.as_deref(), Some("email_with_underscores"));
     }
 
     #[test]
-    fn test_jmap_id_from_db_id_returns_none_for_short_id() {
-        assert!(jmap_id_from_db_id("only_two").is_none());
-        assert!(jmap_id_from_db_id("oneonly").is_none());
+    fn test_jmap_id_from_db_id_handles_underscore_in_mailbox_id() {
+        // Server-opaque mailbox id with underscores — splitn-based parsing
+        // would have returned "child_M9" or worse here; prefix-strip is exact.
+        let id = jmap_id_from_db_id("acc1", "parent_child", "acc1_parent_child_M9");
+        assert_eq!(id.as_deref(), Some("M9"));
+    }
+
+    #[test]
+    fn test_jmap_id_from_db_id_returns_none_when_prefix_missing() {
+        assert!(jmap_id_from_db_id("acc1", "inbox", "different_acc_inbox_M1").is_none());
+        assert!(jmap_id_from_db_id("acc1", "inbox", "acc1_other_M1").is_none());
+        assert!(jmap_id_from_db_id("acc1", "inbox", "no_underscores").is_none());
     }
 
     #[test]
