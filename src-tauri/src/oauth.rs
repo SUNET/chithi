@@ -24,6 +24,13 @@ pub struct OAuthProvider {
     /// Zoom registers `http://127.0.0.1` and rejects `localhost`.
     /// Defaults to `"localhost"` for legacy providers.
     pub redirect_host: &'static str,
+    /// Fixed loopback port the provider's redirect URI uses, when
+    /// the provider doesn't honor RFC 8252's "ignore the port on
+    /// loopback" rule and requires an exact match against what's
+    /// registered. `None` lets `get_auth_url` bind a random free
+    /// port (Google / Microsoft). Zoom Marketplace pins
+    /// `http://127.0.0.1:<port>` exactly so we set this for Zoom.
+    pub redirect_fixed_port: Option<u16>,
 }
 
 pub const GOOGLE: OAuthProvider = OAuthProvider {
@@ -38,6 +45,7 @@ pub const GOOGLE: OAuthProvider = OAuthProvider {
     ],
     use_pkce: true,
     redirect_host: "localhost",
+    redirect_fixed_port: None,
 };
 
 pub const MICROSOFT: OAuthProvider = OAuthProvider {
@@ -65,6 +73,7 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
     ],
     use_pkce: true,
     redirect_host: "localhost",
+    redirect_fixed_port: None,
 };
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
@@ -93,6 +102,12 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
     scopes: &["meeting:write:meeting:user"],
     use_pkce: true,
     redirect_host: "127.0.0.1",
+    // Pinned port that the Marketplace registration matches
+    // exactly. If the port is in use at runtime the bind fails
+    // with a clear error and the user retries; the alternative
+    // (registering a range of ports) inflates Marketplace
+    // bookkeeping for marginal benefit on a desktop app.
+    redirect_fixed_port: Some(47832),
 };
 
 /// Microsoft IMAP/SMTP scopes — used for token refresh for mail access.
@@ -155,8 +170,22 @@ impl OAuthTokens {
 pub fn get_auth_url(
     provider: &OAuthProvider,
 ) -> Result<(String, TcpListener, Option<String>, String)> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| Error::Other(format!("Failed to bind local server: {}", e)))?;
+    // Honor the provider's pinned-port setting when present
+    // (Zoom requires an exact-match redirect URI registered in
+    // Marketplace). Otherwise bind a random free port — the
+    // common case for Google / Microsoft.
+    let bind_port = provider.redirect_fixed_port.unwrap_or(0);
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", bind_port))
+        .map_err(|e| {
+            if provider.redirect_fixed_port.is_some() {
+                Error::Other(format!(
+                    "{} requires loopback port {} but it's already in use ({}). Close the program holding it and retry.",
+                    provider.name, bind_port, e,
+                ))
+            } else {
+                Error::Other(format!("Failed to bind local server: {}", e))
+            }
+        })?;
     let port = listener
         .local_addr()
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
