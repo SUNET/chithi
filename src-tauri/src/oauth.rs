@@ -93,7 +93,17 @@ pub const MICROSOFT_GRAPH_SCOPES: &str =
 /// Scopes → Meeting on the registered app.
 pub const ZOOM: OAuthProvider = OAuthProvider {
     name: "zoom",
-    client_id: "CxRwHStNQkqPBztEsvSDnA",
+    // Build-time override via `CHITHI_ZOOM_CLIENT_ID`. Each fork
+    // / deployment registers its own User-managed app on Zoom
+    // Marketplace and ships the client_id via build env. The
+    // baked-in default is the SUNET-organisation registration
+    // for upstream Chithi development; admin-pre-approval gating
+    // means a fresh Zoom account + Marketplace registration is
+    // typically the path of least resistance for forks.
+    client_id: match option_env!("CHITHI_ZOOM_CLIENT_ID") {
+        Some(s) => s,
+        None => "CxRwHStNQkqPBztEsvSDnA",
+    },
     client_secret: "", // Public client — PKCE only
     auth_url: "https://zoom.us/oauth/authorize",
     token_url: "https://zoom.us/oauth/token",
