@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onBeforeUnmount, watch } from "vue";
+import { ref, onBeforeUnmount, onMounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Calendar } from "@/lib/types";
@@ -32,8 +32,16 @@ function getCalendarColor(color: string): string {
   return color || "#4285f4";
 }
 
+// Time the menu was opened. Used to suppress the trailing click that
+// some WebKit builds synthesise on right-mouse-release; without this
+// guard the menu would flash open and immediately close before the
+// user could interact with it.
+let menuOpenedAt = 0;
+
 function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
   event.preventDefault();
+  event.stopPropagation();
+  menuOpenedAt = performance.now();
   contextMenu.value = { x: event.clientX, y: event.clientY, calendarId: calId, accountId };
 }
 
@@ -41,26 +49,25 @@ function closeContextMenu() {
   contextMenu.value = null;
 }
 
-// Close the context menu on any LEFT-button click that lands outside the
-// teleported menu itself. WebKitGTK synthesises a click event on
-// right-mouse-release (button === 2), so without the button guard the
-// menu would close immediately when the user lets go of the right button.
+// Close the menu on any LEFT-button click that lands outside the
+// teleported menu itself. Listener is attached permanently (in
+// onMounted) and short-circuits when the menu isn't open — that way
+// there's no watch / microtask race between setting `contextMenu`
+// and the listener actually existing.
 function onDocClickForMenu(e: MouseEvent) {
   if (!contextMenu.value) return;
   if (e.button !== 0) return;
+  // 250ms guard against the right-click → synthesised-click sequence
+  // some WebKitGTK builds produce.
+  if (performance.now() - menuOpenedAt < 250) return;
   const target = e.target as HTMLElement | null;
   if (target?.closest(".cal-context-menu")) return;
   closeContextMenu();
 }
 
-watch(contextMenu, (open) => {
-  if (open) {
-    document.addEventListener("click", onDocClickForMenu);
-  } else {
-    document.removeEventListener("click", onDocClickForMenu);
-  }
+onMounted(() => {
+  document.addEventListener("click", onDocClickForMenu);
 });
-
 onBeforeUnmount(() => {
   document.removeEventListener("click", onDocClickForMenu);
 });
