@@ -1059,13 +1059,12 @@ impl JmapConnection {
         Ok(calendars)
     }
 
-    /// Rename a JMAP calendar. Uses Calendar/set with an update entry.
     /// Update the JMAP `color` property on a calendar via
     /// `Calendar/set`. JMAP calendars (RFC 8984 / "JSCalendar") store
     /// color as a CSS-format string, conventionally a `#RRGGBB` hex.
-    /// Stalwart and Cyrus both honor the property; servers that don't
-    /// will surface the rejection in `notUpdated` and we return that
-    /// as an error so the caller can roll back.
+    /// Stalwart and Cyrus both honor the property; servers that
+    /// don't will surface the rejection in `notUpdated` and we
+    /// return that as an error so the caller can roll back.
     pub async fn set_calendar_color(
         &self,
         config: &JmapConfig,
@@ -1107,6 +1106,8 @@ impl JmapConnection {
         Ok(())
     }
 
+    /// Rename a JMAP calendar via `Calendar/set` with an update
+    /// entry whose `name` field carries the new display name.
     pub async fn rename_calendar(
         &self,
         config: &JmapConfig,
