@@ -36,6 +36,46 @@ const defaultStart = props.initialStart
   : new Date();
 const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 
+/// Accounts that can produce a meeting URL (#148). Pulled from the
+/// account summary's `meet_protocol` so we can label the dropdown
+/// with "Nextcloud Talk" / "Matrix" alongside the account name.
+const meetAccountOptions = computed(() =>
+  accountsStore.accounts
+    .filter((a) => a.meet_protocol === "talk" || a.meet_protocol === "matrix")
+    .map((a) => ({
+      value: a.id,
+      label: `${a.display_name || a.email || a.id} (${a.meet_protocol === "talk" ? "Nextcloud Talk" : "Matrix"})`,
+    })),
+);
+const generatingMeetUrl = ref(false);
+const meetError = ref<string | null>(null);
+
+async function addVideoLink(accountId: string) {
+  if (!accountId || generatingMeetUrl.value) return;
+  generatingMeetUrl.value = true;
+  meetError.value = null;
+  try {
+    const url = await api.meetCreateUrl(accountId, title.value || "Meeting");
+    // Convention: the URL goes into `location` (modern calendar
+    // clients render it as a clickable Join link there) and we
+    // also prepend a "Join: <url>" line to the description so
+    // calendars without rich location rendering still show it
+    // in the body. If location already has something, append
+    // newline-separated.
+    location.value = location.value
+      ? `${location.value}\n${url}`
+      : url;
+    description.value = description.value
+      ? `Join: ${url}\n\n${description.value}`
+      : `Join: ${url}`;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    meetError.value = `Could not create meeting: ${msg}`;
+  } finally {
+    generatingMeetUrl.value = false;
+  }
+}
+
 const title = ref("");
 const startDate = ref(toDateInTimezone(defaultStart, uiStore.displayTimezone));
 const startTime = ref(toTimeInTimezone(defaultStart, uiStore.displayTimezone));
@@ -194,6 +234,35 @@ async function save() {
         <div class="form-group">
           <label>Location</label>
           <input v-model="location" type="text" placeholder="Add location" data-testid="event-form-location" />
+          <!-- #148: one-click video conference. Only renders when
+               at least one account has a meet binding configured
+               in Settings. Picking an entry creates the room /
+               call on that provider and appends the join URL to
+               this Location field plus a Join: line in the
+               description below. -->
+          <div
+            v-if="meetAccountOptions.length > 0"
+            class="meet-row"
+            data-testid="event-form-meet-row"
+          >
+            <button
+              v-for="opt in meetAccountOptions"
+              :key="opt.value"
+              type="button"
+              class="meet-btn"
+              :disabled="generatingMeetUrl"
+              :data-testid="`event-form-meet-${opt.value}`"
+              @click="addVideoLink(opt.value)"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+              </svg>
+              {{ generatingMeetUrl ? "Creating…" : `Add ${opt.label}` }}
+            </button>
+          </div>
+          <span v-if="meetError" class="meet-error" data-testid="event-form-meet-error">
+            {{ meetError }}
+          </span>
         </div>
 
         <div class="form-group">
@@ -229,6 +298,39 @@ async function save() {
 </template>
 
 <style scoped>
+/* "Add video conference" buttons under the Location input (#148). */
+.meet-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.meet-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 12px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.meet-btn:hover {
+  background: var(--color-bg-hover);
+}
+.meet-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.meet-error {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--color-danger, #c0392b);
+}
+
 .event-form-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
