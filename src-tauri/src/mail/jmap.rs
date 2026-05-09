@@ -1060,6 +1060,53 @@ impl JmapConnection {
     }
 
     /// Rename a JMAP calendar. Uses Calendar/set with an update entry.
+    /// Update the JMAP `color` property on a calendar via
+    /// `Calendar/set`. JMAP calendars (RFC 8984 / "JSCalendar") store
+    /// color as a CSS-format string, conventionally a `#RRGGBB` hex.
+    /// Stalwart and Cyrus both honor the property; servers that don't
+    /// will surface the rejection in `notUpdated` and we return that
+    /// as an error so the caller can roll back.
+    pub async fn set_calendar_color(
+        &self,
+        config: &JmapConfig,
+        calendar_id: &str,
+        hex: &str,
+    ) -> Result<()> {
+        log::info!("JMAP set color for calendar {} -> {}", calendar_id, hex);
+
+        let mut update = serde_json::Map::new();
+        update.insert(calendar_id.to_string(), serde_json::json!({ "color": hex }));
+
+        let request = serde_json::json!({
+            "using": [
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:calendars"
+            ],
+            "methodCalls": [
+                ["Calendar/set", {
+                    "accountId": self.account_id,
+                    "update": update
+                }, "c1"]
+            ]
+        });
+
+        let resp = self.api_request(&request, config).await?;
+
+        if let Some(err) = resp["methodResponses"][0][1]["notUpdated"][calendar_id].as_object() {
+            let desc = err
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP Calendar/set rejected color update: {}",
+                desc
+            )));
+        }
+
+        log::info!("JMAP color set for calendar {}", calendar_id);
+        Ok(())
+    }
+
     pub async fn rename_calendar(
         &self,
         config: &JmapConfig,

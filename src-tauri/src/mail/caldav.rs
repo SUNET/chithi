@@ -465,6 +465,63 @@ impl CalDavClient {
     /// PROPPATCH the `{DAV:}displayname` property to rename a calendar.
     /// `calendar_href` is the calendar collection URL (as returned by
     /// `list_calendars`).
+    /// PROPPATCH the Apple-namespace `calendar-color` property
+    /// (`http://apple.com/ns/ical/`). Nextcloud, Radicale, Sabre/dav,
+    /// and Apple Calendar Server all honor this property; servers
+    /// that don't simply return a 4xx for that prop in the 207 body,
+    /// which we surface as an error so the caller can roll back the
+    /// local change. Hex format must include the leading `#` —
+    /// most servers accept both 6- and 8-digit forms.
+    pub async fn set_calendar_color(&self, calendar_href: &str, hex: &str) -> Result<()> {
+        let url = self.resolve_url(calendar_href)?;
+        log::info!("caldav: PROPPATCH set color {} -> {}", url, hex);
+
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:A="http://apple.com/ns/ical/">
+  <D:set>
+    <D:prop>
+      <A:calendar-color>{}</A:calendar-color>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>"#,
+            xml_escape(hex)
+        );
+
+        let resp = self
+            .apply_auth(
+                self.http
+                    .request(reqwest::Method::from_bytes(b"PROPPATCH").unwrap(), &url),
+            )
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("CalDAV PROPPATCH (color) failed: {}", e)))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "(no body)".to_string());
+
+        if !status.is_success() && status.as_u16() != 207 {
+            return Err(Error::Other(format!(
+                "CalDAV PROPPATCH (color) returned {}: {}",
+                status,
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+        if text.contains("HTTP/1.1 4") || text.contains("HTTP/1.1 5") {
+            return Err(Error::Other(format!(
+                "CalDAV PROPPATCH rejected calendar-color update: {}",
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+        log::info!("caldav: PROPPATCH color success");
+        Ok(())
+    }
+
     pub async fn rename_calendar(&self, calendar_href: &str, new_name: &str) -> Result<()> {
         let url = self.resolve_url(calendar_href)?;
         log::info!("caldav: PROPPATCH rename calendar {} -> {}", url, new_name);

@@ -117,6 +117,75 @@ const renaming = ref<{ calendar: Calendar; value: string } | null>(null);
 const renameSaving = ref(false);
 const renameError = ref<string | null>(null);
 
+// Color-picker dialog state (#132). Mirrors the rename-dialog
+// shape: a snapshot of the calendar being edited plus a draft
+// `value` (the picked hex) and saving / error refs the modal binds
+// to. Cleared on cancel + on a successful save.
+const recoloring = ref<{ calendar: Calendar; value: string } | null>(null);
+const recolorSaving = ref(false);
+const recolorError = ref<string | null>(null);
+
+// Curated palette mirrors `random_calendar_color()` in
+// commands/calendar.rs so freshly-synced calendars and
+// user-picked colors come from the same set. If the user's
+// current color isn't in the palette (e.g. a server-supplied
+// custom hex) the picker still highlights it via the
+// `current === value` check below; the dialog also accepts a
+// freeform input.
+const PALETTE: { hex: string; name: string }[] = [
+  { hex: "#4285f4", name: "Blue" },
+  { hex: "#0b8043", name: "Green" },
+  { hex: "#8e24aa", name: "Purple" },
+  { hex: "#d50000", name: "Red" },
+  { hex: "#f4511e", name: "Orange" },
+  { hex: "#039be5", name: "Cyan" },
+  { hex: "#616161", name: "Grey" },
+  { hex: "#e67c73", name: "Salmon" },
+  { hex: "#f6bf26", name: "Yellow" },
+  { hex: "#33b679", name: "Teal" },
+];
+
+function startRecolor() {
+  if (!contextMenu.value) return;
+  const cal = calendarStore.calendars.find(
+    (c) => c.id === contextMenu.value!.calendarId,
+  );
+  closeContextMenu();
+  if (!cal) return;
+  recolorError.value = null;
+  recoloring.value = { calendar: cal, value: cal.color || "#4285f4" };
+}
+
+function cancelRecolor() {
+  recoloring.value = null;
+  recolorError.value = null;
+}
+
+async function confirmRecolor() {
+  if (!recoloring.value) return;
+  const newColor = recoloring.value.value.trim();
+  if (!newColor || newColor === recoloring.value.calendar.color) {
+    cancelRecolor();
+    return;
+  }
+  recolorSaving.value = true;
+  recolorError.value = null;
+  try {
+    await api.updateCalendar(
+      recoloring.value.calendar.id,
+      recoloring.value.calendar.name,
+      newColor,
+    );
+    await calendarStore.fetchCalendars();
+    showToast(`Color updated`, "success");
+    recoloring.value = null;
+  } catch (e) {
+    recolorError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    recolorSaving.value = false;
+  }
+}
+
 function startRename() {
   if (!contextMenu.value) return;
   const cal = calendarStore.calendars.find(
@@ -225,6 +294,7 @@ async function unsubscribeThisCalendar() {
       >
         <button class="ctx-item" @click="syncThisCalendar" data-testid="calendar-sync">Sync this calendar</button>
         <button class="ctx-item" @click="startRename" data-testid="calendar-rename">Rename…</button>
+        <button class="ctx-item" @click="startRecolor" data-testid="calendar-recolor">Change color…</button>
         <button class="ctx-item" @click="unsubscribeThisCalendar" data-testid="calendar-unsubscribe">Unsubscribe</button>
       </div>
     </Teleport>
@@ -271,6 +341,70 @@ async function unsubscribeThisCalendar() {
               @click="confirmRename"
             >
               {{ renameSaving ? "Renaming…" : "Rename" }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Color picker (#132) -->
+    <Teleport to="body">
+      <div
+        v-if="recoloring"
+        class="cal-rename-overlay"
+        data-testid="calendar-recolor-modal"
+        @click.self="cancelRecolor"
+      >
+        <div class="rename-modal">
+          <div class="rename-body">
+            <h3>Change color</h3>
+            <p class="rename-sub">
+              Pick a color for "{{ recoloring.calendar.name }}". Where the server supports it (CalDAV, JMAP) the color is also pushed to the remote calendar.
+            </p>
+            <div class="color-swatches">
+              <button
+                v-for="entry in PALETTE"
+                :key="entry.hex"
+                type="button"
+                class="color-swatch"
+                :class="{ selected: recoloring.value.toLowerCase() === entry.hex.toLowerCase() }"
+                :style="{ backgroundColor: entry.hex }"
+                :title="entry.name"
+                :data-testid="`calendar-color-${entry.hex.slice(1)}`"
+                :disabled="recolorSaving"
+                @click="recoloring.value = entry.hex"
+              ></button>
+            </div>
+            <input
+              v-model="recoloring.value"
+              type="text"
+              class="rename-input color-input"
+              placeholder="#rrggbb"
+              data-testid="calendar-color-custom"
+              :disabled="recolorSaving"
+              @keyup.enter="confirmRecolor"
+              @keyup.escape="cancelRecolor"
+            />
+            <p v-if="recolorError" class="rename-error" data-testid="calendar-recolor-error">
+              {{ recolorError }}
+            </p>
+          </div>
+          <div class="rename-footer">
+            <button
+              class="rename-btn-cancel"
+              :disabled="recolorSaving"
+              data-testid="calendar-recolor-cancel"
+              @click="cancelRecolor"
+            >
+              Cancel
+            </button>
+            <button
+              class="rename-btn-save"
+              :disabled="recolorSaving || !recoloring.value.trim()"
+              data-testid="calendar-recolor-save"
+              @click="confirmRecolor"
+            >
+              {{ recolorSaving ? "Saving…" : "Save" }}
             </button>
           </div>
         </div>
@@ -458,6 +592,35 @@ async function unsubscribeThisCalendar() {
 .rename-input:focus {
   outline: none;
   border-color: var(--color-accent);
+}
+
+/* Color-picker (#132) */
+.color-swatches {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+.color-swatch {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform 0.08s, border-color 0.12s;
+  padding: 0;
+}
+.color-swatch:hover { transform: scale(1.06); }
+.color-swatch.selected {
+  border-color: var(--color-text);
+}
+.color-swatch:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.color-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: lowercase;
 }
 
 .rename-error {
