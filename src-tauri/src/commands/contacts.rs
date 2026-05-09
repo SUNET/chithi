@@ -637,6 +637,23 @@ pub async fn sync_contacts(
         }
     }
 
+    // Now that books may exist, fill in default-contact-book on any
+    // sibling mail/calendar binding that is still unset (#137). Call
+    // is idempotent — bindings the user has already pointed
+    // somewhere are left alone.
+    {
+        let conn = state.db.writer().await;
+        if let Err(e) =
+            db::service_bindings::apply_default_contact_book_if_missing(&conn, &account_id)
+        {
+            log::warn!(
+                "sync_contacts: apply_default_contact_book_if_missing failed for {}: {}",
+                account_id,
+                e
+            );
+        }
+    }
+
     // Notify frontend that contact data has changed
     use tauri::Emitter;
     app.emit("contacts-changed", account_id.as_str()).ok();
@@ -1184,6 +1201,30 @@ pub async fn search_contacts(state: State<'_, AppState>, query: String) -> Resul
     db::contacts::search_all_contacts(&conn, &query)
 }
 
+/// Like `search_contacts` but resolves the account's default contact
+/// book for the given service (`"mail"` for compose, `"calendar"`
+/// for event attendees) and ranks matches in that book first. Other
+/// books still appear, just below — see #137 for the UX intent.
+/// `account_id = None` (or no default configured) degrades to the
+/// plain alphabetical search.
+#[tauri::command]
+pub async fn search_contacts_for_account(
+    state: State<'_, AppState>,
+    query: String,
+    account_id: Option<String>,
+    service: Option<String>,
+) -> Result<Vec<Contact>> {
+    let preferred = match (account_id, service) {
+        (Some(aid), Some(svc)) => {
+            let conn = state.db.reader();
+            db::service_bindings::get_default_contact_book(&conn, &aid, &svc)?
+        }
+        _ => None,
+    };
+    let conn = state.db.reader();
+    db::contacts::search_all_contacts_ranked(&conn, &query, preferred.as_deref())
+}
+
 #[tauri::command]
 pub async fn search_collected_contacts(
     state: State<'_, AppState>,
@@ -1191,6 +1232,35 @@ pub async fn search_collected_contacts(
 ) -> Result<Vec<CollectedContact>> {
     let conn = state.db.reader();
     db::contacts::search_collected_contacts(&conn, &query)
+}
+
+/// Read the default contact book id for an account/service binding.
+/// Returns null if no default is set or the binding doesn't exist.
+/// Used by the settings UI to reflect current state.
+#[tauri::command]
+pub async fn get_default_contact_book(
+    state: State<'_, AppState>,
+    account_id: String,
+    service: String,
+) -> Result<Option<String>> {
+    let conn = state.db.reader();
+    db::service_bindings::get_default_contact_book(&conn, &account_id, &service)
+}
+
+/// Set (or clear, when `book_id` is None) the default contact book
+/// for an account's mail or calendar binding. The book may belong
+/// to a different account than the binding — e.g. a personal CardDAV
+/// book can be the default for a work IMAP account's compose
+/// autocomplete.
+#[tauri::command]
+pub async fn set_default_contact_book(
+    state: State<'_, AppState>,
+    account_id: String,
+    service: String,
+    book_id: Option<String>,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::service_bindings::set_default_contact_book(&conn, &account_id, &service, book_id.as_deref())
 }
 
 // ---------------------------------------------------------------------------
