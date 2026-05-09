@@ -87,6 +87,12 @@ const themeLabel = computed(() =>
   uiStore.theme === "dark" ? "Dark" : "Light",
 );
 const showForm = ref(false);
+// First step of "Add Account": pick a type. Replaces the cramped
+// in-modal tab row with a dialog that lists the eight account
+// types as cards grouped by service area, and on pick opens the
+// existing edit form pre-set to that type. Edit-existing skips
+// this step. (#148 cleanup)
+const showPicker = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingAccountId = ref<string | null>(null);
 const saving = ref(false);
@@ -367,16 +373,50 @@ function selectAccountType(type: AccountType) {
 
 function openNewForm() {
   editingAccountId.value = null;
-  form.value = defaultForm();
-  accountType.value = "gmail";
-  selectAccountType("gmail");
   resetDefaultBookState();
+  error.value = null;
+  showPicker.value = true;
+}
+
+/// Step 2 of the Add-account flow: type is chosen, set up the
+/// form and open it. Closes the picker.
+function pickAccountType(type: AccountType) {
+  form.value = defaultForm();
+  accountType.value = type;
+  selectAccountType(type);
   // Pre-load the cross-account book list so the create-flow dropdowns
   // are populated for users who already have an account with synced
   // books and want to point a new account at one of them.
   loadAvailableBooks();
+  showPicker.value = false;
   showForm.value = true;
-  error.value = null;
+}
+
+function cancelPicker() {
+  showPicker.value = false;
+}
+
+/// Brief subtitle shown under each card in the picker dialog.
+/// Kept terse — the card's title already says what the type is.
+function accountTypeDescription(t: AccountType): string {
+  switch (t) {
+    case "gmail":
+      return "Mail, calendar and contacts via Google";
+    case "o365":
+      return "Mail, calendar and contacts via Microsoft 365";
+    case "imap":
+      return "Generic IMAP / SMTP mail account";
+    case "jmap":
+      return "JMAP mail (e.g. Fastmail, Stalwart)";
+    case "caldav":
+      return "Standalone calendar via CalDAV";
+    case "carddav":
+      return "Standalone contacts via CardDAV";
+    case "talk":
+      return "Video conferencing on a Nextcloud server";
+    case "matrix":
+      return "Video conferencing via Matrix / Element Call";
+  }
 }
 
 async function openEditForm(id: string) {
@@ -870,11 +910,15 @@ onMounted(() => {
     gmail: "gmail",
     imap: "imap",
     caldav: "caldav",
+    carddav: "carddav",
+    talk: "talk",
+    matrix: "matrix",
   };
   const type = mapped[want];
   if (!type) return;
-  openNewForm();
-  selectAccountType(type);
+  // Deep-link path skips the picker and lands directly on the
+  // form for the requested type — onboarding has already chosen.
+  pickAccountType(type);
 });
 </script>
 
@@ -990,7 +1034,7 @@ onMounted(() => {
       <h1 class="settings-title">Settings</h1>
 
       <div class="section-header">
-        <h2 class="section-title">Email Accounts</h2>
+        <h2 class="section-title">Accounts</h2>
         <button class="btn-add" @click="openNewForm">
           + Add Account
         </button>
@@ -1030,6 +1074,36 @@ onMounted(() => {
     </div>
   </div>
 
+  <!-- Step 1 of Add Account: pick a type. (#148 cleanup) -->
+  <Teleport to="body">
+    <div v-if="showPicker" class="modal-overlay" @click.self="cancelPicker">
+      <div class="modal modal-picker" data-testid="account-type-picker">
+        <div class="modal-header">
+          <h3>Add Account</h3>
+          <button class="modal-close" @click="cancelPicker">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="picker-help">Pick the kind of account you want to add. You can add more later.</p>
+          <div class="picker-grid">
+            <button
+              v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix'] as AccountType[])"
+              :key="t"
+              class="picker-card"
+              :data-testid="`picker-${t}`"
+              @click="pickAccountType(t)"
+            >
+              <span class="picker-card-title">{{ accountTypeLabelLong(t) }}</span>
+              <span class="picker-card-desc">{{ accountTypeDescription(t) }}</span>
+            </button>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-secondary" @click="cancelPicker">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
   <!-- Add/Edit Account Modal (shared by mobile + desktop) -->
   <Teleport to="body">
       <div v-if="showForm" class="modal-overlay" @click.self="cancelForm">
@@ -1041,18 +1115,14 @@ onMounted(() => {
           <div class="modal-body">
             <div v-if="error" class="form-error">{{ error }}</div>
 
+            <!-- Account type is now picked via the picker dialog
+                 before this modal opens (#148 cleanup). Show a
+                 read-only label here so the user knows what they
+                 picked / which kind of account they're editing. -->
             <div class="form-group">
               <label>Account Type</label>
-              <div class="type-selector">
-                <button
-                  v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix'] as AccountType[])"
-                  :key="t"
-                  class="type-btn"
-                  :class="{ active: accountType === t }"
-                  :disabled="!!editingAccountId"
-                  :data-testid="`account-type-${t}`"
-                  @click="selectAccountType(t)"
-                >{{ accountTypeLabelLong(t) }}</button>
+              <div class="type-readonly" data-testid="account-type-readonly">
+                {{ accountTypeLabelLong(accountType) }}
               </div>
             </div>
 
@@ -1811,6 +1881,58 @@ onMounted(() => {
 .type-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Read-only label that replaces the per-type tab row inside the
+   form modal once the picker has chosen the type. (#148) */
+.type-readonly {
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Account-type picker (#148 cleanup). Two-column card grid. */
+.modal-picker {
+  max-width: 600px;
+}
+.picker-help {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+.picker-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.picker-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  text-align: left;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+.picker-card:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-accent);
+}
+.picker-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.picker-card-desc {
+  font-size: 12px;
+  color: var(--color-text-muted);
 }
 
 .signature-textarea {
