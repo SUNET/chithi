@@ -1,8 +1,9 @@
 //! Video-conferencing integrations (#148).
 //!
-//! Two providers in this slice:
+//! Three providers in this slice:
 //! - `talk` — Nextcloud Talk via the OCS Spreed v4 API.
 //! - `matrix` — Matrix / Element Call.
+//! - `zoom` — Zoom Marketplace OAuth + Meeting API.
 //!
 //! Both bind to a new `meet` service on the existing service-binding
 //! plumbing (so accounts surface alongside CalDAV / CardDAV-only
@@ -37,6 +38,7 @@ use crate::error::Result;
 
 pub mod matrix;
 pub mod talk;
+pub mod zoom;
 
 /// Common surface every meet provider exposes once an account has
 /// been authenticated. Auth flow stays per-provider because each
@@ -64,7 +66,11 @@ pub trait MeetProvider: Send + Sync {
 /// provider = a new line here. Lookup is by protocol string from
 /// the meet binding.
 pub fn registry() -> &'static [&'static dyn MeetProvider] {
-    &[&talk::TalkProvider, &matrix::MatrixProvider]
+    &[
+        &talk::TalkProvider,
+        &matrix::MatrixProvider,
+        &zoom::ZoomProvider,
+    ]
 }
 
 /// Dispatch helper: find the provider matching the account's enabled

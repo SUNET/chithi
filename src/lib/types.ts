@@ -29,7 +29,7 @@ export interface Account {
   // "matrix"), empty when there is none. Lets the calendar event
   // editor populate its "Add video link" dropdown without an
   // extra round-trip per row.
-  meet_protocol: "" | "talk" | "matrix";
+  meet_protocol: "" | "talk" | "matrix" | "zoom";
 }
 
 export interface QuickFilter {
@@ -178,7 +178,7 @@ export interface AccountConfig {
   /// One of `"talk"` / `"matrix"` when the account has a meet
   /// binding, empty otherwise. Picked by which Settings tab the
   /// user signed in through.
-  meet_protocol: "" | "talk" | "matrix";
+  meet_protocol: "" | "talk" | "matrix" | "zoom";
   username: string;
   password: string;
   use_tls: boolean;

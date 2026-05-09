@@ -236,6 +236,158 @@ pub async fn meet_matrix_login_complete(
     Ok(id)
 }
 
+// --- Zoom OAuth flow (#148) -----------------------------------------------
+//
+// Standard OAuth 2.0 Authorization Code + PKCE against
+// `oauth::ZOOM`. The flow stashes its session (listener + PKCE
+// verifier + state nonce) in `state.zoom_oauth_sessions` between
+// the start and complete commands. The session map is evicted on
+// each insert by the same TTL pattern as the Matrix SSO map.
+
+const ZOOM_OAUTH_TTL: std::time::Duration = std::time::Duration::from_secs(360);
+
+fn evict_stale_zoom_sessions(
+    sessions: &mut std::collections::HashMap<u16, crate::state::ZoomOAuthSession>,
+) {
+    let now = std::time::Instant::now();
+    sessions.retain(|_port, s| now.duration_since(s.created) < ZOOM_OAUTH_TTL);
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZoomLoginStart {
+    pub login_url: String,
+    pub port: u16,
+}
+
+/// Build the Zoom OAuth authorize URL, bind the local callback
+/// listener, and stash the PKCE verifier + state for the
+/// matching `meet_zoom_login_complete`.
+#[tauri::command]
+pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLoginStart> {
+    let (url, listener, code_verifier, oauth_state) =
+        crate::oauth::get_auth_url(&crate::oauth::ZOOM)?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| Error::Other(format!("zoom listener port: {}", e)))?
+        .port();
+    {
+        let mut map = state.zoom_oauth_sessions.lock().unwrap();
+        evict_stale_zoom_sessions(&mut map);
+        map.insert(
+            port,
+            crate::state::ZoomOAuthSession {
+                created: std::time::Instant::now(),
+                listener,
+                verifier: code_verifier,
+                state: oauth_state,
+            },
+        );
+    }
+    Ok(ZoomLoginStart {
+        login_url: url,
+        port,
+    })
+}
+
+/// Wait for the Zoom OAuth callback, validate state, exchange
+/// the code for tokens, persist the account row + keyring entry,
+/// return the new account id.
+#[tauri::command]
+pub async fn meet_zoom_login_complete(
+    state: State<'_, AppState>,
+    port: u16,
+    display_name: Option<String>,
+) -> Result<String> {
+    let session = state
+        .zoom_oauth_sessions
+        .lock()
+        .unwrap()
+        .remove(&port)
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "Zoom OAuth: no pending session for port {} — start the flow again",
+                port,
+            ))
+        })?;
+    let crate::state::ZoomOAuthSession {
+        listener,
+        verifier,
+        state: expected_state,
+        ..
+    } = session;
+
+    let callback = tokio::task::spawn_blocking(move || crate::oauth::wait_for_callback(listener))
+        .await
+        .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))??;
+
+    match callback.state.as_deref() {
+        Some(s) if s == expected_state => {}
+        Some(s) => {
+            return Err(Error::Other(format!(
+                "Zoom OAuth: state mismatch (expected {}, got {})",
+                expected_state, s
+            )));
+        }
+        None => {
+            return Err(Error::Other(
+                "Zoom OAuth: callback missing required state parameter".into(),
+            ));
+        }
+    }
+
+    let tokens = crate::oauth::exchange_code(
+        &crate::oauth::ZOOM,
+        &callback.code,
+        port,
+        verifier.as_deref(),
+    )
+    .await?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let display = display_name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Zoom".into());
+    // Zoom is hosted by Zoom — there's no per-user server URL to
+    // remember. The meet binding stores a stable marker URL so
+    // `derive_bindings`'s "both fields set" guard still emits
+    // the binding; `create_url` ignores it.
+    let config = db::accounts::AccountConfig {
+        display_name: display,
+        email: String::new(),
+        provider: "generic".into(),
+        mail_protocol: String::new(),
+        imap_host: String::new(),
+        imap_port: 0,
+        smtp_host: String::new(),
+        smtp_port: 0,
+        jmap_url: String::new(),
+        caldav_url: String::new(),
+        meet_url: "https://zoom.us".into(),
+        meet_protocol: "zoom".into(),
+        username: String::new(),
+        password: String::new(),
+        use_tls: true,
+        signature: String::new(),
+        jmap_auth_method: "basic".into(),
+        oidc_token_endpoint: String::new(),
+        oidc_client_id: String::new(),
+        calendar_sync_enabled: false,
+        mail_sync_enabled: false,
+        contacts_sync_enabled: false,
+        mail_sync_interval_seconds: None,
+        calendar_sync_interval_seconds: None,
+        contacts_sync_interval_seconds: None,
+        has_calendar_binding: false,
+        has_contacts_binding: false,
+    };
+    let conn = state.db.writer().await;
+    db::accounts::insert_account(&conn, &id, &config)?;
+    drop(conn);
+
+    crate::oauth::store_tokens(&id, &tokens)?;
+    Ok(id)
+}
+
 /// Provider-agnostic create. Looks up the account, finds its meet
 /// provider via the registry, and returns the join URL. The event
 /// editor calls this with the event's title as `name`.
