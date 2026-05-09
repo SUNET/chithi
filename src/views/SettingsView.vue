@@ -73,6 +73,36 @@ function makeMinutesField(key: "calendar_sync_interval_seconds" | "contacts_sync
 const calendarIntervalMinutes = makeMinutesField("calendar_sync_interval_seconds");
 const contactsIntervalMinutes = makeMinutesField("contacts_sync_interval_seconds");
 
+// Default contact book per binding (#137). Stored separately from
+// `form` because it lives in service_bindings.config_json, not in
+// AccountConfig. Loaded when the edit modal opens; persisted in
+// saveAccount alongside the account update. `null` = not set, falls
+// back to the auto-pick on the backend.
+const defaultMailBookId = ref<string | null>(null);
+const defaultCalendarBookId = ref<string | null>(null);
+
+// Cross-account list of contact books shown in the dropdowns. Each
+// label is "Account / Book" so the same book name on two different
+// accounts (e.g. "Personal") stays distinguishable.
+type BookOption = { id: string; label: string };
+const availableBooks = ref<BookOption[]>([]);
+
+async function loadAvailableBooks() {
+  const out: BookOption[] = [];
+  for (const acc of accountsStore.accounts) {
+    try {
+      const books = await api.listContactBooks(acc.id);
+      const accLabel = acc.display_name || acc.email || acc.id;
+      for (const b of books) {
+        out.push({ id: b.id, label: `${accLabel} / ${b.name}` });
+      }
+    } catch (e) {
+      console.warn("loadAvailableBooks: failed for", acc.id, e);
+    }
+  }
+  availableBooks.value = out;
+}
+
 // Whether the current form would result in a calendar / contacts
 // binding once saved. Mirrors derive_bindings on the backend:
 //  - JMAP mail accounts get JMAP calendar + JMAP contacts.
@@ -225,6 +255,20 @@ async function openEditForm(id: string) {
   try {
     const config = await api.getAccountConfig(id);
     form.value = config;
+    // Load current default-book selections (#137). Errors are
+    // non-fatal: a missing binding or backend failure leaves the
+    // dropdown empty and the user can still pick a value.
+    try {
+      [defaultMailBookId.value, defaultCalendarBookId.value] = await Promise.all([
+        api.getDefaultContactBook(id, "mail").catch(() => null),
+        api.getDefaultContactBook(id, "calendar").catch(() => null),
+      ]);
+    } catch (e) {
+      console.warn("openEditForm: load default contact books failed", e);
+      defaultMailBookId.value = null;
+      defaultCalendarBookId.value = null;
+    }
+    await loadAvailableBooks();
     if (config.provider === "o365") {
       accountType.value = "o365";
       try {
@@ -373,12 +417,35 @@ async function saveAccount() {
         ? u
         : `${u || "dav"}@local`;
     }
+    let savedId: string | null = null;
     if (editingAccountId.value) {
       await api.updateAccount(editingAccountId.value, form.value);
+      savedId = editingAccountId.value;
       await accountsStore.fetchAccounts();
     } else {
       await accountsStore.addAccount(form.value);
       router.push("/");
+    }
+    // Persist the default-book picks for the account we just saved
+    // (#137). Skipped on creation because the backend hasn't
+    // synced books yet — the auto-pick on first contacts sync will
+    // fill these in. Failures are non-fatal: the rest of the
+    // account update has already succeeded.
+    if (savedId) {
+      try {
+        if (form.value.mail_protocol) {
+          await api.setDefaultContactBook(savedId, "mail", defaultMailBookId.value);
+        }
+        if (hasCalendarBinding.value) {
+          await api.setDefaultContactBook(
+            savedId,
+            "calendar",
+            defaultCalendarBookId.value,
+          );
+        }
+      } catch (e) {
+        console.warn("saveAccount: persist default contact books failed", e);
+      }
     }
     showForm.value = false;
     editingAccountId.value = null;
@@ -1049,6 +1116,32 @@ onMounted(() => {
               <p class="form-help bindings-footer">
                 When a service is off, the corresponding data is not fetched from the server. Already-synced data remains available offline.
               </p>
+
+              <div v-if="form.mail_protocol" class="form-group binding-row">
+                <label>Default address book for compose</label>
+                <select
+                  v-model="defaultMailBookId"
+                  class="form-control"
+                  data-testid="default-contact-book-mail"
+                >
+                  <option :value="null">Auto (first synced book on this account)</option>
+                  <option v-for="b in availableBooks" :key="b.id" :value="b.id">{{ b.label }}</option>
+                </select>
+                <span class="field-hint">Recipient autocomplete in the composer ranks matches from this book first.</span>
+              </div>
+
+              <div v-if="hasCalendarBinding" class="form-group binding-row">
+                <label>Default address book for event attendees</label>
+                <select
+                  v-model="defaultCalendarBookId"
+                  class="form-control"
+                  data-testid="default-contact-book-calendar"
+                >
+                  <option :value="null">Auto (first synced book on this account)</option>
+                  <option v-for="b in availableBooks" :key="b.id" :value="b.id">{{ b.label }}</option>
+                </select>
+                <span class="field-hint">Attendee autocomplete in the event editor ranks matches from this book first.</span>
+              </div>
             </div>
 
             <!-- For standalone CalDAV/CardDAV the only relevant toggle is

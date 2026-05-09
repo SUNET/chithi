@@ -466,6 +466,42 @@ export async function searchContacts(
   return invoke("search_contacts", { query });
 }
 
+/// Cross-account search that, when the (accountId, service) binding
+/// has a default contact book set, ranks matches in that book first.
+/// `service` is "mail" for compose recipients, "calendar" for event
+/// attendees. Pass undefined for either to fall back to plain
+/// alphabetical ordering — same shape as searchContacts.
+export async function searchContactsForAccount(
+  query: string,
+  accountId: string | null,
+  service: "mail" | "calendar" | null,
+): Promise<import("./types").Contact[]> {
+  return invoke("search_contacts_for_account", {
+    query,
+    accountId: accountId ?? null,
+    service: service ?? null,
+  });
+}
+
+export async function getDefaultContactBook(
+  accountId: string,
+  service: "mail" | "calendar",
+): Promise<string | null> {
+  return invoke("get_default_contact_book", { accountId, service });
+}
+
+export async function setDefaultContactBook(
+  accountId: string,
+  service: "mail" | "calendar",
+  bookId: string | null,
+): Promise<void> {
+  return invoke("set_default_contact_book", {
+    accountId,
+    service,
+    bookId,
+  });
+}
+
 export async function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }

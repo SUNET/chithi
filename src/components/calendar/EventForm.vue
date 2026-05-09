@@ -67,6 +67,14 @@ const allDay = ref(false);
 const location = ref("");
 const description = ref("");
 const calendarId = ref(calendarStore.calendars[0]?.id ?? "");
+
+// Account that owns the picked calendar — passed to AttendeeEditor
+// so its autocomplete can hit that account's calendar binding's
+// default contact book first (#137).
+const selectedCalendarAccountId = computed(() => {
+  const cal = calendarStore.calendars.find((c) => c.id === calendarId.value);
+  return cal?.account_id ?? null;
+});
 const recurrenceRule = ref<string | null>(null);
 const attendeeEmails = ref<string[]>([]);
 const saving = ref(false);
@@ -195,7 +203,10 @@ async function save() {
 
         <div class="form-group">
           <label>Attendees</label>
-          <AttendeeEditor v-model="attendeeEmails" />
+          <AttendeeEditor
+            v-model="attendeeEmails"
+            :account-id="selectedCalendarAccountId"
+          />
         </div>
 
         <div class="form-group">

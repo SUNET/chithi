@@ -151,8 +151,15 @@ function onAddrInput(field: "to" | "cc" | "bcc") {
 
 async function searchAutocomplete(query: string) {
   try {
+    // Pass the active sender so the backend can rank matches from
+    // that account's default contact book first (#137). When no
+    // sender is selected (early in the lifecycle), fall back to
+    // unranked search.
+    const accountId = selectedAccountId.value || null;
     const [contacts, collected] = await Promise.all([
-      api.searchContacts(query),
+      accountId
+        ? api.searchContactsForAccount(query, accountId, "mail")
+        : api.searchContacts(query),
       api.searchCollectedContacts(query),
     ]);
 
