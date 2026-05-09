@@ -29,9 +29,12 @@ pub struct Account {
     pub calendar_sync_interval_seconds: Option<i64>,
     #[serde(default)]
     pub contacts_sync_interval_seconds: Option<i64>,
-    /// Whether the account has a calendar / contacts binding row.
-    /// Lets the UI label standalone CalDAV / CardDAV accounts in the
-    /// settings list without a second round-trip per row.
+    /// Whether the account has an *enabled* calendar / contacts
+    /// binding. The `list_accounts` query is `enabled = 1`-aware so a
+    /// CalDAV-tab account (which derives a disabled contacts binding
+    /// alongside its enabled calendar binding) reads as Calendar-only
+    /// rather than as both. Lets the settings UI label standalone DAV
+    /// accounts without a per-row round-trip.
     #[serde(default)]
     pub has_calendar_binding: bool,
     #[serde(default)]

@@ -18,8 +18,11 @@ export interface Account {
   mail_sync_interval_seconds: number | null;
   calendar_sync_interval_seconds: number | null;
   contacts_sync_interval_seconds: number | null;
-  // Lets the settings list label standalone CalDAV / CardDAV accounts
-  // without a per-row round-trip.
+  // Whether the account has a calendar / contacts binding *and*
+  // that binding is currently enabled. The settings list keys off
+  // these to label standalone CalDAV-only vs CardDAV-only accounts
+  // (a CalDAV-tab account derives a disabled contacts binding;
+  // existence-only flags would always say true for both).
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
 }
@@ -191,10 +194,12 @@ export interface AccountConfig {
   has_contacts_binding: boolean;
 }
 
-/// Combined result of Thunderbird-style autoconfig + DAV probing.
-/// Empty strings / zero ports mean "not found"; the frontend only
-/// applies non-empty fields to the form. `source` is informational:
-/// "isp-db" | "domain-autoconfig" | "well-known" | "mx" | "".
+/// IMAP / SMTP discovery result returned by `discoverMailServers`.
+/// Mail-only — CalDAV / CardDAV are not probed here, those have
+/// dedicated account types. Empty strings / zero ports mean "not
+/// found"; the frontend only applies non-empty fields to the form.
+/// `source` is informational: "isp-db" | "domain-autoconfig" |
+/// "well-known" | "mx" | "host-probe" | "".
 export interface AutoconfigResult {
   imap_host: string;
   imap_port: number;
