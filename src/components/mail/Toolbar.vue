@@ -66,13 +66,17 @@ async function markNotSpam() {
 </template>
 
 <style scoped>
+/* Matches the calendar / contacts toolbars in height, padding,
+   background, and border so all three views show a uniform top
+   strip — see #150. */
 .toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  background: var(--color-bg);
-  border-bottom: 1px solid var(--color-border);
+  height: 48px;
+  padding: 0 16px;
+  background: var(--color-bg-secondary);
+  border-bottom: 0.8px solid var(--color-border);
   flex-shrink: 0;
 }
 

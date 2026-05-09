@@ -3,7 +3,9 @@ import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { listen } from "@tauri-apps/api/event";
 import { useAccountsStore } from "@/stores/accounts";
+import { useContactsStore } from "@/stores/contacts";
 import { usePlatformStore } from "@/stores/platform";
+import { useUiStore } from "@/stores/ui";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
@@ -29,13 +31,20 @@ const PHONE_LABEL_OPTIONS = [
 ];
 
 const accountsStore = useAccountsStore();
+const contactsStore = useContactsStore();
 const platformStore = usePlatformStore();
+const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
+// Selected-book / selected-contact state is mirrored from the
+// contacts store so that navigating away to Mail / Calendar and back
+// restores what the user was looking at. Local refs still drive the
+// template — we keep them in sync via watchers below.
+const { selectedBookId: storeSelectedBookId } = storeToRefs(contactsStore);
 
 const contactBooks = ref<ContactBook[]>([]);
 const contacts = ref<Contact[]>([]);
 const searchQuery = ref("");
-const selectedBookId = ref<string | null>(null);
+const selectedBookId = ref<string | null>(storeSelectedBookId.value);
 const selectedContact = ref<Contact | null>(null);
 const showForm = ref(false);
 const showDeleteConfirm = ref(false);
@@ -215,6 +224,13 @@ async function contactsTick() {
 onMounted(async () => {
   // Load local data first, then sync in background
   await fetchBooks();
+  // fetchBooks only mutates selectedBookId when the previously-saved
+  // id is gone, in which case the watcher above triggers the contacts
+  // fetch. When the selection survives (the common case on remount
+  // after navigating back to the contacts view), the value didn't
+  // change so the watcher doesn't fire — call the load explicitly so
+  // the user lands on the same contact they left. (#150)
+  await loadContactsForSelectedBook();
   syncAllContacts();
 
   // Start periodic sync (per-account cadence via contacts binding)
@@ -309,15 +325,37 @@ async function fetchBooks() {
   }
 }
 
-watch(selectedBookId, async (bookId) => {
-  if (bookId) {
-    contacts.value = await api.listContacts(bookId);
-    selectedContact.value = null;
-    // Multi-select state belongs to the previously-shown book; drop
-    // it on book switch so the merge toolbar can't sit visible with
-    // ids that aren't in the current list.
-    selectedContactIds.value = [];
-  }
+async function loadContactsForSelectedBook() {
+  const bookId = selectedBookId.value;
+  if (!bookId) return;
+  contacts.value = await api.listContacts(bookId);
+  // Restore the previously selected contact from the store on remount,
+  // if it still exists in the loaded list. Falls through to null when
+  // the user just switched books or the contact is gone.
+  const wantedId = contactsStore.selectedContactId;
+  selectedContact.value = wantedId
+    ? contacts.value.find((c) => c.id === wantedId) ?? null
+    : null;
+  // Multi-select state belongs to the previously-shown book; drop it
+  // on book switch so the merge toolbar can't sit visible with ids
+  // that aren't in the current list.
+  selectedContactIds.value = [];
+}
+
+watch(selectedBookId, () => {
+  loadContactsForSelectedBook();
+});
+
+// Mirror local selection state into the contacts store so navigating
+// away to Mail / Calendar and back lands us on the same contact (#150).
+// Sync runs in one direction (local → store) because the store fields
+// are never mutated externally; on remount we read them to seed the
+// local refs and the watcher above re-loads contacts.
+watch(selectedBookId, (id) => {
+  if (id !== contactsStore.selectedBookId) contactsStore.setSelectedBook(id);
+});
+watch(selectedContact, (c) => {
+  contactsStore.setSelectedContact(c?.id ?? null);
 });
 
 // Prune `selectedContactIds` against the current contact list whenever
@@ -792,22 +830,13 @@ async function applyMerge() {
 
   <!-- Desktop layout — unchanged -->
   <div v-else class="contacts-view">
-    <!-- Toolbar -->
-    <div class="contacts-toolbar">
-      <button class="btn-new" data-testid="contacts-new-btn" @click="openNewForm">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><line x1="20" y1="8" x2="20" y2="14" /><line x1="23" y1="11" x2="17" y2="11" /></svg>
-        New Contact
-      </button>
-      <div class="toolbar-sep"></div>
-      <button class="btn-sync" :disabled="syncing" @click="syncAllContacts">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" :class="{ spinning: syncing }"><path d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16" /></svg>
-        {{ syncing ? "Syncing..." : "Sync" }}
-      </button>
-    </div>
-
-    <div class="contacts-body">
+    <div
+      class="contacts-body"
+      :class="`contacts-layout-${uiStore.contactViewMode}`"
+    >
       <!-- Left: Contact Books -->
       <div class="books-sidebar" data-testid="contacts-book-select">
+        <div class="app-sidebar-header">Address Books</div>
         <div
           v-for="book in contactBooks"
           :key="book.id"
@@ -834,6 +863,31 @@ async function applyMerge() {
         <div v-if="contactBooks.length === 0" class="empty-text">No contact books</div>
       </div>
 
+      <!-- Middle + Right wrapper. Direction toggles via the
+           `contacts-layout-{right,bottom}` class on the parent: row
+           (default) puts the detail card to the right of the list,
+           column drops it underneath. (#150) -->
+      <div class="contacts-main">
+
+      <!-- Toolbar (#150). Lives inside the main pane so the
+           "+ New Contact" button sits above the contact list, mirror-
+           ing how Calendar's "+ Event" sits in its own toolbar. The
+           "ADDRESS BOOKS" header on the left is the visual partner. -->
+      <div class="contacts-toolbar">
+        <button class="btn-new" data-testid="contacts-new-btn" @click="openNewForm">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><line x1="20" y1="8" x2="20" y2="14" /><line x1="23" y1="11" x2="17" y2="11" /></svg>
+          New Contact
+        </button>
+        <div class="toolbar-sep"></div>
+        <button class="btn-sync" :disabled="syncing" @click="syncAllContacts">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" :class="{ spinning: syncing }"><path d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16" /></svg>
+          {{ syncing ? "Syncing..." : "Sync" }}
+        </button>
+      </div>
+
+      <!-- Inner wrapper. Carries the layout-toggle so the toolbar
+           above stays at the top regardless of right-vs-bottom mode. -->
+      <div class="contacts-content">
       <!-- Middle: Contact List -->
       <div class="contact-list-panel">
         <div class="search-bar">
@@ -937,6 +991,8 @@ async function applyMerge() {
         </template>
         <div v-else class="empty-text">Select a contact to view details</div>
       </div>
+      </div><!-- /.contacts-content -->
+      </div><!-- /.contacts-main -->
     </div>
 
     <!-- New/Edit Contact Modal -->
@@ -1283,7 +1339,20 @@ async function applyMerge() {
   background: var(--color-bg-secondary);
   border-right: 0.8px solid var(--color-border);
   overflow-y: auto;
-  padding: 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Inner items get the indent that used to live on .books-sidebar so
+   the .app-sidebar-header above sits flush with the toolbar's left
+   edge instead of being pushed in 8px from the container. (#150) */
+.books-sidebar .book-item,
+.books-sidebar .empty-text {
+  margin: 0 8px;
+}
+.books-sidebar > .book-item:first-of-type,
+.books-sidebar > .app-sidebar-header + .book-item {
+  margin-top: 8px;
 }
 
 .book-item {
@@ -1341,13 +1410,45 @@ async function applyMerge() {
   color: var(--color-text-muted);
 }
 
+/* Wrapper around the toolbar + contact-list + detail panes. The
+   toolbar always sits at the top so its layout never depends on the
+   View > Contact Pane choice (the toggle below applies to
+   .contacts-content, not the .contacts-main wrapper). */
+.contacts-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Inner content frame that the right/bottom layout toggle targets. */
+.contacts-content {
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.contacts-layout-right .contacts-content {
+  flex-direction: row;
+}
+.contacts-layout-bottom .contacts-content {
+  flex-direction: column;
+}
+
 /* Contact List */
 .contact-list-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+}
+.contacts-layout-right .contact-list-panel {
   border-right: 0.8px solid var(--color-border);
+}
+.contacts-layout-bottom .contact-list-panel {
+  border-bottom: 0.8px solid var(--color-border);
 }
 
 .search-bar {
@@ -1419,11 +1520,20 @@ async function applyMerge() {
 .contact-email { font-size: 14px; color: var(--color-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .contact-org { font-size: 12px; color: var(--color-text-muted); }
 
-/* Detail Panel */
+/* Detail Panel. Sized differently per layout mode:
+   - "right": fixed 400px column, list takes the remaining width.
+   - "bottom": flexible split, both panes share the column. */
 .detail-panel {
-  width: 400px;
   flex-shrink: 0;
   overflow-y: auto;
+}
+.contacts-layout-right .detail-panel {
+  width: 400px;
+}
+.contacts-layout-bottom .detail-panel {
+  width: auto;
+  flex: 1;
+  min-height: 0;
 }
 
 .detail-header {

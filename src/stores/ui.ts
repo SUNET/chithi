@@ -7,6 +7,13 @@ export type MessageViewMode = "right" | "bottom" | "tab" | "none";
 
 const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
 
+/// Where the contact card renders relative to the contact list. Mirrors
+/// MessageViewMode but with a smaller set: contacts don't have a tabs
+/// or none mode (selecting a contact always shows it somewhere).
+export type ContactViewMode = "right" | "bottom";
+
+const VALID_CONTACT_VIEW_MODES: ContactViewMode[] = ["right", "bottom"];
+
 const VALID_THEMES: Theme[] = ["system", "light", "dark"];
 export type Theme = "system" | "light" | "dark";
 export type TimeFormat = "auto" | "12" | "24";
@@ -23,6 +30,12 @@ export const useUiStore = defineStore("ui", () => {
     (() => {
       const stored = localStorage.getItem("chithi-message-view-mode") as MessageViewMode | null;
       return stored && VALID_VIEW_MODES.includes(stored) ? stored : "right";
+    })(),
+  );
+  const contactViewMode = ref<ContactViewMode>(
+    (() => {
+      const stored = localStorage.getItem("chithi-contact-view-mode") as ContactViewMode | null;
+      return stored && VALID_CONTACT_VIEW_MODES.includes(stored) ? stored : "right";
     })(),
   );
   const theme = ref<Theme>(
@@ -104,6 +117,11 @@ export const useUiStore = defineStore("ui", () => {
     if (mode !== "none") {
       readerVisible.value = true;
     }
+  }
+
+  function setContactViewMode(mode: ContactViewMode) {
+    contactViewMode.value = mode;
+    localStorage.setItem("chithi-contact-view-mode", mode);
   }
 
   function setTheme(t: Theme) {
@@ -234,12 +252,14 @@ export const useUiStore = defineStore("ui", () => {
     messageListWidth,
     readerVisible,
     messageViewMode,
+    contactViewMode,
     theme,
     resolvedTheme,
     toggleReader,
     showReader,
     hideReader,
     setMessageViewMode,
+    setContactViewMode,
     setTheme,
     setThreading,
     initTheme,

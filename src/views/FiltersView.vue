@@ -213,8 +213,8 @@ const actionFolderOptions = computed(() => [
   <div class="filters-view">
     <!-- Left Panel: filter list -->
     <div class="filters-left">
+      <div class="app-sidebar-header">Filters</div>
       <div class="left-header">
-        <h2 class="left-title">Message Filters</h2>
         <Select
           :model-value="accountsStore.activeAccountId ?? ''"
           :options="accountOptions"
@@ -409,15 +409,7 @@ const actionFolderOptions = computed(() => [
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 16px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.left-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--color-text);
-  margin: 0;
+  padding: 12px 16px;
 }
 
 .account-select {
