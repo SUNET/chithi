@@ -37,24 +37,14 @@ export async function deleteAccount(accountId: string): Promise<void> {
   return invoke("delete_account", { accountId });
 }
 
-/// Run Thunderbird-style email autoconfig (Mozilla ISP DB + provider
-/// autoconfig + .well-known + MX fallback) and probe CalDAV / CardDAV
-/// across every candidate hostname. Empty fields in the result mean
-/// "not found" — frontend should only apply non-empty values.
-export async function probeDavEndpoints(
+/// Thunderbird-style mail-server discovery for the IMAP tab
+/// (Mozilla ISP DB / provider autoconfig / .well-known / MX). No
+/// CalDAV / CardDAV probing — those live on their own dedicated
+/// account types now. Empty fields = not found.
+export async function discoverMailServers(
   email: string,
-  username: string,
-  password: string,
-  imapHost?: string,
-  smtpHost?: string,
 ): Promise<AutoconfigResult> {
-  return invoke("probe_dav_endpoints", {
-    email,
-    username,
-    password,
-    imapHost: imapHost || null,
-    smtpHost: smtpHost || null,
-  });
+  return invoke("discover_mail_servers", { email });
 }
 
 export async function listFolders(accountId: string): Promise<Folder[]> {

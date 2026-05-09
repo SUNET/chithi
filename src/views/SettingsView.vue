@@ -222,12 +222,30 @@ function selectAccountType(type: AccountType) {
     case "imap":
       f.provider = "generic";
       f.mail_protocol = "imap";
+      // Switching from Gmail / O365 leaves their pre-filled hosts
+      // in the form; clear them so the user starts on an empty
+      // server for a generic IMAP account they're meant to fill in
+      // manually (or via auto-discover).
+      if (!editingAccountId.value) {
+        f.imap_host = "";
+        f.imap_port = 993;
+        f.smtp_host = "";
+        f.smtp_port = 587;
+      }
       f.jmap_url = "";
       f.use_tls = true;
       break;
     case "jmap":
       f.provider = "generic";
       f.mail_protocol = "jmap";
+      // Same logic: any IMAP host pre-filled by Gmail / O365 / a
+      // previous IMAP click is irrelevant for JMAP, clear it.
+      if (!editingAccountId.value) {
+        f.imap_host = "";
+        f.imap_port = 0;
+        f.smtp_host = "";
+        f.smtp_port = 0;
+      }
       f.use_tls = true;
       break;
     case "caldav":
@@ -351,23 +369,18 @@ async function openEditForm(id: string) {
   }
 }
 
-/// Run Thunderbird-style autoconfig + CalDAV/CardDAV probing for the
-/// current form (#43). Applies any discovered IMAP/SMTP host+port+TLS
-/// settings AND the DAV URL if found. Each piece is independent: a
-/// successful autoconfig with no DAV still pre-fills the mail servers
-/// and vice versa. A summary of what was filled in is shown below the
-/// button.
-async function discoverDavEndpoints() {
+/// Thunderbird-style mail-server autodiscovery for the IMAP tab.
+/// Applies any discovered IMAP/SMTP host+port+TLS settings to the
+/// form. CalDAV / CardDAV are intentionally not probed here: an
+/// IMAP account is mail-only by design now, and pretending
+/// otherwise turned out to silently glue mail and DAV bindings
+/// onto the same row, then collide with the dedicated CalDAV /
+/// CardDAV account types and produce duplicate calendars on sync.
+async function discoverMailServers() {
   discoveringDav.value = true;
   discoveryNote.value = null;
   try {
-    const result = await api.probeDavEndpoints(
-      form.value.email,
-      form.value.username || form.value.email,
-      form.value.password,
-      form.value.imap_host,
-      form.value.smtp_host,
-    );
+    const result = await api.discoverMailServers(form.value.email);
 
     const filled: string[] = [];
     if (result.imap_host) {
@@ -397,12 +410,6 @@ async function discoverDavEndpoints() {
       form.value.use_tls = result.imap_use_tls;
     } else if (result.smtp_host) {
       form.value.use_tls = result.smtp_use_tls;
-    }
-    const davUrl = result.caldav_url || result.carddav_url;
-    if (davUrl) {
-      form.value.caldav_url = davUrl;
-      if (result.caldav_url) filled.push("CalDAV");
-      if (result.carddav_url) filled.push("CardDAV");
     }
 
     if (filled.length === 0) {
@@ -1028,27 +1035,40 @@ onMounted(() => {
 
             <template v-if="accountType === 'imap'">
               <div class="form-group">
-                <label>Calendar &amp; Contacts (CalDAV / CardDAV)</label>
+                <label>Mail server auto-discovery</label>
                 <div class="dav-discovery-row">
                   <button
                     type="button"
                     class="btn-secondary"
                     data-testid="dav-discover-btn"
-                    :disabled="discoveringDav || !form.email || !form.password"
-                    @click="discoverDavEndpoints"
+                    :disabled="discoveringDav || !form.email"
+                    @click="discoverMailServers"
                   >
-                    {{ discoveringDav ? 'Searching...' : (form.caldav_url ? 'Re-run discovery' : 'Auto-discover') }}
+                    {{ discoveringDav ? 'Searching...' : 'Auto-discover IMAP / SMTP' }}
                   </button>
-                  <span v-if="form.caldav_url" class="field-hint dav-discovered-url" data-testid="dav-discovered-url">
-                    Found at {{ form.caldav_url }}
-                  </span>
-                  <span v-else-if="!form.email || !form.password" class="field-hint">
-                    Enter email and password first.
+                  <span v-if="!form.email" class="field-hint">
+                    Enter your email address first.
                   </span>
                 </div>
                 <span v-if="discoveryNote" class="field-hint" data-testid="dav-discovery-note">
                   {{ discoveryNote }}
                 </span>
+                <span class="field-hint">
+                  Looks up the IMAP / SMTP host, port and TLS settings for your domain via Thunderbird-style autoconfig. Calendars and contacts are added as separate accounts on the CalDAV / CardDAV tabs.
+                </span>
+                <div v-if="editingAccountId && form.caldav_url" class="dav-cleanup-row">
+                  <span class="field-hint dav-discovered-url" data-testid="dav-discovered-url">
+                    This account is also linked to {{ form.caldav_url }}.
+                  </span>
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    data-testid="dav-unlink-btn"
+                    @click="form.caldav_url = ''"
+                  >
+                    Unlink calendar / contacts
+                  </button>
+                </div>
               </div>
             </template>
 
