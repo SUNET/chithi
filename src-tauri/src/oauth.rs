@@ -88,18 +88,16 @@ pub const MICROSOFT_GRAPH_SCOPES: &str =
 /// `http://localhost:N` callbacks, hence `redirect_host` is
 /// `127.0.0.1` here while Microsoft demands `localhost`.
 ///
-/// Scope is the granular Zoom 2024+ name for "create user
-/// meetings"; if the Marketplace registration only enabled the
-/// classic `meeting:write:meeting`, the OAuth consent screen
-/// will still work but `create_url` will 401 — flip the scope
-/// name in that case.
+/// Scope is the granular `meeting:write:meeting` (create user
+/// meetings) — must match what's checked under Marketplace →
+/// Scopes → Meeting on the registered app.
 pub const ZOOM: OAuthProvider = OAuthProvider {
     name: "zoom",
     client_id: "CxRwHStNQkqPBztEsvSDnA",
     client_secret: "", // Public client — PKCE only
     auth_url: "https://zoom.us/oauth/authorize",
     token_url: "https://zoom.us/oauth/token",
-    scopes: &["meeting:write:meeting:user"],
+    scopes: &["meeting:write:meeting"],
     use_pkce: true,
     redirect_host: "127.0.0.1",
     // Pinned port that the Marketplace registration matches
