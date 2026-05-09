@@ -200,16 +200,28 @@ pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Re
     })
 }
 
-/// Create a fresh Matrix room for a meeting and post an
-/// `im.vector.modular.widgets` state event pointing at the
-/// homeserver's Element Call instance. Returns the join URL that
-/// the user should paste into the calendar event.
+/// Create a fresh Matrix room for a meeting and post an Element
+/// Call widget state event into it. Returns a `matrix.to` join
+/// URL that opens the user's existing Matrix client (Element Web
+/// at their organization, the desktop app, etc.) on the freshly
+/// created room — the call is then driven by the embedded
+/// widget, which uses the homeserver's own LiveKit SFU advertised
+/// via the [`org.matrix.msc4143.rtc_foci`][rtc-foci] well-known.
+///
+/// We deliberately do **not** return a `https://call.element.io`
+/// URL: that hosts the *frontend* of Element Call but doesn't
+/// know about the user's homeserver, so opening it forced a
+/// second, unrelated login at element.io. The matrix.to redirect
+/// keeps the user on their own infrastructure (#148).
 ///
 /// `room_name` becomes the room's `name` in Matrix (visible in any
-/// Matrix client). `element_call_url` is the base of the Element
-/// Call deployment to use for the widget — defaults to
-/// `https://call.element.io` when None, since that's the public
-/// instance Element ships with.
+/// Matrix client). `element_call_url` is the Element Call frontend
+/// referenced by the widget; defaults to `https://call.element.io`
+/// since that's the canonical implementation. Self-hosted Element
+/// Call instances can be passed here later via a per-account
+/// override if/when we add that setting.
+///
+/// [rtc-foci]: https://github.com/matrix-org/matrix-spec-proposals/pull/4143
 pub async fn create_call(
     homeserver: &str,
     access_token: &str,
@@ -288,11 +300,32 @@ pub async fn create_call(
         );
     }
 
+    // matrix.to URL — the standard cross-client room-link
+    // redirector. Format is `https://matrix.to/#/<roomId>?via=<server>`,
+    // where `<roomId>` is the literal room id including its `!` and
+    // `:` (matrix.to keeps those unencoded by spec) and `via` hints
+    // which homeserver to route through. The homeserver fragment
+    // we extract from the user-supplied URL — for matrix.sunet.se
+    // that's just `matrix.sunet.se`.
+    let via = host_only(homeserver);
     Ok(format!(
-        "{}/room/?roomId={}",
-        call_base,
-        urlencoding::encode(&room_id),
+        "https://matrix.to/#/{}?via={}",
+        room_id,
+        urlencoding::encode(&via),
     ))
+}
+
+/// Pull just the host out of a homeserver URL, so the matrix.to
+/// `via=` parameter gets `matrix.example.com`, not the scheme or
+/// trailing slash. Falls back to the input string for malformed
+/// URLs — matrix.to tolerates that and shows its picker UI.
+fn host_only(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
 }
 
 fn normalize_base_url(server: &str) -> String {
@@ -338,6 +371,19 @@ impl crate::meet::MeetProvider for MatrixProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_only_strips_scheme_and_path() {
+        assert_eq!(host_only("https://matrix.sunet.se"), "matrix.sunet.se");
+        assert_eq!(host_only("https://matrix.sunet.se/"), "matrix.sunet.se");
+        assert_eq!(
+            host_only("http://matrix.example.org/foo"),
+            "matrix.example.org"
+        );
+        // Pathological input: pass it through so matrix.to can
+        // surface its picker UI rather than crashing the call.
+        assert_eq!(host_only("matrix.sunet.se"), "matrix.sunet.se");
+    }
 
     #[test]
     fn normalizes_trailing_slashes() {
