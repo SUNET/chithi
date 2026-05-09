@@ -39,12 +39,22 @@ const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 /// Accounts that can produce a meeting URL (#148). Pulled from the
 /// account summary's `meet_protocol` so we can label the dropdown
 /// with "Nextcloud Talk" / "Matrix" alongside the account name.
+/// Map `meet_protocol` values to the human-readable label that
+/// goes on the "Add <provider>" buttons. Adding a new provider
+/// = one new entry in this map; rest of the component picks it
+/// up from `meetAccountOptions`.
+const MEET_PROTOCOL_LABELS: Record<string, string> = {
+  talk: "Nextcloud Talk",
+  matrix: "Matrix",
+  zoom: "Zoom",
+};
+
 const meetAccountOptions = computed(() =>
   accountsStore.accounts
-    .filter((a) => a.meet_protocol === "talk" || a.meet_protocol === "matrix")
+    .filter((a) => a.meet_protocol in MEET_PROTOCOL_LABELS)
     .map((a) => ({
       value: a.id,
-      label: `${a.display_name || a.email || a.id} (${a.meet_protocol === "talk" ? "Nextcloud Talk" : "Matrix"})`,
+      label: `${a.display_name || a.email || a.id} (${MEET_PROTOCOL_LABELS[a.meet_protocol]})`,
     })),
 );
 const generatingMeetUrl = ref(false);
