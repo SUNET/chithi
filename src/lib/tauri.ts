@@ -507,10 +507,13 @@ export async function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }
 
-// Meet (video conferencing — #148). Two browser-assisted login
-// flows + one provider-agnostic create-URL. Talk uses Nextcloud
-// Login Flow v2 (poll-based), Matrix uses SSO redirect to a local
-// listener. Both end with a stored account row + keyring entry.
+// Meet (video conferencing — #148). One browser-assisted login
+// flow per provider (Talk / Matrix / Zoom today; the set is
+// driven by `meet::registry()` on the backend) plus one
+// provider-agnostic create-URL. Talk uses Nextcloud Login Flow
+// v2 (poll-based), Matrix uses SSO redirect to a local listener,
+// Zoom uses OAuth 2.0 Authorization Code + PKCE. All end with a
+// stored account row + keyring entry.
 
 export interface TalkLoginStart {
   login_url: string;

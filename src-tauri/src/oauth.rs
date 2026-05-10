@@ -83,10 +83,17 @@ pub const MICROSOFT_GRAPH_SCOPES: &str =
 /// Zoom OAuth (#148, video conferencing). Native app with PKCE —
 /// no client_secret ships in the binary. Registered on Zoom
 /// Marketplace as a "User-managed app" with redirect URI
-/// `http://127.0.0.1` (loopback wildcard — Zoom matches the host
-/// and ignores the port at runtime). Note that Zoom rejects
-/// `http://localhost:N` callbacks, hence `redirect_host` is
-/// `127.0.0.1` here while Microsoft demands `localhost`.
+/// **`http://127.0.0.1:47832` exactly** — Zoom does *not* honor
+/// RFC 8252's "ignore the port on loopback" rule, so the
+/// registered URI must match the runtime URI character-for-
+/// character (port included). That's why `redirect_fixed_port`
+/// is set: `get_auth_url` binds 47832 specifically. If the port
+/// is held by another process the bind errors out with a clear
+/// message and the user retries.
+///
+/// `localhost` callbacks are rejected by Zoom regardless, hence
+/// `redirect_host` is `127.0.0.1` while Microsoft demands
+/// `localhost`.
 ///
 /// Scope is the granular `meeting:write:meeting` (create user
 /// meetings) — must match what's checked under Marketplace →

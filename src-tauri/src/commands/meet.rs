@@ -264,6 +264,25 @@ pub struct ZoomLoginStart {
 /// matching `meet_zoom_login_complete`.
 #[tauri::command]
 pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLoginStart> {
+    // Evict any session that's still parked on the fixed Zoom
+    // port BEFORE we ask the OS to bind it. Without this, an
+    // abandoned previous flow (browser closed, renderer reload
+    // mid-flow, user cancels) keeps the listener and the next
+    // start fails with EADDRINUSE — and the eviction sweep that
+    // runs after the bind never reaches the stale entry.
+    if let Some(fixed_port) = crate::oauth::ZOOM.redirect_fixed_port {
+        let mut map = state.zoom_oauth_sessions.lock().unwrap();
+        evict_stale_zoom_sessions(&mut map);
+        if let Some(prev) = map.remove(&fixed_port) {
+            log::info!(
+                "meet_zoom_login_start: dropping previous session on port {} (age {:?}) so the new one can bind",
+                fixed_port,
+                std::time::Instant::now().duration_since(prev.created),
+            );
+            // `prev` (and its listener) drop here, releasing the
+            // port before we hit `get_auth_url` below.
+        }
+    }
     let (url, listener, code_verifier, oauth_state) =
         crate::oauth::get_auth_url(&crate::oauth::ZOOM)?;
     let port = listener
@@ -272,7 +291,6 @@ pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLog
         .port();
     {
         let mut map = state.zoom_oauth_sessions.lock().unwrap();
-        evict_stale_zoom_sessions(&mut map);
         map.insert(
             port,
             crate::state::ZoomOAuthSession {
@@ -322,15 +340,23 @@ pub async fn meet_zoom_login_complete(
 
     match callback.state.as_deref() {
         Some(s) if s == expected_state => {}
-        Some(s) => {
-            return Err(Error::Other(format!(
-                "Zoom OAuth: state mismatch (expected {}, got {})",
-                expected_state, s
-            )));
+        Some(got) => {
+            // The raw nonces are unguessable random strings — no
+            // value to a human, and confusing in a UI toast.
+            // Log them at debug level for diagnostics; surface a
+            // short message to the user.
+            log::debug!(
+                "zoom oauth state mismatch: expected={} got={}",
+                expected_state,
+                got
+            );
+            return Err(Error::Other(
+                "Zoom sign-in could not be verified — please try again.".into(),
+            ));
         }
         None => {
             return Err(Error::Other(
-                "Zoom OAuth: callback missing required state parameter".into(),
+                "Zoom sign-in could not be verified — please try again.".into(),
             ));
         }
     }
