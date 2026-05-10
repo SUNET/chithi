@@ -34,7 +34,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+      # Single-package install; not worth wiring `cache: pip`,
+      # which would need a `requirements.txt` we'd otherwise have
+      # nothing to put in. If the build slows down enough for it
+      # to matter, pin via web/requirements.txt at that point.
       - run: pip install --upgrade mkdocs-material
       # `--strict` turns broken links / missing nav entries into
       # build failures so a doc-rot PR fails CI before deploy.
