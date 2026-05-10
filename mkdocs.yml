@@ -1,0 +1,67 @@
+site_name: Chithi
+site_url: https://chithi.org
+site_description: A privacy-focused desktop email, calendar, and contacts client.
+site_author: Sunet
+copyright: Copyright &copy; 2025-2026 Sunet
+
+repo_url: https://github.com/SUNET/chithi
+repo_name: SUNET/chithi
+edit_uri: edit/main/docs/
+
+# `docs/CNAME` and the static OAuth bounce under
+# `docs/oauth/zoom/index.html` are not part of the navigation but
+# need to round-trip through the build untouched. mkdocs copies
+# unrecognised files in docs/ verbatim by default; this section
+# silences the "absolute_links / not in nav" warnings the strict
+# CI build would otherwise emit.
+not_in_nav: |
+  /CNAME
+  /oauth/**
+
+theme:
+  name: material
+  language: en
+  palette:
+    # Match the warm-amber chrome the desktop app uses (ADR 0043).
+    - scheme: default
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - content.action.edit
+    - content.code.copy
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+# Letting mkdocs auto-derive the nav from the `docs/` tree keeps
+# the ADR collection (44 files today and growing) self-maintaining.
+# Top-level pages render as tabs; nested directories become
+# collapsible sections.

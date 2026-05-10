@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Chithi · Returning from Zoom</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+      max-width: 36rem;
+      margin: 4rem auto;
+      padding: 0 1.5rem;
+      color: #2a2419;
+      background: #faf7f2;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.4rem; }
+    p { color: #6a6258; }
+    .card {
+      background: #fff;
+      border: 1px solid #ebe2cf;
+      border-radius: 10px;
+      padding: 1.5rem;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    }
+    a.button {
+      display: inline-block;
+      margin-top: 1rem;
+      padding: 0.5rem 1.1rem;
+      background: #c08a2c;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 500;
+    }
+    a.button:hover { background: #a67323; }
+    code {
+      background: #f1ebde;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1d1a14; color: #e8e1d2; }
+      .card { background: #2a261d; border-color: #3a342a; }
+      p { color: #a89f8e; }
+      code { background: #3a342a; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Returning you to Chithi…</h1>
+    <p id="status">
+      Forwarding your Zoom sign-in to the desktop app. If your browser
+      doesn't switch back automatically, click the button below.
+    </p>
+    <p>
+      <a id="continue" class="button" href="#">Open Chithi</a>
+    </p>
+    <p style="font-size: 0.85em; color: #998c75;">
+      This page is a static redirect helper used by the Chithi desktop
+      app's Zoom OAuth flow. It runs entirely client-side: nothing on
+      <code>chithi.org</code> reads or stores your OAuth code.
+    </p>
+  </div>
+  <script>
+    // Static OAuth bounce for the Zoom Marketplace flow. Zoom requires
+    // an HTTPS redirect URI in production and won't accept loopback or
+    // custom-scheme URLs there, so we register https://chithi.org/oauth/zoom/
+    // and immediately forward back to the loopback listener Chithi
+    // bound at 127.0.0.1:47832.
+    //
+    // Everything happens in the browser — the page never touches a
+    // server side, so there's nowhere to log or cache the OAuth code.
+    (function () {
+      var params = window.location.search || "";
+      var target = "http://127.0.0.1:47832/" + params;
+      var link = document.getElementById("continue");
+      link.href = target;
+      // Most browsers honor an HTTPS → http://127.0.0.1 redirect via
+      // window.location without prompting; replace() is used so this
+      // page doesn't pollute the browser back-stack.
+      try {
+        window.location.replace(target);
+      } catch (_e) {
+        // Fall through to the manual button.
+        document.getElementById("status").textContent =
+          "Couldn't redirect automatically. Click the button below to return to Chithi.";
+      }
+    })();
+  </script>
+</body>
+</html>

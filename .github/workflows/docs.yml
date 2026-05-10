@@ -1,0 +1,64 @@
+# Build and deploy the chithi.org documentation site to GitHub
+# Pages. Triggered on push to main when anything under docs/ or
+# the mkdocs config / this workflow itself changes — keeps
+# unrelated source-only PRs from rebuilding the site.
+#
+# The repo's Pages settings need "Source: GitHub Actions" and
+# the custom domain `chithi.org` configured (DNS apex A records
+# point at GitHub's Pages IPs; see the project README).
+
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - .github/workflows/docs.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - docs/**
+      - mkdocs.yml
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Don't kick off two deploys at once — let the latest commit win.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --upgrade mkdocs-material
+      # `--strict` turns broken links / missing nav entries into
+      # build failures so a doc-rot PR fails CI before deploy.
+      - run: mkdocs build --strict
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    # Only deploy on push to main. PRs do build-only as a guard.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
