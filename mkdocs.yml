@@ -1,19 +1,24 @@
 site_name: Chithi
 site_url: https://chithi.org
 site_description: A privacy-focused desktop email, calendar, and contacts client.
-site_author: Sunet
-copyright: Copyright &copy; 2025-2026 Sunet
+site_author: Chithi authors
+copyright: Copyright &copy; 2025-2026 Chithi authors
 
 repo_url: https://github.com/SUNET/chithi
 repo_name: SUNET/chithi
-edit_uri: edit/main/docs/
+edit_uri: edit/main/web/
 
-# `docs/CNAME` and the static OAuth bounce under
-# `docs/oauth/zoom/index.html` are not part of the navigation but
+# Public website source lives under `web/`, kept separate from the
+# in-repo `docs/` (features overview + ADRs) which is for project
+# contributors and does not get published to chithi.org.
+docs_dir: web
+
+# `web/CNAME` and the static OAuth bounce under
+# `web/oauth/zoom/index.html` are not part of the navigation but
 # need to round-trip through the build untouched. mkdocs copies
-# unrecognised files in docs/ verbatim by default; this section
-# silences the "absolute_links / not in nav" warnings the strict
-# CI build would otherwise emit.
+# unrecognised files in the docs source verbatim; this entry
+# silences the "not in nav" warnings the strict CI build would
+# otherwise emit.
 not_in_nav: |
   /CNAME
   /oauth/**
@@ -61,7 +66,6 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
 
-# Letting mkdocs auto-derive the nav from the `docs/` tree keeps
-# the ADR collection (44 files today and growing) self-maintaining.
-# Top-level pages render as tabs; nested directories become
-# collapsible sections.
+# Letting mkdocs auto-derive the nav from the `web/` tree keeps
+# new pages picked up without bookkeeping. Top-level pages render
+# as tabs; nested directories (user/, admin/) become sections.
