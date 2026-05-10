@@ -69,9 +69,11 @@
   <script>
     // Static OAuth bounce for the Zoom Marketplace flow. Zoom requires
     // an HTTPS redirect URI in production and won't accept loopback or
-    // custom-scheme URLs there, so we register https://chithi.org/oauth/zoom/
+    // custom-scheme URLs there, so we register https://chithi.org/oauth/zoom
     // and immediately forward back to the loopback listener Chithi
-    // bound at 127.0.0.1:47832.
+    // bound at 127.0.0.1:47832. (GitHub Pages serves this file at both
+    // /oauth/zoom and /oauth/zoom/ — the no-slash form 301-redirects to
+    // the slash form, preserving the query string.)
     //
     // Everything happens in the browser — the page never touches a
     // server side, so there's nowhere to log or cache the OAuth code.

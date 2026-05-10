@@ -31,6 +31,21 @@ pub struct OAuthProvider {
     /// port (Google / Microsoft). Zoom Marketplace pins
     /// `http://127.0.0.1:<port>` exactly so we set this for Zoom.
     pub redirect_fixed_port: Option<u16>,
+    /// Optional full-URL redirect that overrides the loopback
+    /// `http://<host>:<port>` we'd otherwise build from
+    /// `redirect_host` / `redirect_fixed_port`. Used when the
+    /// provider's production policy refuses loopback redirects
+    /// outright (Zoom production OAuth) and forces us to register
+    /// an HTTPS bounce. The bounce is a static page on
+    /// `chithi.org` whose only job is to forward the OAuth
+    /// `code` + `state` query string to the loopback listener
+    /// Chithi binds locally — so the listener still runs at
+    /// `redirect_host:redirect_fixed_port`, but Zoom only ever
+    /// sees the override URL.
+    ///
+    /// `None` keeps the legacy direct-loopback behaviour (Google,
+    /// Microsoft, dev-mode Zoom builds without the bounce).
+    pub redirect_url_override: Option<&'static str>,
 }
 
 pub const GOOGLE: OAuthProvider = OAuthProvider {
@@ -46,6 +61,7 @@ pub const GOOGLE: OAuthProvider = OAuthProvider {
     use_pkce: true,
     redirect_host: "localhost",
     redirect_fixed_port: None,
+    redirect_url_override: None,
 };
 
 pub const MICROSOFT: OAuthProvider = OAuthProvider {
@@ -74,6 +90,7 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
     use_pkce: true,
     redirect_host: "localhost",
     redirect_fixed_port: None,
+    redirect_url_override: None,
 };
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
@@ -108,7 +125,7 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
     // the env at build time.
     client_id: match option_env!("CHITHI_ZOOM_CLIENT_ID") {
         Some(s) => s,
-        None => "NvT2nsWbS1Whhgut4Tr8_A",
+        None => "VOqJx9G3Q1mM80wIAmlFNw",
     },
     client_secret: "", // Public client — PKCE only
     auth_url: "https://zoom.us/oauth/authorize",
@@ -116,12 +133,29 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
     scopes: &["meeting:write:meeting"],
     use_pkce: true,
     redirect_host: "127.0.0.1",
-    // Pinned port that the Marketplace registration matches
-    // exactly. If the port is in use at runtime the bind fails
-    // with a clear error and the user retries; the alternative
-    // (registering a range of ports) inflates Marketplace
-    // bookkeeping for marginal benefit on a desktop app.
+    // Pinned port that the local listener binds to. The bounce
+    // at chithi.org/oauth/zoom/ forwards back here — see
+    // `redirect_url_override` below. If the port is held by
+    // another program at runtime the bind fails with a clear
+    // error and the user retries.
     redirect_fixed_port: Some(47832),
+    // Production redirect URI registered on Zoom Marketplace.
+    // Zoom production OAuth refuses loopback URLs entirely, so
+    // the user-visible redirect goes through the static HTTPS
+    // bounce hosted at `web/oauth/zoom/index.html` on
+    // chithi.org, which JS-redirects back to the loopback
+    // listener bound by `redirect_fixed_port` above.
+    //
+    // Build-time override `CHITHI_ZOOM_REDIRECT_URI` lets forks
+    // point at their own bounce (or a `http://127.0.0.1:47832`
+    // dev-mode app registered directly on Marketplace, sidestepping
+    // the bounce). Note: const matching on `&str` isn't stable, so
+    // there's no "set this to empty to disable the override" path —
+    // pass an explicit URL.
+    redirect_url_override: Some(match option_env!("CHITHI_ZOOM_REDIRECT_URI") {
+        Some(s) => s,
+        None => "https://chithi.org/oauth/zoom",
+    }),
 };
 
 /// Microsoft IMAP/SMTP scopes — used for token refresh for mail access.
@@ -205,10 +239,18 @@ pub fn get_auth_url(
         .map_err(|e| Error::Other(format!("Failed to get port: {}", e)))?
         .port();
 
-    // Per-provider loopback host (see `OAuthProvider.redirect_host`):
-    // Microsoft demands `localhost`, Zoom demands `127.0.0.1`,
-    // Google accepts either.
-    let redirect_uri = format!("http://{}:{}", provider.redirect_host, port);
+    // What we send to the provider. When `redirect_url_override`
+    // is set we use that verbatim — Zoom production refuses
+    // loopback URIs so the registered redirect is the static
+    // bounce on `chithi.org/oauth/zoom`, which forwards
+    // `?code=&state=` to the listener bound just above.
+    // Otherwise we build the legacy `http://<host>:<port>` form:
+    // Microsoft demands `localhost`, Zoom dev mode wants
+    // `127.0.0.1`, Google accepts either.
+    let redirect_uri = match provider.redirect_url_override {
+        Some(override_url) => override_url.to_string(),
+        None => format!("http://{}:{}", provider.redirect_host, port),
+    };
 
     // Generate a random state parameter for CSRF protection
     let state = generate_code_verifier();
@@ -351,10 +393,13 @@ pub async fn exchange_code(
     port: u16,
     code_verifier: Option<&str>,
 ) -> Result<OAuthTokens> {
-    // Per-provider loopback host (see `OAuthProvider.redirect_host`):
-    // Microsoft demands `localhost`, Zoom demands `127.0.0.1`,
-    // Google accepts either.
-    let redirect_uri = format!("http://{}:{}", provider.redirect_host, port);
+    // Must match exactly what was sent in the auth request, or
+    // the token endpoint returns `invalid_grant`. See
+    // `get_auth_url` for the matching construction logic.
+    let redirect_uri = match provider.redirect_url_override {
+        Some(override_url) => override_url.to_string(),
+        None => format!("http://{}:{}", provider.redirect_host, port),
+    };
 
     let mut params = HashMap::new();
     params.insert("client_id", provider.client_id.to_string());
