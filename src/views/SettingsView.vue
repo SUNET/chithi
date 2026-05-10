@@ -92,10 +92,11 @@ const themeLabel = computed(() =>
 );
 const showForm = ref(false);
 // First step of "Add Account": pick a type. Replaces the cramped
-// in-modal tab row with a dialog that lists the eight account
-// types as cards grouped by service area, and on pick opens the
-// existing edit form pre-set to that type. Edit-existing skips
-// this step. (#148 cleanup)
+// in-modal tab row with a dialog that lists every supported
+// account type (currently nine — Gmail / O365 / IMAP / JMAP /
+// CalDAV / CardDAV / Talk / Matrix / Zoom) as cards grouped by
+// service area, and on pick opens the existing edit form pre-set
+// to that type. Edit-existing skips this step. (#148 cleanup)
 const showPicker = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingAccountId = ref<string | null>(null);
@@ -862,10 +863,13 @@ async function doDelete() {
 
 // --- Video conferencing (#148) -------------------------------------------
 //
-// Both providers use a browser-assisted login flow. The two-step
-// pattern matches what we already do for Gmail / O365 OAuth: start
-// returns a URL, we open it via the shell-opener, then a second
-// call drives the flow to completion and persists the account.
+// All meet providers (Talk, Matrix, Zoom, …) use a browser-assisted
+// login flow. The two-step pattern matches what we already do for
+// Gmail / O365 OAuth: start returns a URL, we open it via the
+// shell-opener, then a second call drives the flow to completion
+// and persists the account. Each provider has its own pair of
+// signInWith* functions because the shapes differ (Talk polls,
+// Matrix waits for an SSO redirect, Zoom is OAuth+PKCE).
 const meetSigningIn = ref(false);
 
 async function signInWithTalk() {

@@ -5,15 +5,19 @@
 //! - `matrix` — Matrix / Element Call.
 //! - `zoom` — Zoom Marketplace OAuth + Meeting API.
 //!
-//! Both bind to a new `meet` service on the existing service-binding
-//! plumbing (so accounts surface alongside CalDAV / CardDAV-only
-//! accounts), and both use a browser-assisted login flow rather than
-//! ask the user for raw passwords:
-//! - Talk: Nextcloud "Login Flow v2" (poll-based, returns a long-lived
-//!   app password tied to the user).
-//! - Matrix: SSO redirect to the homeserver, captures `loginToken`
-//!   on a local listener, exchanges via `m.login.token` for an
-//!   `access_token`.
+//! All three bind to a new `meet` service on the existing
+//! service-binding plumbing (so accounts surface alongside
+//! CalDAV / CardDAV-only accounts), and all three use a
+//! browser-assisted login flow rather than ask the user for raw
+//! passwords:
+//! - Talk: Nextcloud "Login Flow v2" (poll-based, returns a
+//!   long-lived app password tied to the user).
+//! - Matrix: SSO redirect to the homeserver, captures
+//!   `loginToken` on a local listener, exchanges via
+//!   `m.login.token` for an `access_token`.
+//! - Zoom: standard OAuth 2.0 Authorization Code + PKCE against
+//!   a Marketplace-registered app on a pinned loopback port.
+//!   Tokens auto-refresh on use (60-min access-token lifetime).
 //!
 //! ## Adding a new provider
 //!

@@ -242,8 +242,12 @@ pub struct LegacyBindingFields<'a> {
     pub oidc_client_id: &'a str,
     pub caldav_url: &'a str,
     pub calendar_sync_enabled: bool,
-    /// #148: meet binding inputs. Both empty means no meet binding
-    /// is emitted; `meet_protocol` is one of `"talk"` / `"matrix"`.
+    /// #148: meet binding inputs. Both empty means no meet
+    /// binding is emitted. `meet_protocol` carries the
+    /// provider's discriminator (`talk`, `matrix`, `zoom`, …) —
+    /// the actual list is whatever providers `meet::registry()`
+    /// exposes, not enumerated here so the comment doesn't go
+    /// stale on every new provider.
     pub meet_url: &'a str,
     pub meet_protocol: &'a str,
     /// Phase 4 additions. If `None`, falls back to `enabled` for the mail
@@ -343,7 +347,9 @@ pub fn derive_bindings(f: LegacyBindingFields<'_>) -> Vec<ServiceBinding> {
     // an account that has neither (the common case) gets no meet
     // binding, and an inconsistent half-set state is caught by the
     // explicit guard rather than silently emitting a half-broken
-    // entry. Recognised protocols today are "talk" and "matrix".
+    // entry. The protocol value comes from `meet::registry()`
+    // and isn't enumerated here so this comment doesn't drift on
+    // every new provider.
     if !f.meet_url.is_empty() && !f.meet_protocol.is_empty() {
         out.push(ServiceBinding {
             id: format!("{aid}-meet"),

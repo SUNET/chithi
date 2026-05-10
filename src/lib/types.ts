@@ -25,10 +25,11 @@ export interface Account {
   // existence-only flags would always say true for both).
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
-  // #148. Protocol of the account's enabled meet binding ("talk" /
-  // "matrix"), empty when there is none. Lets the calendar event
-  // editor populate its "Add video link" dropdown without an
-  // extra round-trip per row.
+  // #148. Protocol of the account's enabled meet binding —
+  // `talk`, `matrix`, `zoom`, or whatever else is registered
+  // in `meet::registry()` — empty when there is none. Lets the
+  // calendar event editor populate its "Add video link"
+  // dropdown without an extra round-trip per row.
   meet_protocol: "" | "talk" | "matrix" | "zoom";
 }
 
@@ -171,13 +172,17 @@ export interface AccountConfig {
   smtp_port: number;
   jmap_url: string;
   caldav_url: string;
-  /// #148. Server URL for the video-conferencing binding
-  /// (Nextcloud Talk root or Matrix homeserver). Empty when the
-  /// account has no meet binding. Pairs with `meet_protocol`.
+  /// #148. Server URL the provider keys off. Nextcloud root for
+  /// Talk, homeserver for Matrix. For Zoom this is a marker
+  /// (`https://zoom.us`) since Zoom is a hosted service with no
+  /// per-user URL — `create_url` reads the OAuth token from the
+  /// keyring and ignores this. Empty when the account has no
+  /// meet binding.
   meet_url: string;
-  /// One of `"talk"` / `"matrix"` when the account has a meet
-  /// binding, empty otherwise. Picked by which Settings tab the
-  /// user signed in through.
+  /// Provider discriminator chosen by the Settings tab the user
+  /// signed in through. The set in this union is whatever the
+  /// `meet::registry()` exposes today; empty when there's no
+  /// meet binding.
   meet_protocol: "" | "talk" | "matrix" | "zoom";
   username: string;
   password: string;

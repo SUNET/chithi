@@ -199,7 +199,11 @@ pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Re
     let body = serde_json::json!({
         "type": "m.login.token",
         "token": login_token,
-        "initial_device_display_name": format!("Chithi ({})", USER_AGENT),
+        // USER_AGENT already encodes "Chithi/<version>"; using it
+        // directly as the device label avoids the redundant
+        // "Chithi (Chithi/<version>)" that Matrix clients would
+        // otherwise show in the Active sessions panel.
+        "initial_device_display_name": USER_AGENT,
     });
     let resp = http_client()?
         .post(&url)

@@ -39,10 +39,12 @@ pub struct Account {
     pub has_calendar_binding: bool,
     #[serde(default)]
     pub has_contacts_binding: bool,
-    /// Protocol of the account's enabled meet binding ("talk" /
-    /// "matrix"), or "" when there is none. Lets the calendar
-    /// event editor populate its "Add video link" dropdown with
-    /// just the accounts that can produce one. (#148)
+    /// Protocol of the account's enabled meet binding (`talk` /
+    /// `matrix` / `zoom` today; whatever providers are listed in
+    /// `meet::registry()` more generally), or `""` when the
+    /// account has no meet binding. Lets the calendar event
+    /// editor populate its "Add video link" dropdown without an
+    /// extra round-trip per row. (#148)
     #[serde(default)]
     pub meet_protocol: String,
 }
@@ -61,13 +63,18 @@ pub struct AccountConfig {
     pub smtp_port: u16,
     pub jmap_url: String,
     pub caldav_url: String,
-    /// Base URL for the meet binding's server (Nextcloud root for
-    /// Talk, homeserver for Matrix). Empty when the account has no
-    /// meet binding. Pairs with `meet_protocol`.
+    /// Server URL the provider keys off. For Talk this is the
+    /// Nextcloud root; for Matrix it's the homeserver. For Zoom
+    /// this is a marker (`https://zoom.us`) since Zoom is a
+    /// hosted service with no per-user URL — `create_url` reads
+    /// the OAuth tokens from the keyring and ignores this. Empty
+    /// when the account has no meet binding. Pairs with
+    /// `meet_protocol`.
     #[serde(default)]
     pub meet_url: String,
-    /// `"talk"` (Nextcloud Talk) or `"matrix"` when the account has
-    /// a meet binding; empty otherwise.
+    /// Provider discriminator: `talk`, `matrix`, `zoom`, or
+    /// whatever else is registered in `meet::registry()`.
+    /// Empty when the account has no meet binding.
     #[serde(default)]
     pub meet_protocol: String,
     pub username: String,
