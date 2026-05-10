@@ -1,27 +1,19 @@
-# Build and deploy the chithi.org documentation site to GitHub
-# Pages. Triggered on push to main when anything under docs/ or
-# the mkdocs config / this workflow itself changes — keeps
-# unrelated source-only PRs from rebuilding the site.
+# Build the chithi.org documentation site on every push and pull
+# request, deploy to GitHub Pages on push to main. Building on
+# every push (not just doc-touching ones) catches link rot and
+# config drift introduced by source-only PRs that happen to break
+# the build, and lets feature branches verify their docs even
+# when they don't ship to production yet.
 #
 # The repo's Pages settings need "Source: GitHub Actions" and
 # the custom domain `chithi.org` configured (DNS apex A records
-# point at GitHub's Pages IPs; see the project README).
+# point at GitHub's Pages IPs).
 
 name: Docs
 
 on:
   push:
-    branches: [main]
-    paths:
-      - web/**
-      - mkdocs.yml
-      - .github/workflows/docs.yml
   pull_request:
-    branches: [main]
-    paths:
-      - web/**
-      - mkdocs.yml
-      - .github/workflows/docs.yml
   workflow_dispatch:
 
 permissions:
@@ -52,7 +44,8 @@ jobs:
           path: site
 
   deploy:
-    # Only deploy on push to main. PRs do build-only as a guard.
+    # Only deploy on push to main. Feature branches and PRs
+    # build-only as a guard against doc rot.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
