@@ -334,10 +334,10 @@ A screen recording is embedded below. It covers connecting a Zoom
 account and creating a meeting from a calendar event in Chithi.
 
 <video controls preload="metadata" style="max-width: 100%; height: auto;">
-  <source src="zoom-test-plan-demo.mp4" type="video/mp4">
+  <source src="/zoom-test-plan-demo.mp4" type="video/mp4">
   Your browser does not support inline video playback. The file is
   also available at
-  <a href="zoom-test-plan-demo.mp4">zoom-test-plan-demo.mp4</a>.
+  <a href="/zoom-test-plan-demo.mp4">zoom-test-plan-demo.mp4</a>.
 </video>
 
 ## Contact

@@ -72,12 +72,22 @@ async function addVideoLink(accountId: string) {
   try {
     // Pass the event's start + duration so time-bound providers
     // (Zoom) schedule the meeting on the event's day, not today.
-    // All-day events don't have a meaningful start/duration to
-    // send, so we omit both and let the provider fall back to its
-    // default (Zoom: open-ended for today).
-    let startIso: string | undefined;
-    let durationMinutes: number | undefined;
-    if (!allDay.value) {
+    // All-day events pin the start at noon in the user's display
+    // timezone (converted to UTC) so Zoom's UI shows the meeting
+    // on the right calendar day regardless of timezone, and use a
+    // 24h duration to cover the full day. Pinning at midnight
+    // instead would flip to the previous/next day in some
+    // timezones; noon avoids that.
+    let startIso: string;
+    let durationMinutes: number;
+    if (allDay.value) {
+      startIso = localInputToUTC(
+        startDate.value,
+        "12:00",
+        uiStore.displayTimezone,
+      );
+      durationMinutes = 24 * 60;
+    } else {
       const startUTC = localInputToUTC(
         startDate.value,
         startTime.value,
@@ -89,11 +99,10 @@ async function addVideoLink(accountId: string) {
         uiStore.displayTimezone,
       );
       startIso = startUTC;
-      const minutes = Math.max(
+      durationMinutes = Math.max(
         1,
         Math.round((new Date(endUTC).getTime() - new Date(startUTC).getTime()) / 60000),
       );
-      durationMinutes = minutes;
     }
     const binding = await api.meetCreateUrl(
       accountId,

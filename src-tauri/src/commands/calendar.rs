@@ -85,6 +85,39 @@ pub struct MeetBindingInput {
     pub join_url: String,
 }
 
+/// Defence-in-depth check on a client-supplied meet binding before
+/// it touches the keyring or any provider API. The frontend always
+/// sends bindings that round-tripped through `meet_create_url`, but
+/// the Tauri command surface is also reachable from a compromised
+/// renderer; rejecting bindings whose `protocol` doesn't match the
+/// account's resolved meet provider stops an attacker from forging
+/// e.g. a Zoom protocol entry against a Talk account and causing
+/// Chithi to PATCH/DELETE arbitrary meetings.
+fn validate_meet_binding(conn: &rusqlite::Connection, b: &MeetBindingInput) -> Result<()> {
+    if b.meeting_id.trim().is_empty() || b.join_url.trim().is_empty() {
+        return Err(crate::error::Error::Other(
+            "meet binding: meeting_id and join_url must be non-empty".into(),
+        ));
+    }
+    let account = db::accounts::get_account_full(conn, &b.account_id).map_err(|_| {
+        crate::error::Error::Other(format!("meet binding: unknown account {}", b.account_id))
+    })?;
+    let provider = meet::provider_for(&account).ok_or_else(|| {
+        crate::error::Error::Other(format!(
+            "meet binding: account {} has no meet provider",
+            b.account_id
+        ))
+    })?;
+    if provider.protocol() != b.protocol {
+        return Err(crate::error::Error::Other(format!(
+            "meet binding: protocol '{}' doesn't match account's resolved provider '{}'",
+            b.protocol,
+            provider.protocol()
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Calendar management commands
 // ---------------------------------------------------------------------------
@@ -480,6 +513,9 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
     // Insert locally first, then push to server
     {
         let conn = state.db.writer().await;
+        if let Some(ref b) = meet_binding {
+            validate_meet_binding(&conn, b)?;
+        }
         db::calendar::insert_event(&conn, &cal_event)?;
         if let Some(ref b) = meet_binding {
             db::meet_meetings::upsert(
@@ -814,6 +850,7 @@ pub async fn update_event(
     // Persist a freshly attached meet binding, if any. Replaces a prior
     // binding for the same event (one per event).
     if let Some(ref b) = event.meet_binding {
+        validate_meet_binding(&conn, b)?;
         db::meet_meetings::upsert(
             &conn,
             &db::meet_meetings::MeetMeeting {
