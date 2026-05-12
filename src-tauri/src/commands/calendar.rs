@@ -746,7 +746,9 @@ async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &s
     };
     log::info!(
         "sync_meet_topic: {} meeting {} -> '{}'",
-        binding.protocol, binding.meeting_id, title,
+        binding.protocol,
+        binding.meeting_id,
+        title,
     );
     if let Err(e) = provider
         .update_topic(&acc, &binding.meeting_id, title)
@@ -845,10 +847,14 @@ pub async fn update_event(
 
     if let Some((binding, meet_account)) = reschedule_with {
         if let Some(provider) = meet::provider_for(&meet_account) {
-            let duration_minutes = duration_minutes_between(&existing.start_time, &existing.end_time);
+            let duration_minutes =
+                duration_minutes_between(&existing.start_time, &existing.end_time);
             log::info!(
                 "update_event: rescheduling {} meeting {} to {} ({}m)",
-                binding.protocol, binding.meeting_id, existing.start_time, duration_minutes,
+                binding.protocol,
+                binding.meeting_id,
+                existing.start_time,
+                duration_minutes,
             );
             if let Err(e) = provider
                 .reschedule_meeting(
@@ -995,7 +1001,8 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
         if let Some(provider) = meet::provider_for(&meet_account) {
             log::info!(
                 "delete_event: deleting {} meeting {}",
-                binding.protocol, binding.meeting_id,
+                binding.protocol,
+                binding.meeting_id,
             );
             if let Err(e) = provider
                 .delete_meeting(&meet_account, &binding.meeting_id)
