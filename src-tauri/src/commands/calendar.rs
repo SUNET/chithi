@@ -5,7 +5,31 @@ use crate::calendar::ical::{self, ParsedInvite};
 use crate::db;
 use crate::db::calendar::{Attendee, Calendar, CalendarEvent, NewCalendar};
 use crate::error::Result;
+use crate::meet;
 use crate::state::AppState;
+
+/// Compute the duration in whole minutes between two ISO-8601
+/// timestamps. Returns 60 (Zoom's API default) when either input
+/// fails to parse or the range is non-positive, so a malformed
+/// event time can't poison the reschedule call.
+fn duration_minutes_between(start: &str, end: &str) -> u32 {
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .ok()
+    };
+    match (parse(start), parse(end)) {
+        (Some(s), Some(e)) => {
+            let minutes = (e - s).num_minutes();
+            if minutes > 0 {
+                minutes as u32
+            } else {
+                60
+            }
+        }
+        _ => 60,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -24,6 +48,11 @@ pub struct NewEventInput {
     pub timezone: Option<String>,
     pub recurrence_rule: Option<String>,
     pub attendees: Vec<Attendee>,
+    /// Meet binding to persist alongside the event row (#148).
+    /// `None` when the user didn't add a video link in this form.
+    /// Frontend obtains this from the `meet_create_url` response.
+    #[serde(default)]
+    pub meet_binding: Option<MeetBindingInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +67,22 @@ pub struct UpdateEventInput {
     pub timezone: Option<String>,
     pub recurrence_rule: Option<String>,
     pub attendees: Option<Vec<Attendee>>,
+    /// New meet binding to attach to this event. `None` means "leave
+    /// existing binding alone." Always replaces any prior binding for
+    /// the same event (one binding per event).
+    #[serde(default)]
+    pub meet_binding: Option<MeetBindingInput>,
+}
+
+/// Frontend-supplied meet binding metadata returned from a previous
+/// `meet_create_url` call. Stored verbatim in `meet_meetings` so the
+/// later delete / reschedule code knows which remote meeting to act on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeetBindingInput {
+    pub account_id: String,
+    pub protocol: String,
+    pub meeting_id: String,
+    pub join_url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -430,10 +475,24 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         etag: None,
     };
 
+    let meet_binding = event.meet_binding;
+
     // Insert locally first, then push to server
     {
         let conn = state.db.writer().await;
         db::calendar::insert_event(&conn, &cal_event)?;
+        if let Some(ref b) = meet_binding {
+            db::meet_meetings::upsert(
+                &conn,
+                &db::meet_meetings::MeetMeeting {
+                    event_id: id.clone(),
+                    account_id: b.account_id.clone(),
+                    protocol: b.protocol.clone(),
+                    meeting_id: b.meeting_id.clone(),
+                    join_url: b.join_url.clone(),
+                },
+            )?;
+        }
         let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
 
         if account.calendar_protocol_str() == "google" {
@@ -673,6 +732,8 @@ pub async fn update_event(
 
     // Load existing event, apply updates
     let mut existing = db::calendar::get_event(&conn, &event_id)?;
+    let prev_start = existing.start_time.clone();
+    let prev_end = existing.end_time.clone();
 
     if let Some(calendar_id) = event.calendar_id {
         existing.calendar_id = calendar_id;
@@ -712,11 +773,64 @@ pub async fn update_event(
     db::calendar::update_event(&conn, &existing)?;
     log::info!("update_event: updated event {}", event_id);
 
-    // Push update to server
+    // Persist a freshly attached meet binding, if any. Replaces a prior
+    // binding for the same event (one per event).
+    if let Some(ref b) = event.meet_binding {
+        db::meet_meetings::upsert(
+            &conn,
+            &db::meet_meetings::MeetMeeting {
+                event_id: event_id.clone(),
+                account_id: b.account_id.clone(),
+                protocol: b.protocol.clone(),
+                meeting_id: b.meeting_id.clone(),
+                join_url: b.join_url.clone(),
+            },
+        )?;
+    }
+
+    // If start/end changed and the event has a meet binding, ask the
+    // provider to move the remote meeting to the new slot. Best-effort:
+    // a provider failure logs but doesn't block the local update, since
+    // the user can still open the room via the saved join URL.
+    let time_changed = prev_start != existing.start_time || prev_end != existing.end_time;
+    let reschedule_with = if time_changed && !existing.all_day {
+        match db::meet_meetings::get(&conn, &event_id)? {
+            Some(b) => db::accounts::get_account_full(&conn, &b.account_id)
+                .ok()
+                .map(|acc| (b, acc)),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let account = db::accounts::get_account_full(&conn, &existing.account_id)?;
+    drop(conn);
+
+    if let Some((binding, meet_account)) = reschedule_with {
+        if let Some(provider) = meet::provider_for(&meet_account) {
+            let duration_minutes = duration_minutes_between(&existing.start_time, &existing.end_time);
+            log::info!(
+                "update_event: rescheduling {} meeting {} to {} ({}m)",
+                binding.protocol, binding.meeting_id, existing.start_time, duration_minutes,
+            );
+            if let Err(e) = provider
+                .reschedule_meeting(
+                    &meet_account,
+                    &binding.meeting_id,
+                    &existing.start_time,
+                    duration_minutes,
+                )
+                .await
+            {
+                log::warn!("update_event: meet reschedule failed: {}", e);
+            }
+        }
+    }
+
+    // Push update to server
     if let Some(ref remote_id) = existing.remote_id.filter(|r| !r.is_empty()) {
         if account.calendar_protocol_str() == "google" {
-            drop(conn);
             if let Ok(token) = get_google_token(&existing.account_id).await {
                 let http = reqwest::Client::new();
                 let mut patch = serde_json::json!({
@@ -765,7 +879,6 @@ pub async fn update_event(
                 }
             }
         } else if account.calendar_protocol_str() == "graph" {
-            drop(conn);
             if let Ok(token) = crate::mail::graph::get_graph_token(&existing.account_id).await {
                 let client = crate::mail::graph::GraphClient::new(&token);
                 let mut patch = serde_json::json!({
@@ -796,8 +909,11 @@ pub async fn update_event(
 pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
-    // Look up the event, account, and calendar remote_id
-    let (event, account, cal_remote_id) = {
+    // Look up the event, account, calendar remote_id, and any meet
+    // binding. The meet binding has to be read *before* the event row
+    // is deleted, otherwise the CASCADE drops it and we lose track of
+    // which remote meeting to cancel.
+    let (event, account, cal_remote_id, meet_cleanup) = {
         let conn = state.db.reader();
         let evt = db::calendar::get_event(&conn, &event_id)?;
         let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
@@ -805,8 +921,32 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
         let cal_rid = cal
             .and_then(|c| c.remote_id)
             .unwrap_or_else(|| "primary".to_string());
-        (evt, acc, cal_rid)
+        let cleanup = match db::meet_meetings::get(&conn, &event_id)? {
+            Some(b) => db::accounts::get_account_full(&conn, &b.account_id)
+                .ok()
+                .map(|meet_acc| (b, meet_acc)),
+            None => None,
+        };
+        (evt, acc, cal_rid, cleanup)
     };
+
+    // Best-effort delete on the meet provider. Failure logs but
+    // doesn't block the rest of the event deletion: an undeletable
+    // remote room is annoying, an undeletable calendar event is worse.
+    if let Some((binding, meet_account)) = meet_cleanup {
+        if let Some(provider) = meet::provider_for(&meet_account) {
+            log::info!(
+                "delete_event: deleting {} meeting {}",
+                binding.protocol, binding.meeting_id,
+            );
+            if let Err(e) = provider
+                .delete_meeting(&meet_account, &binding.meeting_id)
+                .await
+            {
+                log::warn!("delete_event: meet provider delete failed: {}", e);
+            }
+        }
+    }
 
     // Delete from server if event has a remote_id
     if let Some(ref remote_id) = event.remote_id {

@@ -328,6 +328,21 @@ export interface NewEventInput {
   timezone: string | null;
   recurrence_rule: string | null;
   attendees: Attendee[];
+  /** Optional meet binding to persist with the event so later
+   * reschedule / cancel calls can act on the right remote meeting.
+   * Comes from `meetCreateUrl` when the user adds a video link. */
+  meet_binding?: MeetBinding | null;
+}
+
+/** Provider-agnostic handle for a remote meeting Chithi created on
+ * behalf of an event. Returned by `meetCreateUrl` and accepted by
+ * `createEvent` / `updateEvent` so the backend can persist the
+ * link in `meet_meetings`. */
+export interface MeetBinding {
+  account_id: string;
+  protocol: string;
+  meeting_id: string;
+  join_url: string;
 }
 
 export interface ComposeMessage {

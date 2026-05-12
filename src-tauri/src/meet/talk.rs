@@ -154,16 +154,18 @@ pub async fn login_flow_v2_complete(
     }
 }
 
-/// Create a fresh Talk conversation (group room) and return the
-/// browser-facing join URL. `room_name` becomes the conversation
-/// title in Nextcloud Talk; we pick a sensible default if the caller
-/// hands us an empty string.
+/// Create a fresh Talk conversation (group room) and return both
+/// the join URL and the room token (Spreed's per-conversation
+/// identifier — what `DELETE /room/{token}` expects later when the
+/// event is cancelled). `room_name` becomes the conversation title
+/// in Nextcloud Talk; we pick a sensible default if the caller hands
+/// us an empty string.
 pub async fn create_room(
     server: &str,
     login_name: &str,
     app_password: &str,
     room_name: &str,
-) -> Result<String> {
+) -> Result<crate::meet::MeetCreateResult> {
     let base = normalize_base_url(server);
     let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room", base);
     let name = if room_name.trim().is_empty() {
@@ -204,7 +206,42 @@ pub async fn create_room(
             payload.to_string().chars().take(300).collect::<String>(),
         ))
     })?;
-    Ok(format!("{}/call/{}", base, token))
+    Ok(crate::meet::MeetCreateResult {
+        join_url: format!("{}/call/{}", base, token),
+        meeting_id: token.to_string(),
+    })
+}
+
+/// Delete a Talk conversation by token. Same auth pair as
+/// `create_room`. Treats 404 as success: the conversation was
+/// already gone (deleted from a Talk web client, etc.), and the
+/// caller wants idempotent cleanup.
+pub async fn delete_room(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+) -> Result<()> {
+    let base = normalize_base_url(server);
+    let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room/{}", base, token);
+    let resp = http_client()?
+        .delete(&url)
+        .basic_auth(login_name, Some(app_password))
+        .header("OCS-APIRequest", "true")
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("talk delete_room request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "talk delete_room: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
 }
 
 /// Strip trailing slashes from a Nextcloud base URL so callers can
@@ -233,7 +270,7 @@ impl crate::meet::MeetProvider for TalkProvider {
         name: &str,
         _start_time: Option<&str>,
         _duration_minutes: Option<u32>,
-    ) -> Result<String> {
+    ) -> Result<crate::meet::MeetCreateResult> {
         // Talk conversations are persistent rooms, not time-bound
         // slots, so the calendar event's start/duration are ignored.
         let url = account.meet_url.trim();
@@ -242,15 +279,34 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = match crate::oauth::load_tokens(&account.id)? {
-            Some(t) => t.access_token,
-            None => {
-                return Err(Error::Other(
-                    "Nextcloud Talk: no app password in keyring; sign in again".into(),
-                ));
-            }
-        };
+        let app_password = load_app_password(account)?;
         create_room(url, &account.username, &app_password, name).await
+    }
+
+    async fn delete_meeting(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+    ) -> Result<()> {
+        let url = account.meet_url.trim();
+        if url.is_empty() {
+            return Err(Error::Other(
+                "Nextcloud Talk: account has no server URL configured".into(),
+            ));
+        }
+        let app_password = load_app_password(account)?;
+        delete_room(url, &account.username, &app_password, meeting_id).await
+    }
+}
+
+/// Shared keyring read so create / delete share one error path
+/// and one not-signed-in message.
+fn load_app_password(account: &crate::db::accounts::AccountFull) -> Result<String> {
+    match crate::oauth::load_tokens(&account.id)? {
+        Some(t) => Ok(t.access_token),
+        None => Err(Error::Other(
+            "Nextcloud Talk: no app password in keyring; sign in again".into(),
+        )),
     }
 }
 

@@ -272,7 +272,7 @@ pub async fn create_call(
     access_token: &str,
     room_name: &str,
     element_call_url: Option<&str>,
-) -> Result<String> {
+) -> Result<crate::meet::MeetCreateResult> {
     let create_url = format!(
         "{}/_matrix/client/v3/createRoom",
         normalize_base_url(homeserver)
@@ -353,11 +353,46 @@ pub async fn create_call(
     // we extract from the user-supplied URL — for matrix.sunet.se
     // that's just `matrix.sunet.se`.
     let via = host_only(homeserver);
-    Ok(format!(
+    let join_url = format!(
         "https://matrix.to/#/{}?via={}",
         room_id,
         urlencoding::encode(&via),
-    ))
+    );
+    Ok(crate::meet::MeetCreateResult {
+        join_url,
+        meeting_id: room_id,
+    })
+}
+
+/// Leave a Matrix room the app created via `create_call`. Matrix
+/// has no "delete room" API (rooms outlive everyone in them), but
+/// leaving drops the room from this user's room list — which is
+/// the closest analogue to "cancelled this call." 403/404 are
+/// treated as already-gone so the local cleanup is idempotent.
+pub async fn leave_room(homeserver: &str, access_token: &str, room_id: &str) -> Result<()> {
+    let url = format!(
+        "{}/_matrix/client/v3/rooms/{}/leave",
+        normalize_base_url(homeserver),
+        urlencoding::encode(room_id),
+    );
+    let resp = http_client()?
+        .post(&url)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("matrix leave_room request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 403 || status.as_u16() == 404 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "matrix leave_room: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
 }
 
 /// Pull just the host out of a homeserver URL, so the matrix.to
@@ -396,7 +431,7 @@ impl crate::meet::MeetProvider for MatrixProvider {
         name: &str,
         _start_time: Option<&str>,
         _duration_minutes: Option<u32>,
-    ) -> Result<String> {
+    ) -> Result<crate::meet::MeetCreateResult> {
         // Element Call rooms are persistent (joinable any time),
         // so the calendar event's start/duration are ignored.
         let homeserver = account.meet_url.trim();
@@ -405,15 +440,32 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = match crate::oauth::load_tokens(&account.id)? {
-            Some(t) => t.access_token,
-            None => {
-                return Err(Error::Other(
-                    "Matrix: no access token in keyring; sign in again".into(),
-                ));
-            }
-        };
+        let access_token = load_access_token(account)?;
         create_call(homeserver, &access_token, name, None).await
+    }
+
+    async fn delete_meeting(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+    ) -> Result<()> {
+        let homeserver = account.meet_url.trim();
+        if homeserver.is_empty() {
+            return Err(Error::Other(
+                "Matrix: account has no homeserver URL configured".into(),
+            ));
+        }
+        let access_token = load_access_token(account)?;
+        leave_room(homeserver, &access_token, meeting_id).await
+    }
+}
+
+fn load_access_token(account: &crate::db::accounts::AccountFull) -> Result<String> {
+    match crate::oauth::load_tokens(&account.id)? {
+        Some(t) => Ok(t.access_token),
+        None => Err(Error::Other(
+            "Matrix: no access token in keyring; sign in again".into(),
+        )),
     }
 }
 

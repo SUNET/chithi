@@ -196,6 +196,24 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_bindings_account ON service_bindings(account_id);
 
+        -- Local link between a calendar event and a video-conferencing
+        -- meeting created via the meet integrations (#148). Keyed on
+        -- event_id so a single event has at most one meet binding;
+        -- ON DELETE CASCADE drops the binding when the event row goes,
+        -- which lets `delete_event` look the binding up *before* it
+        -- removes the event row and then call into the provider to
+        -- delete the remote meeting too. Survives normal resync (sync
+        -- updates `calendar_events` rows in place by remote_id rather
+        -- than DELETE+INSERT).
+        CREATE TABLE IF NOT EXISTS meet_meetings (
+            event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+            account_id TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            meeting_id TEXT NOT NULL,
+            join_url TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- FTS5 virtual table for fast message text search (quick filter)
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             subject,

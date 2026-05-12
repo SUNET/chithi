@@ -59,6 +59,11 @@ const meetAccountOptions = computed(() =>
 );
 const generatingMeetUrl = ref(false);
 const meetError = ref<string | null>(null);
+/** Provider handle for the meeting we just created in this form
+ * session. Persisted with the event on save so later edits /
+ * cancellations can act on the same remote room. Reset when the
+ * user replaces the meet URL (handled in `save()`). */
+const pendingMeetBinding = ref<import("@/lib/types").MeetBinding | null>(null);
 
 async function addVideoLink(accountId: string) {
   if (!accountId || generatingMeetUrl.value) return;
@@ -90,20 +95,21 @@ async function addVideoLink(accountId: string) {
       );
       durationMinutes = minutes;
     }
-    const url = await api.meetCreateUrl(
+    const binding = await api.meetCreateUrl(
       accountId,
       title.value || "Meeting",
       startIso,
       durationMinutes,
     );
-    // `location` is an <input type="text"> — newlines aren't
+    pendingMeetBinding.value = binding;
+    // `location` is an <input type="text">: newlines aren't
     // preserved there, so we replace the field outright rather
     // than appending. The full link history lives in
     // `description` (a textarea), where multi-line works.
-    location.value = url;
+    location.value = binding.join_url;
     description.value = description.value
-      ? `Join: ${url}\n\n${description.value}`
-      : `Join: ${url}`;
+      ? `Join: ${binding.join_url}\n\n${description.value}`
+      : `Join: ${binding.join_url}`;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     meetError.value = `Could not create meeting: ${msg}`;
@@ -189,6 +195,17 @@ async function save() {
       ? `${endDate.value}T23:59:59Z`
       : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
+    // If the user blanked the location after we generated a meet
+    // link, treat the meeting as discarded so we don't bind a stale
+    // remote room to the saved event. The orphaned remote meeting
+    // is acceptable here for the same reason cancelling the form
+    // outright is.
+    const meetBinding =
+      pendingMeetBinding.value &&
+      location.value === pendingMeetBinding.value.join_url
+        ? pendingMeetBinding.value
+        : null;
+
     const eventId = await calendarStore.createEvent({
       account_id: accountId,
       calendar_id: calendarId.value,
@@ -201,6 +218,7 @@ async function save() {
       timezone: uiStore.displayTimezone,
       recurrence_rule: recurrenceRule.value,
       attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
+      meet_binding: meetBinding,
     });
 
     // Send invite emails if attendees were added

@@ -68,7 +68,7 @@ pub async fn create_meeting(
     topic: &str,
     start_time: Option<&str>,
     duration_minutes: Option<u32>,
-) -> Result<String> {
+) -> Result<crate::meet::MeetCreateResult> {
     let topic = if topic.trim().is_empty() {
         "Meeting"
     } else {
@@ -112,7 +112,83 @@ pub async fn create_meeting(
         .json()
         .await
         .map_err(|e| Error::Other(format!("zoom create_meeting parse: {}", e)))?;
-    Ok(payload.join_url)
+    // Zoom returns the meeting id as a JSON number (e.g. `1234567890`)
+    // or, on some account types, a string. Normalise to a string here
+    // so the meeting_id is comparable as a path segment when we later
+    // call DELETE / PATCH /v2/meetings/{id}.
+    let meeting_id = match &payload.id {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    Ok(crate::meet::MeetCreateResult {
+        join_url: payload.join_url,
+        meeting_id,
+    })
+}
+
+/// Delete a Zoom meeting. The 404-OK fallthrough handles the case
+/// where the user (or another client) already removed the meeting
+/// in Zoom's own UI: we still want the local cleanup to succeed.
+async fn api_delete_meeting(access_token: &str, meeting_id: &str) -> Result<()> {
+    let url = format!(
+        "https://api.zoom.us/v2/meetings/{}",
+        urlencoding::encode(meeting_id),
+    );
+    let resp = http_client()?
+        .delete(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("zoom delete_meeting request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 204 || status.as_u16() == 404 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "zoom delete_meeting: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
+}
+
+/// Patch a Zoom meeting's start time + duration. Pinned to UTC for
+/// the same reason as `create_meeting` (the caller hands us an ISO
+/// UTC timestamp). Returns Ok on 204 No Content, which is what
+/// Zoom emits on a successful PATCH.
+async fn api_update_meeting_schedule(
+    access_token: &str,
+    meeting_id: &str,
+    start_time: &str,
+    duration_minutes: u32,
+) -> Result<()> {
+    let url = format!(
+        "https://api.zoom.us/v2/meetings/{}",
+        urlencoding::encode(meeting_id),
+    );
+    let body = serde_json::json!({
+        "start_time": start_time,
+        "duration": duration_minutes,
+        "timezone": "UTC",
+    });
+    let resp = http_client()?
+        .patch(&url)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("zoom update_meeting request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 204 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "zoom update_meeting: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
 }
 
 /// Get a fresh Zoom access token for `account_id`, refreshing
@@ -152,8 +228,28 @@ impl crate::meet::MeetProvider for ZoomProvider {
         name: &str,
         start_time: Option<&str>,
         duration_minutes: Option<u32>,
-    ) -> Result<String> {
+    ) -> Result<crate::meet::MeetCreateResult> {
         let access_token = get_access_token(&account.id).await?;
         create_meeting(&access_token, name, start_time, duration_minutes).await
+    }
+
+    async fn delete_meeting(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+    ) -> Result<()> {
+        let access_token = get_access_token(&account.id).await?;
+        api_delete_meeting(&access_token, meeting_id).await
+    }
+
+    async fn reschedule_meeting(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+        start_time: &str,
+        duration_minutes: u32,
+    ) -> Result<()> {
+        let access_token = get_access_token(&account.id).await?;
+        api_update_meeting_schedule(&access_token, meeting_id, start_time, duration_minutes).await
     }
 }

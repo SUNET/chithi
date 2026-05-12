@@ -585,8 +585,11 @@ export async function meetZoomLoginComplete(
 }
 
 /// Provider-agnostic create — picks the registry entry matching
-/// the account's meet binding. Returns the join URL the event
-/// editor should drop into the event's location field.
+/// the account's meet binding. Returns the join URL plus the
+/// provider-specific meeting id and the account/protocol used, so
+/// the caller can store the binding alongside its calendar event
+/// and later trigger a reschedule or delete on the same remote
+/// meeting.
 ///
 /// `startTime` (ISO 8601 UTC) and `durationMinutes` are passed
 /// through to time-bound providers like Zoom so the meeting lands
@@ -597,7 +600,7 @@ export async function meetCreateUrl(
   name: string,
   startTime?: string,
   durationMinutes?: number,
-): Promise<string> {
+): Promise<import("./types").MeetBinding> {
   return invoke("meet_create_url", {
     accountId,
     name,
