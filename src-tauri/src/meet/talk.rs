@@ -212,6 +212,45 @@ pub async fn create_room(
     })
 }
 
+/// Rename an existing Talk conversation. Implemented against the
+/// OCS Spreed v4 rename endpoint (PUT /room/{token}), which takes
+/// a single `roomName` form field. 404 means the room is already
+/// gone, in which case the rename is a no-op from our perspective.
+pub async fn rename_room(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+    new_name: &str,
+) -> Result<()> {
+    let base = normalize_base_url(server);
+    let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room/{}", base, token);
+    let name = if new_name.trim().is_empty() {
+        "Meeting"
+    } else {
+        new_name
+    };
+    let resp = http_client()?
+        .put(&url)
+        .basic_auth(login_name, Some(app_password))
+        .header("OCS-APIRequest", "true")
+        .header("Accept", "application/json")
+        .form(&[("roomName", name)])
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("talk rename_room request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "talk rename_room: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
+}
+
 /// Delete a Talk conversation by token. Same auth pair as
 /// `create_room`. Treats 404 as success: the conversation was
 /// already gone (deleted from a Talk web client, etc.), and the
@@ -296,6 +335,22 @@ impl crate::meet::MeetProvider for TalkProvider {
         }
         let app_password = load_app_password(account)?;
         delete_room(url, &account.username, &app_password, meeting_id).await
+    }
+
+    async fn update_topic(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+        topic: &str,
+    ) -> Result<()> {
+        let url = account.meet_url.trim();
+        if url.is_empty() {
+            return Err(Error::Other(
+                "Nextcloud Talk: account has no server URL configured".into(),
+            ));
+        }
+        let app_password = load_app_password(account)?;
+        rename_room(url, &account.username, &app_password, meeting_id, topic).await
     }
 }
 

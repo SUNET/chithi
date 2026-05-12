@@ -717,8 +717,43 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         }
     }
 
+    // Re-apply the event title to the meet provider's meeting topic.
+    // The frontend creates the meeting at "Add video link" time, when
+    // the title input is often still empty, so the remote room ends
+    // up named "Meeting" until we sync the final title here.
+    if let Some(ref b) = meet_binding {
+        sync_meet_topic(&state, b, &cal_event.title).await;
+    }
+
     log::info!("create_event: created event id={}", id);
     Ok(id)
+}
+
+/// Push the event title back to the meet provider as the meeting's
+/// topic. Best-effort: a provider failure logs but doesn't abort the
+/// event save. Lives here so both `create_event` and `update_event`
+/// share one rename code path.
+async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &str) {
+    let meet_account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &binding.account_id).ok()
+    };
+    let Some(acc) = meet_account else {
+        return;
+    };
+    let Some(provider) = meet::provider_for(&acc) else {
+        return;
+    };
+    log::info!(
+        "sync_meet_topic: {} meeting {} -> '{}'",
+        binding.protocol, binding.meeting_id, title,
+    );
+    if let Err(e) = provider
+        .update_topic(&acc, &binding.meeting_id, title)
+        .await
+    {
+        log::warn!("sync_meet_topic: provider update_topic failed: {}", e);
+    }
 }
 
 #[tauri::command]
@@ -734,6 +769,7 @@ pub async fn update_event(
     let mut existing = db::calendar::get_event(&conn, &event_id)?;
     let prev_start = existing.start_time.clone();
     let prev_end = existing.end_time.clone();
+    let prev_title = existing.title.clone();
 
     if let Some(calendar_id) = event.calendar_id {
         existing.calendar_id = calendar_id;
@@ -900,6 +936,28 @@ pub async fn update_event(
             }
         }
         // JMAP update is handled by existing code path via update_calendar_event
+    }
+
+    // Sync title to meet provider when the title changed, or a new
+    // binding was just attached (the user may have clicked "Add
+    // video link" with an empty title). Cheaper to look the binding
+    // up fresh than to pipe one through from the writer scope above.
+    let title_changed = prev_title != existing.title;
+    let just_attached = event.meet_binding.is_some();
+    if title_changed || just_attached {
+        let binding = {
+            let conn = state.db.reader();
+            db::meet_meetings::get(&conn, &event_id)?
+        };
+        if let Some(b) = binding {
+            let input = MeetBindingInput {
+                account_id: b.account_id,
+                protocol: b.protocol,
+                meeting_id: b.meeting_id,
+                join_url: b.join_url,
+            };
+            sync_meet_topic(&state, &input, &existing.title).await;
+        }
     }
 
     Ok(())

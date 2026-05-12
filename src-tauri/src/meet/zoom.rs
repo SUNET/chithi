@@ -157,6 +157,37 @@ async fn api_delete_meeting(access_token: &str, meeting_id: &str) -> Result<()> 
 /// the same reason as `create_meeting` (the caller hands us an ISO
 /// UTC timestamp). Returns Ok on 204 No Content, which is what
 /// Zoom emits on a successful PATCH.
+/// Rename a Zoom meeting. Same endpoint as the schedule PATCH but
+/// with only the `topic` field set. Needs `meeting:update:meeting`.
+async fn api_update_meeting_topic(
+    access_token: &str,
+    meeting_id: &str,
+    topic: &str,
+) -> Result<()> {
+    let url = format!(
+        "https://api.zoom.us/v2/meetings/{}",
+        urlencoding::encode(meeting_id),
+    );
+    let body = serde_json::json!({ "topic": topic });
+    let resp = http_client()?
+        .patch(&url)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("zoom update_topic request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 204 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "zoom update_topic: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
+}
+
 async fn api_update_meeting_schedule(
     access_token: &str,
     meeting_id: &str,
@@ -251,5 +282,15 @@ impl crate::meet::MeetProvider for ZoomProvider {
     ) -> Result<()> {
         let access_token = get_access_token(&account.id).await?;
         api_update_meeting_schedule(&access_token, meeting_id, start_time, duration_minutes).await
+    }
+
+    async fn update_topic(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+        topic: &str,
+    ) -> Result<()> {
+        let access_token = get_access_token(&account.id).await?;
+        api_update_meeting_topic(&access_token, meeting_id, topic).await
     }
 }

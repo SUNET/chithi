@@ -93,6 +93,19 @@ pub trait MeetProvider: Send + Sync {
     /// doesn't strand the event in an undeletable state.
     async fn delete_meeting(&self, account: &AccountFull, meeting_id: &str) -> Result<()>;
 
+    /// Rename the remote meeting's title / topic. Called after
+    /// create_event / update_event because the user typically
+    /// clicks "Add video link" *before* typing the event title, so
+    /// the title we sent to create_url was empty (and the provider
+    /// defaulted to "Meeting"). Re-applying on save keeps the
+    /// remote room's name in sync with the calendar event.
+    async fn update_topic(
+        &self,
+        account: &AccountFull,
+        meeting_id: &str,
+        topic: &str,
+    ) -> Result<()>;
+
     /// Move an existing meeting to a new start time + duration.
     /// Default impl is a no-op so persistent-room providers
     /// (Talk, Matrix) inherit the right behaviour: their rooms
