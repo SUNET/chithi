@@ -36,6 +36,7 @@
 //! string.
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::db::accounts::AccountFull;
 use crate::error::Result;
@@ -43,6 +44,16 @@ use crate::error::Result;
 pub mod matrix;
 pub mod talk;
 pub mod zoom;
+
+/// What `create_url` hands back. The join URL is what goes on the
+/// calendar event; `meeting_id` is the provider-specific handle the
+/// app remembers so it can later reschedule or delete the same
+/// remote meeting (Zoom numeric id, Talk room token, Matrix room id).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeetCreateResult {
+    pub join_url: String,
+    pub meeting_id: String,
+}
 
 /// Common surface every meet provider exposes once an account has
 /// been authenticated. Auth flow stays per-provider because each
@@ -73,7 +84,29 @@ pub trait MeetProvider: Send + Sync {
         name: &str,
         start_time: Option<&str>,
         duration_minutes: Option<u32>,
-    ) -> Result<String>;
+    ) -> Result<MeetCreateResult>;
+
+    /// Delete the remote meeting identified by `meeting_id`. Called
+    /// when the calendar event is cancelled (or replaced). Errors
+    /// surface to the caller; the caller logs and proceeds with the
+    /// local cleanup either way so a transient provider failure
+    /// doesn't strand the event in an undeletable state.
+    async fn delete_meeting(&self, account: &AccountFull, meeting_id: &str) -> Result<()>;
+
+    /// Move an existing meeting to a new start time + duration.
+    /// Default impl is a no-op so persistent-room providers
+    /// (Talk, Matrix) inherit the right behaviour: their rooms
+    /// aren't time-bound, so a date change on the calendar event
+    /// doesn't require touching the provider.
+    async fn reschedule_meeting(
+        &self,
+        _account: &AccountFull,
+        _meeting_id: &str,
+        _start_time: &str,
+        _duration_minutes: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Static set of providers compiled into this build. Adding a new

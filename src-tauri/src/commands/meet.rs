@@ -415,11 +415,21 @@ pub async fn meet_zoom_login_complete(
 }
 
 /// Provider-agnostic create. Looks up the account, finds its meet
-/// provider via the registry, and returns the join URL. The event
-/// editor calls this with the event's title as `name` plus, when
-/// known, the event's `start_time` (ISO 8601 UTC) and
-/// `duration_minutes` so time-bound providers like Zoom can land
-/// the meeting on the right day instead of defaulting to today.
+/// provider via the registry, and returns the join URL plus the
+/// provider-specific meeting id and the account/protocol used —
+/// the frontend stashes these alongside the form state so the
+/// matching `create_event` / `update_event` call can persist a
+/// `meet_meetings` binding row. The binding is what lets
+/// `delete_event` know which remote meeting to cancel and
+/// `update_event` know which one to reschedule.
+#[derive(Debug, Serialize)]
+pub struct MeetCreateResponse {
+    pub account_id: String,
+    pub protocol: String,
+    pub meeting_id: String,
+    pub join_url: String,
+}
+
 #[tauri::command]
 pub async fn meet_create_url(
     state: State<'_, AppState>,
@@ -427,7 +437,7 @@ pub async fn meet_create_url(
     name: String,
     start_time: Option<String>,
     duration_minutes: Option<u32>,
-) -> Result<String> {
+) -> Result<MeetCreateResponse> {
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
@@ -435,9 +445,16 @@ pub async fn meet_create_url(
     let provider = meet::provider_for(&account).ok_or_else(|| {
         Error::Other(format!("account {} has no usable meet binding", account_id))
     })?;
-    provider
+    let protocol = provider.protocol().to_string();
+    let res = provider
         .create_url(&account, &name, start_time.as_deref(), duration_minutes)
-        .await
+        .await?;
+    Ok(MeetCreateResponse {
+        account_id: account.id,
+        protocol,
+        meeting_id: res.meeting_id,
+        join_url: res.join_url,
+    })
 }
 
 /// Strip scheme + path from a URL for use as a fallback display
