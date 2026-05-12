@@ -112,9 +112,16 @@ pub const MICROSOFT_GRAPH_SCOPES: &str =
 /// `redirect_host` is `127.0.0.1` while Microsoft demands
 /// `localhost`.
 ///
-/// Scope is the granular `meeting:write:meeting` (create user
-/// meetings) — must match what's checked under Marketplace →
-/// Scopes → Meeting on the registered app.
+/// Scopes are Zoom's granular set:
+/// - `meeting:write:meeting` for `POST /v2/users/me/meetings` (create)
+/// - `meeting:update:meeting` for `PATCH /v2/meetings/{id}` (reschedule on event move)
+/// - `meeting:delete:meeting` for `DELETE /v2/meetings/{id}` (cancel on event delete)
+///
+/// All three must be checked under Marketplace, Scopes, Meeting on
+/// the registered app. Adding a scope after the app is already
+/// published forces existing users to re-authorize; without that,
+/// the access token keeps the old narrower scope set and the
+/// PATCH/DELETE calls 401.
 pub const ZOOM: OAuthProvider = OAuthProvider {
     name: "zoom",
     // Build-time override via `CHITHI_ZOOM_CLIENT_ID`. The baked-
@@ -130,7 +137,11 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
     client_secret: "", // Public client — PKCE only
     auth_url: "https://zoom.us/oauth/authorize",
     token_url: "https://zoom.us/oauth/token",
-    scopes: &["meeting:write:meeting"],
+    scopes: &[
+        "meeting:write:meeting",
+        "meeting:update:meeting",
+        "meeting:delete:meeting",
+    ],
     use_pkce: true,
     redirect_host: "127.0.0.1",
     // Pinned port that the local listener binds to. The bounce
