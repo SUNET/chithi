@@ -224,7 +224,11 @@ pub async fn rename_room(
     new_name: &str,
 ) -> Result<()> {
     let base = normalize_base_url(server);
-    let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room/{}", base, token);
+    let url = format!(
+        "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
+        base,
+        urlencoding::encode(token),
+    );
     let name = if new_name.trim().is_empty() {
         "Meeting"
     } else {
@@ -262,7 +266,11 @@ pub async fn delete_room(
     token: &str,
 ) -> Result<()> {
     let base = normalize_base_url(server);
-    let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room/{}", base, token);
+    let url = format!(
+        "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
+        base,
+        urlencoding::encode(token),
+    );
     let resp = http_client()?
         .delete(&url)
         .basic_auth(login_name, Some(app_password))
