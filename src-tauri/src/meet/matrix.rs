@@ -364,6 +364,46 @@ pub async fn create_call(
     })
 }
 
+/// Update the room's display name. Matrix tracks the title as the
+/// `m.room.name` state event, so renaming = PUT a new state event
+/// with the new name. 403 (no power level) and 404 (room gone) are
+/// treated as success: the rename is best-effort.
+pub async fn rename_room(
+    homeserver: &str,
+    access_token: &str,
+    room_id: &str,
+    new_name: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/_matrix/client/v3/rooms/{}/state/m.room.name",
+        normalize_base_url(homeserver),
+        urlencoding::encode(room_id),
+    );
+    let name = if new_name.trim().is_empty() {
+        "Meeting"
+    } else {
+        new_name
+    };
+    let body = serde_json::json!({ "name": name });
+    let resp = http_client()?
+        .put(&url)
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("matrix rename_room request: {}", e)))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 403 || status.as_u16() == 404 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(Error::Other(format!(
+        "matrix rename_room: {} ({})",
+        status,
+        body.chars().take(500).collect::<String>(),
+    )))
+}
+
 /// Leave a Matrix room the app created via `create_call`. Matrix
 /// has no "delete room" API (rooms outlive everyone in them), but
 /// leaving drops the room from this user's room list — which is
@@ -457,6 +497,22 @@ impl crate::meet::MeetProvider for MatrixProvider {
         }
         let access_token = load_access_token(account)?;
         leave_room(homeserver, &access_token, meeting_id).await
+    }
+
+    async fn update_topic(
+        &self,
+        account: &crate::db::accounts::AccountFull,
+        meeting_id: &str,
+        topic: &str,
+    ) -> Result<()> {
+        let homeserver = account.meet_url.trim();
+        if homeserver.is_empty() {
+            return Err(Error::Other(
+                "Matrix: account has no homeserver URL configured".into(),
+            ));
+        }
+        let access_token = load_access_token(account)?;
+        rename_room(homeserver, &access_token, meeting_id, topic).await
     }
 }
 
