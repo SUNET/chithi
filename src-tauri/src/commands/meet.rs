@@ -416,12 +416,17 @@ pub async fn meet_zoom_login_complete(
 
 /// Provider-agnostic create. Looks up the account, finds its meet
 /// provider via the registry, and returns the join URL. The event
-/// editor calls this with the event's title as `name`.
+/// editor calls this with the event's title as `name` plus, when
+/// known, the event's `start_time` (ISO 8601 UTC) and
+/// `duration_minutes` so time-bound providers like Zoom can land
+/// the meeting on the right day instead of defaulting to today.
 #[tauri::command]
 pub async fn meet_create_url(
     state: State<'_, AppState>,
     account_id: String,
     name: String,
+    start_time: Option<String>,
+    duration_minutes: Option<u32>,
 ) -> Result<String> {
     let account = {
         let conn = state.db.reader();
@@ -430,7 +435,9 @@ pub async fn meet_create_url(
     let provider = meet::provider_for(&account).ok_or_else(|| {
         Error::Other(format!("account {} has no usable meet binding", account_id))
     })?;
-    provider.create_url(&account, &name).await
+    provider
+        .create_url(&account, &name, start_time.as_deref(), duration_minutes)
+        .await
 }
 
 /// Strip scheme + path from a URL for use as a fallback display

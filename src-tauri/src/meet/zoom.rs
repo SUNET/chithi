@@ -56,17 +56,25 @@ struct CreateMeetingResponse {
 /// Zoom (visible in the user's meeting list); we pick a default
 /// when the caller hands us an empty string.
 ///
-/// `type=2` is "scheduled meeting"; we leave `start_time` and
-/// `duration` unset so the meeting is open-ended (Zoom treats it
-/// as joinable any time today). A future iteration could plumb
-/// the calendar event's `start` / `end` through.
-pub async fn create_meeting(access_token: &str, topic: &str) -> Result<String> {
+/// `type=2` is "scheduled meeting". When `start_time` is supplied
+/// it goes through verbatim (must be ISO 8601 UTC like
+/// `2026-05-12T14:00:00Z`) so the meeting lands on the host's
+/// schedule on the right day. Without it, Zoom treats the meeting
+/// as joinable any time today, which is what made every meeting
+/// show up as scheduled for today regardless of the calendar
+/// event's date.
+pub async fn create_meeting(
+    access_token: &str,
+    topic: &str,
+    start_time: Option<&str>,
+    duration_minutes: Option<u32>,
+) -> Result<String> {
     let topic = if topic.trim().is_empty() {
         "Meeting"
     } else {
         topic
     };
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "topic": topic,
         "type": 2,
         "settings": {
@@ -74,6 +82,16 @@ pub async fn create_meeting(access_token: &str, topic: &str) -> Result<String> {
             "waiting_room": false,
         },
     });
+    if let Some(start) = start_time {
+        body["start_time"] = serde_json::Value::String(start.to_string());
+        // `start_time` ending in `Z` is GMT per Zoom's API. Pin
+        // `timezone` to UTC so Zoom doesn't reinterpret the slot
+        // against the account's default zone.
+        body["timezone"] = serde_json::Value::String("UTC".to_string());
+    }
+    if let Some(minutes) = duration_minutes {
+        body["duration"] = serde_json::Value::Number(minutes.into());
+    }
     let resp = http_client()?
         .post("https://api.zoom.us/v2/users/me/meetings")
         .bearer_auth(access_token)
@@ -132,8 +150,10 @@ impl crate::meet::MeetProvider for ZoomProvider {
         &self,
         account: &crate::db::accounts::AccountFull,
         name: &str,
+        start_time: Option<&str>,
+        duration_minutes: Option<u32>,
     ) -> Result<String> {
         let access_token = get_access_token(&account.id).await?;
-        create_meeting(&access_token, name).await
+        create_meeting(&access_token, name, start_time, duration_minutes).await
     }
 }

@@ -61,9 +61,19 @@ pub trait MeetProvider: Send + Sync {
 
     /// Create a fresh meeting room / call and return the join URL
     /// the user should put on their calendar event. The caller
-    /// supplies a hint name (often the event title); each provider
-    /// decides whether and how to pass it through.
-    async fn create_url(&self, account: &AccountFull, name: &str) -> Result<String>;
+    /// supplies a hint name (often the event title) plus optional
+    /// `start_time` (ISO 8601 UTC, e.g. `2026-05-12T14:00:00Z`) and
+    /// `duration_minutes`; each provider decides whether to pass
+    /// them through. Persistent-room providers (Talk, Matrix) ignore
+    /// the time inputs; time-bound providers (Zoom) include them so
+    /// the meeting lands on the correct slot in the host's schedule.
+    async fn create_url(
+        &self,
+        account: &AccountFull,
+        name: &str,
+        start_time: Option<&str>,
+        duration_minutes: Option<u32>,
+    ) -> Result<String>;
 }
 
 /// Static set of providers compiled into this build. Adding a new

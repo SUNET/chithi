@@ -65,7 +65,37 @@ async function addVideoLink(accountId: string) {
   generatingMeetUrl.value = true;
   meetError.value = null;
   try {
-    const url = await api.meetCreateUrl(accountId, title.value || "Meeting");
+    // Pass the event's start + duration so time-bound providers
+    // (Zoom) schedule the meeting on the event's day, not today.
+    // All-day events don't have a meaningful start/duration to
+    // send, so we omit both and let the provider fall back to its
+    // default (Zoom: open-ended for today).
+    let startIso: string | undefined;
+    let durationMinutes: number | undefined;
+    if (!allDay.value) {
+      const startUTC = localInputToUTC(
+        startDate.value,
+        startTime.value,
+        uiStore.displayTimezone,
+      );
+      const endUTC = localInputToUTC(
+        endDate.value,
+        endTime.value,
+        uiStore.displayTimezone,
+      );
+      startIso = startUTC;
+      const minutes = Math.max(
+        1,
+        Math.round((new Date(endUTC).getTime() - new Date(startUTC).getTime()) / 60000),
+      );
+      durationMinutes = minutes;
+    }
+    const url = await api.meetCreateUrl(
+      accountId,
+      title.value || "Meeting",
+      startIso,
+      durationMinutes,
+    );
     // `location` is an <input type="text"> — newlines aren't
     // preserved there, so we replace the field outright rather
     // than appending. The full link history lives in
