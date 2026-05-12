@@ -231,7 +231,11 @@ impl crate::meet::MeetProvider for TalkProvider {
         &self,
         account: &crate::db::accounts::AccountFull,
         name: &str,
+        _start_time: Option<&str>,
+        _duration_minutes: Option<u32>,
     ) -> Result<String> {
+        // Talk conversations are persistent rooms, not time-bound
+        // slots, so the calendar event's start/duration are ignored.
         let url = account.meet_url.trim();
         if url.is_empty() {
             return Err(Error::Other(

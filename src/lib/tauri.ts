@@ -587,11 +587,23 @@ export async function meetZoomLoginComplete(
 /// Provider-agnostic create — picks the registry entry matching
 /// the account's meet binding. Returns the join URL the event
 /// editor should drop into the event's location field.
+///
+/// `startTime` (ISO 8601 UTC) and `durationMinutes` are passed
+/// through to time-bound providers like Zoom so the meeting lands
+/// on the event's day rather than defaulting to "today". Persistent
+/// room providers (Talk, Matrix) ignore them.
 export async function meetCreateUrl(
   accountId: string,
   name: string,
+  startTime?: string,
+  durationMinutes?: number,
 ): Promise<string> {
-  return invoke("meet_create_url", { accountId, name });
+  return invoke("meet_create_url", {
+    accountId,
+    name,
+    startTime: startTime ?? null,
+    durationMinutes: durationMinutes ?? null,
+  });
 }
 
 // IDLE

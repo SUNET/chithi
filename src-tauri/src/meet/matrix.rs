@@ -394,7 +394,11 @@ impl crate::meet::MeetProvider for MatrixProvider {
         &self,
         account: &crate::db::accounts::AccountFull,
         name: &str,
+        _start_time: Option<&str>,
+        _duration_minutes: Option<u32>,
     ) -> Result<String> {
+        // Element Call rooms are persistent (joinable any time),
+        // so the calendar event's start/duration are ignored.
         let homeserver = account.meet_url.trim();
         if homeserver.is_empty() {
             return Err(Error::Other(
