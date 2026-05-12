@@ -153,17 +153,9 @@ async fn api_delete_meeting(access_token: &str, meeting_id: &str) -> Result<()> 
     )))
 }
 
-/// Patch a Zoom meeting's start time + duration. Pinned to UTC for
-/// the same reason as `create_meeting` (the caller hands us an ISO
-/// UTC timestamp). Returns Ok on 204 No Content, which is what
-/// Zoom emits on a successful PATCH.
 /// Rename a Zoom meeting. Same endpoint as the schedule PATCH but
 /// with only the `topic` field set. Needs `meeting:update:meeting`.
-async fn api_update_meeting_topic(
-    access_token: &str,
-    meeting_id: &str,
-    topic: &str,
-) -> Result<()> {
+async fn api_update_meeting_topic(access_token: &str, meeting_id: &str, topic: &str) -> Result<()> {
     let url = format!(
         "https://api.zoom.us/v2/meetings/{}",
         urlencoding::encode(meeting_id),
@@ -188,6 +180,10 @@ async fn api_update_meeting_topic(
     )))
 }
 
+/// Patch a Zoom meeting's start time + duration. Pinned to UTC for
+/// the same reason as `create_meeting` (the caller hands us an ISO
+/// UTC timestamp). Returns Ok on 204 No Content, which is what
+/// Zoom emits on a successful PATCH.
 async fn api_update_meeting_schedule(
     access_token: &str,
     meeting_id: &str,
