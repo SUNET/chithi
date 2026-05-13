@@ -550,13 +550,17 @@ impl ImapConnection {
     /// Set or unset flags on messages.
     ///
     /// If `add` is true, adds the flags (+FLAGS); otherwise removes them (-FLAGS).
+    /// Well-known system flag names (case-insensitive, with or without a leading
+    /// `\`) are translated to their canonical wire form (e.g. `seen` → `\Seen`).
+    /// Anything else is passed through verbatim as a user keyword.
     pub fn set_flags(&mut self, uids: &[u32], flags: &[&str], add: bool) -> Result<()> {
         if uids.is_empty() || flags.is_empty() {
             return Ok(());
         }
 
         let uid_set = uid_set_string(uids);
-        let flags_str = flags.join(" ");
+        let wire_flags: Vec<String> = flags.iter().map(|f| flag_to_wire(f)).collect();
+        let flags_str = wire_flags.join(" ");
         let action = if add { "+FLAGS" } else { "-FLAGS" };
         let store_cmd = format!("{} ({})", action, flags_str);
 
@@ -833,6 +837,59 @@ fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
         imap::types::Flag::Recent => "recent".to_string(),
         imap::types::Flag::MayCreate => "maycreate".to_string(),
         imap::types::Flag::Custom(s) => s.to_string(),
+    }
+}
+
+/// Convert a flag name to its IMAP wire form.
+///
+/// Callers (and our own local DB) store system flags in their lowercase,
+/// unprefixed form (`seen`, `answered`, ...). RFC 3501 STORE needs them
+/// as the system-flag tokens `\Seen`, `\Answered`, ... — sending the
+/// bare lowercase form creates a user keyword instead and trips the
+/// parser in `imap-proto` against some servers' responses.
+fn flag_to_wire(flag: &str) -> String {
+    let trimmed = flag.trim_start_matches('\\');
+    match trimmed.to_ascii_lowercase().as_str() {
+        "seen" => "\\Seen".to_string(),
+        "answered" => "\\Answered".to_string(),
+        "flagged" => "\\Flagged".to_string(),
+        "deleted" => "\\Deleted".to_string(),
+        "draft" => "\\Draft".to_string(),
+        "recent" => "\\Recent".to_string(),
+        _ => flag.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod flag_to_wire_tests {
+    use super::flag_to_wire;
+
+    #[test]
+    fn lowercase_system_flags_become_backslashed() {
+        assert_eq!(flag_to_wire("seen"), "\\Seen");
+        assert_eq!(flag_to_wire("answered"), "\\Answered");
+        assert_eq!(flag_to_wire("flagged"), "\\Flagged");
+        assert_eq!(flag_to_wire("deleted"), "\\Deleted");
+        assert_eq!(flag_to_wire("draft"), "\\Draft");
+        assert_eq!(flag_to_wire("recent"), "\\Recent");
+    }
+
+    #[test]
+    fn canonical_form_is_idempotent() {
+        assert_eq!(flag_to_wire("\\Seen"), "\\Seen");
+        assert_eq!(flag_to_wire("\\Flagged"), "\\Flagged");
+    }
+
+    #[test]
+    fn mixed_case_system_flag_is_normalized() {
+        assert_eq!(flag_to_wire("SEEN"), "\\Seen");
+        assert_eq!(flag_to_wire("Flagged"), "\\Flagged");
+    }
+
+    #[test]
+    fn user_keywords_pass_through_verbatim() {
+        assert_eq!(flag_to_wire("$Important"), "$Important");
+        assert_eq!(flag_to_wire("Junk"), "Junk");
     }
 }
 
