@@ -550,13 +550,30 @@ impl ImapConnection {
     /// Set or unset flags on messages.
     ///
     /// If `add` is true, adds the flags (+FLAGS); otherwise removes them (-FLAGS).
+    /// Well-known system flag names (case-insensitive, with or without a leading
+    /// `\`) are translated to their canonical wire form (e.g. `seen` → `\Seen`).
+    /// Anything else is passed through verbatim as a user keyword.
     pub fn set_flags(&mut self, uids: &[u32], flags: &[&str], add: bool) -> Result<()> {
         if uids.is_empty() || flags.is_empty() {
             return Ok(());
         }
 
         let uid_set = uid_set_string(uids);
-        let flags_str = flags.join(" ");
+        let wire_flags: Vec<String> = flags
+            .iter()
+            .filter(|f| {
+                if is_recent_flag(f) {
+                    log::warn!("IMAP set_flags: ignoring \\Recent (server-set only)");
+                    return false;
+                }
+                true
+            })
+            .map(|f| flag_to_wire(f))
+            .collect();
+        if wire_flags.is_empty() {
+            return Ok(());
+        }
+        let flags_str = wire_flags.join(" ");
         let action = if add { "+FLAGS" } else { "-FLAGS" };
         let store_cmd = format!("{} ({})", action, flags_str);
 
@@ -833,6 +850,86 @@ fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
         imap::types::Flag::Recent => "recent".to_string(),
         imap::types::Flag::MayCreate => "maycreate".to_string(),
         imap::types::Flag::Custom(s) => s.to_string(),
+    }
+}
+
+/// Convert a flag name to its IMAP wire form.
+///
+/// Callers (and our own local DB) store system flags in their lowercase,
+/// unprefixed form (`seen`, `answered`, ...). RFC 3501 STORE needs them
+/// as the system-flag tokens `\Seen`, `\Answered`, ... — sending the
+/// bare lowercase form creates a user keyword instead and trips the
+/// parser in `imap-proto` against some servers' responses.
+fn flag_to_wire(flag: &str) -> String {
+    let trimmed = flag.trim_start_matches('\\');
+    match trimmed.to_ascii_lowercase().as_str() {
+        "seen" => "\\Seen".to_string(),
+        "answered" => "\\Answered".to_string(),
+        "flagged" => "\\Flagged".to_string(),
+        "deleted" => "\\Deleted".to_string(),
+        "draft" => "\\Draft".to_string(),
+        // `\Recent` is server-set only per RFC 3501 §2.3.2 and cannot be
+        // modified via STORE. Don't map `recent` here so callers can still
+        // use it as a user keyword if they really want to.
+        _ => flag.to_string(),
+    }
+}
+
+/// True if `flag` refers to the server-managed `\Recent` system flag,
+/// which RFC 3501 §2.3.2 forbids modifying via STORE.
+fn is_recent_flag(flag: &str) -> bool {
+    flag.trim_start_matches('\\').eq_ignore_ascii_case("recent")
+}
+
+#[cfg(test)]
+mod flag_to_wire_tests {
+    use super::flag_to_wire;
+
+    #[test]
+    fn lowercase_system_flags_become_backslashed() {
+        assert_eq!(flag_to_wire("seen"), "\\Seen");
+        assert_eq!(flag_to_wire("answered"), "\\Answered");
+        assert_eq!(flag_to_wire("flagged"), "\\Flagged");
+        assert_eq!(flag_to_wire("deleted"), "\\Deleted");
+        assert_eq!(flag_to_wire("draft"), "\\Draft");
+    }
+
+    #[test]
+    fn recent_is_not_mapped() {
+        // RFC 3501 §2.3.2: `\Recent` is server-managed and cannot be set via
+        // STORE. Leave bare `recent` alone so callers can keep it as a user
+        // keyword if they explicitly want to.
+        assert_eq!(flag_to_wire("recent"), "recent");
+        assert_eq!(flag_to_wire("Recent"), "Recent");
+    }
+
+    #[test]
+    fn canonical_form_is_idempotent() {
+        assert_eq!(flag_to_wire("\\Seen"), "\\Seen");
+        assert_eq!(flag_to_wire("\\Flagged"), "\\Flagged");
+    }
+
+    #[test]
+    fn mixed_case_system_flag_is_normalized() {
+        assert_eq!(flag_to_wire("SEEN"), "\\Seen");
+        assert_eq!(flag_to_wire("Flagged"), "\\Flagged");
+    }
+
+    #[test]
+    fn user_keywords_pass_through_verbatim() {
+        assert_eq!(flag_to_wire("$Important"), "$Important");
+        assert_eq!(flag_to_wire("Junk"), "Junk");
+    }
+
+    #[test]
+    fn recent_detector_matches_canonical_and_bare_forms() {
+        use super::is_recent_flag;
+        assert!(is_recent_flag("\\Recent"));
+        assert!(is_recent_flag("Recent"));
+        assert!(is_recent_flag("recent"));
+        assert!(is_recent_flag("RECENT"));
+        assert!(!is_recent_flag("seen"));
+        assert!(!is_recent_flag("$Recent"));
     }
 }
 
