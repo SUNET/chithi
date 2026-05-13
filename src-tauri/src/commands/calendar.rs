@@ -2887,92 +2887,99 @@ pub async fn process_invite_reply(
         return Ok(());
     }
 
-    let conn = state.db.writer().await;
-    let account = db::accounts::get_account_full(&conn, &account_id)?;
+    // Phase 1: update local DB, collect any JMAP push we need to do
+    // afterwards. The writer guard is dropped at the end of this block
+    // so the JMAP network round-trip below doesn't block other writes.
+    struct JmapPush {
+        remote_id: String,
+        attendee_email: String,
+        status: String,
+    }
+    let (account, jmap_push) = {
+        let conn = state.db.writer().await;
+        let account = db::accounts::get_account_full(&conn, &account_id)?;
+        let mut jmap_push: Option<JmapPush> = None;
 
-    for reply in &reply_invites {
-        // Find the local event by UID
-        let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
-        let Some(event) = event else {
-            log::debug!("process_invite_reply: no local event for UID {}", reply.uid);
-            continue;
-        };
+        for reply in &reply_invites {
+            let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
+            let Some(event) = event else {
+                log::debug!("process_invite_reply: no local event for UID {}", reply.uid);
+                continue;
+            };
 
-        // Extract the respondent's email and status from the REPLY
-        for attendee in &reply.attendees {
-            let status = &attendee.status;
-            log::info!(
-                "process_invite_reply: {} responded '{}' to event '{}'",
-                attendee.email,
-                status,
-                event.title
-            );
+            for attendee in &reply.attendees {
+                let status = &attendee.status;
+                log::info!(
+                    "process_invite_reply: {} responded '{}' to event '{}'",
+                    attendee.email,
+                    status,
+                    event.title
+                );
 
-            // Update local attendees_json
-            if let Some(ref att_json) = event.attendees_json {
-                if let Ok(mut attendees) = serde_json::from_str::<Vec<serde_json::Value>>(att_json)
-                {
-                    for att in attendees.iter_mut() {
-                        if att["email"].as_str() == Some(&attendee.email) {
-                            att["status"] = serde_json::json!(status);
-                        }
-                    }
-                    let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
-                    conn.execute(
-                        "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
-                        rusqlite::params![updated_json, event.id],
-                    )
-                    .ok();
-                }
-            }
-
-            // Update on JMAP server if applicable
-            if account.calendar_protocol_str() == "jmap" {
-                if let Some(ref remote_id) = event.remote_id {
-                    let jmap_config =
-                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
-                    // Find participant key by matching email
-                    // We need to fetch the event to find the right participant key
-                    drop(conn);
-                    if let Ok(jmap_conn) =
-                        crate::mail::jmap::JmapConnection::connect(&jmap_config).await
+                if let Some(ref att_json) = event.attendees_json {
+                    if let Ok(mut attendees) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(att_json)
                     {
-                        // Fetch current event to find participant key
-                        if let Ok(events) =
-                            jmap_conn.fetch_calendar_events(&jmap_config, None).await
-                        {
-                            for ev in &events {
-                                if ev.id == *remote_id {
-                                    // Parse attendees to find the key
-                                    if let Some(ref aj) = ev.attendees_json {
-                                        if let Ok(atts) =
-                                            serde_json::from_str::<Vec<serde_json::Value>>(aj)
-                                        {
-                                            for (i, a) in atts.iter().enumerate() {
-                                                if a["email"].as_str() == Some(&attendee.email) {
-                                                    let key = format!("att{}", i);
-                                                    jmap_conn
-                                                        .update_participant_status(
-                                                            &jmap_config,
-                                                            remote_id,
-                                                            &key,
-                                                            status,
-                                                        )
-                                                        .await
-                                                        .ok();
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                        for att in attendees.iter_mut() {
+                            if att["email"].as_str() == Some(&attendee.email) {
+                                att["status"] = serde_json::json!(status);
                             }
                         }
+                        let updated_json = serde_json::to_string(&attendees).unwrap_or_default();
+                        conn.execute(
+                            "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
+                            rusqlite::params![updated_json, event.id],
+                        )
+                        .ok();
                     }
-                    return Ok(());
+                }
+
+                if account.calendar_protocol_str() == "jmap" && jmap_push.is_none() {
+                    if let Some(ref remote_id) = event.remote_id {
+                        jmap_push = Some(JmapPush {
+                            remote_id: remote_id.clone(),
+                            attendee_email: attendee.email.clone(),
+                            status: status.clone(),
+                        });
+                    }
                 }
             }
         }
+        (account, jmap_push)
+    };
+
+    // Phase 2: JMAP push without holding the DB writer.
+    if let Some(push) = jmap_push {
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        if let Ok(jmap_conn) = crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
+            if let Ok(events) = jmap_conn.fetch_calendar_events(&jmap_config, None).await {
+                for ev in &events {
+                    if ev.id != push.remote_id {
+                        continue;
+                    }
+                    let Some(ref aj) = ev.attendees_json else { continue };
+                    let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) else {
+                        continue;
+                    };
+                    for (i, a) in atts.iter().enumerate() {
+                        if a["email"].as_str() == Some(&push.attendee_email) {
+                            let key = format!("att{}", i);
+                            jmap_conn
+                                .update_participant_status(
+                                    &jmap_config,
+                                    &push.remote_id,
+                                    &key,
+                                    &push.status,
+                                )
+                                .await
+                                .ok();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
 
     // Notify frontend to refresh calendar UI
