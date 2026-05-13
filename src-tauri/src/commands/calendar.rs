@@ -2958,7 +2958,9 @@ pub async fn process_invite_reply(
                     let Some(ev) = events.iter().find(|e| e.id == push.remote_id) else {
                         continue;
                     };
-                    let Some(ref aj) = ev.attendees_json else { continue };
+                    let Some(ref aj) = ev.attendees_json else {
+                        continue;
+                    };
                     let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) else {
                         continue;
                     };
