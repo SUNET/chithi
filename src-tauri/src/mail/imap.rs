@@ -559,7 +559,20 @@ impl ImapConnection {
         }
 
         let uid_set = uid_set_string(uids);
-        let wire_flags: Vec<String> = flags.iter().map(|f| flag_to_wire(f)).collect();
+        let wire_flags: Vec<String> = flags
+            .iter()
+            .filter(|f| {
+                if is_recent_flag(f) {
+                    log::warn!("IMAP set_flags: ignoring \\Recent (server-set only)");
+                    return false;
+                }
+                true
+            })
+            .map(|f| flag_to_wire(f))
+            .collect();
+        if wire_flags.is_empty() {
+            return Ok(());
+        }
         let flags_str = wire_flags.join(" ");
         let action = if add { "+FLAGS" } else { "-FLAGS" };
         let store_cmd = format!("{} ({})", action, flags_str);
@@ -855,9 +868,17 @@ fn flag_to_wire(flag: &str) -> String {
         "flagged" => "\\Flagged".to_string(),
         "deleted" => "\\Deleted".to_string(),
         "draft" => "\\Draft".to_string(),
-        "recent" => "\\Recent".to_string(),
+        // `\Recent` is server-set only per RFC 3501 §2.3.2 and cannot be
+        // modified via STORE. Don't map `recent` here so callers can still
+        // use it as a user keyword if they really want to.
         _ => flag.to_string(),
     }
+}
+
+/// True if `flag` refers to the server-managed `\Recent` system flag,
+/// which RFC 3501 §2.3.2 forbids modifying via STORE.
+fn is_recent_flag(flag: &str) -> bool {
+    flag.trim_start_matches('\\').eq_ignore_ascii_case("recent")
 }
 
 #[cfg(test)]
@@ -871,7 +892,15 @@ mod flag_to_wire_tests {
         assert_eq!(flag_to_wire("flagged"), "\\Flagged");
         assert_eq!(flag_to_wire("deleted"), "\\Deleted");
         assert_eq!(flag_to_wire("draft"), "\\Draft");
-        assert_eq!(flag_to_wire("recent"), "\\Recent");
+    }
+
+    #[test]
+    fn recent_is_not_mapped() {
+        // RFC 3501 §2.3.2: `\Recent` is server-managed and cannot be set via
+        // STORE. Leave bare `recent` alone so callers can keep it as a user
+        // keyword if they explicitly want to.
+        assert_eq!(flag_to_wire("recent"), "recent");
+        assert_eq!(flag_to_wire("Recent"), "Recent");
     }
 
     #[test]
@@ -890,6 +919,17 @@ mod flag_to_wire_tests {
     fn user_keywords_pass_through_verbatim() {
         assert_eq!(flag_to_wire("$Important"), "$Important");
         assert_eq!(flag_to_wire("Junk"), "Junk");
+    }
+
+    #[test]
+    fn recent_detector_matches_canonical_and_bare_forms() {
+        use super::is_recent_flag;
+        assert!(is_recent_flag("\\Recent"));
+        assert!(is_recent_flag("Recent"));
+        assert!(is_recent_flag("recent"));
+        assert!(is_recent_flag("RECENT"));
+        assert!(!is_recent_flag("seen"));
+        assert!(!is_recent_flag("$Recent"));
     }
 }
 
