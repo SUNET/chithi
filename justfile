@@ -148,7 +148,7 @@ build-deb base_image="debian:13":
     docker rm "$CONTAINER_ID"
 
     # Rename DEB files to include distro name
-    distro_tag=$(echo "$DISTRO_NAME" | tr '-' '')
+    distro_tag=$(echo "$DISTRO_NAME" | tr -d '-')
     for f in "$OUTPUT_DIR"/*.deb; do
         [ -f "$f" ] || continue
         basename=$(basename "$f")

@@ -226,10 +226,14 @@ pub async fn send_message(
         match result {
             Ok(()) => {
                 log::info!("Message sent successfully for account {}", account_id_bg);
-                // Remove from outbox on success
-                let conn = db_bg.writer().await;
-                if let Err(e) = crate::ops::offline::mark_completed(&conn, outbox_id) {
-                    log::warn!("Failed to remove sent message from outbox: {}", e);
+                // Each writer acquire is scoped: shadowing the previous
+                // `conn` would NOT drop the old guard before the new
+                // `lock().await`, self-deadlocking on the same mutex.
+                {
+                    let conn = db_bg.writer().await;
+                    if let Err(e) = crate::ops::offline::mark_completed(&conn, outbox_id) {
+                        log::warn!("Failed to remove sent message from outbox: {}", e);
+                    }
                 }
                 app_bg
                     .emit(
@@ -242,11 +246,14 @@ pub async fn send_message(
                     .ok();
 
                 // Auto-collect recipients to "Collected Contacts"
-                let conn = db_bg.writer().await;
-                for addr in &recipients {
-                    if let Err(e) = db::contacts::collect_contact(&conn, &account_id_bg, addr, None)
-                    {
-                        log::warn!("Failed to collect contact '{}': {}", addr, e);
+                {
+                    let conn = db_bg.writer().await;
+                    for addr in &recipients {
+                        if let Err(e) =
+                            db::contacts::collect_contact(&conn, &account_id_bg, addr, None)
+                        {
+                            log::warn!("Failed to collect contact '{}': {}", addr, e);
+                        }
                     }
                 }
             }
