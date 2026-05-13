@@ -2895,10 +2895,10 @@ pub async fn process_invite_reply(
         attendee_email: String,
         status: String,
     }
-    let (account, jmap_push) = {
+    let (account, jmap_pushes) = {
         let conn = state.db.writer().await;
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let mut jmap_push: Option<JmapPush> = None;
+        let mut jmap_pushes: Vec<JmapPush> = Vec::new();
 
         for reply in &reply_invites {
             let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
@@ -2934,9 +2934,9 @@ pub async fn process_invite_reply(
                     }
                 }
 
-                if account.calendar_protocol_str() == "jmap" && jmap_push.is_none() {
+                if account.calendar_protocol_str() == "jmap" {
                     if let Some(ref remote_id) = event.remote_id {
-                        jmap_push = Some(JmapPush {
+                        jmap_pushes.push(JmapPush {
                             remote_id: remote_id.clone(),
                             attendee_email: attendee.email.clone(),
                             status: status.clone(),
@@ -2945,18 +2945,19 @@ pub async fn process_invite_reply(
                 }
             }
         }
-        (account, jmap_push)
+        (account, jmap_pushes)
     };
 
-    // Phase 2: JMAP push without holding the DB writer.
-    if let Some(push) = jmap_push {
+    // Phase 2: JMAP push without holding the DB writer. Each REPLY component
+    // gets pushed; one fetch_calendar_events round-trip is reused for all.
+    if !jmap_pushes.is_empty() {
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         if let Ok(jmap_conn) = crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
             if let Ok(events) = jmap_conn.fetch_calendar_events(&jmap_config, None).await {
-                for ev in &events {
-                    if ev.id != push.remote_id {
+                for push in &jmap_pushes {
+                    let Some(ev) = events.iter().find(|e| e.id == push.remote_id) else {
                         continue;
-                    }
+                    };
                     let Some(ref aj) = ev.attendees_json else { continue };
                     let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) else {
                         continue;
@@ -2979,10 +2980,10 @@ pub async fn process_invite_reply(
                 }
             }
         }
-        return Ok(());
     }
 
-    // Notify frontend to refresh calendar UI
+    // Notify frontend to refresh calendar UI. Runs regardless of whether
+    // a JMAP push happened, since phase 1 always updated the local DB.
     use tauri::Emitter as _;
     app.emit("calendar-changed", account_id.as_str()).ok();
 
