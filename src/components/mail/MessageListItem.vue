@@ -133,7 +133,11 @@ function onPointerUp() {
     :class="{ active, selected, unread: isUnread(message.flags) }"
     @dblclick="emit('open')"
   >
-    <div class="col col-check">
+    <div
+      class="col col-check"
+      data-testid="msg-check-cell"
+      @click.stop="emit('toggle')"
+    >
       <input
         type="checkbox"
         class="row-checkbox"
@@ -311,12 +315,14 @@ function onPointerUp() {
 }
 
 .col-check {
-  width: 20px;
+  width: 28px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  cursor: pointer;
+  align-self: stretch;
 }
 
 .row-checkbox {
