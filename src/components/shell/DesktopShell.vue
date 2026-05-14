@@ -5,6 +5,7 @@ import Sidebar from "@/components/common/Sidebar.vue";
 import MenuBar from "@/components/common/MenuBar.vue";
 import StatusBar from "@/components/common/StatusBar.vue";
 import OperationsPanel from "@/components/common/OperationsPanel.vue";
+import LinkPopup from "@/components/common/LinkPopup.vue";
 
 const route = useRoute();
 
@@ -17,6 +18,7 @@ const isStandaloneWindow = computed(
 <template>
   <div v-if="isStandaloneWindow" class="standalone-shell">
     <router-view />
+    <LinkPopup />
   </div>
 
   <div v-else class="app-shell">
@@ -38,6 +40,7 @@ const isStandaloneWindow = computed(
       <OperationsPanel />
       <StatusBar />
     </div>
+    <LinkPopup />
   </div>
 </template>
 

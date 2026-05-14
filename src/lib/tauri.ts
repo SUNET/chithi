@@ -698,6 +698,14 @@ export async function openOauthUrl(url: string): Promise<void> {
   return invoke("open_oauth_url", { url });
 }
 
+export async function cleanUrl(url: string): Promise<string> {
+  return invoke("clean_url", { url });
+}
+
+export async function openLink(url: string): Promise<void> {
+  return invoke("open_link", { url });
+}
+
 export async function listTimezones(): Promise<string[]> {
   return invoke("list_timezones");
 }

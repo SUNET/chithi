@@ -9,6 +9,9 @@ import { useUiStore } from "@/stores/ui";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import LinkifiedText from "@/components/common/LinkifiedText.vue";
+import { openComposeWindow } from "@/lib/compose-window";
+import { parseMailto } from "@/lib/mailto";
 import {
   applyMergeChoices,
   defaultChoices,
@@ -393,6 +396,52 @@ function parseEmails(json: string): { email: string; label: string }[] {
 
 function parsePhones(json: string): { number: string; label: string }[] {
   try { return JSON.parse(json); } catch { return []; }
+}
+
+// RFC 6068 requires URI-encoding of reserved characters in the mailto:
+// path. encodeURIComponent over-encodes "@", "/" and other addr-spec
+// chars; selectively re-decode the ones that are safe inside an
+// addr-spec so the resulting URI looks natural in the status bar
+// preview while remaining well-formed.
+function encodeMailtoAddress(email: string): string {
+  return encodeURIComponent(email.trim())
+    .replace(/%40/g, "@")
+    .replace(/%2E/gi, ".")
+    .replace(/%2B/gi, "+");
+}
+
+// RFC 3966 visual-separator chars are kept verbatim; everything else
+// (spaces, parens, letters, "ext." suffix, ...) is stripped, since
+// the OS dialer interprets only digits and "+".
+function sanitizeTel(number: string): string {
+  return number.replace(/[^0-9+*#\-.]/g, "");
+}
+
+// Clicking a contact's email opens compose with `to` prefilled, matching
+// how a mailto: link inside a mail body behaves. The address is built
+// via mailto: so it goes through the same parser and routing.
+function onEmailClick(email: string) {
+  const params = parseMailto(`mailto:${encodeMailtoAddress(email)}`);
+  if (!params) return;
+  openComposeWindow({
+    accountId: accountsStore.activeAccountId ?? undefined,
+    ...params,
+  });
+}
+
+// Phone numbers hand off to the OS via the same backend command that
+// powers the LinkPopup's Open button; tel: is in its allow-list.
+function onPhoneClick(number: string) {
+  const tel = sanitizeTel(number);
+  if (!tel) return;
+  api.openLink(`tel:${tel}`).catch((e) => console.error("openLink tel: failed:", e));
+}
+
+function onLinkEnter(url: string) {
+  uiStore.setHoverUrl(url);
+}
+function onLinkLeave() {
+  uiStore.setHoverUrl(null);
 }
 
 function selectContact(contact: Contact, event?: MouseEvent) {
@@ -982,15 +1031,33 @@ async function applyMerge() {
           <div class="detail-fields">
             <div v-for="em in parseEmails(selectedContact.emails_json)" :key="em.email" class="field-row">
               <span class="field-label">{{ em.label }}</span>
-              <span class="field-value" data-testid="contact-detail-email">{{ em.email }}</span>
+              <a
+                class="field-value field-link"
+                data-testid="contact-detail-email"
+                :href="`mailto:${encodeMailtoAddress(em.email)}`"
+                @click.prevent="onEmailClick(em.email)"
+                @mouseenter="onLinkEnter(`mailto:${encodeMailtoAddress(em.email)}`)"
+                @mouseleave="onLinkLeave"
+              >{{ em.email }}</a>
             </div>
             <div v-for="ph in parsePhones(selectedContact.phones_json)" :key="ph.number" class="field-row">
               <span class="field-label">{{ ph.label }}</span>
-              <span class="field-value" data-testid="contact-detail-phone">{{ ph.number }}</span>
+              <a
+                class="field-value field-link"
+                data-testid="contact-detail-phone"
+                :href="`tel:${sanitizeTel(ph.number)}`"
+                @click.prevent="onPhoneClick(ph.number)"
+                @mouseenter="onLinkEnter(`tel:${sanitizeTel(ph.number)}`)"
+                @mouseleave="onLinkLeave"
+              >{{ ph.number }}</a>
             </div>
             <div v-if="selectedContact.notes" class="field-row">
               <span class="field-label">Notes</span>
-              <span class="field-value notes">{{ selectedContact.notes }}</span>
+              <LinkifiedText
+                :text="selectedContact.notes"
+                class="field-value notes"
+                data-testid="contact-detail-notes"
+              />
             </div>
           </div>
         </template>
@@ -1611,6 +1678,12 @@ async function applyMerge() {
 
 .field-value { font-size: 14px; color: var(--color-text); }
 .field-value.notes { white-space: pre-wrap; color: var(--color-text-secondary); }
+.field-link {
+  color: var(--color-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.field-link:hover { filter: brightness(1.1); }
 
 .empty-text { padding: 32px 20px; text-align: center; color: var(--color-text-muted); font-size: 14px; }
 

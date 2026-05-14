@@ -104,7 +104,7 @@ const replyToMessageId = (route.query.replyTo as string) || "";
 const selectedAccountId = ref("");
 const to = ref((route.query.to as string) || "");
 const cc = ref((route.query.cc as string) || "");
-const bcc = ref("");
+const bcc = ref((route.query.bcc as string) || "");
 const subject = ref((route.query.subject as string) || "");
 const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
@@ -288,10 +288,11 @@ watch(selectedAccountId, (newId) => {
 // a new message with only a signature is not considered dirty.
 const initialTo = (route.query.to as string) || "";
 const initialCc = (route.query.cc as string) || "";
+const initialBcc = (route.query.bcc as string) || "";
 const initialSubject = (route.query.subject as string) || "";
 const baselineTo = ref(initialTo);
 const baselineCc = ref(initialCc);
-const baselineBcc = ref("");
+const baselineBcc = ref(initialBcc);
 const baselineSubject = ref(initialSubject);
 const baselineBody = ref((route.query.body as string) || "");
 

@@ -63,6 +63,17 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.getItem("chithi-decorations") !== "false",
   );
 
+  // Sticky HTML/plain-text preference for the message reader. Default is
+  // plain text (safer, no remote content surprises); flips to whatever the
+  // user last picked so they don't have to re-toggle on every message.
+  const preferHtmlBody = ref(
+    localStorage.getItem("chithi-prefer-html-body") === "true",
+  );
+  function setPreferHtmlBody(prefer: boolean) {
+    preferHtmlBody.value = prefer;
+    localStorage.setItem("chithi-prefer-html-body", String(prefer));
+  }
+
   // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
   const VALID_WEEK_STARTS = [0, 1, 6];
   const weekStartDay = ref<number>(
@@ -246,6 +257,25 @@ export const useUiStore = defineStore("ui", () => {
     drawerOpen.value = false;
   }
 
+  // URL currently hovered in a mail/calendar/contact view; rendered in the
+  // status bar so the user can preview where a link will lead before clicking.
+  const hoverUrl = ref<string | null>(null);
+  function setHoverUrl(url: string | null) {
+    hoverUrl.value = url;
+  }
+
+  // URL the user activated; when non-null, the global LinkPopup component
+  // shows a chooser (copy / open-untracked / cancel) and clears this back
+  // to null when dismissed. Centralized here so any view can trigger the
+  // popup without each owning its own copy of the modal.
+  const linkPopupUrl = ref<string | null>(null);
+  function openLinkPopup(url: string) {
+    linkPopupUrl.value = url;
+  }
+  function closeLinkPopup() {
+    linkPopupUrl.value = null;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -284,5 +314,12 @@ export const useUiStore = defineStore("ui", () => {
     closeCompose,
     openDrawer,
     closeDrawer,
+    hoverUrl,
+    setHoverUrl,
+    linkPopupUrl,
+    openLinkPopup,
+    closeLinkPopup,
+    preferHtmlBody,
+    setPreferHtmlBody,
   };
 });

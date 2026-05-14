@@ -7,6 +7,7 @@ pub mod compose;
 pub mod contacts;
 pub mod events;
 pub mod filters;
+pub mod links;
 pub mod mail;
 pub mod meet;
 pub mod oauth;

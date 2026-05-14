@@ -53,6 +53,10 @@ hickory-resolver = "0.26"
 # CLDR windowsZones table for converting Microsoft display names
 # (e.g. "W. Europe Standard Time") to IANA timezone IDs.
 windows-timezones = "0.5"
+# Strips tracking parameters (utm_*, fbclid, gclid, per-provider rules)
+# before opening user-clicked links from mail/calendar/contacts. Uses the
+# embedded ClearURLs ruleset (~35 KB minified JSON, vendored in the crate).
+clearurls = "0.0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

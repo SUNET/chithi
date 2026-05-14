@@ -8,6 +8,7 @@ import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
 import Select from "@/components/common/Select.vue";
 import { openComposeWindow } from "@/lib/compose-window";
+import { parseMailto } from "@/lib/mailto";
 import * as api from "@/lib/tauri";
 
 const EMAIL_LABEL_OPTIONS = [
@@ -35,8 +36,13 @@ const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const uiStore = useUiStore();
 
-// View mode: plain text by default
-const showHtml = ref(false);
+// View mode: sticky across messages via uiStore so a user who flips to
+// HTML once doesn't have to re-flip on every subsequent message. Falls
+// back to plain text if the current message has no HTML part.
+const showHtml = computed({
+  get: () => uiStore.preferHtmlBody && hasHtml(),
+  set: (v: boolean) => uiStore.setPreferHtmlBody(v),
+});
 const invites = ref<ParsedInvite[]>([]);
 
 // Remote images: per-message, not persisted
@@ -49,11 +55,11 @@ const hasRemoteImages = computed(() => {
   return messagesStore.activeMessage?.has_remote_images ?? false;
 });
 
-// Reset view state when switching messages
+// Reset per-message state when switching messages. The HTML/plain choice
+// is preserved in uiStore.preferHtmlBody and intentionally not touched.
 watch(
   () => messagesStore.activeMessageId,
   () => {
-    showHtml.value = false;
     invites.value = [];
     imagesHtml.value = null;
     loadingImages.value = false;
@@ -133,14 +139,46 @@ function iframeSrcdoc(): string {
 </style>
 </head>
 <body>${html}<script nonce="${nonce}">
+  // Anchor's raw href attribute; null/empty for fragment-only or hrefless
+  // anchors. Use getAttribute (not .href, which auto-resolves relatives
+  // against the iframe location and would surface "about:srcdoc#foo").
+  function anchorHref(a) {
+    var h = a ? a.getAttribute('href') : '';
+    if (!h) return '';
+    h = h.trim();
+    if (!h || h.charAt(0) === '#') return '';
+    return h;
+  }
   // Intercept all link clicks and forward to parent via postMessage
   document.addEventListener('click', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
-    if (a && a.href) {
+    var href = anchorHref(a);
+    if (href) {
       e.preventDefault();
       e.stopPropagation();
-      parent.postMessage({ type: 'link-click', href: a.getAttribute('href') }, '*');
+      parent.postMessage({ type: 'link-click', href: href }, '*');
     }
+  });
+  // Forward hover state on links so the parent can preview the URL in the
+  // status bar. mouseover/mouseout bubble (mouseenter/leave do not), so a
+  // single document-level listener is enough.
+  document.addEventListener('mouseover', function(e) {
+    var a = e.target.closest ? e.target.closest('a') : null;
+    var href = anchorHref(a);
+    if (href) {
+      parent.postMessage({ type: 'link-hover', href: href }, '*');
+    }
+  });
+  document.addEventListener('mouseout', function(e) {
+    var a = e.target.closest ? e.target.closest('a') : null;
+    if (!anchorHref(a)) return;
+    // mouseout also fires when the pointer moves between an anchor's own
+    // child nodes; relatedTarget is where the pointer went next. Only
+    // emit link-leave when the cursor actually left this <a>.
+    var rel = e.relatedTarget;
+    var relAnchor = rel && rel.closest ? rel.closest('a') : null;
+    if (relAnchor === a) return;
+    parent.postMessage({ type: 'link-leave' }, '*');
   });
   // Intercept right-click and forward to parent
   document.addEventListener('contextmenu', function(e) {
@@ -171,9 +209,24 @@ function handleIframeMessage(event: MessageEvent) {
   if (!fromOurIframe) return;
 
   if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
-    navigator.clipboard.writeText(event.data.href).then(() => {
-      showToast("Link copied to clipboard");
-    });
+    uiStore.setHoverUrl(null);
+    // mailto: goes straight to compose, matching the expected behavior of
+    // an email client; users almost never want a confirmation step on
+    // their own send action. Everything else routes through the popup so
+    // the user can choose copy / open / cancel and preview the cleaned URL.
+    const mailto = parseMailto(event.data.href);
+    if (mailto) {
+      openComposeWindow({
+        accountId: accountsStore.activeAccountId ?? undefined,
+        ...mailto,
+      });
+    } else {
+      uiStore.openLinkPopup(event.data.href);
+    }
+  } else if (event.data.type === 'link-hover' && typeof event.data.href === 'string') {
+    uiStore.setHoverUrl(event.data.href);
+  } else if (event.data.type === 'link-leave') {
+    uiStore.setHoverUrl(null);
   } else if (event.data.type === 'resize' && typeof event.data.height === 'number') {
     // Auto-resize the specific iframe that sent the message
     for (const iframe of iframes) {
@@ -191,7 +244,12 @@ watch(() => messagesStore.activeMessageId, () => {
 
 // Set up / tear down message listener
 onMounted(() => window.addEventListener('message', handleIframeMessage));
-onUnmounted(() => window.removeEventListener('message', handleIframeMessage));
+onUnmounted(() => {
+  window.removeEventListener('message', handleIframeMessage);
+  // The iframe's last hover state can otherwise outlive the component (e.g.
+  // the user navigates away mid-hover and no mouseout ever fires).
+  uiStore.setHoverUrl(null);
+});
 
 // Toast
 const toast = ref<string | null>(null);
