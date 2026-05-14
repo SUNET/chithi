@@ -142,6 +142,21 @@ function iframeSrcdoc(): string {
       parent.postMessage({ type: 'link-click', href: a.getAttribute('href') }, '*');
     }
   });
+  // Forward hover state on links so the parent can preview the URL in the
+  // status bar. mouseover/mouseout bubble (mouseenter/leave do not), so a
+  // single document-level listener is enough.
+  document.addEventListener('mouseover', function(e) {
+    var a = e.target.closest ? e.target.closest('a') : null;
+    if (a && a.href) {
+      parent.postMessage({ type: 'link-hover', href: a.getAttribute('href') }, '*');
+    }
+  });
+  document.addEventListener('mouseout', function(e) {
+    var a = e.target.closest ? e.target.closest('a') : null;
+    if (a && a.href) {
+      parent.postMessage({ type: 'link-leave' }, '*');
+    }
+  });
   // Intercept right-click and forward to parent
   document.addEventListener('contextmenu', function(e) {
     e.preventDefault();
@@ -174,6 +189,10 @@ function handleIframeMessage(event: MessageEvent) {
     navigator.clipboard.writeText(event.data.href).then(() => {
       showToast("Link copied to clipboard");
     });
+  } else if (event.data.type === 'link-hover' && typeof event.data.href === 'string') {
+    uiStore.setHoverUrl(event.data.href);
+  } else if (event.data.type === 'link-leave') {
+    uiStore.setHoverUrl(null);
   } else if (event.data.type === 'resize' && typeof event.data.height === 'number') {
     // Auto-resize the specific iframe that sent the message
     for (const iframe of iframes) {
@@ -191,7 +210,12 @@ watch(() => messagesStore.activeMessageId, () => {
 
 // Set up / tear down message listener
 onMounted(() => window.addEventListener('message', handleIframeMessage));
-onUnmounted(() => window.removeEventListener('message', handleIframeMessage));
+onUnmounted(() => {
+  window.removeEventListener('message', handleIframeMessage);
+  // The iframe's last hover state can otherwise outlive the component (e.g.
+  // the user navigates away mid-hover and no mouseout ever fires).
+  uiStore.setHoverUrl(null);
+});
 
 // Toast
 const toast = ref<string | null>(null);

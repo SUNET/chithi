@@ -110,9 +110,15 @@ async function syncAll() {
       </button>
       <span v-if="activityStore.hasActiveOperations" class="op-spinner"></span>
       <span class="status-dot" :class="connectionStatus" data-testid="sync-status"></span>
-      <span v-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
+      <span
+        v-if="uiStore.hoverUrl"
+        class="hover-url"
+        data-testid="status-hover-url"
+        :title="uiStore.hoverUrl"
+      >{{ uiStore.hoverUrl }}</span>
+      <span v-else-if="syncError" class="sync-error-msg" data-testid="sync-error">{{ syncError }}</span>
       <button v-else-if="opsStore.hasFailures" class="sync-error-msg" data-testid="op-failure" @click="opsStore.clearFailures()" title="Click to dismiss">{{ opsStore.recentFailures[0]?.error }}</button>
-      <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline — reconnecting...</span>
+      <span v-else-if="connectionStatus === 'disconnected'" class="disconnect-msg">Offline, reconnecting...</span>
       <span v-else class="account-info">{{ accountsStore.accounts.length }} account{{ accountsStore.accounts.length !== 1 ? 's' : '' }} connected</span>
     </div>
     <div class="status-right">
@@ -242,6 +248,17 @@ async function syncAll() {
 
 .account-info {
   white-space: nowrap;
+}
+
+.hover-url {
+  color: var(--color-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 70vw;
 }
 
 .last-sync {

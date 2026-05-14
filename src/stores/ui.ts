@@ -246,6 +246,13 @@ export const useUiStore = defineStore("ui", () => {
     drawerOpen.value = false;
   }
 
+  // URL currently hovered in a mail/calendar/contact view; rendered in the
+  // status bar so the user can preview where a link will lead before clicking.
+  const hoverUrl = ref<string | null>(null);
+  function setHoverUrl(url: string | null) {
+    hoverUrl.value = url;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -284,5 +291,7 @@ export const useUiStore = defineStore("ui", () => {
     closeCompose,
     openDrawer,
     closeDrawer,
+    hoverUrl,
+    setHoverUrl,
   };
 });
