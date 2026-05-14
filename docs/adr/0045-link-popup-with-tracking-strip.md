@@ -86,7 +86,9 @@ linkification.
   RFC 6068 (`to`/`cc`/`bcc`/`subject`/`body`, query and path forms),
   then handed to `openComposeWindow` with the current active account,
   bypassing the popup. This finally resolves the deferred follow-up
-  from ADR 0001.
+  from ADR 0001. Contact email fields use the same parser + routing
+  so clicking an email in the contact detail composes a new message
+  to that address.
 - `tel:` links are passed through `tauri-plugin-opener` so the OS
   handler picks them up.
 - Other schemes (`javascript:`, `file:`, `data:`, ...) remain refused.

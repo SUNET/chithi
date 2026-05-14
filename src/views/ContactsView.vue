@@ -10,6 +10,8 @@ import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import LinkifiedText from "@/components/common/LinkifiedText.vue";
+import { openComposeWindow } from "@/lib/compose-window";
+import { parseMailto } from "@/lib/mailto";
 import {
   applyMergeChoices,
   defaultChoices,
@@ -394,6 +396,31 @@ function parseEmails(json: string): { email: string; label: string }[] {
 
 function parsePhones(json: string): { number: string; label: string }[] {
   try { return JSON.parse(json); } catch { return []; }
+}
+
+// Clicking a contact's email opens compose with `to` prefilled, matching
+// how a mailto: link inside a mail body behaves. The address is built
+// via mailto: so it goes through the same parser and routing.
+function onEmailClick(email: string) {
+  const params = parseMailto(`mailto:${email}`);
+  if (!params) return;
+  openComposeWindow({
+    accountId: accountsStore.activeAccountId ?? undefined,
+    ...params,
+  });
+}
+
+// Phone numbers hand off to the OS via the same backend command that
+// powers the LinkPopup's Open button; tel: is in its allow-list.
+function onPhoneClick(number: string) {
+  api.openLink(`tel:${number}`).catch((e) => console.error("openLink tel: failed:", e));
+}
+
+function onLinkEnter(url: string) {
+  uiStore.setHoverUrl(url);
+}
+function onLinkLeave() {
+  uiStore.setHoverUrl(null);
 }
 
 function selectContact(contact: Contact, event?: MouseEvent) {
@@ -983,11 +1010,25 @@ async function applyMerge() {
           <div class="detail-fields">
             <div v-for="em in parseEmails(selectedContact.emails_json)" :key="em.email" class="field-row">
               <span class="field-label">{{ em.label }}</span>
-              <span class="field-value" data-testid="contact-detail-email">{{ em.email }}</span>
+              <a
+                class="field-value field-link"
+                data-testid="contact-detail-email"
+                :href="`mailto:${em.email}`"
+                @click.prevent="onEmailClick(em.email)"
+                @mouseenter="onLinkEnter(`mailto:${em.email}`)"
+                @mouseleave="onLinkLeave"
+              >{{ em.email }}</a>
             </div>
             <div v-for="ph in parsePhones(selectedContact.phones_json)" :key="ph.number" class="field-row">
               <span class="field-label">{{ ph.label }}</span>
-              <span class="field-value" data-testid="contact-detail-phone">{{ ph.number }}</span>
+              <a
+                class="field-value field-link"
+                data-testid="contact-detail-phone"
+                :href="`tel:${ph.number}`"
+                @click.prevent="onPhoneClick(ph.number)"
+                @mouseenter="onLinkEnter(`tel:${ph.number}`)"
+                @mouseleave="onLinkLeave"
+              >{{ ph.number }}</a>
             </div>
             <div v-if="selectedContact.notes" class="field-row">
               <span class="field-label">Notes</span>
@@ -1616,6 +1657,12 @@ async function applyMerge() {
 
 .field-value { font-size: 14px; color: var(--color-text); }
 .field-value.notes { white-space: pre-wrap; color: var(--color-text-secondary); }
+.field-link {
+  color: var(--color-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.field-link:hover { filter: brightness(1.1); }
 
 .empty-text { padding: 32px 20px; text-align: center; color: var(--color-text-muted); font-size: 14px; }
 
