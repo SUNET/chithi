@@ -9,6 +9,7 @@ import { useUiStore } from "@/stores/ui";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import LinkifiedText from "@/components/common/LinkifiedText.vue";
 import {
   applyMergeChoices,
   defaultChoices,
@@ -990,7 +991,11 @@ async function applyMerge() {
             </div>
             <div v-if="selectedContact.notes" class="field-row">
               <span class="field-label">Notes</span>
-              <span class="field-value notes">{{ selectedContact.notes }}</span>
+              <LinkifiedText
+                :text="selectedContact.notes"
+                class="field-value notes"
+                data-testid="contact-detail-notes"
+              />
             </div>
           </div>
         </template>
