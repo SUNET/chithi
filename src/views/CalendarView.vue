@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, nextTick, ref, computed, watch } from "vue";
+import { onMounted, onActivated, nextTick, ref, computed, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
@@ -191,24 +191,38 @@ function nowTopOffset(): number {
   return (minutes / 60) * HOUR_ROW;
 }
 
-const dayGridRef = ref<HTMLElement | null>(null);
+const dayViewRef = ref<HTMLElement | null>(null);
+const dayTimedRef = ref<HTMLElement | null>(null);
 const weekGridRef = ref<HTMLElement | null>(null);
 
-function scrollMobileToNow(el: HTMLElement | null) {
-  if (!el) return;
-  const target = nowTopOffset() - el.clientHeight / 2;
-  el.scrollTop = Math.max(0, target);
+// The scroll container can be larger than the timed grid (e.g. day view has
+// an optional all-day strip above .day-grid). Use the timed element's
+// offsetTop inside the scroll container so the now-line lands at visual
+// center, not the grid's 0-coordinate.
+function scrollMobileToNow(scrollEl: HTMLElement | null, timedEl?: HTMLElement | null) {
+  if (!scrollEl) return;
+  const innerOffset = timedEl ? timedEl.offsetTop : 0;
+  const target = innerOffset + nowTopOffset() - scrollEl.clientHeight / 2;
+  scrollEl.scrollTop = Math.max(0, target);
 }
 
-watch(
-  () => calendarStore.viewMode,
-  async (mode) => {
-    if (mode !== "day" && mode !== "week") return;
-    await nextTick();
-    scrollMobileToNow(mode === "day" ? dayGridRef.value : weekGridRef.value);
-  },
-  { immediate: true },
-);
+async function recenterMobileGrid() {
+  const mode = calendarStore.viewMode;
+  if (mode !== "day" && mode !== "week") return;
+  await nextTick();
+  if (mode === "day") {
+    scrollMobileToNow(dayViewRef.value, dayTimedRef.value);
+  } else {
+    scrollMobileToNow(weekGridRef.value);
+  }
+}
+
+watch(() => calendarStore.viewMode, recenterMobileGrid, { immediate: true });
+
+// CalendarView is wrapped in <KeepAlive>, so leaving and returning to the
+// calendar tab does not change viewMode and would otherwise leave the
+// cached scroll position stale.
+onActivated(recenterMobileGrid);
 
 function setMobileViewMode(mode: CalendarViewMode) {
   calendarStore.setViewMode(mode);
@@ -413,7 +427,7 @@ onMounted(() => {
     </div>
 
     <!-- DAY VIEW -->
-    <div v-if="calendarStore.viewMode === 'day'" ref="dayGridRef" class="day-view">
+    <div v-if="calendarStore.viewMode === 'day'" ref="dayViewRef" class="day-view">
       <div
         v-if="allDayEventsForDay(new Date(calendarStore.currentDate)).length"
         class="all-day-strip"
@@ -427,7 +441,7 @@ onMounted(() => {
         >{{ ev.title }}</button>
       </div>
 
-      <div class="day-grid">
+      <div ref="dayTimedRef" class="day-grid">
         <div class="hour-column">
           <div v-for="h in DAY_HOURS" :key="h" class="hour-slot">
             <span class="hour-label">{{ h.toString().padStart(2, "0") }}:00</span>
@@ -1010,9 +1024,13 @@ onMounted(() => {
   position: relative;
   display: flex;
   flex: 1;
-  min-height: 1056px;
+  min-height: 0;
   overflow-y: auto;
 }
+
+/* The hour-column carries the in-flow 1056px height (24 × 44px hour-slots);
+   the flex row stretches the absolute-positioned .week-day-columns to match,
+   so .week-grid's scrollHeight is 1056px regardless of clientHeight. */
 
 .week-day-column {
   position: relative;

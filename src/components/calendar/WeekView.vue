@@ -16,7 +16,7 @@
 // the grid region drops from ~216 → ~32 leaf nodes; first mail→calendar
 // nav is ~390 ms in the same profile. Combined with <KeepAlive> in
 // App.vue, subsequent mail↔calendar swaps are essentially free (~1-2 ms).
-import { computed, onMounted, onUnmounted, ref, nextTick } from "vue";
+import { computed, onMounted, onActivated, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
 import {
@@ -452,20 +452,27 @@ function onColumnDrop(day: Date, e: MouseEvent) {
 // .current-hour label stay accurate. The interval is per-instance; stored
 // so we can clear it on unmount and not leak when the view toggles
 // between week/day and month.
-onMounted(async () => {
+async function centerOnNow() {
   now.value = new Date();
+  await nextTick();
+  if (!gridRef.value) return;
+  const hour = getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+  const minutes = getMinutesInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+  const nowPx = (hour + minutes / 60) * HOUR_HEIGHT;
+  gridRef.value.scrollTop = Math.max(0, nowPx - gridRef.value.clientHeight / 2);
+}
+
+onMounted(() => {
   nowIntervalId = setInterval(() => {
     now.value = new Date();
   }, 60000);
-
-  await nextTick();
-  if (gridRef.value) {
-    const hour = getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone);
-    const minutes = getMinutesInTimezone(now.value.toISOString(), uiStore.displayTimezone);
-    const nowPx = (hour + minutes / 60) * HOUR_HEIGHT;
-    gridRef.value.scrollTop = Math.max(0, nowPx - gridRef.value.clientHeight / 2);
-  }
+  centerOnNow();
 });
+
+// CalendarView is wrapped in <KeepAlive>, so navigating away and back
+// reactivates this cached subtree without re-mounting; re-center so the
+// view doesn't reopen at a stale scroll position.
+onActivated(centerOnNow);
 
 onUnmounted(() => {
   if (nowIntervalId !== null) {
