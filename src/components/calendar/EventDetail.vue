@@ -8,6 +8,7 @@ import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import TimeInput from "@/components/common/TimeInput.vue";
 import DateInput from "@/components/common/DateInput.vue";
+import LinkifiedText from "@/components/common/LinkifiedText.vue";
 
 const emit = defineEmits<{
   close: [];
@@ -225,7 +226,7 @@ async function handleDelete() {
 
         <div v-if="event.location" class="detail-row">
           <span class="detail-icon">&#x1F4CD;</span>
-          <span>{{ event.location }}</span>
+          <LinkifiedText :text="event.location" data-testid="event-location" />
         </div>
 
         <div v-if="event.my_status" class="detail-row">
@@ -254,7 +255,7 @@ async function handleDelete() {
 
         <div v-if="event.description" class="detail-row">
           <span class="detail-icon">&#x1F4DD;</span>
-          <pre class="description">{{ event.description }}</pre>
+          <LinkifiedText :text="event.description" class="description" data-testid="event-description" />
         </div>
 
         <div v-if="event.recurrence_rule" class="detail-row">
