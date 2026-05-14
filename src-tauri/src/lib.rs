@@ -99,6 +99,8 @@ pub fn run() {
             commands::oauth::jmap_oidc_start,
             commands::oauth::jmap_oidc_complete,
             commands::oauth::open_oauth_url,
+            commands::links::clean_url,
+            commands::links::open_link,
             commands::actions::move_messages,
             commands::actions::move_messages_cross_account,
             commands::actions::delete_messages,
