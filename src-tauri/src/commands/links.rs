@@ -28,20 +28,39 @@ pub fn clean_url(url: String) -> Result<String> {
     Ok(sanitize(&url))
 }
 
+/// Schemes the OS handler may be asked to open. http(s) get tracking
+/// stripped first; mailto/tel are user-facing handoffs the OS already
+/// knows how to route. Everything else (javascript:, file:, data:, ...)
+/// is refused so a crafted href smuggled through the iframe postMessage
+/// bridge or a hand-edited calendar field cannot escape the renderer.
+const ALLOWED_SCHEMES: &[&str] = &["http://", "https://", "mailto:", "tel:"];
+
+fn has_allowed_scheme(url: &str) -> bool {
+    // RFC 3986 §3.1 — schemes are case-insensitive. Lowercase just enough
+    // of the head to cover the longest allowed scheme prefix.
+    let head_len = url.len().min(8);
+    let head = url[..head_len].to_ascii_lowercase();
+    ALLOWED_SCHEMES.iter().any(|s| head.starts_with(s))
+}
+
 /// Open a user-clicked link in the OS default handler, stripping tracking
-/// parameters first via the ClearURLs ruleset. Refuses anything that is
-/// not http(s) so the renderer can't shell out to mailto:, file:,
-/// javascript:, etc. by smuggling a crafted href through the iframe
-/// postMessage bridge or a hand-edited calendar field.
+/// parameters first via the ClearURLs ruleset for http(s) URLs.
+/// mailto/tel are passed through unchanged.
 #[tauri::command]
 pub fn open_link(url: String) -> Result<()> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
+    if !has_allowed_scheme(&url) {
         return Err(Error::Other(format!(
-            "Refusing to open non-http(s) URL: {}",
+            "Refusing to open URL with disallowed scheme: {}",
             url
         )));
     }
-    let cleaned = sanitize(&url);
-    tauri_plugin_opener::open_url(&cleaned, None::<&str>)
+    let to_open = if url[..5.min(url.len())].eq_ignore_ascii_case("http:")
+        || url[..6.min(url.len())].eq_ignore_ascii_case("https:")
+    {
+        sanitize(&url)
+    } else {
+        url
+    };
+    tauri_plugin_opener::open_url(&to_open, None::<&str>)
         .map_err(|e| Error::Other(format!("open_url failed: {}", e)))
 }

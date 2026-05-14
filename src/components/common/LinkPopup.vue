@@ -13,9 +13,12 @@ const original = computed(() => uiStore.linkPopupUrl);
 const wasModified = computed(
   () => cleaned.value !== null && original.value !== null && cleaned.value !== original.value,
 );
+// Mirror src-tauri/src/commands/links.rs::ALLOWED_SCHEMES. Schemes are
+// case-insensitive per RFC 3986 §3.1, so compare lowercased.
+const OPENABLE_SCHEMES = ["http://", "https://", "mailto:", "tel:"];
 const openableScheme = computed(() => {
-  const u = original.value ?? "";
-  return u.startsWith("https://") || u.startsWith("http://");
+  const u = (original.value ?? "").slice(0, 8).toLowerCase();
+  return OPENABLE_SCHEMES.some((s) => u.startsWith(s));
 });
 
 // Fetch the cleaned form whenever a new URL is shown. The Tauri command

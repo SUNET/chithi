@@ -158,9 +158,14 @@ function iframeSrcdoc(): string {
   });
   document.addEventListener('mouseout', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
-    if (a && a.href) {
-      parent.postMessage({ type: 'link-leave' }, '*');
-    }
+    if (!a || !a.href) return;
+    // mouseout also fires when the pointer moves between an anchor's own
+    // child nodes; relatedTarget is where the pointer went next. Only
+    // emit link-leave when the cursor actually left this <a>.
+    var rel = e.relatedTarget;
+    var relAnchor = rel && rel.closest ? rel.closest('a') : null;
+    if (relAnchor === a) return;
+    parent.postMessage({ type: 'link-leave' }, '*');
   });
   // Intercept right-click and forward to parent
   document.addEventListener('contextmenu', function(e) {

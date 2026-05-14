@@ -11,8 +11,36 @@ const uiStore = useUiStore();
 // Trailing punctuation that a user almost never means as part of a URL but
 // which the regex would otherwise capture. Stripped at split-time and
 // returned as plain text so it stays visible in the rendered output.
-const TRAILING_PUNCT = /[.,!?;:)\]}>'"]+$/;
+// Closing brackets get a balanced-pair check below (Wikipedia URLs like
+// .../Foo_(disambiguation) keep the trailing ')').
+const TRAILING_PUNCT_ALWAYS = /[.,!?;:>'"]+$/;
 const URL_RE = /https?:\/\/[^\s<>"']+/g;
+const BRACKET_PAIRS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+// Walk trailing punctuation off the end of a matched URL. Symmetric
+// brackets are only stripped when the URL has more of them at the end
+// than openers inside it; otherwise we leave them so URLs containing
+// balanced parens (Wikipedia, MDN, ...) survive unscathed.
+function trimTrailingPunct(url: string): { url: string; trailing: string } {
+  let trailing = "";
+  while (url.length > 0) {
+    const last = url[url.length - 1];
+    if (last in BRACKET_PAIRS) {
+      const opener = BRACKET_PAIRS[last];
+      const opens = (url.match(new RegExp("\\" + opener, "g")) ?? []).length;
+      const closes = (url.match(new RegExp("\\" + last, "g")) ?? []).length;
+      if (closes <= opens) break;
+      trailing = last + trailing;
+      url = url.slice(0, -1);
+      continue;
+    }
+    const m = url.match(TRAILING_PUNCT_ALWAYS);
+    if (!m) break;
+    trailing = m[0] + trailing;
+    url = url.slice(0, url.length - m[0].length);
+  }
+  return { url, trailing };
+}
 
 // Exchange/Outlook calendar descriptions sometimes arrive as a full HTML
 // document instead of plain text. Decode them to text so the user sees the
@@ -20,9 +48,22 @@ const URL_RE = /https?:\/\/[^\s<>"']+/g;
 // common block elements. <a href> values are appended to the text output
 // so links that only existed as anchors (no visible URL) still get
 // linkified by the regex pass below.
+//
+// The trigger requires a doctype, <html>, or any explicit closing tag.
+// Plain prose containing comparisons like "a < b" or "span > 0" therefore
+// does not get fed to DOMParser (which would silently rewrite whitespace
+// and drop anything outside <body>).
+function looksLikeHtml(input: string): boolean {
+  return /<!doctype html|<html\b|<\/[a-z][a-z0-9]*\s*>/i.test(input);
+}
+
 function htmlToPlain(input: string): string {
-  if (!/<\s*(html|body|head|div|p|br|a|span)\b/i.test(input)) return input;
+  if (!looksLikeHtml(input)) return input;
   const doc = new DOMParser().parseFromString(input, "text/html");
+  // Outlook/Word HTML exports embed large <style> blocks ("p.MsoNormal {...}")
+  // and the occasional <script>. textContent would otherwise dump that
+  // CSS/JS into the user-visible description.
+  doc.querySelectorAll("style, script, head, noscript").forEach((el) => el.remove());
   doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
   doc
     .querySelectorAll("p, div, li, h1, h2, h3, h4, h5, h6, tr")
@@ -52,13 +93,7 @@ const segments = computed<Segment[]>(() => {
   let lastIndex = 0;
   for (const match of input.matchAll(URL_RE)) {
     const start = match.index ?? 0;
-    let url = match[0];
-    let trailing = "";
-    const m = url.match(TRAILING_PUNCT);
-    if (m) {
-      trailing = m[0];
-      url = url.slice(0, url.length - trailing.length);
-    }
+    const { url, trailing } = trimTrailingPunct(match[0]);
     if (start > lastIndex) {
       out.push({ kind: "text", value: input.slice(lastIndex, start) });
     }
