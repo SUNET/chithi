@@ -142,7 +142,7 @@ const DRAG_THRESHOLD = 5; // pixels before drag starts
 
 function onDragMouseDown(event: MouseEvent, messageId: string) {
   if (event.button !== 0) return;
-  if ((event.target as HTMLElement).closest(".row-checkbox")) return;
+  if ((event.target as HTMLElement).closest(".col-check")) return;
   dragStartPos.value = { x: event.clientX, y: event.clientY };
   dragSourceId.value = messageId;
 
@@ -576,7 +576,11 @@ function resolveFolderName(path: string): string {
   <div class="message-list" data-testid="message-list" @click.left="closeContextMenu">
     <QuickFilterBar v-if="messagesStore.quickFilterVisible" />
     <div class="column-headers">
-      <div class="col col-check">
+      <div
+        class="col col-check"
+        data-testid="select-all-cell"
+        @click.stop="toggleSelectAll"
+      >
         <input
           type="checkbox"
           class="row-checkbox"
@@ -855,11 +859,13 @@ function resolveFolderName(path: string): string {
 }
 
 .col-check {
-  width: 20px;
+  width: 28px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  cursor: pointer;
+  align-self: stretch;
 }
 
 .row-checkbox {

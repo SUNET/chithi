@@ -58,7 +58,11 @@ function isReply(): boolean {
     :class="{ active, selected, unread: hasUnread() }"
     @dblclick="$emit('open')"
   >
-    <div class="col col-check">
+    <div
+      class="col col-check"
+      data-testid="thread-check-cell"
+      @click.stop="$emit('toggleSelect')"
+    >
       <input
         type="checkbox"
         class="row-checkbox"
@@ -143,12 +147,14 @@ function isReply(): boolean {
 }
 
 .col-check {
-  width: 20px;
+  width: 28px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  cursor: pointer;
+  align-self: stretch;
 }
 
 .row-checkbox {
