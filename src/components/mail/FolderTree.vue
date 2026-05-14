@@ -112,9 +112,20 @@ function toggleAccountCollapse(accountId: string) {
 function selectFolder(accountId: string, folderPath: string) {
   // Set the folder path BEFORE switching accounts so the watcher
   // in the folders store doesn't reset it to Inbox.
+  const accountChanged = accountsStore.activeAccountId !== accountId;
+  const folderChanged = foldersStore.activeFolderPath !== folderPath;
   foldersStore.setActiveFolder(folderPath);
-  if (accountsStore.activeAccountId !== accountId) {
+  if (accountChanged) {
     accountsStore.setActiveAccount(accountId);
+  }
+  // When both accounts share a folder name (the typical IMAP case where
+  // both have "INBOX"), neither ref changes by value if the user clicks
+  // the other account's same-named folder, so the messages-store watcher
+  // doesn't always fire reliably. Dispatch the refetch explicitly when
+  // the account changes to make this case work without relying on the
+  // exact ordering of folder/account reactivity.
+  if (accountChanged && !folderChanged) {
+    messagesStore.fetchMessages();
   }
 }
 
