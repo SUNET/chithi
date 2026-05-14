@@ -8,6 +8,7 @@ const uiStore = useUiStore();
 
 const cleaned = ref<string | null>(null);
 const cleaning = ref(false);
+const cleanError = ref(false);
 
 const original = computed(() => uiStore.linkPopupUrl);
 const wasModified = computed(
@@ -28,12 +29,17 @@ watch(
   () => uiStore.linkPopupUrl,
   async (url) => {
     cleaned.value = null;
+    cleanError.value = false;
     if (!url) return;
     cleaning.value = true;
     try {
       cleaned.value = await api.cleanUrl(url);
     } catch {
+      // Preserve the original so Open still has a sensible argument, but
+      // surface the failure to the user instead of silently claiming the
+      // URL is clean.
       cleaned.value = url;
+      cleanError.value = true;
     } finally {
       cleaning.value = false;
     }
@@ -102,6 +108,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
       </div>
       <div v-else-if="cleaning" class="link-popup-row hint">
         <span class="link-popup-hint">Checking for tracking parameters...</span>
+      </div>
+      <div v-else-if="cleanError" class="link-popup-row hint">
+        <span class="link-popup-hint error" data-testid="link-popup-clean-error">
+          Could not check for tracking parameters.
+        </span>
       </div>
       <div v-else class="link-popup-row hint">
         <span class="link-popup-hint">No tracking parameters detected.</span>
@@ -194,6 +205,10 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 .link-popup-hint {
   font-size: 11px;
   color: var(--color-text-muted);
+}
+
+.link-popup-hint.error {
+  color: var(--color-danger-text, var(--color-danger));
 }
 
 .link-popup-actions {

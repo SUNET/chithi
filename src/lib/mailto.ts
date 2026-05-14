@@ -26,13 +26,16 @@ export function parseMailto(href: string): ComposeParams | null {
     .filter(Boolean);
 
   const params = new URLSearchParams(queryStr);
-  const merged = mergeCommaList(toFromPath, params.getAll("to"));
+  // Per RFC 6068 the path is a comma-separated list of full addr-specs;
+  // drop anything that doesn't at least contain "@" so a malformed
+  // mailto: doesn't push "foo" into the compose To field.
+  const merged = mergeCommaList(toFromPath, params.getAll("to"), true);
 
   const result: ComposeParams = {};
   if (merged) result.to = merged;
-  const cc = mergeCommaList([], params.getAll("cc"));
+  const cc = mergeCommaList([], params.getAll("cc"), true);
   if (cc) result.cc = cc;
-  const bcc = mergeCommaList([], params.getAll("bcc"));
+  const bcc = mergeCommaList([], params.getAll("bcc"), true);
   if (bcc) result.bcc = bcc;
   const subject = params.get("subject");
   if (subject) result.subject = subject;
@@ -52,12 +55,15 @@ function safeDecode(s: string): string {
 // Multiple ?to= / ?cc= / ?bcc= parameters are allowed, and each may itself
 // contain a comma-separated list. Flatten into a single comma-separated
 // string with no duplicates so the compose form gets a clean prefill.
-function mergeCommaList(initial: string[], extra: string[]): string {
+// When requireAt is set, entries missing "@" are discarded so a partial
+// addr-spec doesn't end up in the recipient field.
+function mergeCommaList(initial: string[], extra: string[], requireAt = false): string {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const piece of [...initial, ...extra.flatMap((e) => e.split(","))]) {
     const v = piece.trim();
     if (!v || seen.has(v)) continue;
+    if (requireAt && !v.includes("@")) continue;
     seen.add(v);
     out.push(v);
   }

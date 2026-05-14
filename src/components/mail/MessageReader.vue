@@ -139,13 +139,24 @@ function iframeSrcdoc(): string {
 </style>
 </head>
 <body>${html}<script nonce="${nonce}">
+  // Anchor's raw href attribute; null/empty for fragment-only or hrefless
+  // anchors. Use getAttribute (not .href, which auto-resolves relatives
+  // against the iframe location and would surface "about:srcdoc#foo").
+  function anchorHref(a) {
+    var h = a ? a.getAttribute('href') : '';
+    if (!h) return '';
+    h = h.trim();
+    if (!h || h.charAt(0) === '#') return '';
+    return h;
+  }
   // Intercept all link clicks and forward to parent via postMessage
   document.addEventListener('click', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
-    if (a && a.href) {
+    var href = anchorHref(a);
+    if (href) {
       e.preventDefault();
       e.stopPropagation();
-      parent.postMessage({ type: 'link-click', href: a.getAttribute('href') }, '*');
+      parent.postMessage({ type: 'link-click', href: href }, '*');
     }
   });
   // Forward hover state on links so the parent can preview the URL in the
@@ -153,13 +164,14 @@ function iframeSrcdoc(): string {
   // single document-level listener is enough.
   document.addEventListener('mouseover', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
-    if (a && a.href) {
-      parent.postMessage({ type: 'link-hover', href: a.getAttribute('href') }, '*');
+    var href = anchorHref(a);
+    if (href) {
+      parent.postMessage({ type: 'link-hover', href: href }, '*');
     }
   });
   document.addEventListener('mouseout', function(e) {
     var a = e.target.closest ? e.target.closest('a') : null;
-    if (!a || !a.href) return;
+    if (!anchorHref(a)) return;
     // mouseout also fires when the pointer moves between an anchor's own
     // child nodes; relatedTarget is where the pointer went next. Only
     // emit link-leave when the cursor actually left this <a>.

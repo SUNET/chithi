@@ -398,11 +398,30 @@ function parsePhones(json: string): { number: string; label: string }[] {
   try { return JSON.parse(json); } catch { return []; }
 }
 
+// RFC 6068 requires URI-encoding of reserved characters in the mailto:
+// path. encodeURIComponent over-encodes "@", "/" and other addr-spec
+// chars; selectively re-decode the ones that are safe inside an
+// addr-spec so the resulting URI looks natural in the status bar
+// preview while remaining well-formed.
+function encodeMailtoAddress(email: string): string {
+  return encodeURIComponent(email.trim())
+    .replace(/%40/g, "@")
+    .replace(/%2E/gi, ".")
+    .replace(/%2B/gi, "+");
+}
+
+// RFC 3966 visual-separator chars are kept verbatim; everything else
+// (spaces, parens, letters, "ext." suffix, ...) is stripped, since
+// the OS dialer interprets only digits and "+".
+function sanitizeTel(number: string): string {
+  return number.replace(/[^0-9+*#\-.]/g, "");
+}
+
 // Clicking a contact's email opens compose with `to` prefilled, matching
 // how a mailto: link inside a mail body behaves. The address is built
 // via mailto: so it goes through the same parser and routing.
 function onEmailClick(email: string) {
-  const params = parseMailto(`mailto:${email}`);
+  const params = parseMailto(`mailto:${encodeMailtoAddress(email)}`);
   if (!params) return;
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
@@ -413,7 +432,9 @@ function onEmailClick(email: string) {
 // Phone numbers hand off to the OS via the same backend command that
 // powers the LinkPopup's Open button; tel: is in its allow-list.
 function onPhoneClick(number: string) {
-  api.openLink(`tel:${number}`).catch((e) => console.error("openLink tel: failed:", e));
+  const tel = sanitizeTel(number);
+  if (!tel) return;
+  api.openLink(`tel:${tel}`).catch((e) => console.error("openLink tel: failed:", e));
 }
 
 function onLinkEnter(url: string) {
@@ -1013,9 +1034,9 @@ async function applyMerge() {
               <a
                 class="field-value field-link"
                 data-testid="contact-detail-email"
-                :href="`mailto:${em.email}`"
+                :href="`mailto:${encodeMailtoAddress(em.email)}`"
                 @click.prevent="onEmailClick(em.email)"
-                @mouseenter="onLinkEnter(`mailto:${em.email}`)"
+                @mouseenter="onLinkEnter(`mailto:${encodeMailtoAddress(em.email)}`)"
                 @mouseleave="onLinkLeave"
               >{{ em.email }}</a>
             </div>
@@ -1024,9 +1045,9 @@ async function applyMerge() {
               <a
                 class="field-value field-link"
                 data-testid="contact-detail-phone"
-                :href="`tel:${ph.number}`"
+                :href="`tel:${sanitizeTel(ph.number)}`"
                 @click.prevent="onPhoneClick(ph.number)"
-                @mouseenter="onLinkEnter(`tel:${ph.number}`)"
+                @mouseenter="onLinkEnter(`tel:${sanitizeTel(ph.number)}`)"
                 @mouseleave="onLinkLeave"
               >{{ ph.number }}</a>
             </div>

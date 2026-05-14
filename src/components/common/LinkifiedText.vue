@@ -49,12 +49,16 @@ function trimTrailingPunct(url: string): { url: string; trailing: string } {
 // so links that only existed as anchors (no visible URL) still get
 // linkified by the regex pass below.
 //
-// The trigger requires a doctype, <html>, or any explicit closing tag.
-// Plain prose containing comparisons like "a < b" or "span > 0" therefore
-// does not get fed to DOMParser (which would silently rewrite whitespace
-// and drop anything outside <body>).
+// The trigger requires a doctype/<html>/<body> root marker, or both an
+// opening and matching closing tag of the same element. Notes that just
+// mention a stray close-tag in prose do not qualify, so they go through
+// the regex pass without DOMParser's whitespace rewriting.
 function looksLikeHtml(input: string): boolean {
-  return /<!doctype html|<html\b|<\/[a-z][a-z0-9]*\s*>/i.test(input);
+  if (/<!doctype html\b|<html\b|<body\b/i.test(input)) return true;
+  const m = input.match(/<([a-z][a-z0-9]*)\b[^>]*>/i);
+  if (!m) return false;
+  const tag = m[1].toLowerCase();
+  return new RegExp(`</${tag}\\s*>`, "i").test(input);
 }
 
 function htmlToPlain(input: string): string {
