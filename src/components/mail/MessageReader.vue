@@ -8,6 +8,7 @@ import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
 import Select from "@/components/common/Select.vue";
 import { openComposeWindow } from "@/lib/compose-window";
+import { parseMailto } from "@/lib/mailto";
 import * as api from "@/lib/tauri";
 
 const EMAIL_LABEL_OPTIONS = [
@@ -196,11 +197,20 @@ function handleIframeMessage(event: MessageEvent) {
   if (!fromOurIframe) return;
 
   if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
-    // The popup gives the user the choice between copy and open-untracked.
-    // Clear the hover state first so the status bar doesn't keep showing
-    // the URL underneath the modal.
     uiStore.setHoverUrl(null);
-    uiStore.openLinkPopup(event.data.href);
+    // mailto: goes straight to compose, matching the expected behavior of
+    // an email client; users almost never want a confirmation step on
+    // their own send action. Everything else routes through the popup so
+    // the user can choose copy / open / cancel and preview the cleaned URL.
+    const mailto = parseMailto(event.data.href);
+    if (mailto) {
+      openComposeWindow({
+        accountId: accountsStore.activeAccountId ?? undefined,
+        ...mailto,
+      });
+    } else {
+      uiStore.openLinkPopup(event.data.href);
+    }
   } else if (event.data.type === 'link-hover' && typeof event.data.href === 'string') {
     uiStore.setHoverUrl(event.data.href);
   } else if (event.data.type === 'link-leave') {

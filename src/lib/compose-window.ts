@@ -7,6 +7,7 @@ export interface ComposeParams {
   replyTo?: string;
   to?: string;
   cc?: string;
+  bcc?: string;
   subject?: string;
   body?: string;
 }
@@ -20,6 +21,7 @@ export function openComposeWindow(params: ComposeParams = {}) {
   if (params.replyTo) query.set("replyTo", params.replyTo);
   if (params.to) query.set("to", params.to);
   if (params.cc) query.set("cc", params.cc);
+  if (params.bcc) query.set("bcc", params.bcc);
   if (params.subject) query.set("subject", params.subject);
   if (params.body) query.set("body", params.body);
 

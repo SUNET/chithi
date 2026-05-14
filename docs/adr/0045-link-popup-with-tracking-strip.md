@@ -82,7 +82,11 @@ linkification.
   combination regresses, that becomes an upstream concern.
 - ClearURLs rules are vendored in the `clearurls` crate (~35 KB
   minified JSON). Refreshing the rules means bumping the crate version.
-- `mailto:` links are still intercepted by the iframe and currently
-  routed through the popup; opening one will fail the http(s) guard.
-  Wiring `mailto:` to the compose window (the deferred follow-up from
-  ADR 0001) is out of scope here and will be tracked separately.
+- `mailto:` links are intercepted in the mail iframe and parsed per
+  RFC 6068 (`to`/`cc`/`bcc`/`subject`/`body`, query and path forms),
+  then handed to `openComposeWindow` with the current active account,
+  bypassing the popup. This finally resolves the deferred follow-up
+  from ADR 0001.
+- `tel:` links are passed through `tauri-plugin-opener` so the OS
+  handler picks them up.
+- Other schemes (`javascript:`, `file:`, `data:`, ...) remain refused.
