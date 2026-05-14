@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0045: Link click opens a popup; tracking parameters stripped before opening](0045-link-popup-with-tracking-strip.md)
 
 ## Date
 
