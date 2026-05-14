@@ -1,6 +1,7 @@
+use lettre::address::Envelope;
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::error::{Error, Result};
 
@@ -143,6 +144,42 @@ pub async fn send_message(
         .multipart(body)
         .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
 
+    let transport = build_transport(
+        smtp_host,
+        smtp_port,
+        username,
+        password,
+        use_tls,
+        use_xoauth2,
+    )?;
+
+    let response = transport.send(message).await.map_err(|e| {
+        log::error!("SMTP send failed: {}", e);
+        Error::Other(format!("SMTP send failed: {}", e))
+    })?;
+
+    log::info!(
+        "SMTP message sent successfully: {} (code {})",
+        response.message().collect::<Vec<_>>().join(", "),
+        response.code()
+    );
+
+    Ok(())
+}
+
+/// Build an SMTP transport from connection parameters.
+///
+/// Port 587 forces STARTTLS regardless of `use_tls`; port 465 (or
+/// `use_tls=true` on any other port) uses implicit TLS; everything else
+/// falls back to STARTTLS on the requested port.
+fn build_transport(
+    smtp_host: &str,
+    smtp_port: u16,
+    username: &str,
+    password: &str,
+    use_tls: bool,
+    use_xoauth2: bool,
+) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
     let creds = Credentials::new(username.to_string(), password.to_string());
     let auth_mechanisms = if use_xoauth2 {
         vec![Mechanism::Xoauth2]
@@ -175,18 +212,92 @@ pub async fn send_message(
             .authentication(auth_mechanisms)
             .build()
     };
+    Ok(transport)
+}
 
-    let response = transport.send(message).await.map_err(|e| {
-        log::error!("SMTP send failed: {}", e);
-        Error::Other(format!("SMTP send failed: {}", e))
-    })?;
+/// Parse an address string ("user@host" or "Name <user@host>") into a
+/// lettre `Address` (just the addr-spec; display name is dropped because
+/// the envelope is only the addr-spec per RFC 5321 §3.6.1).
+fn parse_address(addr: &str) -> Result<Address> {
+    let trimmed = addr.trim();
+    // If it's in `Name <user@host>` form, extract the bracketed addr-spec.
+    let addr_spec = if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if lt < gt {
+            trimmed[lt + 1..gt].trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    addr_spec
+        .parse::<Address>()
+        .map_err(|e| Error::Other(format!("Invalid SMTP address '{}': {}", addr, e)))
+}
+
+/// Send a previously-built RFC 5322 message via SMTP.
+///
+/// Used for retries: `compose::send_message` already built and persisted
+/// the bytes, so on replay we don't reconstruct them. The envelope is
+/// stored separately because the bytes alone may not carry the full
+/// recipient list (Bcc is sometimes stripped before transmission).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_raw(
+    smtp_host: &str,
+    smtp_port: u16,
+    username: &str,
+    password: &str,
+    use_tls: bool,
+    use_xoauth2: bool,
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    raw_message: &[u8],
+) -> Result<()> {
+    let from_addr = parse_address(from)?;
+    let mut recipients: Vec<Address> = Vec::with_capacity(to.len() + cc.len() + bcc.len());
+    for addr in to.iter().chain(cc.iter()).chain(bcc.iter()) {
+        recipients.push(parse_address(addr)?);
+    }
+    if recipients.is_empty() {
+        return Err(Error::Other(
+            "SMTP send_raw: no recipients in envelope".into(),
+        ));
+    }
+    let envelope = Envelope::new(Some(from_addr), recipients)
+        .map_err(|e| Error::Other(format!("SMTP envelope build failed: {}", e)))?;
 
     log::info!(
-        "SMTP message sent successfully: {} (code {})",
+        "SMTP send_raw ({} bytes) from {} to {} recipients via {}:{}",
+        raw_message.len(),
+        from,
+        envelope.to().len(),
+        smtp_host,
+        smtp_port
+    );
+
+    let transport = build_transport(
+        smtp_host,
+        smtp_port,
+        username,
+        password,
+        use_tls,
+        use_xoauth2,
+    )?;
+    let response = transport
+        .send_raw(&envelope, raw_message)
+        .await
+        .map_err(|e| {
+            log::error!("SMTP send_raw failed: {}", e);
+            Error::Other(format!("SMTP send_raw failed: {}", e))
+        })?;
+
+    log::info!(
+        "SMTP send_raw success: {} (code {})",
         response.message().collect::<Vec<_>>().join(", "),
         response.code()
     );
-
     Ok(())
 }
 

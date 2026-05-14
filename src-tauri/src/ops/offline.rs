@@ -4,14 +4,16 @@ use crate::error::{Error, Result};
 use crate::ops::queue::MailOp;
 
 /// Replay order matching Thunderbird's `nsImapOfflineSync`:
-/// flags (0) -> moves (1) -> copies (2) -> deletes (3)
+/// flags (0) -> moves (1) -> copies (2) -> deletes (3).
+/// `send` is independent of folder state, so it goes last (4).
 fn replay_order(action_type: &str) -> i32 {
     match action_type {
         "set_flags" => 0,
         "move" => 1,
         "copy" => 2,
         "delete" => 3,
-        _ => 4,
+        "send" => 4,
+        _ => 5,
     }
 }
 
@@ -38,14 +40,56 @@ pub fn queue_offline_op(
     action_type: &str,
     payload: &serde_json::Value,
 ) -> Result<i64> {
+    queue_offline_op_with_status(conn, account_id, action_type, payload, "pending")
+}
+
+/// Like `queue_offline_op` but inserts with an explicit initial status.
+///
+/// `compose::send_message` uses this with `'sending'` to claim the row
+/// for the in-process spawn task, keeping the worker's replay loop from
+/// picking it up while the first attempt is still in flight.
+pub fn queue_offline_op_with_status(
+    conn: &Connection,
+    account_id: &str,
+    action_type: &str,
+    payload: &serde_json::Value,
+    initial_status: &str,
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO outbox (account_id, action_type, payload_json, status, retry_count, error_message)
-         VALUES (?1, ?2, ?3, 'pending', 0, NULL)",
-        rusqlite::params![account_id, action_type, payload.to_string()],
+         VALUES (?1, ?2, ?3, ?4, 0, NULL)",
+        rusqlite::params![account_id, action_type, payload.to_string(), initial_status],
     )
     .map_err(Error::Database)?;
     let id = conn.last_insert_rowid();
     Ok(id)
+}
+
+/// Flip a 'sending' row back to 'pending' so the worker will retry it
+/// on the next sync.
+pub fn mark_pending(conn: &Connection, outbox_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE outbox SET status = 'pending' WHERE id = ?1",
+        rusqlite::params![outbox_id],
+    )
+    .map_err(Error::Database)?;
+    Ok(())
+}
+
+/// On app startup, revive any rows left as 'sending' from a previous run.
+/// The owning task is gone, so the message would otherwise be invisible
+/// to both the user and the worker. Returns how many rows were revived.
+pub fn revive_stuck_sending(conn: &Connection) -> Result<usize> {
+    let count = conn
+        .execute(
+            "UPDATE outbox SET status = 'pending' WHERE status = 'sending'",
+            [],
+        )
+        .map_err(Error::Database)?;
+    if count > 0 {
+        log::info!("Revived {} outbox row(s) stuck in 'sending'", count);
+    }
+    Ok(count)
 }
 
 /// Get all pending operations for an account, ordered by replay priority.
@@ -184,6 +228,28 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
                 "target_folder": target_folder,
             }),
         )),
+        MailOp::SendRaw {
+            raw_message,
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+        } => {
+            use base64::Engine;
+            let raw_b64 = base64::engine::general_purpose::STANDARD.encode(raw_message);
+            Some((
+                "send",
+                serde_json::json!({
+                    "raw_message_b64": raw_b64,
+                    "from": from,
+                    "to": to,
+                    "cc": cc,
+                    "bcc": bcc,
+                    "subject": subject,
+                }),
+            ))
+        }
         // Sync ops are not queued offline
         _ => None,
     }
@@ -243,6 +309,40 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             Some(MailOp::CopyMessages {
                 by_folder,
                 target_folder,
+            })
+        }
+        "send" => {
+            use base64::Engine;
+            let raw_b64 = payload.get("raw_message_b64")?.as_str()?;
+            let raw_message = base64::engine::general_purpose::STANDARD
+                .decode(raw_b64)
+                .ok()?;
+            let from = payload.get("from")?.as_str()?.to_string();
+            let to: Vec<String> =
+                serde_json::from_value(payload.get("to").cloned().unwrap_or_default())
+                    .unwrap_or_default();
+            let cc: Vec<String> =
+                serde_json::from_value(payload.get("cc").cloned().unwrap_or_default())
+                    .unwrap_or_default();
+            let bcc: Vec<String> =
+                serde_json::from_value(payload.get("bcc").cloned().unwrap_or_default())
+                    .unwrap_or_default();
+            let subject = payload
+                .get("subject")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+                log::warn!("outbox_to_mail_op: rejected send op with no recipients");
+                return None;
+            }
+            Some(MailOp::SendRaw {
+                raw_message,
+                from,
+                to,
+                cc,
+                bcc,
+                subject,
             })
         }
         _ => None,

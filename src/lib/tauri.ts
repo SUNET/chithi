@@ -705,3 +705,18 @@ export async function listTimezones(): Promise<string[]> {
 export async function getDefaultTimezone(): Promise<string> {
   return invoke("get_default_timezone");
 }
+
+// Outbox
+export async function listOutbox(
+  accountId: string,
+): Promise<import("./types").OutboxRow[]> {
+  return invoke("list_outbox", { accountId });
+}
+
+export async function retryOutboxOp(outboxId: number): Promise<void> {
+  return invoke("retry_outbox_op", { outboxId });
+}
+
+export async function discardOutboxOp(outboxId: number): Promise<void> {
+  return invoke("discard_outbox_op", { outboxId });
+}

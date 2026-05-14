@@ -412,3 +412,23 @@ export interface OfflineQueueChange {
   dead_op_id: number;
   action_type: string;
 }
+
+// --- Outbox ---
+
+/// Synthetic folder path used by the FolderTree to flag the per-account
+/// Outbox node. Picked to be invalid as a real IMAP/JMAP mailbox name so
+/// it can never collide with a server-side folder.
+export const OUTBOX_FOLDER = "__chithi_outbox__";
+
+export interface OutboxRow {
+  id: number;
+  account_id: string;
+  action_type: string;
+  status: "pending" | "sending" | "dead";
+  retry_count: number;
+  error_message: string | null;
+  subject: string | null;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+}
