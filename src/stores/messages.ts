@@ -728,8 +728,13 @@ export const useMessagesStore = defineStore("messages", () => {
     fetchMessages();
   }
 
+  // Key on both account and folder path. Two accounts can share a folder
+  // name (e.g. "INBOX"), so watching the path alone never fires when the
+  // user clicks INBOX in account B while INBOX in account A is active,
+  // and the list keeps showing A's messages until a different folder is
+  // clicked first.
   watch(
-    () => foldersStore.activeFolderPath,
+    () => [accountsStore.activeAccountId, foldersStore.activeFolderPath] as const,
     () => {
       activeMessage.value = null;
       activeMessageId.value = null;
