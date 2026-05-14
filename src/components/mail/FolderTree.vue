@@ -3,7 +3,7 @@ import { ref, onMounted, watch } from "vue";
 import { useFoldersStore } from "@/stores/folders";
 import { useAccountsStore } from "@/stores/accounts";
 import { useMessagesStore } from "@/stores/messages";
-import type { Folder } from "@/lib/types";
+import { OUTBOX_FOLDER, type Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { dragMessageIds, dragSourceAccountId, isDragging } from "@/lib/drag-state";
 import { showToast, dismissToast } from "@/lib/toast";
@@ -484,6 +484,28 @@ async function doDeleteFolder() {
           <span class="folder-name">{{ item.folder.name }}</span>
           <span v-if="syncing === item.folder.path" class="sync-spinner"></span>
           <span v-else-if="item.folder.unread_count > 0" class="unread-badge">{{ item.folder.unread_count }}</span>
+        </button>
+
+        <!-- Synthetic per-account Outbox node. Clicking activates the
+             Outbox view in the main pane. -->
+        <button
+          class="folder-item"
+          :class="{
+            active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === OUTBOX_FOLDER,
+          }"
+          :data-testid="`folder-${account.id}-outbox`"
+          :style="{ paddingLeft: '12px' }"
+          @click.stop="selectFolder(account.id, OUTBOX_FOLDER)"
+        >
+          <span class="folder-toggle-spacer"></span>
+          <svg
+            class="folder-svg folder-svg--outbox"
+            width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
+          >
+            <path fill="currentColor" d="M3 13h5l1 2h6l1-2h5v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>
+            <path fill="currentColor" opacity=".55" d="m12 3 5 6h-3v4h-4V9H7l5-6Z"/>
+          </svg>
+          <span class="folder-name">Outbox</span>
         </button>
       </div>
     </div>

@@ -30,6 +30,20 @@ pub enum MailOp {
         by_folder: HashMap<String, Vec<u32>>,
         target_folder: String,
     },
+    /// Replay a previously-built RFC 5322 message.
+    ///
+    /// First-attempt sends originate in `commands::compose::send_message`
+    /// which both persists the outbox row and spawns its own send task;
+    /// this variant is only constructed by `outbox_to_mail_op` when the
+    /// worker replays a failed send during the post-sync drain.
+    SendRaw {
+        raw_message: Vec<u8>,
+        from: String,
+        to: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
+        subject: String,
+    },
 }
 
 /// Priority level for operations. Lower numeric value = higher priority.

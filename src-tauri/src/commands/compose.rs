@@ -144,7 +144,10 @@ pub async fn send_message(
     .ok();
 
     // --- Persist to outbox before spawning background send ---
-    // This ensures the message survives a crash during sending.
+    // The row is inserted with status 'sending' so the worker's replay
+    // loop won't pick it up while the first attempt is still in flight.
+    // On success the row is deleted; on failure it flips to 'pending'
+    // and the next post-sync drain replays it via the worker.
     let raw_message_b64 = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(&raw_message)
@@ -152,10 +155,20 @@ pub async fn send_message(
     let send_payload = serde_json::json!({
         "raw_message_b64": raw_message_b64,
         "subject": subject_display,
+        "from": account.email,
+        "to": message.to,
+        "cc": message.cc,
+        "bcc": message.bcc,
     });
     let outbox_id = {
         let conn = state.db.writer().await;
-        crate::ops::offline::queue_offline_op(&conn, &account_id, "send", &send_payload)?
+        crate::ops::offline::queue_offline_op_with_status(
+            &conn,
+            &account_id,
+            "send",
+            &send_payload,
+            "sending",
+        )?
     };
     log::info!(
         "Persisted send to outbox (id={}) for account {}",
@@ -259,9 +272,11 @@ pub async fn send_message(
             }
             Err(e) => {
                 log::error!("Send failed for account {}: {}", account_id_bg, e);
-                // Leave the message in the outbox for retry (mark as failed)
+                // Flip the row from 'sending' back to 'pending' and record
+                // the error so the worker replays it on the next sync.
                 let conn = db_bg.writer().await;
                 let _ = crate::ops::offline::mark_failed(&conn, outbox_id, &e.to_string());
+                let _ = crate::ops::offline::mark_pending(&conn, outbox_id);
                 app_bg
                     .emit(
                         "send-failed",

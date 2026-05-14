@@ -216,6 +216,26 @@ impl AccountWorker {
                         entry.id,
                         entry.action_type
                     );
+                    drop(conn);
+                    if entry.action_type == "send" {
+                        let subject =
+                            serde_json::from_str::<serde_json::Value>(&entry.payload_json)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("subject").and_then(|s| s.as_str()).map(String::from)
+                                })
+                                .unwrap_or_default();
+                        self.app
+                            .emit(
+                                "send-complete",
+                                serde_json::json!({
+                                    "account_id": self.account_id,
+                                    "subject": subject,
+                                    "via": "outbox-replay",
+                                }),
+                            )
+                            .ok();
+                    }
                 }
                 Err(e) => {
                     let conn = self.db.writer().await;
@@ -227,8 +247,14 @@ impl AccountWorker {
                         entry.retry_count + 1,
                         e
                     );
-                    // Stop replaying on first failure — connection is likely broken
-                    break;
+                    // For send ops we keep going: a retryable transient
+                    // (timeout, transient SMTP 4xx, etc.) on one message
+                    // shouldn't stall the other replays in this drain.
+                    // For other ops a failure usually indicates the
+                    // connection is broken, so break as before.
+                    if entry.action_type != "send" {
+                        break;
+                    }
                 }
             }
         }
@@ -390,6 +416,13 @@ impl AccountWorker {
     // --- IMAP operations on persistent connection ---
 
     async fn execute_imap(&mut self, op: MailOp) -> Result<()> {
+        // SendRaw on an IMAP account goes out over SMTP, not the persistent
+        // IMAP connection. Branch before we touch IMAP state so a stalled
+        // mail server doesn't gate retries of a queued send.
+        if let MailOp::SendRaw { .. } = op {
+            return self.execute_smtp_send(op).await;
+        }
+
         // Ensure we have a live connection
         self.ensure_imap_connection().await?;
 
@@ -527,8 +560,11 @@ impl AccountWorker {
                 log::debug!("JMAP delete handled by optimistic path");
             }
             MailOp::SetFlags { flags, add, .. } => {
-                let _ = (conn_jmap, jmap_config, flags, add);
+                let _ = (jmap_config.clone(), flags, add);
                 log::debug!("JMAP set_flags handled by optimistic path");
+            }
+            MailOp::SendRaw { raw_message, .. } => {
+                conn_jmap.send_email(&jmap_config, &raw_message).await?;
             }
             _ => {}
         }
@@ -544,9 +580,80 @@ impl AccountWorker {
             | MailOp::SetFlags { .. } => {
                 log::debug!("Graph op handled by optimistic path");
             }
+            MailOp::SendRaw { .. } => {
+                // Graph's server-side `/me/mailFolders/outbox` already holds
+                // messages that were accepted by `sendMail`. Client-side
+                // replay would require re-parsing the raw MIME back into
+                // Graph's structured payload, which is error-prone. Fail
+                // here so the row eventually marks dead and the user can
+                // surface it via the Outbox view.
+                return Err(Error::Other(
+                    "Graph send replay is not implemented; the server-side Outbox folder owns delivery from this point. Discard or recompose this message.".into(),
+                ));
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Send a queued `MailOp::SendRaw` over the account's SMTP host. Used
+    /// by `execute_imap` to bypass the persistent IMAP connection for
+    /// outgoing mail.
+    async fn execute_smtp_send(&mut self, op: MailOp) -> Result<()> {
+        let MailOp::SendRaw {
+            raw_message,
+            from,
+            to,
+            cc,
+            bcc,
+            ..
+        } = op
+        else {
+            return Err(Error::Other(
+                "execute_smtp_send called with non-SendRaw op".into(),
+            ));
+        };
+
+        let account = {
+            let conn = self.db.reader();
+            crate::db::accounts::get_account_full(&conn, &self.account_id)?
+        };
+
+        // For O365 SMTP, refresh the OAuth token (XOAUTH2). For password
+        // accounts, just use the stored password.
+        let (smtp_username, smtp_password, use_xoauth2) =
+            if account.auth_method == "oauth-microsoft" {
+                let tokens = crate::oauth::load_tokens(&self.account_id)?
+                    .ok_or_else(|| Error::Other("No O365 tokens for SMTP replay".into()))?;
+                let refresh = tokens
+                    .refresh_token
+                    .ok_or_else(|| Error::Other("No O365 refresh token for SMTP replay".into()))?;
+                let new = crate::oauth::refresh_with_scopes(
+                    &crate::oauth::MICROSOFT,
+                    &refresh,
+                    crate::oauth::MICROSOFT_IMAP_SCOPES,
+                )
+                .await?;
+                crate::oauth::store_tokens(&self.account_id, &new)?;
+                (account.username.clone(), new.access_token, true)
+            } else {
+                (account.username.clone(), account.password.clone(), false)
+            };
+
+        crate::mail::smtp::send_raw(
+            &account.smtp_host,
+            account.smtp_port,
+            &smtp_username,
+            &smtp_password,
+            account.use_tls,
+            use_xoauth2,
+            &from,
+            &to,
+            &cc,
+            &bcc,
+            &raw_message,
+        )
+        .await
     }
 }
 

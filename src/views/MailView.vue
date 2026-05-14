@@ -15,6 +15,8 @@ import Toolbar from "@/components/mail/Toolbar.vue";
 import FolderTree from "@/components/mail/FolderTree.vue";
 import MessageList from "@/components/mail/MessageList.vue";
 import MessageReader from "@/components/mail/MessageReader.vue";
+import OutboxList from "@/components/mail/OutboxList.vue";
+import { OUTBOX_FOLDER } from "@/lib/types";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import MobileIconButton from "@/components/mobile/MobileIconButton.vue";
 
@@ -26,11 +28,15 @@ const platformStore = usePlatformStore();
 const router = useRouter();
 
 const { isMobile } = storeToRefs(platformStore);
-const activeFolderName = computed(
-  () =>
-    foldersStore.folders.find(
-      (f) => f.path === foldersStore.activeFolderPath,
-    )?.name ?? "Inbox",
+const activeFolderName = computed(() => {
+  if (foldersStore.activeFolderPath === OUTBOX_FOLDER) return "Outbox";
+  return (
+    foldersStore.folders.find((f) => f.path === foldersStore.activeFolderPath)
+      ?.name ?? "Inbox"
+  );
+});
+const isOutboxFolder = computed(
+  () => foldersStore.activeFolderPath === OUTBOX_FOLDER,
 );
 const activeAccountEmail = computed(
   () => accountsStore.activeAccount()?.email ?? "",
@@ -367,8 +373,13 @@ onUnmounted(() => {
         <Toolbar />
         <div class="mail-content">
 
+      <!-- Outbox view replaces the message list when the synthetic
+           Outbox folder is selected. The pane-mode templates below
+           are mutually exclusive with this. -->
+      <OutboxList v-if="isOutboxFolder" data-testid="outbox-pane" />
+
       <!-- Right mode: message list + reader side by side -->
-      <template v-if="uiStore.messageViewMode === 'right'">
+      <template v-if="!isOutboxFolder && uiStore.messageViewMode === 'right'">
         <div
           class="message-list-pane"
           :style="{ width: showRightReader ? uiStore.messageListWidth + 'px' : undefined }"
@@ -387,7 +398,7 @@ onUnmounted(() => {
       </template>
 
       <!-- Bottom mode: message list on top, single-message reader below -->
-      <template v-else-if="uiStore.messageViewMode === 'bottom'">
+      <template v-else-if="!isOutboxFolder && uiStore.messageViewMode === 'bottom'">
         <div class="stacked-content" data-testid="bottom-mode-content">
           <div class="message-list-pane expanded">
             <MessageList @open-message="onOpenMessage" />
@@ -399,12 +410,12 @@ onUnmounted(() => {
       </template>
 
       <!-- None mode: list only, no reader. Double-click opens a window. -->
-      <template v-else-if="uiStore.messageViewMode === 'none'">
+      <template v-else-if="!isOutboxFolder && uiStore.messageViewMode === 'none'">
         <MessageList data-testid="none-mode-list" @open-message="onOpenMessage" />
       </template>
 
       <!-- Tab mode: tab bar on top, list or reader content below -->
-      <template v-else>
+      <template v-else-if="!isOutboxFolder">
         <div class="stacked-content" data-testid="tab-mode-content">
           <div class="tab-bar" role="tablist" data-testid="tab-bar">
             <div
