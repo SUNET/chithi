@@ -35,12 +35,19 @@ pub fn clean_url(url: String) -> Result<String> {
 /// bridge or a hand-edited calendar field cannot escape the renderer.
 const ALLOWED_SCHEMES: &[&str] = &["http://", "https://", "mailto:", "tel:"];
 
+// Case-insensitive ASCII prefix check. Works on raw bytes so a URL with
+// multi-byte UTF-8 characters (e.g. an IRI like `héllo://...`) cannot
+// trigger a panic on a non-char-boundary slice — the allowed scheme
+// prefixes are all ASCII, so byte comparison is the right primitive.
+fn starts_with_ci(url: &str, prefix: &str) -> bool {
+    url.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
 fn has_allowed_scheme(url: &str) -> bool {
-    // RFC 3986 §3.1 — schemes are case-insensitive. Lowercase just enough
-    // of the head to cover the longest allowed scheme prefix.
-    let head_len = url.len().min(8);
-    let head = url[..head_len].to_ascii_lowercase();
-    ALLOWED_SCHEMES.iter().any(|s| head.starts_with(s))
+    // RFC 3986 §3.1 — schemes are case-insensitive.
+    ALLOWED_SCHEMES.iter().any(|s| starts_with_ci(url, s))
 }
 
 /// Open a user-clicked link in the OS default handler, stripping tracking
@@ -54,9 +61,7 @@ pub fn open_link(url: String) -> Result<()> {
             url
         )));
     }
-    let to_open = if url[..5.min(url.len())].eq_ignore_ascii_case("http:")
-        || url[..6.min(url.len())].eq_ignore_ascii_case("https:")
-    {
+    let to_open = if starts_with_ci(&url, "http://") || starts_with_ci(&url, "https://") {
         sanitize(&url)
     } else {
         url

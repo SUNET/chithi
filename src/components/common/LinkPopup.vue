@@ -118,6 +118,12 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
         <span class="link-popup-hint">No tracking parameters detected.</span>
       </div>
 
+      <div v-if="!openableScheme" class="link-popup-row hint">
+        <span class="link-popup-hint warn" data-testid="link-popup-unopenable">
+          chithi can only open http(s), mailto:, and tel: links. Copy this one and paste it where you need it.
+        </span>
+      </div>
+
       <div class="link-popup-actions">
         <button
           type="button"
@@ -209,6 +215,10 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 
 .link-popup-hint.error {
   color: var(--color-danger-text, var(--color-danger));
+}
+
+.link-popup-hint.warn {
+  color: var(--color-warning, var(--color-text));
 }
 
 .link-popup-actions {
