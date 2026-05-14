@@ -186,9 +186,11 @@ function handleIframeMessage(event: MessageEvent) {
   if (!fromOurIframe) return;
 
   if (event.data.type === 'link-click' && typeof event.data.href === 'string') {
-    navigator.clipboard.writeText(event.data.href).then(() => {
-      showToast("Link copied to clipboard");
-    });
+    // The popup gives the user the choice between copy and open-untracked.
+    // Clear the hover state first so the status bar doesn't keep showing
+    // the URL underneath the modal.
+    uiStore.setHoverUrl(null);
+    uiStore.openLinkPopup(event.data.href);
   } else if (event.data.type === 'link-hover' && typeof event.data.href === 'string') {
     uiStore.setHoverUrl(event.data.href);
   } else if (event.data.type === 'link-leave') {

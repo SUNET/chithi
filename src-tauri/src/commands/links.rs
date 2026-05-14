@@ -1,9 +1,22 @@
 use crate::error::{Error, Result};
+use clearurls::UrlCleaner;
+use std::sync::OnceLock;
 
-/// Strip tracking parameters (utm_*, fbclid, gclid, ...) from a single URL.
-/// Returns the cleaned URL, or the original if untrack made no changes.
+/// The ClearURLs ruleset is embedded in the crate; building the cleaner
+/// compiles the regex providers once. Kept in a OnceLock so the work
+/// happens at most once per process rather than per command call.
+fn cleaner() -> &'static UrlCleaner {
+    static CLEANER: OnceLock<UrlCleaner> = OnceLock::new();
+    CLEANER.get_or_init(|| {
+        UrlCleaner::from_embedded_rules().expect("embedded ClearURLs ruleset is valid")
+    })
+}
+
 fn sanitize(url: &str) -> String {
-    untrack::clone_and_sanitize_text(url).unwrap_or_else(|| url.to_string())
+    cleaner()
+        .clear_single_url_str(url)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| url.to_string())
 }
 
 /// Preview the cleaned form of a URL without opening it. The frontend uses
@@ -16,9 +29,10 @@ pub fn clean_url(url: String) -> Result<String> {
 }
 
 /// Open a user-clicked link in the OS default handler, stripping tracking
-/// parameters first via the `untrack` crate. Refuses anything that is not
-/// http(s) so the renderer can't shell out to mailto:, file:, javascript:,
-/// etc. by smuggling a crafted href through the iframe postMessage bridge.
+/// parameters first via the ClearURLs ruleset. Refuses anything that is
+/// not http(s) so the renderer can't shell out to mailto:, file:,
+/// javascript:, etc. by smuggling a crafted href through the iframe
+/// postMessage bridge or a hand-edited calendar field.
 #[tauri::command]
 pub fn open_link(url: String) -> Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {

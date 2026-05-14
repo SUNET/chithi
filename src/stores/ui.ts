@@ -253,6 +253,18 @@ export const useUiStore = defineStore("ui", () => {
     hoverUrl.value = url;
   }
 
+  // URL the user activated; when non-null, the global LinkPopup component
+  // shows a chooser (copy / open-untracked / cancel) and clears this back
+  // to null when dismissed. Centralized here so any view can trigger the
+  // popup without each owning its own copy of the modal.
+  const linkPopupUrl = ref<string | null>(null);
+  function openLinkPopup(url: string) {
+    linkPopupUrl.value = url;
+  }
+  function closeLinkPopup() {
+    linkPopupUrl.value = null;
+  }
+
   return {
     threadingEnabled,
     folderPaneWidth,
@@ -293,5 +305,8 @@ export const useUiStore = defineStore("ui", () => {
     closeDrawer,
     hoverUrl,
     setHoverUrl,
+    linkPopupUrl,
+    openLinkPopup,
+    closeLinkPopup,
   };
 });
