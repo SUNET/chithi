@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, watch } from "vue";
+import { onMounted, nextTick, ref, computed, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
@@ -190,6 +190,25 @@ function nowTopOffset(): number {
   const minutes = now.getHours() * 60 + now.getMinutes();
   return (minutes / 60) * HOUR_ROW;
 }
+
+const dayGridRef = ref<HTMLElement | null>(null);
+const weekGridRef = ref<HTMLElement | null>(null);
+
+function scrollMobileToNow(el: HTMLElement | null) {
+  if (!el) return;
+  const target = nowTopOffset() - el.clientHeight / 2;
+  el.scrollTop = Math.max(0, target);
+}
+
+watch(
+  () => calendarStore.viewMode,
+  async (mode) => {
+    if (mode !== "day" && mode !== "week") return;
+    await nextTick();
+    scrollMobileToNow(mode === "day" ? dayGridRef.value : weekGridRef.value);
+  },
+  { immediate: true },
+);
 
 function setMobileViewMode(mode: CalendarViewMode) {
   calendarStore.setViewMode(mode);
@@ -394,7 +413,7 @@ onMounted(() => {
     </div>
 
     <!-- DAY VIEW -->
-    <div v-if="calendarStore.viewMode === 'day'" class="day-view">
+    <div v-if="calendarStore.viewMode === 'day'" ref="dayGridRef" class="day-view">
       <div
         v-if="allDayEventsForDay(new Date(calendarStore.currentDate)).length"
         class="all-day-strip"
@@ -486,7 +505,7 @@ onMounted(() => {
         </button>
       </div>
 
-      <div class="week-grid">
+      <div ref="weekGridRef" class="week-grid">
         <div class="hour-column">
           <div v-for="h in WEEK_HOURS" :key="h" class="hour-slot">
             <span class="hour-label">{{ h.toString().padStart(2, "0") }}</span>

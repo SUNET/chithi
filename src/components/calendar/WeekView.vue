@@ -447,8 +447,8 @@ function onColumnDrop(day: Date, e: MouseEvent) {
   });
 }
 
-// Scroll to current hour (or 8 AM if before that) on mount, and refresh
-// the "now" ref once per minute so the red current-time line and
+// Center the current time in the viewport on mount, and refresh the
+// "now" ref once per minute so the red current-time line and
 // .current-hour label stay accurate. The interval is per-instance; stored
 // so we can clear it on unmount and not leak when the view toggles
 // between week/day and month.
@@ -460,8 +460,10 @@ onMounted(async () => {
 
   await nextTick();
   if (gridRef.value) {
-    const scrollToHour = Math.max(getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) - 2, 0);
-    gridRef.value.scrollTop = HOUR_HEIGHT * scrollToHour;
+    const hour = getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+    const minutes = getMinutesInTimezone(now.value.toISOString(), uiStore.displayTimezone);
+    const nowPx = (hour + minutes / 60) * HOUR_HEIGHT;
+    gridRef.value.scrollTop = Math.max(0, nowPx - gridRef.value.clientHeight / 2);
   }
 });
 
