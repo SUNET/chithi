@@ -35,8 +35,13 @@ const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const uiStore = useUiStore();
 
-// View mode: plain text by default
-const showHtml = ref(false);
+// View mode: sticky across messages via uiStore so a user who flips to
+// HTML once doesn't have to re-flip on every subsequent message. Falls
+// back to plain text if the current message has no HTML part.
+const showHtml = computed({
+  get: () => uiStore.preferHtmlBody && hasHtml(),
+  set: (v: boolean) => uiStore.setPreferHtmlBody(v),
+});
 const invites = ref<ParsedInvite[]>([]);
 
 // Remote images: per-message, not persisted
@@ -49,11 +54,11 @@ const hasRemoteImages = computed(() => {
   return messagesStore.activeMessage?.has_remote_images ?? false;
 });
 
-// Reset view state when switching messages
+// Reset per-message state when switching messages. The HTML/plain choice
+// is preserved in uiStore.preferHtmlBody and intentionally not touched.
 watch(
   () => messagesStore.activeMessageId,
   () => {
-    showHtml.value = false;
     invites.value = [];
     imagesHtml.value = null;
     loadingImages.value = false;

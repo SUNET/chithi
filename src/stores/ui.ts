@@ -63,6 +63,17 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.getItem("chithi-decorations") !== "false",
   );
 
+  // Sticky HTML/plain-text preference for the message reader. Default is
+  // plain text (safer, no remote content surprises); flips to whatever the
+  // user last picked so they don't have to re-toggle on every message.
+  const preferHtmlBody = ref(
+    localStorage.getItem("chithi-prefer-html-body") === "true",
+  );
+  function setPreferHtmlBody(prefer: boolean) {
+    preferHtmlBody.value = prefer;
+    localStorage.setItem("chithi-prefer-html-body", String(prefer));
+  }
+
   // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
   const VALID_WEEK_STARTS = [0, 1, 6];
   const weekStartDay = ref<number>(
@@ -308,5 +319,7 @@ export const useUiStore = defineStore("ui", () => {
     linkPopupUrl,
     openLinkPopup,
     closeLinkPopup,
+    preferHtmlBody,
+    setPreferHtmlBody,
   };
 });
