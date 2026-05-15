@@ -174,7 +174,8 @@ onMounted(() => {
 const fieldLabels: Record<string, string> = {
   from: "From",
   to: "To",
-  cc: "Cc",
+  cc: "CC",
+  to_cc: "To/CC",
   subject: "Subject",
   size: "Size (bytes)",
   has_attachment: "Has Attachment",

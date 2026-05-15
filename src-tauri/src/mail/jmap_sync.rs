@@ -221,6 +221,7 @@ async fn sync_jmap_folder(
     );
 
     let mut total_synced = 0u32;
+    let mut new_ids: Vec<String> = Vec::new();
 
     {
         let conn = db.writer().await;
@@ -288,6 +289,7 @@ async fn sync_jmap_folder(
                 snippet,
             };
             db::messages::insert_message(&conn, &new_msg)?;
+            new_ids.push(id);
             total_synced += 1;
         }
 
@@ -335,6 +337,28 @@ async fn sync_jmap_folder(
                 deleted,
                 folder_name
             );
+        }
+    }
+
+    // Run filter rules against newly inserted messages. Errors are logged
+    // and swallowed so a transient JMAP hiccup can't poison the sync.
+    if !new_ids.is_empty() {
+        match crate::commands::filters::apply_filters_to_new_messages(
+            db, account_id, mailbox_id, &new_ids,
+        )
+        .await
+        {
+            Ok(filtered) => {
+                if filtered > 0 {
+                    log::info!(
+                        "JMAP filters matched {} of {} new messages in '{}'",
+                        filtered,
+                        new_ids.len(),
+                        folder_name
+                    );
+                }
+            }
+            Err(e) => log::warn!("JMAP filter pass failed for '{}': {}", folder_name, e),
         }
     }
 

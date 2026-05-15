@@ -33,6 +33,7 @@ pub enum ConditionField {
     From,
     To,
     Cc,
+    ToCc,
     Subject,
     Size,
     HasAttachment,

@@ -7,7 +7,7 @@
  * options are skipped, Escape dismisses, mousedown outside dismisses,
  * keyboard arrow navigation + Enter to commit.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import Select from "@/components/common/Select.vue";
@@ -39,6 +39,7 @@ describe("Select", () => {
 
   afterEach(() => {
     document.body.innerHTML = "";
+    vi.restoreAllMocks();
   });
 
   it("renders the selected option's label on the trigger", async () => {
@@ -117,5 +118,29 @@ describe("Select", () => {
     });
     expect(w.find(".select-label").text()).toBe("Pick one…");
     expect(w.find(".select-label").classes()).toContain("is-placeholder");
+  });
+
+  it("opens above the trigger when there is not enough room below", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 320, configurable: true, writable: true });
+
+    const w = await mountWith("a");
+    vi.spyOn(w.element, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 290,
+      width: 240,
+      height: 30,
+      top: 290,
+      right: 240,
+      bottom: 320,
+      left: 0,
+      toJSON: () => ({}),
+    });
+
+    await w.find(".select-trigger").trigger("click");
+
+    const menu = w.find(".select-menu");
+    expect(menu.exists()).toBe(true);
+    expect(menu.classes()).toContain("open-above");
+    expect(menu.attributes("style")).toContain("max-height: 280px");
   });
 });

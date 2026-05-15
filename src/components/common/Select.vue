@@ -39,6 +39,11 @@ const rootEl = ref<HTMLElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
 const open = ref(false);
 const highlight = ref(-1);
+const openAbove = ref(false);
+
+const MENU_MAX_HEIGHT = 280;
+const MENU_VIEWPORT_PADDING = 8;
+const menuMaxHeight = ref(`${MENU_MAX_HEIGHT}px`);
 
 const selectedOption = computed(() =>
   props.options.find((o) => o.value === props.modelValue),
@@ -54,6 +59,7 @@ function openMenu() {
   );
   highlight.value = idx >= 0 ? idx : firstEnabledIndex();
   open.value = true;
+  updateMenuPlacement();
   nextTick(() => scrollHighlightedIntoView());
 }
 
@@ -64,6 +70,18 @@ function closeMenu() {
 function toggleMenu() {
   if (open.value) closeMenu();
   else openMenu();
+}
+
+function updateMenuPlacement() {
+  if (!open.value || !rootEl.value) return;
+
+  const rect = rootEl.value.getBoundingClientRect();
+  const spaceBelow = window.innerHeight - rect.bottom - MENU_VIEWPORT_PADDING;
+  const spaceAbove = rect.top - MENU_VIEWPORT_PADDING;
+  openAbove.value = spaceBelow < MENU_MAX_HEIGHT && spaceAbove > spaceBelow;
+
+  const availableSpace = openAbove.value ? spaceAbove : spaceBelow;
+  menuMaxHeight.value = `${Math.max(0, Math.min(MENU_MAX_HEIGHT, availableSpace))}px`;
 }
 
 function firstEnabledIndex(): number {
@@ -167,9 +185,11 @@ watch(
 
 onMounted(() => {
   document.addEventListener("mousedown", onDocMouseDown);
+  window.addEventListener("resize", updateMenuPlacement);
 });
 onUnmounted(() => {
   document.removeEventListener("mousedown", onDocMouseDown);
+  window.removeEventListener("resize", updateMenuPlacement);
 });
 </script>
 
@@ -205,6 +225,8 @@ onUnmounted(() => {
       v-if="open"
       ref="listEl"
       class="select-menu"
+      :class="{ 'open-above': openAbove }"
+      :style="{ maxHeight: menuMaxHeight }"
       role="listbox"
       :aria-activedescendant="highlight >= 0 ? `${testid ?? 'select'}-opt-${highlight}` : undefined"
     >
@@ -289,7 +311,6 @@ onUnmounted(() => {
   left: 0;
   right: 0;
   z-index: 1000;
-  max-height: 280px;
   overflow-y: auto;
   margin: 0;
   padding: 4px;
@@ -298,6 +319,12 @@ onUnmounted(() => {
   border: 1px solid var(--color-border);
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.select-menu.open-above {
+  top: auto;
+  bottom: calc(100% + 4px);
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.25);
 }
 
 .select-option {
