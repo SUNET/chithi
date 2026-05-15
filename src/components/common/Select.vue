@@ -58,8 +58,8 @@ function openMenu() {
     (o) => o.value === props.modelValue && !o.disabled,
   );
   highlight.value = idx >= 0 ? idx : firstEnabledIndex();
-  updateMenuPlacement();
   open.value = true;
+  updateMenuPlacement();
   nextTick(() => scrollHighlightedIntoView());
 }
 
@@ -73,7 +73,7 @@ function toggleMenu() {
 }
 
 function updateMenuPlacement() {
-  if (!rootEl.value) return;
+  if (!open.value || !rootEl.value) return;
 
   const rect = rootEl.value.getBoundingClientRect();
   const spaceBelow = window.innerHeight - rect.bottom - MENU_VIEWPORT_PADDING;
