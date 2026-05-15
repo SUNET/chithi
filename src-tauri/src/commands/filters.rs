@@ -238,10 +238,30 @@ fn build_filter_action_plan(
     plan
 }
 
-/// Load `MessageData` rows for a specific set of message IDs, scoped to one
-/// folder. Modeled on `load_folder_messages` but bounded to the new-messages
-/// set produced by a sync pass.
+const MAX_IN_PARAMS: usize = 900;
+
+/// Load `MessageData` rows for a specific set of message IDs, chunked to
+/// stay under SQLite's bound-parameter limit (999 by default).
 fn load_messages_by_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_path: &str,
+    ids: &[String],
+) -> Result<Vec<MessageData>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(MAX_IN_PARAMS) {
+        let msgs = load_messages_by_ids_chunk(conn, account_id, folder_path, chunk)?;
+        all.extend(msgs);
+    }
+    Ok(all)
+}
+
+/// Load a single chunk of message IDs (must fit within SQLite parameter limit).
+fn load_messages_by_ids_chunk(
     conn: &rusqlite::Connection,
     account_id: &str,
     folder_path: &str,
@@ -363,8 +383,7 @@ pub(crate) async fn apply_filters_to_new_messages(
     let (rules, messages, account) = {
         let conn = db.reader();
         let all_rules = db::filters::list_filters(&conn, Some(account_id))?;
-        let enabled_rules: Vec<FilterRule> =
-            all_rules.into_iter().filter(|r| r.enabled).collect();
+        let enabled_rules: Vec<FilterRule> = all_rules.into_iter().filter(|r| r.enabled).collect();
         if enabled_rules.is_empty() {
             return Ok(0);
         }
@@ -1193,10 +1212,14 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].0.id, "acc1_inbox_M1");
         assert_eq!(plan[0].1.len(), 2);
-        let has_move = plan[0].1.iter().any(|a| {
-            matches!(a, FilterAction::Move { target } if target == "archive_box")
-        });
-        let has_mark_read = plan[0].1.iter().any(|a| matches!(a, FilterAction::MarkRead));
+        let has_move = plan[0]
+            .1
+            .iter()
+            .any(|a| matches!(a, FilterAction::Move { target } if target == "archive_box"));
+        let has_mark_read = plan[0]
+            .1
+            .iter()
+            .any(|a| matches!(a, FilterAction::MarkRead));
         assert!(has_move);
         assert!(has_mark_read);
     }

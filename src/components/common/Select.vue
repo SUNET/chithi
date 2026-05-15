@@ -40,10 +40,10 @@ const listEl = ref<HTMLElement | null>(null);
 const open = ref(false);
 const highlight = ref(-1);
 const openAbove = ref(false);
-const menuMaxHeight = ref("280px");
 
 const MENU_MAX_HEIGHT = 280;
 const MENU_VIEWPORT_PADDING = 8;
+const menuMaxHeight = ref(`${MENU_MAX_HEIGHT}px`);
 
 const selectedOption = computed(() =>
   props.options.find((o) => o.value === props.modelValue),
@@ -311,7 +311,6 @@ onUnmounted(() => {
   left: 0;
   right: 0;
   z-index: 1000;
-  max-height: 280px;
   overflow-y: auto;
   margin: 0;
   padding: 4px;

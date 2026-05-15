@@ -1181,28 +1181,21 @@ async fn sync_graph_account(
         // the sync — messages already landed in the DB.
         if !new_ids.is_empty() {
             match crate::commands::filters::apply_filters_to_new_messages(
-                &db_arc,
-                account_id,
-                &gf.id,
-                &new_ids,
+                &db_arc, account_id, &gf.id, &new_ids,
             )
             .await
             {
                 Ok(filtered) => {
                     if filtered > 0 {
                         log::info!(
-                            "Graph filters applied to {} of {} new messages in '{}'",
+                            "Graph filters matched {} of {} new messages in '{}'",
                             filtered,
                             new_ids.len(),
                             gf.display_name
                         );
                     }
                 }
-                Err(e) => log::warn!(
-                    "Graph filter pass failed for '{}': {}",
-                    gf.display_name,
-                    e
-                ),
+                Err(e) => log::warn!("Graph filter pass failed for '{}': {}", gf.display_name, e),
             }
         }
     }

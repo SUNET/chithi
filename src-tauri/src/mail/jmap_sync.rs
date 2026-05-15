@@ -344,28 +344,21 @@ async fn sync_jmap_folder(
     // and swallowed so a transient JMAP hiccup can't poison the sync.
     if !new_ids.is_empty() {
         match crate::commands::filters::apply_filters_to_new_messages(
-            db,
-            account_id,
-            mailbox_id,
-            &new_ids,
+            db, account_id, mailbox_id, &new_ids,
         )
         .await
         {
             Ok(filtered) => {
                 if filtered > 0 {
                     log::info!(
-                        "JMAP filters applied to {} of {} new messages in '{}'",
+                        "JMAP filters matched {} of {} new messages in '{}'",
                         filtered,
                         new_ids.len(),
                         folder_name
                     );
                 }
             }
-            Err(e) => log::warn!(
-                "JMAP filter pass failed for '{}': {}",
-                folder_name,
-                e
-            ),
+            Err(e) => log::warn!("JMAP filter pass failed for '{}': {}", folder_name, e),
         }
     }
 
