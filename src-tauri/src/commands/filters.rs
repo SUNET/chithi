@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use tauri::State;
 
 use crate::db;
+use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::{FilterAction, FilterRule};
@@ -124,13 +126,7 @@ pub async fn apply_filters_to_folder(
     );
 
     // 3. For each message, run filter engine to get actions
-    let mut action_plan: Vec<(MessageData, Vec<FilterAction>)> = Vec::new();
-    for msg in &messages {
-        let actions = engine::apply_filters(&rules, msg);
-        if !actions.is_empty() {
-            action_plan.push((msg.clone(), actions));
-        }
-    }
+    let action_plan = build_filter_action_plan(&rules, &messages);
 
     let affected_count = action_plan.len() as u32;
 
@@ -220,6 +216,235 @@ pub async fn apply_filters_to_folder(
         "Apply filters to folder complete: {} messages affected",
         affected_count
     );
+
+    Ok(affected_count)
+}
+
+/// Run the filter engine over a slice of messages and collect the per-message
+/// action plan. Pure function: the only side effect is reading rule and
+/// message fields. Shared between the explicit `apply_filters_to_folder`
+/// command and the sync-time `apply_filters_to_new_messages` helper.
+fn build_filter_action_plan(
+    rules: &[FilterRule],
+    messages: &[MessageData],
+) -> Vec<(MessageData, Vec<FilterAction>)> {
+    let mut plan = Vec::new();
+    for msg in messages {
+        let actions = engine::apply_filters(rules, msg);
+        if !actions.is_empty() {
+            plan.push((msg.clone(), actions));
+        }
+    }
+    plan
+}
+
+/// Load `MessageData` rows for a specific set of message IDs, scoped to one
+/// folder. Modeled on `load_folder_messages` but bounded to the new-messages
+/// set produced by a sync pass.
+fn load_messages_by_ids(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    folder_path: &str,
+    ids: &[String],
+) -> Result<Vec<MessageData>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders: String = (0..ids.len())
+        .map(|i| format!("?{}", i + 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, uid, folder_path, from_name, from_email, to_addresses, cc_addresses, \
+                subject, size, has_attachments, flags \
+         FROM messages \
+         WHERE account_id = ?1 AND folder_path = ?2 AND id IN ({})",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len() + 2);
+    params.push(&account_id);
+    params.push(&folder_path);
+    for id in ids {
+        params.push(id as &dyn rusqlite::types::ToSql);
+    }
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            let id: String = row.get(0)?;
+            let uid: u32 = row.get(1)?;
+            let folder: String = row.get(2)?;
+            let from_name: Option<String> = row.get(3)?;
+            let from_email: String = row.get(4)?;
+            let to_json: String = row.get(5)?;
+            let cc_json: String = row.get(6)?;
+            let subject: Option<String> = row.get(7)?;
+            let size: i64 = row.get(8)?;
+            let has_attachments: bool = row.get(9)?;
+            let flags_json: String = row.get(10)?;
+
+            Ok((
+                id,
+                uid,
+                folder,
+                from_name,
+                from_email,
+                to_json,
+                cc_json,
+                subject,
+                size,
+                has_attachments,
+                flags_json,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for (
+        id,
+        uid,
+        folder,
+        from_name,
+        from_email,
+        to_json,
+        cc_json,
+        subject,
+        size,
+        has_attach,
+        flags_json,
+    ) in rows
+    {
+        let to_addresses: Vec<AddressEntry> = serde_json::from_str(&to_json).unwrap_or_default();
+        let cc_addresses: Vec<AddressEntry> = serde_json::from_str(&cc_json).unwrap_or_default();
+        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+
+        messages.push(MessageData {
+            id,
+            uid,
+            folder_path: folder,
+            from_name,
+            from_email,
+            to_addresses,
+            cc_addresses,
+            subject,
+            size: size as u64,
+            has_attachments: has_attach,
+            flags,
+        });
+    }
+
+    Ok(messages)
+}
+
+/// Apply enabled filter rules to a bounded set of newly-synced messages in
+/// one folder, dispatching to the protocol-specific executor that matches the
+/// account's mail binding. Called from the sync paths for JMAP and Graph
+/// accounts; IMAP sync handles its own filter pass inline so it can reuse
+/// the open `imap::Session`.
+///
+/// Returns the number of messages that had at least one action planned.
+/// Executor errors are logged and swallowed (returning `Ok(0)`) so a
+/// transient JMAP/Graph failure cannot poison the surrounding sync — the
+/// messages are already in the DB and the user can retry via the manual
+/// "Apply Filters" button.
+pub(crate) async fn apply_filters_to_new_messages(
+    db: &Arc<DbPool>,
+    account_id: &str,
+    folder_path: &str,
+    new_ids: &[String],
+) -> Result<u32> {
+    if new_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let (rules, messages, account) = {
+        let conn = db.reader();
+        let all_rules = db::filters::list_filters(&conn, Some(account_id))?;
+        let enabled_rules: Vec<FilterRule> =
+            all_rules.into_iter().filter(|r| r.enabled).collect();
+        if enabled_rules.is_empty() {
+            return Ok(0);
+        }
+        let messages = load_messages_by_ids(&conn, account_id, folder_path, new_ids)?;
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let account = db::accounts::get_account_full(&conn, account_id)?;
+        (enabled_rules, messages, account)
+    };
+
+    let action_plan = build_filter_action_plan(&rules, &messages);
+    if action_plan.is_empty() {
+        return Ok(0);
+    }
+    let affected_count = action_plan.len() as u32;
+
+    log::info!(
+        "Sync-time filters: {} new messages, {} matched in '{}' (protocol={})",
+        messages.len(),
+        affected_count,
+        folder_path,
+        account.mail_protocol_str()
+    );
+
+    // Dispatch by protocol. IMAP is handled by sync.rs's inline executor
+    // (which reuses the open Session); anything we don't know how to dispatch
+    // is a silent no-op so a misconfigured account never blocks sync.
+    let result = match account.mail_protocol_str() {
+        "jmap" => match execute_jmap_filter_actions(&account, folder_path, &action_plan).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "Sync-time JMAP filter execution failed for '{}': {}",
+                    folder_path,
+                    e
+                );
+                return Ok(0);
+            }
+        },
+        "graph" => match execute_graph_filter_actions(account_id, &action_plan).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "Sync-time Graph filter execution failed for '{}': {}",
+                    folder_path,
+                    e
+                );
+                return Ok(0);
+            }
+        },
+        "imap" => return Ok(0),
+        other => {
+            log::debug!(
+                "Sync-time filters: protocol '{}' has no sync-time executor; skipping",
+                other
+            );
+            return Ok(0);
+        }
+    };
+
+    // Prune local rows whose server-side state was confirmed changed. Mirrors
+    // the cleanup at the end of `apply_filters_to_folder`.
+    let mut to_remove = result.moved_db_ids;
+    to_remove.extend(result.deleted_db_ids);
+    to_remove.sort();
+    to_remove.dedup();
+    if !to_remove.is_empty() {
+        let conn = db.writer().await;
+        db::messages::delete_messages_by_ids(&conn, &to_remove)?;
+    }
+
+    if !result.errors.is_empty() {
+        log::warn!(
+            "Sync-time filters: {} executor error(s) in '{}'; first: {}",
+            result.errors.len(),
+            folder_path,
+            result.errors[0]
+        );
+    }
 
     Ok(affected_count)
 }
@@ -797,5 +1022,205 @@ mod tests {
                 .into(),
         );
         assert!(!is_graph_item_not_found(&e));
+    }
+
+    // ---- Sync-time filter helper tests ----
+    //
+    // These cover the new code path that JMAP and Graph sync take on each
+    // batch of newly inserted messages. They exercise the planning + DB
+    // cleanup layers directly against in-memory SQLite. The network-touching
+    // protocol executors (`execute_jmap_filter_actions` /
+    // `execute_graph_filter_actions`) are intentionally not invoked — those
+    // are already exercised in production via `apply_filters_to_folder`.
+
+    use crate::db;
+    use crate::filters::rules::{
+        Condition, ConditionField, ConditionOp, FilterAction, FilterRule, MatchType,
+    };
+    use rusqlite::Connection;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        // Schema initialization enables foreign keys; insert a parent
+        // accounts row before any messages or rules so FK constraints
+        // pass.
+        db::schema::initialize(&conn).expect("initialize schema");
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["acc1", "Test", "test@example.com", "test@example.com"],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_test_message(
+        conn: &Connection,
+        id: &str,
+        folder: &str,
+        from_email: &str,
+        subject: &str,
+    ) {
+        let msg = db::messages::NewMessage {
+            id: id.to_string(),
+            account_id: "acc1".to_string(),
+            folder_path: folder.to_string(),
+            uid: 0,
+            message_id: None,
+            in_reply_to: None,
+            thread_id: None,
+            subject: Some(subject.to_string()),
+            from_name: None,
+            from_email: from_email.to_string(),
+            to_addresses: "[]".to_string(),
+            cc_addresses: "[]".to_string(),
+            date: "2026-05-15T00:00:00Z".to_string(),
+            size: 100,
+            has_attachments: false,
+            is_encrypted: false,
+            is_signed: false,
+            flags: "[]".to_string(),
+            maildir_path: String::new(),
+            snippet: None,
+        };
+        db::messages::insert_message(conn, &msg).unwrap();
+    }
+
+    fn make_rule(id: &str, contains: &str, actions: Vec<FilterAction>) -> FilterRule {
+        FilterRule {
+            id: id.to_string(),
+            account_id: Some("acc1".to_string()),
+            name: format!("rule {}", id),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::From,
+                op: ConditionOp::Contains,
+                value: contains.to_string(),
+            }],
+            actions,
+            stop_processing: false,
+        }
+    }
+
+    #[test]
+    fn load_messages_by_ids_returns_only_requested_rows() {
+        let conn = setup_test_db();
+        insert_test_message(&conn, "acc1_inbox_M1", "inbox", "alice@example.com", "Hi");
+        insert_test_message(&conn, "acc1_inbox_M2", "inbox", "bob@example.com", "Hi");
+        insert_test_message(&conn, "acc1_inbox_M3", "inbox", "carol@example.com", "Hi");
+
+        let loaded = load_messages_by_ids(
+            &conn,
+            "acc1",
+            "inbox",
+            &["acc1_inbox_M1".into(), "acc1_inbox_M3".into()],
+        )
+        .unwrap();
+
+        let mut ids: Vec<String> = loaded.into_iter().map(|m| m.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["acc1_inbox_M1", "acc1_inbox_M3"]);
+    }
+
+    #[test]
+    fn load_messages_by_ids_is_folder_scoped() {
+        // An id that happens to live in a different folder must not be
+        // returned even if the caller asks for it under the wrong folder.
+        let conn = setup_test_db();
+        insert_test_message(&conn, "acc1_inbox_M1", "inbox", "alice@example.com", "Hi");
+        insert_test_message(&conn, "acc1_arch_M2", "archive", "bob@example.com", "Hi");
+
+        let loaded =
+            load_messages_by_ids(&conn, "acc1", "inbox", &["acc1_arch_M2".into()]).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_messages_by_ids_short_circuits_on_empty_ids() {
+        let conn = setup_test_db();
+        let loaded = load_messages_by_ids(&conn, "acc1", "inbox", &[]).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn build_filter_action_plan_only_emits_for_matches() {
+        // Three messages: one matches the rule, one doesn't, one is the
+        // "pre-existing" message that the caller would not have passed
+        // through `load_messages_by_ids` at all.
+        let matching = MessageData {
+            id: "acc1_inbox_M1".into(),
+            uid: 0,
+            folder_path: "inbox".into(),
+            from_name: None,
+            from_email: "newsletter@example.com".into(),
+            to_addresses: vec![],
+            cc_addresses: vec![],
+            subject: Some("hello".into()),
+            size: 100,
+            has_attachments: false,
+            flags: vec![],
+        };
+        let unrelated = MessageData {
+            id: "acc1_inbox_M2".into(),
+            uid: 0,
+            folder_path: "inbox".into(),
+            from_name: None,
+            from_email: "friend@example.com".into(),
+            to_addresses: vec![],
+            cc_addresses: vec![],
+            subject: Some("hello".into()),
+            size: 100,
+            has_attachments: false,
+            flags: vec![],
+        };
+
+        let rules = vec![
+            make_rule(
+                "r1",
+                "newsletter",
+                vec![FilterAction::Move {
+                    target: "archive_box".into(),
+                }],
+            ),
+            make_rule("r2", "newsletter", vec![FilterAction::MarkRead]),
+        ];
+
+        let plan = build_filter_action_plan(&rules, &[matching.clone(), unrelated]);
+
+        // Only the matching message is in the plan, and it has both actions.
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.id, "acc1_inbox_M1");
+        assert_eq!(plan[0].1.len(), 2);
+        let has_move = plan[0].1.iter().any(|a| {
+            matches!(a, FilterAction::Move { target } if target == "archive_box")
+        });
+        let has_mark_read = plan[0].1.iter().any(|a| matches!(a, FilterAction::MarkRead));
+        assert!(has_move);
+        assert!(has_mark_read);
+    }
+
+    #[test]
+    fn delete_messages_by_ids_prunes_only_specified_rows() {
+        // Simulates what apply_filters_to_new_messages does after a JMAP/Graph
+        // executor confirms a move/delete: the DB cleanup must remove exactly
+        // those ids and leave everything else untouched.
+        let conn = setup_test_db();
+        insert_test_message(&conn, "acc1_inbox_M1", "inbox", "a@example.com", "x");
+        insert_test_message(&conn, "acc1_inbox_M2", "inbox", "b@example.com", "x");
+        insert_test_message(&conn, "acc1_inbox_M3", "inbox", "c@example.com", "x");
+
+        let to_remove = vec!["acc1_inbox_M1".to_string(), "acc1_inbox_M3".to_string()];
+        db::messages::delete_messages_by_ids(&conn, &to_remove).unwrap();
+
+        let remaining: Vec<String> = conn
+            .prepare("SELECT id FROM messages WHERE account_id = 'acc1'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(remaining, vec!["acc1_inbox_M2"]);
     }
 }

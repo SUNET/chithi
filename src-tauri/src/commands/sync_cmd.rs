@@ -1124,6 +1124,7 @@ async fn sync_graph_account(
         conn.execute_batch("BEGIN")?;
 
         let mut synced = 0u32;
+        let mut new_ids: Vec<String> = Vec::new();
         for (msg, maildir_path) in &downloaded {
             let id = format!("{}_{}", account_id, msg.id);
             let flags = if msg.is_read {
@@ -1134,7 +1135,7 @@ async fn sync_graph_account(
             let thread_id = msg.conversation_id.clone();
 
             let new_msg = db::messages::NewMessage {
-                id,
+                id: id.clone(),
                 account_id: account_id.to_string(),
                 folder_path: gf.id.clone(),
                 uid: 0,
@@ -1159,6 +1160,7 @@ async fn sync_graph_account(
                 snippet: msg.preview.clone(),
             };
             db::messages::insert_message(&conn, &new_msg)?;
+            new_ids.push(id);
             synced += 1;
         }
 
@@ -1172,6 +1174,36 @@ async fn sync_graph_account(
                 gf.display_name
             );
             grand_total += synced;
+        }
+
+        // Run filter rules against newly inserted messages. Errors are
+        // logged and swallowed so a transient Graph hiccup can't poison
+        // the sync — messages already landed in the DB.
+        if !new_ids.is_empty() {
+            match crate::commands::filters::apply_filters_to_new_messages(
+                &db_arc,
+                account_id,
+                &gf.id,
+                &new_ids,
+            )
+            .await
+            {
+                Ok(filtered) => {
+                    if filtered > 0 {
+                        log::info!(
+                            "Graph filters applied to {} of {} new messages in '{}'",
+                            filtered,
+                            new_ids.len(),
+                            gf.display_name
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "Graph filter pass failed for '{}': {}",
+                    gf.display_name,
+                    e
+                ),
+            }
         }
     }
 
