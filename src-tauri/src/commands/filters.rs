@@ -286,10 +286,10 @@ fn load_messages_by_ids_chunk(
     let mut stmt = conn.prepare(&sql)?;
 
     let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len() + 2);
-    params.push(account_id as &dyn rusqlite::types::ToSql);
-    params.push(folder_path as &dyn rusqlite::types::ToSql);
+    params.push(&account_id);
+    params.push(&folder_path);
     for id in ids {
-        params.push(id as &dyn rusqlite::types::ToSql);
+        params.push(id);
     }
 
     let rows = stmt
