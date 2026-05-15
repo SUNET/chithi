@@ -91,6 +91,12 @@ fn eval_condition(cond: &Condition, msg: &MessageData) -> bool {
             // Match if any Cc address matches
             eval_address_list_op(&cond.op, &msg.cc_addresses, &cond.value)
         }
+        ConditionField::ToCc => eval_address_iter_op(
+            &cond.op,
+            msg.to_addresses.iter().chain(msg.cc_addresses.iter()),
+            msg.to_addresses.is_empty() && msg.cc_addresses.is_empty(),
+            &cond.value,
+        ),
         ConditionField::Subject => {
             let subject = msg.subject.as_deref().unwrap_or("");
             eval_string_op(&cond.op, subject, &cond.value)
@@ -156,28 +162,37 @@ fn eval_numeric_op(op: &ConditionOp, actual: u64, value_str: &str) -> bool {
 /// Returns true if ANY address in the list matches.
 /// For NotContains / NotEquals, returns true only if NONE match the positive form.
 fn eval_address_list_op(op: &ConditionOp, addrs: &[AddressEntry], value: &str) -> bool {
-    if addrs.is_empty() {
+    eval_address_iter_op(op, addrs.iter(), addrs.is_empty(), value)
+}
+
+fn eval_address_iter_op<'a>(
+    op: &ConditionOp,
+    mut addrs: impl Iterator<Item = &'a AddressEntry>,
+    is_empty: bool,
+    value: &str,
+) -> bool {
+    if is_empty {
         return matches!(op, ConditionOp::NotContains | ConditionOp::NotEquals);
     }
 
     match op {
         ConditionOp::NotContains => {
             // True if no address contains the value
-            !addrs.iter().any(|a| {
+            !addrs.any(|a| {
                 let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(&ConditionOp::Contains, &combined, value)
             })
         }
         ConditionOp::NotEquals => {
             // True if no address equals the value
-            !addrs.iter().any(|a| {
+            !addrs.any(|a| {
                 let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(&ConditionOp::Equals, &combined, value)
             })
         }
         _ => {
             // For Contains, Equals, MatchesRegex: true if any address matches
-            addrs.iter().any(|a| {
+            addrs.any(|a| {
                 let combined = format!("{} {}", a.name.as_deref().unwrap_or(""), a.email);
                 eval_string_op(op, &combined, value)
             })
@@ -385,6 +400,76 @@ mod tests {
             stop_processing: false,
         };
         assert!(matches_message(&rule, &msg));
+    }
+
+    #[test]
+    fn test_to_cc_contains_matches_either_recipient_field() {
+        let mut msg = make_msg();
+        msg.cc_addresses = vec![AddressEntry {
+            name: Some("Carol".to_string()),
+            email: "carol@example.com".to_string(),
+        }];
+
+        let to_rule = FilterRule {
+            id: "r_to_cc_to".to_string(),
+            account_id: None,
+            name: "test".to_string(),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::ToCc,
+                op: ConditionOp::Contains,
+                value: "bob@example.com".to_string(),
+            }],
+            actions: vec![],
+            stop_processing: false,
+        };
+        let cc_rule = FilterRule {
+            id: "r_to_cc_cc".to_string(),
+            account_id: None,
+            name: "test".to_string(),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::ToCc,
+                op: ConditionOp::Contains,
+                value: "carol@example.com".to_string(),
+            }],
+            actions: vec![],
+            stop_processing: false,
+        };
+
+        assert!(matches_message(&to_rule, &msg));
+        assert!(matches_message(&cc_rule, &msg));
+    }
+
+    #[test]
+    fn test_to_cc_not_contains_checks_all_recipient_fields() {
+        let mut msg = make_msg();
+        msg.cc_addresses = vec![AddressEntry {
+            name: Some("Carol".to_string()),
+            email: "carol@example.com".to_string(),
+        }];
+
+        let rule = FilterRule {
+            id: "r_to_cc_not".to_string(),
+            account_id: None,
+            name: "test".to_string(),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::ToCc,
+                op: ConditionOp::NotContains,
+                value: "carol@example.com".to_string(),
+            }],
+            actions: vec![],
+            stop_processing: false,
+        };
+
+        assert!(!matches_message(&rule, &msg));
     }
 
     #[test]

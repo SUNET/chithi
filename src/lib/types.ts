@@ -241,7 +241,7 @@ export interface FilterRule {
 }
 
 export interface FilterCondition {
-  field: "from" | "to" | "cc" | "subject" | "size" | "has_attachment";
+  field: "from" | "to" | "cc" | "to_cc" | "subject" | "size" | "has_attachment";
   op:
     | "contains"
     | "not_contains"
