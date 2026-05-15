@@ -121,7 +121,7 @@ describe("Select", () => {
   });
 
   it("opens above the trigger when there is not enough room below", async () => {
-    vi.spyOn(window, "innerHeight", "get").mockReturnValue(320);
+    Object.defineProperty(window, "innerHeight", { value: 320, configurable: true, writable: true });
 
     const w = await mountWith("a");
     vi.spyOn(w.element, "getBoundingClientRect").mockReturnValue({
