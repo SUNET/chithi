@@ -175,6 +175,7 @@ const loadingRoomSuggestions = ref(false);
 const roomAvailability = ref<import("@/lib/types").RoomAvailability | null>(null);
 const checkingRoomAvailability = ref(false);
 let roomAvailabilityRequestId = 0;
+let roomSuggestionsRequestId = 0;
 
 function selectedRoom() {
   const query = location.value.trim().toLowerCase();
@@ -187,13 +188,18 @@ function selectedRoom() {
 }
 
 function currentScheduleRange() {
+  // All-day events still need a concrete UTC window for the Graph
+  // getSchedule query, and that window is the day boundaries in the
+  // user's display timezone — not UTC midnight. A Stockholm all-day
+  // event on May 19 actually runs 2026-05-18T22:00Z..2026-05-19T22:00Z.
+  const tz = uiStore.displayTimezone;
   return {
     start: allDay.value
-      ? `${startDate.value}T00:00:00Z`
-      : localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone),
+      ? localInputToUTC(startDate.value, "00:00", tz)
+      : localInputToUTC(startDate.value, startTime.value, tz),
     end: allDay.value
-      ? `${endDate.value}T23:59:59Z`
-      : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone),
+      ? localInputToUTC(endDate.value, "23:59", tz)
+      : localInputToUTC(endDate.value, endTime.value, tz),
   };
 }
 
@@ -231,6 +237,12 @@ const roomAvailabilityMessage = computed(() => {
 });
 
 async function refreshRoomAvailability() {
+  // Claim a request id up front so any in-flight check is invalidated
+  // immediately — including when we bail out below. Otherwise a slower
+  // earlier response could still match its id and repopulate a stale
+  // message for a room/time that is no longer selected.
+  const requestId = ++roomAvailabilityRequestId;
+
   const room = selectedRoom();
   const accountId = selectedCalendarAccountId.value;
   const account = accountsStore.accounts.find((entry) => entry.id === accountId);
@@ -247,7 +259,6 @@ async function refreshRoomAvailability() {
     return;
   }
 
-  const requestId = ++roomAvailabilityRequestId;
   checkingRoomAvailability.value = true;
   try {
     const availability = await api.checkRoomAvailability(accountId, room.address, start, end);
@@ -267,6 +278,11 @@ async function refreshRoomAvailability() {
 }
 
 async function refreshRoomSuggestions() {
+  // Claim a request id so a slower load for a previously selected
+  // account can't overwrite the current account's suggestions when
+  // the user switches calendars/accounts mid-flight.
+  const requestId = ++roomSuggestionsRequestId;
+
   const accountId = selectedCalendarAccountId.value;
   const account = accountsStore.accounts.find((entry) => entry.id === accountId);
   if (!accountId || !account || (account.provider !== "o365" && account.provider !== "microsoft365")) {
@@ -277,13 +293,22 @@ async function refreshRoomSuggestions() {
 
   loadingRoomSuggestions.value = true;
   try {
-    roomSuggestions.value = await api.listRoomSuggestions(accountId);
+    const suggestions = await api.listRoomSuggestions(accountId);
+    if (requestId !== roomSuggestionsRequestId) {
+      return;
+    }
+    roomSuggestions.value = suggestions;
   } catch (e) {
+    if (requestId !== roomSuggestionsRequestId) {
+      return;
+    }
     console.error("Failed to load room suggestions:", e);
     roomSuggestions.value = [];
     roomAvailability.value = null;
   } finally {
-    loadingRoomSuggestions.value = false;
+    if (requestId === roomSuggestionsRequestId) {
+      loadingRoomSuggestions.value = false;
+    }
   }
 
   await refreshRoomAvailability();

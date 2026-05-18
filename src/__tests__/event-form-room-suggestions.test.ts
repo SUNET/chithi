@@ -122,4 +122,42 @@ describe("EventForm room suggestions", () => {
     );
     expect(wrapper.get('[data-testid="event-form-room-availability"]').text()).toContain("Busy");
   });
+
+  it("checks all-day room availability in the display timezone, not UTC midnight", async () => {
+    const uiStore = useUiStore();
+    uiStore.displayTimezone = "Europe/Stockholm";
+
+    vi.mocked(api.listRoomSuggestions).mockResolvedValueOnce([
+      { name: "Board Room", address: "board@example.com" },
+    ]);
+
+    const wrapper = mount(EventForm, {
+      props: {
+        initialStart: "2026-05-19T10:00:00Z",
+      },
+      global: {
+        stubs: {
+          RecurrenceEditor: { template: "<div />" },
+          AttendeeEditor: { template: "<div />" },
+          TimeInput: { template: "<input />" },
+          DateInput: { template: "<input />" },
+          Select: { template: "<div />" },
+        },
+      },
+    });
+
+    await flushPromises();
+    await wrapper.get('[data-testid="event-form-location"]').setValue("Board Room");
+    await wrapper.get('[data-testid="event-form-allday"]').setValue(true);
+    await flushPromises();
+
+    // May 19 (all-day) in Stockholm (CEST, UTC+2) runs from the
+    // previous day 22:00Z, not 2026-05-19T00:00:00Z.
+    const calls = vi.mocked(api.checkRoomAvailability).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall?.[0]).toBe("acc-o365");
+    expect(lastCall?.[1]).toBe("board@example.com");
+    expect(lastCall?.[2]).toBe("2026-05-18T22:00:00.000Z");
+    expect(lastCall?.[3]).toBe("2026-05-19T21:59:00.000Z");
+  });
 });

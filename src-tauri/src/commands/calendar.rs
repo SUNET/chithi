@@ -797,7 +797,7 @@ pub async fn list_room_suggestions(
         return Ok(Vec::new());
     }
 
-    let token = crate::mail::graph::get_graph_token(&account.id).await?;
+    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
     let client = crate::mail::graph::GraphClient::new(&token);
     let rooms = client.list_rooms().await?;
     Ok(rooms
@@ -830,7 +830,7 @@ pub async fn check_room_availability(
         });
     }
 
-    let token = crate::mail::graph::get_graph_token(&account.id).await?;
+    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
     let client = crate::mail::graph::GraphClient::new(&token);
     let availability = client
         .get_room_availability(&room_address, &start_time, &end_time)

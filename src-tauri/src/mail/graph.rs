@@ -93,6 +93,52 @@ impl GraphClient {
             .map_err(|e| Error::Other(format!("Graph beta JSON parse failed: {}", e)))
     }
 
+    /// GET an absolute Graph URL (used to follow `@odata.nextLink`,
+    /// which Graph returns as a fully-qualified URL rather than a path).
+    async fn get_absolute(&self, url: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", url, e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "Graph GET {} returned {}: {}",
+                url,
+                status,
+                truncate(&body, 500)
+            )));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))
+    }
+
+    /// GET a Graph collection endpoint and return every item across all
+    /// pages, following `@odata.nextLink` until exhausted. Graph caps a
+    /// single page at `$top` items, so endpoints like the room/room-list
+    /// places APIs silently drop everything past the first page on large
+    /// tenants unless pagination is followed (PR #173 review).
+    async fn get_all(&self, path: &str, params: &[(&str, &str)]) -> Result<Vec<serde_json::Value>> {
+        let mut items = Vec::new();
+        let mut page = self.get(path, params).await?;
+        loop {
+            if let Some(values) = page["value"].as_array() {
+                items.extend(values.iter().cloned());
+            }
+            match page["@odata.nextLink"].as_str() {
+                Some(next) => page = self.get_absolute(next).await?,
+                None => break,
+            }
+        }
+        Ok(items)
+    }
+
     /// Stream a Graph API response directly to a file on disk.
     /// Returns the number of bytes written. Avoids buffering the entire
     /// response in memory — critical for large emails with attachments.
@@ -683,7 +729,7 @@ impl GraphClient {
 
         log::info!("Graph rooms: listing room lists via v1.0 /places/microsoft.graph.roomlist");
         let room_lists = match self
-            .get(
+            .get_all(
                 "/places/microsoft.graph.roomlist",
                 &[("$top", "200"), ("$select", "displayName,emailAddress")],
             )
@@ -700,7 +746,7 @@ impl GraphClient {
         };
 
         if let Some(room_lists) = room_lists {
-            let lists = parse_graph_named_addresses(&room_lists["value"]);
+            let lists = parse_graph_named_addresses(&serde_json::Value::Array(room_lists));
             log::info!("Graph rooms: found {} room lists", lists.len());
             for (name, address) in lists {
                 log::info!("Graph rooms: using room list '{}' <{}>", name, address);
@@ -716,14 +762,14 @@ impl GraphClient {
                 );
 
                 match self
-                    .get(
+                    .get_all(
                         &path,
                         &[("$top", "200"), ("$select", "displayName,emailAddress")],
                     )
                     .await
                 {
                     Ok(resp) => {
-                        let mut list_rooms = parse_graph_rooms(&resp["value"]);
+                        let mut list_rooms = parse_graph_rooms(&serde_json::Value::Array(resp));
                         log::info!(
                             "Graph rooms: list '{}' returned {} rooms",
                             if name.is_empty() { address } else { name },
@@ -746,14 +792,14 @@ impl GraphClient {
         if rooms.is_empty() {
             log::info!("Graph rooms: falling back to v1.0 /places/microsoft.graph.room");
             match self
-                .get(
+                .get_all(
                     "/places/microsoft.graph.room",
                     &[("$top", "200"), ("$select", "displayName,emailAddress")],
                 )
                 .await
             {
                 Ok(resp) => {
-                    let mut place_rooms = parse_graph_rooms(&resp["value"]);
+                    let mut place_rooms = parse_graph_rooms(&serde_json::Value::Array(resp));
                     log::info!(
                         "Graph rooms: places direct rooms returned {} rooms",
                         place_rooms.len()
@@ -1322,6 +1368,21 @@ fn parse_graph_room_availability(value: &serde_json::Value) -> GraphRoomAvailabi
         };
     };
 
+    // Graph getSchedule reports per-recipient failures (unresolvable
+    // mailbox, free/busy not published, throttling) via an `error`
+    // object on the schedule entry. Without `scheduleItems`/
+    // `availabilityView` we genuinely don't know — never report "free".
+    if !schedule["error"].is_null()
+        || (schedule["scheduleItems"].as_array().is_none()
+            && schedule["availabilityView"].as_str().is_none())
+    {
+        return GraphRoomAvailability {
+            state: "unknown".into(),
+            busy_start: None,
+            busy_end: None,
+        };
+    }
+
     if let Some(item) = schedule["scheduleItems"]
         .as_array()
         .into_iter()
@@ -1776,6 +1837,21 @@ fn nearest_outlook_color(hex: &str) -> &'static str {
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
 pub async fn get_graph_token(account_id: &str) -> Result<String> {
+    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_SCOPES).await
+}
+
+/// Like [`get_graph_token`] but requests the room scopes (`Place.Read.All`).
+///
+/// Accounts that signed in before room support existed never consented to
+/// `Place.Read.All`, so this refresh fails them with consent_required. That
+/// is expected: callers (room suggestion/availability commands) treat the
+/// error as "rooms unavailable" and never let it disrupt baseline Graph
+/// operations, which keep using the consent-safe [`get_graph_token`].
+pub async fn get_graph_token_for_rooms(account_id: &str) -> Result<String> {
+    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_ROOM_SCOPES).await
+}
+
+async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<String> {
     let tokens = crate::oauth::load_tokens(account_id)?.ok_or_else(|| {
         Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
     })?;
@@ -1785,12 +1861,8 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
         .ok_or_else(|| Error::Other("No refresh token for O365. Please sign in again.".into()))?;
 
     // Always refresh with Graph scopes — the cached token is likely IMAP-scoped
-    let new_tokens = crate::oauth::refresh_with_scopes(
-        &crate::oauth::MICROSOFT,
-        &refresh_token,
-        crate::oauth::MICROSOFT_GRAPH_SCOPES,
-    )
-    .await?;
+    let new_tokens =
+        crate::oauth::refresh_with_scopes(&crate::oauth::MICROSOFT, &refresh_token, scopes).await?;
     // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
     // The refresh_token may rotate, so save that part only.
     if new_tokens.refresh_token.is_some() {
@@ -2018,5 +2090,42 @@ mod color_tests {
         assert_eq!(availability.state, "available");
         assert!(availability.busy_start.is_none());
         assert!(availability.busy_end.is_none());
+    }
+
+    #[test]
+    fn parse_graph_room_availability_reports_unknown_on_schedule_error() {
+        // A per-recipient `error` (e.g. mailbox not found, free/busy
+        // not published) must surface as "unknown" — never "available",
+        // which would tell the user a room is free when Graph failed.
+        let value = serde_json::json!({
+            "value": [
+                {
+                    "scheduleId": "board@example.com",
+                    "error": {
+                        "message": "ErrorMailRecipientNotFound",
+                        "responseCode": "MailRecipientNotFound"
+                    }
+                }
+            ]
+        });
+
+        let availability = parse_graph_room_availability(&value);
+        assert_eq!(availability.state, "unknown");
+        assert!(availability.busy_start.is_none());
+        assert!(availability.busy_end.is_none());
+    }
+
+    #[test]
+    fn parse_graph_room_availability_reports_unknown_without_free_busy_data() {
+        // A schedule entry carrying neither scheduleItems nor an
+        // availabilityView gives us nothing to judge on — "unknown".
+        let value = serde_json::json!({
+            "value": [
+                { "scheduleId": "board@example.com" }
+            ]
+        });
+
+        let availability = parse_graph_room_availability(&value);
+        assert_eq!(availability.state, "unknown");
     }
 }

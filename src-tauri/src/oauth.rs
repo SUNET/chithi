@@ -73,8 +73,10 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
     // Request all scopes during authorization for consent.
     // IMAP/SMTP use outlook.office.com (not office365.com) for personal accounts.
     // Graph scopes use short form (resolved to graph.microsoft.com automatically).
-    // All Graph scopes here must also appear in MICROSOFT_GRAPH_SCOPES or token
-    // refresh will fail with AADSTS65001 (consent_required).
+    // Every Graph scope here must appear in MICROSOFT_GRAPH_SCOPES *or*
+    // MICROSOFT_GRAPH_ROOM_SCOPES, or the corresponding token refresh fails
+    // with AADSTS65001 (consent_required). `Place.Read.All` is deliberately
+    // kept out of the baseline MICROSOFT_GRAPH_SCOPES — see that constant.
     scopes: &[
         "https://outlook.office.com/IMAP.AccessAsUser.All",
         "https://outlook.office.com/SMTP.Send",
@@ -95,7 +97,23 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
 };
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
+///
+/// Deliberately excludes `Place.Read.All`: accounts that signed in before
+/// room support was added never consented to it, so requesting it on every
+/// `get_graph_token()` refresh would fail those accounts with consent_required
+/// (AADSTS65001) and break mail/calendar/contacts sync even when the user
+/// never touches room suggestions. Room features use
+/// [`MICROSOFT_GRAPH_ROOM_SCOPES`] via a separate, room-specific token
+/// request that is allowed to fail gracefully.
 pub const MICROSOFT_GRAPH_SCOPES: &str =
+    "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite offline_access";
+
+/// Graph scopes for room discovery/availability — the baseline scopes plus
+/// `Place.Read.All`. Requested only by the room-specific token path; a
+/// refresh failure here means rooms are unavailable for that account (an
+/// account that predates room support and never consented), and callers
+/// must treat that as a soft failure rather than propagating it.
+pub const MICROSOFT_GRAPH_ROOM_SCOPES: &str =
     "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite Place.Read.All offline_access";
 
 /// Zoom OAuth (#148, video conferencing). Native app with PKCE —
