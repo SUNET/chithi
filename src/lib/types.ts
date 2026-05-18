@@ -83,6 +83,17 @@ export interface Address {
   email: string;
 }
 
+export interface RoomSuggestion {
+  name: string;
+  address: string;
+}
+
+export interface RoomAvailability {
+  state: "available" | "busy" | "unknown";
+  busy_start: string | null;
+  busy_end: string | null;
+}
+
 export interface MessageSummary {
   id: string;
   subject: string | null;

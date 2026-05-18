@@ -4,6 +4,7 @@ import { setActivePinia, createPinia } from "pinia";
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listRoomSuggestions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),

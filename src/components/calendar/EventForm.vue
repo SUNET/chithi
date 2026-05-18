@@ -170,6 +170,157 @@ const recurrenceRule = ref<string | null>(null);
 const attendeeEmails = ref<string[]>([]);
 const saving = ref(false);
 const error = ref<string | null>(null);
+const roomSuggestions = ref<import("@/lib/types").RoomSuggestion[]>([]);
+const loadingRoomSuggestions = ref(false);
+const roomAvailability = ref<import("@/lib/types").RoomAvailability | null>(null);
+const checkingRoomAvailability = ref(false);
+let roomAvailabilityRequestId = 0;
+let roomSuggestionsRequestId = 0;
+
+function selectedRoom() {
+  const query = location.value.trim().toLowerCase();
+  if (!query) {
+    return null;
+  }
+  return roomSuggestions.value.find((room) =>
+    room.name.toLowerCase() === query || room.address.toLowerCase() === query,
+  ) ?? null;
+}
+
+function currentScheduleRange() {
+  // All-day events still need a concrete UTC window for the Graph
+  // getSchedule query, and that window is the day boundaries in the
+  // user's display timezone — not UTC midnight. A Stockholm all-day
+  // event on May 19 actually runs 2026-05-18T22:00Z..2026-05-19T22:00Z.
+  const tz = uiStore.displayTimezone;
+  return {
+    start: allDay.value
+      ? localInputToUTC(startDate.value, "00:00", tz)
+      : localInputToUTC(startDate.value, startTime.value, tz),
+    end: allDay.value
+      ? localInputToUTC(endDate.value, "23:59", tz)
+      : localInputToUTC(endDate.value, endTime.value, tz),
+  };
+}
+
+function formatAvailabilityTime(value: string | null) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(`${value}Z`);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+    day: "numeric",
+    timeZone: uiStore.displayTimezone,
+  }).format(date);
+}
+
+const roomAvailabilityMessage = computed(() => {
+  if (checkingRoomAvailability.value) {
+    return "Checking room availability...";
+  }
+  if (!roomAvailability.value) {
+    return null;
+  }
+  if (roomAvailability.value.state === "available") {
+    return "Available for the selected time";
+  }
+  if (roomAvailability.value.state === "busy") {
+    return `Busy ${formatAvailabilityTime(roomAvailability.value.busy_start)} - ${formatAvailabilityTime(roomAvailability.value.busy_end)}`;
+  }
+  return "Availability unknown";
+});
+
+async function refreshRoomAvailability() {
+  // Claim a request id up front so any in-flight check is invalidated
+  // immediately — including when we bail out below. Otherwise a slower
+  // earlier response could still match its id and repopulate a stale
+  // message for a room/time that is no longer selected.
+  const requestId = ++roomAvailabilityRequestId;
+
+  const room = selectedRoom();
+  const accountId = selectedCalendarAccountId.value;
+  const account = accountsStore.accounts.find((entry) => entry.id === accountId);
+  if (!room || !accountId || !account || (account.provider !== "o365" && account.provider !== "microsoft365")) {
+    roomAvailability.value = null;
+    checkingRoomAvailability.value = false;
+    return;
+  }
+
+  const { start, end } = currentScheduleRange();
+  if (new Date(end) <= new Date(start)) {
+    roomAvailability.value = null;
+    checkingRoomAvailability.value = false;
+    return;
+  }
+
+  checkingRoomAvailability.value = true;
+  try {
+    const availability = await api.checkRoomAvailability(accountId, room.address, start, end);
+    if (requestId === roomAvailabilityRequestId) {
+      roomAvailability.value = availability;
+    }
+  } catch (e) {
+    if (requestId === roomAvailabilityRequestId) {
+      console.error("Failed to check room availability:", e);
+      roomAvailability.value = { state: "unknown", busy_start: null, busy_end: null };
+    }
+  } finally {
+    if (requestId === roomAvailabilityRequestId) {
+      checkingRoomAvailability.value = false;
+    }
+  }
+}
+
+async function refreshRoomSuggestions() {
+  // Claim a request id so a slower load for a previously selected
+  // account can't overwrite the current account's suggestions when
+  // the user switches calendars/accounts mid-flight.
+  const requestId = ++roomSuggestionsRequestId;
+
+  const accountId = selectedCalendarAccountId.value;
+  const account = accountsStore.accounts.find((entry) => entry.id === accountId);
+  if (!accountId || !account || (account.provider !== "o365" && account.provider !== "microsoft365")) {
+    roomSuggestions.value = [];
+    roomAvailability.value = null;
+    return;
+  }
+
+  loadingRoomSuggestions.value = true;
+  try {
+    const suggestions = await api.listRoomSuggestions(accountId);
+    if (requestId !== roomSuggestionsRequestId) {
+      return;
+    }
+    roomSuggestions.value = suggestions;
+  } catch (e) {
+    if (requestId !== roomSuggestionsRequestId) {
+      return;
+    }
+    console.error("Failed to load room suggestions:", e);
+    roomSuggestions.value = [];
+    roomAvailability.value = null;
+  } finally {
+    if (requestId === roomSuggestionsRequestId) {
+      loadingRoomSuggestions.value = false;
+    }
+  }
+
+  await refreshRoomAvailability();
+}
+
+watch(selectedCalendarAccountId, () => {
+  void refreshRoomSuggestions();
+}, { immediate: true });
+
+watch([location, startDate, startTime, endDate, endTime, allDay], () => {
+  void refreshRoomAvailability();
+});
 
 async function save() {
   if (!title.value.trim()) {
@@ -296,7 +447,41 @@ async function save() {
 
         <div class="form-group">
           <label>Location</label>
-          <input v-model="location" type="text" placeholder="Add location" data-testid="event-form-location" />
+          <input
+            v-model="location"
+            type="text"
+            placeholder="Add location"
+            :list="roomSuggestions.length > 0 ? 'event-form-room-suggestions' : undefined"
+            data-testid="event-form-location"
+          />
+          <datalist
+            v-if="roomSuggestions.length > 0"
+            id="event-form-room-suggestions"
+            data-testid="event-form-room-suggestions"
+          >
+            <option
+              v-for="room in roomSuggestions"
+              :key="room.address"
+              :value="room.name"
+            >
+              {{ room.address }}
+            </option>
+          </datalist>
+          <span
+            v-if="loadingRoomSuggestions"
+            class="room-suggestions-loading"
+            data-testid="event-form-room-suggestions-loading"
+          >
+            Loading rooms...
+          </span>
+          <span
+            v-if="roomAvailabilityMessage"
+            class="room-availability"
+            :class="roomAvailability ? `room-availability--${roomAvailability.state}` : undefined"
+            data-testid="event-form-room-availability"
+          >
+            {{ roomAvailabilityMessage }}
+          </span>
           <!-- #148: one-click video conference. Only renders when
                at least one account has a meet binding configured
                in Settings. Picking an entry creates the room /
@@ -392,6 +577,31 @@ async function save() {
   margin-top: 6px;
   font-size: 11px;
   color: var(--color-danger, #c0392b);
+}
+
+.room-suggestions-loading {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--color-text-secondary, #666);
+}
+
+.room-availability {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.room-availability--available {
+  color: var(--color-success, #2f7a3e);
+}
+
+.room-availability--busy {
+  color: var(--color-warning, #a65a00);
+}
+
+.room-availability--unknown {
+  color: var(--color-text-secondary, #666);
 }
 
 .event-form-overlay {
