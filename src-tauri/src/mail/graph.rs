@@ -9,6 +9,7 @@ use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 
 // ---------------------------------------------------------------------------
 // Graph client
@@ -17,6 +18,19 @@ const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 pub struct GraphClient {
     http: reqwest::Client,
     access_token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphRoom {
+    pub name: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphRoomAvailability {
+    pub state: String,
+    pub busy_start: Option<String>,
+    pub busy_end: Option<String>,
 }
 
 impl GraphClient {
@@ -51,6 +65,32 @@ impl GraphClient {
 
         serde_json::from_str(&body)
             .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))
+    }
+
+    async fn get_beta(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let url = format!("{}{}", GRAPH_BETA_BASE, path);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .query(params)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Graph beta GET {} failed: {}", path, e)))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "Graph beta GET {} returned {}: {}",
+                path,
+                status,
+                truncate(&body, 500)
+            )));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| Error::Other(format!("Graph beta JSON parse failed: {}", e)))
     }
 
     /// Stream a Graph API response directly to a file on disk.
@@ -637,6 +677,201 @@ impl GraphClient {
             .collect())
     }
 
+    /// List meeting rooms for O365 event creation via the beta room-list API.
+    pub async fn list_rooms(&self) -> Result<Vec<GraphRoom>> {
+        let mut rooms = Vec::new();
+
+        log::info!("Graph rooms: listing room lists via v1.0 /places/microsoft.graph.roomlist");
+        let room_lists = match self
+            .get(
+                "/places/microsoft.graph.roomlist",
+                &[("$top", "200"), ("$select", "displayName,emailAddress")],
+            )
+            .await
+        {
+            Ok(value) => Some(value),
+            Err(e) => {
+                log::warn!(
+                    "Graph rooms: v1.0 /places/microsoft.graph.roomlist failed, falling back to beta room-list lookup: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        if let Some(room_lists) = room_lists {
+            let lists = parse_graph_named_addresses(&room_lists["value"]);
+            log::info!("Graph rooms: found {} room lists", lists.len());
+            for (name, address) in lists {
+                log::info!("Graph rooms: using room list '{}' <{}>", name, address);
+
+                let path = format!(
+                    "/places/{}/microsoft.graph.roomlist/rooms",
+                    urlencoding::encode(&address)
+                );
+                log::debug!(
+                    "Graph rooms: fetching rooms for list '{}' <{}> via Places",
+                    name,
+                    address
+                );
+
+                match self
+                    .get(
+                        &path,
+                        &[("$top", "200"), ("$select", "displayName,emailAddress")],
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        let mut list_rooms = parse_graph_rooms(&resp["value"]);
+                        log::info!(
+                            "Graph rooms: list '{}' returned {} rooms",
+                            if name.is_empty() { address } else { name },
+                            list_rooms.len()
+                        );
+                        rooms.append(&mut list_rooms);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Graph rooms: Places rooms failed for list '{}' <{}>: {}",
+                            name,
+                            address,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        if rooms.is_empty() {
+            log::info!("Graph rooms: falling back to v1.0 /places/microsoft.graph.room");
+            match self
+                .get(
+                    "/places/microsoft.graph.room",
+                    &[("$top", "200"), ("$select", "displayName,emailAddress")],
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let mut place_rooms = parse_graph_rooms(&resp["value"]);
+                    log::info!(
+                        "Graph rooms: places direct rooms returned {} rooms",
+                        place_rooms.len()
+                    );
+                    rooms.append(&mut place_rooms);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Graph rooms: v1.0 /places/microsoft.graph.room failed, falling back to beta /me/findRoomLists: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        if rooms.is_empty() {
+            log::info!("Graph rooms: listing room lists via beta /me/findRoomLists");
+            let room_lists = match self.get_beta("/me/findRoomLists", &[]).await {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    log::warn!(
+                        "Graph rooms: beta /me/findRoomLists failed, falling back to direct rooms lookup: {}",
+                        e
+                    );
+                    None
+                }
+            };
+
+            if let Some(room_lists) = room_lists {
+                let lists = parse_graph_named_addresses(&room_lists["value"]);
+                log::info!("Graph rooms: found {} beta room lists", lists.len());
+                for (name, address) in lists {
+                    let path = format!("/me/findRooms(RoomList='{}')", address.replace('\'', "''"));
+                    log::debug!(
+                        "Graph rooms: fetching beta rooms for list '{}' <{}>",
+                        name,
+                        address
+                    );
+
+                    match self.get_beta(&path, &[]).await {
+                        Ok(resp) => {
+                            let mut list_rooms = parse_graph_rooms(&resp["value"]);
+                            log::info!(
+                                "Graph rooms: beta list '{}' returned {} rooms",
+                                if name.is_empty() { address } else { name },
+                                list_rooms.len()
+                            );
+                            rooms.append(&mut list_rooms);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Graph rooms: beta findRooms failed for list '{}' <{}>: {}",
+                                name,
+                                address,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if rooms.is_empty() {
+            log::info!("Graph rooms: falling back to beta /me/findRooms");
+            match self.get_beta("/me/findRooms", &[]).await {
+                Ok(resp) => {
+                    let mut direct_rooms = parse_graph_rooms(&resp["value"]);
+                    log::info!(
+                        "Graph rooms: direct findRooms returned {} rooms",
+                        direct_rooms.len()
+                    );
+                    rooms.append(&mut direct_rooms);
+                }
+                Err(e) => {
+                    log::warn!("Graph rooms: beta /me/findRooms failed: {}", e);
+                }
+            }
+        }
+
+        let unique = dedupe_graph_rooms(rooms);
+        log::info!("Graph rooms: returning {} normalized rooms", unique.len());
+        Ok(unique)
+    }
+
+    /// Check whether a room resource is free for a specific time range.
+    pub async fn get_room_availability(
+        &self,
+        room_address: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<GraphRoomAvailability> {
+        let start_utc = normalize_schedule_datetime(start)?;
+        let end_utc = normalize_schedule_datetime(end)?;
+
+        log::debug!(
+            "Graph rooms: getSchedule for {} from {} to {}",
+            room_address,
+            start_utc,
+            end_utc
+        );
+
+        let body = serde_json::json!({
+            "schedules": [room_address],
+            "startTime": {
+                "dateTime": start_utc,
+                "timeZone": "UTC",
+            },
+            "endTime": {
+                "dateTime": end_utc,
+                "timeZone": "UTC",
+            },
+            "availabilityViewInterval": 30,
+        });
+
+        let resp = self.post_json("/me/calendar/getSchedule", &body).await?;
+        Ok(parse_graph_room_availability(&resp))
+    }
+
     /// Rename a calendar via PATCH /me/calendars/{id}.
     pub async fn rename_calendar(&self, calendar_id: &str, new_name: &str) -> Result<()> {
         log::info!("Graph rename calendar: id={} -> {}", calendar_id, new_name);
@@ -1058,6 +1293,114 @@ pub struct GraphCalendarEvent {
     pub is_recurring: bool,
 }
 
+fn parse_graph_rooms(value: &serde_json::Value) -> Vec<GraphRoom> {
+    parse_graph_named_addresses(value)
+        .into_iter()
+        .map(|(name, address)| GraphRoom { name, address })
+        .collect()
+}
+
+fn normalize_schedule_datetime(datetime: &str) -> Result<String> {
+    chrono::DateTime::parse_from_rfc3339(datetime)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        })
+        .map_err(|e| Error::Other(format!("Invalid schedule datetime '{}': {}", datetime, e)))
+}
+
+fn parse_graph_room_availability(value: &serde_json::Value) -> GraphRoomAvailability {
+    let Some(schedule) = value["value"]
+        .as_array()
+        .and_then(|entries| entries.first())
+    else {
+        return GraphRoomAvailability {
+            state: "unknown".into(),
+            busy_start: None,
+            busy_end: None,
+        };
+    };
+
+    if let Some(item) = schedule["scheduleItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|item| {
+            matches!(
+                item["status"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "busy" | "tentative" | "oof" | "workingelsewhere"
+            )
+        })
+    {
+        return GraphRoomAvailability {
+            state: "busy".into(),
+            busy_start: item["start"]["dateTime"].as_str().map(|s| s.to_string()),
+            busy_end: item["end"]["dateTime"].as_str().map(|s| s.to_string()),
+        };
+    }
+
+    GraphRoomAvailability {
+        state: "available".into(),
+        busy_start: None,
+        busy_end: None,
+    }
+}
+
+fn parse_graph_named_addresses(value: &serde_json::Value) -> Vec<(String, String)> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let address = entry["address"]
+                .as_str()
+                .or_else(|| entry["emailAddress"].as_str())?
+                .trim();
+            if address.is_empty() {
+                return None;
+            }
+
+            let name = entry["name"]
+                .as_str()
+                .or_else(|| entry["displayName"].as_str())
+                .unwrap_or(address)
+                .trim();
+            Some((
+                if name.is_empty() {
+                    address.to_string()
+                } else {
+                    name.to_string()
+                },
+                address.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn dedupe_graph_rooms(rooms: Vec<GraphRoom>) -> Vec<GraphRoom> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::new();
+
+    for room in rooms {
+        let key = room.address.to_ascii_lowercase();
+        if seen.insert(key) {
+            unique.push(room);
+        }
+    }
+
+    unique.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+    unique
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1466,7 +1809,10 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
 
 #[cfg(test)]
 mod color_tests {
-    use super::{graph_color_to_hex, nearest_outlook_color};
+    use super::{
+        dedupe_graph_rooms, graph_color_to_hex, nearest_outlook_color, normalize_schedule_datetime,
+        parse_graph_named_addresses, parse_graph_room_availability, parse_graph_rooms, GraphRoom,
+    };
 
     #[test]
     fn anchor_round_trip() {
@@ -1518,5 +1864,159 @@ mod color_tests {
         assert_ne!(nearest_outlook_color("#000000"), "maxColor");
         assert_ne!(nearest_outlook_color("#ffffff"), "maxColor");
         assert_ne!(nearest_outlook_color("#8b5cf6"), "maxColor");
+    }
+
+    #[test]
+    fn parse_graph_rooms_normalizes_name_and_address() {
+        let value = serde_json::json!([
+            {"name": "Board Room", "address": "board@example.com"},
+            {"name": "", "address": "fallback@example.com"},
+            {"name": "Ignored", "address": ""}
+        ]);
+
+        let rooms = parse_graph_rooms(&value);
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].name, "Board Room");
+        assert_eq!(rooms[0].address, "board@example.com");
+        assert_eq!(rooms[1].name, "fallback@example.com");
+        assert_eq!(rooms[1].address, "fallback@example.com");
+    }
+
+    #[test]
+    fn parse_graph_named_addresses_filters_blank_addresses() {
+        let value = serde_json::json!([
+            {"name": "Building 1 Rooms", "address": "building1@example.com"},
+            {"name": "", "address": "fallback@example.com"},
+            {"name": "Ignored", "address": ""}
+        ]);
+
+        let items = parse_graph_named_addresses(&value);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            (
+                "Building 1 Rooms".to_string(),
+                "building1@example.com".to_string()
+            )
+        );
+        assert_eq!(
+            items[1],
+            (
+                "fallback@example.com".to_string(),
+                "fallback@example.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_graph_named_addresses_supports_places_payload() {
+        let value = serde_json::json!([
+            {"displayName": "Building 1 Rooms", "emailAddress": "building1@example.com"},
+            {"displayName": "", "emailAddress": "fallback@example.com"},
+            {"displayName": "Ignored", "emailAddress": ""}
+        ]);
+
+        let items = parse_graph_named_addresses(&value);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            (
+                "Building 1 Rooms".to_string(),
+                "building1@example.com".to_string()
+            )
+        );
+        assert_eq!(
+            items[1],
+            (
+                "fallback@example.com".to_string(),
+                "fallback@example.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn dedupe_graph_rooms_keeps_unique_addresses() {
+        let rooms = vec![
+            GraphRoom {
+                name: "Zebra".into(),
+                address: "room@example.com".into(),
+            },
+            GraphRoom {
+                name: "Alpha".into(),
+                address: "ROOM@example.com".into(),
+            },
+            GraphRoom {
+                name: "Beta".into(),
+                address: "beta@example.com".into(),
+            },
+        ];
+
+        let unique = dedupe_graph_rooms(rooms);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].name, "Beta");
+        assert_eq!(unique[1].address, "room@example.com");
+    }
+
+    #[test]
+    fn normalize_schedule_datetime_converts_to_utc_naive_format() {
+        assert_eq!(
+            normalize_schedule_datetime("2026-05-19T10:00:00+02:00").unwrap(),
+            "2026-05-19T08:00:00"
+        );
+    }
+
+    #[test]
+    fn parse_graph_room_availability_detects_busy_slots() {
+        let value = serde_json::json!({
+            "value": [
+                {
+                    "scheduleItems": [
+                        {
+                            "status": "free",
+                            "start": { "dateTime": "2026-05-19T09:00:00.0000000" },
+                            "end": { "dateTime": "2026-05-19T10:00:00.0000000" }
+                        },
+                        {
+                            "status": "busy",
+                            "start": { "dateTime": "2026-05-19T10:30:00.0000000" },
+                            "end": { "dateTime": "2026-05-19T11:00:00.0000000" }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let availability = parse_graph_room_availability(&value);
+        assert_eq!(availability.state, "busy");
+        assert_eq!(
+            availability.busy_start.as_deref(),
+            Some("2026-05-19T10:30:00.0000000")
+        );
+        assert_eq!(
+            availability.busy_end.as_deref(),
+            Some("2026-05-19T11:00:00.0000000")
+        );
+    }
+
+    #[test]
+    fn parse_graph_room_availability_defaults_to_available_without_blocks() {
+        let value = serde_json::json!({
+            "value": [
+                {
+                    "scheduleItems": [
+                        {
+                            "status": "free",
+                            "start": { "dateTime": "2026-05-19T09:00:00.0000000" },
+                            "end": { "dateTime": "2026-05-19T10:00:00.0000000" }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let availability = parse_graph_room_availability(&value);
+        assert_eq!(availability.state, "available");
+        assert!(availability.busy_start.is_none());
+        assert!(availability.busy_end.is_none());
     }
 }

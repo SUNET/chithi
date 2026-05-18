@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::calendar::ical::{self, ParsedInvite};
@@ -83,6 +83,19 @@ pub struct MeetBindingInput {
     pub protocol: String,
     pub meeting_id: String,
     pub join_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomSuggestion {
+    pub name: String,
+    pub address: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomAvailability {
+    pub state: String,
+    pub busy_start: Option<String>,
+    pub busy_end: Option<String>,
 }
 
 /// Defence-in-depth check on a client-supplied meet binding before
@@ -763,6 +776,71 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
 
     log::info!("create_event: created event id={}", id);
     Ok(id)
+}
+
+#[tauri::command]
+pub async fn list_room_suggestions(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<RoomSuggestion>> {
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.calendar_protocol_str() != "graph" {
+        log::debug!(
+            "list_room_suggestions: skipping non-graph account {} ({})",
+            account.id,
+            account.calendar_protocol_str()
+        );
+        return Ok(Vec::new());
+    }
+
+    let token = crate::mail::graph::get_graph_token(&account.id).await?;
+    let client = crate::mail::graph::GraphClient::new(&token);
+    let rooms = client.list_rooms().await?;
+    Ok(rooms
+        .into_iter()
+        .map(|room| RoomSuggestion {
+            name: room.name,
+            address: room.address,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn check_room_availability(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_address: String,
+    start_time: String,
+    end_time: String,
+) -> Result<RoomAvailability> {
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+
+    if account.calendar_protocol_str() != "graph" {
+        return Ok(RoomAvailability {
+            state: "unknown".into(),
+            busy_start: None,
+            busy_end: None,
+        });
+    }
+
+    let token = crate::mail::graph::get_graph_token(&account.id).await?;
+    let client = crate::mail::graph::GraphClient::new(&token);
+    let availability = client
+        .get_room_availability(&room_address, &start_time, &end_time)
+        .await?;
+
+    Ok(RoomAvailability {
+        state: availability.state,
+        busy_start: availability.busy_start,
+        busy_end: availability.busy_end,
+    })
 }
 
 /// Push the event title back to the meet provider as the meeting's

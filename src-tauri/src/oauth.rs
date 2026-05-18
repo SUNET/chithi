@@ -82,6 +82,7 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
         "Mail.ReadWrite",
         "Calendars.ReadWrite",
         "Contacts.ReadWrite",
+        "Place.Read.All",
         "offline_access",
         "openid",
         "profile",
@@ -95,7 +96,7 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
 
 /// Microsoft Graph scopes — used for a separate token refresh for calendar/contacts.
 pub const MICROSOFT_GRAPH_SCOPES: &str =
-    "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite offline_access";
+    "User.Read Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite Place.Read.All offline_access";
 
 /// Zoom OAuth (#148, video conferencing). Native app with PKCE —
 /// no client_secret ships in the binary. Registered on Zoom

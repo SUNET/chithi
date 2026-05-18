@@ -315,6 +315,26 @@ export async function getEvents(
   return invoke("get_events", { accountId, start, end, calendarId: calendarId ?? null });
 }
 
+export async function listRoomSuggestions(
+  accountId: string,
+): Promise<import("./types").RoomSuggestion[]> {
+  return invoke("list_room_suggestions", { accountId });
+}
+
+export async function checkRoomAvailability(
+  accountId: string,
+  roomAddress: string,
+  startTime: string,
+  endTime: string,
+): Promise<import("./types").RoomAvailability> {
+  return invoke("check_room_availability", {
+    accountId,
+    roomAddress,
+    startTime,
+    endTime,
+  });
+}
+
 export async function createEvent(
   event: import("./types").NewEventInput,
 ): Promise<string> {
