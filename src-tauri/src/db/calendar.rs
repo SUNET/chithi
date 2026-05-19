@@ -57,6 +57,18 @@ pub struct Attendee {
     pub status: String, // "accepted", "tentative", "declined", "needs-action"
 }
 
+/// A calendar invite — a `CalendarEvent` plus its row `created_at`
+/// timestamp. Returned by `list_invites` for the Invites view, where the
+/// arrival time backs the "recently received" sort. `created_at` is kept
+/// off `CalendarEvent` itself so the many event-construction sites in the
+/// sync code are unaffected; `#[serde(flatten)]` keeps the wire JSON flat.
+#[derive(Debug, Clone, Serialize)]
+pub struct Invite {
+    #[serde(flatten)]
+    pub event: CalendarEvent,
+    pub created_at: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Calendar CRUD
 // ---------------------------------------------------------------------------
@@ -324,6 +336,62 @@ pub fn list_events(
     };
 
     Ok(rows)
+}
+
+/// List all invites for an account — events where the account is an
+/// attendee but NOT the organizer. Used by the dedicated Invites view.
+///
+/// `since` (ISO 8601) bounds the recent past: single-shot events whose
+/// `end_time` is older than `since` are dropped. Recurring events
+/// (non-empty `recurrence_rule`) always pass the date filter — the
+/// frontend computes their next occurrence.
+///
+/// SQL narrows by date and organizer; the attendee-membership check is
+/// done in Rust because `attendees_json` is an opaque JSON blob that
+/// SQLite cannot reliably search.
+pub fn list_invites(
+    conn: &Connection,
+    account_id: &str,
+    account_email: &str,
+    since: &str,
+) -> Result<Vec<Invite>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, calendar_id, uid, title, description, location,
+                start_time, end_time, all_day, timezone, recurrence_rule,
+                organizer_email, attendees_json, my_status, source_message_id,
+                ical_data, remote_id, etag, created_at
+         FROM calendar_events
+         WHERE account_id = ?1
+           AND organizer_email IS NOT NULL
+           AND organizer_email != ''
+           AND organizer_email <> ?2 COLLATE NOCASE
+           AND (end_time > ?3
+                OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
+         ORDER BY start_time ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, account_email, since], |row| {
+            Ok(Invite {
+                event: map_event_row(row)?,
+                created_at: row.get(19)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Keep only events where the account's own address is among the
+    // attendees (case-insensitive) — i.e. you were genuinely invited,
+    // not merely the owner of a calendar that holds the event.
+    let me = account_email.to_lowercase();
+    let filtered = rows
+        .into_iter()
+        .filter(|inv| match inv.event.attendees_json.as_deref() {
+            Some(json) => serde_json::from_str::<Vec<Attendee>>(json)
+                .map(|atts| atts.iter().any(|a| a.email.to_lowercase() == me))
+                .unwrap_or(false),
+            None => false,
+        })
+        .collect();
+    Ok(filtered)
 }
 
 pub fn get_event(conn: &Connection, id: &str) -> Result<CalendarEvent> {
@@ -654,6 +722,93 @@ mod tests {
 
         let found = get_event_by_uid(&conn, "acc1", "e1@test").unwrap().unwrap();
         assert_eq!(found.my_status, Some("accepted".to_string()));
+    }
+
+    fn attendees_json(emails: &[&str]) -> String {
+        let atts: Vec<Attendee> = emails
+            .iter()
+            .map(|e| Attendee {
+                email: e.to_string(),
+                name: None,
+                status: "needs-action".to_string(),
+            })
+            .collect();
+        serde_json::to_string(&atts).unwrap()
+    }
+
+    #[test]
+    fn test_list_invites_basic() {
+        let conn = setup_db();
+        let since = "2026-01-01T00:00:00Z";
+
+        // 1. A genuine invite: someone else organizes, we attend.
+        let mut invite = make_event("inv1", "Team Sync", None);
+        invite.organizer_email = Some("boss@example.com".to_string());
+        invite.attendees_json = Some(attendees_json(&["test@example.com", "boss@example.com"]));
+        insert_event(&conn, &invite).unwrap();
+
+        // 2. Self-organized event — excluded (organizer == account email).
+        let mut mine = make_event("mine1", "My Event", None);
+        mine.organizer_email = Some("test@example.com".to_string());
+        mine.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &mine).unwrap();
+
+        // 3. Event with no organizer — excluded.
+        let plain = make_event("plain1", "Personal", None);
+        insert_event(&conn, &plain).unwrap();
+
+        // 4. Organized by someone else but we're not an attendee — excluded.
+        let mut other = make_event("other1", "Not Mine", None);
+        other.organizer_email = Some("boss@example.com".to_string());
+        other.attendees_json = Some(attendees_json(&["someone@example.com"]));
+        insert_event(&conn, &other).unwrap();
+
+        let invites = list_invites(&conn, "acc1", "test@example.com", since).unwrap();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].event.id, "inv1");
+    }
+
+    #[test]
+    fn test_list_invites_organizer_match_is_case_insensitive() {
+        let conn = setup_db();
+        let mut mine = make_event("mine1", "My Event", None);
+        mine.organizer_email = Some("TEST@Example.com".to_string());
+        mine.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &mine).unwrap();
+
+        let invites =
+            list_invites(&conn, "acc1", "test@example.com", "2026-01-01T00:00:00Z").unwrap();
+        assert!(
+            invites.is_empty(),
+            "self-organized event must be excluded regardless of email case"
+        );
+    }
+
+    #[test]
+    fn test_list_invites_date_window() {
+        let conn = setup_db();
+        let since = "2026-04-01T00:00:00Z";
+
+        // Past non-recurring invite (ended before `since`) — excluded.
+        let mut past = make_event("past1", "Old Meeting", None);
+        past.start_time = "2026-03-01T10:00:00Z".to_string();
+        past.end_time = "2026-03-01T11:00:00Z".to_string();
+        past.organizer_email = Some("boss@example.com".to_string());
+        past.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &past).unwrap();
+
+        // Past recurring invite — always included (occurrences computed later).
+        let mut recurring = make_event("rec1", "Weekly Standup", None);
+        recurring.start_time = "2026-01-01T10:00:00Z".to_string();
+        recurring.end_time = "2026-01-01T10:30:00Z".to_string();
+        recurring.recurrence_rule = Some("FREQ=WEEKLY".to_string());
+        recurring.organizer_email = Some("boss@example.com".to_string());
+        recurring.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &recurring).unwrap();
+
+        let invites = list_invites(&conn, "acc1", "test@example.com", since).unwrap();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].event.id, "rec1");
     }
 
     #[test]

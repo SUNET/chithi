@@ -733,6 +733,10 @@ export const useMessagesStore = defineStore("messages", () => {
   // user clicks INBOX in account B while INBOX in account A is active,
   // and the list keeps showing A's messages until a different folder is
   // clicked first.
+  // Fires on every account/folder change. The messages store is created
+  // during MailView setup — before `fetchFolders()` sets the initial
+  // `activeFolderPath` — so this watch reliably catches the cold-start
+  // null -> inbox transition and loads the inbox without an explicit call.
   watch(
     () => [accountsStore.activeAccountId, foldersStore.activeFolderPath] as const,
     () => {

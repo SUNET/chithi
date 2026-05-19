@@ -63,10 +63,53 @@ export function expandRRule(
 
   const duration = eventEnd.getTime() - eventStart.getTime();
   const occurrences: { start: Date; end: Date }[] = [];
-  let current = new Date(eventStart);
+  const current = new Date(eventStart);
+  // `count` tracks occurrences elapsed since DTSTART (for the RRULE COUNT
+  // limit); `iterations` caps the loop independently so a fast-forwarded
+  // `count` cannot trip the iteration guard.
   let count = 0;
+  let iterations = 0;
 
-  while (count < maxOccurrences) {
+  // Fast-forward long-running series. A rule whose DTSTART is far before
+  // the requested window would otherwise spend the whole iteration budget
+  // stepping through history and never reach [rangeStart, rangeEnd].
+  // Advancing by whole periods keeps the occurrence grid (including WEEKLY
+  // BYDAY) aligned; `count` is bumped so the COUNT limit still applies.
+  if (current < rangeStart) {
+    let skip = 0;
+    const msBehind = rangeStart.getTime() - current.getTime();
+    const DAY_MS = 86_400_000;
+    switch (parsed.freq) {
+      case "DAILY":
+        skip = Math.floor(msBehind / (DAY_MS * parsed.interval));
+        if (skip > 0) current.setDate(current.getDate() + skip * parsed.interval);
+        break;
+      case "WEEKLY":
+        skip = Math.floor(msBehind / (7 * DAY_MS * parsed.interval));
+        if (skip > 0)
+          current.setDate(current.getDate() + skip * 7 * parsed.interval);
+        break;
+      case "MONTHLY": {
+        const months =
+          (rangeStart.getFullYear() - current.getFullYear()) * 12 +
+          (rangeStart.getMonth() - current.getMonth());
+        skip = Math.floor(months / parsed.interval);
+        if (skip > 0)
+          current.setMonth(current.getMonth() + skip * parsed.interval);
+        break;
+      }
+      case "YEARLY":
+        skip = Math.floor(
+          (rangeStart.getFullYear() - current.getFullYear()) / parsed.interval,
+        );
+        if (skip > 0)
+          current.setFullYear(current.getFullYear() + skip * parsed.interval);
+        break;
+    }
+    if (skip > 0) count += skip;
+  }
+
+  while (iterations < maxOccurrences) {
     if (parsed.until && current > parsed.until) break;
     if (parsed.count !== undefined && count >= parsed.count) break;
     if (current > rangeEnd) break;
@@ -97,6 +140,7 @@ export function expandRRule(
     }
 
     count++;
+    iterations++;
 
     // Advance to next occurrence
     switch (parsed.freq) {

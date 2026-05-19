@@ -230,6 +230,9 @@ async function periodicSync() {
 onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
+    // fetchFolders() sets activeFolderPath; the messages store's watch on
+    // [activeAccountId, activeFolderPath] then loads the inbox. No explicit
+    // fetchMessages() here — that would double-fetch on cold start.
     await foldersStore.fetchFolders();
   }
 

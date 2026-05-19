@@ -20,6 +20,11 @@ const router = createRouter({
       component: CalendarView,
     },
     {
+      path: "/invites",
+      name: "invites",
+      component: () => import("@/views/InvitesView.vue"),
+    },
+    {
       path: "/filters",
       name: "filters",
       component: () => import("@/views/FiltersView.vue"),
@@ -80,9 +85,12 @@ router.beforeEach(async (to) => {
   try {
     const { useAccountsStore } = await import("@/stores/accounts");
     const accountsStore = useAccountsStore();
-    if (accountsStore.accounts.length === 0 && !accountsStore.loading) {
-      // Attempt a fetch before redirecting — guard runs before onMounted
-      // in App.vue, so the store may just be empty from cold start.
+    if (accountsStore.accounts.length === 0) {
+      // Guard runs before onMounted in App.vue, so the store may just be
+      // empty from a cold start. Always await fetchAccounts() — it is
+      // de-duplicated, so if App.vue already started a fetch we await that
+      // same in-flight promise instead of redirecting to onboarding
+      // before the real account list has loaded.
       await accountsStore.fetchAccounts();
     }
     if (accountsStore.accounts.length === 0) {

@@ -310,6 +310,15 @@ export interface Attendee {
   status: string;
 }
 
+/**
+ * A calendar invite returned by `list_invites` — a CalendarEvent the
+ * account was invited to (attendee, not organizer), plus the row's
+ * `created_at` arrival timestamp used for the "recently received" sort.
+ */
+export interface Invite extends CalendarEvent {
+  created_at: string | null;
+}
+
 export interface ParsedInvite {
   method: string;
   uid: string;

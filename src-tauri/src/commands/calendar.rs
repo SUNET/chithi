@@ -3,7 +3,7 @@ use tauri::State;
 
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::db;
-use crate::db::calendar::{Attendee, Calendar, CalendarEvent, NewCalendar};
+use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
 use crate::meet;
 use crate::state::AppState;
@@ -472,6 +472,23 @@ pub async fn get_events(
         db::calendar::list_events(&conn, &account_id, calendar_id.as_deref(), &start, &end)?;
     log::debug!("get_events: found {} events", events.len());
     Ok(events)
+}
+
+/// List all calendar invites for an account — events where the account is
+/// an attendee but not the organizer. Backs the dedicated Invites view.
+/// The recent-past window is fixed at 7 days; recurring invites always pass.
+#[tauri::command]
+pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Result<Vec<Invite>> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let conn = state.db.reader();
+    let account = db::accounts::get_account_full(&conn, &account_id)?;
+    let invites = db::calendar::list_invites(&conn, &account_id, &account.email, &since)?;
+    log::debug!(
+        "list_invites: account={} found {} invites",
+        account_id,
+        invites.len()
+    );
+    Ok(invites)
 }
 
 #[tauri::command]
@@ -2253,6 +2270,37 @@ pub async fn respond_to_invite(
             ))
         })?;
 
+    apply_invite_response(
+        &app,
+        &state,
+        account_id,
+        account,
+        invite,
+        invite_uid,
+        response,
+        Some(message_id),
+    )
+    .await
+}
+
+/// Deliver an iTIP REPLY for `invite` and persist the RSVP locally.
+///
+/// Shared by `respond_to_invite` (invite parsed from an email) and
+/// `respond_to_event` (invite rebuilt from a stored calendar row). The
+/// per-provider routing — JMAP / Graph RSVP / SMTP plus the Google
+/// Calendar API path — is identical for both callers. `source_message_id`
+/// is recorded only when a brand-new local event row has to be created.
+#[allow(clippy::too_many_arguments)]
+async fn apply_invite_response(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    account_id: String,
+    account: db::accounts::AccountFull,
+    invite: &ParsedInvite,
+    invite_uid: String,
+    response: String,
+    source_message_id: Option<String>,
+) -> Result<()> {
     // Step 2: Generate the iTIP REPLY
     let reply_ical = ical::generate_reply(invite, &account.email, &response);
 
@@ -2272,7 +2320,7 @@ pub async fn respond_to_invite(
 
         match invite_reply_transport(account.calendar_protocol_str()) {
             InviteReplyTransport::Jmap => {
-                log::info!("respond_to_invite: sending reply via JMAP");
+                log::info!("apply_invite_response: sending reply via JMAP");
                 let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
                 let raw_message = build_calendar_reply_message(
@@ -2291,11 +2339,11 @@ pub async fn respond_to_invite(
                 // email to the organizer is sent by Microsoft itself via the
                 // Graph API RSVP call (`sendResponse: true`) in Step 3b below.
                 log::info!(
-                    "respond_to_invite: O365 account — reply delivered via Graph API RSVP (Step 3b)"
+                    "apply_invite_response: O365 account — reply delivered via Graph API RSVP (Step 3b)"
                 );
             }
             InviteReplyTransport::Smtp => {
-                log::info!("respond_to_invite: sending reply via SMTP");
+                log::info!("apply_invite_response: sending reply via SMTP");
                 let raw_message = build_calendar_reply_message(
                     &account.email,
                     organizer_email,
@@ -2322,7 +2370,7 @@ pub async fn respond_to_invite(
             }
         }
     } else {
-        log::info!("respond_to_invite: no organizer email, skipping send");
+        log::info!("apply_invite_response: no organizer email, skipping send");
     }
 
     // Step 3b: For O365/Graph accounts, deliver the RSVP to the organizer
@@ -2347,7 +2395,7 @@ pub async fn respond_to_invite(
             })?;
         client.rsvp_event(&event_id, &response, "").await?;
         log::info!(
-            "respond_to_invite: updated O365 Calendar response to {}",
+            "apply_invite_response: updated O365 Calendar response to {}",
             response
         );
         Some(event_id)
@@ -2383,7 +2431,10 @@ pub async fn respond_to_invite(
             is_default: true,
         };
         db::calendar::insert_calendar(&conn, &cal_id, &new_cal)?;
-        log::info!("respond_to_invite: created default calendar id={}", cal_id);
+        log::info!(
+            "apply_invite_response: created default calendar id={}",
+            cal_id
+        );
         cal_id
     };
 
@@ -2409,7 +2460,7 @@ pub async fn respond_to_invite(
         existing.attendees_json = attendees_json;
         db::calendar::update_event(&conn, &existing)?;
         log::info!(
-            "respond_to_invite: updated existing event {} status={}",
+            "apply_invite_response: updated existing event {} status={}",
             existing.id,
             response
         );
@@ -2434,14 +2485,14 @@ pub async fn respond_to_invite(
             organizer_email: invite.organizer_email.clone(),
             attendees_json,
             my_status: Some(my_status),
-            source_message_id: Some(message_id.clone()),
+            source_message_id: source_message_id.clone(),
             ical_data: Some(invite.ical_raw.clone()),
             remote_id: None,
             etag: None,
         };
         db::calendar::insert_event(&conn, &cal_event)?;
         log::info!(
-            "respond_to_invite: created event {} status={}",
+            "apply_invite_response: created event {} status={}",
             event_id,
             response
         );
@@ -2512,15 +2563,18 @@ pub async fn respond_to_invite(
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(data) = resp.json::<serde_json::Value>().await {
                             google_event_id_found = data["id"].as_str().map(|s| s.to_string());
-                            log::info!("respond_to_invite: imported event to Google Calendar");
+                            log::info!("apply_invite_response: imported event to Google Calendar");
                         }
                     }
                     Ok(resp) => {
                         let body = resp.text().await.unwrap_or_default();
-                        log::warn!("respond_to_invite: Google Calendar import failed: {}", body);
+                        log::warn!(
+                            "apply_invite_response: Google Calendar import failed: {}",
+                            body
+                        );
                     }
                     Err(e) => log::warn!(
-                        "respond_to_invite: Google Calendar import request failed: {}",
+                        "apply_invite_response: Google Calendar import request failed: {}",
                         e
                     ),
                 }
@@ -2548,16 +2602,22 @@ pub async fn respond_to_invite(
                     {
                         Ok(r) if r.status().is_success() => {
                             log::info!(
-                                "respond_to_invite: updated Google Calendar response to {}",
+                                "apply_invite_response: updated Google Calendar response to {}",
                                 google_status
                             );
                         }
                         Ok(r) => {
                             let body = r.text().await.unwrap_or_default();
-                            log::warn!("respond_to_invite: Google Calendar PATCH failed: {}", body);
+                            log::warn!(
+                                "apply_invite_response: Google Calendar PATCH failed: {}",
+                                body
+                            );
                         }
                         Err(e) => {
-                            log::warn!("respond_to_invite: Google Calendar request failed: {}", e)
+                            log::warn!(
+                                "apply_invite_response: Google Calendar request failed: {}",
+                                e
+                            )
                         }
                     }
                 }
@@ -2572,7 +2632,7 @@ pub async fn respond_to_invite(
                         rusqlite::params![geid, invite_uid, account_id],
                     ).ok();
                     log::info!(
-                        "respond_to_invite: stored Google Calendar remote_id={}",
+                        "apply_invite_response: stored Google Calendar remote_id={}",
                         geid
                     );
                 }
@@ -2598,6 +2658,102 @@ pub async fn respond_to_invite(
     app.emit("calendar-changed", account_id.as_str()).ok();
 
     Ok(())
+}
+
+/// Rebuild a `ParsedInvite` from a stored calendar event so an iTIP REPLY
+/// can be generated without the original invite email. Prefers the stored
+/// iCalendar payload (most faithful — keeps SEQUENCE, exact organizer and
+/// attendee encoding); falls back to synthesizing one from the row columns.
+fn event_to_parsed_invite(event: &CalendarEvent, uid: &str) -> ParsedInvite {
+    if let Some(ical) = event.ical_data.as_deref() {
+        if !ical.trim().is_empty() {
+            if let Some(parsed) = ical::parse_ical_data(ical)
+                .into_iter()
+                .find(|inv| inv.uid == uid)
+            {
+                return parsed;
+            }
+        }
+    }
+
+    let attendees: Vec<Attendee> = event
+        .attendees_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+
+    ParsedInvite {
+        method: "REQUEST".to_string(),
+        uid: uid.to_string(),
+        summary: Some(event.title.clone()),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        dtstart: event.start_time.clone(),
+        dtend: event.end_time.clone(),
+        all_day: event.all_day,
+        timezone: event.timezone.clone(),
+        organizer_email: event.organizer_email.clone(),
+        organizer_name: None,
+        attendees,
+        recurrence_rule: event.recurrence_rule.clone(),
+        sequence: 0,
+        ical_raw: event.ical_data.clone().unwrap_or_default(),
+    }
+}
+
+/// Respond to a calendar invite from a stored event row — backs the
+/// dedicated Invites view. Unlike `respond_to_invite`, no original invite
+/// email is needed: the iTIP REPLY is rebuilt from the persisted event.
+/// RSVP delivery and local persistence are shared via `apply_invite_response`.
+#[tauri::command]
+pub async fn respond_to_event(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+    response: String,
+) -> Result<()> {
+    log::info!(
+        "respond_to_event: account={} event={} response={}",
+        account_id,
+        event_id,
+        response
+    );
+
+    let (event, account) = {
+        let conn = state.db.reader();
+        let event = db::calendar::get_event(&conn, &event_id)?;
+        let account = db::accounts::get_account_full(&conn, &account_id)?;
+        (event, account)
+    };
+
+    // Reject cross-account requests: the event must belong to the account
+    // we are about to RSVP as, otherwise the reply would be sent from the
+    // wrong identity.
+    if event.account_id != account_id {
+        return Err(crate::error::Error::Other(
+            "Event does not belong to the specified account".to_string(),
+        ));
+    }
+
+    let uid = event.uid.clone().ok_or_else(|| {
+        crate::error::Error::Other("Event has no UID; cannot send an RSVP".to_string())
+    })?;
+
+    let invite = event_to_parsed_invite(&event, &uid);
+    let source_message_id = event.source_message_id.clone();
+
+    apply_invite_response(
+        &app,
+        &state,
+        account_id,
+        account,
+        &invite,
+        uid,
+        response,
+        source_message_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,13 @@
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-type TabId = "mail" | "calendar" | "contacts" | "filters" | "settings";
+type TabId =
+  | "mail"
+  | "calendar"
+  | "invites"
+  | "contacts"
+  | "filters"
+  | "settings";
 
 interface Tab {
   id: TabId;
@@ -13,6 +19,7 @@ interface Tab {
 const tabs: Tab[] = [
   { id: "mail", label: "Mail", path: "/" },
   { id: "calendar", label: "Calendar", path: "/calendar" },
+  { id: "invites", label: "Invites", path: "/invites" },
   { id: "contacts", label: "Contacts", path: "/contacts" },
   { id: "filters", label: "Filters", path: "/filters" },
   { id: "settings", label: "Settings", path: "/settings" },
@@ -24,6 +31,7 @@ const route = useRoute();
 const active = computed<TabId>(() => {
   const p = route.path;
   if (p.startsWith("/calendar")) return "calendar";
+  if (p.startsWith("/invites")) return "invites";
   if (p.startsWith("/contacts")) return "contacts";
   if (p.startsWith("/filters")) return "filters";
   if (p.startsWith("/settings")) return "settings";
@@ -69,6 +77,18 @@ function onTabClick(tab: Tab) {
         >
           <rect x="3" y="4" width="18" height="18" rx="2" />
           <path d="M16 2v4M8 2v4M3 10h18" />
+        </svg>
+        <svg
+          v-else-if="t.id === 'invites'"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M21 13V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h7" />
+          <path d="M16 2v4M8 2v4M3 10h18" />
+          <path d="M15 18l2 2 4-4" />
         </svg>
         <svg
           v-else-if="t.id === 'contacts'"
