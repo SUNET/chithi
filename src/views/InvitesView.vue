@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useInvitesStore } from "@/stores/invites";
 import type { InviteStatusFilter, InviteSortMode } from "@/stores/invites";
 import { normalizeInviteStatus, nextOccurrence } from "@/stores/invites";
@@ -96,6 +96,11 @@ function closeDetail() {
   // An edit/delete from the detail panel may have changed the invite.
   invitesStore.fetchInvites().catch(() => {});
 }
+
+// Tell the store the view is open so it keeps invites fresh even when the
+// sidebar badge preference is disabled; release that tracking on unmount.
+onMounted(() => invitesStore.setViewActive(true));
+onUnmounted(() => invitesStore.setViewActive(false));
 </script>
 
 <template>

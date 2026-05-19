@@ -2715,6 +2715,15 @@ pub async fn respond_to_event(
         (event, account)
     };
 
+    // Reject cross-account requests: the event must belong to the account
+    // we are about to RSVP as, otherwise the reply would be sent from the
+    // wrong identity.
+    if event.account_id != account_id {
+        return Err(crate::error::Error::Other(
+            "Event does not belong to the specified account".to_string(),
+        ));
+    }
+
     let uid = event.uid.clone().ok_or_else(|| {
         crate::error::Error::Other("Event has no UID; cannot send an RSVP".to_string())
     })?;

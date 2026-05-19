@@ -12,8 +12,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { useInvitesStore, nextOccurrence } from "@/stores/invites";
+import {
+  useInvitesStore,
+  nextOccurrence,
+  parseInviteTimestamp,
+} from "@/stores/invites";
 import { useAccountsStore } from "@/stores/accounts";
+import { useUiStore } from "@/stores/ui";
 import type { Invite } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
@@ -65,6 +70,9 @@ function flush() {
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  // Clear so the "show invites badge" preference starts at its default
+  // (enabled) and doesn't leak between tests.
+  localStorage.clear();
   vi.mocked(api.listAccounts).mockResolvedValue([]);
   vi.mocked(api.listInvites).mockReset().mockResolvedValue([]);
   vi.mocked(api.respondToEvent).mockReset().mockResolvedValue(undefined);
@@ -239,5 +247,52 @@ describe("nextOccurrence", () => {
     const occ = nextOccurrence(invite, now);
     // The next standup must not be the long-past series start.
     expect(occ.getTime()).toBeGreaterThanOrEqual(now.getTime());
+  });
+});
+
+describe("parseInviteTimestamp", () => {
+  it("treats a SQLite CURRENT_TIMESTAMP string as UTC", () => {
+    // "YYYY-MM-DD HH:MM:SS" with no zone — must be read as UTC.
+    expect(parseInviteTimestamp("2026-05-01 09:00:00")).toBe(
+      Date.parse("2026-05-01T09:00:00Z"),
+    );
+  });
+
+  it("passes ISO-8601 strings through and handles missing values", () => {
+    expect(parseInviteTimestamp("2026-05-01T09:00:00Z")).toBe(
+      Date.parse("2026-05-01T09:00:00Z"),
+    );
+    expect(parseInviteTimestamp(null)).toBe(0);
+    expect(parseInviteTimestamp("not a date")).toBe(0);
+  });
+});
+
+describe("invites store — background tracking", () => {
+  it("skips the eager fetch when the badge is off and the view is closed", async () => {
+    const ui = useUiStore();
+    ui.setShowInviteBadge(false);
+    const accounts = useAccountsStore();
+    accounts.accounts = [makeAccount("acc1", "me@example.com")];
+
+    const store = useInvitesStore();
+    await flush();
+    // No badge, no open view → no background fetch.
+    expect(api.listInvites).not.toHaveBeenCalled();
+
+    // Opening the Invites view starts tracking and triggers a load.
+    store.setViewActive(true);
+    await flush();
+    expect(api.listInvites).toHaveBeenCalledWith("acc1");
+  });
+
+  it("eager-fetches when the badge preference is enabled", async () => {
+    const ui = useUiStore();
+    ui.setShowInviteBadge(true);
+    const accounts = useAccountsStore();
+    accounts.accounts = [makeAccount("acc1", "me@example.com")];
+
+    useInvitesStore();
+    await flush();
+    expect(api.listInvites).toHaveBeenCalledWith("acc1");
   });
 });
