@@ -926,7 +926,7 @@ fn get_threaded_messages_inner(
             MAX(has_attachments) AS has_attach,
             MAX(flags) AS latest_flags,
             MAX(snippet) AS latest_snippet,
-            GROUP_CONCAT(id, '||') AS all_ids
+            GROUP_CONCAT(id, '||' ORDER BY date ASC) AS all_ids
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2{filter}
          GROUP BY tid
@@ -1180,6 +1180,53 @@ mod tests {
         let conn = setup_db();
         let paths = get_maildir_paths(&conn, "acc1", &[]).unwrap();
         assert!(paths.is_empty());
+    }
+
+    /// Regression: in an expanded thread the first (oldest) email must stay
+    /// reachable. The ThreadRow header opens `message_ids[0]` and the frontend
+    /// renders only `threadMessages[1..]` as separate rows, so `message_ids[0]`
+    /// has to be the chronologically-first message. `GROUP_CONCAT` without an
+    /// explicit `ORDER BY` echoes rowid (insertion) order, which is not
+    /// chronological after delta syncs — leaving the first email unclickable.
+    #[test]
+    fn threaded_message_ids_are_ordered_by_date_ascending() {
+        let conn = setup_db();
+        // Insertion order is deliberately NOT chronological.
+        let insert = |id: &str, date: &str| {
+            conn.execute(
+                "INSERT INTO messages
+                 (id, account_id, folder_path, uid, message_id, thread_id, date, from_email, maildir_path)
+                 VALUES (?1, 'acc1', 'INBOX', 1, ?1, '<root@t>', ?2, 'x@y', '')",
+                params![id, date],
+            )
+            .unwrap();
+        };
+        insert("newest", "2026-05-03T00:00:00Z");
+        insert("oldest", "2026-05-01T00:00:00Z");
+        insert("middle", "2026-05-02T00:00:00Z");
+
+        let page = get_threaded_messages_inner(
+            &conn,
+            "acc1",
+            "INBOX",
+            0,
+            50,
+            "date",
+            false,
+            &QuickFilter::default(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(page.threads.len(), 1);
+        assert_eq!(
+            page.threads[0].message_ids,
+            vec![
+                "oldest".to_string(),
+                "middle".to_string(),
+                "newest".to_string(),
+            ],
+        );
     }
 
     fn insert_threaded_row(

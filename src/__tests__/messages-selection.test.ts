@@ -277,3 +277,63 @@ describe("Mark as read", () => {
     expect(store.subjectForMessage("missing")).toBeNull();
   });
 });
+
+describe("Threaded Shift+click range selection", () => {
+  beforeEach(() => setActivePinia(createPinia()));
+
+  it("range across an expanded thread has no duplicate IDs", () => {
+    const store = setup(true);
+    // message_ids[0] is the thread root, rendered by the ThreadRow header.
+    // threadMessages[0] is that same root; childrenWithDepth() renders only
+    // threadMessages[1..] as reply rows, so getVisibleIds() must skip the
+    // root in threadMessages to avoid listing it twice.
+    store.threads = [makeThread("t1", ["msg1", "msg2", "msg3"])];
+    store.threadMessages = {
+      t1: [makeSummary("msg1"), makeSummary("msg2"), makeSummary("msg3")],
+    };
+    store.collapsedThreads = []; // expanded
+
+    store.selectMessage("msg1", noMod); // ThreadRow header
+    store.selectMessage("msg3", shift); // last reply row
+
+    expect(store.selectedIds).toEqual(["msg1", "msg2", "msg3"]);
+    expect(new Set(store.selectedIds).size).toBe(store.selectedIds.length);
+  });
+
+  it("range spans the header id and reply rows across threads in order", () => {
+    const store = setup(true);
+    store.threads = [
+      makeThread("t1", ["msg1", "msg2"]),
+      makeThread("t2", ["msg3"]),
+    ];
+    store.threadMessages = {
+      t1: [makeSummary("msg1"), makeSummary("msg2")],
+    };
+    store.collapsedThreads = [];
+
+    store.selectMessage("msg1", noMod);
+    store.selectMessage("msg3", shift);
+
+    expect(store.selectedIds).toEqual(["msg1", "msg2", "msg3"]);
+  });
+
+  it("collapsed thread contributes only its header id to the range", () => {
+    const store = setup(true);
+    store.threads = [
+      makeThread("t1", ["msg1", "msg2"]),
+      makeThread("t2", ["msg3", "msg4"]),
+    ];
+    store.threadMessages = {
+      t1: [makeSummary("msg1"), makeSummary("msg2")],
+      t2: [makeSummary("msg3"), makeSummary("msg4")],
+    };
+    store.collapsedThreads = ["t1"]; // t1 collapsed, t2 expanded
+
+    store.selectMessage("msg1", noMod);
+    store.selectMessage("msg4", shift);
+
+    // t1 is collapsed so only its header (msg1) is visible; t2 expanded
+    // contributes its header (msg3) plus reply rows (msg4).
+    expect(store.selectedIds).toEqual(["msg1", "msg3", "msg4"]);
+  });
+});
