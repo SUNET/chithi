@@ -1000,7 +1000,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -1073,7 +1073,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -1335,6 +1335,10 @@ pub struct GraphCalendarEvent {
     pub location: Option<String>,
     pub organizer_email: Option<String>,
     pub attendees_json: Option<String>,
+    /// The signed-in user's own RSVP to this event, in iCal PARTSTAT
+    /// vocabulary. `None` for events with no RSVP concept (events the user
+    /// organized, or invites not yet responded to).
+    pub my_status: Option<String>,
     pub ical_uid: Option<String>,
     pub is_recurring: bool,
 }
@@ -1622,6 +1626,36 @@ pub fn guess_folder_type(display_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Translate a Microsoft Graph attendee `status.response` value into the
+/// iCal PARTSTAT vocabulary the rest of the app (and the UI) uses. Graph
+/// emits its own `responseType` enum (`none`, `organizer`, `accepted`,
+/// `tentativelyAccepted`, `declined`, `notResponded`); storing those verbatim
+/// makes the event popup show e.g. "tentativelyAccepted" instead of "Maybe".
+fn graph_response_to_partstat(response: &str) -> &'static str {
+    match response {
+        "accepted" => "accepted",
+        "tentativelyAccepted" => "tentative",
+        "declined" => "declined",
+        // The organizer implicitly accepts their own event.
+        "organizer" => "accepted",
+        // "none", "notResponded", and anything unrecognised.
+        _ => "needs-action",
+    }
+}
+
+/// Translate the event-level Graph `responseStatus.response` (the signed-in
+/// user's own RSVP) into an `Option` of iCal PARTSTAT. Only a genuine RSVP
+/// produces a value: `organizer`, `none`, and `notResponded` map to `None`
+/// so the UI doesn't show a stray status badge on the user's own events.
+fn graph_response_to_my_status(response: &str) -> Option<String> {
+    match response {
+        "accepted" => Some("accepted".to_string()),
+        "tentativelyAccepted" => Some("tentative".to_string()),
+        "declined" => Some("declined".to_string()),
+        _ => None,
+    }
+}
+
 fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
     let start_obj = &e["start"];
     let end_obj = &e["end"];
@@ -1679,7 +1713,9 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
                 serde_json::json!({
                     "name": a["emailAddress"]["name"].as_str().unwrap_or(""),
                     "email": a["emailAddress"]["address"].as_str().unwrap_or(""),
-                    "status": a["status"]["response"].as_str().unwrap_or("none"),
+                    "status": graph_response_to_partstat(
+                        a["status"]["response"].as_str().unwrap_or("none"),
+                    ),
                 })
             })
             .collect();
@@ -1697,6 +1733,9 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         location,
         organizer_email,
         attendees_json,
+        my_status: graph_response_to_my_status(
+            e["responseStatus"]["response"].as_str().unwrap_or("none"),
+        ),
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
         is_recurring: e["recurrence"].is_object(),
     }
@@ -1882,9 +1921,102 @@ async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<S
 #[cfg(test)]
 mod color_tests {
     use super::{
-        dedupe_graph_rooms, graph_color_to_hex, nearest_outlook_color, normalize_schedule_datetime,
-        parse_graph_named_addresses, parse_graph_room_availability, parse_graph_rooms, GraphRoom,
+        dedupe_graph_rooms, graph_color_to_hex, graph_response_to_my_status,
+        graph_response_to_partstat, nearest_outlook_color, normalize_schedule_datetime,
+        parse_graph_event, parse_graph_named_addresses, parse_graph_room_availability,
+        parse_graph_rooms, GraphRoom,
     };
+
+    // Graph emits its own responseType enum; the UI only understands iCal
+    // PARTSTAT values. Storing Graph's vocabulary verbatim made the event
+    // popup show "tentativelyAccepted" / "notResponded" next to attendees.
+    #[test]
+    fn graph_response_types_map_to_partstat() {
+        assert_eq!(graph_response_to_partstat("accepted"), "accepted");
+        assert_eq!(
+            graph_response_to_partstat("tentativelyAccepted"),
+            "tentative"
+        );
+        assert_eq!(graph_response_to_partstat("declined"), "declined");
+        assert_eq!(graph_response_to_partstat("organizer"), "accepted");
+        assert_eq!(graph_response_to_partstat("none"), "needs-action");
+        assert_eq!(graph_response_to_partstat("notResponded"), "needs-action");
+        // Unknown / future values fall back safely.
+        assert_eq!(graph_response_to_partstat("somethingNew"), "needs-action");
+    }
+
+    // A synced Graph event's attendee list must carry translated statuses.
+    #[test]
+    fn parse_graph_event_translates_attendee_status() {
+        let raw = serde_json::json!({
+            "id": "evt1",
+            "subject": "Linux docs",
+            "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
+            "isAllDay": false,
+            "organizer": { "emailAddress": { "address": "chithiapp@outlook.com" } },
+            "attendees": [
+                {
+                    "emailAddress": { "name": "Kushal", "address": "kushal@sunet.se" },
+                    "status": { "response": "tentativelyAccepted" }
+                }
+            ]
+        });
+        let parsed = parse_graph_event(&raw);
+        let atts: serde_json::Value =
+            serde_json::from_str(&parsed.attendees_json.unwrap()).unwrap();
+        assert_eq!(atts[0]["status"], "tentative");
+    }
+
+    // The signed-in user's own RSVP comes from the event-level
+    // responseStatus; only a genuine RSVP yields a my_status badge.
+    #[test]
+    fn graph_response_maps_to_my_status() {
+        assert_eq!(
+            graph_response_to_my_status("tentativelyAccepted").as_deref(),
+            Some("tentative")
+        );
+        assert_eq!(
+            graph_response_to_my_status("accepted").as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            graph_response_to_my_status("declined").as_deref(),
+            Some("declined")
+        );
+        // No RSVP concept — the user's own events / unanswered invites.
+        assert_eq!(graph_response_to_my_status("organizer"), None);
+        assert_eq!(graph_response_to_my_status("none"), None);
+        assert_eq!(graph_response_to_my_status("notResponded"), None);
+    }
+
+    // A synced Graph event carries the user's RSVP from responseStatus.
+    #[test]
+    fn parse_graph_event_extracts_my_status() {
+        let raw = serde_json::json!({
+            "id": "evt2",
+            "subject": "Linux docs",
+            "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
+            "isAllDay": false,
+            "responseStatus": { "response": "tentativelyAccepted" }
+        });
+        assert_eq!(
+            parse_graph_event(&raw).my_status.as_deref(),
+            Some("tentative")
+        );
+
+        // An event the user organized has no RSVP badge.
+        let own = serde_json::json!({
+            "id": "evt3",
+            "subject": "My own event",
+            "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
+            "isAllDay": false,
+            "responseStatus": { "response": "organizer" }
+        });
+        assert_eq!(parse_graph_event(&own).my_status, None);
+    }
 
     #[test]
     fn anchor_round_trip() {
