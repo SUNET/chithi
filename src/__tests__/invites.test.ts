@@ -248,6 +248,33 @@ describe("nextOccurrence", () => {
     // The next standup must not be the long-past series start.
     expect(occ.getTime()).toBeGreaterThanOrEqual(now.getTime());
   });
+
+  it("finds the next occurrence of a daily series that started years ago", () => {
+    const now = new Date("2026-05-19T00:00:00Z");
+    const invite = makeInvite("daily", {
+      start_time: "2022-01-01T09:00:00Z",
+      end_time: "2022-01-01T09:30:00Z",
+      recurrence_rule: "FREQ=DAILY",
+    });
+    const occ = nextOccurrence(invite, now);
+    // Must be an upcoming occurrence, not the long-past series start.
+    expect(occ.getTime()).toBeGreaterThanOrEqual(now.getTime());
+    expect(occ.getTime()).toBeLessThan(now.getTime() + 2 * 86_400_000);
+  });
+
+  it("finds the next occurrence of a long-interval yearly series", () => {
+    const now = new Date("2026-05-19T00:00:00Z");
+    // Occurs in 2023, 2028, 2033, ... — the next instance is beyond a
+    // naive fixed 2-year horizon, so the window must size to the interval.
+    const invite = makeInvite("yearly5", {
+      start_time: "2023-06-15T10:00:00Z",
+      end_time: "2023-06-15T11:00:00Z",
+      recurrence_rule: "FREQ=YEARLY;INTERVAL=5",
+    });
+    const occ = nextOccurrence(invite, now);
+    expect(occ.getTime()).toBeGreaterThan(Date.parse("2028-01-01T00:00:00Z"));
+    expect(occ.getTime()).toBeLessThan(Date.parse("2029-01-01T00:00:00Z"));
+  });
 });
 
 describe("parseInviteTimestamp", () => {

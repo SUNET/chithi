@@ -58,8 +58,20 @@ function statusLabel(invite: Invite): string {
 }
 
 function whenLabel(invite: Invite): string {
-  const occ = nextOccurrence(invite).toISOString();
-  return formatInTimezone(occ, uiStore.displayTimezone, {
+  const occ = nextOccurrence(invite);
+  if (invite.all_day) {
+    // All-day invites are anchored to a date-only (UTC midnight) start.
+    // Formatting through a display timezone would add a time component
+    // and could shift the day, so render a plain date read in UTC.
+    return occ.toLocaleDateString(undefined, {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: "UTC",
+    });
+  }
+  return formatInTimezone(occ.toISOString(), uiStore.displayTimezone, {
     hour12: uiStore.hour12,
   });
 }
@@ -73,13 +85,28 @@ function isCurrent(invite: Invite, response: string): boolean {
   return normalizeInviteStatus(invite.my_status) === response;
 }
 
+/**
+ * Best-effort human-readable message from a thrown value. Tauri command
+ * errors arrive as plain strings; `Error` instances carry `.message`;
+ * anything else is JSON-stringified rather than rendered as "[object Object]".
+ */
+function errorMessage(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
 async function respond(invite: Invite, response: string) {
   respondingId.value = invite.id;
   delete errorById.value[invite.id];
   try {
     await invitesStore.respond(invite, response);
   } catch (e) {
-    errorById.value = { ...errorById.value, [invite.id]: String(e) };
+    errorById.value = { ...errorById.value, [invite.id]: errorMessage(e) };
   } finally {
     respondingId.value = null;
   }

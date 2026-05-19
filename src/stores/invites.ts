@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { Invite } from "@/lib/types";
-import { expandRRule } from "@/lib/rrule";
+import { expandRRule, parseRRule } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
@@ -48,15 +48,27 @@ export function nextOccurrence(invite: Invite, now: Date = new Date()): Date {
 
   const end = new Date(invite.end_time);
   const DAY = 86_400_000;
+
+  // The next occurrence is at most one recurrence interval after `now`, so
+  // size the forward window from the rule itself. A fixed horizon would
+  // miss long-interval rules (e.g. FREQ=YEARLY;INTERVAL=5) and wrongly
+  // fall back to the series start.
+  const parsed = parseRRule(invite.recurrence_rule);
+  const interval = parsed?.interval ?? 1;
+  const intervalDays =
+    parsed?.freq === "WEEKLY"
+      ? 7 * interval
+      : parsed?.freq === "MONTHLY"
+        ? 31 * interval
+        : parsed?.freq === "YEARLY"
+          ? 366 * interval
+          : interval; // DAILY (or unknown) — one day per interval
   const rangeStart = new Date(now.getTime() - 366 * DAY);
-  const rangeEnd = new Date(now.getTime() + 730 * DAY);
-  const occ = expandRRule(
-    invite.recurrence_rule,
-    start,
-    end,
-    rangeStart,
-    rangeEnd,
-  );
+  const rangeEnd = new Date(now.getTime() + (intervalDays + 14) * DAY);
+
+  // expandRRule fast-forwards to the window start, and the window is only
+  // ~one interval wide ahead of now, so the default occurrence cap is ample.
+  const occ = expandRRule(invite.recurrence_rule, start, end, rangeStart, rangeEnd);
   if (occ.length === 0) return start;
   const upcoming = occ.find((o) => o.end.getTime() >= now.getTime());
   return upcoming ? upcoming.start : occ[occ.length - 1].start;

@@ -2320,7 +2320,7 @@ async fn apply_invite_response(
 
         match invite_reply_transport(account.calendar_protocol_str()) {
             InviteReplyTransport::Jmap => {
-                log::info!("respond_to_invite: sending reply via JMAP");
+                log::info!("apply_invite_response: sending reply via JMAP");
                 let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
                 let raw_message = build_calendar_reply_message(
@@ -2339,11 +2339,11 @@ async fn apply_invite_response(
                 // email to the organizer is sent by Microsoft itself via the
                 // Graph API RSVP call (`sendResponse: true`) in Step 3b below.
                 log::info!(
-                    "respond_to_invite: O365 account — reply delivered via Graph API RSVP (Step 3b)"
+                    "apply_invite_response: O365 account — reply delivered via Graph API RSVP (Step 3b)"
                 );
             }
             InviteReplyTransport::Smtp => {
-                log::info!("respond_to_invite: sending reply via SMTP");
+                log::info!("apply_invite_response: sending reply via SMTP");
                 let raw_message = build_calendar_reply_message(
                     &account.email,
                     organizer_email,
@@ -2370,7 +2370,7 @@ async fn apply_invite_response(
             }
         }
     } else {
-        log::info!("respond_to_invite: no organizer email, skipping send");
+        log::info!("apply_invite_response: no organizer email, skipping send");
     }
 
     // Step 3b: For O365/Graph accounts, deliver the RSVP to the organizer
@@ -2395,7 +2395,7 @@ async fn apply_invite_response(
             })?;
         client.rsvp_event(&event_id, &response, "").await?;
         log::info!(
-            "respond_to_invite: updated O365 Calendar response to {}",
+            "apply_invite_response: updated O365 Calendar response to {}",
             response
         );
         Some(event_id)
@@ -2431,7 +2431,10 @@ async fn apply_invite_response(
             is_default: true,
         };
         db::calendar::insert_calendar(&conn, &cal_id, &new_cal)?;
-        log::info!("respond_to_invite: created default calendar id={}", cal_id);
+        log::info!(
+            "apply_invite_response: created default calendar id={}",
+            cal_id
+        );
         cal_id
     };
 
@@ -2457,7 +2460,7 @@ async fn apply_invite_response(
         existing.attendees_json = attendees_json;
         db::calendar::update_event(&conn, &existing)?;
         log::info!(
-            "respond_to_invite: updated existing event {} status={}",
+            "apply_invite_response: updated existing event {} status={}",
             existing.id,
             response
         );
@@ -2489,7 +2492,7 @@ async fn apply_invite_response(
         };
         db::calendar::insert_event(&conn, &cal_event)?;
         log::info!(
-            "respond_to_invite: created event {} status={}",
+            "apply_invite_response: created event {} status={}",
             event_id,
             response
         );
@@ -2560,15 +2563,18 @@ async fn apply_invite_response(
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(data) = resp.json::<serde_json::Value>().await {
                             google_event_id_found = data["id"].as_str().map(|s| s.to_string());
-                            log::info!("respond_to_invite: imported event to Google Calendar");
+                            log::info!("apply_invite_response: imported event to Google Calendar");
                         }
                     }
                     Ok(resp) => {
                         let body = resp.text().await.unwrap_or_default();
-                        log::warn!("respond_to_invite: Google Calendar import failed: {}", body);
+                        log::warn!(
+                            "apply_invite_response: Google Calendar import failed: {}",
+                            body
+                        );
                     }
                     Err(e) => log::warn!(
-                        "respond_to_invite: Google Calendar import request failed: {}",
+                        "apply_invite_response: Google Calendar import request failed: {}",
                         e
                     ),
                 }
@@ -2596,16 +2602,22 @@ async fn apply_invite_response(
                     {
                         Ok(r) if r.status().is_success() => {
                             log::info!(
-                                "respond_to_invite: updated Google Calendar response to {}",
+                                "apply_invite_response: updated Google Calendar response to {}",
                                 google_status
                             );
                         }
                         Ok(r) => {
                             let body = r.text().await.unwrap_or_default();
-                            log::warn!("respond_to_invite: Google Calendar PATCH failed: {}", body);
+                            log::warn!(
+                                "apply_invite_response: Google Calendar PATCH failed: {}",
+                                body
+                            );
                         }
                         Err(e) => {
-                            log::warn!("respond_to_invite: Google Calendar request failed: {}", e)
+                            log::warn!(
+                                "apply_invite_response: Google Calendar request failed: {}",
+                                e
+                            )
                         }
                     }
                 }
@@ -2620,7 +2632,7 @@ async fn apply_invite_response(
                         rusqlite::params![geid, invite_uid, account_id],
                     ).ok();
                     log::info!(
-                        "respond_to_invite: stored Google Calendar remote_id={}",
+                        "apply_invite_response: stored Google Calendar remote_id={}",
                         geid
                     );
                 }

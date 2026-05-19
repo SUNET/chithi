@@ -230,14 +230,10 @@ async function periodicSync() {
 onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
+    // fetchFolders() sets activeFolderPath; the messages store's watch on
+    // [activeAccountId, activeFolderPath] then loads the inbox. No explicit
+    // fetchMessages() here — that would double-fetch on cold start.
     await foldersStore.fetchFolders();
-    // Explicitly load the initial folder's messages. The messages store
-    // watch only fires when account/folder *change*; on a cold start the
-    // store may be created after those values are already set, so the
-    // watch would never fire and the inbox would render empty.
-    if (foldersStore.activeFolderPath) {
-      await messagesStore.fetchMessages();
-    }
   }
 
   initNotifications();

@@ -6,8 +6,9 @@ import { useUiStore } from "@/stores/ui";
 const router = useRouter();
 const route = useRoute();
 
-// Instantiating the store here also kicks off its eager invite fetch, so
-// the needs-action badge is populated without ever opening the tab.
+// The invites store backs the needs-action badge. It only fetches in the
+// background while the badge preference is enabled (or the Invites view is
+// open), so instantiating it here is cheap when the badge is turned off.
 const invitesStore = useInvitesStore();
 const uiStore = useUiStore();
 
