@@ -2177,6 +2177,29 @@ pub async fn get_invite_status(
     Ok(event.and_then(|e| e.my_status))
 }
 
+/// How an iTIP REPLY to a meeting invite should be delivered, by calendar
+/// protocol. Graph/O365 accounts have no SMTP host configured — Microsoft
+/// delivers the reply to the organizer itself via the Graph RSVP call
+/// (`sendResponse: true`). Routing them through SMTP fails with an empty
+/// hostname.
+#[derive(Debug, PartialEq, Eq)]
+enum InviteReplyTransport {
+    /// Send the reply email over JMAP submission.
+    Jmap,
+    /// No client-side send — the Graph RSVP call delivers the reply.
+    GraphRsvp,
+    /// Send the reply email over SMTP (IMAP/Gmail accounts).
+    Smtp,
+}
+
+fn invite_reply_transport(calendar_protocol: &str) -> InviteReplyTransport {
+    match calendar_protocol {
+        "jmap" => InviteReplyTransport::Jmap,
+        "graph" => InviteReplyTransport::GraphRsvp,
+        _ => InviteReplyTransport::Smtp,
+    }
+}
+
 #[tauri::command]
 pub async fn respond_to_invite(
     app: tauri::AppHandle,
@@ -2247,49 +2270,90 @@ pub async fn respond_to_invite(
             invite.summary.as_deref().unwrap_or("Calendar Invite")
         );
 
-        if account.calendar_protocol_str() == "jmap" {
-            log::info!("respond_to_invite: sending reply via JMAP");
-            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        match invite_reply_transport(account.calendar_protocol_str()) {
+            InviteReplyTransport::Jmap => {
+                log::info!("respond_to_invite: sending reply via JMAP");
+                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
 
-            let raw_message = build_calendar_reply_message(
-                &account.email,
-                organizer_email,
-                &subject,
-                &body_text,
-                &reply_ical,
-            )?;
+                let raw_message = build_calendar_reply_message(
+                    &account.email,
+                    organizer_email,
+                    &subject,
+                    &body_text,
+                    &reply_ical,
+                )?;
 
-            let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-            jmap_conn.send_email(&jmap_config, &raw_message).await?;
-        } else {
-            log::info!("respond_to_invite: sending reply via SMTP");
-            let raw_message = build_calendar_reply_message(
-                &account.email,
-                organizer_email,
-                &subject,
-                &body_text,
-                &reply_ical,
-            )?;
+                let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                jmap_conn.send_email(&jmap_config, &raw_message).await?;
+            }
+            InviteReplyTransport::GraphRsvp => {
+                // O365/Graph accounts have no SMTP host configured. The reply
+                // email to the organizer is sent by Microsoft itself via the
+                // Graph API RSVP call (`sendResponse: true`) in Step 3b below.
+                log::info!(
+                    "respond_to_invite: O365 account — reply delivered via Graph API RSVP (Step 3b)"
+                );
+            }
+            InviteReplyTransport::Smtp => {
+                log::info!("respond_to_invite: sending reply via SMTP");
+                let raw_message = build_calendar_reply_message(
+                    &account.email,
+                    organizer_email,
+                    &subject,
+                    &body_text,
+                    &reply_ical,
+                )?;
 
-            // For O365: refresh SMTP-scoped OAuth token
-            let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+                // For O365: refresh SMTP-scoped OAuth token
+                let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
 
-            send_raw_smtp(
-                &account.smtp_host,
-                account.smtp_port,
-                &account.username,
-                &smtp_password,
-                account.use_tls,
-                use_xoauth2,
-                &account.email,
-                organizer_email,
-                &raw_message,
-            )
-            .await?;
+                send_raw_smtp(
+                    &account.smtp_host,
+                    account.smtp_port,
+                    &account.username,
+                    &smtp_password,
+                    account.use_tls,
+                    use_xoauth2,
+                    &account.email,
+                    organizer_email,
+                    &raw_message,
+                )
+                .await?;
+            }
         }
     } else {
         log::info!("respond_to_invite: no organizer email, skipping send");
     }
+
+    // Step 3b: For O365/Graph accounts, deliver the RSVP to the organizer
+    // *before* the local DB write below. The Graph RSVP (`sendResponse:
+    // true`) is the only delivery path for these accounts, and Graph locates
+    // the event by UID itself (no organizer address needed). Doing it here
+    // keeps the operation atomic: a delivery failure returns an error
+    // without having marked the invite answered locally — Step 4 (and the
+    // remote_id store in Step 6) only run once delivery has succeeded.
+    let graph_event_id: Option<String> = if account.calendar_protocol_str() == "graph" {
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        let event_id = client
+            .find_event_by_ical_uid(&invite_uid)
+            .await?
+            .ok_or_else(|| {
+                crate::error::Error::Other(
+                    "This invitation isn't on your Outlook calendar yet. \
+                     Sync the calendar and try again."
+                        .into(),
+                )
+            })?;
+        client.rsvp_event(&event_id, &response, "").await?;
+        log::info!(
+            "respond_to_invite: updated O365 Calendar response to {}",
+            response
+        );
+        Some(event_id)
+    } else {
+        None
+    };
 
     // Step 4: Create/update event in local calendar
     let my_status = response.to_lowercase();
@@ -2323,10 +2387,20 @@ pub async fn respond_to_invite(
         cal_id
     };
 
+    // Reflect the user's own RSVP in the attendee list. The invite email
+    // carries the original "needs-action" PARTSTAT for every attendee, so
+    // without this patch the event popup shows "needs-action" next to the
+    // user's own name even though they just responded.
     let attendees_json = if invite.attendees.is_empty() {
         None
     } else {
-        Some(serde_json::to_string(&invite.attendees).unwrap_or_else(|_| "[]".to_string()))
+        let mut attendees = invite.attendees.clone();
+        for att in attendees.iter_mut() {
+            if att.email.eq_ignore_ascii_case(&account.email) {
+                att.status = my_status.clone();
+            }
+        }
+        Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
     };
 
     // Check if we already have this event
@@ -2373,9 +2447,13 @@ pub async fn respond_to_invite(
         );
     }
 
+    // The DB write lock covers only the local update above. Release it before
+    // any network I/O below, so calendar reads aren't blocked and so the
+    // Google/Graph steps can re-acquire the writer without deadlocking.
+    drop(conn);
+
     // Step 5: Update Google Calendar if this is a Gmail account with OAuth
     if account.calendar_protocol_str() == "google" {
-        drop(conn); // Release DB lock before async
         if let Ok(token) = get_google_token(&account_id).await {
             let google_status = match response.to_lowercase().as_str() {
                 "accepted" => "accepted",
@@ -2502,41 +2580,17 @@ pub async fn respond_to_invite(
         }
     }
 
-    // Step 6: Update O365 calendar via Graph API RSVP
-    if account.calendar_protocol_str() == "graph" {
-        match crate::mail::graph::get_graph_token(&account_id).await {
-            Ok(token) => {
-                let client = crate::mail::graph::GraphClient::new(&token);
-                match client.find_event_by_ical_uid(&invite_uid).await {
-                    Ok(Some(graph_event_id)) => {
-                        match client.rsvp_event(&graph_event_id, &response, "").await {
-                            Ok(()) => {
-                                log::info!(
-                                    "respond_to_invite: updated O365 Calendar response to {}",
-                                    response
-                                );
-                                // Store remote_id so process_invite_reply can find the event later
-                                let conn = state.db.writer().await;
-                                conn.execute(
-                                    "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3",
-                                    rusqlite::params![graph_event_id, invite_uid, account_id],
-                                ).ok();
-                            }
-                            Err(e) => {
-                                log::warn!("respond_to_invite: O365 Graph RSVP failed: {}", e)
-                            }
-                        }
-                    }
-                    Ok(None) => log::debug!(
-                        "respond_to_invite: event not found on O365 Calendar by iCalUId"
-                    ),
-                    Err(e) => {
-                        log::warn!("respond_to_invite: O365 Graph event lookup failed: {}", e)
-                    }
-                }
-            }
-            Err(e) => log::warn!("respond_to_invite: failed to get O365 token: {}", e),
-        }
+    // Step 6: Persist the Graph event id. The RSVP itself was already
+    // delivered in Step 3b; this only records remote_id on the now-existing
+    // local row so process_invite_reply can locate the event later. It is
+    // best-effort (`.ok()`) — a failure here doesn't lose the RSVP.
+    if let Some(graph_event_id) = graph_event_id {
+        let conn = state.db.writer().await;
+        conn.execute(
+            "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3",
+            rusqlite::params![graph_event_id, invite_uid, account_id],
+        )
+        .ok();
     }
 
     // Notify frontend that calendar data changed so the UI refreshes
@@ -3492,7 +3546,8 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                     conn.execute(
                         "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                          all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                         description = ?8, timezone = ?9, calendar_id = ?10 WHERE id = ?11",
+                         description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11
+                         WHERE id = ?12",
                         rusqlite::params![
                             ge.subject,
                             ge.start,
@@ -3503,6 +3558,7 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                             ge.attendees_json,
                             ge.body_preview,
                             ge.timezone,
+                            ge.my_status,
                             local_cal_id,
                             local_id,
                         ],
@@ -3525,7 +3581,7 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                         recurrence_rule: None,
                         organizer_email: ge.organizer_email.clone(),
                         attendees_json: ge.attendees_json.clone(),
-                        my_status: None,
+                        my_status: ge.my_status.clone(),
                         source_message_id: None,
                         ical_data: None,
                         remote_id: Some(ge.id.clone()),
@@ -3587,4 +3643,35 @@ pub fn list_timezones() -> Vec<String> {
 #[tauri::command]
 pub fn get_default_timezone() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: replying to a meeting invite on an O365/Graph account must
+    // NOT route through SMTP. Graph accounts have no SMTP host configured
+    // (empty string), so SMTP delivery fails. Microsoft delivers the reply
+    // itself via the Graph RSVP call.
+    #[test]
+    fn graph_invite_reply_does_not_use_smtp() {
+        assert_eq!(
+            invite_reply_transport("graph"),
+            InviteReplyTransport::GraphRsvp
+        );
+    }
+
+    #[test]
+    fn jmap_invite_reply_uses_jmap() {
+        assert_eq!(invite_reply_transport("jmap"), InviteReplyTransport::Jmap);
+    }
+
+    #[test]
+    fn imap_and_gmail_invite_reply_use_smtp() {
+        // IMAP/CalDAV and Gmail accounts send the iTIP REPLY over SMTP.
+        assert_eq!(invite_reply_transport("caldav"), InviteReplyTransport::Smtp);
+        assert_eq!(invite_reply_transport("google"), InviteReplyTransport::Smtp);
+        // An account with no calendar binding still falls back to SMTP.
+        assert_eq!(invite_reply_transport(""), InviteReplyTransport::Smtp);
+    }
 }

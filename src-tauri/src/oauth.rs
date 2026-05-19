@@ -1145,6 +1145,30 @@ fn store_tokens_keyring(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
     Ok(())
 }
 
+/// Read tokens from the keyring exactly once.
+///
+/// Distinguishes three outcomes so the caller can react correctly:
+/// - `Ok(Some(_))` — tokens found.
+/// - `Ok(None)` — keyring reachable, but no entry exists (`NoEntry`). The
+///   account genuinely has no stored tokens; the user must sign in.
+/// - `Err(Error::Keyring(_))` — the keyring could not be reached (e.g. the
+///   Secret Service DBus connection dropped). This is *not* the same as
+///   "no tokens" and must never be reported as such.
+#[cfg(not(target_os = "android"))]
+fn load_tokens_keyring_once(account_id: &str) -> Result<Option<OAuthTokens>> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
+        .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
+    match entry.get_password() {
+        Ok(json) => {
+            let tokens: OAuthTokens = serde_json::from_str(&json)
+                .map_err(|e| Error::Other(format!("Token deserialize failed: {}", e)))?;
+            Ok(Some(tokens))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(Error::Keyring(format!("keyring read failed: {}", e))),
+    }
+}
+
 pub fn load_tokens(account_id: &str) -> Result<Option<OAuthTokens>> {
     #[cfg(target_os = "android")]
     {
@@ -1152,19 +1176,29 @@ pub fn load_tokens(account_id: &str) -> Result<Option<OAuthTokens>> {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
-            .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
-        match entry.get_password() {
-            Ok(json) => {
-                let tokens: OAuthTokens = serde_json::from_str(&json)
-                    .map_err(|e| Error::Other(format!("Token deserialize failed: {}", e)))?;
-                Ok(Some(tokens))
+        // The Secret Service DBus connection can drop transiently
+        // ("Remote peer disconnected") — e.g. when the gnome-keyring daemon
+        // or session bus restarts. Retry once with a fresh connection before
+        // surfacing the failure. Crucially, a keyring error is propagated as
+        // an error (not Ok(None)): treating it as "no tokens" would wrongly
+        // tell the user to sign in again when their tokens are still stored.
+        match load_tokens_keyring_once(account_id) {
+            Err(Error::Keyring(first)) => {
+                log::warn!(
+                    "OAuth2: keyring read failed for {} ({}); retrying once",
+                    account_id,
+                    first,
+                );
+                load_tokens_keyring_once(account_id).map_err(|e| {
+                    log::error!(
+                        "OAuth2: keyring read retry failed for {}: {}",
+                        account_id,
+                        e
+                    );
+                    e
+                })
             }
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => {
-                log::warn!("OAuth2: keyring read failed for {}: {}", account_id, e);
-                Ok(None)
-            }
+            other => other,
         }
     }
 }
