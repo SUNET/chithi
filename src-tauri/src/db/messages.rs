@@ -926,7 +926,11 @@ fn get_threaded_messages_inner(
             MAX(has_attachments) AS has_attach,
             MAX(flags) AS latest_flags,
             MAX(snippet) AS latest_snippet,
-            GROUP_CONCAT(id, '||' ORDER BY date ASC) AS all_ids
+            GROUP_CONCAT(
+                id,
+                '||'
+                ORDER BY date ASC, COALESCE(uid, 9223372036854775807) ASC, id ASC
+            ) AS all_ids
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2{filter}
          GROUP BY tid
@@ -991,7 +995,8 @@ fn get_threaded_messages_inner(
 /// Only returns messages from the given folder — Gmail stores the same email
 /// in multiple folders (INBOX, All Mail, Sent Mail, Important) as "labels",
 /// so without folder filtering a thread would show duplicates.
-/// Messages are sorted by date ASC to show the conversation chronologically.
+/// Messages are sorted chronologically with deterministic tie-breakers so the
+/// expanded-thread rows and thread summary agree on the root message.
 pub fn get_thread_messages(
     conn: &Connection,
     account_id: &str,
@@ -1012,7 +1017,7 @@ pub fn get_thread_messages(
          FROM messages
          WHERE account_id = ?1 AND folder_path = ?2
            AND (thread_id = ?3 OR (thread_id IS NULL AND id = ?3))
-         ORDER BY date ASC",
+         ORDER BY date ASC, COALESCE(uid, 9223372036854775807) ASC, id ASC",
     )?;
 
     let messages = stmt
@@ -1226,6 +1231,58 @@ mod tests {
                 "middle".to_string(),
                 "newest".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn threaded_message_ids_use_deterministic_tiebreakers_for_equal_dates() {
+        let conn = setup_db();
+        let insert = |id: &str, uid: Option<i64>| {
+            conn.execute(
+                "INSERT INTO messages
+                 (id, account_id, folder_path, uid, message_id, thread_id, date, from_email, maildir_path)
+                 VALUES (?1, 'acc1', 'INBOX', ?2, ?1, '<root@t>', '2026-05-01T00:00:00Z', 'x@y', '')",
+                params![id, uid],
+            )
+            .unwrap();
+        };
+        // Insertion order is deliberately different from the expected
+        // deterministic order.
+        insert("uid-30", Some(30));
+        insert("uid-10", Some(10));
+        insert("uid-20", Some(20));
+        insert("null-b", None);
+        insert("null-a", None);
+
+        let page = get_threaded_messages_inner(
+            &conn,
+            "acc1",
+            "INBOX",
+            0,
+            50,
+            "date",
+            false,
+            &QuickFilter::default(),
+            false,
+        )
+        .unwrap();
+        let thread_messages = get_thread_messages(&conn, "acc1", "INBOX", "<root@t>").unwrap();
+        let expected = vec![
+            "uid-10".to_string(),
+            "uid-20".to_string(),
+            "uid-30".to_string(),
+            "null-a".to_string(),
+            "null-b".to_string(),
+        ];
+
+        assert_eq!(page.threads.len(), 1);
+        assert_eq!(page.threads[0].message_ids, expected);
+        assert_eq!(
+            thread_messages
+                .into_iter()
+                .map(|msg| msg.id)
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 

@@ -585,8 +585,8 @@ export const useMessagesStore = defineStore("messages", () => {
           // ThreadRow header (message_ids[0]). Only the replies are rendered
           // as separate rows, so skip the root to avoid a duplicate entry.
           const children = threadMessages.value[thread.thread_id] ?? [];
-          for (const msg of children.slice(1)) {
-            ids.push(msg.id);
+          for (let i = 1; i < children.length; i += 1) {
+            ids.push(children[i].id);
           }
         }
       }
