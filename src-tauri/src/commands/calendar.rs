@@ -3,7 +3,7 @@ use tauri::State;
 
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::db;
-use crate::db::calendar::{Attendee, Calendar, CalendarEvent, NewCalendar};
+use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
 use crate::meet;
 use crate::state::AppState;
@@ -472,6 +472,23 @@ pub async fn get_events(
         db::calendar::list_events(&conn, &account_id, calendar_id.as_deref(), &start, &end)?;
     log::debug!("get_events: found {} events", events.len());
     Ok(events)
+}
+
+/// List all calendar invites for an account — events where the account is
+/// an attendee but not the organizer. Backs the dedicated Invites view.
+/// The recent-past window is fixed at 7 days; recurring invites always pass.
+#[tauri::command]
+pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Result<Vec<Invite>> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let conn = state.db.reader();
+    let account = db::accounts::get_account_full(&conn, &account_id)?;
+    let invites = db::calendar::list_invites(&conn, &account_id, &account.email, &since)?;
+    log::debug!(
+        "list_invites: account={} found {} invites",
+        account_id,
+        invites.len()
+    );
+    Ok(invites)
 }
 
 #[tauri::command]
@@ -2253,6 +2270,37 @@ pub async fn respond_to_invite(
             ))
         })?;
 
+    apply_invite_response(
+        &app,
+        &state,
+        account_id,
+        account,
+        invite,
+        invite_uid,
+        response,
+        Some(message_id),
+    )
+    .await
+}
+
+/// Deliver an iTIP REPLY for `invite` and persist the RSVP locally.
+///
+/// Shared by `respond_to_invite` (invite parsed from an email) and
+/// `respond_to_event` (invite rebuilt from a stored calendar row). The
+/// per-provider routing — JMAP / Graph RSVP / SMTP plus the Google
+/// Calendar API path — is identical for both callers. `source_message_id`
+/// is recorded only when a brand-new local event row has to be created.
+#[allow(clippy::too_many_arguments)]
+async fn apply_invite_response(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    account_id: String,
+    account: db::accounts::AccountFull,
+    invite: &ParsedInvite,
+    invite_uid: String,
+    response: String,
+    source_message_id: Option<String>,
+) -> Result<()> {
     // Step 2: Generate the iTIP REPLY
     let reply_ical = ical::generate_reply(invite, &account.email, &response);
 
@@ -2434,7 +2482,7 @@ pub async fn respond_to_invite(
             organizer_email: invite.organizer_email.clone(),
             attendees_json,
             my_status: Some(my_status),
-            source_message_id: Some(message_id.clone()),
+            source_message_id: source_message_id.clone(),
             ical_data: Some(invite.ical_raw.clone()),
             remote_id: None,
             etag: None,
@@ -2598,6 +2646,93 @@ pub async fn respond_to_invite(
     app.emit("calendar-changed", account_id.as_str()).ok();
 
     Ok(())
+}
+
+/// Rebuild a `ParsedInvite` from a stored calendar event so an iTIP REPLY
+/// can be generated without the original invite email. Prefers the stored
+/// iCalendar payload (most faithful — keeps SEQUENCE, exact organizer and
+/// attendee encoding); falls back to synthesizing one from the row columns.
+fn event_to_parsed_invite(event: &CalendarEvent, uid: &str) -> ParsedInvite {
+    if let Some(ical) = event.ical_data.as_deref() {
+        if !ical.trim().is_empty() {
+            if let Some(parsed) = ical::parse_ical_data(ical)
+                .into_iter()
+                .find(|inv| inv.uid == uid)
+            {
+                return parsed;
+            }
+        }
+    }
+
+    let attendees: Vec<Attendee> = event
+        .attendees_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+
+    ParsedInvite {
+        method: "REQUEST".to_string(),
+        uid: uid.to_string(),
+        summary: Some(event.title.clone()),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        dtstart: event.start_time.clone(),
+        dtend: event.end_time.clone(),
+        all_day: event.all_day,
+        timezone: event.timezone.clone(),
+        organizer_email: event.organizer_email.clone(),
+        organizer_name: None,
+        attendees,
+        recurrence_rule: event.recurrence_rule.clone(),
+        sequence: 0,
+        ical_raw: event.ical_data.clone().unwrap_or_default(),
+    }
+}
+
+/// Respond to a calendar invite from a stored event row — backs the
+/// dedicated Invites view. Unlike `respond_to_invite`, no original invite
+/// email is needed: the iTIP REPLY is rebuilt from the persisted event.
+/// RSVP delivery and local persistence are shared via `apply_invite_response`.
+#[tauri::command]
+pub async fn respond_to_event(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+    response: String,
+) -> Result<()> {
+    log::info!(
+        "respond_to_event: account={} event={} response={}",
+        account_id,
+        event_id,
+        response
+    );
+
+    let (event, account) = {
+        let conn = state.db.reader();
+        let event = db::calendar::get_event(&conn, &event_id)?;
+        let account = db::accounts::get_account_full(&conn, &account_id)?;
+        (event, account)
+    };
+
+    let uid = event.uid.clone().ok_or_else(|| {
+        crate::error::Error::Other("Event has no UID; cannot send an RSVP".to_string())
+    })?;
+
+    let invite = event_to_parsed_invite(&event, &uid);
+    let source_message_id = event.source_message_id.clone();
+
+    apply_invite_response(
+        &app,
+        &state,
+        account_id,
+        account,
+        &invite,
+        uid,
+        response,
+        source_message_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

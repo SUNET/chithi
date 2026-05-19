@@ -231,6 +231,13 @@ onMounted(async () => {
   await accountsStore.fetchAccounts();
   if (accountsStore.activeAccountId) {
     await foldersStore.fetchFolders();
+    // Explicitly load the initial folder's messages. The messages store
+    // watch only fires when account/folder *change*; on a cold start the
+    // store may be created after those values are already set, so the
+    // watch would never fire and the inbox would render empty.
+    if (foldersStore.activeFolderPath) {
+      await messagesStore.fetchMessages();
+    }
   }
 
   initNotifications();

@@ -74,6 +74,16 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-prefer-html-body", String(prefer));
   }
 
+  // Whether the sidebar shows a count badge of unanswered invites.
+  // Defaults to on; persisted so the choice survives restarts.
+  const showInviteBadge = ref(
+    localStorage.getItem("chithi-show-invite-badge") !== "false",
+  );
+  function setShowInviteBadge(enabled: boolean) {
+    showInviteBadge.value = enabled;
+    localStorage.setItem("chithi-show-invite-badge", String(enabled));
+  }
+
   // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
   const VALID_WEEK_STARTS = [0, 1, 6];
   const weekStartDay = ref<number>(
@@ -321,5 +331,7 @@ export const useUiStore = defineStore("ui", () => {
     closeLinkPopup,
     preferHtmlBody,
     setPreferHtmlBody,
+    showInviteBadge,
+    setShowInviteBadge,
   };
 });

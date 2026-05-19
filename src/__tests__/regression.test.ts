@@ -288,3 +288,50 @@ describe("Regression: Load images button visibility (#34)", () => {
     expect(messagesStore.activeMessage.has_remote_images).toBe(true);
   });
 });
+
+describe("Regression: concurrent fetchAccounts is de-duplicated", () => {
+  // Bug: on startup the router guard, App.vue and MailView all called
+  // fetchAccounts() concurrently. The guard skipped its own fetch when
+  // another was already loading, then saw accounts.length === 0 and
+  // redirected to onboarding — even though 3 accounts were configured.
+  it("shares one in-flight listAccounts call across concurrent callers", async () => {
+    setActivePinia(createPinia());
+    vi.mocked(api.listAccounts).mockClear();
+
+    let resolveList: (v: unknown) => void = () => {};
+    const pending = new Promise((r) => {
+      resolveList = r;
+    });
+    vi.mocked(api.listAccounts).mockReturnValueOnce(pending as Promise<never>);
+
+    const accounts = useAccountsStore();
+    // Simulate App.vue and the router guard both starting a fetch.
+    const p1 = accounts.fetchAccounts();
+    const p2 = accounts.fetchAccounts();
+
+    // Only one backend call despite two callers.
+    expect(api.listAccounts).toHaveBeenCalledTimes(1);
+
+    resolveList([
+      {
+        id: "acc1", display_name: "A", email: "a@x.com",
+        provider: "generic", mail_protocol: "imap", enabled: true,
+        username: "", mail_sync_interval_seconds: null,
+        calendar_sync_interval_seconds: null,
+        contacts_sync_interval_seconds: null,
+        has_calendar_binding: false, has_contacts_binding: false,
+        meet_protocol: "",
+      },
+    ]);
+    await Promise.all([p1, p2]);
+
+    // Both callers observe the loaded accounts — the guard would now NOT
+    // redirect to onboarding.
+    expect(accounts.accounts).toHaveLength(1);
+    expect(accounts.loading).toBe(false);
+
+    // Once settled, a later call starts a fresh fetch.
+    await accounts.fetchAccounts();
+    expect(api.listAccounts).toHaveBeenCalledTimes(2);
+  });
+});

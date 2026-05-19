@@ -415,6 +415,26 @@ export async function respondToInvite(
   return invoke("respond_to_invite", { accountId, messageId, inviteUid, response });
 }
 
+/** List all calendar invites for an account (Invites view). */
+export async function listInvites(
+  accountId: string,
+): Promise<import("./types").Invite[]> {
+  return invoke("list_invites", { accountId });
+}
+
+/**
+ * Change the RSVP for a stored calendar event. Unlike `respondToInvite`,
+ * this needs no original invite email — the iTIP REPLY is rebuilt from the
+ * persisted event. `response` is "accepted", "tentative", or "declined".
+ */
+export async function respondToEvent(
+  accountId: string,
+  eventId: string,
+  response: string,
+): Promise<void> {
+  return invoke("respond_to_event", { accountId, eventId, response });
+}
+
 // Filter rules
 export async function listFilters(
   accountId?: string,

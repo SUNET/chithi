@@ -81,6 +81,17 @@ describe("PreferencesView", () => {
     expect(ui.decorationsEnabled).toBe(true);
   });
 
+  it("Show Invites Badge toggle drives uiStore.setShowInviteBadge", async () => {
+    const wrapper = mount(PreferencesView, { global: { plugins: [makeRouter()] } });
+    const ui = useUiStore();
+    expect(ui.showInviteBadge).toBe(true);
+    await wrapper.find('[data-testid="prefs-show-invite-badge"]').setValue(false);
+    expect(ui.showInviteBadge).toBe(false);
+    expect(localStorage.getItem("chithi-show-invite-badge")).toBe("false");
+    await wrapper.find('[data-testid="prefs-show-invite-badge"]').setValue(true);
+    expect(ui.showInviteBadge).toBe(true);
+  });
+
   it("Date and Time section drives week start, time format, and timezone", async () => {
     const wrapper = mount(PreferencesView, { global: { plugins: [makeRouter()] } });
     const ui = useUiStore();

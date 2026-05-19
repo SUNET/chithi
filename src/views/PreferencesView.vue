@@ -166,6 +166,18 @@ function scrollHighlightedIntoView() {
               />
             </div>
           </div>
+          <div class="prefs-row">
+            <label class="prefs-label" for="prefs-show-invite-badge">Show invites badge</label>
+            <div class="prefs-toggle">
+              <input
+                id="prefs-show-invite-badge"
+                type="checkbox"
+                :checked="uiStore.showInviteBadge"
+                data-testid="prefs-show-invite-badge"
+                @change="(e) => uiStore.setShowInviteBadge((e.target as HTMLInputElement).checked)"
+              />
+            </div>
+          </div>
         </section>
 
         <!-- Date and Time -->

@@ -19,16 +19,28 @@ export const useAccountsStore = defineStore("accounts", () => {
     accounts.value.filter((a) => a.mail_protocol !== ""),
   );
 
-  async function fetchAccounts() {
+  // On startup `fetchAccounts()` is called concurrently from the router
+  // guard, App.vue and MailView. Without de-duplication the guard could
+  // observe `accounts.length === 0` while another call is still in flight
+  // and wrongly redirect to onboarding. Sharing one in-flight promise
+  // makes every caller await the same result.
+  let inFlight: Promise<void> | null = null;
+
+  async function fetchAccounts(): Promise<void> {
+    if (inFlight) return inFlight;
     loading.value = true;
-    try {
-      accounts.value = await api.listAccounts();
-      if (accounts.value.length > 0 && !activeAccountId.value) {
-        activeAccountId.value = accounts.value[0].id;
+    inFlight = (async () => {
+      try {
+        accounts.value = await api.listAccounts();
+        if (accounts.value.length > 0 && !activeAccountId.value) {
+          activeAccountId.value = accounts.value[0].id;
+        }
+      } finally {
+        loading.value = false;
+        inFlight = null;
       }
-    } finally {
-      loading.value = false;
-    }
+    })();
+    return inFlight;
   }
 
   async function addAccount(config: AccountConfig): Promise<string> {
