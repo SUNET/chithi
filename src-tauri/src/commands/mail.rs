@@ -37,6 +37,18 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Split a folder path of the form `parentId/name` into its parent ID and
+/// leaf name. For JMAP the parent component is a mailbox ID; for Graph it is a
+/// mail folder ID. An empty or missing parent component means a top-level
+/// folder, returned as `None`.
+fn split_folder_path(folder_path: &str) -> (Option<&str>, &str) {
+    match folder_path.rsplit_once('/') {
+        Some((parent, name)) if !parent.is_empty() => (Some(parent), name),
+        Some((_, name)) => (None, name),
+        None => (None, folder_path),
+    }
+}
+
 #[tauri::command]
 pub async fn list_folders(
     state: State<'_, AppState>,
@@ -658,24 +670,32 @@ pub async fn create_folder(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol_str() == "jmap" {
+    if account.mail_protocol_str() == "graph" {
+        // Microsoft Graph: POST /me/mailFolders (or .../childFolders).
+        // folder_path is "parentFolderId/name" (built by the frontend); the
+        // parent component is the parent's Graph folder ID.
+        let (parent_id, folder_name) = split_folder_path(&folder_path);
+        let token = crate::mail::graph::get_graph_token(&account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client
+            .create_mail_folder(folder_name, parent_id)
+            .await
+            .map_err(|e| {
+                log::error!(
+                    "Failed to create Graph folder '{}' for account {}: {}",
+                    folder_path,
+                    account_id,
+                    e
+                );
+                e
+            })?;
+    } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set create
         let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
         // Split to get the parent mailbox ID and the new folder name.
-        let (parent_id, mailbox_name) = if let Some((parent, name)) = folder_path.rsplit_once('/') {
-            (
-                if parent.is_empty() {
-                    None
-                } else {
-                    Some(parent)
-                },
-                name,
-            )
-        } else {
-            (None, folder_path.as_str())
-        };
+        let (parent_id, mailbox_name) = split_folder_path(&folder_path);
         conn_jmap
             .create_mailbox(&jmap_config, mailbox_name, parent_id)
             .await?;
@@ -1032,4 +1052,43 @@ pub async fn save_attachment(
 
     log::info!("Attachment saved to {}", dest_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_folder_path;
+
+    // A bare name with no slash is a top-level folder.
+    #[test]
+    fn split_folder_path_top_level() {
+        assert_eq!(split_folder_path("Projects"), (None, "Projects"));
+    }
+
+    // "parentId/name" yields the parent ID and the leaf name. The parent is a
+    // server-side ID (JMAP mailbox ID / Graph folder ID), so it must not be
+    // confused with the leaf — a regression here once routed Graph/JMAP folder
+    // creation down the IMAP path.
+    #[test]
+    fn split_folder_path_nested() {
+        assert_eq!(
+            split_folder_path("AAMkAGI2parentid/Reports"),
+            (Some("AAMkAGI2parentid"), "Reports")
+        );
+    }
+
+    // A leading slash means an empty parent component — treat as top-level.
+    #[test]
+    fn split_folder_path_empty_parent() {
+        assert_eq!(split_folder_path("/Reports"), (None, "Reports"));
+    }
+
+    // Only the last slash separates parent from leaf; earlier slashes (e.g. in
+    // a Graph base64 ID) stay with the parent component.
+    #[test]
+    fn split_folder_path_splits_on_last_slash() {
+        assert_eq!(
+            split_folder_path("grand/parent/Child"),
+            (Some("grand/parent"), "Child")
+        );
+    }
 }

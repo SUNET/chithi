@@ -665,6 +665,31 @@ impl GraphClient {
         self.delete(&format!("/me/mailFolders/{}", folder_id)).await
     }
 
+    /// Create a mail folder. When `parent_id` is `Some`, creates a child folder
+    /// under that parent; otherwise creates a top-level folder. Returns the new
+    /// folder's Graph ID.
+    pub async fn create_mail_folder(&self, name: &str, parent_id: Option<&str>) -> Result<String> {
+        log::info!(
+            "Graph creating mail folder: {} (parent={:?})",
+            name,
+            parent_id
+        );
+        let body = serde_json::json!({ "displayName": name });
+        let path = match parent_id {
+            Some(pid) => format!("/me/mailFolders/{}/childFolders", pid),
+            None => "/me/mailFolders".to_string(),
+        };
+        let resp = self.post_json(&path, &body).await?;
+        let id = resp["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Err(Error::Other(
+                "Graph mailFolders create returned no id".into(),
+            ));
+        }
+        log::info!("Graph mail folder created: id={}", id);
+        Ok(id)
+    }
+
     /// Update message properties (isRead, flag, etc).
     pub async fn update_message(
         &self,
