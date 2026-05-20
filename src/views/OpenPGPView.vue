@@ -29,6 +29,47 @@ const importError = ref<string | null>(null);
 const wkdError = ref<string | null>(null);
 const lastSyncSummary = ref<string | null>(null);
 
+// Resizable left pane. Persist the chosen width across sessions so the
+// user doesn't have to re-tune it on every launch.
+const MIN_LEFT_WIDTH = 240;
+const MAX_LEFT_WIDTH = 720;
+const leftPaneWidth = ref(
+  (() => {
+    const stored = Number(localStorage.getItem("chithi-pgp-left-pane-width"));
+    if (Number.isFinite(stored) && stored >= MIN_LEFT_WIDTH && stored <= MAX_LEFT_WIDTH) {
+      return stored;
+    }
+    return 320;
+  })(),
+);
+const resizeStartX = ref(0);
+const resizeStartWidth = ref(0);
+
+function startResize(event: MouseEvent) {
+  resizeStartX.value = event.clientX;
+  resizeStartWidth.value = leftPaneWidth.value;
+  document.addEventListener("mousemove", onResize);
+  document.addEventListener("mouseup", stopResize);
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+}
+
+function onResize(event: MouseEvent) {
+  const delta = event.clientX - resizeStartX.value;
+  leftPaneWidth.value = Math.max(
+    MIN_LEFT_WIDTH,
+    Math.min(MAX_LEFT_WIDTH, resizeStartWidth.value + delta),
+  );
+}
+
+function stopResize() {
+  document.removeEventListener("mousemove", onResize);
+  document.removeEventListener("mouseup", stopResize);
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  localStorage.setItem("chithi-pgp-left-pane-width", String(leftPaneWidth.value));
+}
+
 onMounted(async () => {
   await pgpStore.ensureListener();
   // Keys + cards in parallel — the card list is best-effort.
@@ -37,6 +78,12 @@ onMounted(async () => {
 
 onUnmounted(() => {
   pgpStore.disposeListener();
+  // Defensive: if the view unmounts mid-drag, drop the global listeners
+  // and reset the cursor/selection styles we set on document.body.
+  document.removeEventListener("mousemove", onResize);
+  document.removeEventListener("mouseup", stopResize);
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
 });
 
 function selectKey(fp: string) {
@@ -223,7 +270,7 @@ const keystoreEmptyHint = computed(() =>
 <template>
   <div class="openpgp-view">
     <!-- Left pane: search + key list + cards section -->
-    <aside class="left-pane">
+    <aside class="left-pane" :style="{ width: leftPaneWidth + 'px' }">
       <div class="toolbar">
         <input
           v-model="searchQuery"
@@ -296,6 +343,15 @@ const keystoreEmptyHint = computed(() =>
         </ul>
       </section>
     </aside>
+
+    <div
+      class="resize-handle"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize key list"
+      @mousedown="startResize"
+      data-testid="pgp-resize-handle"
+    ></div>
 
     <!-- Right pane: key or card detail -->
     <main class="right-pane">
@@ -554,12 +610,23 @@ const keystoreEmptyHint = computed(() =>
 }
 
 .left-pane {
-  width: 320px;
   flex-shrink: 0;
   border-right: 0.8px solid var(--color-border);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.resize-handle:hover {
+  background: var(--color-accent);
 }
 
 .toolbar {
