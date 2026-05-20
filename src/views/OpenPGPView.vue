@@ -307,7 +307,7 @@ const keystoreEmptyHint = computed(() =>
             <span class="primary">{{ primaryDisplay(key) }}</span>
             <span class="badges">
               <span v-if="key.isSecret" class="badge badge-secret" title="Secret key present">S</span>
-              <span v-if="key.cardIdents.length" class="badge badge-card" :title="`On card: ${key.cardIdents.join(', ')}`">C</span>
+              <span v-if="key.cardIdents.length" class="badge badge-card" :title="`On card: ${key.cardIdents.join(', ')}`">card</span>
               <span v-if="key.isRevoked" class="badge badge-revoked" title="Revoked">R</span>
             </span>
           </div>
