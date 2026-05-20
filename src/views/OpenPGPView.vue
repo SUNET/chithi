@@ -78,11 +78,10 @@ function formatRetryCounter(n: number): string {
   return n === 0 ? "0 (locked)" : String(n);
 }
 
-function shortFingerprint(fp: string): string {
-  // 40-char SHA-1 / 64-char SHA-256 fingerprint — show last 16 hex digits
-  // grouped 4-by-4, as gpg / sequoia conventionally do.
-  const tail = fp.slice(-16).toUpperCase();
-  return tail.replace(/(.{4})/g, "$1 ").trim();
+function formatFingerprint(fp: string): string {
+  // Full 40-char SHA-1 (v4) / 64-char SHA-256 (v6) fingerprint, grouped
+  // 4-by-4 as gpg / sequoia conventionally display them.
+  return fp.toUpperCase().replace(/(.{4})/g, "$1 ").trim();
 }
 
 function formatDate(iso: string | null): string {
@@ -95,7 +94,7 @@ function formatDate(iso: string | null): string {
 }
 
 function primaryDisplay(key: { primaryUid: string | null; fingerprint: string }) {
-  return key.primaryUid?.trim() || `(no UID) ${shortFingerprint(key.fingerprint)}`;
+  return key.primaryUid?.trim() || `(no UID) ${formatFingerprint(key.fingerprint)}`;
 }
 
 // "Secret key" status is more nuanced than the libtumpa `isSecret` flag
@@ -265,7 +264,7 @@ const keystoreEmptyHint = computed(() =>
               <span v-if="key.isRevoked" class="badge badge-revoked" title="Revoked">R</span>
             </span>
           </div>
-          <div class="fp">{{ shortFingerprint(key.fingerprint) }}</div>
+          <div class="fp">{{ formatFingerprint(key.fingerprint) }}</div>
         </li>
       </ul>
       <div v-else class="empty">
@@ -349,7 +348,7 @@ const keystoreEmptyHint = computed(() =>
                   <td>Signature</td>
                   <td>
                     <code v-if="cardDetails.signatureFingerprint">
-                      {{ shortFingerprint(cardDetails.signatureFingerprint) }}
+                      {{ formatFingerprint(cardDetails.signatureFingerprint) }}
                     </code>
                     <span v-else class="muted">empty</span>
                   </td>
@@ -358,7 +357,7 @@ const keystoreEmptyHint = computed(() =>
                   <td>Encryption</td>
                   <td>
                     <code v-if="cardDetails.encryptionFingerprint">
-                      {{ shortFingerprint(cardDetails.encryptionFingerprint) }}
+                      {{ formatFingerprint(cardDetails.encryptionFingerprint) }}
                     </code>
                     <span v-else class="muted">empty</span>
                   </td>
@@ -367,7 +366,7 @@ const keystoreEmptyHint = computed(() =>
                   <td>Authentication</td>
                   <td>
                     <code v-if="cardDetails.authenticationFingerprint">
-                      {{ shortFingerprint(cardDetails.authenticationFingerprint) }}
+                      {{ formatFingerprint(cardDetails.authenticationFingerprint) }}
                     </code>
                     <span v-else class="muted">empty</span>
                   </td>
@@ -437,7 +436,7 @@ const keystoreEmptyHint = computed(() =>
             </thead>
             <tbody>
               <tr v-for="sk in selectedKey.subkeys" :key="sk.fingerprint">
-                <td><code>{{ shortFingerprint(sk.fingerprint) }}</code></td>
+                <td><code>{{ formatFingerprint(sk.fingerprint) }}</code></td>
                 <td>{{ sk.keyType }}</td>
                 <td>{{ sk.algorithm ?? "—" }}</td>
                 <td>{{ sk.bitLength ?? "—" }}</td>
@@ -707,6 +706,7 @@ const keystoreEmptyHint = computed(() =>
   font-size: 11px;
   color: var(--color-text-muted);
   margin-top: 2px;
+  word-break: break-all;
 }
 
 .empty {
