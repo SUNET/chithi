@@ -28,28 +28,21 @@ pub(crate) fn try_acquire_sync_guard(
     account_id: &str,
     operation: &str,
 ) -> Option<SyncGuard> {
-    {
-        let map = flags.lock().unwrap();
-        if let Some(flag) = map.get(account_id) {
-            if flag.load(Ordering::Relaxed) {
-                log::debug!(
-                    "{} already in progress for account {}, skipping",
-                    operation,
-                    account_id
-                );
-                return None;
-            }
-        }
-    }
-
     let flag = {
         let mut map = flags.lock().unwrap();
-        let flag = map
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
-        flag.store(true, Ordering::Relaxed);
-        flag.clone()
+        map.entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     };
+
+    if flag.swap(true, Ordering::AcqRel) {
+        log::debug!(
+            "{} already in progress for account {}, skipping",
+            operation,
+            account_id
+        );
+        return None;
+    }
 
     Some(SyncGuard(flag))
 }
