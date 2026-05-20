@@ -27,13 +27,24 @@ function emit(name: string, payload: unknown) {
 }
 
 describe("activity store — sync indicator data flow", () => {
+  // Tests in this block trigger completeOperation/failOperation, which
+  // schedule real 60s/5min setTimeout removals. Without disposing the
+  // store, those handles can keep the test process alive in happy-dom.
+  let store: ReturnType<typeof useActivityStore> | undefined;
+
   beforeEach(() => {
     setActivePinia(createPinia());
     handlers.clear();
+    store = undefined;
+  });
+
+  afterEach(() => {
+    // onScopeDispose clears any pending removal timers.
+    store?.$dispose();
   });
 
   it("mail sync drives hasActiveOperations true while running", async () => {
-    const store = useActivityStore();
+    store = useActivityStore();
     await store.initEventListeners();
 
     emit("sync-started", { account_id: "a1", account_name: "Acc" });
@@ -47,7 +58,7 @@ describe("activity store — sync indicator data flow", () => {
     // Regression: calendar sync previously did not register a running
     // operation, so the StatusBar Sync button never spun during calendar
     // sync even though the sync was happening.
-    const store = useActivityStore();
+    store = useActivityStore();
     await store.initEventListeners();
 
     emit("calendar-sync-started", "a1");
@@ -58,7 +69,7 @@ describe("activity store — sync indicator data flow", () => {
   });
 
   it("calendar sync error fails the operation", async () => {
-    const store = useActivityStore();
+    store = useActivityStore();
     await store.initEventListeners();
 
     emit("calendar-sync-started", "a1");
@@ -74,7 +85,7 @@ describe("activity store — sync indicator data flow", () => {
   });
 
   it("calendar sync op id is scoped per account", async () => {
-    const store = useActivityStore();
+    store = useActivityStore();
     await store.initEventListeners();
 
     emit("calendar-sync-started", "acc-42");
@@ -94,7 +105,7 @@ describe("activity store — sync indicator data flow", () => {
     // Regression: invite responses and push processing also emit
     // 'calendar-changed'. Coupling that event to the sync spinner would
     // stop the indicator while the backend sync was still running.
-    const store = useActivityStore();
+    store = useActivityStore();
     await store.initEventListeners();
 
     emit("calendar-sync-started", "a1");

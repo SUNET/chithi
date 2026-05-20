@@ -1321,21 +1321,21 @@ pub async fn sync_calendars(
     }
     .await;
 
-    // Spinner-state events are kept separate from "calendar-changed" so
-    // unrelated subscribers (invite tracking, calendar list refresh) don't
-    // refetch on every sync tick, and so the spinner doesn't get prematurely
-    // completed by an invite-response or push-processing emission of
-    // "calendar-changed".
+    // "calendar-changed" is emitted in BOTH branches because the lower-level
+    // sync helpers can mutate the DB before an error propagates (e.g.
+    // sync_calendars_caldav upserts calendars, then a later query errors).
+    // Subscribers (invites store, calendar list) would otherwise hold stale
+    // data after a partial-write failure. Spinner state is carried by the
+    // dedicated "calendar-sync-complete"/"calendar-sync-error" events so
+    // "calendar-changed" no longer conflates "sync finished" with "data
+    // changed" — and so an invite-response or push-processing emission of
+    // "calendar-changed" can't prematurely complete the spinner.
+    app.emit("calendar-changed", account_id.as_str()).ok();
     match &sync_result {
         Ok(()) => {
-            // Sync succeeded — the DB may have changed; let refetchers run.
-            app.emit("calendar-changed", account_id.as_str()).ok();
             app.emit("calendar-sync-complete", account_id.as_str()).ok();
         }
         Err(e) => {
-            // Sync failed — do NOT emit "calendar-changed" (it would trigger
-            // unnecessary refetches by the invites and calendar stores).
-            // Only signal failure to the activity indicator.
             app.emit(
                 "calendar-sync-error",
                 serde_json::json!({
