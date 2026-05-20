@@ -45,6 +45,7 @@ export const useAccountsStore = defineStore("accounts", () => {
 
   async function addAccount(config: AccountConfig): Promise<string> {
     const id = await api.addAccount(config);
+    localStorage.removeItem("chithi-onboarding-skipped");
     await fetchAccounts();
     activeAccountId.value = id;
     // Auto-trigger sync for the new account (fire and forget)

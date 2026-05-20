@@ -51,10 +51,12 @@ function pickProvider(p: Provider) {
   // Hand off to the main Settings flow — the full provider wizards live
   // there. This keeps onboarding the first-run router and the settings
   // view the canonical "add account" surface.
+  localStorage.setItem("chithi-onboarding-skipped", "true");
   router.push({ path: "/settings", query: { addAccount: p.id } });
 }
 
 function skipForNow() {
+  localStorage.setItem("chithi-onboarding-skipped", "true");
   router.push("/");
 }
 </script>
@@ -75,6 +77,7 @@ function skipForNow() {
       <li v-for="p in providers" :key="p.id">
         <button
           class="provider-card"
+          :data-testid="`onboarding-provider-${p.id}`"
           :style="{ borderLeftColor: p.color }"
           @click="pickProvider(p)"
         >
@@ -103,7 +106,7 @@ function skipForNow() {
       </li>
     </ul>
 
-    <button class="skip-link" @click="skipForNow">
+    <button class="skip-link" @click="skipForNow" data-testid="onboarding-skip">
       Skip and add an account later
     </button>
   </div>
