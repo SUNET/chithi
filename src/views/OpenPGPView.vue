@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from "vue";
 import { storeToRefs } from "pinia";
 import * as api from "@/lib/tauri";
 import { usePgpStore } from "@/stores/pgp";
+import type { PgpCardDetails } from "@/lib/types";
 
 const pgpStore = usePgpStore();
 const {
@@ -39,7 +40,42 @@ onUnmounted(() => {
 });
 
 function selectKey(fp: string) {
+  // Keys and cards share the right pane — selecting one clears the
+  // other so the user always sees a single detail view that matches
+  // the highlighted row on the left.
+  selectedCardIdent.value = null;
+  cardDetails.value = null;
+  cardDetailsError.value = null;
   pgpStore.selectKey(fp);
+}
+
+// Card selection lives in the view (not the store) because it's
+// purely a UI focus state — the underlying card data is already
+// in `cards` from `pgpStore.fetchCards()`, and the per-card detail
+// is fetched on demand because each call hits the card reader.
+const selectedCardIdent = ref<string | null>(null);
+const cardDetails = ref<PgpCardDetails | null>(null);
+const cardDetailsLoading = ref(false);
+const cardDetailsError = ref<string | null>(null);
+
+async function selectCard(ident: string) {
+  pgpStore.selectKey(null);
+  selectedCardIdent.value = ident;
+  cardDetails.value = null;
+  cardDetailsError.value = null;
+  cardDetailsLoading.value = true;
+  try {
+    cardDetails.value = await api.pgpCardDetails(ident);
+  } catch (e) {
+    cardDetailsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    cardDetailsLoading.value = false;
+  }
+}
+
+function formatRetryCounter(n: number): string {
+  // libtumpa surfaces 0 when the card is locked-out on that PIN.
+  return n === 0 ? "0 (locked)" : String(n);
 }
 
 function shortFingerprint(fp: string): string {
@@ -239,7 +275,19 @@ const keystoreEmptyHint = computed(() =>
       <section class="cards-section" v-if="!loadingCards">
         <h3>Smartcards <span class="muted" v-if="cards.length === 0">(none connected)</span></h3>
         <ul v-if="cards.length" class="card-list" data-testid="pgp-card-list">
-          <li v-for="c in cards" :key="c.ident" class="card-item">
+          <li
+            v-for="c in cards"
+            :key="c.ident"
+            class="card-item"
+            :class="{ active: c.ident === selectedCardIdent }"
+            :data-testid="`pgp-card-${c.ident}`"
+            role="button"
+            tabindex="0"
+            :aria-selected="c.ident === selectedCardIdent"
+            @click="selectCard(c.ident)"
+            @keydown.enter.prevent="selectCard(c.ident)"
+            @keydown.space.prevent="selectCard(c.ident)"
+          >
             <div class="card-name">{{ c.manufacturerName }} <span class="muted">#{{ c.serialNumber }}</span></div>
             <div class="card-meta">
               <span v-if="c.cardholderName">{{ c.cardholderName }}</span>
@@ -250,10 +298,102 @@ const keystoreEmptyHint = computed(() =>
       </section>
     </aside>
 
-    <!-- Right pane: key detail -->
+    <!-- Right pane: key or card detail -->
     <main class="right-pane">
-      <div v-if="!selectedKey" class="placeholder">
-        Select a key on the left to see its details.
+      <!-- Card detail takes precedence when a card is selected. -->
+      <div v-if="selectedCardIdent" class="detail" data-testid="pgp-card-detail">
+        <header class="detail-header">
+          <h2>
+            {{ cardDetails?.manufacturerName ?? "Smartcard" }}
+            <span v-if="cardDetails?.serialNumber" class="muted">
+              #{{ cardDetails.serialNumber }}
+            </span>
+          </h2>
+          <code class="fp-full">{{ selectedCardIdent }}</code>
+        </header>
+
+        <p v-if="cardDetailsLoading" class="hint">Reading card…</p>
+        <p v-if="cardDetailsError" class="error">{{ cardDetailsError }}</p>
+
+        <template v-if="cardDetails && !cardDetailsError">
+          <section>
+            <h3>Card</h3>
+            <dl class="meta">
+              <dt>Cardholder</dt>
+              <dd>{{ cardDetails.cardholderName ?? "—" }}</dd>
+              <dt>Manufacturer</dt>
+              <dd>{{ cardDetails.manufacturerName ?? "—" }}</dd>
+              <dt>Serial</dt>
+              <dd><code>{{ cardDetails.serialNumber }}</code></dd>
+              <dt>Public key URL</dt>
+              <dd>
+                <a
+                  v-if="cardDetails.publicKeyUrl"
+                  :href="cardDetails.publicKeyUrl"
+                  target="_blank"
+                  rel="noopener"
+                >{{ cardDetails.publicKeyUrl }}</a>
+                <span v-else>—</span>
+              </dd>
+            </dl>
+          </section>
+
+          <section>
+            <h3>On-card key slots</h3>
+            <table class="subkey-table">
+              <thead>
+                <tr><th>Slot</th><th>Fingerprint</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Signature</td>
+                  <td>
+                    <code v-if="cardDetails.signatureFingerprint">
+                      {{ shortFingerprint(cardDetails.signatureFingerprint) }}
+                    </code>
+                    <span v-else class="muted">empty</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Encryption</td>
+                  <td>
+                    <code v-if="cardDetails.encryptionFingerprint">
+                      {{ shortFingerprint(cardDetails.encryptionFingerprint) }}
+                    </code>
+                    <span v-else class="muted">empty</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Authentication</td>
+                  <td>
+                    <code v-if="cardDetails.authenticationFingerprint">
+                      {{ shortFingerprint(cardDetails.authenticationFingerprint) }}
+                    </code>
+                    <span v-else class="muted">empty</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section>
+            <h3>Counters</h3>
+            <dl class="meta">
+              <dt>Signatures made</dt>
+              <dd>{{ cardDetails.signatureCounter }}</dd>
+              <dt>User PIN retries left</dt>
+              <dd>{{ formatRetryCounter(cardDetails.pinRetryCounter) }}</dd>
+              <dt>Reset code retries left</dt>
+              <dd>{{ formatRetryCounter(cardDetails.resetCodeRetryCounter) }}</dd>
+              <dt>Admin PIN retries left</dt>
+              <dd>{{ formatRetryCounter(cardDetails.adminPinRetryCounter) }}</dd>
+            </dl>
+          </section>
+        </template>
+      </div>
+
+      <div v-else-if="!selectedKey" class="placeholder">
+        Select a key or smartcard on the left to see its details.
       </div>
       <div v-else class="detail" data-testid="pgp-key-detail">
         <header class="detail-header">
@@ -599,8 +739,24 @@ const keystoreEmptyHint = computed(() =>
 }
 
 .card-item {
-  padding: 6px 0;
+  padding: 6px 8px;
+  margin: 0 -8px;
   font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.card-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.card-item.active {
+  background: var(--color-bg-selected, var(--color-bg-hover));
+}
+
+.card-item:focus-visible {
+  outline: 2px solid var(--color-accent, currentColor);
+  outline-offset: -2px;
 }
 
 .card-name {
