@@ -1284,9 +1284,8 @@ pub async fn sync_calendars(
     }
 
     // Tell the frontend a calendar sync has started so the activity panel
-    // and the StatusBar Sync button show the spinning indicator — the same
-    // contract as the mail "sync-started" event. Completed by the
-    // "calendar-changed" event emitted below.
+    // and the StatusBar Sync button show the spinning indicator — same
+    // contract as the mail "sync-started" event.
     use tauri::Emitter;
     app.emit("calendar-sync-started", account_id.as_str()).ok();
 
@@ -1322,10 +1321,31 @@ pub async fn sync_calendars(
     }
     .await;
 
-    // Notify the frontend that calendar data has changed. Emitted on success
-    // *and* failure so the activity indicator started above always completes
-    // and the spinner never gets stuck.
-    app.emit("calendar-changed", account_id.as_str()).ok();
+    // Spinner-state events are kept separate from "calendar-changed" so
+    // unrelated subscribers (invite tracking, calendar list refresh) don't
+    // refetch on every sync tick, and so the spinner doesn't get prematurely
+    // completed by an invite-response or push-processing emission of
+    // "calendar-changed".
+    match &sync_result {
+        Ok(()) => {
+            // Sync succeeded — the DB may have changed; let refetchers run.
+            app.emit("calendar-changed", account_id.as_str()).ok();
+            app.emit("calendar-sync-complete", account_id.as_str()).ok();
+        }
+        Err(e) => {
+            // Sync failed — do NOT emit "calendar-changed" (it would trigger
+            // unnecessary refetches by the invites and calendar stores).
+            // Only signal failure to the activity indicator.
+            app.emit(
+                "calendar-sync-error",
+                serde_json::json!({
+                    "account_id": account_id.as_str(),
+                    "error": e.to_string(),
+                }),
+            )
+            .ok();
+        }
+    }
 
     sync_result?;
 
