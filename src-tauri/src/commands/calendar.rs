@@ -1283,37 +1283,51 @@ pub async fn sync_calendars(
         );
     }
 
-    if account.calendar_protocol_str() == "jmap" {
-        sync_calendars_jmap(&state, &account_id, &account).await?;
-    } else if account.calendar_protocol_str() == "google" {
-        // Gmail: use Google CalDAV with OAuth2 bearer token
-        match sync_calendars_google(&state, &account_id, &account).await {
-            Ok(()) => {}
-            Err(e) => {
-                log::warn!(
-                    "sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}",
-                    e
-                );
-                // Fall back to configured CalDAV URL if available
-                if !account.caldav_url.is_empty() {
-                    sync_calendars_caldav(&state, &account_id, &account).await?;
+    // Tell the frontend a calendar sync has started so the activity panel
+    // and the StatusBar Sync button show the spinning indicator — the same
+    // contract as the mail "sync-started" event. Completed by the
+    // "calendar-changed" event emitted below.
+    use tauri::Emitter;
+    app.emit("calendar-sync-started", account_id.as_str()).ok();
+
+    let sync_result: Result<()> = async {
+        if account.calendar_protocol_str() == "jmap" {
+            sync_calendars_jmap(&state, &account_id, &account).await?;
+        } else if account.calendar_protocol_str() == "google" {
+            // Gmail: use Google CalDAV with OAuth2 bearer token
+            match sync_calendars_google(&state, &account_id, &account).await {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!(
+                        "sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}",
+                        e
+                    );
+                    // Fall back to configured CalDAV URL if available
+                    if !account.caldav_url.is_empty() {
+                        sync_calendars_caldav(&state, &account_id, &account).await?;
+                    }
                 }
             }
+        } else if account.calendar_protocol_str() == "graph" {
+            sync_calendars_graph(&state, &account_id).await?;
+        } else if !account.caldav_url.is_empty() {
+            sync_calendars_caldav(&state, &account_id, &account).await?;
+        } else {
+            log::debug!(
+                "sync_calendars: skipping account {} (no JMAP or CalDAV configured)",
+                account_id
+            );
         }
-    } else if account.calendar_protocol_str() == "graph" {
-        sync_calendars_graph(&state, &account_id).await?;
-    } else if !account.caldav_url.is_empty() {
-        sync_calendars_caldav(&state, &account_id, &account).await?;
-    } else {
-        log::debug!(
-            "sync_calendars: skipping account {} (no JMAP or CalDAV configured)",
-            account_id
-        );
+        Ok(())
     }
+    .await;
 
-    // Notify frontend that calendar data has changed
-    use tauri::Emitter;
+    // Notify the frontend that calendar data has changed. Emitted on success
+    // *and* failure so the activity indicator started above always completes
+    // and the spinner never gets stuck.
     app.emit("calendar-changed", account_id.as_str()).ok();
+
+    sync_result?;
 
     log::info!("sync_calendars: completed for account {}", account_id);
     Ok(())

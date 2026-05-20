@@ -148,6 +148,19 @@ export const useActivityStore = defineStore("activity", () => {
     );
 
     // --- Calendar sync events ---
+    // `calendar-sync-started` registers the running operation so the
+    // StatusBar Sync button spins during calendar sync, mirroring the mail
+    // `sync-started`/`sync-complete` pair. `calendar-changed` completes it.
+    unlistenFns.push(
+      await listen<string>("calendar-sync-started", (event) => {
+        startOperation(
+          `cal-sync-${event.payload}`,
+          "sync",
+          "Syncing calendars",
+          "Syncing...",
+        );
+      }),
+    );
     unlistenFns.push(
       await listen<string>("calendar-changed", (event) => {
         completeOperation(
