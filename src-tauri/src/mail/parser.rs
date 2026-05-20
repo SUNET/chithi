@@ -200,6 +200,7 @@ pub fn parse_message_body(
         _ => None,
     };
 
+    let pgp_kind = crate::mail::pgp_mime::detect_kind(raw);
     Some(MessageBody {
         id: message_id.to_string(),
         subject,
@@ -215,6 +216,7 @@ pub fn parse_message_body(
         is_signed,
         list_id,
         has_remote_images,
+        pgp_kind,
     })
 }
 

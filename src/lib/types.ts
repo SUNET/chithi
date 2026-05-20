@@ -111,6 +111,8 @@ export interface MessageSummary {
   in_reply_to: string | null;
 }
 
+export type PgpKind = "mimeEncrypted" | "mimeSigned" | "inlineArmor";
+
 export interface MessageBody {
   id: string;
   subject: string | null;
@@ -126,6 +128,26 @@ export interface MessageBody {
   is_signed: boolean;
   list_id: string | null;
   has_remote_images: boolean;
+  /** Detected PGP shape — absent for plain mail. Drives the reader UI's
+   *  Decrypt button / signature badge. */
+  pgp_kind?: PgpKind;
+}
+
+export type PgpVerifyOutcome =
+  | { kind: "unsigned" }
+  | {
+      kind: "good";
+      signerUid: string | null;
+      signerFingerprint: string;
+      verifierFingerprint: string;
+    }
+  | { kind: "bad"; signerUid: string | null; signerFingerprint: string }
+  | { kind: "unknownKey"; keyId: string }
+  | { kind: "error"; message: string };
+
+export interface PgpDecryptedMessage {
+  plaintextBody: MessageBody;
+  verifyOutcome: PgpVerifyOutcome;
 }
 
 export interface Attachment {
@@ -376,6 +398,15 @@ export interface ComposeMessage {
   /** chithi's internal id of the message being replied to. Drives
    *  In-Reply-To / References on the outgoing email. Omit for new mails. */
   reply_to_message_id?: string | null;
+  /** OpenPGP toggles. Default false. */
+  pgp_sign?: boolean;
+  pgp_encrypt?: boolean;
+}
+
+export interface PgpRecipientStatus {
+  email: string;
+  hasKey: boolean;
+  fingerprint: string | null;
 }
 
 export interface ComposeAttachment {
@@ -451,4 +482,70 @@ export interface OutboxRow {
   to: string[];
   cc: string[];
   bcc: string[];
+}
+
+// --- OpenPGP ---
+
+export interface PgpUserId {
+  uid: string;
+  email: string | null;
+}
+
+export interface PgpSubkey {
+  fingerprint: string;
+  keyId: string;
+  /** "signing" | "encryption" | "authentication" | "certification" | "unknown" */
+  keyType: string;
+  algorithm: string | null;
+  bitLength: number | null;
+}
+
+export interface PgpKeySummary {
+  fingerprint: string;
+  isSecret: boolean;
+  primaryUid: string | null;
+  userIds: PgpUserId[];
+  subkeys: PgpSubkey[];
+  /** ISO-8601 UTC timestamp or null */
+  creationTime: string | null;
+  expirationTime: string | null;
+  isRevoked: boolean;
+  revocationTime: string | null;
+  /** Card idents this key is linked to (may repeat per slot). */
+  cardIdents: string[];
+}
+
+export interface PgpCardSummary {
+  ident: string;
+  manufacturerName: string;
+  serialNumber: string;
+  cardholderName: string | null;
+}
+
+export interface PgpCardDetails {
+  ident: string;
+  serialNumber: string;
+  cardholderName: string | null;
+  manufacturerName: string | null;
+  publicKeyUrl: string | null;
+  signatureFingerprint: string | null;
+  encryptionFingerprint: string | null;
+  authenticationFingerprint: string | null;
+  signatureCounter: number;
+  pinRetryCounter: number;
+  resetCodeRetryCounter: number;
+  adminPinRetryCounter: number;
+}
+
+export interface PgpCardDetection {
+  keyFingerprint: string;
+  cardIdent: string;
+  /** "signature" | "encryption" | "authentication" */
+  slot: string;
+  slotFingerprint: string;
+}
+
+export interface PgpImportResult {
+  fingerprint: string;
+  isSecret: boolean;
 }

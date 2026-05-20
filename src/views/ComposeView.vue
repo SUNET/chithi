@@ -1,14 +1,33 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { storeToRefs } from "pinia";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
+import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
-import type { Account, ComposeAttachment } from "@/lib/types";
+import type { Account, ComposeAttachment, PgpRecipientStatus } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import Select from "@/components/common/Select.vue";
 import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
+import PassphraseDialog from "@/components/pgp/PassphraseDialog.vue";
+import PinDialog from "@/components/pgp/PinDialog.vue";
+
+// Compose is a separate window; subscribe to the same PGP prompt event
+// so the unlock dialog appears here (where the user clicked Send) rather
+// than only in the main window.
+const pgpPrompts = usePgpPromptsStore();
+const { currentPrompt } = storeToRefs(pgpPrompts);
+
+// PGP toggles.
+const pgpSign = ref(false);
+const pgpEncrypt = ref(false);
+// Per-recipient key availability for the encrypt flow.
+const recipientStatuses = ref<PgpRecipientStatus[]>([]);
+const missingRecipientCount = computed(
+  () => recipientStatuses.value.filter((s) => !s.hasKey).length,
+);
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
@@ -24,6 +43,7 @@ const accounts = ref<Account[]>([]);
 const initialAccountId = (route.query.accountId as string) || "";
 
 onMounted(async () => {
+  await pgpPrompts.start();
   // Try store first (works if opened in same window context)
   if (accountsStore.accounts.length > 0) {
     accounts.value = accountsStore.accounts;
@@ -376,6 +396,37 @@ onMounted(() => {
   });
 });
 
+// When Encrypt is on (or when recipients change while it's on), look up
+// each recipient's public key so the UI can show red/green pips and
+// block sending if any are missing.
+async function refreshRecipientStatuses() {
+  if (!pgpEncrypt.value) {
+    recipientStatuses.value = [];
+    return;
+  }
+  const all = [
+    ...parseAddresses(to.value),
+    ...parseAddresses(cc.value),
+    ...parseAddresses(bcc.value),
+  ].filter((s) => s.trim().length > 0);
+  if (all.length === 0) {
+    recipientStatuses.value = [];
+    return;
+  }
+  try {
+    recipientStatuses.value = await api.pgpCheckRecipients(all);
+  } catch (e) {
+    console.error("PGP recipient check failed:", e);
+  }
+}
+
+watch(
+  () => [pgpEncrypt.value, to.value, cc.value, bcc.value],
+  () => {
+    refreshRecipientStatuses();
+  },
+);
+
 async function saveDraft(): Promise<boolean> {
   const accountId = selectedAccountId.value;
   if (!accountId) return false;
@@ -502,6 +553,8 @@ async function send() {
       body_html: null,
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
+      pgp_sign: pgpSign.value,
+      pgp_encrypt: pgpEncrypt.value,
     });
     if (replyToMessageId) {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
@@ -540,11 +593,34 @@ async function send() {
         </svg>
         {{ sending ? "Sending..." : "Send" }}
       </button>
-      <button class="toolbar-btn">
+      <button
+        class="toolbar-btn"
+        :class="{ active: pgpSign }"
+        data-testid="compose-pgp-sign"
+        title="Sign with OpenPGP"
+        @click="pgpSign = !pgpSign"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+        Sign
+      </button>
+      <button
+        class="toolbar-btn"
+        :class="{ active: pgpEncrypt, warn: pgpEncrypt && missingRecipientCount > 0 }"
+        data-testid="compose-pgp-encrypt"
+        title="Encrypt with OpenPGP"
+        @click="pgpEncrypt = !pgpEncrypt"
+      >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
         </svg>
         Encrypt
+        <span
+          v-if="pgpEncrypt && missingRecipientCount > 0"
+          class="pgp-missing-badge"
+          :title="`Missing keys: ${recipientStatuses.filter(s => !s.hasKey).map(s => s.email).join(', ')}`"
+        >{{ missingRecipientCount }}</span>
       </button>
       <button class="toolbar-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -721,6 +797,19 @@ async function send() {
       </div>
     </div>
   </div>
+
+  <!-- Local PGP secret prompts — mounted inside the compose window so
+       the unlock dialog appears where the user clicked Send. The
+       prompt store is global, so this dialog and the main window's
+       dialog share the same queue. -->
+  <PassphraseDialog
+    v-if="currentPrompt && currentPrompt.kind === 'passphrase'"
+    :prompt="currentPrompt"
+  />
+  <PinDialog
+    v-if="currentPrompt && currentPrompt.kind === 'pin'"
+    :prompt="currentPrompt"
+  />
 </template>
 
 <style scoped>
@@ -776,6 +865,29 @@ async function send() {
 .toolbar-btn.compose-send.disabled,
 .toolbar-btn.compose-send:disabled {
   opacity: 0.55;
+}
+
+/* PGP sign/encrypt toggle states. */
+.toolbar-btn.active {
+  background: var(--color-accent);
+  color: #fff;
+}
+.toolbar-btn.active.warn {
+  background: var(--color-danger, #fb2c36);
+}
+.pgp-missing-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--color-danger, #fb2c36);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .toolbar-spacer {

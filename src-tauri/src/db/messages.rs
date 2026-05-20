@@ -83,6 +83,11 @@ pub struct MessageBody {
     pub is_signed: bool,
     pub list_id: Option<String>,
     pub has_remote_images: bool,
+    /// Detected PGP shape (None for plain mail). Drives the reader's
+    /// Decrypt button / signature badge. Set by the parser via
+    /// `mail::pgp_mime::detect_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgp_kind: Option<crate::mail::pgp_mime::PgpKind>,
 }
 
 pub struct NewMessage {

@@ -12,4 +12,5 @@ pub mod mail;
 pub mod meet;
 pub mod oauth;
 pub mod outbox;
+pub mod pgp;
 pub mod sync_cmd;

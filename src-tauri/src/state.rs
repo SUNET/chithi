@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 use crate::db;
@@ -62,6 +62,31 @@ pub struct AppState {
     /// (Zoom is a public OAuth client and uses PKCE rather than
     /// a client_secret). (#148)
     pub zoom_oauth_sessions: std::sync::Mutex<HashMap<u16, ZoomOAuthSession>>,
+    /// Shared OpenPGP keystore (~/.tumpa/keys.db by default, overridable
+    /// with $TUMPA_DIR / $TUMPA_KEYSTORE). Lazily opened on first use so a
+    /// broken or missing keystore directory doesn't block app startup.
+    /// Mutex-wrapped because `libtumpa::KeyStore` holds a `rusqlite::
+    /// Connection`, which is `Send + !Sync`.
+    pgp_store: OnceLock<Arc<std::sync::Mutex<libtumpa::KeyStore>>>,
+    /// In-memory passphrase / card-PIN cache. Values are `Zeroizing<String>`
+    /// and zero on drop. Periodically swept by `pgp::start_cache_sweeper`.
+    pub pgp_cache: Arc<std::sync::Mutex<libtumpa::cache::CredentialCache>>,
+    /// Pending secret-prompt one-shots, keyed by the request id emitted to
+    /// the frontend on the `pgp-secret-needed` event.
+    pub pgp_pending_secrets: Arc<std::sync::Mutex<HashMap<String, PendingSecret>>>,
+}
+
+/// A `pgp-secret-needed` request waiting for the frontend to call
+/// `pgp_provide_secret` (or `pgp_cancel_secret`). The held value is a
+/// `Zeroizing<String>` so any user-supplied secret zeroes on drop even if
+/// the consumer panics before consuming it.
+pub struct PendingSecret {
+    pub tx: tokio::sync::oneshot::Sender<Option<zeroize::Zeroizing<String>>>,
+    /// The secret target this prompt was raised for — a key fingerprint
+    /// (for passphrases) or a card ident (for PINs). Used by
+    /// `pgp_provide_secret` to populate the credential cache when the
+    /// "remember" checkbox is set.
+    pub target: String,
 }
 
 /// One in-flight Matrix SSO login. Lives in
@@ -118,7 +143,29 @@ impl AppState {
             attachments: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
             zoom_oauth_sessions: std::sync::Mutex::new(HashMap::new()),
+            pgp_store: OnceLock::new(),
+            pgp_cache: Arc::new(std::sync::Mutex::new(
+                libtumpa::cache::CredentialCache::new(),
+            )),
+            pgp_pending_secrets: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Return the shared OpenPGP keystore, opening it on first call. The
+    /// keystore lives at `~/.tumpa/keys.db` by default — same database that
+    /// tumpa-cli and the tumpa desktop app read and write.
+    pub fn pgp_store(
+        &self,
+    ) -> std::result::Result<Arc<std::sync::Mutex<libtumpa::KeyStore>>, libtumpa::Error> {
+        if let Some(store) = self.pgp_store.get() {
+            return Ok(store.clone());
+        }
+        let store = Arc::new(std::sync::Mutex::new(libtumpa::store::open_keystore(None)?));
+        // OnceLock::set takes ownership; ignore the Err(_) branch — it only
+        // fires when another caller raced us and already installed a store,
+        // in which case `get()` below returns the winner.
+        let _ = self.pgp_store.set(store);
+        Ok(self.pgp_store.get().expect("just initialised").clone())
     }
 
     /// Get or create an operation queue sender for the given account.

@@ -35,6 +35,11 @@ const router = createRouter({
       component: () => import("@/views/ContactsView.vue"),
     },
     {
+      path: "/openpgp",
+      name: "openpgp",
+      component: () => import("@/views/OpenPGPView.vue"),
+    },
+    {
       path: "/reader",
       name: "reader",
       component: () => import("@/views/ReaderView.vue"),

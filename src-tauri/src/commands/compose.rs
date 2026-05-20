@@ -24,6 +24,11 @@ pub struct ComposeMessage {
     /// message. None for new conversations.
     #[serde(default)]
     pub reply_to_message_id: Option<String>,
+    /// OpenPGP sign / encrypt toggles. Both default to off (plain mail).
+    #[serde(default)]
+    pub pgp_sign: bool,
+    #[serde(default)]
+    pub pgp_encrypt: bool,
 }
 
 /// An attachment referenced by the renderer. `token` is the opaque handle
@@ -50,6 +55,7 @@ pub struct FileAttachment {
 #[tauri::command]
 pub async fn send_message(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, AppState>,
     account_id: String,
     message: ComposeMessage,
@@ -88,10 +94,7 @@ pub async fn send_message(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
-    // `raw_message` carries the inlined attachment bytes — wrap in `Arc`
-    // so the background spawn can share the buffer with the IMAP APPEND
-    // path without deep-cloning megabytes of MIME each send.
-    let raw_message: std::sync::Arc<[u8]> = smtp::build_raw_message(
+    let plain_raw = smtp::build_raw_message(
         &account.email,
         &message.to,
         &message.cc,
@@ -104,6 +107,28 @@ pub async fn send_message(
         &references,
     )?
     .into();
+
+    // PGP wrap (RFC 3156) if the compose toggles asked for it. Sign or
+    // encrypt — or both, in which case we sign-then-encrypt in a single
+    // OpenPGP message and wrap in multipart/encrypted (RFC 3156 §6.1).
+    let raw_message = if message.pgp_sign || message.pgp_encrypt {
+        let origin = window.label().to_string();
+        apply_pgp_envelope(
+            &app,
+            &state,
+            &account,
+            &plain_raw,
+            &message.to,
+            &message.cc,
+            &message.bcc,
+            message.pgp_sign,
+            message.pgp_encrypt,
+            Some(&origin),
+        )
+        .await?
+    } else {
+        plain_raw
+    };
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
     let smtp_creds =
@@ -220,7 +245,12 @@ pub async fn send_message(
                     account.smtp_port,
                     account.email
                 );
-                smtp::send_message(
+                // Send the already-built `raw_message` bytes verbatim.
+                // PGP/MIME wrapping (when pgp_sign/pgp_encrypt is set) is
+                // applied to those bytes upstream; rebuilding the message
+                // from structured fields here would discard the wrapping
+                // and leak the cleartext on the wire.
+                smtp::send_raw(
                     &account.smtp_host,
                     account.smtp_port,
                     &smtp_username,
@@ -231,12 +261,7 @@ pub async fn send_message(
                     &message.to,
                     &message.cc,
                     &message.bcc,
-                    &message.subject,
-                    &message.body_text,
-                    message.body_html.as_deref(),
-                    &attachment_data,
-                    in_reply_to.as_deref(),
-                    &references,
+                    &raw_message,
                 )
                 .await?;
 
@@ -650,4 +675,400 @@ fn build_attachment_data(
         });
     }
     Ok(result)
+}
+
+/// Wrap the plain `raw_message` bytes in a PGP/MIME envelope. Resolves
+/// the signer key from `account.email`, prompts for the passphrase via
+/// the global pgp-secret-needed event (caching in
+/// `state.pgp_cache`), and produces a multipart/signed and/or
+/// multipart/encrypted message per RFC 3156. When both toggles are set
+/// we do sign-then-encrypt (signature lives inside the ciphertext) and
+/// wrap in multipart/encrypted, which is what every modern MUA
+/// recognises and what Thunderbird/GPG round-trip cleanly.
+async fn apply_pgp_envelope(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    account: &crate::db::accounts::AccountFull,
+    raw_message: &[u8],
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    sign: bool,
+    encrypt: bool,
+    origin_window: Option<&str>,
+) -> Result<Vec<u8>> {
+    use crate::commands::pgp::{acquire_secret, SecretKind};
+    use crate::mail::pgp_mime::canonicalize_for_signing;
+    use crate::mail::smtp::{inner_part_of, wrap_pgp_mime_encrypted, wrap_pgp_mime_signed};
+
+    if !sign && !encrypt {
+        return Err(Error::Other(
+            "apply_pgp_envelope called with no flags set".into(),
+        ));
+    }
+
+    let store = state
+        .pgp_store()
+        .map_err(|e| Error::Other(format!("openpgp keystore: {e}")))?;
+
+    // Resolve signer key by From email. `signer_data` is the keystore's
+    // stored representation — for software signers it includes the
+    // secret packets; for card-resident signers it's public-only and
+    // the secret material lives on the card (gated by the PIN).
+    let (signer_data, signer_info) = {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        libtumpa::store::resolve_signer(&guard, &account.email).map_err(|e| {
+            Error::Other(format!("openpgp: signer lookup for {}: {e}", account.email))
+        })?
+    };
+
+    // Decide signer backend. Mirrors what libtumpa's own sign/encrypt
+    // paths do: `find_signing_card` reports the card whose signing slot
+    // holds the signer key (if any). When that returns Some we MUST go
+    // through the card path; passing `signer_data` (public-only) into
+    // the software API would parse as an empty secret-key set, which is
+    // exactly the "unknown packet header" / "expected SecretKey, got
+    // PublicKey" failure we see today.
+    let card_match = if sign {
+        let signer_pub = signer_data.clone();
+        tokio::task::spawn_blocking(move || {
+            libtumpa::encrypt::find_signing_card_for_encrypt(&signer_pub)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("pgp card lookup task join failed: {e}")))?
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
+    let reason = if encrypt && sign {
+        "Sign and encrypt outgoing message"
+    } else if encrypt {
+        "Encrypt outgoing message"
+    } else {
+        "Sign outgoing message"
+    };
+
+    enum SignerSecret {
+        Passphrase(libtumpa::Passphrase),
+        CardPin { pin: libtumpa::Pin, ident: String },
+        None,
+    }
+
+    // Track which cache key the active secret lives under (card ident for
+    // PIN, fingerprint for passphrase). If signing/encryption fails the
+    // secret is wrong, so we evict it and the next retry re-prompts. With
+    // the always-cache policy this is the only path that drops a stale
+    // entry mid-session — without it, a single mistyped PIN would loop
+    // forever.
+    let mut cache_target: Option<String> = None;
+    let signer_secret: SignerSecret = if !sign {
+        SignerSecret::None
+    } else if let Some(ref m) = card_match {
+        let pin_str = acquire_secret(
+            app,
+            state.pgp_pending_secrets.clone(),
+            state.pgp_cache.clone(),
+            SecretKind::Pin,
+            &m.card.ident,
+            reason,
+            origin_window,
+        )
+        .await?;
+        cache_target = Some(m.card.ident.clone());
+        SignerSecret::CardPin {
+            pin: libtumpa::Pin::new(pin_str.as_bytes().to_vec()),
+            ident: m.card.ident.clone(),
+        }
+    } else {
+        let pass_str = acquire_secret(
+            app,
+            state.pgp_pending_secrets.clone(),
+            state.pgp_cache.clone(),
+            SecretKind::Passphrase,
+            &signer_info.fingerprint,
+            reason,
+            origin_window,
+        )
+        .await?;
+        cache_target = Some(signer_info.fingerprint.clone());
+        SignerSecret::Passphrase(libtumpa::Passphrase::new(pass_str.to_string()))
+    };
+
+    let inner = inner_part_of(raw_message)?;
+    let canonical_inner = canonicalize_for_signing(&inner);
+
+    if encrypt {
+        // Sign-then-encrypt (or encrypt-only) into one OpenPGP message,
+        // then wrap in multipart/encrypted. Recipients = To + Cc + Bcc +
+        // the sender's own address ("encrypt-to-self") so the user can
+        // decrypt messages from their Sent folder later. If the sender
+        // has no usable public key in the local keystore we skip self
+        // and log a warning — failing the send would be worse than
+        // shipping a message the sender can't read back.
+        let mut recipients: Vec<String> = to
+            .iter()
+            .chain(cc.iter())
+            .chain(bcc.iter())
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
+        if has_resolvable_public_key(&store, &account.email) {
+            if !recipients_contain(&recipients, &account.email) {
+                recipients.push(account.email.clone());
+            }
+        } else {
+            log::warn!(
+                "openpgp: skipping encrypt-to-self for {} — no usable public key in keystore; \
+                 the sender will NOT be able to decrypt this message from Sent",
+                account.email
+            );
+        }
+
+        let store_for_blocking = store.clone();
+        let signer_data_clone = signer_data.clone();
+        let canonical_inner_clone = canonical_inner.clone();
+        let recipients_owned: Vec<String> = recipients;
+
+        let join_result = tokio::task::spawn_blocking(move || -> libtumpa::Result<Vec<u8>> {
+            let guard = store_for_blocking
+                .lock()
+                .expect("pgp keystore mutex poisoned");
+            let recipient_refs: Vec<&str> = recipients_owned.iter().map(|s| s.as_str()).collect();
+            match signer_secret {
+                SignerSecret::None => libtumpa::encrypt::encrypt_to_recipients(
+                    &guard,
+                    &recipient_refs,
+                    &canonical_inner_clone,
+                    true,
+                ),
+                SignerSecret::Passphrase(pass) => {
+                    libtumpa::encrypt::sign_and_encrypt_to_recipients(
+                        &guard,
+                        &signer_data_clone,
+                        &pass,
+                        &recipient_refs,
+                        &canonical_inner_clone,
+                        true,
+                    )
+                }
+                SignerSecret::CardPin { pin, ident } => {
+                    libtumpa::encrypt::sign_and_encrypt_on_card_to_recipients(
+                        &guard,
+                        &signer_data_clone,
+                        &pin,
+                        Some(&ident),
+                        &recipient_refs,
+                        &canonical_inner_clone,
+                        true,
+                    )
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Other(format!("pgp encrypt task join failed: {e}")))?;
+        let armored = match join_result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if let Some(t) = cache_target.as_deref() {
+                    crate::commands::pgp::evict_cached_secret(&state.pgp_cache, t);
+                }
+                return Err(Error::Other(format!("openpgp encrypt: {e}")));
+            }
+        };
+        let armored_str = String::from_utf8(armored)
+            .map_err(|e| Error::Other(format!("openpgp encrypt produced non-utf8: {e}")))?;
+        wrap_pgp_mime_encrypted(raw_message, &armored_str)
+    } else {
+        // Sign-only: detached signature over the canonicalised inner,
+        // multipart/signed wrapper. libtumpa's sign_detached_with_hash
+        // takes a closure that asks for the right secret kind based on
+        // the resolved signer backend, so we match the request to the
+        // pre-acquired SignerSecret.
+        use libtumpa::sign::{sign_detached_with_hash, Secret, SecretRequest};
+        let store_for_blocking = store.clone();
+        let signer_data_clone = signer_data.clone();
+        let signer_info_clone = signer_info.clone();
+        let canonical_inner_clone = canonical_inner.clone();
+
+        let join_result = tokio::task::spawn_blocking(move || {
+            let _guard = store_for_blocking
+                .lock()
+                .expect("pgp keystore mutex poisoned");
+            sign_detached_with_hash(
+                &signer_data_clone,
+                &signer_info_clone,
+                &canonical_inner_clone,
+                None,
+                |req: SecretRequest<'_>| match (&signer_secret, req) {
+                    (SignerSecret::Passphrase(p), SecretRequest::KeyPassphrase { .. }) => {
+                        Ok(Secret::Passphrase(p.clone()))
+                    }
+                    (SignerSecret::CardPin { pin, .. }, SecretRequest::CardPin { .. }) => {
+                        Ok(Secret::Pin(pin.clone()))
+                    }
+                    _ => Err(libtumpa::Error::Sign(
+                        "signer-secret mismatch between what libtumpa asked for and what \
+                         we acquired"
+                            .into(),
+                    )),
+                },
+            )
+        })
+        .await
+        .map_err(|e| Error::Other(format!("pgp sign task join failed: {e}")))?;
+        let detached = match join_result {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(t) = cache_target.as_deref() {
+                    crate::commands::pgp::evict_cached_secret(&state.pgp_cache, t);
+                }
+                return Err(Error::Other(format!("openpgp sign: {e}")));
+            }
+        };
+
+        let micalg = format!("pgp-{}", hash_alg_to_micalg(detached.hash_algorithm));
+        wrap_pgp_mime_signed(raw_message, &detached.armored, &micalg)
+    }
+}
+
+/// Case-insensitive membership check against an email recipient list.
+/// We dedup the encrypt-to-self addition so the OpenPGP message doesn't
+/// carry two PKESK packets for the same key (correct but wasteful) and
+/// so libtumpa's `resolve_recipient_keys` doesn't trip on a duplicate.
+fn recipients_contain(list: &[String], email: &str) -> bool {
+    let needle = extract_addr_spec(email);
+    list.iter()
+        .any(|r| extract_addr_spec(r).eq_ignore_ascii_case(&needle))
+}
+
+/// Probe the keystore for a public encryption key usable for `id`. Returns
+/// true iff `resolve_recipient` returns Ok AND the key passes
+/// `ensure_key_usable_for_encryption`. Used as a precheck for the
+/// encrypt-to-self addition so we can skip it instead of failing the send.
+fn has_resolvable_public_key(
+    store: &std::sync::Arc<std::sync::Mutex<libtumpa::KeyStore>>,
+    id: &str,
+) -> bool {
+    let guard = store.lock().expect("pgp keystore mutex poisoned");
+    match libtumpa::store::resolve_recipient(&guard, id) {
+        Ok((_data, info)) => libtumpa::store::ensure_key_usable_for_encryption(&info).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Strip a display name to just the addr-spec ("Alice <a@x>" -> "a@x").
+/// Matches what lettre / SMTP envelopes carry on the wire.
+fn extract_addr_spec(addr: &str) -> String {
+    let trimmed = addr.trim();
+    if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if lt < gt {
+            return trimmed[lt + 1..gt].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn hash_alg_to_micalg(h: libtumpa::HashAlgorithm) -> &'static str {
+    use libtumpa::HashAlgorithm as H;
+    // Lowercase OpenPGP hash name without the "pgp-" prefix; the wrapper
+    // adds the prefix. Mapping per RFC 3156 §5 + RFC 4880 §9.4.
+    match h {
+        H::Sha1 => "sha1",
+        H::Sha224 => "sha224",
+        H::Sha256 => "sha256",
+        H::Sha384 => "sha384",
+        H::Sha512 => "sha512",
+        H::Sha3_256 => "sha3-256",
+        H::Sha3_512 => "sha3-512",
+        _ => "sha256",
+    }
+}
+
+/// Frontend pre-check for the compose UI. For each recipient, reports
+/// whether a public encryption key is already in the keystore. The UI
+/// turns each badge red/green and offers a "fetch via WKD" action for
+/// missing ones.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PgpRecipientStatus {
+    pub email: String,
+    pub has_key: bool,
+    pub fingerprint: Option<String>,
+}
+
+#[tauri::command]
+pub async fn pgp_check_recipients(
+    state: State<'_, AppState>,
+    recipients: Vec<String>,
+) -> Result<Vec<PgpRecipientStatus>> {
+    let store = state
+        .pgp_store()
+        .map_err(|e| Error::Other(format!("openpgp keystore: {e}")))?;
+    let guard = store.lock().expect("pgp keystore mutex poisoned");
+    let mut out = Vec::with_capacity(recipients.len());
+    for email in recipients {
+        let trimmed = email.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let status = match libtumpa::store::resolve_recipient(&guard, &trimmed) {
+            Ok((_data, info)) => PgpRecipientStatus {
+                email: trimmed,
+                has_key: true,
+                fingerprint: Some(info.fingerprint),
+            },
+            Err(_) => PgpRecipientStatus {
+                email: trimmed,
+                has_key: false,
+                fingerprint: None,
+            },
+        };
+        out.push(status);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod encrypt_to_self_tests {
+    use super::{extract_addr_spec, recipients_contain};
+
+    /// Regression: encrypt-to-self must not double-add the sender if
+    /// they're already explicitly in To/Cc/Bcc. Two PKESK packets for the
+    /// same key is correct OpenPGP but wasteful, and libtumpa's
+    /// `resolve_recipient_keys` will refuse the duplicate.
+    #[test]
+    fn recipients_contain_matches_addr_spec_only() {
+        let list = vec![
+            "Alice <alice@example.com>".to_string(),
+            "bob@example.com".to_string(),
+        ];
+        // bare addr-spec match
+        assert!(recipients_contain(&list, "alice@example.com"));
+        // case-insensitive
+        assert!(recipients_contain(&list, "ALICE@example.com"));
+        // display-name on the candidate side, addr-spec match still wins
+        assert!(recipients_contain(
+            &list,
+            "Alice In Wonderland <alice@example.com>"
+        ));
+        // unrelated
+        assert!(!recipients_contain(&list, "carol@example.com"));
+    }
+
+    /// `extract_addr_spec` is what the SMTP envelope sees. We rely on it
+    /// to strip a display name before comparing — if it returned the full
+    /// "Alice <alice@x>" string we'd double-add the sender every time.
+    #[test]
+    fn extract_addr_spec_strips_display_name() {
+        assert_eq!(extract_addr_spec("alice@example.com"), "alice@example.com");
+        assert_eq!(
+            extract_addr_spec("Alice <alice@example.com>"),
+            "alice@example.com"
+        );
+        // Whitespace inside angle brackets gets trimmed too.
+        assert_eq!(extract_addr_spec("Alice <  alice@x  >"), "alice@x");
+        // Malformed input (lone '<' or '>') falls through to a trim.
+        assert_eq!(extract_addr_spec("  bob@x  "), "bob@x");
+    }
 }
