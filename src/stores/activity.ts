@@ -30,12 +30,42 @@ export const useActivityStore = defineStore("activity", () => {
 
   const hasActiveOperations = computed(() => activeOperations.value.length > 0);
 
+  // Pending removal timers keyed by operation id. A second op that reuses an
+  // id (e.g. a repeated sync for the same account) must cancel the earlier
+  // timer, or the stale timer would wipe out the new "running" entry mid-run.
+  const pendingRemovals = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function cancelPendingRemoval(id: string) {
+    const handle = pendingRemovals.get(id);
+    if (handle !== undefined) {
+      clearTimeout(handle);
+      pendingRemovals.delete(id);
+    }
+  }
+
+  function scheduleRemoval(id: string, ms: number) {
+    cancelPendingRemoval(id);
+    const handle = setTimeout(() => {
+      pendingRemovals.delete(id);
+      const op = operations.value.get(id);
+      // Guard against a new "running" op having taken the same id since we
+      // were scheduled. We only auto-remove terminal entries.
+      if (op && (op.status === "done" || op.status === "error")) {
+        operations.value.delete(id);
+        operations.value = new Map(operations.value);
+      }
+    }, ms);
+    pendingRemovals.set(id, handle);
+  }
+
   function startOperation(
     id: string,
     type: Operation["type"],
     label: string,
     detail: string = "",
   ): string {
+    // A fresh run with the same id supersedes any pending removal.
+    cancelPendingRemoval(id);
     operations.value.set(id, {
       id,
       type,
@@ -64,10 +94,7 @@ export const useActivityStore = defineStore("activity", () => {
       if (detail) op.detail = detail;
       operations.value = new Map(operations.value);
       // Auto-remove after 60 seconds (visible in operations panel)
-      setTimeout(() => {
-        operations.value.delete(id);
-        operations.value = new Map(operations.value);
-      }, 60_000);
+      scheduleRemoval(id, 60_000);
     }
   }
 
@@ -79,10 +106,7 @@ export const useActivityStore = defineStore("activity", () => {
       op.detail = error;
       operations.value = new Map(operations.value);
       // Auto-remove errors after 5 minutes
-      setTimeout(() => {
-        operations.value.delete(id);
-        operations.value = new Map(operations.value);
-      }, 5 * 60_000);
+      scheduleRemoval(id, 5 * 60_000);
     }
   }
 
@@ -148,13 +172,36 @@ export const useActivityStore = defineStore("activity", () => {
     );
 
     // --- Calendar sync events ---
+    // Dedicated start/complete/error events, mirroring the mail
+    // `sync-started`/`sync-complete`/`sync-error` triad. We deliberately do
+    // NOT listen for `calendar-changed`: that event also fires from invite
+    // responses, push processing, and other non-sync mutations, so coupling
+    // it to the spinner would complete the indicator prematurely.
     unlistenFns.push(
-      await listen<string>("calendar-changed", (event) => {
-        completeOperation(
+      await listen<string>("calendar-sync-started", (event) => {
+        startOperation(
           `cal-sync-${event.payload}`,
-          "Calendars updated",
+          "sync",
+          "Syncing calendars",
+          "Syncing...",
         );
       }),
+    );
+    unlistenFns.push(
+      await listen<string>("calendar-sync-complete", (event) => {
+        completeOperation(`cal-sync-${event.payload}`, "Calendars updated");
+      }),
+    );
+    unlistenFns.push(
+      await listen<{ account_id: string; error: string }>(
+        "calendar-sync-error",
+        (event) => {
+          failOperation(
+            `cal-sync-${event.payload.account_id}`,
+            event.payload.error,
+          );
+        },
+      ),
     );
 
     // --- Contacts sync events ---
@@ -247,6 +294,12 @@ export const useActivityStore = defineStore("activity", () => {
     for (const unlisten of unlistenFns) {
       unlisten();
     }
+    // Cancel any pending removal timers so they don't fire on a disposed
+    // store and mutate state (or leak the handle).
+    for (const handle of pendingRemovals.values()) {
+      clearTimeout(handle);
+    }
+    pendingRemovals.clear();
   });
 
   return {

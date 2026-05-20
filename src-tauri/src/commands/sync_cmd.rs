@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::events::{emit_folders_changed, emit_messages_changed};
@@ -9,11 +9,42 @@ use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 type PrefetchMsg = (String, u32, String);
 
 /// RAII guard that clears the sync-in-progress flag on drop.
-struct SyncGuard(Arc<AtomicBool>);
+pub(crate) struct SyncGuard(Arc<AtomicBool>);
 impl Drop for SyncGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Relaxed);
     }
+}
+
+/// Try to acquire a per-account in-progress flag from the given map. Returns
+/// `None` if another caller already holds it; the returned guard releases
+/// the flag on drop.
+///
+/// Shared by mail sync (`AppState.sync_in_progress`) and calendar sync
+/// (`AppState.calendar_sync_in_progress`) so both domains use the same
+/// serialization pattern without blocking each other.
+pub(crate) fn try_acquire_sync_guard(
+    flags: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+    account_id: &str,
+    operation: &str,
+) -> Option<SyncGuard> {
+    let flag = {
+        let mut map = flags.lock().unwrap();
+        map.entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
+
+    if flag.swap(true, Ordering::AcqRel) {
+        log::debug!(
+            "{} already in progress for account {}, skipping",
+            operation,
+            account_id
+        );
+        return None;
+    }
+
+    Some(SyncGuard(flag))
 }
 
 use crate::db;
@@ -188,30 +219,7 @@ fn try_acquire_account_sync_guard(
     account_id: &str,
     operation: &str,
 ) -> Option<SyncGuard> {
-    {
-        let flags = state.sync_in_progress.lock().unwrap();
-        if let Some(flag) = flags.get(account_id) {
-            if flag.load(Ordering::Relaxed) {
-                log::debug!(
-                    "{} already in progress for account {}, skipping",
-                    operation,
-                    account_id
-                );
-                return None;
-            }
-        }
-    }
-
-    let flag = {
-        let mut flags = state.sync_in_progress.lock().unwrap();
-        let flag = flags
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
-        flag.store(true, Ordering::Relaxed);
-        flag.clone()
-    };
-
-    Some(SyncGuard(flag))
+    try_acquire_sync_guard(&state.sync_in_progress, account_id, operation)
 }
 
 #[tauri::command]
@@ -1424,6 +1432,8 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn o365_sync_suspends_idle_but_still_allows_idle_startup() {
         // Phase 3: these helpers now key off auth_method, not provider.
@@ -1435,5 +1445,32 @@ mod tests {
             "oauth-google"
         ));
         assert!(!super::should_suspend_idle_for_imap_operation("password"));
+    }
+
+    /// A second acquire for the same account is rejected while the first
+    /// guard is alive — the serialization contract that both
+    /// `trigger_sync` and `sync_calendars` rely on to keep their emitted
+    /// "*-sync-*" events coherent.
+    #[test]
+    fn try_acquire_sync_guard_rejects_concurrent_same_account() {
+        let flags: Mutex<HashMap<String, Arc<AtomicBool>>> = Mutex::new(HashMap::new());
+
+        let first = try_acquire_sync_guard(&flags, "acc-1", "test");
+        assert!(first.is_some());
+
+        let second = try_acquire_sync_guard(&flags, "acc-1", "test");
+        assert!(
+            second.is_none(),
+            "concurrent acquire for the same account must be rejected",
+        );
+
+        // A different account is unaffected.
+        let other = try_acquire_sync_guard(&flags, "acc-2", "test");
+        assert!(other.is_some());
+
+        // Releasing the first guard lets the next caller proceed.
+        drop(first);
+        let retry = try_acquire_sync_guard(&flags, "acc-1", "test");
+        assert!(retry.is_some());
     }
 }

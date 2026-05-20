@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::calendar::ical::{self, ParsedInvite};
+use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
 use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
@@ -1265,6 +1266,23 @@ pub async fn sync_calendars(
         return Ok(());
     }
 
+    // Serialize calendar sync per account. The frontend can trigger this
+    // command from multiple sources (toolbar button, 5-minute periodic tick,
+    // context menu); without this guard, overlapping runs would race on DB
+    // writes and emit out-of-order "calendar-sync-*" events for the same
+    // account (e.g. an early "calendar-sync-error" from one run would
+    // overwrite the "running" state of another). Mirrors the mail-sync
+    // pattern in `trigger_sync` / `sync_folder`.
+    let Some(_guard) = try_acquire_sync_guard(
+        &state.calendar_sync_in_progress,
+        &account_id,
+        "Calendar sync",
+    ) else {
+        // A sync for this account is already running; skip silently with no
+        // event emission so the in-progress run's events stay coherent.
+        return Ok(());
+    };
+
     // When force_full_sync is true (manual Sync button), clear Google/O365
     // sync tokens to force a full sync that reconciles server-side deletions.
     if force_full_sync.unwrap_or(false) {
@@ -1283,37 +1301,71 @@ pub async fn sync_calendars(
         );
     }
 
-    if account.calendar_protocol_str() == "jmap" {
-        sync_calendars_jmap(&state, &account_id, &account).await?;
-    } else if account.calendar_protocol_str() == "google" {
-        // Gmail: use Google CalDAV with OAuth2 bearer token
-        match sync_calendars_google(&state, &account_id, &account).await {
-            Ok(()) => {}
-            Err(e) => {
-                log::warn!(
-                    "sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}",
-                    e
-                );
-                // Fall back to configured CalDAV URL if available
-                if !account.caldav_url.is_empty() {
-                    sync_calendars_caldav(&state, &account_id, &account).await?;
+    // Tell the frontend a calendar sync has started so the activity panel
+    // and the StatusBar Sync button show the spinning indicator — same
+    // contract as the mail "sync-started" event.
+    use tauri::Emitter;
+    app.emit("calendar-sync-started", account_id.as_str()).ok();
+
+    let sync_result: Result<()> = async {
+        if account.calendar_protocol_str() == "jmap" {
+            sync_calendars_jmap(&state, &account_id, &account).await?;
+        } else if account.calendar_protocol_str() == "google" {
+            // Gmail: use Google CalDAV with OAuth2 bearer token
+            match sync_calendars_google(&state, &account_id, &account).await {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!(
+                        "sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}",
+                        e
+                    );
+                    // Fall back to configured CalDAV URL if available
+                    if !account.caldav_url.is_empty() {
+                        sync_calendars_caldav(&state, &account_id, &account).await?;
+                    }
                 }
             }
+        } else if account.calendar_protocol_str() == "graph" {
+            sync_calendars_graph(&state, &account_id).await?;
+        } else if !account.caldav_url.is_empty() {
+            sync_calendars_caldav(&state, &account_id, &account).await?;
+        } else {
+            log::debug!(
+                "sync_calendars: skipping account {} (no JMAP or CalDAV configured)",
+                account_id
+            );
         }
-    } else if account.calendar_protocol_str() == "graph" {
-        sync_calendars_graph(&state, &account_id).await?;
-    } else if !account.caldav_url.is_empty() {
-        sync_calendars_caldav(&state, &account_id, &account).await?;
-    } else {
-        log::debug!(
-            "sync_calendars: skipping account {} (no JMAP or CalDAV configured)",
-            account_id
-        );
+        Ok(())
+    }
+    .await;
+
+    // "calendar-changed" is emitted in BOTH branches because the lower-level
+    // sync helpers can mutate the DB before an error propagates (e.g.
+    // sync_calendars_caldav upserts calendars, then a later query errors).
+    // Subscribers (invites store, calendar list) would otherwise hold stale
+    // data after a partial-write failure. Spinner state is carried by the
+    // dedicated "calendar-sync-complete"/"calendar-sync-error" events so
+    // "calendar-changed" no longer conflates "sync finished" with "data
+    // changed" — and so an invite-response or push-processing emission of
+    // "calendar-changed" can't prematurely complete the spinner.
+    app.emit("calendar-changed", account_id.as_str()).ok();
+    match &sync_result {
+        Ok(()) => {
+            app.emit("calendar-sync-complete", account_id.as_str()).ok();
+        }
+        Err(e) => {
+            app.emit(
+                "calendar-sync-error",
+                serde_json::json!({
+                    "account_id": account_id.as_str(),
+                    "error": e.to_string(),
+                }),
+            )
+            .ok();
+        }
     }
 
-    // Notify frontend that calendar data has changed
-    use tauri::Emitter;
-    app.emit("calendar-changed", account_id.as_str()).ok();
+    sync_result?;
 
     log::info!("sync_calendars: completed for account {}", account_id);
     Ok(())
