@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::calendar::ical::{self, ParsedInvite};
+use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
 use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
@@ -1264,6 +1265,23 @@ pub async fn sync_calendars(
         );
         return Ok(());
     }
+
+    // Serialize calendar sync per account. The frontend can trigger this
+    // command from multiple sources (toolbar button, 5-minute periodic tick,
+    // context menu); without this guard, overlapping runs would race on DB
+    // writes and emit out-of-order "calendar-sync-*" events for the same
+    // account (e.g. an early "calendar-sync-error" from one run would
+    // overwrite the "running" state of another). Mirrors the mail-sync
+    // pattern in `trigger_sync` / `sync_folder`.
+    let Some(_guard) = try_acquire_sync_guard(
+        &state.calendar_sync_in_progress,
+        &account_id,
+        "Calendar sync",
+    ) else {
+        // A sync for this account is already running; skip silently with no
+        // event emission so the in-progress run's events stay coherent.
+        return Ok(());
+    };
 
     // When force_full_sync is true (manual Sync button), clear Google/O365
     // sync tokens to force a full sync that reconciles server-side deletions.
