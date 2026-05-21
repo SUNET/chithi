@@ -540,6 +540,26 @@ async function send() {
     }
   }
 
+  // Hard-gate: refuse to send an encrypted message if any recipient has
+  // no public key in the keystore. The backend would fail-closed anyway
+  // (apply_pgp_envelope errors before the outbox row is persisted) but
+  // surfacing the specific missing recipients here is far more useful
+  // than the generic libtumpa error that would otherwise come back.
+  if (pgpEncrypt.value) {
+    // refreshRecipientStatuses() is debounced behind a watch — re-run it
+    // synchronously so we see today's recipient list, not the last typed
+    // value.
+    await refreshRecipientStatuses();
+    const missing = recipientStatuses.value.filter((s) => !s.hasKey);
+    if (missing.length > 0) {
+      error.value =
+        `Cannot encrypt — no public key in keystore for: ` +
+        missing.map((s) => s.email).join(", ") +
+        `. Fetch keys via WKD or import them, then try again.`;
+      return;
+    }
+  }
+
   sending.value = true;
   error.value = null;
 

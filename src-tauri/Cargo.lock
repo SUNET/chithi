@@ -3354,9 +3354,9 @@ dependencies = [
 
 [[package]]
 name = "libtumpa"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b82b6601e626183aae808e2afed5b10946a5c60c5a7bd8a08950c115349ef99"
+checksum = "021c60c784ce25d3977755fb4ea2fc43d59a12c903e9241d396ff2f149c66748"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7425,9 +7425,9 @@ dependencies = [
 
 [[package]]
 name = "wecanencrypt"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc0703345f40fd973402b286882d994199456dfd2251c8d375fe41bd856a92b6"
+checksum = "75f3922162bbe25f4ba50ed561c49b48c9b5172991348c8eed1cee852f3ac228"
 dependencies = [
  "aes",
  "aes-kw",

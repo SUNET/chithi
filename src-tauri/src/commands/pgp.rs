@@ -6,7 +6,6 @@
 //! in those apps. We list, import, export, fetch over WKD, and enumerate /
 //! auto-link OpenPGP smartcards.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -190,28 +189,6 @@ pub async fn pgp_import_key(state: State<'_, AppState>, data: Vec<u8>) -> Result
     let store = state.pgp_store().map_err(lt_err)?;
     let guard = store.lock().expect("pgp keystore mutex poisoned");
     let info = key::import_any(&guard, &data).map_err(lt_err)?;
-    Ok(PgpImportResult {
-        fingerprint: info.fingerprint,
-        is_secret: info.is_secret,
-    })
-}
-
-/// Import an armored key by file path. Reads the file on the backend so the
-/// renderer never sees the raw bytes (and so we get a clean filesystem error
-/// rather than a base64 round-trip error on big keys).
-///
-/// Frontend callers should prefer `pgp_pick_and_import_key`, which opens
-/// the file dialog server-side so the renderer never learns the path.
-#[tauri::command]
-pub async fn pgp_import_key_file(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<PgpImportResult> {
-    let p = PathBuf::from(&path);
-    let bytes = std::fs::read(&p)?;
-    let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let info = key::import_any(&guard, &bytes).map_err(lt_err)?;
     Ok(PgpImportResult {
         fingerprint: info.fingerprint,
         is_secret: info.is_secret,

@@ -137,7 +137,6 @@ pub fn run() {
             commands::pgp::pgp_list_keys,
             commands::pgp::pgp_get_key,
             commands::pgp::pgp_import_key,
-            commands::pgp::pgp_import_key_file,
             commands::pgp::pgp_pick_and_import_key,
             commands::pgp::pgp_delete_key,
             commands::pgp::pgp_export_public,

@@ -108,13 +108,6 @@ export const usePgpStore = defineStore("pgp", () => {
     return result;
   }
 
-  async function importFromPath(path: string) {
-    const result = await api.pgpImportKeyFile(path);
-    await fetchKeys();
-    selectedFingerprint.value = result.fingerprint;
-    return result;
-  }
-
   async function deleteKey(fingerprint: string) {
     await api.pgpDeleteKey(fingerprint);
     if (selectedFingerprint.value === fingerprint) {
@@ -176,7 +169,6 @@ export const usePgpStore = defineStore("pgp", () => {
     setSearch,
     importArmored,
     importBinary,
-    importFromPath,
     deleteKey,
     exportPublic,
     fetchViaWkd,

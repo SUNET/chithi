@@ -35,7 +35,6 @@ vi.mock("@/lib/tauri", () => ({
   }),
   pgpAutoLinkCards: vi.fn().mockResolvedValue([]),
   pgpImportKey: vi.fn(),
-  pgpImportKeyFile: vi.fn(),
   pgpPickAndImportKey: vi.fn(),
   pgpDeleteKey: vi.fn(),
   pgpExportPublic: vi.fn(),

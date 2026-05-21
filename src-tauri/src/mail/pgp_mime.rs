@@ -649,4 +649,72 @@ Just plain text.\r\n";
         let variants = tolerant_signed_variants(bad);
         assert!(variants.iter().any(|v| v == b"hello\r\nworld\r\n"));
     }
+
+    /// Property pin: every recovery variant must be reachable from the
+    /// canonical input by a composition of the two documented transforms
+    /// — `\r\r\n -> \r\n` collapse and trailing-CRLF strip (up to 3) — and
+    /// NOTHING ELSE. If a variant ever diverges further from the canonical
+    /// (e.g. body-content insertion, header rewriting, mid-stream LF
+    /// stripping) the signature recovery would let an attacker mutate
+    /// signed content while still reporting Good.
+    ///
+    /// The check synthesises the legal-variant set from the canonical and
+    /// asserts every produced variant lives inside it. Bounded enumeration
+    /// (the strip is ≤3 CRLFs, the collapse is idempotent), so the synth
+    /// set has at most a handful of members regardless of input size.
+    #[test]
+    fn tolerant_signed_variants_only_strips_trailing_crlf_or_collapses_doubled_cr() {
+        // Two representative inputs: one with no mangling (so the variants
+        // can only be the trailing-strip ladder) and one with a doubled-CR
+        // in the middle (so the collapse path triggers AND the strip
+        // ladder applies to both bases).
+        let canonical_plain = b"line1\r\nline2\r\nline3\r\n\r\n\r\n".to_vec();
+        let canonical_doubled = b"head\r\r\nbody\r\nfoot\r\n\r\n".to_vec();
+
+        for canonical in [canonical_plain, canonical_doubled] {
+            let variants = tolerant_signed_variants(&canonical);
+
+            // Legal-variant set: canonical, collapsed, and each form's
+            // strip-1/strip-2/strip-3 trailing-CRLF descendants. Anything
+            // outside this set is a bug.
+            let collapsed = collapse_doubled_cr(&canonical);
+            let mut legal: Vec<Vec<u8>> = vec![canonical.clone()];
+            if collapsed != canonical {
+                legal.push(collapsed.clone());
+            }
+            for base in [canonical.clone(), collapsed] {
+                let mut current = base;
+                for _ in 0..3 {
+                    if current.ends_with(b"\r\n") {
+                        current.truncate(current.len() - 2);
+                        if !legal.iter().any(|v| v == &current) {
+                            legal.push(current.clone());
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            for v in &variants {
+                assert!(
+                    legal.iter().any(|l| l == v),
+                    "tolerant variant escaped the legal-transform set: {:?}\n\
+                     legal set was: {:?}",
+                    String::from_utf8_lossy(v),
+                    legal
+                        .iter()
+                        .map(|l| String::from_utf8_lossy(l))
+                        .collect::<Vec<_>>(),
+                );
+                // Variants must not equal the canonical (those would be
+                // duplicate work).
+                assert_ne!(
+                    v, &canonical,
+                    "canonical itself must not be in the variants list — \
+                     the verifier already tried the canonical form first"
+                );
+            }
+        }
+    }
 }

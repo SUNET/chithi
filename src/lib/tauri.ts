@@ -788,12 +788,6 @@ export async function pgpImportKey(
   return invoke("pgp_import_key", { data: Array.from(data) });
 }
 
-export async function pgpImportKeyFile(
-  path: string,
-): Promise<import("./types").PgpImportResult> {
-  return invoke("pgp_import_key_file", { path });
-}
-
 /** Opens the native file dialog server-side and imports the picked file.
  *  Returns null if the user cancels. */
 export async function pgpPickAndImportKey(): Promise<

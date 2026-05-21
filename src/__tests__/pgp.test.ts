@@ -11,10 +11,6 @@ vi.mock("@/lib/tauri", () => ({
     fingerprint: "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555",
     isSecret: true,
   }),
-  pgpImportKeyFile: vi.fn().mockResolvedValue({
-    fingerprint: "FILE1111BBBB2222CCCC3333DDDD4444EEEE5555",
-    isSecret: true,
-  }),
   pgpPickAndImportKey: vi.fn().mockResolvedValue(null),
   pgpDeleteKey: vi.fn().mockResolvedValue(undefined),
   pgpExportPublic: vi.fn().mockResolvedValue("-----BEGIN PGP PUBLIC KEY BLOCK-----"),

@@ -800,22 +800,31 @@ async fn apply_pgp_envelope(
 
     if encrypt {
         // Sign-then-encrypt (or encrypt-only) into one OpenPGP message,
-        // then wrap in multipart/encrypted. Recipients = To + Cc + Bcc +
+        // then wrap in multipart/encrypted. Visible recipients = To + Cc +
         // the sender's own address ("encrypt-to-self") so the user can
-        // decrypt messages from their Sent folder later. If the sender
-        // has no usable public key in the local keystore we skip self
-        // and log a warning — failing the send would be worse than
-        // shipping a message the sender can't read back.
-        let mut recipients: Vec<String> = to
+        // decrypt messages from their Sent folder later. Hidden recipients
+        // = Bcc: their PKESK packets get the all-zero wildcard key id
+        // (RFC 4880 throw-keyid / --hidden-recipient) so the To/Cc
+        // recipients can't read off the Bcc list from the OpenPGP packet
+        // stream. If the sender has no usable public key in the local
+        // keystore we skip self and log a warning — failing the send would
+        // be worse than shipping a message the sender can't read back.
+        let mut visible_recipients: Vec<String> = to
             .iter()
             .chain(cc.iter())
-            .chain(bcc.iter())
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
+        let hidden_recipients: Vec<String> = bcc
+            .iter()
             .filter(|s| !s.trim().is_empty())
             .cloned()
             .collect();
         if has_resolvable_public_key(&store, &account.email) {
-            if !recipients_contain(&recipients, &account.email) {
-                recipients.push(account.email.clone());
+            if !recipients_contain(&visible_recipients, &account.email)
+                && !recipients_contain(&hidden_recipients, &account.email)
+            {
+                visible_recipients.push(account.email.clone());
             }
         } else {
             log::warn!(
@@ -828,37 +837,42 @@ async fn apply_pgp_envelope(
         let store_for_blocking = store.clone();
         let signer_data_clone = signer_data.clone();
         let canonical_inner_clone = canonical_inner.clone();
-        let recipients_owned: Vec<String> = recipients;
+        let visible_owned = visible_recipients;
+        let hidden_owned = hidden_recipients;
 
         let join_result = tokio::task::spawn_blocking(move || -> libtumpa::Result<Vec<u8>> {
             let guard = store_for_blocking
                 .lock()
                 .expect("pgp keystore mutex poisoned");
-            let recipient_refs: Vec<&str> = recipients_owned.iter().map(|s| s.as_str()).collect();
+            let visible_refs: Vec<&str> = visible_owned.iter().map(|s| s.as_str()).collect();
+            let hidden_refs: Vec<&str> = hidden_owned.iter().map(|s| s.as_str()).collect();
             match signer_secret {
-                SignerSecret::None => libtumpa::encrypt::encrypt_to_recipients(
+                SignerSecret::None => libtumpa::encrypt::encrypt_to_recipients_with_hidden(
                     &guard,
-                    &recipient_refs,
+                    &visible_refs,
+                    &hidden_refs,
                     &canonical_inner_clone,
                     true,
                 ),
                 SignerSecret::Passphrase(pass) => {
-                    libtumpa::encrypt::sign_and_encrypt_to_recipients(
+                    libtumpa::encrypt::sign_and_encrypt_to_recipients_with_hidden(
                         &guard,
                         &signer_data_clone,
                         &pass,
-                        &recipient_refs,
+                        &visible_refs,
+                        &hidden_refs,
                         &canonical_inner_clone,
                         true,
                     )
                 }
                 SignerSecret::CardPin { pin, ident } => {
-                    libtumpa::encrypt::sign_and_encrypt_on_card_to_recipients(
+                    libtumpa::encrypt::sign_and_encrypt_on_card_to_recipients_with_hidden(
                         &guard,
                         &signer_data_clone,
                         &pin,
                         Some(&ident),
-                        &recipient_refs,
+                        &visible_refs,
+                        &hidden_refs,
                         &canonical_inner_clone,
                         true,
                     )
