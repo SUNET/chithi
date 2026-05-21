@@ -51,7 +51,6 @@ function pickProvider(p: Provider) {
   // Hand off to the main Settings flow — the full provider wizards live
   // there. This keeps onboarding the first-run router and the settings
   // view the canonical "add account" surface.
-  localStorage.setItem("chithi-onboarding-skipped", "true");
   router.push({ path: "/settings", query: { addAccount: p.id } });
 }
 
