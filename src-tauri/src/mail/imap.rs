@@ -678,6 +678,24 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Append a raw RFC5322 message to a folder, marking it `\Seen`.
+    ///
+    /// Used by the post-SMTP-send hook (#189) to populate the Sent
+    /// folder. Differs from [`Self::append_message`] in that it does
+    /// **not** set `\Draft` — these are delivered messages, not drafts.
+    pub fn append_sent_message(&mut self, folder: &str, message: &[u8]) -> Result<()> {
+        log::info!(
+            "IMAP appending sent message ({} bytes) to folder '{}'",
+            message.len(),
+            folder
+        );
+        self.session
+            .append_with_flags(folder, message, &[imap::types::Flag::Seen])
+            .map_err(|e| Error::Imap(format!("IMAP APPEND to '{}' failed: {}", folder, e)))?;
+        log::info!("IMAP sent message appended to '{}'", folder);
+        Ok(())
+    }
+
     /// Append a raw RFC5322 message to a folder preserving its original state
     /// (no extra flags). Used for cross-account moves where we want to keep
     /// the message as-is.
@@ -810,6 +828,57 @@ pub fn search_account_blocking(
 
     conn.logout();
     Ok(hits)
+}
+
+/// Open an IMAP session and APPEND `raw_message` to the account's Sent
+/// folder, marking it `\Seen`.
+///
+/// Tries `sent_folder_path` first when supplied (from the local folder
+/// cache), then walks a list of common Sent-folder names — covering
+/// vanilla IMAP servers (`Sent`), Courier-style hierarchies
+/// (`INBOX.Sent`), Exchange / O365 (`Sent Items`), Cyrus
+/// (`Sent Messages`) and Gmail (`[Gmail]/Sent Mail`).
+///
+/// This is the post-SMTP-send hook from #189: SMTP submission alone
+/// never writes to Sent (JMAP/Graph send APIs handle Sent server-side,
+/// but Exchange-via-SMTP and plain IMAP do not). Callers should treat
+/// failures as best-effort — the message has already been delivered,
+/// so a failed APPEND must NOT bubble up and trigger an outbox retry
+/// (that would cause duplicate delivery).
+///
+/// Blocking. Wrap in `tokio::task::spawn_blocking` from async code.
+pub fn append_message_to_sent(
+    config: &ImapConfig,
+    sent_folder_path: Option<&str>,
+    raw_message: &[u8],
+) -> Result<()> {
+    let mut conn = ImapConnection::connect(config)?;
+    let candidates: Vec<&str> = match sent_folder_path {
+        Some(p) => vec![p],
+        None => vec![
+            "Sent",
+            "INBOX.Sent",
+            "Sent Items",
+            "Sent Messages",
+            "[Gmail]/Sent Mail",
+        ],
+    };
+    let mut last_err: Option<Error> = None;
+    for folder in candidates {
+        match conn.append_sent_message(folder, raw_message) {
+            Ok(()) => {
+                conn.logout();
+                return Ok(());
+            }
+            Err(e) => {
+                log::debug!("APPEND to Sent candidate '{}' failed: {}", folder, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    conn.logout();
+    Err(last_err
+        .unwrap_or_else(|| Error::Imap("APPEND to Sent failed: no candidate folders".into())))
 }
 
 fn envelope_to_hit(account_id: &str, folder_path: &str, env: EnvelopeData) -> SearchHit {

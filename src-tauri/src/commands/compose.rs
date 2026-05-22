@@ -231,6 +231,54 @@ pub async fn send_message(
                     &references,
                 )
                 .await?;
+
+                // Best-effort: APPEND the sent message to the IMAP Sent
+                // folder (#189). SMTP submission alone never writes to
+                // Sent for plain IMAP+SMTP or Exchange-via-SMTP-AUTH;
+                // JMAP / Graph send APIs are unaffected because they
+                // populate Sent server-side. Failures here MUST NOT
+                // propagate — the message has been delivered, and a
+                // retried send would duplicate it for the recipient.
+                let sent_folder_path = {
+                    let conn = db_bg.writer().await;
+                    crate::db::folders::folder_path_by_type(&conn, &account_id_bg, "sent")
+                        .ok()
+                        .flatten()
+                };
+                let imap_config = crate::mail::imap::ImapConfig {
+                    host: account.imap_host.clone(),
+                    port: account.imap_port,
+                    username: smtp_username.clone(),
+                    password: smtp_password.clone(),
+                    use_tls: account.use_tls,
+                    use_xoauth2,
+                };
+                let raw_for_append = raw_message.clone();
+                let account_id_append = account_id_bg.clone();
+                let append_result = tokio::task::spawn_blocking(move || {
+                    crate::mail::imap::append_message_to_sent(
+                        &imap_config,
+                        sent_folder_path.as_deref(),
+                        &raw_for_append,
+                    )
+                })
+                .await;
+                match append_result {
+                    Ok(Ok(())) => log::info!(
+                        "Sent message APPENDed to Sent folder for account {}",
+                        account_id_append
+                    ),
+                    Ok(Err(e)) => log::warn!(
+                        "Sent delivered but APPEND to Sent failed for account {}: {}",
+                        account_id_append,
+                        e
+                    ),
+                    Err(e) => log::warn!(
+                        "APPEND-to-Sent task panicked for account {}: {}",
+                        account_id_append,
+                        e
+                    ),
+                }
             }
             Ok(())
         }

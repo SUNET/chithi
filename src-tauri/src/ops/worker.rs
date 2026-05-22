@@ -653,7 +653,52 @@ impl AccountWorker {
             &bcc,
             &raw_message,
         )
-        .await
+        .await?;
+
+        // Best-effort APPEND to Sent (#189). Same rule as the live-send
+        // path in `commands::compose`: a failure here MUST NOT propagate,
+        // because the message has been delivered and the outbox would
+        // otherwise retry the send and duplicate it for the recipient.
+        let sent_folder_path = {
+            let conn = self.db.reader();
+            crate::db::folders::folder_path_by_type(&conn, &self.account_id, "sent")
+                .ok()
+                .flatten()
+        };
+        let imap_config = crate::mail::imap::ImapConfig {
+            host: account.imap_host.clone(),
+            port: account.imap_port,
+            username: smtp_username,
+            password: smtp_password,
+            use_tls: account.use_tls,
+            use_xoauth2,
+        };
+        let account_id_append = self.account_id.clone();
+        let append_result = tokio::task::spawn_blocking(move || {
+            crate::mail::imap::append_message_to_sent(
+                &imap_config,
+                sent_folder_path.as_deref(),
+                &raw_message,
+            )
+        })
+        .await;
+        match append_result {
+            Ok(Ok(())) => log::info!(
+                "Outbox replay: APPENDed sent message to Sent for account {}",
+                account_id_append
+            ),
+            Ok(Err(e)) => log::warn!(
+                "Outbox replay: delivered but APPEND to Sent failed for account {}: {}",
+                account_id_append,
+                e
+            ),
+            Err(e) => log::warn!(
+                "Outbox replay: APPEND-to-Sent task panicked for account {}: {}",
+                account_id_append,
+                e
+            ),
+        }
+        Ok(())
     }
 }
 
