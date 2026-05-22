@@ -1086,7 +1086,11 @@ mod pgp_wrap_tests {
                 line.starts_with(' ') && !line.starts_with("  "),
                 "continuation line must start with a single space: {line:?}"
             );
-            assert!(line.len() <= 78, "line exceeds 78 cols: {} chars", line.len());
+            assert!(
+                line.len() <= 78,
+                "line exceeds 78 cols: {} chars",
+                line.len()
+            );
         }
 
         // Strip ALL whitespace from the keydata value and base64-decode.

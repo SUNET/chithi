@@ -71,13 +71,11 @@ function stopResize() {
 }
 
 onMounted(async () => {
-  await pgpStore.ensureListener();
   // Keys + cards in parallel — the card list is best-effort.
   await Promise.all([pgpStore.fetchKeys(), pgpStore.fetchCards()]);
 });
 
 onUnmounted(() => {
-  pgpStore.disposeListener();
   // Defensive: if the view unmounts mid-drag, drop the global listeners
   // and reset the cursor/selection styles we set on document.body.
   document.removeEventListener("mousemove", onResize);

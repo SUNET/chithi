@@ -69,7 +69,9 @@ pub struct AppState {
     /// Connection`, which is `Send + !Sync`.
     pgp_store: OnceLock<Arc<std::sync::Mutex<libtumpa::KeyStore>>>,
     /// In-memory passphrase / card-PIN cache. Values are `Zeroizing<String>`
-    /// and zero on drop. Periodically swept by `pgp::start_cache_sweeper`.
+    /// and zero on drop. There is no background sweeper: entries live for
+    /// the lifetime of the process unless explicitly evicted via
+    /// `pgp::evict_cached_secret` (or the `pgp_forget_all` command).
     pub pgp_cache: Arc<std::sync::Mutex<libtumpa::cache::CredentialCache>>,
     /// Pending secret-prompt one-shots, keyed by the request id emitted to
     /// the frontend on the `pgp-secret-needed` event.

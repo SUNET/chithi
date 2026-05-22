@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
-import { storeToRefs } from "pinia";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { usePgpPromptsStore } from "@/stores/pgp-prompts";
@@ -17,14 +16,12 @@ import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import Select from "@/components/common/Select.vue";
 import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
-import PassphraseDialog from "@/components/pgp/PassphraseDialog.vue";
-import PinDialog from "@/components/pgp/PinDialog.vue";
 
-// Compose is a separate window; subscribe to the same PGP prompt event
-// so the unlock dialog appears here (where the user clicked Send) rather
-// than only in the main window.
+// Compose runs in its own window; start the shared PGP prompt listener
+// so a sign/decrypt triggered from here is served. The passphrase / PIN
+// dialogs themselves are rendered globally by App.vue (the root of every
+// window, this one included), so they are not mounted in this view.
 const pgpPrompts = usePgpPromptsStore();
-const { currentPrompt } = storeToRefs(pgpPrompts);
 
 // PGP toggles.
 const pgpSign = ref(false);
@@ -481,6 +478,11 @@ onMounted(() => {
 // When Encrypt is on (or when recipients change while it's on), look up
 // each recipient's public key so the UI can show red/green pips and
 // block sending if any are missing.
+// Sequence guard: pgpCheckRecipients is async, so a slow earlier call
+// could resolve after a faster later one and overwrite fresher data.
+// Each call captures a seq; only the most recent writes the result.
+let recipientCheckSeq = 0;
+
 async function refreshRecipientStatuses() {
   if (!pgpEncrypt.value) {
     recipientStatuses.value = [];
@@ -495,17 +497,35 @@ async function refreshRecipientStatuses() {
     recipientStatuses.value = [];
     return;
   }
+  const seq = ++recipientCheckSeq;
   try {
-    recipientStatuses.value = await api.pgpCheckRecipients(all);
+    const result = await api.pgpCheckRecipients(all);
+    // Drop a stale response: a newer call superseded this one in flight.
+    if (seq === recipientCheckSeq) {
+      recipientStatuses.value = result;
+    }
   } catch (e) {
     console.error("PGP recipient check failed:", e);
   }
 }
 
+// To/Cc/Bcc are bound to text inputs, so the watch below fires on every
+// keystroke. Debounce it so recipient editing triggers one backend call
+// once typing pauses, not one per character.
+let recipientCheckTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRecipientRefresh() {
+  if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
+  recipientCheckTimer = setTimeout(() => {
+    recipientCheckTimer = null;
+    void refreshRecipientStatuses();
+  }, 300);
+}
+
 watch(
   () => [pgpEncrypt.value, to.value, cc.value, bcc.value],
   () => {
-    refreshRecipientStatuses();
+    scheduleRecipientRefresh();
   },
 );
 
@@ -633,9 +653,9 @@ async function send() {
   // surfacing the specific missing recipients here is far more useful
   // than the generic libtumpa error that would otherwise come back.
   if (pgpEncrypt.value) {
-    // refreshRecipientStatuses() is debounced behind a watch — re-run it
-    // synchronously so we see today's recipient list, not the last typed
-    // value.
+    // The recipient precheck behind the watch is debounced, so a pending
+    // edit may not have run yet — re-run it synchronously here so the
+    // gate below sees the current recipient list, not a stale one.
     await refreshRecipientStatuses();
     const missing = recipientStatuses.value.filter((s) => !s.hasKey);
     if (missing.length > 0) {
@@ -942,18 +962,6 @@ async function send() {
     </div>
   </div>
 
-  <!-- Local PGP secret prompts — mounted inside the compose window so
-       the unlock dialog appears where the user clicked Send. The
-       prompt store is global, so this dialog and the main window's
-       dialog share the same queue. -->
-  <PassphraseDialog
-    v-if="currentPrompt && currentPrompt.kind === 'passphrase'"
-    :prompt="currentPrompt"
-  />
-  <PinDialog
-    v-if="currentPrompt && currentPrompt.kind === 'pin'"
-    :prompt="currentPrompt"
-  />
 </template>
 
 <style scoped>

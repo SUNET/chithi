@@ -1,7 +1,5 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "@/lib/tauri";
 import type {
   PgpKeySummary,
@@ -22,8 +20,6 @@ export const usePgpStore = defineStore("pgp", () => {
   const searchQuery = ref("");
   /** Last surfaced error message, if any. Cleared on the next successful op. */
   const lastError = ref<string | null>(null);
-
-  let pgpChangedUnlisten: UnlistenFn | null = null;
 
   const selectedKey = computed<PgpKeySummary | null>(() => {
     if (!selectedFingerprint.value) return null;
@@ -134,22 +130,6 @@ export const usePgpStore = defineStore("pgp", () => {
     return detections;
   }
 
-  /** Idempotently subscribe to the backend "pgp-changed" event. */
-  async function ensureListener() {
-    if (pgpChangedUnlisten) return;
-    pgpChangedUnlisten = await listen<string>("pgp-changed", () => {
-      // Fire-and-forget — store action handles its own errors.
-      void fetchKeys();
-    });
-  }
-
-  function disposeListener() {
-    if (pgpChangedUnlisten) {
-      pgpChangedUnlisten();
-      pgpChangedUnlisten = null;
-    }
-  }
-
   return {
     // state
     keys,
@@ -173,7 +153,5 @@ export const usePgpStore = defineStore("pgp", () => {
     exportPublic,
     fetchViaWkd,
     autoLinkCards,
-    ensureListener,
-    disposeListener,
   };
 });

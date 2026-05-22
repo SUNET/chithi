@@ -1194,9 +1194,10 @@ fn encrypt_draft_core(
     // body reparses cleanly after the decrypt round-trip.
     let inner = smtp::inner_part_of(raw_message).ok()?;
     let canonical = canonicalize_for_signing(&inner);
-    let armored = libtumpa::encrypt::encrypt_to_recipients(store, &[sender_email], &canonical, true)
-        .map_err(|e| log::warn!("openpgp: draft encrypt-to-self failed: {e}"))
-        .ok()?;
+    let armored =
+        libtumpa::encrypt::encrypt_to_recipients(store, &[sender_email], &canonical, true)
+            .map_err(|e| log::warn!("openpgp: draft encrypt-to-self failed: {e}"))
+            .ok()?;
     let armored_str = String::from_utf8(armored).ok()?;
     // Drafts keep their subject in the cleartext outer envelope — the
     // resume path reads it back from there, and protected-headers
@@ -1451,8 +1452,9 @@ mod encrypt_draft_tests {
         // The ciphertext decrypts back to the canonicalised inner body.
         let ciphertext =
             pgp_mime::extract_encrypted_payload(&encrypted).expect("extract ciphertext");
-        let recovered = libtumpa::decrypt::decrypt_with_key(&generated.secret_key, &ciphertext, &pw)
-            .expect("decrypt draft");
+        let recovered =
+            libtumpa::decrypt::decrypt_with_key(&generated.secret_key, &ciphertext, &pw)
+                .expect("decrypt draft");
         let original_inner = smtp::inner_part_of(&raw).expect("inner part");
         let canonical = pgp_mime::canonicalize_for_signing(&original_inner);
         assert_eq!(
@@ -1543,8 +1545,7 @@ mod protected_headers_tests {
         let armored_str = String::from_utf8(armored).expect("utf8 armor");
 
         // Step 3: multipart/encrypted with the subject placeholder.
-        let wrapped =
-            smtp::wrap_pgp_mime_encrypted(&raw, &armored_str, Some("...")).expect("wrap");
+        let wrapped = smtp::wrap_pgp_mime_encrypted(&raw, &armored_str, Some("...")).expect("wrap");
 
         // The cleartext envelope hides the real subject.
         let wrapped_s = String::from_utf8_lossy(&wrapped);
@@ -1558,8 +1559,7 @@ mod protected_headers_tests {
         );
 
         // Decrypt and confirm the protected entity carries the real subject.
-        let ciphertext =
-            pgp_mime::extract_encrypted_payload(&wrapped).expect("extract ciphertext");
+        let ciphertext = pgp_mime::extract_encrypted_payload(&wrapped).expect("extract ciphertext");
         let recovered =
             libtumpa::decrypt::decrypt_with_key(&generated.secret_key, &ciphertext, &pw)
                 .expect("decrypt");
