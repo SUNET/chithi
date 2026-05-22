@@ -81,11 +81,12 @@ pub async fn get_jmap_oidc_token(
 
     let now = chrono::Utc::now().timestamp();
     let expired = tokens.is_expired();
+    // Don't log access / refresh tokens (even truncated); the expiry +
+    // presence flag is enough to diagnose refresh behavior.
     log::info!(
-        "OIDC[get_jmap_oidc_token]: account={} loaded access={} refresh={} expires_at={:?} now={} expired={}",
+        "OIDC[get_jmap_oidc_token]: account={} loaded has_refresh={} expires_at={:?} now={} expired={}",
         account.id,
-        crate::oauth::tok_prefix_pub(&tokens.access_token),
-        tokens.refresh_token.as_deref().map(crate::oauth::tok_prefix_pub).unwrap_or_else(|| "<none>".into()),
+        tokens.refresh_token.is_some(),
         tokens.expires_at,
         now,
         expired,
@@ -151,11 +152,11 @@ pub async fn refresh_jmap_oidc_token(
 
     let now = chrono::Utc::now().timestamp();
     let expired = tokens.is_expired();
+    // Don't log access / refresh tokens (even truncated).
     log::info!(
-        "OIDC[refresh_jmap_oidc_token]: account={} access={} refresh={} expires_at={:?} now={} expired={}",
+        "OIDC[refresh_jmap_oidc_token]: account={} has_refresh={} expires_at={:?} now={} expired={}",
         account_id,
-        crate::oauth::tok_prefix_pub(&tokens.access_token),
-        tokens.refresh_token.as_deref().map(crate::oauth::tok_prefix_pub).unwrap_or_else(|| "<none>".into()),
+        tokens.refresh_token.is_some(),
         tokens.expires_at,
         now,
         expired,

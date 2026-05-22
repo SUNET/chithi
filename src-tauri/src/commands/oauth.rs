@@ -110,32 +110,21 @@ pub async fn oauth_complete(
         .await
         .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
-    // Validate CSRF state parameter
+    // Validate CSRF state parameter. Don't log the raw values — `state`
+    // is a CSRF secret and logging it (or returning it in the error
+    // message) can leak session secrets into the persistent log file.
     log::info!(
-        "OAuth2[{}]: state validation expected={} returned={}",
+        "OAuth2[{}]: state validation has_returned={}",
         provider,
-        oauth::tok_prefix_pub(&expected_state),
-        result
-            .state
-            .as_deref()
-            .map(oauth::tok_prefix_pub)
-            .unwrap_or_else(|| "<missing>".into()),
+        result.state.is_some(),
     );
     match result.state {
         Some(ref returned_state) if returned_state == &expected_state => {
             log::debug!("OAuth2: state parameter validated");
         }
-        Some(ref returned_state) => {
-            log::error!(
-                "OAuth2[{}]: state MISMATCH expected_full={} returned_full={}",
-                provider,
-                expected_state,
-                returned_state
-            );
-            return Err(Error::Other(format!(
-                "OAuth2 state mismatch (possible CSRF): expected={}, got={}",
-                expected_state, returned_state
-            )));
+        Some(_) => {
+            log::error!("OAuth2[{}]: state MISMATCH (possible CSRF)", provider);
+            return Err(Error::Other("OAuth2 state mismatch (possible CSRF)".into()));
         }
         None => {
             return Err(Error::Other(

@@ -338,14 +338,10 @@ pub async fn meet_zoom_login_complete(
         .await
         .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))??;
 
+    // Don't log raw `state` values — they're CSRF secrets.
     log::info!(
-        "zoom oauth state validation: expected={} returned={}",
-        crate::oauth::tok_prefix_pub(&expected_state),
-        callback
-            .state
-            .as_deref()
-            .map(crate::oauth::tok_prefix_pub)
-            .unwrap_or_else(|| "<missing>".into()),
+        "zoom oauth state validation: has_returned={}",
+        callback.state.is_some(),
     );
     match callback.state.as_deref() {
         Some(s) if s == expected_state => {

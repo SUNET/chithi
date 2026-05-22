@@ -6,21 +6,6 @@ use std::net::TcpListener;
 
 use crate::error::{Error, Result};
 
-/// Truncate a secret to its first 8 chars for safe logging.
-/// Returns "<empty>" for empty input, or "<prefix>…<len=N>" otherwise.
-fn tok_prefix(s: &str) -> String {
-    if s.is_empty() {
-        return "<empty>".into();
-    }
-    let take = s.chars().take(8).collect::<String>();
-    format!("{}…<len={}>", take, s.len())
-}
-
-/// Public re-export of `tok_prefix` for use from other modules' logging.
-pub fn tok_prefix_pub(s: &str) -> String {
-    tok_prefix(s)
-}
-
 // ---------------------------------------------------------------------------
 // Provider configurations
 // ---------------------------------------------------------------------------
@@ -331,14 +316,14 @@ pub fn get_auth_url(
         url.push_str("&prompt=select_account");
     }
 
+    // Don't log `state` or `url` — both contain CSRF / PKCE material that
+    // would land in the persistent log file.
     log::info!(
-        "OAuth2[{}]: get_auth_url generated state={} redirect_uri={} port={} pkce={} url={}",
+        "OAuth2[{}]: get_auth_url generated redirect_uri={} port={} pkce={}",
         provider.name,
-        tok_prefix(&state),
         redirect_uri,
         port,
         code_verifier.is_some(),
-        url,
     );
 
     Ok((url, listener, code_verifier, state))
@@ -437,13 +422,10 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         </body></html>";
     stream.write_all(response.as_bytes()).ok();
 
+    // Don't log the authorization `code` or `state` — both are secrets.
     log::info!(
-        "OAuth2: received callback code={} state={} other_keys={:?}",
-        tok_prefix(&code),
-        state
-            .as_deref()
-            .map(tok_prefix)
-            .unwrap_or_else(|| "<missing>".into()),
+        "OAuth2: received callback has_state={} other_keys={:?}",
+        state.is_some(),
         query_params
             .keys()
             .filter(|k| k.as_str() != "code" && k.as_str() != "state")
@@ -481,15 +463,19 @@ pub async fn exchange_code(
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
+    // Don't log `code` or `code_verifier` — both are single-use secrets.
     log::info!(
-        "OAuth2[{}]: exchange_code POST {} client_id={} redirect_uri={} code={} pkce={} client_secret={}",
+        "OAuth2[{}]: exchange_code POST {} client_id={} redirect_uri={} pkce={} client_secret={}",
         provider.name,
         provider.token_url,
         provider.client_id,
         params.get("redirect_uri").cloned().unwrap_or_default(),
-        tok_prefix(code),
-        code_verifier.map(tok_prefix).unwrap_or_else(|| "<none>".into()),
-        if provider.client_secret.is_empty() { "<none>" } else { "<set>" },
+        code_verifier.is_some(),
+        if provider.client_secret.is_empty() {
+            "<none>"
+        } else {
+            "<set>"
+        },
     );
 
     let client = reqwest::Client::new();
@@ -539,14 +525,12 @@ pub async fn exchange_code(
     let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
     let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
+    // Don't log access / refresh tokens — log only whether a refresh token
+    // was issued and the access token's lifetime.
     log::info!(
-        "OAuth2[{}]: exchange_code OK access={} refresh={} expires_in={}s",
+        "OAuth2[{}]: exchange_code OK has_refresh={} expires_in={}s",
         provider.name,
-        tok_prefix(&access_token),
-        refresh_token
-            .as_deref()
-            .map(tok_prefix)
-            .unwrap_or_else(|| "<none>".into()),
+        refresh_token.is_some(),
         expires_in,
     );
 
@@ -571,12 +555,12 @@ pub async fn refresh_access_token(
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
+    // Don't log the refresh token — it's a long-lived credential.
     log::info!(
-        "OAuth2[{}]: refresh_access_token POST {} client_id={} refresh={} client_secret={}",
+        "OAuth2[{}]: refresh_access_token POST {} client_id={} client_secret={}",
         provider.name,
         provider.token_url,
         provider.client_id,
-        tok_prefix(refresh_token),
         if provider.client_secret.is_empty() {
             "<none>"
         } else {
@@ -632,11 +616,11 @@ pub async fn refresh_access_token(
         .unwrap_or_else(|| refresh_token.to_string());
 
     let rotated = token_resp["refresh_token"].is_string();
+    // Don't log tokens — log only that refresh succeeded and whether the
+    // refresh token was rotated.
     log::info!(
-        "OAuth2[{}]: refresh OK access={} refresh={} rotated={} expires_in={}s",
+        "OAuth2[{}]: refresh OK rotated={} expires_in={}s",
         provider.name,
-        tok_prefix(&access_token),
-        tok_prefix(&new_refresh),
         rotated,
         expires_in,
     );
@@ -932,10 +916,10 @@ pub async fn device_auth_start(
         .await
         .map_err(|e| Error::Other(format!("Device auth response parse error: {}", e)))?;
 
+    // Don't log `device_code` (single-use secret used to poll the token
+    // endpoint) or `user_code` (one-time credential the user types in).
     log::info!(
-        "OIDC device flow: received device_code={} user_code={} verification_uri={} interval={}s expires_in={}s",
-        tok_prefix(&auth_resp.device_code),
-        auth_resp.user_code,
+        "OIDC device flow: received verification_uri={} interval={}s expires_in={}s",
         auth_resp.verification_uri,
         auth_resp.interval,
         auth_resp.expires_in,
@@ -1023,10 +1007,10 @@ pub async fn device_auth_poll(
             let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
             let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
+            // Don't log access / refresh tokens.
             log::info!(
-                "OIDC device flow: authorization complete access={} refresh={} expires_in={}s expires_at={}",
-                tok_prefix(&access_token),
-                refresh_token.as_deref().map(tok_prefix).unwrap_or_else(|| "<none>".into()),
+                "OIDC device flow: authorization complete has_refresh={} expires_in={}s expires_at={}",
+                refresh_token.is_some(),
                 expires_in,
                 expires_at,
             );
@@ -1087,11 +1071,11 @@ pub async fn refresh_token_dynamic(
     params.insert("refresh_token", refresh_token.to_string());
     params.insert("grant_type", "refresh_token".to_string());
 
+    // Don't log the refresh token.
     log::info!(
-        "OIDC: refresh_token_dynamic POST {} client_id={} refresh={}",
+        "OIDC: refresh_token_dynamic POST {} client_id={}",
         token_url,
         client_id,
-        tok_prefix(refresh_token),
     );
 
     let client = reqwest::Client::builder()
@@ -1113,11 +1097,10 @@ pub async fn refresh_token_dynamic(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         log::error!(
-            "OIDC: refresh error status={} token_url={} client_id={} refresh_prefix={} body={}",
+            "OIDC: refresh error status={} token_url={} client_id={} body={}",
             status,
             token_url,
             client_id,
-            tok_prefix(refresh_token),
             body,
         );
         return Err(Error::Other(format!("OIDC token refresh error: {}", body)));
@@ -1143,10 +1126,9 @@ pub async fn refresh_token_dynamic(
         .map(|s| s.to_string())
         .unwrap_or_else(|| refresh_token.to_string());
 
+    // Don't log access / refresh tokens.
     log::info!(
-        "OIDC: refresh OK access={} refresh={} rotated={} expires_in={}s",
-        tok_prefix(&access_token),
-        tok_prefix(&new_refresh),
+        "OIDC: refresh OK rotated={} expires_in={}s",
         rotated,
         expires_in,
     );
