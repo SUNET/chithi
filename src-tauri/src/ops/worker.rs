@@ -710,11 +710,21 @@ impl AccountWorker {
                 account_id_append,
                 e
             ),
-            Err(e) => log::warn!(
-                "Outbox replay: APPEND-to-Sent task panicked for account {}: {}",
-                account_id_append,
-                e
-            ),
+            Err(e) => {
+                let kind = if e.is_panic() {
+                    "panicked"
+                } else if e.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                log::warn!(
+                    "Outbox replay: APPEND-to-Sent task {} for account {}: {}",
+                    kind,
+                    account_id_append,
+                    e
+                );
+            }
         }
         Ok(())
     }

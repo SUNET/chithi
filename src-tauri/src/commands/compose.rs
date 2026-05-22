@@ -88,7 +88,10 @@ pub async fn send_message(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
-    let raw_message = smtp::build_raw_message(
+    // `raw_message` carries the inlined attachment bytes — wrap in `Arc`
+    // so the background spawn can share the buffer with the IMAP APPEND
+    // path without deep-cloning megabytes of MIME each send.
+    let raw_message: std::sync::Arc<[u8]> = smtp::build_raw_message(
         &account.email,
         &message.to,
         &message.cc,
@@ -99,7 +102,8 @@ pub async fn send_message(
         &attachment_data,
         in_reply_to.as_deref(),
         &references,
-    )?;
+    )?
+    .into();
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
     let smtp_creds =
@@ -243,8 +247,10 @@ pub async fn send_message(
                 // populate Sent server-side. Failures here MUST NOT
                 // propagate — the message has been delivered, and a
                 // retried send would duplicate it for the recipient.
+                // Read-only lookup — use the pool's reader so we don't
+                // serialize on the single-writer mutex.
                 let sent_folder_path = {
-                    let conn = db_bg.writer().await;
+                    let conn = db_bg.reader();
                     crate::db::folders::folder_path_by_type(&conn, &account_id_bg, "sent")
                         .ok()
                         .flatten()
@@ -257,7 +263,10 @@ pub async fn send_message(
                     use_tls: account.use_tls,
                     use_xoauth2,
                 };
-                let raw_for_append = raw_message.clone();
+                // `Arc::clone` of `Arc<[u8]>` is a refcount bump — does
+                // not duplicate the inlined-attachment bytes (which can
+                // be many MB on a send with large attachments).
+                let raw_for_append = std::sync::Arc::clone(&raw_message);
                 let account_id_append = account_id_bg.clone();
                 let append_result = tokio::task::spawn_blocking(move || {
                     crate::mail::imap::append_message_to_sent(
@@ -298,11 +307,21 @@ pub async fn send_message(
                         account_id_append,
                         e
                     ),
-                    Err(e) => log::warn!(
-                        "APPEND-to-Sent task panicked for account {}: {}",
-                        account_id_append,
-                        e
-                    ),
+                    Err(e) => {
+                        let kind = if e.is_panic() {
+                            "panicked"
+                        } else if e.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        log::warn!(
+                            "APPEND-to-Sent task {} for account {}: {}",
+                            kind,
+                            account_id_append,
+                            e
+                        );
+                    }
                 }
             }
             Ok(())

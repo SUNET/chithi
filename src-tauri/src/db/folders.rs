@@ -340,9 +340,14 @@ pub fn folder_path_by_type(
     folder_type: &str,
 ) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
+    // `ORDER BY id` keeps the choice stable when an account ends up with
+    // more than one folder tagged for the same role (e.g. a server-side
+    // rename leaves both the old and new Sent boxes classified). The
+    // first inserted wins, which lines up with sync's insertion order.
     let path = conn
         .query_row(
-            "SELECT path FROM folders WHERE account_id = ?1 AND folder_type = ?2 LIMIT 1",
+            "SELECT path FROM folders WHERE account_id = ?1 AND folder_type = ?2 \
+             ORDER BY id LIMIT 1",
             params![account_id, folder_type],
             |row| row.get::<_, String>(0),
         )

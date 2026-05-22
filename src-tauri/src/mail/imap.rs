@@ -854,16 +854,26 @@ pub fn append_message_to_sent(
     raw_message: &[u8],
 ) -> Result<String> {
     let mut conn = ImapConnection::connect(config)?;
-    let candidates: Vec<String> = match sent_folder_path {
-        Some(p) => vec![p.to_string()],
-        None => vec![
-            "Sent".to_string(),
-            "INBOX.Sent".to_string(),
-            "Sent Items".to_string(),
-            "Sent Messages".to_string(),
-            "[Gmail]/Sent Mail".to_string(),
-        ],
-    };
+    // Cached path first (preferred — picked up by sync from SPECIAL-USE
+    // or name heuristics), then the common fallbacks. The fallback walk
+    // covers the case where the cached path is stale or wrong: an
+    // account that was renamed server-side, or first-sync edge cases
+    // where the cache lists an outdated path.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = sent_folder_path {
+        candidates.push(p.to_string());
+    }
+    for fallback in [
+        "Sent",
+        "INBOX.Sent",
+        "Sent Items",
+        "Sent Messages",
+        "[Gmail]/Sent Mail",
+    ] {
+        if !candidates.iter().any(|c| c == fallback) {
+            candidates.push(fallback.to_string());
+        }
+    }
     let mut last_err: Option<Error> = None;
     for folder in candidates {
         match conn.append_sent_message(&folder, raw_message) {
