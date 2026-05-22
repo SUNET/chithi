@@ -64,11 +64,34 @@ pub async fn get_jmap_oidc_token(
         return Ok(None);
     }
 
+    log::info!(
+        "OIDC[get_jmap_oidc_token]: account={} token_endpoint={} client_id={}",
+        account.id,
+        account.oidc_token_endpoint,
+        account.oidc_client_id,
+    );
+
     let tokens = crate::oauth::load_tokens(&account.id)?.ok_or_else(|| {
+        log::error!(
+            "OIDC[get_jmap_oidc_token]: no tokens in keyring for account {}",
+            account.id
+        );
         crate::error::Error::Other("No OIDC tokens found. Please sign in again.".into())
     })?;
 
-    if !tokens.is_expired() {
+    let now = chrono::Utc::now().timestamp();
+    let expired = tokens.is_expired();
+    log::info!(
+        "OIDC[get_jmap_oidc_token]: account={} loaded access={} refresh={} expires_at={:?} now={} expired={}",
+        account.id,
+        crate::oauth::tok_prefix_pub(&tokens.access_token),
+        tokens.refresh_token.as_deref().map(crate::oauth::tok_prefix_pub).unwrap_or_else(|| "<none>".into()),
+        tokens.expires_at,
+        now,
+        expired,
+    );
+
+    if !expired {
         return Ok(Some(tokens.access_token));
     }
 
@@ -94,6 +117,10 @@ pub async fn get_jmap_oidc_token(
     )
     .await?;
     crate::oauth::store_tokens(&account.id, &new_tokens)?;
+    log::info!(
+        "OIDC[get_jmap_oidc_token]: account={} new tokens stored",
+        account.id
+    );
 
     Ok(Some(new_tokens.access_token))
 }
@@ -105,12 +132,34 @@ pub async fn refresh_jmap_oidc_token(
     oidc_token_endpoint: &str,
     oidc_client_id: &str,
 ) -> crate::error::Result<Option<String>> {
+    log::info!(
+        "OIDC[refresh_jmap_oidc_token]: account={} token_endpoint={} client_id={}",
+        account_id, oidc_token_endpoint, oidc_client_id
+    );
     let tokens = match crate::oauth::load_tokens(account_id)? {
         Some(tokens) => tokens,
-        None => return Ok(None),
+        None => {
+            log::warn!(
+                "OIDC[refresh_jmap_oidc_token]: no tokens for account {}",
+                account_id
+            );
+            return Ok(None);
+        }
     };
 
-    if !tokens.is_expired() {
+    let now = chrono::Utc::now().timestamp();
+    let expired = tokens.is_expired();
+    log::info!(
+        "OIDC[refresh_jmap_oidc_token]: account={} access={} refresh={} expires_at={:?} now={} expired={}",
+        account_id,
+        crate::oauth::tok_prefix_pub(&tokens.access_token),
+        tokens.refresh_token.as_deref().map(crate::oauth::tok_prefix_pub).unwrap_or_else(|| "<none>".into()),
+        tokens.expires_at,
+        now,
+        expired,
+    );
+
+    if !expired {
         return Ok(Some(tokens.access_token));
     }
 
@@ -127,6 +176,10 @@ pub async fn refresh_jmap_oidc_token(
         crate::oauth::refresh_token_dynamic(oidc_token_endpoint, &refresh_token, oidc_client_id)
             .await?;
     crate::oauth::store_tokens(account_id, &new_tokens)?;
+    log::info!(
+        "OIDC[refresh_jmap_oidc_token]: account={} new tokens stored",
+        account_id
+    );
 
     Ok(Some(new_tokens.access_token))
 }

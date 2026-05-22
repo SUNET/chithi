@@ -338,8 +338,19 @@ pub async fn meet_zoom_login_complete(
         .await
         .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))??;
 
+    log::info!(
+        "zoom oauth state validation: expected={} returned={}",
+        crate::oauth::tok_prefix_pub(&expected_state),
+        callback
+            .state
+            .as_deref()
+            .map(crate::oauth::tok_prefix_pub)
+            .unwrap_or_else(|| "<missing>".into()),
+    );
     match callback.state.as_deref() {
-        Some(s) if s == expected_state => {}
+        Some(s) if s == expected_state => {
+            log::info!("zoom oauth: state OK");
+        }
         Some(got) => {
             // The raw nonces are unguessable random strings — no
             // value to a human, and confusing in a UI toast.

@@ -111,11 +111,25 @@ pub async fn oauth_complete(
         .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
     // Validate CSRF state parameter
+    log::info!(
+        "OAuth2[{}]: state validation expected={} returned={}",
+        provider,
+        oauth::tok_prefix_pub(&expected_state),
+        result
+            .state
+            .as_deref()
+            .map(oauth::tok_prefix_pub)
+            .unwrap_or_else(|| "<missing>".into()),
+    );
     match result.state {
         Some(ref returned_state) if returned_state == &expected_state => {
             log::debug!("OAuth2: state parameter validated");
         }
         Some(ref returned_state) => {
+            log::error!(
+                "OAuth2[{}]: state MISMATCH expected_full={} returned_full={}",
+                provider, expected_state, returned_state
+            );
             return Err(Error::Other(format!(
                 "OAuth2 state mismatch (possible CSRF): expected={}, got={}",
                 expected_state, returned_state

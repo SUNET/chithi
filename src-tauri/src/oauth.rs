@@ -6,6 +6,21 @@ use std::net::TcpListener;
 
 use crate::error::{Error, Result};
 
+/// Truncate a secret to its first 8 chars for safe logging.
+/// Returns "<empty>" for empty input, or "<prefix>…<len=N>" otherwise.
+fn tok_prefix(s: &str) -> String {
+    if s.is_empty() {
+        return "<empty>".into();
+    }
+    let take = s.chars().take(8).collect::<String>();
+    format!("{}…<len={}>", take, s.len())
+}
+
+/// Public re-export of `tok_prefix` for use from other modules' logging.
+pub fn tok_prefix_pub(s: &str) -> String {
+    tok_prefix(s)
+}
+
 // ---------------------------------------------------------------------------
 // Provider configurations
 // ---------------------------------------------------------------------------
@@ -316,6 +331,16 @@ pub fn get_auth_url(
         url.push_str("&prompt=select_account");
     }
 
+    log::info!(
+        "OAuth2[{}]: get_auth_url generated state={} redirect_uri={} port={} pkce={} url={}",
+        provider.name,
+        tok_prefix(&state),
+        redirect_uri,
+        port,
+        code_verifier.is_some(),
+        url,
+    );
+
     Ok((url, listener, code_verifier, state))
 }
 
@@ -412,7 +437,12 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         </body></html>";
     stream.write_all(response.as_bytes()).ok();
 
-    log::info!("OAuth2: received authorization code");
+    log::info!(
+        "OAuth2: received callback code={} state={} other_keys={:?}",
+        tok_prefix(&code),
+        state.as_deref().map(tok_prefix).unwrap_or_else(|| "<missing>".into()),
+        query_params.keys().filter(|k| k.as_str() != "code" && k.as_str() != "state").collect::<Vec<_>>(),
+    );
     Ok(CallbackResult { code, state })
 }
 
@@ -445,16 +475,36 @@ pub async fn exchange_code(
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
+    log::info!(
+        "OAuth2[{}]: exchange_code POST {} client_id={} redirect_uri={} code={} pkce={} client_secret={}",
+        provider.name,
+        provider.token_url,
+        provider.client_id,
+        params.get("redirect_uri").cloned().unwrap_or_default(),
+        tok_prefix(code),
+        code_verifier.map(tok_prefix).unwrap_or_else(|| "<none>".into()),
+        if provider.client_secret.is_empty() { "<none>" } else { "<set>" },
+    );
+
     let client = reqwest::Client::new();
     let resp = client
         .post(provider.token_url)
         .form(&params)
         .send()
         .await
-        .map_err(|e| Error::Other(format!("Token exchange failed: {}", e)))?;
+        .map_err(|e| {
+            log::error!("OAuth2[{}]: exchange_code transport error: {}", provider.name, e);
+            Error::Other(format!("Token exchange failed: {}", e))
+        })?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    log::info!("OAuth2[{}]: exchange_code response status={}", provider.name, status);
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        log::error!(
+            "OAuth2[{}]: exchange_code error status={} body={}",
+            provider.name, status, body
+        );
         return Err(Error::Other(format!("Token exchange error: {}", body)));
     }
 
@@ -474,8 +524,11 @@ pub async fn exchange_code(
     let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
     log::info!(
-        "OAuth2: token exchange successful, expires in {}s",
-        expires_in
+        "OAuth2[{}]: exchange_code OK access={} refresh={} expires_in={}s",
+        provider.name,
+        tok_prefix(&access_token),
+        refresh_token.as_deref().map(tok_prefix).unwrap_or_else(|| "<none>".into()),
+        expires_in,
     );
 
     Ok(OAuthTokens {
@@ -499,16 +552,34 @@ pub async fn refresh_access_token(
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
+    log::info!(
+        "OAuth2[{}]: refresh_access_token POST {} client_id={} refresh={} client_secret={}",
+        provider.name,
+        provider.token_url,
+        provider.client_id,
+        tok_prefix(refresh_token),
+        if provider.client_secret.is_empty() { "<none>" } else { "<set>" },
+    );
+
     let client = reqwest::Client::new();
     let resp = client
         .post(provider.token_url)
         .form(&params)
         .send()
         .await
-        .map_err(|e| Error::Other(format!("Token refresh failed: {}", e)))?;
+        .map_err(|e| {
+            log::error!("OAuth2[{}]: refresh transport error: {}", provider.name, e);
+            Error::Other(format!("Token refresh failed: {}", e))
+        })?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    log::info!("OAuth2[{}]: refresh response status={}", provider.name, status);
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        log::error!(
+            "OAuth2[{}]: refresh error status={} body={}",
+            provider.name, status, body
+        );
         return Err(Error::Other(format!("Token refresh error: {}", body)));
     }
 
@@ -525,13 +596,21 @@ pub async fn refresh_access_token(
     let expires_in = token_resp["expires_in"].as_i64().unwrap_or(3600);
     let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
-    log::info!("OAuth2: token refreshed, expires in {}s", expires_in);
-
     // Microsoft may rotate the refresh token — use the new one if provided
     let new_refresh = token_resp["refresh_token"]
         .as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(|| refresh_token.to_string());
+
+    let rotated = token_resp["refresh_token"].is_string();
+    log::info!(
+        "OAuth2[{}]: refresh OK access={} refresh={} rotated={} expires_in={}s",
+        provider.name,
+        tok_prefix(&access_token),
+        tok_prefix(&new_refresh),
+        rotated,
+        expires_in,
+    );
 
     Ok(OAuthTokens {
         access_token,
@@ -808,6 +887,10 @@ pub async fn device_auth_start(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        log::error!(
+            "OIDC device flow: device_auth_start error status={} body={}",
+            status, body
+        );
         return Err(Error::Other(format!(
             "Device auth endpoint returned {}: {}",
             status, body
@@ -820,8 +903,12 @@ pub async fn device_auth_start(
         .map_err(|e| Error::Other(format!("Device auth response parse error: {}", e)))?;
 
     log::info!(
-        "OIDC device flow: received user_code, verification_uri={}",
-        auth_resp.verification_uri
+        "OIDC device flow: received device_code={} user_code={} verification_uri={} interval={}s expires_in={}s",
+        tok_prefix(&auth_resp.device_code),
+        auth_resp.user_code,
+        auth_resp.verification_uri,
+        auth_resp.interval,
+        auth_resp.expires_in,
     );
 
     Ok(auth_resp)
@@ -907,8 +994,11 @@ pub async fn device_auth_poll(
             let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
             log::info!(
-                "OIDC device flow: authorization complete, expires in {}s",
-                expires_in
+                "OIDC device flow: authorization complete access={} refresh={} expires_in={}s expires_at={}",
+                tok_prefix(&access_token),
+                refresh_token.as_deref().map(tok_prefix).unwrap_or_else(|| "<none>".into()),
+                expires_in,
+                expires_at,
             );
 
             return Ok(OAuthTokens {
@@ -967,6 +1057,13 @@ pub async fn refresh_token_dynamic(
     params.insert("refresh_token", refresh_token.to_string());
     params.insert("grant_type", "refresh_token".to_string());
 
+    log::info!(
+        "OIDC: refresh_token_dynamic POST {} client_id={} refresh={}",
+        token_url,
+        client_id,
+        tok_prefix(refresh_token),
+    );
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -976,10 +1073,23 @@ pub async fn refresh_token_dynamic(
         .form(&params)
         .send()
         .await
-        .map_err(|e| Error::Other(format!("OIDC token refresh failed: {}", e)))?;
+        .map_err(|e| {
+            log::error!("OIDC: refresh transport error: {}", e);
+            Error::Other(format!("OIDC token refresh failed: {}", e))
+        })?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    log::info!("OIDC: refresh response status={}", status);
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        log::error!(
+            "OIDC: refresh error status={} token_url={} client_id={} refresh_prefix={} body={}",
+            status,
+            token_url,
+            client_id,
+            tok_prefix(refresh_token),
+            body,
+        );
         return Err(Error::Other(format!("OIDC token refresh error: {}", body)));
     }
 
@@ -997,12 +1107,19 @@ pub async fn refresh_token_dynamic(
     let expires_at = chrono::Utc::now().timestamp() + expires_in;
 
     // IdP may rotate the refresh token
+    let rotated = token_resp["refresh_token"].is_string();
     let new_refresh = token_resp["refresh_token"]
         .as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(|| refresh_token.to_string());
 
-    log::info!("OIDC: token refreshed, expires in {}s", expires_in);
+    log::info!(
+        "OIDC: refresh OK access={} refresh={} rotated={} expires_in={}s",
+        tok_prefix(&access_token),
+        tok_prefix(&new_refresh),
+        rotated,
+        expires_in,
+    );
 
     Ok(OAuthTokens {
         access_token,
