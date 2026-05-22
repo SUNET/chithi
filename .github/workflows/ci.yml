@@ -22,6 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pcscd libpcsclite-dev pcsc-tools pkgconf
+
       - name: Setup pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -53,6 +58,9 @@ jobs:
       # check/clippy/test because tauri links against webkit2gtk at compile.
       # gnome-keyring + dbus-x11 are needed by the db::accounts tests, which
       # round-trip passwords through the real OS Secret Service.
+      # libpcsclite-dev is needed by pcsc-sys, pulled in transitively by
+      # libtumpa for OpenPGP smartcard support; its build script fails the
+      # whole compile if libpcsclite.pc is missing.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -62,6 +70,7 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            libpcsclite-dev \
             build-essential \
             pkg-config \
             gnome-keyring \
