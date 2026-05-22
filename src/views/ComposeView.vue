@@ -45,6 +45,27 @@ interface ComposeE2EBridge {
 const accounts = ref<Account[]>([]);
 const initialAccountId = (route.query.accountId as string) || "";
 
+// Whether `email` has a usable OpenPGP signing key in the keystore — a
+// secret key, or a key linked to a connected card. Gates the
+// reply-to-encrypted Sign default (see openComposeWindow's pgpSign) so
+// the composer never opens with a Sign toggle the send path can't honour.
+async function accountCanSign(email: string): Promise<boolean> {
+  const target = email.trim().toLowerCase();
+  if (!target) return false;
+  try {
+    const keys = await api.pgpListKeys();
+    return keys.some(
+      (k) =>
+        (k.isSecret || k.cardIdents.length > 0) &&
+        !k.isRevoked &&
+        k.userIds.some((u) => (u.email ?? "").trim().toLowerCase() === target),
+    );
+  } catch (e) {
+    console.error("PGP signing-capability check failed:", e);
+    return false;
+  }
+}
+
 onMounted(async () => {
   await pgpPrompts.start();
   // Try store first (works if opened in same window context)
@@ -78,6 +99,20 @@ onMounted(async () => {
   } else if (!error.value) {
     // Only set error if we didn't already fail to fetch
     error.value = "No accounts found. Please add an account first.";
+  }
+  // Reply to an encrypted message pre-arms the PGP toggles (see
+  // openComposeWindow's pgpEncrypt / pgpSign params). Encrypt is applied
+  // straight from the param; Sign is gated on the From account actually
+  // having a usable signing key, so the reply never opens with a Sign
+  // toggle the send path can't satisfy.
+  if (route.query.pgpEncrypt === "1") {
+    pgpEncrypt.value = true;
+  }
+  if (route.query.pgpSign === "1" && selectedAccountId.value) {
+    const acct = accounts.value.find((a) => a.id === selectedAccountId.value);
+    if (acct && (await accountCanSign(acct.email))) {
+      pgpSign.value = true;
+    }
   }
   // Resume a saved draft, if this composer was opened for one.
   if (isResumingDraft && selectedAccountId.value) {

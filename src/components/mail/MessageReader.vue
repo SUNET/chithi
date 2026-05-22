@@ -548,10 +548,37 @@ async function saveContactForm() {
 
 // --- Message actions ---
 
+// Content the reply/forward quote is built from. When the message was
+// decrypted in the reader, use the decrypted plaintext and the recovered
+// real subject: the stored copy of an encrypted message carries only the
+// ciphertext placeholder body and, for protected-headers mail, a "..."
+// placeholder subject.
+function effectiveBodyText(): string {
+  return (
+    decryptedOverlay.value?.body_text ??
+    messagesStore.activeMessage?.body_text ??
+    ""
+  );
+}
+
+function effectiveSubject(): string {
+  return (
+    decryptedOverlay.value?.subject ??
+    messagesStore.activeMessage?.subject ??
+    ""
+  );
+}
+
+/** True when the open message arrived PGP-encrypted, so a reply to it
+ *  should itself default to encrypted (and signed). */
+function repliedMessageWasEncrypted(): boolean {
+  return pgpKind.value === "mimeEncrypted" || pgpKind.value === "inlineArmor";
+}
+
 function quoteBody(): string {
   const msg = messagesStore.activeMessage;
   if (!msg) return "";
-  const text = msg.body_text || "";
+  const text = effectiveBodyText();
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
@@ -567,12 +594,18 @@ function quoteBody(): string {
 function reply() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
+  const subject = effectiveSubject();
+  // Replying to an encrypted message defaults the reply to sign+encrypt
+  // (ComposeView still gates Sign on the account having a signing key).
+  const encrypted = repliedMessageWasEncrypted();
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: msg.from.email,
-    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
     body: quoteBody(),
+    pgpEncrypt: encrypted,
+    pgpSign: encrypted,
   });
 }
 
@@ -585,29 +618,34 @@ function replyAll() {
     ...msg.to.map((a) => a.email).filter((e) => e !== myEmail),
   ];
   const allCc = msg.cc.map((a) => a.email).filter((e) => e !== myEmail);
+  const subject = effectiveSubject();
+  const encrypted = repliedMessageWasEncrypted();
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: allTo.join(", "),
     cc: allCc.join(", "),
-    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
     body: quoteBody(),
+    pgpEncrypt: encrypted,
+    pgpSign: encrypted,
   });
 }
 
 function forward() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
-  const text = msg.body_text || "";
+  const text = effectiveBodyText();
+  const subject = effectiveSubject();
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
   const toStr = msg.to.map((a) => a.name || a.email).join(", ");
-  const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${msg.subject || ""}\nTo: ${toStr}\n\n`;
+  const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${subject}\nTo: ${toStr}\n\n`;
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
-    subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
+    subject: subject.startsWith("Fwd:") ? subject : `Fwd: ${subject}`,
     body: `\n\n${fwdHeader}${text}`,
   });
 }
