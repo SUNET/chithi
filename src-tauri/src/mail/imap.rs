@@ -831,7 +831,8 @@ pub fn search_account_blocking(
 }
 
 /// Open an IMAP session and APPEND `raw_message` to the account's Sent
-/// folder, marking it `\Seen`.
+/// folder, marking it `\Seen`. Returns the folder path that succeeded
+/// so the caller can nudge a targeted sync on it.
 ///
 /// Tries `sent_folder_path` first when supplied (from the local folder
 /// cache), then walks a list of common Sent-folder names — covering
@@ -851,24 +852,24 @@ pub fn append_message_to_sent(
     config: &ImapConfig,
     sent_folder_path: Option<&str>,
     raw_message: &[u8],
-) -> Result<()> {
+) -> Result<String> {
     let mut conn = ImapConnection::connect(config)?;
-    let candidates: Vec<&str> = match sent_folder_path {
-        Some(p) => vec![p],
+    let candidates: Vec<String> = match sent_folder_path {
+        Some(p) => vec![p.to_string()],
         None => vec![
-            "Sent",
-            "INBOX.Sent",
-            "Sent Items",
-            "Sent Messages",
-            "[Gmail]/Sent Mail",
+            "Sent".to_string(),
+            "INBOX.Sent".to_string(),
+            "Sent Items".to_string(),
+            "Sent Messages".to_string(),
+            "[Gmail]/Sent Mail".to_string(),
         ],
     };
     let mut last_err: Option<Error> = None;
     for folder in candidates {
-        match conn.append_sent_message(folder, raw_message) {
+        match conn.append_sent_message(&folder, raw_message) {
             Ok(()) => {
                 conn.logout();
-                return Ok(());
+                return Ok(folder);
             }
             Err(e) => {
                 log::debug!("APPEND to Sent candidate '{}' failed: {}", folder, e);

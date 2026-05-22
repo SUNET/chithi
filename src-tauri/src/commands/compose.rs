@@ -188,6 +188,10 @@ pub async fn send_message(
     let account_id_bg = account_id.clone();
     let subject_bg = subject_display.clone();
     let db_bg = state.db.clone();
+    // Capture the worker's op-sender now so the spawn can enqueue a
+    // Sent-folder sync after a successful APPEND (#189). `state` is
+    // not `'static`, so the sender must be cloned out before the move.
+    let op_sender_bg = state.get_op_sender(&account_id, &app);
     let recipients: Vec<String> = message
         .to
         .iter()
@@ -264,10 +268,31 @@ pub async fn send_message(
                 })
                 .await;
                 match append_result {
-                    Ok(Ok(())) => log::info!(
-                        "Sent message APPENDed to Sent folder for account {}",
-                        account_id_append
-                    ),
+                    Ok(Ok(sent_folder)) => {
+                        log::info!(
+                            "APPENDed sent message to '{}' for account {}",
+                            sent_folder,
+                            account_id_append
+                        );
+                        // Nudge a targeted sync so the freshly-APPENDed
+                        // message shows up in the UI immediately instead
+                        // of waiting for the next scheduled sync.
+                        let send_res = op_sender_bg
+                            .send(crate::ops::queue::OpEntry {
+                                op: crate::ops::queue::MailOp::SyncFolder {
+                                    folder_path: sent_folder,
+                                },
+                                priority: crate::ops::queue::OpPriority::User,
+                            })
+                            .await;
+                        if let Err(e) = send_res {
+                            log::warn!(
+                                "Failed to queue Sent-folder sync for account {}: {}",
+                                account_id_append,
+                                e
+                            );
+                        }
+                    }
                     Ok(Err(e)) => log::warn!(
                         "Sent delivered but APPEND to Sent failed for account {}: {}",
                         account_id_append,

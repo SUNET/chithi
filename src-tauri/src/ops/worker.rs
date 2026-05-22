@@ -683,10 +683,28 @@ impl AccountWorker {
         })
         .await;
         match append_result {
-            Ok(Ok(())) => log::info!(
-                "Outbox replay: APPENDed sent message to Sent for account {}",
-                account_id_append
-            ),
+            Ok(Ok(sent_folder)) => {
+                log::info!(
+                    "Outbox replay: APPENDed sent message to '{}' for account {}",
+                    sent_folder,
+                    account_id_append
+                );
+                // Nudge a targeted sync of the Sent folder so the
+                // freshly-APPENDed message surfaces in the UI without
+                // waiting for the next scheduled sync.
+                if let Err(e) = self
+                    .execute_sync(MailOp::SyncFolder {
+                        folder_path: sent_folder,
+                    })
+                    .await
+                {
+                    log::warn!(
+                        "Outbox replay: Sent-folder sync nudge failed for account {}: {}",
+                        account_id_append,
+                        e
+                    );
+                }
+            }
             Ok(Err(e)) => log::warn!(
                 "Outbox replay: delivered but APPEND to Sent failed for account {}: {}",
                 account_id_append,
