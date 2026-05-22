@@ -485,12 +485,10 @@ impl ImapConnection {
 
         // 1. Copy messages to destination
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session
-            .uid_copy(&uid_set, &quoted_dest)
-            .map_err(|e| {
-                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-            })?;
+        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
+            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+        })?;
         log::debug!("IMAP COPY to '{}' succeeded", dest_folder);
 
         // 2. Mark originals as deleted
@@ -648,12 +646,10 @@ impl ImapConnection {
         );
 
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session
-            .uid_copy(&uid_set, &quoted_dest)
-            .map_err(|e| {
-                log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-                Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-            })?;
+        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
+            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
+            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
+        })?;
 
         log::info!(
             "IMAP copy complete: {} messages copied to '{}'",
