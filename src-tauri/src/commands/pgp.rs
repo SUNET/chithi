@@ -387,11 +387,11 @@ struct SecretPromptPayload<'a> {
 /// so the IPC buffer becomes the only allocation that can leak — and
 /// that's owned by Tauri's IPC pipeline, not us.
 ///
-/// The secret is unconditionally added to the in-memory cache. The cache
-/// lives for the lifetime of the process: closing the app drops the
-/// `CredentialCache` and zeroizes every entry. Nothing touches disk. To
-/// drop a stale entry mid-session use `pgp_forget_all` / `pgp_forget_card`,
-/// or rely on the auth-failure eviction in `apply_pgp_envelope`.
+/// This command is a pure relay: it just hands the secret back to the
+/// waiting `acquire_secret` through the oneshot. Caching — whether into
+/// the `tcli` agent or the in-process `CredentialCache` — is decided by
+/// `acquire_secret` once it receives the value, so the agent-vs-local
+/// policy lives in exactly one place.
 #[tauri::command]
 pub async fn pgp_provide_secret(
     state: State<'_, AppState>,
@@ -399,14 +399,6 @@ pub async fn pgp_provide_secret(
     value: String,
 ) -> Result<()> {
     let secret = Zeroizing::new(value);
-    // Snapshot the target *before* removing the pending entry — once
-    // popped we lose the registration's target.
-    let target_for_cache: Option<String> = state
-        .pgp_pending_secrets
-        .lock()
-        .expect("pgp pending secrets mutex poisoned")
-        .get(&request_id)
-        .map(|p| p.target.clone());
     let entry = state
         .pgp_pending_secrets
         .lock()
@@ -417,13 +409,6 @@ pub async fn pgp_provide_secret(
         // answered). Treat as a no-op so the dialog can close cleanly.
         return Ok(());
     };
-    if let Some(target) = target_for_cache {
-        state
-            .pgp_cache
-            .lock()
-            .expect("pgp cache mutex poisoned")
-            .store(&target, secret.clone());
-    }
     let _ = pending.tx.send(Some(secret));
     Ok(())
 }
@@ -465,50 +450,118 @@ pub async fn pgp_forget_card(state: State<'_, AppState>, ident: String) -> Resul
     Ok(())
 }
 
-/// Acquire a secret for `target`. Checks the cache first; if absent,
-/// emits `pgp-secret-needed` and awaits the frontend response.
+/// Acquire a secret (passphrase or PIN) for `target`.
+///
+/// Lookup order:
+///
+///  1. **`tcli` agent.** When `agent_key` is `Some` and the agent is
+///     running, `GET_PASSPHRASE` it. A hit returns immediately; a miss
+///     means "agent up, just not cached" — we prompt, then write the
+///     collected secret back with `PUT_PASSPHRASE`. While the agent is
+///     reachable it is the *sole* cache: we do NOT also populate the
+///     in-process `CredentialCache`, so the agent's TTL governs expiry
+///     and a key unlocked in any Tumpa tool is shared.
+///  2. **In-process cache.** When the agent is unreachable — or
+///     `agent_key` is `None`, e.g. an unlinked smartcard whose ident
+///     could not be resolved to a fingerprint — fall back to chithi's
+///     own `CredentialCache`, exactly as before the agent integration.
+///  3. **Prompt.** On a miss in whichever cache applies, emit
+///     `pgp-secret-needed` and await the user's dialog input.
+///
+/// `agent_key` is the namespaced agent cache key (`passphrase:<FP>` /
+/// `pin:<FP>`, built via `mail::pgp_agent`); `target` is the in-process
+/// cache key (a fingerprint for passphrases, a card ident for PINs). The
+/// two differ because chithi and `tcli` historically key their caches
+/// differently.
 ///
 /// `origin_window` routes the prompt to a single webview. When `Some`,
 /// only the window with that label receives the event (compose-triggered
 /// sends → compose window; reader-triggered decrypts → main window).
 /// When `None` (e.g. background card-link tasks with no originating
 /// window) the event is broadcast to every webview as a fallback.
-///
 /// Without this routing the dialog renders in BOTH App.vue and
-/// ComposeView.vue at the same time, which the user perceives as being
-/// asked for the PIN twice.
+/// ComposeView.vue at once, which the user perceives as being asked for
+/// the PIN twice.
 ///
-/// Reusable by the sign/decrypt closures in phases C and D. Not a
-/// `#[tauri::command]` — it's an internal helper.
+/// Not a `#[tauri::command]` — it's an internal helper reused by the
+/// sign/decrypt paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn acquire_secret(
     app: &tauri::AppHandle,
     pending: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingSecret>>>,
     cache: Arc<std::sync::Mutex<libtumpa::cache::CredentialCache>>,
     kind: SecretKind,
     target: &str,
+    agent_key: Option<&str>,
     reason: &str,
     origin_window: Option<&str>,
 ) -> Result<Zeroizing<String>> {
-    if let Some(cached) = cache
-        .lock()
-        .expect("pgp cache mutex poisoned")
-        .get(target)
-        .cloned()
-    {
-        return Ok(cached);
+    use crate::mail::pgp_agent::{self, AgentLookup};
+
+    // 1. Try the tcli agent first when we have a namespaced key for it.
+    let agent_up = if let Some(ak) = agent_key {
+        match pgp_agent::get(ak).await {
+            AgentLookup::Found(secret) => return Ok(secret),
+            AgentLookup::NotFound => true,
+            AgentLookup::Unavailable => false,
+        }
+    } else {
+        false
+    };
+
+    // 2. Agent down (or no agent key): consult the in-process cache.
+    if !agent_up {
+        if let Some(cached) = cache
+            .lock()
+            .expect("pgp cache mutex poisoned")
+            .get(target)
+            .cloned()
+        {
+            return Ok(cached);
+        }
     }
+
+    // 3. Prompt the user through chithi's own dialog.
+    let secret = prompt_via_dialog(app, &pending, kind, target, reason, origin_window).await?;
+
+    // 4. Cache the freshly-collected secret. When the agent is up it is
+    //    the single source of truth — write back so every Tumpa tool
+    //    benefits and the TTL governs expiry; only if that write fails
+    //    (the agent died between GET and PUT) keep a local copy so the
+    //    secret is not lost this session. When the agent is down, cache
+    //    in-process as before.
+    let stored_in_agent = if agent_up {
+        let ak = agent_key.expect("agent_up implies agent_key is Some");
+        pgp_agent::put(ak, &secret).await
+    } else {
+        false
+    };
+    if !stored_in_agent {
+        cache
+            .lock()
+            .expect("pgp cache mutex poisoned")
+            .store(target, secret.clone());
+    }
+    Ok(secret)
+}
+
+/// Emit `pgp-secret-needed` and await the frontend's response. Factored
+/// out of `acquire_secret` so the cache/agent policy and the raw prompt
+/// mechanics stay separable.
+async fn prompt_via_dialog(
+    app: &tauri::AppHandle,
+    pending: &Arc<std::sync::Mutex<std::collections::HashMap<String, PendingSecret>>>,
+    kind: SecretKind,
+    target: &str,
+    reason: &str,
+    origin_window: Option<&str>,
+) -> Result<Zeroizing<String>> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
     pending
         .lock()
         .expect("pgp pending secrets mutex poisoned")
-        .insert(
-            request_id.clone(),
-            PendingSecret {
-                tx,
-                target: target.to_string(),
-            },
-        );
+        .insert(request_id.clone(), PendingSecret { tx });
     let payload = SecretPromptPayload {
         request_id: &request_id,
         kind,
@@ -678,12 +731,14 @@ pub async fn pgp_decrypt_message(
     let origin = window.label().to_string();
     let result = if let Some((key_data, key_info)) = software_key {
         let fingerprint = key_info.fingerprint;
+        let agent_key = crate::mail::pgp_agent::passphrase_key(&fingerprint);
         let passphrase_str = acquire_secret(
             &app,
             state.pgp_pending_secrets.clone(),
             state.pgp_cache.clone(),
             SecretKind::Passphrase,
             &fingerprint,
+            Some(&agent_key),
             "Decrypt an OpenPGP message",
             Some(&origin),
         )
@@ -709,7 +764,7 @@ pub async fn pgp_decrypt_message(
         match join {
             Ok(r) => r,
             Err(e) => {
-                evict_cached_secret(&state.pgp_cache, &fingerprint);
+                evict_cached_secret(&state.pgp_cache, &fingerprint, Some(&agent_key));
                 return Err(lt_err(e));
             }
         }
@@ -736,6 +791,12 @@ pub async fn pgp_decrypt_message(
             ));
         };
         let ident = card.card.ident.clone();
+        // `tpass` / `tcli` key the card PIN by the card key's primary
+        // fingerprint — `libtumpa::decrypt::DecryptionCard.key_info`, the
+        // very struct `find_decryption_card` just returned. Use that exact
+        // value so the agent cache interoperates, with no dependency on
+        // the `card_keys` link table being populated on this machine.
+        let agent_key = crate::mail::pgp_agent::pin_key(&card.key_info.fingerprint);
         let key_data = card.key_data;
         let pin_str = acquire_secret(
             &app,
@@ -743,6 +804,7 @@ pub async fn pgp_decrypt_message(
             state.pgp_cache.clone(),
             SecretKind::Pin,
             &ident,
+            Some(&agent_key),
             "Decrypt an OpenPGP message",
             Some(&origin),
         )
@@ -770,7 +832,7 @@ pub async fn pgp_decrypt_message(
         match join {
             Ok(r) => r,
             Err(e) => {
-                evict_cached_secret(&state.pgp_cache, &ident);
+                evict_cached_secret(&state.pgp_cache, &ident, Some(&agent_key));
                 return Err(lt_err(e));
             }
         }
@@ -908,23 +970,38 @@ async fn load_raw_with_metadata(
     ))
 }
 
-/// Drop every cached secret. Called explicitly via `pgp_forget_all`; also
-/// invoked by `apply_pgp_envelope` when a cached PIN/passphrase produced a
-/// signing failure (so the user gets re-prompted instead of looping with
-/// the same wrong secret).
+/// Drop a stale secret after an authentication failure. Invoked by the
+/// decrypt path and `apply_pgp_envelope` when a cached PIN/passphrase
+/// produced a sign/encrypt/decrypt failure, so the user is re-prompted
+/// instead of looping with the same wrong secret.
 ///
-/// Note: there is no background TTL sweeper. The cache lives in memory for
-/// the lifetime of the process; closing the app drops the
-/// `CredentialCache` and the `Zeroizing<String>` values overwrite their
-/// backing buffers as they're dropped.
+/// Removes `target` from the in-process `CredentialCache` and, when
+/// `agent_key` is `Some`, also sends a targeted `CLEAR_PASSPHRASE` to the
+/// `tcli` agent — otherwise the next `GET_PASSPHRASE` would serve the
+/// wrong secret straight back. The CLEAR is fire-and-forget: a failure
+/// just means the agent is not running. This automatic failure path is
+/// the *only* place chithi clears the shared agent; the manual
+/// `pgp_forget_*` commands deliberately leave it untouched.
+///
+/// Note: there is no background TTL sweeper on the in-process cache. It
+/// lives in memory for the lifetime of the process; closing the app drops
+/// the `CredentialCache` and the `Zeroizing<String>` values overwrite
+/// their backing buffers as they're dropped.
 pub fn evict_cached_secret(
     cache: &Arc<std::sync::Mutex<libtumpa::cache::CredentialCache>>,
     target: &str,
+    agent_key: Option<&str>,
 ) {
     cache
         .lock()
         .expect("pgp cache mutex poisoned")
         .remove(target);
+    if let Some(ak) = agent_key {
+        let ak = ak.to_string();
+        tokio::spawn(async move {
+            crate::mail::pgp_agent::clear(&ak).await;
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,7 +1158,9 @@ mod tests {
                 Zeroizing::new(String::from("passphrase")),
             );
         }
-        super::evict_cached_secret(&cache, "0006:DEAD");
+        // `None` agent key: a plain `#[test]` has no tokio runtime, and
+        // this exercise is only about the in-process cache eviction.
+        super::evict_cached_secret(&cache, "0006:DEAD", None);
         let guard = cache.lock().expect("cache mutex");
         assert!(
             guard.get("0006:DEAD").is_none(),

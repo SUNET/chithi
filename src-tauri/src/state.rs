@@ -82,13 +82,12 @@ pub struct AppState {
 /// `pgp_provide_secret` (or `pgp_cancel_secret`). The held value is a
 /// `Zeroizing<String>` so any user-supplied secret zeroes on drop even if
 /// the consumer panics before consuming it.
+///
+/// Caching the collected secret (in the `tcli` agent or the in-process
+/// `CredentialCache`) is owned entirely by `acquire_secret` — this struct
+/// is now just the oneshot back-channel for the prompt.
 pub struct PendingSecret {
     pub tx: tokio::sync::oneshot::Sender<Option<zeroize::Zeroizing<String>>>,
-    /// The secret target this prompt was raised for — a key fingerprint
-    /// (for passphrases) or a card ident (for PINs). Used by
-    /// `pgp_provide_secret` to populate the credential cache when the
-    /// "remember" checkbox is set.
-    pub target: String,
 }
 
 /// One in-flight Matrix SSO login. Lives in

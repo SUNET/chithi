@@ -844,43 +844,56 @@ async fn apply_pgp_envelope(
         None,
     }
 
-    // Track which cache key the active secret lives under (card ident for
-    // PIN, fingerprint for passphrase). If signing/encryption fails the
-    // secret is wrong, so we evict it and the next retry re-prompts. With
-    // the always-cache policy this is the only path that drops a stale
-    // entry mid-session — without it, a single mistyped PIN would loop
-    // forever.
+    // Track which cache keys the active secret lives under: `cache_target`
+    // is the in-process `CredentialCache` key (card ident for a PIN,
+    // fingerprint for a passphrase); `agent_cache_key` is the namespaced
+    // `tcli` agent key (`pin:<FP>` / `passphrase:<FP>`), `None` when the
+    // agent cannot be addressed for this secret. If signing/encryption
+    // fails the secret is wrong, so `evict_cached_secret` drops it from
+    // both caches and the next retry re-prompts — without that a single
+    // mistyped PIN would loop forever.
     let mut cache_target: Option<String> = None;
+    let mut agent_cache_key: Option<String> = None;
     let signer_secret: SignerSecret = if !sign {
         SignerSecret::None
     } else if let Some(ref m) = card_match {
+        // `tpass` / `tcli` key the card PIN by the signer key's primary
+        // fingerprint (`KeyInfo.fingerprint`). Use the value chithi
+        // already resolved for the signer so the agent cache matches,
+        // with no dependency on the `card_keys` link table.
+        let agent_key = crate::mail::pgp_agent::pin_key(&signer_info.fingerprint);
         let pin_str = acquire_secret(
             app,
             state.pgp_pending_secrets.clone(),
             state.pgp_cache.clone(),
             SecretKind::Pin,
             &m.card.ident,
+            Some(&agent_key),
             reason,
             origin_window,
         )
         .await?;
         cache_target = Some(m.card.ident.clone());
+        agent_cache_key = Some(agent_key);
         SignerSecret::CardPin {
             pin: libtumpa::Pin::new(pin_str.as_bytes().to_vec()),
             ident: m.card.ident.clone(),
         }
     } else {
+        let agent_key = crate::mail::pgp_agent::passphrase_key(&signer_info.fingerprint);
         let pass_str = acquire_secret(
             app,
             state.pgp_pending_secrets.clone(),
             state.pgp_cache.clone(),
             SecretKind::Passphrase,
             &signer_info.fingerprint,
+            Some(&agent_key),
             reason,
             origin_window,
         )
         .await?;
         cache_target = Some(signer_info.fingerprint.clone());
+        agent_cache_key = Some(agent_key);
         SignerSecret::Passphrase(libtumpa::Passphrase::new(pass_str.to_string()))
     };
 
@@ -987,7 +1000,11 @@ async fn apply_pgp_envelope(
             Ok(bytes) => bytes,
             Err(e) => {
                 if let Some(t) = cache_target.as_deref() {
-                    crate::commands::pgp::evict_cached_secret(&state.pgp_cache, t);
+                    crate::commands::pgp::evict_cached_secret(
+                        &state.pgp_cache,
+                        t,
+                        agent_cache_key.as_deref(),
+                    );
                 }
                 return Err(Error::Other(format!("openpgp encrypt: {e}")));
             }
@@ -1042,7 +1059,11 @@ async fn apply_pgp_envelope(
             Ok(d) => d,
             Err(e) => {
                 if let Some(t) = cache_target.as_deref() {
-                    crate::commands::pgp::evict_cached_secret(&state.pgp_cache, t);
+                    crate::commands::pgp::evict_cached_secret(
+                        &state.pgp_cache,
+                        t,
+                        agent_cache_key.as_deref(),
+                    );
                 }
                 return Err(Error::Other(format!("openpgp sign: {e}")));
             }
