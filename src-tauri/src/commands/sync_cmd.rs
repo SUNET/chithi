@@ -134,7 +134,9 @@ pub async fn refresh_jmap_oidc_token(
 ) -> crate::error::Result<Option<String>> {
     log::info!(
         "OIDC[refresh_jmap_oidc_token]: account={} token_endpoint={} client_id={}",
-        account_id, oidc_token_endpoint, oidc_client_id
+        account_id,
+        oidc_token_endpoint,
+        oidc_client_id
     );
     let tokens = match crate::oauth::load_tokens(account_id)? {
         Some(tokens) => tokens,

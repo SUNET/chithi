@@ -440,8 +440,14 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
     log::info!(
         "OAuth2: received callback code={} state={} other_keys={:?}",
         tok_prefix(&code),
-        state.as_deref().map(tok_prefix).unwrap_or_else(|| "<missing>".into()),
-        query_params.keys().filter(|k| k.as_str() != "code" && k.as_str() != "state").collect::<Vec<_>>(),
+        state
+            .as_deref()
+            .map(tok_prefix)
+            .unwrap_or_else(|| "<missing>".into()),
+        query_params
+            .keys()
+            .filter(|k| k.as_str() != "code" && k.as_str() != "state")
+            .collect::<Vec<_>>(),
     );
     Ok(CallbackResult { code, state })
 }
@@ -493,17 +499,27 @@ pub async fn exchange_code(
         .send()
         .await
         .map_err(|e| {
-            log::error!("OAuth2[{}]: exchange_code transport error: {}", provider.name, e);
+            log::error!(
+                "OAuth2[{}]: exchange_code transport error: {}",
+                provider.name,
+                e
+            );
             Error::Other(format!("Token exchange failed: {}", e))
         })?;
 
     let status = resp.status();
-    log::info!("OAuth2[{}]: exchange_code response status={}", provider.name, status);
+    log::info!(
+        "OAuth2[{}]: exchange_code response status={}",
+        provider.name,
+        status
+    );
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         log::error!(
             "OAuth2[{}]: exchange_code error status={} body={}",
-            provider.name, status, body
+            provider.name,
+            status,
+            body
         );
         return Err(Error::Other(format!("Token exchange error: {}", body)));
     }
@@ -527,7 +543,10 @@ pub async fn exchange_code(
         "OAuth2[{}]: exchange_code OK access={} refresh={} expires_in={}s",
         provider.name,
         tok_prefix(&access_token),
-        refresh_token.as_deref().map(tok_prefix).unwrap_or_else(|| "<none>".into()),
+        refresh_token
+            .as_deref()
+            .map(tok_prefix)
+            .unwrap_or_else(|| "<none>".into()),
         expires_in,
     );
 
@@ -558,7 +577,11 @@ pub async fn refresh_access_token(
         provider.token_url,
         provider.client_id,
         tok_prefix(refresh_token),
-        if provider.client_secret.is_empty() { "<none>" } else { "<set>" },
+        if provider.client_secret.is_empty() {
+            "<none>"
+        } else {
+            "<set>"
+        },
     );
 
     let client = reqwest::Client::new();
@@ -573,12 +596,18 @@ pub async fn refresh_access_token(
         })?;
 
     let status = resp.status();
-    log::info!("OAuth2[{}]: refresh response status={}", provider.name, status);
+    log::info!(
+        "OAuth2[{}]: refresh response status={}",
+        provider.name,
+        status
+    );
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         log::error!(
             "OAuth2[{}]: refresh error status={} body={}",
-            provider.name, status, body
+            provider.name,
+            status,
+            body
         );
         return Err(Error::Other(format!("Token refresh error: {}", body)));
     }
@@ -889,7 +918,8 @@ pub async fn device_auth_start(
         let body = resp.text().await.unwrap_or_default();
         log::error!(
             "OIDC device flow: device_auth_start error status={} body={}",
-            status, body
+            status,
+            body
         );
         return Err(Error::Other(format!(
             "Device auth endpoint returned {}: {}",

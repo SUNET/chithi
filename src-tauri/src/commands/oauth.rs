@@ -128,7 +128,9 @@ pub async fn oauth_complete(
         Some(ref returned_state) => {
             log::error!(
                 "OAuth2[{}]: state MISMATCH expected_full={} returned_full={}",
-                provider, expected_state, returned_state
+                provider,
+                expected_state,
+                returned_state
             );
             return Err(Error::Other(format!(
                 "OAuth2 state mismatch (possible CSRF): expected={}, got={}",
