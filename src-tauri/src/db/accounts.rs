@@ -336,6 +336,26 @@ impl AccountFull {
             self.smtp_host = c.smtp_host;
             self.smtp_port = c.smtp_port;
             self.use_tls = c.use_tls;
+        } else if self.mail_protocol == "graph" {
+            // O365 (Graph): everything — sync, calendar, contacts — runs
+            // over the Graph API, EXCEPT outgoing mail, which still goes
+            // over SMTP+XOAUTH2 (see ADR 0025 / commit cb08a43). The
+            // `mail/graph` binding carries no IMAP/SMTP host, so the SMTP
+            // endpoint is the fixed Microsoft relay rather than a stored
+            // config field: `smtp.office365.com:587` (STARTTLS — forced by
+            // `smtp::build_transport` on port 587, so `use_tls` is moot).
+            //
+            // Without this branch a Graph account's `smtp_host` stays
+            // empty and every send dials a blank host, failing with
+            // "No address associated with hostname". This regressed when
+            // dispatch reads moved to service_bindings (phase 2) — the
+            // graph binding never stored the SMTP coordinates the legacy
+            // `smtp_host` column used to hold.
+            self.imap_host = String::new();
+            self.imap_port = 993;
+            self.smtp_host = "smtp.office365.com".to_string();
+            self.smtp_port = 587;
+            self.use_tls = true;
         } else {
             // Sensible defaults for non-IMAP accounts.
             self.imap_host = String::new();
@@ -814,6 +834,36 @@ mod tests {
         assert_eq!(full.smtp_port, 587);
         assert_eq!(full.username, "user");
         assert!(full.use_tls);
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: O365 (Graph) accounts sync over the Graph API but
+    /// still SEND mail over SMTP+XOAUTH2. Their `mail/graph` binding
+    /// carries no SMTP host, so `populate_legacy_from_bindings` must
+    /// supply the fixed Microsoft relay (`smtp.office365.com:587`).
+    /// Without it `smtp_host` is empty and every send dials a blank
+    /// host — "No address associated with hostname". This regressed
+    /// when dispatch reads moved to service_bindings (phase 2).
+    #[test]
+    fn test_get_account_full_graph_account_keeps_o365_smtp_host() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@outlook.com", "Kushal");
+        config.provider = "o365".to_string();
+        config.mail_protocol = "graph".to_string();
+        // O365 accounts have no IMAP host; the broken binding carried
+        // no SMTP host either.
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(full.mail_protocol, "graph");
+        assert_eq!(
+            full.smtp_host, "smtp.office365.com",
+            "Graph accounts must fall back to the O365 SMTP relay for sending"
+        );
+        assert_eq!(full.smtp_port, 587);
         crate::keyring::delete_password(&id).ok();
     }
 

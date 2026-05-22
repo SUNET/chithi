@@ -54,6 +54,23 @@ fn build_body(
     Ok(mixed)
 }
 
+/// Build a Message-ID for an outgoing message, with the sender's own
+/// domain as the right-hand side.
+///
+/// lettre's `message_id(None)` fills the domain via `hostname::get()` —
+/// the local machine name (e.g. `ubuntu24`). That leaks the host
+/// machine's name onto the wire and, being a non-routable token, is a
+/// mild spam signal at strict receivers. RFC 5322 §3.6.4 only requires
+/// the id be globally unique; the sender's domain is the universal
+/// convention and keeps the header innocuous.
+fn sender_message_id(from: &Mailbox) -> String {
+    format!(
+        "<{}@{}>",
+        uuid::Uuid::new_v4().simple(),
+        from.email.domain()
+    )
+}
+
 /// Send an email message via SMTP.
 ///
 /// `in_reply_to` and `references` carry RFC 5322 threading headers,
@@ -92,13 +109,15 @@ pub async fn send_message(
         .parse()
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
-    // `message_id(None)` makes lettre emit a generated <UUID@host>;
-    // without it lettre never adds the header and the next reply
-    // has nothing to point In-Reply-To at.
+    // Emit a Message-ID explicitly: lettre's `build()` adds none on its
+    // own, and the next reply needs one to point In-Reply-To at. The
+    // domain is the sender's (see `sender_message_id`), not lettre's
+    // local-hostname default.
+    let message_id = sender_message_id(&from_mailbox);
     let mut builder = Message::builder()
         .from(from_mailbox)
         .subject(subject)
-        .message_id(None);
+        .message_id(Some(message_id));
 
     for addr in to {
         let mailbox: Mailbox = addr
@@ -325,13 +344,15 @@ pub fn build_raw_message(
         .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
 
     // Always emit a Message-ID. Lettre's `build()` does NOT add one
-    // automatically, so without this, our outgoing replies have no
-    // Message-ID for the next reply to thread off of. `message_id(None)`
-    // generates `<UUID@hostname>` per RFC 5322 §3.6.4.
+    // automatically, so without this our outgoing replies have no
+    // Message-ID for the next reply to thread off of. The domain is the
+    // sender's own (see `sender_message_id`) per RFC 5322 §3.6.4, rather
+    // than lettre's local-hostname default.
+    let message_id = sender_message_id(&from_mailbox);
     let mut builder = Message::builder()
         .from(from_mailbox)
         .subject(subject)
-        .message_id(None);
+        .message_id(Some(message_id));
 
     for addr in to {
         let mailbox: Mailbox = addr
@@ -793,6 +814,41 @@ mod pgp_wrap_tests {
             &[],
         )
         .expect("build_raw_message")
+    }
+
+    /// Regression: the generated Message-ID's domain must be the
+    /// sender's own domain, never the local machine hostname. lettre's
+    /// `message_id(None)` default fills it via `hostname::get()` (e.g.
+    /// `ubuntu24`), which leaks the host name onto the wire and is a
+    /// mild spam signal at strict receivers.
+    #[test]
+    fn message_id_domain_is_sender_domain_not_hostname() {
+        let raw = build_raw_message(
+            "alice@example.com",
+            &["bob@example.com".into()],
+            &[],
+            &[],
+            "Subject",
+            "body",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build_raw_message");
+        let s = String::from_utf8_lossy(&raw);
+        let line = s
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("message-id:"))
+            .expect("Message-ID header present");
+        assert!(
+            line.contains("@example.com>"),
+            "Message-ID domain must be the sender's domain: {line:?}"
+        );
+        assert!(
+            !line.contains("@localhost"),
+            "Message-ID must not fall back to lettre's hostname default: {line:?}"
+        );
     }
 
     #[test]
