@@ -328,6 +328,33 @@ pub fn recalculate_folder_counts(conn: &Connection, account_id: &str) -> Result<
     Ok(())
 }
 
+/// Look up the IMAP path of the first folder belonging to `account_id`
+/// whose `folder_type` matches (e.g. `"sent"`, `"drafts"`, `"trash"`).
+///
+/// Returns `Ok(None)` when no folder is tagged with that type yet — the
+/// cache is populated by `guess_folder_type` during folder sync, so a
+/// brand-new account may not have it until the first sync completes.
+pub fn folder_path_by_type(
+    conn: &Connection,
+    account_id: &str,
+    folder_type: &str,
+) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    // `ORDER BY id` keeps the choice stable when an account ends up with
+    // more than one folder tagged for the same role (e.g. a server-side
+    // rename leaves both the old and new Sent boxes classified). The
+    // first inserted wins, which lines up with sync's insertion order.
+    let path = conn
+        .query_row(
+            "SELECT path FROM folders WHERE account_id = ?1 AND folder_type = ?2 \
+             ORDER BY id LIMIT 1",
+            params![account_id, folder_type],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(path)
+}
+
 /// Guess folder type from name for common IMAP folder names
 pub fn guess_folder_type(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
@@ -488,6 +515,47 @@ mod tests {
             .find(|f| f.path == "INBOX/Infra")
             .unwrap();
         assert_eq!(infra.children.len(), 1);
+    }
+
+    #[test]
+    fn folder_path_by_type_returns_path_for_matching_account_and_type() {
+        let conn = create_delete_test_db();
+        // Sent folder for the target account; Sent for another account too.
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, folder_type) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Sent", "INBOX.Sent", "sent"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, folder_type) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc2", "Sent", "Sent Items", "sent"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, folder_type) VALUES (?1, ?2, ?3, ?4)",
+            params!["acc1", "Drafts", "Drafts", "drafts"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            folder_path_by_type(&conn, "acc1", "sent").unwrap(),
+            Some("INBOX.Sent".to_string())
+        );
+        assert_eq!(
+            folder_path_by_type(&conn, "acc2", "sent").unwrap(),
+            Some("Sent Items".to_string())
+        );
+        assert_eq!(
+            folder_path_by_type(&conn, "acc1", "drafts").unwrap(),
+            Some("Drafts".to_string())
+        );
+        // No archive folder anywhere -> None, not an error.
+        assert_eq!(folder_path_by_type(&conn, "acc1", "archive").unwrap(), None);
+        // Unknown account -> None.
+        assert_eq!(
+            folder_path_by_type(&conn, "acc-none", "sent").unwrap(),
+            None
+        );
     }
 
     fn create_delete_test_db() -> Connection {

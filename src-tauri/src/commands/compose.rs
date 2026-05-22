@@ -88,7 +88,10 @@ pub async fn send_message(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
-    let raw_message = smtp::build_raw_message(
+    // `raw_message` carries the inlined attachment bytes — wrap in `Arc`
+    // so the background spawn can share the buffer with the IMAP APPEND
+    // path without deep-cloning megabytes of MIME each send.
+    let raw_message: std::sync::Arc<[u8]> = smtp::build_raw_message(
         &account.email,
         &message.to,
         &message.cc,
@@ -99,7 +102,8 @@ pub async fn send_message(
         &attachment_data,
         in_reply_to.as_deref(),
         &references,
-    )?;
+    )?
+    .into();
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
     let smtp_creds =
@@ -188,6 +192,10 @@ pub async fn send_message(
     let account_id_bg = account_id.clone();
     let subject_bg = subject_display.clone();
     let db_bg = state.db.clone();
+    // Capture the worker's op-sender now so the spawn can enqueue a
+    // Sent-folder sync after a successful APPEND (#189). `state` is
+    // not `'static`, so the sender must be cloned out before the move.
+    let op_sender_bg = state.get_op_sender(&account_id, &app);
     let recipients: Vec<String> = message
         .to
         .iter()
@@ -231,6 +239,90 @@ pub async fn send_message(
                     &references,
                 )
                 .await?;
+
+                // Best-effort: APPEND the sent message to the IMAP Sent
+                // folder (#189). SMTP submission alone never writes to
+                // Sent for plain IMAP+SMTP or Exchange-via-SMTP-AUTH;
+                // JMAP / Graph send APIs are unaffected because they
+                // populate Sent server-side. Failures here MUST NOT
+                // propagate — the message has been delivered, and a
+                // retried send would duplicate it for the recipient.
+                // Read-only lookup — use the pool's reader so we don't
+                // serialize on the single-writer mutex.
+                let sent_folder_path = {
+                    let conn = db_bg.reader();
+                    crate::db::folders::folder_path_by_type(&conn, &account_id_bg, "sent")
+                        .ok()
+                        .flatten()
+                };
+                let imap_config = crate::mail::imap::ImapConfig {
+                    host: account.imap_host.clone(),
+                    port: account.imap_port,
+                    username: smtp_username.clone(),
+                    password: smtp_password.clone(),
+                    use_tls: account.use_tls,
+                    use_xoauth2,
+                };
+                // `Arc::clone` of `Arc<[u8]>` is a refcount bump — does
+                // not duplicate the inlined-attachment bytes (which can
+                // be many MB on a send with large attachments).
+                let raw_for_append = std::sync::Arc::clone(&raw_message);
+                let account_id_append = account_id_bg.clone();
+                let append_result = tokio::task::spawn_blocking(move || {
+                    crate::mail::imap::append_message_to_sent(
+                        &imap_config,
+                        sent_folder_path.as_deref(),
+                        &raw_for_append,
+                    )
+                })
+                .await;
+                match append_result {
+                    Ok(Ok(sent_folder)) => {
+                        log::info!(
+                            "APPENDed sent message to '{}' for account {}",
+                            sent_folder,
+                            account_id_append
+                        );
+                        // Nudge a targeted sync so the freshly-APPENDed
+                        // message shows up in the UI immediately instead
+                        // of waiting for the next scheduled sync.
+                        let send_res = op_sender_bg
+                            .send(crate::ops::queue::OpEntry {
+                                op: crate::ops::queue::MailOp::SyncFolder {
+                                    folder_path: sent_folder,
+                                },
+                                priority: crate::ops::queue::OpPriority::User,
+                            })
+                            .await;
+                        if let Err(e) = send_res {
+                            log::warn!(
+                                "Failed to queue Sent-folder sync for account {}: {}",
+                                account_id_append,
+                                e
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => log::warn!(
+                        "Sent delivered but APPEND to Sent failed for account {}: {}",
+                        account_id_append,
+                        e
+                    ),
+                    Err(e) => {
+                        let kind = if e.is_panic() {
+                            "panicked"
+                        } else if e.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        log::warn!(
+                            "APPEND-to-Sent task {} for account {}: {}",
+                            kind,
+                            account_id_append,
+                            e
+                        );
+                    }
+                }
             }
             Ok(())
         }
