@@ -243,6 +243,13 @@ export interface AccountConfig {
   /// Backend-populated; treated as read-only in form state.
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
+  /// Per-account OpenPGP "Advanced settings". All default `true`. The
+  /// compose / draft backend reads these to govern feature behavior at
+  /// send / save time.
+  pgp_attach_pubkey_on_sign: boolean;
+  pgp_autocrypt_header: boolean;
+  pgp_encrypt_subject: boolean;
+  pgp_encrypt_drafts: boolean;
 }
 
 /// IMAP / SMTP discovery result returned by `discoverMailServers`.
@@ -407,6 +414,15 @@ export interface PgpRecipientStatus {
   email: string;
   hasKey: boolean;
   fingerprint: string | null;
+}
+
+/** Result of `save_draft`. Lets the composer tell the user when the
+ *  "Store drafts encrypted" toggle could not be honored. */
+export interface DraftSaveOutcome {
+  /** True when encryption was requested for this account but the draft
+   *  was stored in plaintext anyway (Microsoft Graph account, or no
+   *  usable public key in the keystore). */
+  plaintext_fallback: boolean;
 }
 
 export interface ComposeAttachment {

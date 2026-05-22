@@ -449,6 +449,19 @@ pub fn update_maildir_path(conn: &Connection, message_id: &str, path: &str) -> R
     Ok(())
 }
 
+/// Overwrite a message's stored subject. Used by the protected-headers
+/// ("encrypt the subject") feature: when an encrypted message is
+/// decrypted and the real subject is recovered from inside the
+/// ciphertext, it's written back here so the message list, search, and
+/// thread view show the real subject instead of the `...` placeholder.
+pub fn update_subject(conn: &Connection, message_id: &str, subject: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET subject = ?1 WHERE id = ?2",
+        params![subject, message_id],
+    )?;
+    Ok(())
+}
+
 /// Returns (message_id, folder_path, uid, flags_json) for messages whose body
 /// has not been downloaded yet, ordered by date DESC (newest first).
 /// Returns (message_id, folder_path, uid) for each of the given message IDs.

@@ -86,7 +86,24 @@ pub async fn send_message(
         .collect();
     let names: Vec<String> = message.attachments.iter().map(|a| a.name.clone()).collect();
     let paths = crate::commands::attachments::peek_tokens(&state, &tokens)?;
-    let attachment_data = build_attachment_data(&paths, &names)?;
+    let mut attachment_data = build_attachment_data(&paths, &names)?;
+
+    // Feature: attach sender's public key when adding an OpenPGP digital
+    // signature. Per-account toggle (`pgp_attach_pubkey_on_sign`,
+    // default-on); only fires when the message is being signed (whether
+    // signed-only or signed-then-encrypted). The pubkey is added as
+    // another attachment BEFORE `build_raw_message`, so it lands inside
+    // the inner MIME tree, gets canonicalised together with the body,
+    // and ends up covered by the signature (sign-only) or sealed inside
+    // the encrypted envelope (sign-then-encrypt). Failure to resolve
+    // the signer's pubkey is non-fatal — we log and skip, same fail-open
+    // pattern as the existing encrypt-to-self fallback in
+    // apply_pgp_envelope.
+    if message.pgp_sign && account.pgp_attach_pubkey_on_sign {
+        if let Some(att) = build_signer_pubkey_attachment(&state, &account.email) {
+            attachment_data.push(att);
+        }
+    }
 
     // Resolve threading headers from the original message we're replying
     // to (if any). This is what makes the next sync render the new
@@ -121,6 +138,7 @@ pub async fn send_message(
             &message.to,
             &message.cc,
             &message.bcc,
+            &message.subject,
             message.pgp_sign,
             message.pgp_encrypt,
             Some(&origin),
@@ -128,6 +146,23 @@ pub async fn send_message(
         .await?
     } else {
         plain_raw
+    };
+
+    // Feature: Autocrypt header. Per-account toggle (`pgp_autocrypt_header`,
+    // default-on). The `Autocrypt:` header rides on the OUTER envelope of
+    // EVERY outgoing message — signed, encrypted, or plain — because
+    // Autocrypt key distribution bootstraps from cleartext headers. We
+    // inject onto the final `raw_message` (post-PGP-wrap) so the header
+    // survives the `wrap_pgp_mime_*` outer-header allowlist. Skipped
+    // silently when the sender has no usable key in the keystore — the
+    // header is an enhancement, not a guarantee.
+    let raw_message = if account.pgp_autocrypt_header {
+        match build_autocrypt_header(&state, &account.email) {
+            Some(header_line) => smtp::insert_header_before_body(&raw_message, &header_line),
+            None => raw_message,
+        }
+    } else {
+        raw_message
     };
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
@@ -411,12 +446,24 @@ pub async fn send_message(
     Ok(())
 }
 
+/// Outcome of `save_draft`, returned to the renderer so it can tell the
+/// user when the "Store drafts encrypted" toggle could not be honored.
+#[derive(Debug, serde::Serialize)]
+pub struct DraftSaveOutcome {
+    /// True when `pgp_encrypt_drafts` was enabled for the account but the
+    /// draft was nonetheless stored in plaintext — either a Microsoft
+    /// Graph account (no raw-MIME draft endpoint wired up) or no usable
+    /// public key in the keystore. The renderer surfaces a non-blocking
+    /// notice so the toggle's label isn't silently misleading.
+    pub plaintext_fallback: bool,
+}
+
 #[tauri::command]
 pub async fn save_draft(
     state: State<'_, AppState>,
     account_id: String,
     message: ComposeMessage,
-) -> Result<()> {
+) -> Result<DraftSaveOutcome> {
     log::info!(
         "Save draft command: account={} subject='{}'",
         account_id,
@@ -464,6 +511,44 @@ pub async fn save_draft(
         in_reply_to.as_deref(),
         &references,
     )?;
+
+    // Feature: store draft messages in encrypted format. Per-account
+    // toggle (`pgp_encrypt_drafts`, default-on). The draft body is
+    // encrypted-to-self with the sender's PUBLIC key — no signing, no
+    // passphrase / card PIN prompt, so a card that isn't plugged in at
+    // draft time is irrelevant (the user re-attaches it to decrypt on
+    // resume). Graph accounts short-circuit: the Graph draft path posts
+    // structured JSON to /me/messages and has no raw-MIME endpoint wired
+    // up, so an encrypted MIME blob can't round-trip — we log and save
+    // plaintext, same fail-open posture as a missing key. JMAP and IMAP
+    // both upload `raw_message` verbatim, so the encrypted form flows
+    // through unchanged.
+    // `plaintext_fallback` records that encryption was requested but
+    // could not be applied — reported back to the renderer for LOW-3.
+    let mut plaintext_fallback = false;
+    let raw_message = if account.pgp_encrypt_drafts {
+        if account.mail_protocol_str() == "graph" {
+            log::warn!(
+                "Encrypted drafts not yet supported on Graph accounts ({}); \
+                 saving plaintext draft",
+                account.email
+            );
+            plaintext_fallback = true;
+            raw_message
+        } else {
+            match encrypt_draft_to_self(&state, &account.email, &raw_message).await {
+                Some(encrypted) => encrypted,
+                None => {
+                    // encrypt_draft_to_self already logged the cause
+                    // (no usable public key, or an encrypt failure).
+                    plaintext_fallback = true;
+                    raw_message
+                }
+            }
+        }
+    } else {
+        raw_message
+    };
 
     if account.mail_protocol_str() == "graph" {
         // Save draft via Graph API: POST /me/messages creates a draft without sending
@@ -542,7 +627,7 @@ pub async fn save_draft(
     }
 
     log::info!("Draft saved successfully for account {}", account_id);
-    Ok(())
+    Ok(DraftSaveOutcome { plaintext_fallback })
 }
 
 /// Resolve the In-Reply-To and References values for a reply.
@@ -685,6 +770,7 @@ fn build_attachment_data(
 /// we do sign-then-encrypt (signature lives inside the ciphertext) and
 /// wrap in multipart/encrypted, which is what every modern MUA
 /// recognises and what Thunderbird/GPG round-trip cleanly.
+#[allow(clippy::too_many_arguments)]
 async fn apply_pgp_envelope(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -693,13 +779,16 @@ async fn apply_pgp_envelope(
     to: &[String],
     cc: &[String],
     bcc: &[String],
+    subject: &str,
     sign: bool,
     encrypt: bool,
     origin_window: Option<&str>,
 ) -> Result<Vec<u8>> {
     use crate::commands::pgp::{acquire_secret, SecretKind};
     use crate::mail::pgp_mime::canonicalize_for_signing;
-    use crate::mail::smtp::{inner_part_of, wrap_pgp_mime_encrypted, wrap_pgp_mime_signed};
+    use crate::mail::smtp::{
+        inner_part_of, wrap_pgp_mime_encrypted, wrap_pgp_mime_signed, wrap_with_protected_headers,
+    };
 
     if !sign && !encrypt {
         return Err(Error::Other(
@@ -834,9 +923,22 @@ async fn apply_pgp_envelope(
             );
         }
 
+        // Protected headers ("encrypt the subject"): when the per-account
+        // toggle is on, the real subject is folded into a
+        // multipart/mixed; protected-headers="v1" wrapper that becomes
+        // the encrypted payload, and the cleartext outer envelope gets a
+        // "..." placeholder. Off → encrypt the body part directly and
+        // leave the outer subject untouched.
+        let encrypt_subject = account.pgp_encrypt_subject;
+        let payload = if encrypt_subject {
+            canonicalize_for_signing(&wrap_with_protected_headers(&inner, subject))
+        } else {
+            canonical_inner.clone()
+        };
+
         let store_for_blocking = store.clone();
         let signer_data_clone = signer_data.clone();
-        let canonical_inner_clone = canonical_inner.clone();
+        let canonical_inner_clone = payload;
         let visible_owned = visible_recipients;
         let hidden_owned = hidden_recipients;
 
@@ -892,7 +994,12 @@ async fn apply_pgp_envelope(
         };
         let armored_str = String::from_utf8(armored)
             .map_err(|e| Error::Other(format!("openpgp encrypt produced non-utf8: {e}")))?;
-        wrap_pgp_mime_encrypted(raw_message, &armored_str)
+        // When the subject was protected, replace the cleartext outer
+        // Subject with a placeholder. Receivers that understand
+        // protected headers (incl. chithi's own decrypt path) recover
+        // the real subject from inside the ciphertext.
+        let subject_override = if encrypt_subject { Some("...") } else { None };
+        wrap_pgp_mime_encrypted(raw_message, &armored_str, subject_override)
     } else {
         // Sign-only: detached signature over the canonicalised inner,
         // multipart/signed wrapper. libtumpa's sign_detached_with_hash
@@ -954,6 +1061,148 @@ fn recipients_contain(list: &[String], email: &str) -> bool {
     let needle = extract_addr_spec(email);
     list.iter()
         .any(|r| extract_addr_spec(r).eq_ignore_ascii_case(&needle))
+}
+
+/// Resolve the sender's signer key by email, export the ASCII-armored
+/// PUBLIC key bytes, and wrap them as an `AttachmentData` ready to be
+/// appended to the outgoing message's attachment list.
+///
+/// Returns `None` (after logging a warning) if the signer cannot be
+/// resolved or the pubkey export fails — the caller treats absence as
+/// "skip the pubkey attachment, send the message anyway". The filename
+/// convention matches Thunderbird and Enigmail: `OpenPGP_0x<long-keyid>.asc`
+/// where `<long-keyid>` is the last 16 hex chars of the fingerprint, so
+/// receiving MUAs that file attached keys by name don't collide.
+fn build_signer_pubkey_attachment(
+    state: &State<'_, AppState>,
+    sender_email: &str,
+) -> Option<smtp::AttachmentData> {
+    let store = state.pgp_store().ok()?;
+    let guard = store.lock().expect("pgp keystore mutex poisoned");
+    signer_pubkey_attachment_from_store(&guard, sender_email)
+}
+
+/// Pure helper extracted out of `build_signer_pubkey_attachment` so the
+/// MIME-shape logic (filename pattern, content-type, full-armor body) is
+/// unit-testable against a hand-built `KeyStore` without needing a live
+/// `AppState`. The `&KeyStore` here is the locked guard the caller
+/// already holds.
+fn signer_pubkey_attachment_from_store(
+    store: &libtumpa::KeyStore,
+    sender_email: &str,
+) -> Option<smtp::AttachmentData> {
+    let (_signer_data, signer_info) = libtumpa::store::resolve_signer(store, sender_email).ok()?;
+    match libtumpa::key::export_public_armored(store, &signer_info.fingerprint) {
+        Ok(armored) => {
+            // Long key id = last 16 hex chars of the fingerprint (uppercase
+            // hex per OpenPGP convention; the fingerprint itself is
+            // already uppercase out of libtumpa).
+            let fp = &signer_info.fingerprint;
+            let long_keyid = &fp[fp.len().saturating_sub(16)..];
+            Some(smtp::AttachmentData {
+                name: format!("OpenPGP_0x{long_keyid}.asc"),
+                content_type: "application/pgp-keys".to_string(),
+                data: armored.into_bytes(),
+            })
+        }
+        Err(e) => {
+            log::warn!(
+                "openpgp: skipping pubkey attachment for signed message from {} \
+                 — export_public_armored failed: {e}",
+                sender_email
+            );
+            None
+        }
+    }
+}
+
+/// Build the folded `Autocrypt:` header line for `sender_email`, or
+/// `None` (logged at debug) when the sender has no key in the keystore
+/// — Autocrypt is an opportunistic enhancement, so a missing key is not
+/// an error. Resolves the signer key by email, exports an
+/// Autocrypt-minimised transferable public key
+/// (`libtumpa::key::export_public_for_autocrypt`), and folds it via
+/// `smtp::format_autocrypt_header`. The returned string is the header
+/// line WITHOUT a trailing CRLF — `insert_header_before_body` adds the
+/// framing.
+fn build_autocrypt_header(state: &State<'_, AppState>, sender_email: &str) -> Option<String> {
+    let store = state.pgp_store().ok()?;
+    let guard = store.lock().expect("pgp keystore mutex poisoned");
+    let (_signer_data, signer_info) = libtumpa::store::resolve_signer(&guard, sender_email).ok()?;
+    let addr = extract_addr_spec(sender_email);
+    match libtumpa::key::export_public_for_autocrypt(&guard, &signer_info.fingerprint, &addr) {
+        Ok(keydata) => Some(smtp::format_autocrypt_header(&addr, &keydata)),
+        Err(e) => {
+            log::debug!(
+                "openpgp: no Autocrypt header for {} — export_public_for_autocrypt failed: {e}",
+                sender_email
+            );
+            None
+        }
+    }
+}
+
+/// Encrypt a draft `raw_message` to the sender's own public key, in the
+/// standard PGP/MIME `multipart/encrypted` shape: the inner body part is
+/// encrypted, the outer envelope headers (From / To / Subject / ...)
+/// stay in cleartext, exactly like a normal encrypted mail. Returns
+/// `None` when there's no usable public key for `sender_email` or any
+/// step fails — the caller then stores the plaintext draft (fail-open).
+///
+/// Encryption only, never signing: `encrypt_to_recipients` uses the
+/// recipient's PUBLIC key, which needs no unlock, so Save Draft never
+/// triggers a passphrase or card-PIN prompt. The CPU-bound encrypt runs
+/// on a blocking thread.
+async fn encrypt_draft_to_self(
+    state: &State<'_, AppState>,
+    sender_email: &str,
+    raw_message: &[u8],
+) -> Option<Vec<u8>> {
+    let store = state.pgp_store().ok()?;
+    // Cheap precheck so we don't spawn a blocking task just to fail.
+    if !has_resolvable_public_key(&store, sender_email) {
+        log::warn!(
+            "openpgp: encrypt-drafts is on but no usable public key for {} — \
+             saving plaintext draft",
+            sender_email
+        );
+        return None;
+    }
+    let raw = raw_message.to_vec();
+    let email = sender_email.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        encrypt_draft_core(&guard, &email, &raw)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Pure core of `encrypt_draft_to_self`, split out so the PGP/MIME
+/// shaping is unit-testable against a hand-built `KeyStore` without a
+/// live `AppState` or a Tokio runtime. Returns `None` on any failure;
+/// the caller treats that as "save plaintext".
+fn encrypt_draft_core(
+    store: &libtumpa::KeyStore,
+    sender_email: &str,
+    raw_message: &[u8],
+) -> Option<Vec<u8>> {
+    use crate::mail::pgp_mime::canonicalize_for_signing;
+    // Encrypt the inner body part only — same split a normal outgoing
+    // PGP/MIME message uses. Canonicalise line endings to CRLF so the
+    // body reparses cleanly after the decrypt round-trip.
+    let inner = smtp::inner_part_of(raw_message).ok()?;
+    let canonical = canonicalize_for_signing(&inner);
+    let armored = libtumpa::encrypt::encrypt_to_recipients(store, &[sender_email], &canonical, true)
+        .map_err(|e| log::warn!("openpgp: draft encrypt-to-self failed: {e}"))
+        .ok()?;
+    let armored_str = String::from_utf8(armored).ok()?;
+    // Drafts keep their subject in the cleartext outer envelope — the
+    // resume path reads it back from there, and protected-headers
+    // ("encrypt the subject") is a separate per-account feature scoped
+    // to messages actually sent, not to drafts.
+    smtp::wrap_pgp_mime_encrypted(raw_message, &armored_str, None).ok()
 }
 
 /// Probe the keystore for a public encryption key usable for `id`. Returns
@@ -1084,5 +1333,244 @@ mod encrypt_to_self_tests {
         assert_eq!(extract_addr_spec("Alice <  alice@x  >"), "alice@x");
         // Malformed input (lone '<' or '>') falls through to a trim.
         assert_eq!(extract_addr_spec("  bob@x  "), "bob@x");
+    }
+}
+
+#[cfg(test)]
+mod signer_pubkey_attachment_tests {
+    use super::signer_pubkey_attachment_from_store;
+    use libtumpa::{key, CipherSuite, KeyStore, Passphrase, SubkeyFlags};
+
+    fn make_keystore_with_key(uid: &str) -> (KeyStore, String) {
+        let store = KeyStore::open_in_memory().expect("keystore");
+        let pw = Passphrase::new("pw".into());
+        let params = key::GenerateKeyParams {
+            uids: vec![uid.into()],
+            cipher_suite: CipherSuite::Cv25519,
+            expiry: None,
+            subkey_flags: SubkeyFlags::all(),
+            can_primary_sign: true,
+        };
+        let info = key::generate_and_import(&store, params, &pw).expect("generate");
+        (store, info.fingerprint)
+    }
+
+    /// Round-trip: create an in-memory keystore, generate a key for
+    /// alice@example.com, and assert that the pubkey-attachment helper
+    /// returns a well-formed `AttachmentData` with:
+    ///   * content_type "application/pgp-keys" (RFC 3156 §7 / Autocrypt)
+    ///   * filename "OpenPGP_0x<long-keyid>.asc" matching the last 16
+    ///     hex chars of the fingerprint (Thunderbird convention)
+    ///   * data is the ASCII-armored PUBLIC key, no secret material
+    #[test]
+    fn pubkey_attachment_shape_matches_thunderbird_convention() {
+        let (store, fp) = make_keystore_with_key("Alice <alice@example.com>");
+
+        let att =
+            signer_pubkey_attachment_from_store(&store, "alice@example.com").expect("attachment");
+
+        assert_eq!(att.content_type, "application/pgp-keys");
+        let expected_keyid = &fp[fp.len() - 16..];
+        assert_eq!(att.name, format!("OpenPGP_0x{expected_keyid}.asc"));
+        let armored = std::str::from_utf8(&att.data).expect("utf8 armor");
+        assert!(
+            armored.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+            "expected armored public-key block, got: {}",
+            armored.lines().next().unwrap_or("")
+        );
+        assert!(
+            !armored.contains("BEGIN PGP PRIVATE KEY"),
+            "pubkey attachment must NEVER include secret material"
+        );
+    }
+
+    /// No usable signer for the address → helper returns None (caller
+    /// then skips the attachment without failing the send). This mirrors
+    /// the encrypt-to-self fail-open behaviour for accounts that have no
+    /// PGP key in the keystore yet.
+    #[test]
+    fn pubkey_attachment_returns_none_when_no_signer_resolved() {
+        let store = KeyStore::open_in_memory().expect("keystore");
+        assert!(signer_pubkey_attachment_from_store(&store, "nobody@example.com").is_none());
+    }
+}
+
+#[cfg(test)]
+mod encrypt_draft_tests {
+    use super::encrypt_draft_core;
+    use crate::mail::{pgp_mime, smtp};
+    use libtumpa::{key, CipherSuite, KeyStore, Passphrase, SubkeyFlags};
+
+    /// Round-trip: encrypt a draft to self, then decrypt the ciphertext
+    /// with the secret key and assert the recovered body equals the
+    /// canonicalised original inner part. Also pins the PGP/MIME shape:
+    /// the output is `multipart/encrypted` and the outer Subject stays
+    /// in cleartext (body-only encryption — protected subjects are a
+    /// separate feature/toggle).
+    #[test]
+    fn encrypt_draft_round_trips_through_decrypt() {
+        let store = KeyStore::open_in_memory().expect("keystore");
+        let pw = Passphrase::new("pw".into());
+        let params = key::GenerateKeyParams {
+            uids: vec!["Alice <alice@example.com>".into()],
+            cipher_suite: CipherSuite::Cv25519,
+            expiry: None,
+            subkey_flags: SubkeyFlags::all(),
+            can_primary_sign: true,
+        };
+        let generated = key::generate(params, &pw).expect("generate");
+        store.import_key(&generated.secret_key).expect("import");
+
+        let raw = smtp::build_raw_message(
+            "alice@example.com",
+            &["alice@example.com".into()],
+            &[],
+            &[],
+            "Draft subject",
+            "Draft body in progress.",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build raw");
+
+        let encrypted =
+            encrypt_draft_core(&store, "alice@example.com", &raw).expect("encrypt draft");
+
+        let s = String::from_utf8_lossy(&encrypted);
+        assert!(
+            s.contains("multipart/encrypted"),
+            "draft must be wrapped as multipart/encrypted"
+        );
+        assert!(
+            s.contains("Subject: Draft subject"),
+            "outer Subject stays in cleartext for body-only encryption"
+        );
+
+        // The ciphertext decrypts back to the canonicalised inner body.
+        let ciphertext =
+            pgp_mime::extract_encrypted_payload(&encrypted).expect("extract ciphertext");
+        let recovered = libtumpa::decrypt::decrypt_with_key(&generated.secret_key, &ciphertext, &pw)
+            .expect("decrypt draft");
+        let original_inner = smtp::inner_part_of(&raw).expect("inner part");
+        let canonical = pgp_mime::canonicalize_for_signing(&original_inner);
+        assert_eq!(
+            &recovered[..],
+            &canonical[..],
+            "decrypted draft body must match the canonicalised original inner"
+        );
+        assert!(
+            String::from_utf8_lossy(&recovered).contains("Draft body in progress."),
+            "the in-progress body text must survive the encrypt/decrypt round-trip"
+        );
+    }
+
+    /// No key in the store for the sender → `encrypt_draft_core` returns
+    /// None and the caller stores the plaintext draft (fail-open).
+    #[test]
+    fn encrypt_draft_returns_none_without_a_key() {
+        let store = KeyStore::open_in_memory().expect("keystore");
+        let raw = smtp::build_raw_message(
+            "nobody@example.com",
+            &["nobody@example.com".into()],
+            &[],
+            &[],
+            "x",
+            "y",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build raw");
+        assert!(encrypt_draft_core(&store, "nobody@example.com", &raw).is_none());
+    }
+}
+
+#[cfg(test)]
+mod protected_headers_tests {
+    use crate::mail::{pgp_mime, smtp};
+    use libtumpa::{key, CipherSuite, KeyStore, Passphrase, SubkeyFlags};
+
+    /// Full protected-headers round-trip mirroring what `apply_pgp_envelope`
+    /// does when the "encrypt the subject" toggle is on: wrap the inner
+    /// body in a protected-headers entity carrying the real subject,
+    /// encrypt that, then wrap in multipart/encrypted with a "..." outer
+    /// subject. Then decrypt and assert the real subject is recovered
+    /// from inside the ciphertext while the cleartext envelope only
+    /// shows "...".
+    #[test]
+    fn protected_headers_round_trip_hides_then_recovers_subject() {
+        let store = KeyStore::open_in_memory().expect("keystore");
+        let pw = Passphrase::new("pw".into());
+        let params = key::GenerateKeyParams {
+            uids: vec!["Alice <alice@example.com>".into()],
+            cipher_suite: CipherSuite::Cv25519,
+            expiry: None,
+            subkey_flags: SubkeyFlags::all(),
+            can_primary_sign: true,
+        };
+        let generated = key::generate(params, &pw).expect("generate");
+        store.import_key(&generated.secret_key).expect("import");
+
+        let real_subject = "Quarterly numbers are confidential";
+        let raw = smtp::build_raw_message(
+            "alice@example.com",
+            &["bob@example.com".into()],
+            &[],
+            &[],
+            real_subject,
+            "Body that should also stay secret.",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build raw");
+
+        // Step 1+2: protected-headers wrap, then encrypt.
+        let inner = smtp::inner_part_of(&raw).expect("inner part");
+        let protected = smtp::wrap_with_protected_headers(&inner, real_subject);
+        let canonical = pgp_mime::canonicalize_for_signing(&protected);
+        let armored = libtumpa::encrypt::encrypt_to_recipients(
+            &store,
+            &["alice@example.com"],
+            &canonical,
+            true,
+        )
+        .expect("encrypt");
+        let armored_str = String::from_utf8(armored).expect("utf8 armor");
+
+        // Step 3: multipart/encrypted with the subject placeholder.
+        let wrapped =
+            smtp::wrap_pgp_mime_encrypted(&raw, &armored_str, Some("...")).expect("wrap");
+
+        // The cleartext envelope hides the real subject.
+        let wrapped_s = String::from_utf8_lossy(&wrapped);
+        assert!(
+            wrapped_s.contains("Subject: ...\r\n"),
+            "outer envelope must carry the placeholder subject"
+        );
+        assert!(
+            !wrapped_s.contains(real_subject),
+            "the real subject must NOT be anywhere in the cleartext bytes"
+        );
+
+        // Decrypt and confirm the protected entity carries the real subject.
+        let ciphertext =
+            pgp_mime::extract_encrypted_payload(&wrapped).expect("extract ciphertext");
+        let recovered =
+            libtumpa::decrypt::decrypt_with_key(&generated.secret_key, &ciphertext, &pw)
+                .expect("decrypt");
+        let recovered_s = String::from_utf8_lossy(&recovered);
+        assert!(
+            recovered_s.contains("protected-headers=\"v1\""),
+            "decrypted payload must be the protected-headers entity"
+        );
+        assert!(
+            recovered_s.contains(&format!("Subject: {real_subject}")),
+            "the real subject must be recoverable from inside the ciphertext"
+        );
     }
 }

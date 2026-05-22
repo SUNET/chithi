@@ -510,12 +510,25 @@ fn walk_headers(headers: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// Re-emit the outer header section, dropping any Content-* / MIME-Version
 /// header (those moved to the inner part).
-fn outer_headers_only(header_section: &[u8]) -> Vec<u8> {
+///
+/// When `subject_override` is `Some`, the `Subject:` field's value is
+/// replaced with the override. This is how protected-headers encryption
+/// (draft-ietf-lamps-header-protection) keeps the real subject out of
+/// the cleartext envelope — the real subject is duplicated INSIDE the
+/// ciphertext by `wrap_with_protected_headers`, and the outer envelope
+/// carries only a placeholder.
+fn outer_headers_only(header_section: &[u8], subject_override: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, line) in walk_headers(header_section) {
         let lower = name.to_ascii_lowercase();
         if lower.starts_with(b"content-") || lower == b"mime-version" {
             continue;
+        }
+        if lower == b"subject" {
+            if let Some(new_subject) = subject_override {
+                out.extend_from_slice(format!("Subject: {new_subject}\r\n").as_bytes());
+                continue;
+            }
         }
         // Trust the outer-name filter: not every header is "envelope" but
         // we want to keep them unless they clash with the new
@@ -524,6 +537,46 @@ fn outer_headers_only(header_section: &[u8]) -> Vec<u8> {
         let _ = PGP_OUTER_HEADERS; // suppress unused-const warning if filter logic shrinks
         out.extend_from_slice(&line);
     }
+    out
+}
+
+/// Wrap an inner MIME body part in a draft-ietf-lamps-header-protection
+/// "v1" layer: a `multipart/mixed` entity whose Content-Type carries the
+/// `protected-headers="v1"` parameter and whose own header block
+/// duplicates the `Subject:` field. The original `inner` part becomes
+/// the single child.
+///
+/// The result is what gets encrypted. A protected-headers-aware receiver
+/// (Thunderbird, K-9, chithi's own decrypt path) reads `Subject` off
+/// this entity's headers; the cleartext envelope only ever carries a
+/// placeholder. `subject` is written as raw UTF-8 — it is inside the
+/// ciphertext, and both `mail_parser` and other modern MUAs accept
+/// UTF-8 header values there.
+pub fn wrap_with_protected_headers(inner: &[u8], subject: &str) -> Vec<u8> {
+    let boundary = format!("chithi-protected-{}", uuid::Uuid::new_v4().simple());
+    let mut out = Vec::with_capacity(inner.len() + 256);
+    out.extend_from_slice(
+        format!(
+            "Content-Type: multipart/mixed; protected-headers=\"v1\"; \
+             boundary=\"{boundary}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    // The protected header field(s). Subject only, in v1.
+    // Collapse any CR/LF in the subject to a space: a header value can't
+    // contain a bare CR/LF, and an embedded `\r\n\r\n` would otherwise
+    // terminate this entity's header block early and malform the
+    // encrypted MIME structure. (The non-protected path goes through
+    // lettre, which RFC 2047-encodes and so can't be injected.)
+    let subject = subject.replace(['\r', '\n'], " ");
+    out.extend_from_slice(format!("Subject: {subject}\r\n").as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    out.extend_from_slice(inner);
+    if !inner.ends_with(b"\r\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     out
 }
 
@@ -537,7 +590,10 @@ fn outer_headers_only(header_section: &[u8]) -> Vec<u8> {
 pub fn wrap_pgp_mime_signed(raw: &[u8], armored_signature: &str, micalg: &str) -> Result<Vec<u8>> {
     let (header_section, inner_part) = split_inner_part(raw)
         .ok_or_else(|| Error::Other("pgp/mime: source message has no header/body split".into()))?;
-    let outer_headers = outer_headers_only(&header_section);
+    // Signed messages never protect the subject — the whole point of a
+    // multipart/signed message is that its content (including the body
+    // and any wrapped headers) stays readable.
+    let outer_headers = outer_headers_only(&header_section, None);
     let boundary = format!("chithi-pgp-signed-{}", uuid::Uuid::new_v4().simple());
 
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() + armored_signature.len() + 512);
@@ -579,10 +635,21 @@ pub fn wrap_pgp_mime_signed(raw: &[u8], armored_signature: &str, micalg: &str) -
 /// `armored_ciphertext` is the ASCII-armored OpenPGP message produced by
 /// libtumpa::encrypt::encrypt_to_recipients (or
 /// sign_and_encrypt_to_recipients for sign-then-encrypt).
-pub fn wrap_pgp_mime_encrypted(raw: &[u8], armored_ciphertext: &str) -> Result<Vec<u8>> {
+///
+/// `subject_override` replaces the outer envelope's `Subject:` value
+/// when `Some` — used by protected-headers ("encrypt the subject")
+/// encryption, where the caller passes a placeholder such as `"..."`
+/// and the real subject has been folded inside the ciphertext via
+/// `wrap_with_protected_headers`. Pass `None` to keep the original
+/// outer subject.
+pub fn wrap_pgp_mime_encrypted(
+    raw: &[u8],
+    armored_ciphertext: &str,
+    subject_override: Option<&str>,
+) -> Result<Vec<u8>> {
     let (header_section, _inner_part) = split_inner_part(raw)
         .ok_or_else(|| Error::Other("pgp/mime: source message has no header/body split".into()))?;
-    let outer_headers = outer_headers_only(&header_section);
+    let outer_headers = outer_headers_only(&header_section, subject_override);
     let boundary = format!("chithi-pgp-encrypted-{}", uuid::Uuid::new_v4().simple());
 
     let mut out: Vec<u8> = Vec::with_capacity(armored_ciphertext.len() + 1024);
@@ -613,10 +680,19 @@ pub fn wrap_pgp_mime_encrypted(raw: &[u8], armored_ciphertext: &str) -> Result<V
           \r\n",
     );
     out.extend_from_slice(armored_ciphertext.as_bytes());
+    // RFC 2046 §5.1.1: the CRLF immediately preceding the closing
+    // `--boundary--` delimiter is part of the delimiter. Ensure exactly
+    // one CRLF terminates the ciphertext part. rpgp's armor writer ends
+    // its output with a bare LF, so the naive "append \r" branch would
+    // produce `\n\r` (CR *after* LF) — malformed, and strict parsers
+    // such as our own `pgp_mime::extract_encrypted_payload` then fail to
+    // locate the closing boundary. Pop the bare LF and re-terminate
+    // with a proper CRLF instead.
     if !armored_ciphertext.ends_with('\n') {
         out.extend_from_slice(b"\r\n");
     } else if !armored_ciphertext.ends_with("\r\n") {
-        out.extend_from_slice(b"\r");
+        out.pop(); // drop the trailing bare LF
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     Ok(out)
@@ -637,6 +713,66 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Format a folded `Autocrypt:` header line for `addr` carrying the
+/// Autocrypt-minimised transferable public key `keydata` (raw binary
+/// OpenPGP bytes). The returned string is a complete header field
+/// WITHOUT a trailing CRLF — `insert_header_before_body` supplies the
+/// framing.
+///
+/// `prefer-encrypt=mutual` is always emitted: a chithi user who has the
+/// Autocrypt toggle on is signalling they want encrypted replies. The
+/// base64 `keydata` is folded onto continuation lines, each prefixed by
+/// a single space (RFC 5322 §2.2.3 FWS). Autocrypt parsers strip ALL
+/// whitespace from `keydata` before base64-decoding (Autocrypt Level 1
+/// §2.1.1), so the fold width is purely cosmetic; 72 chars keeps every
+/// wire line under the 78-column soft limit (1 leading space + 72 = 73).
+pub fn format_autocrypt_header(addr: &str, keydata: &[u8]) -> String {
+    use base64::Engine;
+    // Defense-in-depth: this header is hand-assembled and spliced in by
+    // `insert_header_before_body`, bypassing lettre's address validation.
+    // An addr-spec cannot contain CR/LF — strip any so a malformed
+    // account address can't inject extra headers into the outgoing
+    // message.
+    let addr = addr.replace(['\r', '\n'], "");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(keydata);
+    let mut out = format!("Autocrypt: addr={addr}; prefer-encrypt=mutual; keydata=");
+    // base64 output is pure ASCII, so byte-index slicing is char-safe.
+    const WIDTH: usize = 72;
+    let mut idx = 0;
+    while idx < b64.len() {
+        let end = (idx + WIDTH).min(b64.len());
+        out.push_str("\r\n ");
+        out.push_str(&b64[idx..end]);
+        idx = end;
+    }
+    out
+}
+
+/// Insert `header_line` (a complete header field WITHOUT a trailing
+/// CRLF; any continuation lines already folded) into the header block
+/// of RFC 5322 message `raw`, as the last header before the blank line
+/// that separates headers from body.
+///
+/// Returns `raw` unchanged if no `\r\n\r\n` header/body separator is
+/// found — a malformed message shouldn't be made worse.
+pub fn insert_header_before_body(raw: &[u8], header_line: &str) -> Vec<u8> {
+    match find_subslice(raw, b"\r\n\r\n") {
+        Some(i) => {
+            // raw[..i] ends at the last header's content (its trailing
+            // CRLF is part of the `\r\n\r\n` at `i`). Splice in
+            // "\r\n<header_line>" so the new field becomes the final
+            // header, then the existing `\r\n\r\n` closes the block.
+            let mut out = Vec::with_capacity(raw.len() + header_line.len() + 2);
+            out.extend_from_slice(&raw[..i]);
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(header_line.as_bytes());
+            out.extend_from_slice(&raw[i..]);
+            out
+        }
+        None => raw.to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +840,7 @@ mod pgp_wrap_tests {
         let wrapped = wrap_pgp_mime_encrypted(
             &raw,
             "-----BEGIN PGP MESSAGE-----\nfake\n-----END PGP MESSAGE-----\n",
+            None,
         )
         .expect("wrap");
         let s = String::from_utf8_lossy(&wrapped);
@@ -759,6 +896,7 @@ mod pgp_wrap_tests {
         let wrapped = wrap_pgp_mime_encrypted(
             &raw,
             "-----BEGIN PGP MESSAGE-----\nopaque-ciphertext\n-----END PGP MESSAGE-----\n",
+            None,
         )
         .expect("wrap");
         let wrapped_s = String::from_utf8_lossy(&wrapped);
@@ -867,5 +1005,162 @@ mod pgp_wrap_tests {
         // The raw bytes are opaque to `send_raw`; whether they're a plain
         // RFC 822 message, a multipart/signed, or a multipart/encrypted
         // envelope doesn't affect the SMTP envelope.
+    }
+
+    /// The Autocrypt header must carry `addr`, `prefer-encrypt=mutual`,
+    /// and a `keydata=` payload that — once all whitespace is stripped,
+    /// per Autocrypt Level 1 §2.1.1 — base64-decodes back to the exact
+    /// input bytes. Continuation lines must be folded with CRLF + a
+    /// single leading space so the header is RFC 5322-legal.
+    #[test]
+    fn autocrypt_header_folds_and_round_trips_keydata() {
+        use base64::Engine;
+        // 600 bytes is enough to force several continuation lines.
+        let keydata: Vec<u8> = (0..600u32).map(|i| (i % 256) as u8).collect();
+        let header = format_autocrypt_header("alice@example.com", &keydata);
+
+        assert!(header.starts_with("Autocrypt: addr=alice@example.com; "));
+        assert!(header.contains("prefer-encrypt=mutual;"));
+        assert!(header.contains("keydata="));
+
+        // Every continuation line begins with exactly one space (FWS),
+        // and no wire line exceeds the 78-column soft limit.
+        for line in header.split("\r\n").skip(1) {
+            assert!(
+                line.starts_with(' ') && !line.starts_with("  "),
+                "continuation line must start with a single space: {line:?}"
+            );
+            assert!(line.len() <= 78, "line exceeds 78 cols: {} chars", line.len());
+        }
+
+        // Strip ALL whitespace from the keydata value and base64-decode.
+        let value = header.split("keydata=").nth(1).expect("keydata= present");
+        let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .expect("keydata base64-decodes");
+        assert_eq!(decoded, keydata, "keydata must round-trip exactly");
+    }
+
+    /// `insert_header_before_body` places the new field as the LAST
+    /// header (right before the blank line) and leaves the body byte-
+    /// identical.
+    #[test]
+    fn insert_header_before_body_appends_last_header() {
+        let raw = b"From: a@x\r\nSubject: hi\r\n\r\nbody text\r\n";
+        let out = insert_header_before_body(raw, "Autocrypt: addr=a@x; keydata=AAAA");
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s,
+            "From: a@x\r\nSubject: hi\r\nAutocrypt: addr=a@x; keydata=AAAA\r\n\r\nbody text\r\n"
+        );
+    }
+
+    /// No header/body separator → returned unchanged (don't corrupt a
+    /// malformed message).
+    #[test]
+    fn insert_header_before_body_noop_without_separator() {
+        let raw = b"this is not a real rfc5322 message";
+        let out = insert_header_before_body(raw, "Autocrypt: x");
+        assert_eq!(out, raw);
+    }
+
+    /// `wrap_with_protected_headers` produces a multipart/mixed entity
+    /// tagged `protected-headers="v1"`, carries the real Subject as one
+    /// of its own header fields, and keeps the original inner part as
+    /// the single child.
+    #[test]
+    fn protected_headers_wrap_carries_subject_and_child() {
+        let inner = b"Content-Type: text/plain\r\n\r\nthe body text\r\n";
+        let wrapped = wrap_with_protected_headers(inner, "Secret Subject");
+        let s = String::from_utf8(wrapped).unwrap();
+        assert!(
+            s.starts_with("Content-Type: multipart/mixed; protected-headers=\"v1\";"),
+            "must be a protected-headers multipart/mixed entity"
+        );
+        assert!(
+            s.contains("\r\nSubject: Secret Subject\r\n"),
+            "the real subject must be a header of the protected entity"
+        );
+        assert!(
+            s.contains("the body text"),
+            "the original inner body must survive as the child part"
+        );
+    }
+
+    /// `wrap_pgp_mime_encrypted` with a `subject_override` replaces the
+    /// cleartext outer Subject with the placeholder — the real subject
+    /// never appears in the envelope.
+    #[test]
+    fn wrap_encrypted_subject_override_replaces_outer_subject() {
+        // build_simple() sets Subject: "Test subject".
+        let raw = build_simple();
+        let wrapped = wrap_pgp_mime_encrypted(
+            &raw,
+            "-----BEGIN PGP MESSAGE-----\nfake\n-----END PGP MESSAGE-----\n",
+            Some("..."),
+        )
+        .expect("wrap");
+        let s = String::from_utf8_lossy(&wrapped);
+        assert!(
+            s.contains("Subject: ...\r\n"),
+            "outer Subject must be the placeholder"
+        );
+        assert!(
+            !s.contains("Test subject"),
+            "the real subject must NOT appear in the cleartext envelope"
+        );
+    }
+
+    /// Security regression (review LOW-1): a CR/LF in the Autocrypt
+    /// `addr` must not start a new header line — otherwise a malformed
+    /// account address could inject extra headers into outgoing mail.
+    /// (A `Bcc:` substring left inside the `addr=` *value* is harmless;
+    /// only a `CRLF`-then-`Bcc:` line break would be an injection.) The
+    /// only CRLFs in the result are the keydata fold continuations.
+    #[test]
+    fn autocrypt_header_strips_crlf_from_address() {
+        let header = format_autocrypt_header(
+            "alice@example.com\r\nBcc: victim@example.com",
+            b"keydata-bytes",
+        );
+        assert!(
+            !header.contains("\r\nBcc:"),
+            "a CRLF-injected header line must not appear: {header:?}"
+        );
+        // Every CRLF present must be a fold (CRLF + single space) — no
+        // CRLF starts a fresh header field.
+        for (i, _) in header.match_indices("\r\n") {
+            assert_eq!(
+                header.as_bytes().get(i + 2),
+                Some(&b' '),
+                "every CRLF must begin a folded continuation line"
+            );
+        }
+    }
+
+    /// Security regression (review LOW-2): a CR/LF in the protected
+    /// subject must not inject extra header fields into — or malform —
+    /// the protected-headers entity. The entity's header block stays
+    /// exactly two lines (Content-Type + Subject) before its blank line.
+    #[test]
+    fn protected_headers_wrap_strips_crlf_from_subject() {
+        let inner = b"Content-Type: text/plain\r\n\r\nbody\r\n";
+        let wrapped =
+            wrap_with_protected_headers(inner, "Secret\r\nBcc: victim@example.com\r\n\r\ninjected");
+        let s = String::from_utf8(wrapped).unwrap();
+        // The protected entity's own header block is Content-Type then
+        // Subject, then the blank line — the Subject must be a single
+        // line, so the block is exactly two header lines.
+        let header_block = s.split("\r\n\r\n").next().unwrap();
+        assert_eq!(
+            header_block.lines().count(),
+            2,
+            "protected entity must have exactly 2 header lines, got: {header_block:?}"
+        );
+        assert!(
+            !header_block.contains("\r\nBcc:"),
+            "a CRLF-injected header line must not appear: {header_block:?}"
+        );
     }
 }

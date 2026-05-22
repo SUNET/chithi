@@ -6,7 +6,13 @@ import { useAccountsStore } from "@/stores/accounts";
 import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
-import type { Account, ComposeAttachment, PgpRecipientStatus } from "@/lib/types";
+import type {
+  Account,
+  Address,
+  ComposeAttachment,
+  MessageBody,
+  PgpRecipientStatus,
+} from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import Select from "@/components/common/Select.vue";
@@ -76,6 +82,10 @@ onMounted(async () => {
     // Only set error if we didn't already fail to fetch
     error.value = "No accounts found. Please add an account first.";
   }
+  // Resume a saved draft, if this composer was opened for one.
+  if (isResumingDraft && selectedAccountId.value) {
+    await loadDraft(selectedAccountId.value);
+  }
 });
 
 // WebKitGTK on Linux doesn't forward standard editing shortcuts (Ctrl+Z,
@@ -129,6 +139,10 @@ const subject = ref((route.query.subject as string) || "");
 const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
 const savingDraft = ref(false);
+// Set true by saveDraft() when the account's "Store drafts encrypted"
+// toggle was on but the draft had to be stored in plaintext anyway
+// (Graph account / no usable public key). Drives a non-blocking notice.
+const draftPlaintextNotice = ref(false);
 const error = ref<string | null>(null);
 const showCc = ref(!!cc.value);
 const showBcc = ref(false);
@@ -298,9 +312,12 @@ async function applySignature(accountId: string) {
   }
 }
 
-// Apply signature on initial account selection and when switching accounts
+// Apply signature on initial account selection and when switching
+// accounts. Skipped entirely when resuming a draft — the draft already
+// carries whatever signature it was saved with, and appending another
+// would both duplicate it and race the async draft pre-fill.
 watch(selectedAccountId, (newId) => {
-  if (newId) applySignature(newId);
+  if (newId && !isResumingDraft) applySignature(newId);
 });
 
 // Track initial values to detect changes.
@@ -329,6 +346,71 @@ function markDraftStateAsClean() {
   baselineSubject.value = subject.value;
   baselineBody.value = bodyText.value;
   baselineAttachments.value = attachmentBaselineValue(attachments.value);
+}
+
+// --- Resuming a saved draft ----------------------------------------------
+// When `draftId` is present the composer was opened to resume a draft.
+// We fetch the draft body, decrypt it first if it's an encrypted draft,
+// and pre-fill the form. A failed decrypt (no key / card not attached /
+// wrong PIN) renders an inline placeholder + Retry instead of silently
+// opening a blank composer.
+//
+// Known v1 limitations: resuming does not carry forward Bcc (the parsed
+// MessageBody has no bcc field) or attachments (those are server-side
+// refs, not local upload tokens), and saving a resumed draft creates a
+// new draft rather than replacing the original.
+const draftId = (route.query.draftId as string) || "";
+const isResumingDraft = !!draftId;
+const draftLoading = ref(false);
+const draftDecryptError = ref<string | null>(null);
+
+function formatAddress(a: Address): string {
+  return a.name ? `${a.name} <${a.email}>` : a.email;
+}
+
+// Pre-fill the form. `envelope` is the cleartext outer message (To / Cc /
+// Subject), `body` is the message text. For a plaintext draft the two
+// come from the same fetch; for an encrypted draft the envelope is the
+// cleartext outer headers and `body` is the decrypted inner — the
+// decrypted inner carries no Subject of its own, which is why the
+// envelope must be fetched separately.
+function prefillFromDraft(envelope: MessageBody, body: string) {
+  to.value = envelope.to.map(formatAddress).join(", ");
+  cc.value = envelope.cc.map(formatAddress).join(", ");
+  if (cc.value) showCc.value = true;
+  subject.value = envelope.subject ?? "";
+  bodyText.value = body;
+  // The pre-filled draft is the new clean baseline — editing from here
+  // is what counts as dirty, not the act of loading it.
+  markDraftStateAsClean();
+}
+
+async function loadDraft(accountId: string) {
+  if (!draftId) return;
+  draftLoading.value = true;
+  draftDecryptError.value = null;
+  try {
+    // The outer fetch always gives the cleartext envelope (To / Cc /
+    // Subject). For a plaintext draft it also gives the body.
+    const envelope = await api.getMessageBody(accountId, draftId);
+    let body = envelope.body_text ?? "";
+    if (envelope.pgp_kind === "mimeEncrypted") {
+      // Encrypted draft: decrypt for the real body. pgp_decrypt_message
+      // drives the passphrase / card-PIN dialog through the pgp-prompts
+      // store, which this window is already subscribed to.
+      const decrypted = await api.pgpDecryptMessage(accountId, draftId);
+      body = decrypted.plaintextBody.body_text ?? "";
+    }
+    prefillFromDraft(envelope, body);
+  } catch (e) {
+    draftDecryptError.value = String(e);
+  } finally {
+    draftLoading.value = false;
+  }
+}
+
+function retryLoadDraft() {
+  if (selectedAccountId.value) loadDraft(selectedAccountId.value);
 }
 
 const isDirty = computed(() =>
@@ -434,7 +516,7 @@ async function saveDraft(): Promise<boolean> {
   savingDraft.value = true;
   error.value = null;
   try {
-    await api.saveDraft(accountId, {
+    const outcome = await api.saveDraft(accountId, {
       to: parseAddresses(to.value),
       cc: parseAddresses(cc.value),
       bcc: parseAddresses(bcc.value),
@@ -444,6 +526,11 @@ async function saveDraft(): Promise<boolean> {
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
     });
+    // The account asked for encrypted drafts but the backend had to
+    // store this one in plaintext (Graph account, or no usable public
+    // key). Surface a non-blocking notice so the toggle isn't silently
+    // misleading. `outcome` may be undefined under older test mocks.
+    draftPlaintextNotice.value = outcome?.plaintext_fallback ?? false;
     markDraftStateAsClean();
     // Trigger a sync so the draft appears in the local mailbox
     api.triggerSync(accountId).catch(() => {});
@@ -671,6 +758,43 @@ async function send() {
     </div>
 
     <div v-if="error" class="compose-error">{{ error }}</div>
+
+    <!-- Resuming a draft: in-progress / failed-decrypt banners. -->
+    <div
+      v-if="draftLoading"
+      class="compose-draft-banner"
+      data-testid="draft-loading"
+    >
+      Loading draft…
+    </div>
+    <div
+      v-else-if="draftDecryptError"
+      class="compose-draft-banner compose-draft-banner-error"
+      data-testid="draft-decrypt-error"
+    >
+      <span>
+        Encrypted draft — re-attach card or unlock key to continue editing.
+      </span>
+      <button
+        type="button"
+        class="draft-retry-btn"
+        data-testid="draft-decrypt-retry"
+        @click="retryLoadDraft"
+      >
+        Retry
+      </button>
+    </div>
+
+    <!-- "Store drafts encrypted" was on but this draft was saved in
+         plaintext (Graph account, or no usable public key). -->
+    <div
+      v-if="draftPlaintextNotice"
+      class="compose-draft-banner compose-draft-banner-warn"
+      data-testid="draft-plaintext-notice"
+    >
+      Draft saved in plaintext — encrypted drafts need an OpenPGP key for
+      this account, and aren't supported on Microsoft accounts yet.
+    </div>
 
     <!-- Fields & Body -->
     <div class="compose-body-area">
@@ -920,6 +1044,39 @@ async function send() {
   color: var(--color-danger-text);
   font-size: 12px;
   flex-shrink: 0;
+}
+
+.compose-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--color-surface-2, rgba(0, 0, 0, 0.04));
+  color: var(--color-text-secondary, inherit);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.compose-draft-banner-error {
+  background: rgba(251, 44, 54, 0.06);
+  color: var(--color-danger-text);
+}
+
+.compose-draft-banner-warn {
+  background: rgba(245, 158, 11, 0.10);
+  color: var(--color-warning-text, #92400e);
+}
+
+.draft-retry-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
 }
 
 /* Body area */

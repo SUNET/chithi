@@ -10,6 +10,11 @@ export interface ComposeParams {
   bcc?: string;
   subject?: string;
   body?: string;
+  /** chithi message id of a saved draft to resume. When set, ComposeView
+   *  fetches the draft (decrypting it first if it's an encrypted draft)
+   *  and pre-fills the form. Mutually exclusive with the reply/prefill
+   *  params above in practice. */
+  draftId?: string;
 }
 
 export function openComposeWindow(params: ComposeParams = {}) {
@@ -24,6 +29,7 @@ export function openComposeWindow(params: ComposeParams = {}) {
   if (params.bcc) query.set("bcc", params.bcc);
   if (params.subject) query.set("subject", params.subject);
   if (params.body) query.set("body", params.body);
+  if (params.draftId) query.set("draftId", params.draftId);
 
   const queryStr = query.toString();
   const url = queryStr ? `/compose?${queryStr}` : "/compose";

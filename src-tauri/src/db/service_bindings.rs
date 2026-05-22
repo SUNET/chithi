@@ -729,6 +729,10 @@ mod tests {
             mail_sync_interval_seconds: None,
             calendar_sync_interval_seconds: None,
             contacts_sync_interval_seconds: None,
+            pgp_attach_pubkey_on_sign: true,
+            pgp_autocrypt_header: true,
+            pgp_encrypt_subject: true,
+            pgp_encrypt_drafts: true,
         }
     }
 

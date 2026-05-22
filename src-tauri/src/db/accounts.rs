@@ -121,6 +121,19 @@ pub struct AccountConfig {
     pub has_calendar_binding: bool,
     #[serde(default)]
     pub has_contacts_binding: bool,
+    /// Per-account OpenPGP "Advanced settings" toggles. All default `true`
+    /// — fresh-install behavior is fully-enabled and the user opts out by
+    /// unticking. The compose / draft backend reads these via a
+    /// `SendOptions` IPC payload and only acts when the corresponding
+    /// flag is set.
+    #[serde(default = "default_true")]
+    pub pgp_attach_pubkey_on_sign: bool,
+    #[serde(default = "default_true")]
+    pub pgp_autocrypt_header: bool,
+    #[serde(default = "default_true")]
+    pub pgp_encrypt_subject: bool,
+    #[serde(default = "default_true")]
+    pub pgp_encrypt_drafts: bool,
 }
 
 fn default_basic() -> String {
@@ -174,6 +187,13 @@ pub struct AccountFull {
     pub mail_sync_interval_seconds: Option<i64>,
     pub calendar_sync_interval_seconds: Option<i64>,
     pub contacts_sync_interval_seconds: Option<i64>,
+    /// Per-account OpenPGP "Advanced settings" toggles. Mirrors the four
+    /// columns on the `accounts` table; loaded by `get_account_full` and
+    /// pushed back by `update_account`.
+    pub pgp_attach_pubkey_on_sign: bool,
+    pub pgp_autocrypt_header: bool,
+    pub pgp_encrypt_subject: bool,
+    pub pgp_encrypt_drafts: bool,
 }
 
 impl AccountFull {
@@ -453,7 +473,9 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn
         .query_row(
             "SELECT id, display_name, email, username, enabled, signature,
-                oidc_token_endpoint, oidc_client_id, auth_method
+                oidc_token_endpoint, oidc_client_id, auth_method,
+                pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
+                pgp_encrypt_subject, pgp_encrypt_drafts
          FROM accounts WHERE id = ?1",
             params![id],
             |row| {
@@ -467,6 +489,10 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                     oidc_token_endpoint: row.get(6)?,
                     oidc_client_id: row.get(7)?,
                     auth_method: row.get(8)?,
+                    pgp_attach_pubkey_on_sign: row.get(9)?,
+                    pgp_autocrypt_header: row.get(10)?,
+                    pgp_encrypt_subject: row.get(11)?,
+                    pgp_encrypt_drafts: row.get(12)?,
                     // Legacy fields populated below from bindings + auth_method.
                     provider: String::new(),
                     mail_protocol: String::new(),
@@ -538,8 +564,10 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 
     conn.execute(
         "INSERT INTO accounts (id, display_name, email, username, signature,
-                               oidc_token_endpoint, oidc_client_id, auth_method)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                               oidc_token_endpoint, oidc_client_id, auth_method,
+                               pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
+                               pgp_encrypt_subject, pgp_encrypt_drafts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id,
             config.display_name,
@@ -549,6 +577,10 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             auth_method,
+            config.pgp_attach_pubkey_on_sign,
+            config.pgp_autocrypt_header,
+            config.pgp_encrypt_subject,
+            config.pgp_encrypt_drafts,
         ],
     )?;
     crate::db::service_bindings::rebuild_for_account(
@@ -609,8 +641,10 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         "UPDATE accounts
          SET display_name=?1, email=?2, username=?3, signature=?4,
              oidc_token_endpoint=?5, oidc_client_id=?6, auth_method=?7,
+             pgp_attach_pubkey_on_sign=?8, pgp_autocrypt_header=?9,
+             pgp_encrypt_subject=?10, pgp_encrypt_drafts=?11,
              updated_at=CURRENT_TIMESTAMP
-         WHERE id=?8",
+         WHERE id=?12",
         params![
             config.display_name,
             config.email,
@@ -619,6 +653,10 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             auth_method,
+            config.pgp_attach_pubkey_on_sign,
+            config.pgp_autocrypt_header,
+            config.pgp_encrypt_subject,
+            config.pgp_encrypt_drafts,
             id,
         ],
     )?;
@@ -673,6 +711,10 @@ mod tests {
                 auth_method TEXT NOT NULL DEFAULT '',
                 oidc_token_endpoint TEXT NOT NULL DEFAULT '',
                 oidc_client_id TEXT NOT NULL DEFAULT '',
+                pgp_attach_pubkey_on_sign INTEGER NOT NULL DEFAULT 1,
+                pgp_autocrypt_header INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_subject INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_drafts INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -727,6 +769,10 @@ mod tests {
             contacts_sync_interval_seconds: None,
             has_calendar_binding: false,
             has_contacts_binding: false,
+            pgp_attach_pubkey_on_sign: true,
+            pgp_autocrypt_header: true,
+            pgp_encrypt_subject: true,
+            pgp_encrypt_drafts: true,
         }
     }
 

@@ -802,6 +802,23 @@ pub async fn pgp_decrypt_message(
     .map_err(|e| Error::Other(format!("pgp body parse task join failed: {e}")))?
     .ok_or_else(|| Error::MailParse("could not parse decrypted plaintext as MIME".into()))?;
 
+    // Protected headers (draft-ietf-lamps-header-protection): if the
+    // decrypted payload carried its own Subject, the sender used the
+    // "encrypt the subject" feature and the cleartext envelope only has
+    // a `...` placeholder. Persist the recovered subject over the stored
+    // placeholder so the message list, search, and thread view all show
+    // the real subject. A normal encrypted message's decrypted payload
+    // is a bare body part with no Subject of its own, so this is a
+    // no-op for non-protected mail.
+    if let Some(ref subj) = plaintext_body.subject {
+        if !subj.is_empty() {
+            let conn = state.db.writer().await;
+            if let Err(e) = crate::db::messages::update_subject(&conn, &message_id, subj) {
+                log::warn!("pgp: failed to persist protected subject for {message_id}: {e}");
+            }
+        }
+    }
+
     Ok(PgpDecryptedMessage {
         plaintext_body,
         verify_outcome: PgpVerifyOutcome::from_decrypt(result.outcome),

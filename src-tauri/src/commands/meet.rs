@@ -90,6 +90,10 @@ pub async fn meet_talk_login_complete(
         contacts_sync_interval_seconds: None,
         has_calendar_binding: false,
         has_contacts_binding: false,
+        pgp_attach_pubkey_on_sign: true,
+        pgp_autocrypt_header: true,
+        pgp_encrypt_subject: true,
+        pgp_encrypt_drafts: true,
     };
     let conn = state.db.writer().await;
     db::accounts::insert_account(&conn, &id, &config)?;
@@ -220,6 +224,10 @@ pub async fn meet_matrix_login_complete(
         contacts_sync_interval_seconds: None,
         has_calendar_binding: false,
         has_contacts_binding: false,
+        pgp_attach_pubkey_on_sign: true,
+        pgp_autocrypt_header: true,
+        pgp_encrypt_subject: true,
+        pgp_encrypt_drafts: true,
     };
     let conn = state.db.writer().await;
     db::accounts::insert_account(&conn, &id, &config)?;
@@ -412,6 +420,10 @@ pub async fn meet_zoom_login_complete(
         contacts_sync_interval_seconds: None,
         has_calendar_binding: false,
         has_contacts_binding: false,
+        pgp_attach_pubkey_on_sign: true,
+        pgp_autocrypt_header: true,
+        pgp_encrypt_subject: true,
+        pgp_encrypt_drafts: true,
     };
     let conn = state.db.writer().await;
     db::accounts::insert_account(&conn, &id, &config)?;

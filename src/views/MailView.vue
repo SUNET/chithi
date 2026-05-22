@@ -11,6 +11,7 @@ import { useUiStore } from "@/stores/ui";
 import { usePlatformStore } from "@/stores/platform";
 import * as api from "@/lib/tauri";
 import { openReaderWindow } from "@/lib/reader-window";
+import { openComposeWindow } from "@/lib/compose-window";
 import Toolbar from "@/components/mail/Toolbar.vue";
 import FolderTree from "@/components/mail/FolderTree.vue";
 import MessageList from "@/components/mail/MessageList.vue";
@@ -38,11 +39,33 @@ const activeFolderName = computed(() => {
 const isOutboxFolder = computed(
   () => foldersStore.activeFolderPath === OUTBOX_FOLDER,
 );
+// True when the folder currently being viewed is the account's Drafts
+// folder. Clicking a message here resumes it in the composer instead of
+// opening the read-only reader.
+const isDraftsFolder = computed(
+  () =>
+    foldersStore.folders.find((f) => f.path === foldersStore.activeFolderPath)
+      ?.folder_type === "drafts",
+);
+
+/// Resume a saved draft: open a compose window pointed at the draft's
+/// message id. ComposeView fetches the draft body (decrypting it first
+/// when it's an encrypted draft) and pre-fills the form. Shared by the
+/// desktop and mobile open-message handlers.
+function resumeDraft(messageId: string) {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId) return;
+  openComposeWindow({ accountId, draftId: messageId });
+}
 const activeAccountEmail = computed(
   () => accountsStore.activeAccount()?.email ?? "",
 );
 
 function onMobileOpenMessage(messageId: string) {
+  if (isDraftsFolder.value) {
+    resumeDraft(messageId);
+    return;
+  }
   router.push(`/mail/thread/${encodeURIComponent(messageId)}`);
 }
 
@@ -142,6 +165,11 @@ function stopResize() {
 //  - none:          open the message in a new standalone window
 //  - tab:           open the message in a new tab (or focus existing)
 function onOpenMessage(messageId: string) {
+  // Drafts resume into the composer regardless of the reader view mode.
+  if (isDraftsFolder.value) {
+    resumeDraft(messageId);
+    return;
+  }
   if (
     uiStore.messageViewMode === "right" ||
     uiStore.messageViewMode === "bottom"

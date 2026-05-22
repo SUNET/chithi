@@ -173,7 +173,7 @@ export async function sendMessage(
 export async function saveDraft(
   accountId: string,
   message: import("./types").ComposeMessage,
-): Promise<void> {
+): Promise<import("./types").DraftSaveOutcome> {
   return invoke("save_draft", { accountId, message });
 }
 
