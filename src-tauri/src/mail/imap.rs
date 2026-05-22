@@ -484,7 +484,8 @@ impl ImapConnection {
         );
 
         // 1. Copy messages to destination
-        self.session.uid_copy(&uid_set, dest_folder).map_err(|e| {
+        let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
+        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
             log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
             Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
         })?;
@@ -644,7 +645,8 @@ impl ImapConnection {
             dest_folder
         );
 
-        self.session.uid_copy(&uid_set, dest_folder).map_err(|e| {
+        let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
+        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
             log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
             Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
         })?;
@@ -840,6 +842,40 @@ fn uid_set_string(uids: &[u32]) -> String {
         .join(",")
 }
 
+/// Quote a mailbox name as an IMAP RFC 3501 quoted-string.
+///
+/// `imap` 2.4.1's `Session::uid_copy` / `Session::copy` interpolate the
+/// destination mailbox name into `UID COPY <set> <name>` without any
+/// quoting, so a name containing a space (e.g. `Infra/SUNET Drive`) is
+/// parsed by the server as two atoms and the COPY fails with
+/// `Mailbox doesn't exist: Infra/SUNET`. Quote it ourselves: wrap in
+/// `"` and backslash-escape `"` and `\` per the `quoted` grammar.
+///
+/// The `quoted` grammar (RFC 3501 §4.3) excludes CR, LF, and NUL —
+/// these would break command framing on the wire. Since `dest_folder`
+/// reaches us from a Tauri command argument we fail loudly on any
+/// control character rather than silently stripping it (silent
+/// stripping would change the destination folder, which is worse than
+/// a clear error).
+fn quote_mailbox_for_imap(name: &str) -> Result<String> {
+    if let Some(c) = name.chars().find(|c| c.is_control()) {
+        return Err(Error::Imap(format!(
+            "invalid mailbox name: contains control character U+{:04X}",
+            c as u32
+        )));
+    }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('"');
+    for c in name.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    Ok(out)
+}
+
 fn flag_to_string(flag: &imap::types::Flag<'_>) -> String {
     match flag {
         imap::types::Flag::Seen => "seen".to_string(),
@@ -879,6 +915,60 @@ fn flag_to_wire(flag: &str) -> String {
 /// which RFC 3501 §2.3.2 forbids modifying via STORE.
 fn is_recent_flag(flag: &str) -> bool {
     flag.trim_start_matches('\\').eq_ignore_ascii_case("recent")
+}
+
+#[cfg(test)]
+mod quote_mailbox_tests {
+    use super::quote_mailbox_for_imap;
+
+    #[test]
+    fn simple_name_is_quoted() {
+        assert_eq!(quote_mailbox_for_imap("INBOX").unwrap(), "\"INBOX\"");
+    }
+
+    #[test]
+    fn name_with_space_is_quoted_unchanged() {
+        // The regression from #185: a space in the name caused the server
+        // to parse `Infra/SUNET Drive` as two atoms.
+        assert_eq!(
+            quote_mailbox_for_imap("Infra/SUNET Drive").unwrap(),
+            "\"Infra/SUNET Drive\""
+        );
+    }
+
+    #[test]
+    fn embedded_double_quote_is_backslash_escaped() {
+        assert_eq!(
+            quote_mailbox_for_imap("weird\"name").unwrap(),
+            "\"weird\\\"name\""
+        );
+    }
+
+    #[test]
+    fn embedded_backslash_is_backslash_escaped() {
+        assert_eq!(quote_mailbox_for_imap("a\\b").unwrap(), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn empty_name_round_trips_to_empty_quoted_string() {
+        assert_eq!(quote_mailbox_for_imap("").unwrap(), "\"\"");
+    }
+
+    #[test]
+    fn control_characters_are_rejected() {
+        // RFC 3501 §4.3 excludes CR/LF/NUL from the quoted grammar. We
+        // reject loudly rather than silently strip — silent stripping
+        // would change the destination folder, which is worse than a
+        // clear error and could mask injection attempts via the Tauri
+        // command argument.
+        for bad in ["a\rb", "a\nb", "a\0b", "\x07bell"] {
+            assert!(
+                quote_mailbox_for_imap(bad).is_err(),
+                "expected rejection for {:?}",
+                bad
+            );
+        }
+    }
 }
 
 #[cfg(test)]
