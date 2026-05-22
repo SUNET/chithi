@@ -338,8 +338,15 @@ pub async fn meet_zoom_login_complete(
         .await
         .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))??;
 
+    // Don't log raw `state` values — they're CSRF secrets.
+    log::info!(
+        "zoom oauth state validation: has_returned={}",
+        callback.state.is_some(),
+    );
     match callback.state.as_deref() {
-        Some(s) if s == expected_state => {}
+        Some(s) if s == expected_state => {
+            log::info!("zoom oauth: state OK");
+        }
         Some(got) => {
             // The raw nonces are unguessable random strings — no
             // value to a human, and confusing in a UI toast.
