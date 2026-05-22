@@ -46,8 +46,8 @@ RUN if [ -n "$PKG_VERSION" ]; then \
 # Install frontend dependencies
 RUN pnpm install
 
-# Build the Tauri app binary
-RUN pnpm tauri build --bundles none
+# Build the Tauri app binary (no installer bundle; we package via makepkg below)
+RUN pnpm tauri build --no-bundle
 
 # Stage pre-built binary and create Arch package via makepkg
 RUN mkdir -p /build/output /build/src && \
@@ -56,41 +56,44 @@ RUN mkdir -p /build/output /build/src && \
     cp LICENSE /build/src/LICENSE
 
 # Write the PKGBUILD for packaging the pre-built binary
+# Built using printf with shell-quoted args (no heredoc) so this works with
+# both the classic Docker builder and BuildKit. Single-quoted args keep
+# $srcdir / $pkgdir / $pkgname literal so makepkg expands them at install time.
 RUN VERSION=$(jq -r .version src-tauri/tauri.conf.json) && \
     ARCH_VERSION=$(printf '%s' "$VERSION" | tr '-' '.') && \
-    cat > /build/src/PKGBUILD <<PKGEOF
-pkgname=chithi
-pkgver=${ARCH_VERSION}
-pkgrel=1
-pkgdesc="Desktop email client with IMAP, JMAP and Microsoft 365 support"
-arch=("x86_64" "aarch64")
-url="https://github.com/SUNET/chithi"
-license=("GPL-3.0-only")
-depends=("webkit2gtk-4.1" "gtk3" "libayatana-appindicator" "openssl" "libsoup3")
-source=("chithi" "icon.png" "LICENSE")
-noextract=("chithi" "icon.png" "LICENSE")
-sha256sums=("SKIP" "SKIP" "SKIP")
-
-package() {
-    install -Dm755 "\$srcdir/chithi" "\$pkgdir/usr/bin/chithi"
-    install -Dm644 "\$srcdir/icon.png" "\$pkgdir/usr/share/icons/hicolor/128x128/apps/chithi.png"
-    install -Dm644 "\$srcdir/LICENSE" "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
-
-    install -dm755 "\$pkgdir/usr/share/applications"
-    cat > "\$pkgdir/usr/share/applications/chithi.desktop" <<DESKTOPEOF
-[Desktop Entry]
-Name=Chithi
-Comment=Desktop email client with IMAP, JMAP and Microsoft 365 support
-Exec=chithi
-Icon=chithi
-Terminal=false
-Type=Application
-Categories=Network;Email;
-MimeType=x-scheme-handler/mailto;
-StartupWMClass=chithi
-DESKTOPEOF
-}
-PKGEOF
+    printf '%s\n' \
+        'pkgname=chithi' \
+        "pkgver=${ARCH_VERSION}" \
+        'pkgrel=1' \
+        'pkgdesc="Desktop email client with IMAP, JMAP and Microsoft 365 support"' \
+        'arch=("x86_64" "aarch64")' \
+        'url="https://github.com/SUNET/chithi"' \
+        'license=("GPL-3.0-only")' \
+        'depends=("webkit2gtk-4.1" "gtk3" "libayatana-appindicator" "openssl" "libsoup3")' \
+        'source=("chithi" "icon.png" "LICENSE")' \
+        'noextract=("chithi" "icon.png" "LICENSE")' \
+        'sha256sums=("SKIP" "SKIP" "SKIP")' \
+        '' \
+        'package() {' \
+        '    install -Dm755 "$srcdir/chithi" "$pkgdir/usr/bin/chithi"' \
+        '    install -Dm644 "$srcdir/icon.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/chithi.png"' \
+        '    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"' \
+        '' \
+        '    install -dm755 "$pkgdir/usr/share/applications"' \
+        '    cat > "$pkgdir/usr/share/applications/chithi.desktop" <<DESKTOPEOF' \
+        '[Desktop Entry]' \
+        'Name=Chithi' \
+        'Comment=Desktop email client with IMAP, JMAP and Microsoft 365 support' \
+        'Exec=chithi' \
+        'Icon=chithi' \
+        'Terminal=false' \
+        'Type=Application' \
+        'Categories=Network;Email;' \
+        'MimeType=x-scheme-handler/mailto;' \
+        'StartupWMClass=chithi' \
+        'DESKTOPEOF' \
+        '}' \
+        > /build/src/PKGBUILD
 
 # Build the package (makepkg refuses to run as root)
 RUN useradd -m builder && \
