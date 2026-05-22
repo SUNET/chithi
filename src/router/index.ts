@@ -74,13 +74,19 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   if (to.name === "onboarding") return true;
   if (to.name === "compose" || to.name === "reader") return true;
-  // Onboarding hands off to Settings with ?addAccount=<provider> — let it
-  // through even with zero accounts, otherwise the first-run provider tap
-  // would bounce right back to /onboarding.
-  if (to.name === "settings" && to.query.addAccount) return true;
+  // Settings is the canonical "add account" surface (it covers provider
+  // types that onboarding's picker omits, like Zoom). Always allow it
+  // through — otherwise tapping the gear icon on a zero-account install
+  // bounces to onboarding, which is what confused the Zoom marketplace
+  // tester who just wanted to add a Zoom account.
+  if (to.name === "settings") return true;
 
   const params = new URLSearchParams(window.location.search);
   if (params.get("messageId") || params.get("draftId")) return true;
+
+  // "Skip and add an account later" sets this flag so the guard stops
+  // redirecting back to onboarding on every navigation.
+  if (localStorage.getItem("chithi-onboarding-skipped") === "true") return true;
 
   try {
     const { useAccountsStore } = await import("@/stores/accounts");

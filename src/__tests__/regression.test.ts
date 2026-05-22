@@ -10,6 +10,7 @@ import ThreadRow from "@/components/mail/ThreadRow.vue";
 
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
+  addAccount: vi.fn().mockResolvedValue("new-acc"),
   getMessages: vi.fn().mockResolvedValue({ messages: [], total: 0, page: 0, per_page: 100 }),
   getMessageBody: vi.fn().mockResolvedValue({
     id: "msg1", subject: "Test", from: { name: "T", email: "t@t.com" },
@@ -333,5 +334,56 @@ describe("Regression: concurrent fetchAccounts is de-duplicated", () => {
     // Once settled, a later call starts a fresh fetch.
     await accounts.fetchAccounts();
     expect(api.listAccounts).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Regression: onboarding skip + gear-icon bounce", () => {
+  // Bugs:
+  // - "Skip and add an account later" navigated to '/' but the guard
+  //   immediately redirected back to /onboarding because accounts was [].
+  // - Tapping the settings gear icon on a zero-account install bounced
+  //   to onboarding, blocking the Zoom marketplace tester from adding a
+  //   Zoom account (Zoom isn't in the onboarding picker).
+  // - After successfully adding an account the skip flag was left in
+  //   localStorage forever, so a later zero-account state (user deletes
+  //   their accounts) wouldn't re-engage onboarding.
+  const SKIP_KEY = "chithi-onboarding-skipped";
+
+  async function makeRouter() {
+    // Re-import the production router fresh per test so beforeEach hooks
+    // and module state don't leak between cases.
+    vi.resetModules();
+    const mod = await import("@/router");
+    return mod.default;
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    localStorage.removeItem(SKIP_KEY);
+    vi.mocked(api.listAccounts).mockResolvedValue([]);
+  });
+
+  it("BUG: skip flag prevents the guard from redirecting back to onboarding", async () => {
+    localStorage.setItem(SKIP_KEY, "true");
+    const router = await makeRouter();
+    await router.push("/");
+    await router.isReady();
+    expect(router.currentRoute.value.name).toBe("mail");
+  });
+
+  it("BUG: zero accounts must not block /settings (gear-icon fix)", async () => {
+    const router = await makeRouter();
+    await router.push("/settings");
+    await router.isReady();
+    expect(router.currentRoute.value.name).toBe("settings");
+  });
+
+  it("BUG: addAccount() clears the skip flag so onboarding re-engages later", async () => {
+    localStorage.setItem(SKIP_KEY, "true");
+    const accounts = useAccountsStore();
+    await accounts.addAccount({
+      display_name: "T", email: "t@t.com", provider: "generic",
+    } as any);
+    expect(localStorage.getItem(SKIP_KEY)).toBeNull();
   });
 });

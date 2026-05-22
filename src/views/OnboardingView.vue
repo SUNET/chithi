@@ -55,6 +55,7 @@ function pickProvider(p: Provider) {
 }
 
 function skipForNow() {
+  localStorage.setItem("chithi-onboarding-skipped", "true");
   router.push("/");
 }
 </script>
@@ -75,6 +76,7 @@ function skipForNow() {
       <li v-for="p in providers" :key="p.id">
         <button
           class="provider-card"
+          :data-testid="`onboarding-provider-${p.id}`"
           :style="{ borderLeftColor: p.color }"
           @click="pickProvider(p)"
         >
@@ -103,7 +105,7 @@ function skipForNow() {
       </li>
     </ul>
 
-    <button class="skip-link" @click="skipForNow">
+    <button class="skip-link" @click="skipForNow" data-testid="onboarding-skip">
       Skip and add an account later
     </button>
   </div>
