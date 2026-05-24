@@ -311,6 +311,7 @@ impl GraphClient {
                 .and_then(|r| r["emailAddress"]["address"].as_str())
             {
                 if to_addr != email
+                    && looks_like_smtp_address(to_addr)
                     && (to_addr.contains("outlook.")
                         || to_addr.contains("hotmail.")
                         || to_addr.contains("live."))
@@ -335,9 +336,18 @@ impl GraphClient {
                     .and_then(|a| a.first())
                     .and_then(|m| m["from"]["emailAddress"]["address"].as_str())
                 {
-                    if from_addr != email {
+                    // Exchange Online frequently reports the Sent `from`
+                    // as a legacy X.500 / "EX" DN rather than an SMTP
+                    // address — never let that overwrite the real
+                    // address `/me` already returned.
+                    if from_addr != email && looks_like_smtp_address(from_addr) {
                         log::info!("Graph: mailbox email from Sent: {}", from_addr);
                         email = from_addr.to_string();
+                    } else if !looks_like_smtp_address(from_addr) {
+                        log::debug!(
+                            "Graph: ignoring non-SMTP Sent `from` address: {}",
+                            from_addr
+                        );
                     }
                 }
             }
@@ -1295,6 +1305,23 @@ pub struct GraphUser {
     pub login_email: String,
 }
 
+/// Whether `s` is a plausible SMTP addr-spec (`local@domain.tld`).
+///
+/// Graph's `emailAddress.address` is NOT always an SMTP address. For an
+/// Exchange Online mailbox the `from` of a Sent Items message (and
+/// other internal-sender fields) is frequently a legacy X.500 / "EX"
+/// distinguished name, e.g.
+/// `/O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP (FYDIBOHF23SPDLT)/CN=RECIPIENTS/CN=...`.
+/// The mailbox-address heuristic in `get_me` must reject those, or the
+/// EX DN gets shown to the user as their email address and overwrites
+/// the real SMTP address that `/me` already returned correctly.
+fn looks_like_smtp_address(s: &str) -> bool {
+    match s.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && domain.contains('.'),
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphMailFolder {
     pub id: String,
@@ -1947,10 +1974,30 @@ async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<S
 mod color_tests {
     use super::{
         dedupe_graph_rooms, graph_color_to_hex, graph_response_to_my_status,
-        graph_response_to_partstat, nearest_outlook_color, normalize_schedule_datetime,
-        parse_graph_event, parse_graph_named_addresses, parse_graph_room_availability,
-        parse_graph_rooms, GraphRoom,
+        graph_response_to_partstat, looks_like_smtp_address, nearest_outlook_color,
+        normalize_schedule_datetime, parse_graph_event, parse_graph_named_addresses,
+        parse_graph_room_availability, parse_graph_rooms, GraphRoom,
     };
+
+    /// Regression: `get_me`'s mailbox-address heuristic must reject a
+    /// legacy Exchange X.500 / "EX" distinguished name. Graph returns
+    /// one as the Sent `from` address for Exchange Online mailboxes;
+    /// without this guard it was shown to the user as their email
+    /// address, replacing the correct SMTP address from `/me`.
+    #[test]
+    fn ex_distinguished_name_is_not_an_smtp_address() {
+        let ex_dn = "/O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP \
+                     (FYDIBOHF23SPDLT)/CN=RECIPIENTS/CN=abc123";
+        assert!(!looks_like_smtp_address(ex_dn));
+        // Real SMTP addresses still pass.
+        assert!(looks_like_smtp_address("chithiapp@outlook.com"));
+        assert!(looks_like_smtp_address("kushal.das@example.co.uk"));
+        // Degenerate inputs are rejected.
+        assert!(!looks_like_smtp_address(""));
+        assert!(!looks_like_smtp_address("noatsign"));
+        assert!(!looks_like_smtp_address("@outlook.com"));
+        assert!(!looks_like_smtp_address("user@localhost"));
+    }
 
     // Graph emits its own responseType enum; the UI only understands iCal
     // PARTSTAT values. Storing Graph's vocabulary verbatim made the event

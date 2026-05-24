@@ -250,6 +250,10 @@ const defaultForm = (): AccountConfig => ({
   contacts_sync_interval_seconds: null,
   has_calendar_binding: false,
   has_contacts_binding: false,
+  pgp_attach_pubkey_on_sign: true,
+  pgp_autocrypt_header: true,
+  pgp_encrypt_subject: true,
+  pgp_encrypt_drafts: true,
 });
 
 const form = ref<AccountConfig>(defaultForm());
@@ -1627,6 +1631,64 @@ onMounted(() => {
                   <option v-for="b in availableBooks" :key="b.id" :value="b.id">{{ b.label }}</option>
                 </select>
                 <span class="field-hint">Attendee autocomplete in the event editor ranks matches from this book first.</span>
+              </div>
+            </div>
+
+            <!-- Per-account OpenPGP "Advanced settings". Only shown for
+                 accounts that actually have a mail binding (mail_protocol
+                 non-empty) — CalDAV-only / CardDAV-only / Meet accounts
+                 don't send mail so these toggles would be meaningless.
+                 All four ship default-on; the user opts out by unticking.
+                 Backend reads these on the compose / draft commands. -->
+            <div
+              v-if="!isMeetTab && form.mail_protocol"
+              class="form-group bindings-section"
+              data-testid="pgp-advanced-settings"
+            >
+              <label class="bindings-section-title">Advanced settings</label>
+
+              <div class="form-group form-group-checkbox">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.pgp_attach_pubkey_on_sign"
+                    type="checkbox"
+                    data-testid="pgp-attach-pubkey-on-sign"
+                  />
+                  Attach my public key when adding an OpenPGP digital signature
+                </label>
+              </div>
+
+              <div class="form-group form-group-checkbox">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.pgp_autocrypt_header"
+                    type="checkbox"
+                    data-testid="pgp-autocrypt-header"
+                  />
+                  Send OpenPGP public key(s) in the email headers for compatibility with Autocrypt
+                </label>
+              </div>
+
+              <div class="form-group form-group-checkbox">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.pgp_encrypt_subject"
+                    type="checkbox"
+                    data-testid="pgp-encrypt-subject"
+                  />
+                  Encrypt the subject of OpenPGP messages
+                </label>
+              </div>
+
+              <div class="form-group form-group-checkbox">
+                <label class="checkbox-label">
+                  <input
+                    v-model="form.pgp_encrypt_drafts"
+                    type="checkbox"
+                    data-testid="pgp-encrypt-drafts"
+                  />
+                  Store draft messages in encrypted format
+                </label>
               </div>
             </div>
 

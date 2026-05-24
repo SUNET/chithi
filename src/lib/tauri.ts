@@ -173,7 +173,7 @@ export async function sendMessage(
 export async function saveDraft(
   accountId: string,
   message: import("./types").ComposeMessage,
-): Promise<void> {
+): Promise<import("./types").DraftSaveOutcome> {
   return invoke("save_draft", { accountId, message });
 }
 
@@ -767,4 +767,80 @@ export async function retryOutboxOp(outboxId: number): Promise<void> {
 
 export async function discardOutboxOp(outboxId: number): Promise<void> {
   return invoke("discard_outbox_op", { outboxId });
+}
+
+// OpenPGP
+export async function pgpListKeys(): Promise<import("./types").PgpKeySummary[]> {
+  return invoke("pgp_list_keys");
+}
+
+export async function pgpGetKey(
+  fingerprint: string,
+): Promise<import("./types").PgpKeySummary> {
+  return invoke("pgp_get_key", { fingerprint });
+}
+
+export async function pgpImportKey(
+  data: Uint8Array,
+): Promise<import("./types").PgpImportResult> {
+  // Tauri serialises Uint8Array → JSON array of numbers — backend command
+  // takes Vec<u8>.
+  return invoke("pgp_import_key", { data: Array.from(data) });
+}
+
+/** Opens the native file dialog server-side and imports the picked file.
+ *  Returns null if the user cancels. */
+export async function pgpPickAndImportKey(): Promise<
+  import("./types").PgpImportResult | null
+> {
+  return invoke("pgp_pick_and_import_key");
+}
+
+export async function pgpDeleteKey(fingerprint: string): Promise<void> {
+  return invoke("pgp_delete_key", { fingerprint });
+}
+
+export async function pgpExportPublic(fingerprint: string): Promise<string> {
+  return invoke("pgp_export_public", { fingerprint });
+}
+
+/** Returns the fingerprint of the imported key. */
+export async function pgpWkdFetch(email: string): Promise<string> {
+  return invoke("pgp_wkd_fetch", { email });
+}
+
+export async function pgpListCards(): Promise<import("./types").PgpCardSummary[]> {
+  return invoke("pgp_list_cards");
+}
+
+export async function pgpCardDetails(
+  ident: string,
+): Promise<import("./types").PgpCardDetails> {
+  return invoke("pgp_card_details", { ident });
+}
+
+export async function pgpAutoLinkCards(): Promise<
+  import("./types").PgpCardDetection[]
+> {
+  return invoke("pgp_auto_link_cards");
+}
+
+export async function pgpDecryptMessage(
+  accountId: string,
+  messageId: string,
+): Promise<import("./types").PgpDecryptedMessage> {
+  return invoke("pgp_decrypt_message", { accountId, messageId });
+}
+
+export async function pgpVerifyMessage(
+  accountId: string,
+  messageId: string,
+): Promise<import("./types").PgpVerifyOutcome> {
+  return invoke("pgp_verify_message", { accountId, messageId });
+}
+
+export async function pgpCheckRecipients(
+  recipients: string[],
+): Promise<import("./types").PgpRecipientStatus[]> {
+  return invoke("pgp_check_recipients", { recipients });
 }

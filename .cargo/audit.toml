@@ -4,7 +4,7 @@
 # migrates wry to webkit6gtk, or a transitive dep bumps a nom/rand version),
 # remove the entry and let CI flag any regression.
 #
-# Note: 20 IDs cover 21 findings because RUSTSEC-2026-0097 matches two crate
+# Note: 21 IDs cover 22 findings because RUSTSEC-2026-0097 matches two crate
 # versions (rand 0.7.3 and rand 0.8.5) under the same advisory.
 ignore = [
     # --- gtk-rs GTK3 bindings, unmaintained. Transitive via
@@ -43,4 +43,17 @@ ignore = [
                         # into the binary. Our runtime logger is fern (see
                         # logging.rs) with only chrono + log as deps; it does
                         # not touch rand.
+
+    # --- cryptographic timing side-channel, no upstream fix available
+    "RUSTSEC-2023-0071", # rsa "Marvin Attack": potential RSA key recovery
+                        # through a timing side-channel. Transitive via the
+                        # OpenPGP stack (libtumpa -> rpgp -> rsa). No
+                        # constant-time `rsa` release exists yet. The attack
+                        # needs an adversary to time many RSA private-key
+                        # operations, in practice over a network; Chithi
+                        # decrypts locally on explicit user action and
+                        # exposes no network-reachable RSA oracle, so the
+                        # practical exposure is minimal. Drop this once
+                        # `rsa` ships a constant-time release.
+                        # Upstream: https://github.com/RustCrypto/RSA/issues/19
 ]

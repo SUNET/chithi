@@ -83,6 +83,11 @@ pub struct MessageBody {
     pub is_signed: bool,
     pub list_id: Option<String>,
     pub has_remote_images: bool,
+    /// Detected PGP shape (None for plain mail). Drives the reader's
+    /// Decrypt button / signature badge. Set by the parser via
+    /// `mail::pgp_mime::detect_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pgp_kind: Option<crate::mail::pgp_mime::PgpKind>,
 }
 
 pub struct NewMessage {
@@ -440,6 +445,19 @@ pub fn update_maildir_path(conn: &Connection, message_id: &str, path: &str) -> R
     conn.execute(
         "UPDATE messages SET maildir_path = ?1 WHERE id = ?2",
         params![path, message_id],
+    )?;
+    Ok(())
+}
+
+/// Overwrite a message's stored subject. Used by the protected-headers
+/// ("encrypt the subject") feature: when an encrypted message is
+/// decrypted and the real subject is recovered from inside the
+/// ciphertext, it's written back here so the message list, search, and
+/// thread view show the real subject instead of the `...` placeholder.
+pub fn update_subject(conn: &Connection, message_id: &str, subject: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET subject = ?1 WHERE id = ?2",
+        params![subject, message_id],
     )?;
     Ok(())
 }

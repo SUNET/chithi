@@ -63,8 +63,96 @@ watch(
     invites.value = [];
     imagesHtml.value = null;
     loadingImages.value = false;
+    decryptedOverlay.value = null;
+    verifyOutcome.value = null;
+    decryptError.value = null;
+    decryptBusy.value = false;
   },
 );
+
+// OpenPGP state. When a message is decrypted we render the decrypted
+// MessageBody in place of the original (which is just an encrypted
+// blob). For signed messages we auto-verify once on load.
+import type { MessageBody as MessageBodyT, PgpVerifyOutcome } from "@/lib/types";
+const decryptedOverlay = ref<MessageBodyT | null>(null);
+const verifyOutcome = ref<PgpVerifyOutcome | null>(null);
+const decryptBusy = ref(false);
+const decryptError = ref<string | null>(null);
+
+// The body fields actually rendered are either the live message or the
+// decrypted overlay if we successfully decrypted.
+const displayedBody = computed<MessageBodyT | null>(
+  () => decryptedOverlay.value ?? messagesStore.activeMessage,
+);
+const pgpKind = computed(() => messagesStore.activeMessage?.pgp_kind);
+
+async function decryptOpenPGP() {
+  const acct = accountsStore.activeAccountId;
+  const msgId = messagesStore.activeMessageId;
+  if (!acct || !msgId) return;
+  decryptError.value = null;
+  decryptBusy.value = true;
+  try {
+    const result = await api.pgpDecryptMessage(acct, msgId);
+    decryptedOverlay.value = result.plaintextBody;
+    verifyOutcome.value = result.verifyOutcome;
+  } catch (e) {
+    decryptError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    decryptBusy.value = false;
+  }
+}
+
+// Auto-verify multipart/signed on load. Encrypted messages don't
+// auto-decrypt — that needs a passphrase prompt, which is user-driven.
+watch(
+  () => messagesStore.activeMessage,
+  async (msg) => {
+    if (!msg || msg.pgp_kind !== "mimeSigned") return;
+    const acct = accountsStore.activeAccountId;
+    const msgId = messagesStore.activeMessageId;
+    if (!acct || !msgId) return;
+    try {
+      verifyOutcome.value = await api.pgpVerifyMessage(acct, msgId);
+    } catch (e) {
+      verifyOutcome.value = {
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      };
+    }
+  },
+);
+
+function verifyBadgeLabel(o: PgpVerifyOutcome | null): string {
+  if (!o) return "";
+  switch (o.kind) {
+    case "good":
+      return `Signed by ${o.signerUid ?? o.signerFingerprint.slice(-16)}`;
+    case "bad":
+      return `Signature invalid (${o.signerUid ?? o.signerFingerprint.slice(-16)})`;
+    case "unknownKey":
+      return `Unknown signer (key id ${o.keyId})`;
+    case "unsigned":
+      return "";
+    case "error":
+      return `Signature check error: ${o.message}`;
+  }
+}
+
+function verifyBadgeClass(o: PgpVerifyOutcome | null): string {
+  if (!o) return "";
+  switch (o.kind) {
+    case "good":
+      return "pgp-badge pgp-badge-good";
+    case "bad":
+    case "error":
+      return "pgp-badge pgp-badge-bad";
+    case "unknownKey":
+      return "pgp-badge pgp-badge-warn";
+    case "unsigned":
+      return "";
+  }
+}
 
 // Check for calendar invites AFTER body is loaded (body must be on disk for parsing)
 watch(
@@ -100,8 +188,8 @@ watch(
   },
 );
 
-const hasHtml = () => !!messagesStore.activeMessage?.body_html;
-const hasText = () => !!messagesStore.activeMessage?.body_text;
+const hasHtml = () => !!(displayedBody.value?.body_html);
+const hasText = () => !!(displayedBody.value?.body_text);
 
 // Generate a random nonce for iframe CSP
 function generateNonce(): string {
@@ -117,7 +205,7 @@ const currentNonce = ref(generateNonce());
 // Uses a CSP nonce instead of 'unsafe-inline' so only our bootstrap script runs.
 // Email HTML is embedded in srcdoc but sanitized by ammonia on the backend.
 function iframeSrcdoc(): string {
-  const html = imagesHtml.value ?? messagesStore.activeMessage?.body_html ?? "";
+  const html = imagesHtml.value ?? displayedBody.value?.body_html ?? "";
   const nonce = currentNonce.value;
   return `<!DOCTYPE html>
 <html>
@@ -460,10 +548,37 @@ async function saveContactForm() {
 
 // --- Message actions ---
 
+// Content the reply/forward quote is built from. When the message was
+// decrypted in the reader, use the decrypted plaintext and the recovered
+// real subject: the stored copy of an encrypted message carries only the
+// ciphertext placeholder body and, for protected-headers mail, a "..."
+// placeholder subject.
+function effectiveBodyText(): string {
+  return (
+    decryptedOverlay.value?.body_text ??
+    messagesStore.activeMessage?.body_text ??
+    ""
+  );
+}
+
+function effectiveSubject(): string {
+  return (
+    decryptedOverlay.value?.subject ??
+    messagesStore.activeMessage?.subject ??
+    ""
+  );
+}
+
+/** True when the open message arrived PGP-encrypted, so a reply to it
+ *  should itself default to encrypted (and signed). */
+function repliedMessageWasEncrypted(): boolean {
+  return pgpKind.value === "mimeEncrypted" || pgpKind.value === "inlineArmor";
+}
+
 function quoteBody(): string {
   const msg = messagesStore.activeMessage;
   if (!msg) return "";
-  const text = msg.body_text || "";
+  const text = effectiveBodyText();
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
@@ -479,12 +594,18 @@ function quoteBody(): string {
 function reply() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
+  const subject = effectiveSubject();
+  // Replying to an encrypted message defaults the reply to sign+encrypt
+  // (ComposeView still gates Sign on the account having a signing key).
+  const encrypted = repliedMessageWasEncrypted();
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: msg.from.email,
-    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
     body: quoteBody(),
+    pgpEncrypt: encrypted,
+    pgpSign: encrypted,
   });
 }
 
@@ -497,29 +618,34 @@ function replyAll() {
     ...msg.to.map((a) => a.email).filter((e) => e !== myEmail),
   ];
   const allCc = msg.cc.map((a) => a.email).filter((e) => e !== myEmail);
+  const subject = effectiveSubject();
+  const encrypted = repliedMessageWasEncrypted();
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
     replyTo: msg.id,
     to: allTo.join(", "),
     cc: allCc.join(", "),
-    subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
+    subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
     body: quoteBody(),
+    pgpEncrypt: encrypted,
+    pgpSign: encrypted,
   });
 }
 
 function forward() {
   const msg = messagesStore.activeMessage;
   if (!msg) return;
-  const text = msg.body_text || "";
+  const text = effectiveBodyText();
+  const subject = effectiveSubject();
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name
     ? `${msg.from.name} <${msg.from.email}>`
     : msg.from.email;
   const toStr = msg.to.map((a) => a.name || a.email).join(", ");
-  const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${msg.subject || ""}\nTo: ${toStr}\n\n`;
+  const fwdHeader = `---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${subject}\nTo: ${toStr}\n\n`;
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
-    subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
+    subject: subject.startsWith("Fwd:") ? subject : `Fwd: ${subject}`,
     body: `\n\n${fwdHeader}${text}`,
   });
 }
@@ -705,6 +831,43 @@ async function markSpam() {
         </div>
       </div>
 
+      <!-- OpenPGP banners — appear above the body so they're seen
+           before the cipher-blob (encrypted) or signed body. -->
+      <div v-if="pgpKind === 'mimeEncrypted' || pgpKind === 'inlineArmor'" class="pgp-banner pgp-banner-encrypted">
+        <div class="pgp-banner-row">
+          <span class="pgp-banner-icon">🔒</span>
+          <span v-if="!decryptedOverlay">
+            This message is encrypted with OpenPGP.
+          </span>
+          <span v-else>This message was decrypted.</span>
+          <span class="spacer"></span>
+          <button
+            v-if="!decryptedOverlay"
+            class="pgp-btn"
+            :disabled="decryptBusy"
+            data-testid="reader-decrypt-btn"
+            @click="decryptOpenPGP"
+          >
+            {{ decryptBusy ? "Decrypting…" : "Decrypt" }}
+          </button>
+          <span
+            v-if="decryptedOverlay && verifyOutcome && verifyOutcome.kind !== 'unsigned'"
+            :class="verifyBadgeClass(verifyOutcome)"
+          >{{ verifyBadgeLabel(verifyOutcome) }}</span>
+        </div>
+        <div v-if="decryptError" class="pgp-banner-error">{{ decryptError }}</div>
+      </div>
+      <div
+        v-else-if="pgpKind === 'mimeSigned' && verifyOutcome"
+        :class="['pgp-banner', verifyBadgeClass(verifyOutcome)]"
+        data-testid="reader-signature-badge"
+      >
+        <div class="pgp-banner-row">
+          <span class="pgp-banner-icon">✍️</span>
+          <span>{{ verifyBadgeLabel(verifyOutcome) }}</span>
+        </div>
+      </div>
+
       <div class="message-body">
         <div
           v-if="showHtml && hasHtml()"
@@ -728,7 +891,7 @@ async function markSpam() {
           v-else-if="hasText()"
           class="body-text"
           @contextmenu="handleContextMenu"
-        >{{ messagesStore.activeMessage.body_text }}</pre>
+        >{{ displayedBody?.body_text }}</pre>
         <div
           v-else-if="hasHtml()"
           class="body-html-wrapper"
@@ -1387,5 +1550,66 @@ async function markSpam() {
   border: 1px solid var(--color-border);
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+/* OpenPGP banner — shown above the message body. */
+.pgp-banner {
+  margin: 8px 16px 0 16px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 0.8px solid var(--color-border);
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pgp-banner-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pgp-banner-icon {
+  font-size: 14px;
+}
+.pgp-banner-error {
+  color: var(--color-danger, #fb2c36);
+  font-size: 11px;
+}
+.pgp-banner-encrypted {
+  background: var(--color-bg-tertiary);
+}
+.pgp-btn {
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 0.8px solid var(--color-border);
+  background: var(--color-accent);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pgp-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.pgp-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.pgp-badge-good {
+  background: #16a34a;
+  color: #fff;
+}
+.pgp-badge-bad {
+  background: var(--color-danger, #fb2c36);
+  color: #fff;
+}
+.pgp-badge-warn {
+  background: #d97706;
+  color: #fff;
+}
+.spacer {
+  flex: 1;
 }
 </style>

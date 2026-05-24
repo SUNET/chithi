@@ -22,6 +22,10 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             auth_method TEXT NOT NULL DEFAULT '',
             oidc_token_endpoint TEXT NOT NULL DEFAULT '',
             oidc_client_id TEXT NOT NULL DEFAULT '',
+            pgp_attach_pubkey_on_sign INTEGER NOT NULL DEFAULT 1,
+            pgp_autocrypt_header INTEGER NOT NULL DEFAULT 1,
+            pgp_encrypt_subject INTEGER NOT NULL DEFAULT 1,
+            pgp_encrypt_drafts INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -467,6 +471,28 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         normalize_message_ids_and_rethread(conn)?;
         set_migration(conn, "messageid_normalize_v1")?;
         log::info!("Migration: message-id normalization complete");
+    }
+
+    // Per-account OpenPGP "Advanced settings" toggles. Default to 1 (on) so
+    // both fresh installs and existing accounts get the four PGP-policy
+    // features enabled out of the box; the user can untick each in the
+    // account-edit form. Existence-probe + ALTER per column matches the
+    // pattern used everywhere else in this file.
+    for col in [
+        "pgp_attach_pubkey_on_sign",
+        "pgp_autocrypt_header",
+        "pgp_encrypt_subject",
+        "pgp_encrypt_drafts",
+    ] {
+        let has_col: bool = conn
+            .prepare(&format!("SELECT {col} FROM accounts LIMIT 0"))
+            .is_ok();
+        if !has_col {
+            log::info!("Migration: adding {col} column to accounts table");
+            conn.execute_batch(&format!(
+                "ALTER TABLE accounts ADD COLUMN {col} INTEGER NOT NULL DEFAULT 1;"
+            ))?;
+        }
     }
 
     Ok(())

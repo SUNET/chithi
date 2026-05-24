@@ -245,6 +245,10 @@ pub async fn get_account_config(
         contacts_sync_interval_seconds: full.contacts_sync_interval_seconds,
         has_calendar_binding,
         has_contacts_binding,
+        pgp_attach_pubkey_on_sign: full.pgp_attach_pubkey_on_sign,
+        pgp_autocrypt_header: full.pgp_autocrypt_header,
+        pgp_encrypt_subject: full.pgp_encrypt_subject,
+        pgp_encrypt_drafts: full.pgp_encrypt_drafts,
     })
 }
 

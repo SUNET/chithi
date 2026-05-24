@@ -1,20 +1,25 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, onUnmounted } from "vue";
 import { storeToRefs } from "pinia";
 import DesktopShell from "@/components/shell/DesktopShell.vue";
 import MobileShell from "@/components/shell/MobileShell.vue";
 import ToastContainer from "@/components/common/ToastContainer.vue";
+import PassphraseDialog from "@/components/pgp/PassphraseDialog.vue";
+import PinDialog from "@/components/pgp/PinDialog.vue";
 import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { usePlatformStore } from "@/stores/platform";
+import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 
 const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 const platformStore = usePlatformStore();
+const pgpPrompts = usePgpPromptsStore();
 
 const { isMobile } = storeToRefs(platformStore);
+const { currentPrompt } = storeToRefs(pgpPrompts);
 
 onMounted(async () => {
   uiStore.initTheme();
@@ -22,6 +27,9 @@ onMounted(async () => {
   await uiStore.initTimezone();
   activityStore.initEventListeners();
   await accountsStore.fetchAccounts();
+  // Subscribe globally so any view that triggers a sign/decrypt can
+  // receive its prompt.
+  await pgpPrompts.start();
 
   // Zoom with Ctrl+/Ctrl- (WebKitGTK doesn't support zoomHotkeysEnabled)
   let zoomLevel = 1.0;
@@ -42,6 +50,10 @@ onMounted(async () => {
     }
   });
 });
+
+onUnmounted(() => {
+  pgpPrompts.stop();
+});
 </script>
 
 <template>
@@ -50,6 +62,16 @@ onMounted(async () => {
     <MobileShell v-else />
   </div>
   <ToastContainer />
+  <!-- Global PGP secret prompts. The head of the queue is rendered;
+       when it resolves the next prompt (if any) takes its place. -->
+  <PassphraseDialog
+    v-if="currentPrompt && currentPrompt.kind === 'passphrase'"
+    :prompt="currentPrompt"
+  />
+  <PinDialog
+    v-if="currentPrompt && currentPrompt.kind === 'pin'"
+    :prompt="currentPrompt"
+  />
 </template>
 
 <style scoped>

@@ -111,6 +111,8 @@ export interface MessageSummary {
   in_reply_to: string | null;
 }
 
+export type PgpKind = "mimeEncrypted" | "mimeSigned" | "inlineArmor";
+
 export interface MessageBody {
   id: string;
   subject: string | null;
@@ -126,6 +128,26 @@ export interface MessageBody {
   is_signed: boolean;
   list_id: string | null;
   has_remote_images: boolean;
+  /** Detected PGP shape — absent for plain mail. Drives the reader UI's
+   *  Decrypt button / signature badge. */
+  pgp_kind?: PgpKind;
+}
+
+export type PgpVerifyOutcome =
+  | { kind: "unsigned" }
+  | {
+      kind: "good";
+      signerUid: string | null;
+      signerFingerprint: string;
+      verifierFingerprint: string;
+    }
+  | { kind: "bad"; signerUid: string | null; signerFingerprint: string }
+  | { kind: "unknownKey"; keyId: string }
+  | { kind: "error"; message: string };
+
+export interface PgpDecryptedMessage {
+  plaintextBody: MessageBody;
+  verifyOutcome: PgpVerifyOutcome;
 }
 
 export interface Attachment {
@@ -221,6 +243,13 @@ export interface AccountConfig {
   /// Backend-populated; treated as read-only in form state.
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
+  /// Per-account OpenPGP "Advanced settings". All default `true`. The
+  /// compose / draft backend reads these to govern feature behavior at
+  /// send / save time.
+  pgp_attach_pubkey_on_sign: boolean;
+  pgp_autocrypt_header: boolean;
+  pgp_encrypt_subject: boolean;
+  pgp_encrypt_drafts: boolean;
 }
 
 /// IMAP / SMTP discovery result returned by `discoverMailServers`.
@@ -376,6 +405,24 @@ export interface ComposeMessage {
   /** chithi's internal id of the message being replied to. Drives
    *  In-Reply-To / References on the outgoing email. Omit for new mails. */
   reply_to_message_id?: string | null;
+  /** OpenPGP toggles. Default false. */
+  pgp_sign?: boolean;
+  pgp_encrypt?: boolean;
+}
+
+export interface PgpRecipientStatus {
+  email: string;
+  hasKey: boolean;
+  fingerprint: string | null;
+}
+
+/** Result of `save_draft`. Lets the composer tell the user when the
+ *  "Store drafts encrypted" toggle could not be honored. */
+export interface DraftSaveOutcome {
+  /** True when encryption was requested for this account but the draft
+   *  was stored in plaintext anyway (Microsoft Graph account, or no
+   *  usable public key in the keystore). */
+  plaintext_fallback: boolean;
 }
 
 export interface ComposeAttachment {
@@ -451,4 +498,70 @@ export interface OutboxRow {
   to: string[];
   cc: string[];
   bcc: string[];
+}
+
+// --- OpenPGP ---
+
+export interface PgpUserId {
+  uid: string;
+  email: string | null;
+}
+
+export interface PgpSubkey {
+  fingerprint: string;
+  keyId: string;
+  /** "signing" | "encryption" | "authentication" | "certification" | "unknown" */
+  keyType: string;
+  algorithm: string | null;
+  bitLength: number | null;
+}
+
+export interface PgpKeySummary {
+  fingerprint: string;
+  isSecret: boolean;
+  primaryUid: string | null;
+  userIds: PgpUserId[];
+  subkeys: PgpSubkey[];
+  /** ISO-8601 UTC timestamp or null */
+  creationTime: string | null;
+  expirationTime: string | null;
+  isRevoked: boolean;
+  revocationTime: string | null;
+  /** Card idents this key is linked to (may repeat per slot). */
+  cardIdents: string[];
+}
+
+export interface PgpCardSummary {
+  ident: string;
+  manufacturerName: string;
+  serialNumber: string;
+  cardholderName: string | null;
+}
+
+export interface PgpCardDetails {
+  ident: string;
+  serialNumber: string;
+  cardholderName: string | null;
+  manufacturerName: string | null;
+  publicKeyUrl: string | null;
+  signatureFingerprint: string | null;
+  encryptionFingerprint: string | null;
+  authenticationFingerprint: string | null;
+  signatureCounter: number;
+  pinRetryCounter: number;
+  resetCodeRetryCounter: number;
+  adminPinRetryCounter: number;
+}
+
+export interface PgpCardDetection {
+  keyFingerprint: string;
+  cardIdent: string;
+  /** "signature" | "encryption" | "authentication" */
+  slot: string;
+  slotFingerprint: string;
+}
+
+export interface PgpImportResult {
+  fingerprint: string;
+  isSecret: boolean;
 }

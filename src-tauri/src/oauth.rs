@@ -17,6 +17,18 @@ pub struct OAuthProvider {
     pub auth_url: &'static str,
     pub token_url: &'static str,
     pub scopes: &'static [&'static str],
+    /// Scope sent in the `authorization_code` -> token exchange request
+    /// (`exchange_code`), when the provider requires one.
+    ///
+    /// Microsoft's v2.0 token endpoint rejects a code redemption that
+    /// omits `scope` with AADSTS70011 ("must include a 'scope' input
+    /// parameter") whenever the authorization request spanned more than
+    /// one resource — and `MICROSOFT.scopes` does (Graph +
+    /// outlook.office.com). The redemption `scope` must name a SINGLE
+    /// resource, so it can't just be `scopes.join(" ")`; Microsoft uses
+    /// the Graph subset here. `None` (Google, Zoom) omits `scope` at
+    /// exchange — those endpoints derive it from the code.
+    pub token_exchange_scope: Option<&'static str>,
     /// Use PKCE (required for Microsoft public clients)
     pub use_pkce: bool,
     /// Loopback host the provider expects in the redirect URI.
@@ -58,6 +70,7 @@ pub const GOOGLE: OAuthProvider = OAuthProvider {
         "https://www.googleapis.com/auth/calendar",
         "https://www.googleapis.com/auth/contacts",
     ],
+    token_exchange_scope: None,
     use_pkce: true,
     redirect_host: "localhost",
     redirect_fixed_port: None,
@@ -90,6 +103,11 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
         "profile",
         "email",
     ],
+    // Code redemption must name a single resource — see the field doc
+    // on `OAuthProvider::token_exchange_scope`. The Graph subset is what
+    // the post-sign-in profile fetch needs first, and `offline_access`
+    // in it yields the (resource-independent) refresh token.
+    token_exchange_scope: Some(MICROSOFT_GRAPH_SCOPES),
     use_pkce: true,
     redirect_host: "localhost",
     redirect_fixed_port: None,
@@ -161,6 +179,7 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
         "meeting:update:meeting",
         "meeting:delete:meeting",
     ],
+    token_exchange_scope: None,
     use_pkce: true,
     redirect_host: "127.0.0.1",
     // Pinned port that the local listener binds to. The bounce
@@ -454,6 +473,14 @@ pub async fn exchange_code(
     params.insert("code", code.to_string());
     params.insert("redirect_uri", redirect_uri);
     params.insert("grant_type", "authorization_code".to_string());
+
+    // Microsoft's v2.0 token endpoint rejects a code redemption with no
+    // `scope` (AADSTS70011) when the authorize request spanned multiple
+    // resources. Send the provider's single-resource exchange scope
+    // when it defines one; Google/Zoom derive scope from the code.
+    if let Some(scope) = provider.token_exchange_scope {
+        params.insert("scope", scope.to_string());
+    }
 
     if let Some(verifier) = code_verifier {
         params.insert("code_verifier", verifier.to_string());
@@ -1467,6 +1494,37 @@ mod tests {
         assert!(MICROSOFT_GRAPH_SCOPES.contains("User.Read"));
         assert!(MICROSOFT_GRAPH_SCOPES.contains("Calendars.ReadWrite"));
         assert!(MICROSOFT_GRAPH_SCOPES.contains("Contacts.ReadWrite"));
+    }
+
+    /// Microsoft authorizes across two resources (Graph +
+    /// outlook.office.com), so its `authorization_code` redemption must
+    /// send a `scope` or the v2.0 token endpoint rejects it with
+    /// AADSTS70011. The exchange scope must be single-resource (no
+    /// outlook.office.com mixed in) and every scope must be one the
+    /// authorize request already consented to.
+    #[test]
+    fn test_microsoft_has_single_resource_token_exchange_scope() {
+        let scope = MICROSOFT
+            .token_exchange_scope
+            .expect("Microsoft must define a token-exchange scope");
+        assert!(
+            !scope.contains("outlook.office.com"),
+            "exchange scope must name a single resource (Graph only)"
+        );
+        for s in scope.split_whitespace() {
+            assert!(
+                MICROSOFT.scopes.contains(&s),
+                "exchange scope {s:?} must be a subset of the consented scopes"
+            );
+        }
+    }
+
+    /// Google and Zoom derive scope from the code; they must not send
+    /// one at exchange time.
+    #[test]
+    fn test_non_microsoft_providers_omit_token_exchange_scope() {
+        assert!(GOOGLE.token_exchange_scope.is_none());
+        assert!(ZOOM.token_exchange_scope.is_none());
     }
 
     #[test]

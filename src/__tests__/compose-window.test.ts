@@ -27,7 +27,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   sendMessage: vi.fn().mockResolvedValue(undefined),
-  saveDraft: vi.fn().mockResolvedValue(undefined),
+  saveDraft: vi.fn().mockResolvedValue({ plaintext_fallback: false }),
   setMessageFlags: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -135,6 +135,50 @@ describe("openComposeWindow", () => {
     const [, options] = mockWebviewWindow.mock.calls[0];
     const url = options.url as string;
     expect(url).toContain("accountId=acc-123");
+  });
+
+  it("should pass draftId in URL when resuming a draft", () => {
+    openComposeWindow({ accountId: "acc-1", draftId: "msg-draft-42" });
+
+    const [, options] = mockWebviewWindow.mock.calls[0];
+    const url = options.url as string;
+    expect(url).toContain("draftId=msg-draft-42");
+    expect(url).toContain("accountId=acc-1");
+  });
+
+  it("should not include draftId when not resuming", () => {
+    openComposeWindow({ accountId: "acc-1" });
+
+    const [, options] = mockWebviewWindow.mock.calls[0];
+    const url = options.url as string;
+    expect(url).not.toContain("draftId=");
+  });
+});
+
+describe("Draft resume address formatting", () => {
+  // Mirrors ComposeView's formatAddress: turns a parsed Address into the
+  // "Name <email>" string the compose To/Cc fields expect.
+  function formatAddress(a: { name: string | null; email: string }): string {
+    return a.name ? `${a.name} <${a.email}>` : a.email;
+  }
+
+  it("formats an address with a display name", () => {
+    expect(formatAddress({ name: "Alice Smith", email: "alice@example.com" }))
+      .toBe("Alice Smith <alice@example.com>");
+  });
+
+  it("formats a bare address with no display name", () => {
+    expect(formatAddress({ name: null, email: "bob@example.com" }))
+      .toBe("bob@example.com");
+  });
+
+  it("joins multiple recipients with comma-space", () => {
+    const addrs = [
+      { name: "Alice", email: "alice@a.com" },
+      { name: null, email: "bob@b.com" },
+    ];
+    expect(addrs.map(formatAddress).join(", "))
+      .toBe("Alice <alice@a.com>, bob@b.com");
   });
 });
 

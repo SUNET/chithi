@@ -121,6 +121,19 @@ pub struct AccountConfig {
     pub has_calendar_binding: bool,
     #[serde(default)]
     pub has_contacts_binding: bool,
+    /// Per-account OpenPGP "Advanced settings" toggles. All default `true`
+    /// — fresh-install behavior is fully-enabled and the user opts out by
+    /// unticking. The compose / draft backend reads these via a
+    /// `SendOptions` IPC payload and only acts when the corresponding
+    /// flag is set.
+    #[serde(default = "default_true")]
+    pub pgp_attach_pubkey_on_sign: bool,
+    #[serde(default = "default_true")]
+    pub pgp_autocrypt_header: bool,
+    #[serde(default = "default_true")]
+    pub pgp_encrypt_subject: bool,
+    #[serde(default = "default_true")]
+    pub pgp_encrypt_drafts: bool,
 }
 
 fn default_basic() -> String {
@@ -174,6 +187,13 @@ pub struct AccountFull {
     pub mail_sync_interval_seconds: Option<i64>,
     pub calendar_sync_interval_seconds: Option<i64>,
     pub contacts_sync_interval_seconds: Option<i64>,
+    /// Per-account OpenPGP "Advanced settings" toggles. Mirrors the four
+    /// columns on the `accounts` table; loaded by `get_account_full` and
+    /// pushed back by `update_account`.
+    pub pgp_attach_pubkey_on_sign: bool,
+    pub pgp_autocrypt_header: bool,
+    pub pgp_encrypt_subject: bool,
+    pub pgp_encrypt_drafts: bool,
 }
 
 impl AccountFull {
@@ -316,6 +336,26 @@ impl AccountFull {
             self.smtp_host = c.smtp_host;
             self.smtp_port = c.smtp_port;
             self.use_tls = c.use_tls;
+        } else if self.mail_protocol == "graph" {
+            // O365 (Graph): everything — sync, calendar, contacts — runs
+            // over the Graph API, EXCEPT outgoing mail, which still goes
+            // over SMTP+XOAUTH2 (see ADR 0025 / commit cb08a43). The
+            // `mail/graph` binding carries no IMAP/SMTP host, so the SMTP
+            // endpoint is the fixed Microsoft relay rather than a stored
+            // config field: `smtp.office365.com:587` (STARTTLS — forced by
+            // `smtp::build_transport` on port 587, so `use_tls` is moot).
+            //
+            // Without this branch a Graph account's `smtp_host` stays
+            // empty and every send dials a blank host, failing with
+            // "No address associated with hostname". This regressed when
+            // dispatch reads moved to service_bindings (phase 2) — the
+            // graph binding never stored the SMTP coordinates the legacy
+            // `smtp_host` column used to hold.
+            self.imap_host = String::new();
+            self.imap_port = 993;
+            self.smtp_host = "smtp.office365.com".to_string();
+            self.smtp_port = 587;
+            self.use_tls = true;
         } else {
             // Sensible defaults for non-IMAP accounts.
             self.imap_host = String::new();
@@ -453,7 +493,9 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn
         .query_row(
             "SELECT id, display_name, email, username, enabled, signature,
-                oidc_token_endpoint, oidc_client_id, auth_method
+                oidc_token_endpoint, oidc_client_id, auth_method,
+                pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
+                pgp_encrypt_subject, pgp_encrypt_drafts
          FROM accounts WHERE id = ?1",
             params![id],
             |row| {
@@ -467,6 +509,10 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                     oidc_token_endpoint: row.get(6)?,
                     oidc_client_id: row.get(7)?,
                     auth_method: row.get(8)?,
+                    pgp_attach_pubkey_on_sign: row.get(9)?,
+                    pgp_autocrypt_header: row.get(10)?,
+                    pgp_encrypt_subject: row.get(11)?,
+                    pgp_encrypt_drafts: row.get(12)?,
                     // Legacy fields populated below from bindings + auth_method.
                     provider: String::new(),
                     mail_protocol: String::new(),
@@ -538,8 +584,10 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 
     conn.execute(
         "INSERT INTO accounts (id, display_name, email, username, signature,
-                               oidc_token_endpoint, oidc_client_id, auth_method)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                               oidc_token_endpoint, oidc_client_id, auth_method,
+                               pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
+                               pgp_encrypt_subject, pgp_encrypt_drafts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id,
             config.display_name,
@@ -549,6 +597,10 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             auth_method,
+            config.pgp_attach_pubkey_on_sign,
+            config.pgp_autocrypt_header,
+            config.pgp_encrypt_subject,
+            config.pgp_encrypt_drafts,
         ],
     )?;
     crate::db::service_bindings::rebuild_for_account(
@@ -609,8 +661,10 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         "UPDATE accounts
          SET display_name=?1, email=?2, username=?3, signature=?4,
              oidc_token_endpoint=?5, oidc_client_id=?6, auth_method=?7,
+             pgp_attach_pubkey_on_sign=?8, pgp_autocrypt_header=?9,
+             pgp_encrypt_subject=?10, pgp_encrypt_drafts=?11,
              updated_at=CURRENT_TIMESTAMP
-         WHERE id=?8",
+         WHERE id=?12",
         params![
             config.display_name,
             config.email,
@@ -619,6 +673,10 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
             config.oidc_token_endpoint,
             config.oidc_client_id,
             auth_method,
+            config.pgp_attach_pubkey_on_sign,
+            config.pgp_autocrypt_header,
+            config.pgp_encrypt_subject,
+            config.pgp_encrypt_drafts,
             id,
         ],
     )?;
@@ -673,6 +731,10 @@ mod tests {
                 auth_method TEXT NOT NULL DEFAULT '',
                 oidc_token_endpoint TEXT NOT NULL DEFAULT '',
                 oidc_client_id TEXT NOT NULL DEFAULT '',
+                pgp_attach_pubkey_on_sign INTEGER NOT NULL DEFAULT 1,
+                pgp_autocrypt_header INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_subject INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_drafts INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -727,6 +789,10 @@ mod tests {
             contacts_sync_interval_seconds: None,
             has_calendar_binding: false,
             has_contacts_binding: false,
+            pgp_attach_pubkey_on_sign: true,
+            pgp_autocrypt_header: true,
+            pgp_encrypt_subject: true,
+            pgp_encrypt_drafts: true,
         }
     }
 
@@ -768,6 +834,36 @@ mod tests {
         assert_eq!(full.smtp_port, 587);
         assert_eq!(full.username, "user");
         assert!(full.use_tls);
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: O365 (Graph) accounts sync over the Graph API but
+    /// still SEND mail over SMTP+XOAUTH2. Their `mail/graph` binding
+    /// carries no SMTP host, so `populate_legacy_from_bindings` must
+    /// supply the fixed Microsoft relay (`smtp.office365.com:587`).
+    /// Without it `smtp_host` is empty and every send dials a blank
+    /// host — "No address associated with hostname". This regressed
+    /// when dispatch reads moved to service_bindings (phase 2).
+    #[test]
+    fn test_get_account_full_graph_account_keeps_o365_smtp_host() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@outlook.com", "Kushal");
+        config.provider = "o365".to_string();
+        config.mail_protocol = "graph".to_string();
+        // O365 accounts have no IMAP host; the broken binding carried
+        // no SMTP host either.
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(full.mail_protocol, "graph");
+        assert_eq!(
+            full.smtp_host, "smtp.office365.com",
+            "Graph accounts must fall back to the O365 SMTP relay for sending"
+        );
+        assert_eq!(full.smtp_port, 587);
         crate::keyring::delete_password(&id).ok();
     }
 

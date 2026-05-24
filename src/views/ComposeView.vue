@@ -2,13 +2,35 @@
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
+import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
-import type { Account, ComposeAttachment } from "@/lib/types";
+import type {
+  Account,
+  Address,
+  ComposeAttachment,
+  MessageBody,
+  PgpRecipientStatus,
+} from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
 import Select from "@/components/common/Select.vue";
 import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
+
+// Compose runs in its own window; start the shared PGP prompt listener
+// so a sign/decrypt triggered from here is served. The passphrase / PIN
+// dialogs themselves are rendered globally by App.vue (the root of every
+// window, this one included), so they are not mounted in this view.
+const pgpPrompts = usePgpPromptsStore();
+
+// PGP toggles.
+const pgpSign = ref(false);
+const pgpEncrypt = ref(false);
+// Per-recipient key availability for the encrypt flow.
+const recipientStatuses = ref<PgpRecipientStatus[]>([]);
+const missingRecipientCount = computed(
+  () => recipientStatuses.value.filter((s) => !s.hasKey).length,
+);
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
@@ -23,7 +45,29 @@ interface ComposeE2EBridge {
 const accounts = ref<Account[]>([]);
 const initialAccountId = (route.query.accountId as string) || "";
 
+// Whether `email` has a usable OpenPGP signing key in the keystore — a
+// secret key, or a key linked to a connected card. Gates the
+// reply-to-encrypted Sign default (see openComposeWindow's pgpSign) so
+// the composer never opens with a Sign toggle the send path can't honour.
+async function accountCanSign(email: string): Promise<boolean> {
+  const target = email.trim().toLowerCase();
+  if (!target) return false;
+  try {
+    const keys = await api.pgpListKeys();
+    return keys.some(
+      (k) =>
+        (k.isSecret || k.cardIdents.length > 0) &&
+        !k.isRevoked &&
+        k.userIds.some((u) => (u.email ?? "").trim().toLowerCase() === target),
+    );
+  } catch (e) {
+    console.error("PGP signing-capability check failed:", e);
+    return false;
+  }
+}
+
 onMounted(async () => {
+  await pgpPrompts.start();
   // Try store first (works if opened in same window context)
   if (accountsStore.accounts.length > 0) {
     accounts.value = accountsStore.accounts;
@@ -55,6 +99,24 @@ onMounted(async () => {
   } else if (!error.value) {
     // Only set error if we didn't already fail to fetch
     error.value = "No accounts found. Please add an account first.";
+  }
+  // Reply to an encrypted message pre-arms the PGP toggles (see
+  // openComposeWindow's pgpEncrypt / pgpSign params). Encrypt is applied
+  // straight from the param; Sign is gated on the From account actually
+  // having a usable signing key, so the reply never opens with a Sign
+  // toggle the send path can't satisfy.
+  if (route.query.pgpEncrypt === "1") {
+    pgpEncrypt.value = true;
+  }
+  if (route.query.pgpSign === "1" && selectedAccountId.value) {
+    const acct = accounts.value.find((a) => a.id === selectedAccountId.value);
+    if (acct && (await accountCanSign(acct.email))) {
+      pgpSign.value = true;
+    }
+  }
+  // Resume a saved draft, if this composer was opened for one.
+  if (isResumingDraft && selectedAccountId.value) {
+    await loadDraft(selectedAccountId.value);
   }
 });
 
@@ -109,6 +171,10 @@ const subject = ref((route.query.subject as string) || "");
 const bodyText = ref((route.query.body as string) || "");
 const sending = ref(false);
 const savingDraft = ref(false);
+// Set true by saveDraft() when the account's "Store drafts encrypted"
+// toggle was on but the draft had to be stored in plaintext anyway
+// (Graph account / no usable public key). Drives a non-blocking notice.
+const draftPlaintextNotice = ref(false);
 const error = ref<string | null>(null);
 const showCc = ref(!!cc.value);
 const showBcc = ref(false);
@@ -278,9 +344,12 @@ async function applySignature(accountId: string) {
   }
 }
 
-// Apply signature on initial account selection and when switching accounts
+// Apply signature on initial account selection and when switching
+// accounts. Skipped entirely when resuming a draft — the draft already
+// carries whatever signature it was saved with, and appending another
+// would both duplicate it and race the async draft pre-fill.
 watch(selectedAccountId, (newId) => {
-  if (newId) applySignature(newId);
+  if (newId && !isResumingDraft) applySignature(newId);
 });
 
 // Track initial values to detect changes.
@@ -309,6 +378,71 @@ function markDraftStateAsClean() {
   baselineSubject.value = subject.value;
   baselineBody.value = bodyText.value;
   baselineAttachments.value = attachmentBaselineValue(attachments.value);
+}
+
+// --- Resuming a saved draft ----------------------------------------------
+// When `draftId` is present the composer was opened to resume a draft.
+// We fetch the draft body, decrypt it first if it's an encrypted draft,
+// and pre-fill the form. A failed decrypt (no key / card not attached /
+// wrong PIN) renders an inline placeholder + Retry instead of silently
+// opening a blank composer.
+//
+// Known v1 limitations: resuming does not carry forward Bcc (the parsed
+// MessageBody has no bcc field) or attachments (those are server-side
+// refs, not local upload tokens), and saving a resumed draft creates a
+// new draft rather than replacing the original.
+const draftId = (route.query.draftId as string) || "";
+const isResumingDraft = !!draftId;
+const draftLoading = ref(false);
+const draftDecryptError = ref<string | null>(null);
+
+function formatAddress(a: Address): string {
+  return a.name ? `${a.name} <${a.email}>` : a.email;
+}
+
+// Pre-fill the form. `envelope` is the cleartext outer message (To / Cc /
+// Subject), `body` is the message text. For a plaintext draft the two
+// come from the same fetch; for an encrypted draft the envelope is the
+// cleartext outer headers and `body` is the decrypted inner — the
+// decrypted inner carries no Subject of its own, which is why the
+// envelope must be fetched separately.
+function prefillFromDraft(envelope: MessageBody, body: string) {
+  to.value = envelope.to.map(formatAddress).join(", ");
+  cc.value = envelope.cc.map(formatAddress).join(", ");
+  if (cc.value) showCc.value = true;
+  subject.value = envelope.subject ?? "";
+  bodyText.value = body;
+  // The pre-filled draft is the new clean baseline — editing from here
+  // is what counts as dirty, not the act of loading it.
+  markDraftStateAsClean();
+}
+
+async function loadDraft(accountId: string) {
+  if (!draftId) return;
+  draftLoading.value = true;
+  draftDecryptError.value = null;
+  try {
+    // The outer fetch always gives the cleartext envelope (To / Cc /
+    // Subject). For a plaintext draft it also gives the body.
+    const envelope = await api.getMessageBody(accountId, draftId);
+    let body = envelope.body_text ?? "";
+    if (envelope.pgp_kind === "mimeEncrypted") {
+      // Encrypted draft: decrypt for the real body. pgp_decrypt_message
+      // drives the passphrase / card-PIN dialog through the pgp-prompts
+      // store, which this window is already subscribed to.
+      const decrypted = await api.pgpDecryptMessage(accountId, draftId);
+      body = decrypted.plaintextBody.body_text ?? "";
+    }
+    prefillFromDraft(envelope, body);
+  } catch (e) {
+    draftDecryptError.value = String(e);
+  } finally {
+    draftLoading.value = false;
+  }
+}
+
+function retryLoadDraft() {
+  if (selectedAccountId.value) loadDraft(selectedAccountId.value);
 }
 
 const isDirty = computed(() =>
@@ -376,6 +510,60 @@ onMounted(() => {
   });
 });
 
+// When Encrypt is on (or when recipients change while it's on), look up
+// each recipient's public key so the UI can show red/green pips and
+// block sending if any are missing.
+// Sequence guard: pgpCheckRecipients is async, so a slow earlier call
+// could resolve after a faster later one and overwrite fresher data.
+// Each call captures a seq; only the most recent writes the result.
+let recipientCheckSeq = 0;
+
+async function refreshRecipientStatuses() {
+  if (!pgpEncrypt.value) {
+    recipientStatuses.value = [];
+    return;
+  }
+  const all = [
+    ...parseAddresses(to.value),
+    ...parseAddresses(cc.value),
+    ...parseAddresses(bcc.value),
+  ].filter((s) => s.trim().length > 0);
+  if (all.length === 0) {
+    recipientStatuses.value = [];
+    return;
+  }
+  const seq = ++recipientCheckSeq;
+  try {
+    const result = await api.pgpCheckRecipients(all);
+    // Drop a stale response: a newer call superseded this one in flight.
+    if (seq === recipientCheckSeq) {
+      recipientStatuses.value = result;
+    }
+  } catch (e) {
+    console.error("PGP recipient check failed:", e);
+  }
+}
+
+// To/Cc/Bcc are bound to text inputs, so the watch below fires on every
+// keystroke. Debounce it so recipient editing triggers one backend call
+// once typing pauses, not one per character.
+let recipientCheckTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRecipientRefresh() {
+  if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
+  recipientCheckTimer = setTimeout(() => {
+    recipientCheckTimer = null;
+    void refreshRecipientStatuses();
+  }, 300);
+}
+
+watch(
+  () => [pgpEncrypt.value, to.value, cc.value, bcc.value],
+  () => {
+    scheduleRecipientRefresh();
+  },
+);
+
 async function saveDraft(): Promise<boolean> {
   const accountId = selectedAccountId.value;
   if (!accountId) return false;
@@ -383,7 +571,7 @@ async function saveDraft(): Promise<boolean> {
   savingDraft.value = true;
   error.value = null;
   try {
-    await api.saveDraft(accountId, {
+    const outcome = await api.saveDraft(accountId, {
       to: parseAddresses(to.value),
       cc: parseAddresses(cc.value),
       bcc: parseAddresses(bcc.value),
@@ -393,6 +581,11 @@ async function saveDraft(): Promise<boolean> {
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
     });
+    // The account asked for encrypted drafts but the backend had to
+    // store this one in plaintext (Graph account, or no usable public
+    // key). Surface a non-blocking notice so the toggle isn't silently
+    // misleading. `outcome` may be undefined under older test mocks.
+    draftPlaintextNotice.value = outcome?.plaintext_fallback ?? false;
     markDraftStateAsClean();
     // Trigger a sync so the draft appears in the local mailbox
     api.triggerSync(accountId).catch(() => {});
@@ -489,6 +682,26 @@ async function send() {
     }
   }
 
+  // Hard-gate: refuse to send an encrypted message if any recipient has
+  // no public key in the keystore. The backend would fail-closed anyway
+  // (apply_pgp_envelope errors before the outbox row is persisted) but
+  // surfacing the specific missing recipients here is far more useful
+  // than the generic libtumpa error that would otherwise come back.
+  if (pgpEncrypt.value) {
+    // The recipient precheck behind the watch is debounced, so a pending
+    // edit may not have run yet — re-run it synchronously here so the
+    // gate below sees the current recipient list, not a stale one.
+    await refreshRecipientStatuses();
+    const missing = recipientStatuses.value.filter((s) => !s.hasKey);
+    if (missing.length > 0) {
+      error.value =
+        `Cannot encrypt — no public key in keystore for: ` +
+        missing.map((s) => s.email).join(", ") +
+        `. Fetch keys via WKD or import them, then try again.`;
+      return;
+    }
+  }
+
   sending.value = true;
   error.value = null;
 
@@ -502,6 +715,8 @@ async function send() {
       body_html: null,
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
+      pgp_sign: pgpSign.value,
+      pgp_encrypt: pgpEncrypt.value,
     });
     if (replyToMessageId) {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
@@ -540,11 +755,34 @@ async function send() {
         </svg>
         {{ sending ? "Sending..." : "Send" }}
       </button>
-      <button class="toolbar-btn">
+      <button
+        class="toolbar-btn"
+        :class="{ active: pgpSign }"
+        data-testid="compose-pgp-sign"
+        title="Sign with OpenPGP"
+        @click="pgpSign = !pgpSign"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+        Sign
+      </button>
+      <button
+        class="toolbar-btn"
+        :class="{ active: pgpEncrypt, warn: pgpEncrypt && missingRecipientCount > 0 }"
+        data-testid="compose-pgp-encrypt"
+        title="Encrypt with OpenPGP"
+        @click="pgpEncrypt = !pgpEncrypt"
+      >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
         </svg>
         Encrypt
+        <span
+          v-if="pgpEncrypt && missingRecipientCount > 0"
+          class="pgp-missing-badge"
+          :title="`Missing keys: ${recipientStatuses.filter(s => !s.hasKey).map(s => s.email).join(', ')}`"
+        >{{ missingRecipientCount }}</span>
       </button>
       <button class="toolbar-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -575,6 +813,43 @@ async function send() {
     </div>
 
     <div v-if="error" class="compose-error">{{ error }}</div>
+
+    <!-- Resuming a draft: in-progress / failed-decrypt banners. -->
+    <div
+      v-if="draftLoading"
+      class="compose-draft-banner"
+      data-testid="draft-loading"
+    >
+      Loading draft…
+    </div>
+    <div
+      v-else-if="draftDecryptError"
+      class="compose-draft-banner compose-draft-banner-error"
+      data-testid="draft-decrypt-error"
+    >
+      <span>
+        Encrypted draft — re-attach card or unlock key to continue editing.
+      </span>
+      <button
+        type="button"
+        class="draft-retry-btn"
+        data-testid="draft-decrypt-retry"
+        @click="retryLoadDraft"
+      >
+        Retry
+      </button>
+    </div>
+
+    <!-- "Store drafts encrypted" was on but this draft was saved in
+         plaintext (Graph account, or no usable public key). -->
+    <div
+      v-if="draftPlaintextNotice"
+      class="compose-draft-banner compose-draft-banner-warn"
+      data-testid="draft-plaintext-notice"
+    >
+      Draft saved in plaintext — encrypted drafts need an OpenPGP key for
+      this account, and aren't supported on Microsoft accounts yet.
+    </div>
 
     <!-- Fields & Body -->
     <div class="compose-body-area">
@@ -721,6 +996,7 @@ async function send() {
       </div>
     </div>
   </div>
+
 </template>
 
 <style scoped>
@@ -778,6 +1054,29 @@ async function send() {
   opacity: 0.55;
 }
 
+/* PGP sign/encrypt toggle states. */
+.toolbar-btn.active {
+  background: var(--color-accent);
+  color: #fff;
+}
+.toolbar-btn.active.warn {
+  background: var(--color-danger, #fb2c36);
+}
+.pgp-missing-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--color-danger, #fb2c36);
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .toolbar-spacer {
   flex: 1;
 }
@@ -788,6 +1087,39 @@ async function send() {
   color: var(--color-danger-text);
   font-size: 12px;
   flex-shrink: 0;
+}
+
+.compose-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--color-surface-2, rgba(0, 0, 0, 0.04));
+  color: var(--color-text-secondary, inherit);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.compose-draft-banner-error {
+  background: rgba(251, 44, 54, 0.06);
+  color: var(--color-danger-text);
+}
+
+.compose-draft-banner-warn {
+  background: rgba(245, 158, 11, 0.10);
+  color: var(--color-warning-text, #92400e);
+}
+
+.draft-retry-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
 }
 
 /* Body area */
