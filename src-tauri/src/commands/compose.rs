@@ -111,6 +111,12 @@ pub async fn send_message(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
+    // Build the plain MIME bytes. `plain_raw` stays a `Vec<u8>` so the
+    // optional PGP wrap and Autocrypt header inject below can each
+    // consume and replace it cheaply. Only the FINAL `raw_message` is
+    // wrapped in `Arc<[u8]>` (below), so the background spawn can share
+    // the buffer with the IMAP APPEND-to-Sent path (#189) without
+    // deep-cloning the inlined attachment bytes each send.
     let plain_raw = smtp::build_raw_message(
         &account.email,
         &message.to,
@@ -122,8 +128,7 @@ pub async fn send_message(
         &attachment_data,
         in_reply_to.as_deref(),
         &references,
-    )?
-    .into();
+    )?;
 
     // PGP wrap (RFC 3156) if the compose toggles asked for it. Sign or
     // encrypt — or both, in which case we sign-then-encrypt in a single
@@ -164,6 +169,12 @@ pub async fn send_message(
     } else {
         raw_message
     };
+
+    // Wrap the final bytes in `Arc<[u8]>` so the background spawn can
+    // share them between the SMTP `send_raw` call and the IMAP APPEND-
+    // to-Sent path (#189) via a refcount bump, rather than deep-cloning
+    // the inlined attachment bytes (potentially many MB).
+    let raw_message: std::sync::Arc<[u8]> = raw_message.into();
 
     // For O365 SMTP: refresh OAuth token now (needs keyring access)
     let smtp_creds =
