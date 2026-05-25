@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from "vue";
+import { ref, onMounted, watch, nextTick } from "vue";
 import { useFoldersStore } from "@/stores/folders";
 import { useAccountsStore } from "@/stores/accounts";
 import { useMessagesStore } from "@/stores/messages";
@@ -141,9 +141,24 @@ watch(
   },
 );
 
+const folderMenuEl = ref<HTMLElement | null>(null);
+const accountMenuEl = ref<HTMLElement | null>(null);
+
+function clampMenuPosition(el: HTMLElement, x: number, y: number) {
+  const rect = el.getBoundingClientRect();
+  const margin = 4;
+  const maxX = window.innerWidth - rect.width - margin;
+  const maxY = window.innerHeight - rect.height - margin;
+  el.style.left = `${Math.max(margin, Math.min(x, maxX))}px`;
+  el.style.top = `${Math.max(margin, Math.min(y, maxY))}px`;
+}
+
 function onFolderContextMenu(event: MouseEvent, folder: Folder, accountId: string) {
   event.preventDefault();
   contextMenu.value = { x: event.clientX, y: event.clientY, folder, accountId };
+  void nextTick(() => {
+    if (folderMenuEl.value) clampMenuPosition(folderMenuEl.value, event.clientX, event.clientY);
+  });
 }
 
 function closeContextMenu() {
@@ -155,6 +170,9 @@ function onAccountContextMenu(event: MouseEvent, accountId: string) {
   event.preventDefault();
   contextMenu.value = null;
   accountMenu.value = { x: event.clientX, y: event.clientY, accountId };
+  void nextTick(() => {
+    if (accountMenuEl.value) clampMenuPosition(accountMenuEl.value, event.clientX, event.clientY);
+  });
 }
 
 function openNewFolderFromAccount() {
@@ -526,6 +544,7 @@ async function doDeleteFolder() {
       <div v-if="contextMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
       <div
         v-if="contextMenu"
+        ref="folderMenuEl"
         class="folder-context-menu"
         data-testid="folder-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
@@ -551,6 +570,7 @@ async function doDeleteFolder() {
       <div v-if="accountMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
       <div
         v-if="accountMenu"
+        ref="accountMenuEl"
         class="folder-context-menu"
         :style="{ left: accountMenu.x + 'px', top: accountMenu.y + 'px' }"
       >
