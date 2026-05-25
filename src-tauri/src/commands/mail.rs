@@ -947,23 +947,31 @@ pub async fn save_attachment(
 
     let contents = attachment.contents().to_vec();
 
-    prompt_save_and_write_bytes(&app, &suggested_filename, &contents, "attachment").await
+    prompt_save_and_stream(
+        &app,
+        &suggested_filename,
+        "attachment",
+        std::io::Cursor::new(contents),
+    )
+    .await
 }
 
 /// Open the native save-as dialog with `suggested_filename`, then atomically
-/// write `contents` to the user-chosen path (refusing symlinks, temp file +
-/// fsync + rename). Returns `Ok(())` if the user cancelled the dialog, since
-/// cancellation isn't an error from the caller's perspective.
+/// stream bytes from `reader` to the user-chosen path (refusing symlinks,
+/// temp file + fsync + rename). `std::io::copy` is used so large payloads
+/// don't have to be buffered in memory. Returns `Ok(())` if the user
+/// cancelled the dialog, since cancellation isn't an error from the
+/// caller's perspective.
 ///
 /// The non-blocking callback API + oneshot is intentional: calling
 /// `blocking_save_file()` on the tokio worker that invoked the command
 /// starves the GTK main thread on Linux, which manifests as a dialog that
 /// opens but never renders its Save button.
-async fn prompt_save_and_write_bytes(
+async fn prompt_save_and_stream<R: std::io::Read>(
     app: &tauri::AppHandle,
     suggested_filename: &str,
-    contents: &[u8],
     what: &str,
+    mut reader: R,
 ) -> Result<()> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1015,63 +1023,51 @@ async fn prompt_save_and_write_bytes(
     ));
 
     #[cfg(unix)]
-    {
-        use std::io::Write;
+    let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp_path)
-            .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?
+    };
 
-        if let Err(e) = file.write_all(contents) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to write {}: {}", what, e)));
-        }
-        if let Err(e) = file.sync_all() {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to flush {}: {}", what, e)));
-        }
-        drop(file);
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
 
-        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
-        }
-
-        if let Ok(dir) = std::fs::File::open(dest_dir) {
-            let _ = dir.sync_all();
-        }
+    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(Error::Other(format!("Failed to write {}: {}", what, e)));
     }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(Error::Other(format!("Failed to flush {}: {}", what, e)));
+    }
+    drop(file);
 
     #[cfg(not(unix))]
     {
-        use std::io::Write;
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
-
-        if let Err(e) = file.write_all(contents) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to write {}: {}", what, e)));
-        }
-        if let Err(e) = file.sync_all() {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to flush {}: {}", what, e)));
-        }
-        drop(file);
-
+        // On Windows, rename fails if dest exists. Remove it first.
         if dest_path.exists() {
             let _ = std::fs::remove_file(dest_path);
         }
-        if let Err(e) = std::fs::rename(&temp_path, dest_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
+    }
+
+    if let Err(e) = std::fs::rename(&temp_path, dest_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
+    }
+
+    #[cfg(unix)]
+    {
+        // Fsync parent directory for durability.
+        if let Ok(dir) = std::fs::File::open(dest_dir) {
+            let _ = dir.sync_all();
         }
     }
 
@@ -1081,8 +1077,9 @@ async fn prompt_save_and_write_bytes(
 
 /// Save a message's raw RFC822 (.eml) bytes to a user-chosen path. Fetches
 /// the body on-demand if it isn't on disk yet, then opens the native save
-/// dialog. `suggested_filename` is provided by the caller (typically derived
-/// from the subject).
+/// dialog and streams the bytes through to the destination without
+/// buffering the whole message in memory. `suggested_filename` is provided
+/// by the caller (typically derived from the subject).
 #[tauri::command]
 pub async fn save_message_as_eml(
     app: tauri::AppHandle,
@@ -1109,10 +1106,16 @@ pub async fn save_message_as_eml(
     .await?;
 
     let full_path = crate::path_validation::resolve_under(&state.data_dir, &actual_maildir_path)?;
-    let raw = std::fs::read(&full_path)
-        .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
+    let source = std::fs::File::open(&full_path)
+        .map_err(|e| Error::Other(format!("Failed to open message file: {}", e)))?;
 
-    prompt_save_and_write_bytes(&app, &suggested_filename, &raw, "message").await
+    prompt_save_and_stream(
+        &app,
+        &suggested_filename,
+        "message",
+        std::io::BufReader::new(source),
+    )
+    .await
 }
 
 #[cfg(test)]

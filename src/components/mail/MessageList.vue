@@ -403,7 +403,8 @@ async function ctxSaveAsEml() {
     await api.saveMessageAsEml(accountId, msgId, suggested);
   } catch (e) {
     console.error("Save as .eml failed:", e);
-    showToast(`Save as .eml failed: ${e}`, "error");
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Save as .eml failed: ${msg}`, "error");
   }
 }
 
