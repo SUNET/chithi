@@ -39,6 +39,13 @@ pub struct JmapConfig {
     pub username: String,
     pub password: String,
     pub access_token: Option<String>,
+    /// One of `"basic"`, `"bearer"`, or `"oidc"`. Carried explicitly
+    /// (not just inferred from `access_token.is_some()`) so `connect()`
+    /// can fail fast when bearer mode is selected but no token is
+    /// available — otherwise the request silently downgrades to HTTP
+    /// Basic with an empty password and the user sees a generic 401
+    /// instead of "your API token is missing".
+    pub auth_method: String,
     /// OIDC metadata for token refresh (used by push loop on reconnect)
     pub oidc_token_endpoint: String,
     pub oidc_client_id: String,
@@ -55,6 +62,7 @@ mod connect_tests {
             username: "u".into(),
             password: "p".into(),
             access_token: None,
+            auth_method: "basic".into(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
         }
@@ -68,16 +76,65 @@ mod connect_tests {
         };
         assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
     }
+
+    /// Regression: a Fastmail account configured with bearer auth but
+    /// no token (keyring entry missing, or the user saved the form
+    /// with an empty API token before the save-time guard landed) used
+    /// to silently fall through to HTTP Basic with an empty password.
+    /// Stalwart and Fastmail both reject that with a generic 401, so
+    /// the user saw a confusing auth failure instead of "your token is
+    /// missing". connect() now fails fast with an explicit error.
+    #[tokio::test]
+    async fn connect_rejects_bearer_without_token() {
+        let cfg = JmapConfig {
+            jmap_url: "https://api.fastmail.com".into(),
+            email: "u@fastmail.com".into(),
+            username: "u".into(),
+            password: String::new(),
+            access_token: None,
+            auth_method: "bearer".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let msg = match JmapConnection::connect(&cfg).await {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("bearer") && msg.contains("token"),
+            "expected bearer/token error, got: {}",
+            msg
+        );
+    }
 }
 
 impl JmapConfig {
     pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
+        // "bearer" mode stores the API token in the password field but the
+        // server (e.g. Fastmail) expects Authorization: Bearer <token>, not
+        // Basic auth. Promote it to access_token so apply_auth() routes it
+        // through the bearer branch alongside OIDC tokens.
+        //
+        // Trim whitespace — reqwest's bearer_auth() embeds the token
+        // verbatim into the header, so a trailing newline from paste
+        // turns "Bearer fmu1-xxx\n" into a malformed header and Fastmail
+        // returns "Invalid Authorization bearer parameters, not valid
+        // format". The token format itself never contains whitespace, so
+        // trimming is always safe.
+        let trimmed = account.password.trim();
+        let (password, access_token) =
+            if account.jmap_auth_method == "bearer" && !trimmed.is_empty() {
+                (String::new(), Some(trimmed.to_string()))
+            } else {
+                (account.password.clone(), None)
+            };
         Self {
             jmap_url: account.jmap_url.clone(),
             email: account.email.clone(),
             username: account.username.clone(),
-            password: account.password.clone(),
-            access_token: None,
+            password,
+            access_token,
+            auth_method: account.jmap_auth_method.clone(),
             oidc_token_endpoint: account.oidc_token_endpoint.clone(),
             oidc_client_id: account.oidc_client_id.clone(),
         }
@@ -92,6 +149,163 @@ impl JmapConfig {
             req.basic_auth(&self.username, Some(&self.password))
         }
     }
+}
+
+#[cfg(test)]
+mod from_account_tests {
+    use super::*;
+    use crate::db::accounts::AccountFull;
+
+    fn account_with(auth: &str, password: &str) -> AccountFull {
+        AccountFull {
+            id: "acc1".into(),
+            display_name: "Test".into(),
+            email: "u@example.com".into(),
+            provider: "generic".into(),
+            mail_protocol: "jmap".into(),
+            imap_host: String::new(),
+            imap_port: 0,
+            smtp_host: String::new(),
+            smtp_port: 0,
+            jmap_url: "https://api.example.com".into(),
+            caldav_url: String::new(),
+            meet_url: String::new(),
+            meet_protocol: String::new(),
+            username: "u@example.com".into(),
+            password: password.into(),
+            use_tls: true,
+            enabled: true,
+            signature: String::new(),
+            jmap_auth_method: auth.into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            calendar_sync_enabled: false,
+            auth_method: String::new(),
+            bindings: Vec::new(),
+            mail_sync_enabled: true,
+            contacts_sync_enabled: false,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
+            pgp_attach_pubkey_on_sign: false,
+            pgp_autocrypt_header: false,
+            pgp_encrypt_subject: false,
+            pgp_encrypt_drafts: false,
+        }
+    }
+
+    #[test]
+    fn basic_mode_keeps_password_clears_access_token() {
+        let cfg = JmapConfig::from_account(&account_with("basic", "hunter2"));
+        assert_eq!(cfg.password, "hunter2");
+        assert!(cfg.access_token.is_none());
+    }
+
+    #[test]
+    fn bearer_mode_moves_password_to_access_token() {
+        let cfg = JmapConfig::from_account(&account_with("bearer", "fmu1-secret-api-token"));
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.access_token.as_deref(), Some("fmu1-secret-api-token"));
+    }
+
+    #[test]
+    fn bearer_mode_trims_whitespace() {
+        // Paste from settings page can carry a trailing newline.
+        // reqwest::bearer_auth embeds the value verbatim, so a
+        // newline turns "Bearer fmu1-xxx\n" into a malformed header
+        // and Fastmail returns "Invalid Authorization bearer
+        // parameters, not valid format". Verify the trim happens.
+        let cfg = JmapConfig::from_account(&account_with("bearer", "  fmu1-secret-api-token\n"));
+        assert_eq!(cfg.access_token.as_deref(), Some("fmu1-secret-api-token"));
+        assert_eq!(cfg.password, "");
+    }
+
+    #[test]
+    fn bearer_mode_with_empty_password_falls_through() {
+        // Token-less bearer (editing account form, password preserved in
+        // keyring) must not promote an empty string to access_token —
+        // apply_auth would then send "Bearer " with no value.
+        let cfg = JmapConfig::from_account(&account_with("bearer", ""));
+        assert_eq!(cfg.password, "");
+        assert!(cfg.access_token.is_none());
+    }
+
+    #[test]
+    fn oidc_mode_leaves_access_token_for_caller() {
+        // OIDC populates access_token at the call site (sync_cmd / push
+        // loop) after refresh — from_account itself should leave it None.
+        let cfg = JmapConfig::from_account(&account_with("oidc", ""));
+        assert!(cfg.access_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_auth_routes_bearer_for_token() {
+        let cfg = JmapConfig {
+            jmap_url: "https://api.example.com".into(),
+            email: "u@example.com".into(),
+            username: "u".into(),
+            password: String::new(),
+            access_token: Some("tok".into()),
+            auth_method: "bearer".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let client = reqwest::Client::new();
+        let req = cfg
+            .apply_auth(client.get("https://api.example.com/"))
+            .build()
+            .unwrap();
+        let auth = req
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(auth, "Bearer tok");
+    }
+
+    #[tokio::test]
+    async fn apply_auth_routes_basic_for_password() {
+        let cfg = JmapConfig {
+            jmap_url: "https://api.example.com".into(),
+            email: "u@example.com".into(),
+            username: "u".into(),
+            password: "p".into(),
+            access_token: None,
+            auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let client = reqwest::Client::new();
+        let req = cfg
+            .apply_auth(client.get("https://api.example.com/"))
+            .build()
+            .unwrap();
+        let auth = req
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            auth.starts_with("Basic "),
+            "expected Basic auth, got: {}",
+            auth
+        );
+    }
+}
+
+/// Result of `JmapConnection::fetch_emails`. `is_full` distinguishes a
+/// full mailbox scan (where `destroyed` is empty and the caller should
+/// reconcile deletions by comparing against the full server-side set)
+/// from a delta sync (where `destroyed` lists exactly the IDs the
+/// server removed).
+#[derive(Debug, Clone)]
+pub struct JmapFetchResult {
+    pub emails: Vec<JmapEmail>,
+    pub destroyed: Vec<String>,
+    pub state: String,
+    pub is_full: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +326,11 @@ pub struct JmapEmail {
     pub has_attachments: bool,
     pub flags: Vec<String>,
     pub preview: Option<String>,
+    /// JMAP mailbox IDs this email is in (an Email can be in multiple
+    /// mailboxes — "labels" in Gmail-style accounts). Used by the delta
+    /// sync path to filter `Email/changes` results, since that method
+    /// returns changes for the whole account, not a single mailbox.
+    pub mailbox_ids: Vec<String>,
 }
 
 /// JMAP connection that uses raw HTTP requests through the HTTPS proxy.
@@ -140,8 +359,59 @@ struct JmapSession {
     primary_accounts: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DeltaSyncFallbackReason {
+    CannotCalculateChanges,
+    InvalidArguments,
+    ExceededPageCap,
+    StalledState,
+}
+
+impl DeltaSyncFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CannotCalculateChanges => "cannotCalculateChanges",
+            Self::InvalidArguments => "invalidArguments",
+            Self::ExceededPageCap => "Email/changes exceeded page cap",
+            Self::StalledState => "Email/changes returned hasMoreChanges without state advance",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FetchEmailChangesError {
+    Fallback(DeltaSyncFallbackReason),
+    Fatal(Error),
+}
+
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
+        // Fail fast if bearer/OIDC was selected but no access token
+        // resolved. Without this guard, apply_auth() would silently fall
+        // through to HTTP Basic with an empty password, the server would
+        // 401, and the user would see a generic auth failure instead of
+        // "your credential is missing". bearer_auth("") would otherwise
+        // emit an "Authorization: Bearer " header with no value, which
+        // is equally useless.
+        //
+        // The error message uses "access token" — accurate for both
+        // bearer mode (Fastmail API token used as Bearer) and OIDC
+        // (refreshed OIDC access token). The credential-source hint
+        // differs by mode so the user knows where to look.
+        if (config.auth_method == "bearer" || config.auth_method == "oidc")
+            && config.access_token.as_deref().unwrap_or("").is_empty()
+        {
+            let source_hint = if config.auth_method == "bearer" {
+                "the API token in the keyring is missing or empty"
+            } else {
+                "the OIDC token refresh did not return an access token"
+            };
+            return Err(Error::Other(format!(
+                "JMAP {} mode is selected but no access token is available — {}",
+                config.auth_method, source_hint,
+            )));
+        }
+
         let base_url = if !config.jmap_url.is_empty() {
             let url = config.jmap_url.trim_end_matches('/').to_string();
             let url = url.trim_end_matches("/.well-known/jmap").to_string();
@@ -179,7 +449,25 @@ impl JmapConnection {
                 .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
         };
 
-        log::info!("JMAP connecting to {} as {}", base_url, config.username);
+        // Diagnostic: enough to tell which auth mode is in play and to
+        // spot truncated/empty credentials without leaking any part of
+        // them. The auth mode comes from `auth_method` directly (not
+        // inferred from `access_token.is_some()`, which would misreport
+        // OIDC as "bearer"). Length is the post-trim credential the
+        // request will actually send, and is logged uniformly as
+        // `credential_len` for all auth methods.
+        let credential_len = if config.auth_method == "basic" {
+            config.password.len()
+        } else {
+            config.access_token.as_deref().map(str::len).unwrap_or(0)
+        };
+        log::info!(
+            "JMAP connecting to {} as {} [auth={} credential_len={}]",
+            base_url,
+            config.username,
+            config.auth_method,
+            credential_len,
+        );
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -335,9 +623,196 @@ impl JmapConnection {
         &self,
         config: &JmapConfig,
         mailbox_id: &str,
-        _since_state: Option<&str>,
-    ) -> Result<(Vec<JmapEmail>, String)> {
-        log::debug!("JMAP fetching emails from mailbox {}", mailbox_id);
+        since_state: Option<&str>,
+    ) -> Result<JmapFetchResult> {
+        // Try a delta sync first if we have a state token. On success we
+        // skip the full pagination scan entirely — the common case after
+        // the first sync, where 9000 envelopes shouldn't be re-fetched
+        // just to discover 0–5 changed.
+        //
+        // Three signals fall through to a full re-sync rather than
+        // propagating an error:
+        //   * cannotCalculateChanges / invalidArguments — the server
+        //     forgot the state (TTL'd) or the state is from a different
+        //     account (RFC 8620 §5.2).
+        //   * Email/changes exceeded the page cap — too many changes to
+        //     paginate; faster to re-list the mailbox.
+        //   * hasMoreChanges: true with newState unchanged — server is
+        //     misbehaving and can't make progress.
+        // All three mean "delta path cannot finish"; the safe answer is
+        // the same in every case.
+        if let Some(state) = since_state.filter(|s| !s.is_empty()) {
+            match self.fetch_email_changes(config, state).await {
+                Ok(delta) => return Ok(delta),
+                Err(FetchEmailChangesError::Fallback(reason)) => {
+                    log::info!(
+                        "JMAP Email/changes could not complete ({}); falling back to full sync of {}",
+                        reason.as_str(),
+                        mailbox_id
+                    );
+                }
+                Err(FetchEmailChangesError::Fatal(e)) => return Err(e),
+            }
+        }
+
+        self.fetch_emails_full(config, mailbox_id).await
+    }
+
+    /// Delta sync via `Email/changes` (RFC 8621 §4.3). Returns
+    /// `is_full: false` so the caller knows to reconcile deletions
+    /// using `destroyed` rather than the full-server-set comparison
+    /// the initial-sync path needs.
+    ///
+    /// `Email/changes` caps each response at `maxChanges` and sets
+    /// `hasMoreChanges: true` when there is more to fetch. We loop,
+    /// advancing `sinceState` to the previous response's `newState`,
+    /// until the server reports no more. Without the loop a mailbox
+    /// that accumulated more than one page of changes between syncs
+    /// would silently drop created/updated/destroyed entries past the
+    /// first page even though state would advance to the end. A hard
+    /// cap on iterations prevents an infinite loop if a server keeps
+    /// reporting `hasMoreChanges` without advancing state.
+    async fn fetch_email_changes(
+        &self,
+        config: &JmapConfig,
+        since_state: &str,
+    ) -> std::result::Result<JmapFetchResult, FetchEmailChangesError> {
+        log::debug!("JMAP Email/changes since state={}", since_state);
+
+        const MAX_CHANGES_PER_PAGE: u64 = 5000;
+        // 100 * 5000 = 500k changes per sync, far beyond anything a
+        // real mailbox produces between polls. If we hit this the
+        // server is misbehaving — bail to a full re-sync.
+        const MAX_PAGES: usize = 100;
+
+        let mut emails = Vec::new();
+        let mut destroyed: Vec<String> = Vec::new();
+        let mut cursor = since_state.to_string();
+        let final_state: String;
+        let mut pages = 0usize;
+
+        loop {
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/changes", {
+                        "accountId": self.account_id,
+                        // Pass as &str (not the owned String) so the json!
+                        // macro's Value::from path borrows cleanly and
+                        // `cursor` stays available for the hasMoreChanges
+                        // comparison + reassignment after the request.
+                        "sinceState": cursor.as_str(),
+                        "maxChanges": MAX_CHANGES_PER_PAGE
+                    }, "c1"],
+                    ["Email/get", {
+                        "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/created" },
+                        "accountId": self.account_id,
+                        "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
+                                       "size", "keywords", "messageId", "inReplyTo",
+                                       "references", "hasAttachment", "preview", "mailboxIds"]
+                    }, "g1"],
+                    // Fetch full envelope properties for updated emails too,
+                    // not just id+keywords: a message can appear in "updated"
+                    // because its mailboxIds changed (moved into this folder),
+                    // in which case the caller needs to insert it as a new
+                    // row with the real subject/from/date, not an empty one.
+                    ["Email/get", {
+                        "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/updated" },
+                        "accountId": self.account_id,
+                        "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
+                                       "size", "keywords", "messageId", "inReplyTo",
+                                       "references", "hasAttachment", "preview", "mailboxIds"]
+                    }, "g2"]
+                ]
+            });
+
+            let resp = self
+                .api_request(&request, config)
+                .await
+                .map_err(FetchEmailChangesError::Fatal)?;
+
+            // Surface server errors (cannotCalculateChanges, invalidArguments, …)
+            // so the caller can decide whether to fall back to a full sync.
+            if let Some(err_type) = resp["methodResponses"][0][1]["type"].as_str() {
+                let fallback_reason = match err_type {
+                    "cannotCalculateChanges" => {
+                        Some(DeltaSyncFallbackReason::CannotCalculateChanges)
+                    }
+                    "invalidArguments" => Some(DeltaSyncFallbackReason::InvalidArguments),
+                    _ => None,
+                };
+                if let Some(reason) = fallback_reason {
+                    return Err(FetchEmailChangesError::Fallback(reason));
+                }
+                return Err(FetchEmailChangesError::Fatal(Error::Other(format!(
+                    "Email/changes error: {}",
+                    err_type
+                ))));
+            }
+
+            let changes = &resp["methodResponses"][0][1];
+            let new_state = changes["newState"].as_str().unwrap_or("").to_string();
+            let has_more = changes["hasMoreChanges"].as_bool().unwrap_or(false);
+
+            if let Some(arr) = changes["destroyed"].as_array() {
+                destroyed.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+
+            for list_idx in [1usize, 2] {
+                if let Some(arr) = resp["methodResponses"][list_idx][1]["list"].as_array() {
+                    for e in arr {
+                        emails.push(self.parse_jmap_email(e));
+                    }
+                }
+            }
+
+            if !has_more {
+                final_state = new_state;
+                break;
+            }
+
+            pages += 1;
+            if pages >= MAX_PAGES {
+                return Err(FetchEmailChangesError::Fallback(
+                    DeltaSyncFallbackReason::ExceededPageCap,
+                ));
+            }
+
+            // Guard against a server that returns hasMoreChanges: true
+            // without advancing state — would loop forever otherwise.
+            if new_state == cursor {
+                return Err(FetchEmailChangesError::Fallback(
+                    DeltaSyncFallbackReason::StalledState,
+                ));
+            }
+            cursor = new_state;
+        }
+
+        log::info!(
+            "JMAP delta: {} created/updated, {} destroyed (pages={}, newState={})",
+            emails.len(),
+            destroyed.len(),
+            pages + 1,
+            final_state
+        );
+
+        Ok(JmapFetchResult {
+            emails,
+            destroyed,
+            state: final_state,
+            is_full: false,
+        })
+    }
+
+    /// Full mailbox scan via paged `Email/query` + `Email/get`. Used on
+    /// first sync (no state) and as the fallback when the server cannot
+    /// calculate changes since the stored state.
+    async fn fetch_emails_full(
+        &self,
+        config: &JmapConfig,
+        mailbox_id: &str,
+    ) -> Result<JmapFetchResult> {
+        log::debug!("JMAP full fetch from mailbox {}", mailbox_id);
 
         let mut all_emails = Vec::new();
         let mut position: u64 = 0;
@@ -359,19 +834,27 @@ impl JmapConnection {
                         "accountId": self.account_id,
                         "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
                                        "size", "keywords", "messageId", "inReplyTo",
-                                       "references", "hasAttachment", "preview"]
+                                       "references", "hasAttachment", "preview", "mailboxIds"]
                     }, "g1"]
                 ]
             });
 
             let resp = self.api_request(&request, config).await?;
 
-            // Capture state from the first page
+            // For state continuity across syncs we want the Email/get state
+            // (which is what Email/changes works against), not the queryState
+            // (which only tracks the ordered query result and can't be passed
+            // to Email/changes). Capture from the first page.
             if state.is_empty() {
-                state = resp["methodResponses"][0][1]["queryState"]
+                state = resp["methodResponses"][1][1]["state"]
                     .as_str()
                     .unwrap_or("")
                     .to_string();
+                log::debug!(
+                    "JMAP captured Email/get state for {}: {:?} (used for next sync's Email/changes)",
+                    mailbox_id,
+                    state
+                );
             }
 
             let emails_json = resp["methodResponses"][1][1]["list"]
@@ -392,7 +875,6 @@ impl JmapConnection {
                 all_emails.len()
             );
 
-            // If we got fewer than the page size, we've reached the end
             if page_count < Self::JMAP_PAGE_SIZE {
                 break;
             }
@@ -400,11 +882,16 @@ impl JmapConnection {
         }
 
         log::info!(
-            "JMAP fetched {} emails from mailbox {}",
+            "JMAP full sync: {} emails from mailbox {}",
             all_emails.len(),
             mailbox_id
         );
-        Ok((all_emails, state))
+        Ok(JmapFetchResult {
+            emails: all_emails,
+            destroyed: Vec::new(),
+            state,
+            is_full: true,
+        })
     }
 
     /// Parse a single JMAP email JSON object into a JmapEmail struct.
@@ -474,6 +961,13 @@ impl JmapConnection {
             }
         }
 
+        // mailboxIds is an Id[Boolean] object per RFC 8621 §4.1.4: each
+        // key is a mailbox id, value is always `true`. Collect the keys.
+        let mailbox_ids: Vec<String> = e["mailboxIds"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
         JmapEmail {
             id,
             subject,
@@ -489,6 +983,7 @@ impl JmapConnection {
             has_attachments,
             flags,
             preview,
+            mailbox_ids,
         }
     }
 
@@ -2216,10 +2711,21 @@ pub struct JmapContact {
 
 /// Rewrite an internal URL to go through the HTTPS proxy.
 /// e.g., "http://mail.example.com:8080/jmap/foo" → "https://mail.example.com/jmap/foo"
-/// Uses simple string manipulation to preserve template placeholders like {accountId}.
+///
+/// Only rewrites URLs whose host looks "internal" — loopback, RFC 1918,
+/// or a non-standard port (the Stalwart-behind-nginx case ADR 0008 was
+/// written for). Public hosts are left alone, otherwise Fastmail's
+/// session URLs (apiUrl on `api.fastmail.com`, downloadUrl on
+/// `www.fastmail.com` / `www.fastmailusercontent.com`) get force-merged
+/// onto the base host and downloads return the Fastmail marketing
+/// homepage instead of message bodies.
+///
+/// Uses simple string manipulation rather than `Url::set_host` so
+/// template placeholders like `{accountId}` survive intact.
 fn rewrite_url(internal_url: &str, base_url: &str) -> String {
-    // Extract the path from the internal URL by finding the third slash
-    // e.g., "http://mail.example.com:8080/jmap/download/{accountId}..." → "/jmap/download/{accountId}..."
+    if !is_internal_url(internal_url) {
+        return internal_url.to_string();
+    }
     if let Some(scheme_end) = internal_url.find("://") {
         let after_scheme = &internal_url[scheme_end + 3..];
         if let Some(path_start) = after_scheme.find('/') {
@@ -2230,6 +2736,113 @@ fn rewrite_url(internal_url: &str, base_url: &str) -> String {
         }
     }
     internal_url.to_string()
+}
+
+/// Heuristic: does this URL point at a private/internal address that
+/// would be reachable only from inside a reverse-proxy network?
+///
+/// `true` for:
+///   - any URL with an explicit port (the proxied Stalwart case —
+///     `http://host:8080/jmap/`)
+///   - any URL whose host is `localhost`
+///   - any URL whose host parses as loopback (`127.0.0.0/8`, `::1`),
+///     RFC 1918 private IPv4 (`10/8`, `172.16/12`, `192.168/16`),
+///     IPv4 link-local (`169.254.0.0/16`, RFC 3927),
+///     IPv6 unique-local (`fc00::/7`, RFC 4193),
+///     or IPv6 link-local (`fe80::/10`, RFC 4291).
+///
+/// Link-local addresses are treated as "internal" because a session
+/// URL pointing at one only makes sense on the same L2 segment as
+/// the server — exactly the deployment shape this rewrite is
+/// designed for.
+///
+/// `false` for everything else (DNS hostnames without ports, on the
+/// standard port for the scheme — Fastmail, public Stalwart, etc.).
+fn is_internal_url(url_str: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url_str) else {
+        return false;
+    };
+    // Any explicit port → Stalwart-behind-nginx pattern; rewrite.
+    if parsed.port().is_some() {
+        return true;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                // IPv6: loopback (::1), link-local (fe80::/10),
+                // unique-local (fc00::/7). `is_unique_local` is stable.
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        };
+    }
+    false
+}
+
+#[cfg(test)]
+mod url_rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_internal_stalwart_url() {
+        // ADR 0008 case: stalwart on a private port behind nginx.
+        let rewritten = rewrite_url(
+            "http://mail.internal:8080/jmap/download/{accountId}/{blobId}/{name}",
+            "https://mail.example.com",
+        );
+        assert_eq!(
+            rewritten,
+            "https://mail.example.com/jmap/download/{accountId}/{blobId}/{name}"
+        );
+    }
+
+    #[test]
+    fn rewrites_localhost_url() {
+        let rewritten = rewrite_url("http://localhost/jmap/api/", "https://mail.example.com");
+        assert_eq!(rewritten, "https://mail.example.com/jmap/api/");
+    }
+
+    #[test]
+    fn rewrites_rfc1918_url() {
+        let rewritten = rewrite_url("https://10.0.0.5/jmap/api/", "https://mail.example.com");
+        assert_eq!(rewritten, "https://mail.example.com/jmap/api/");
+    }
+
+    #[test]
+    fn leaves_public_host_alone() {
+        // Fastmail: downloadUrl points at a different public host than
+        // the session URL, but both are public. Rewriting it onto the
+        // base host (api.fastmail.com) routes downloads to a host that
+        // returns Fastmail's marketing homepage instead of message
+        // bodies — the bug this whole helper exists to prevent.
+        let original =
+            "https://www.fastmail.com/jmap/download/{accountId}/{blobId}/{name}?type={type}";
+        let rewritten = rewrite_url(original, "https://api.fastmail.com");
+        assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn leaves_fastmailusercontent_alone() {
+        let original =
+            "https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}";
+        let rewritten = rewrite_url(original, "https://api.fastmail.com");
+        assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn leaves_public_host_with_https_no_port_alone() {
+        let original = "https://api.example.com/jmap/api/";
+        let rewritten = rewrite_url(original, "https://api.example.com");
+        assert_eq!(rewritten, original);
+    }
 }
 
 fn flag_to_keyword(flag: &str) -> &str {

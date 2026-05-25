@@ -6,6 +6,74 @@ use crate::db::service_bindings::{
 };
 use crate::error::Result;
 
+/// Strict Fastmail JMAP endpoint check. Returns `true` only when
+/// the URL parses, uses https, and its host is *exactly*
+/// `api.fastmail.com` (case-insensitive). A plain
+/// `starts_with("https://api.fastmail.com")` would also match
+/// lookalike hosts such as `https://api.fastmail.com.attacker.example`
+/// and tag them as Fastmail. Used by both the per-account
+/// `populate_legacy_from_bindings` and the list-view `list_accounts`
+/// query so the two recovery paths stay in lock-step.
+fn is_fastmail_jmap_url(url_str: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url_str) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed
+        .host_str()
+        .map(|h| h.eq_ignore_ascii_case("api.fastmail.com"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod fastmail_url_tests {
+    use super::is_fastmail_jmap_url;
+
+    #[test]
+    fn accepts_canonical_fastmail() {
+        assert!(is_fastmail_jmap_url("https://api.fastmail.com"));
+        assert!(is_fastmail_jmap_url("https://api.fastmail.com/jmap"));
+        assert!(is_fastmail_jmap_url(
+            "https://api.fastmail.com/.well-known/jmap"
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_host() {
+        assert!(is_fastmail_jmap_url("https://API.Fastmail.COM/jmap"));
+    }
+
+    #[test]
+    fn rejects_lookalike_subdomains() {
+        // The whole reason this helper exists: a startsWith check
+        // would have approved these.
+        assert!(!is_fastmail_jmap_url(
+            "https://api.fastmail.com.attacker.example/jmap"
+        ));
+        assert!(!is_fastmail_jmap_url(
+            "https://api.fastmail.com.evil.com/jmap"
+        ));
+        assert!(!is_fastmail_jmap_url("https://api.fastmail.computer/jmap"));
+    }
+
+    #[test]
+    fn rejects_http() {
+        // Bearer credentials over plaintext is a hard no; downgrade
+        // the provider tag so the saved account stops claiming
+        // Fastmail-grade hardening.
+        assert!(!is_fastmail_jmap_url("http://api.fastmail.com/jmap"));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(!is_fastmail_jmap_url(""));
+        assert!(!is_fastmail_jmap_url("api.fastmail.com"));
+        assert!(!is_fastmail_jmap_url("not a url at all"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -166,6 +234,11 @@ pub struct AccountFull {
     pub use_tls: bool,
     pub enabled: bool,
     pub signature: String,
+    /// One of "basic" | "bearer" | "oidc". "basic" sends HTTP Basic with
+    /// username + password (Stalwart). "bearer" sends Authorization: Bearer
+    /// <password> where the password field holds an API token (Fastmail).
+    /// "oidc" runs the OAuth/OIDC token flow and uses the resulting access
+    /// token as Bearer.
     pub jmap_auth_method: String,
     pub oidc_token_endpoint: String,
     pub oidc_client_id: String,
@@ -312,18 +385,39 @@ impl AccountFull {
     /// touched in earlier phases keep working unchanged.
     pub fn populate_legacy_from_bindings(&mut self) {
         self.provider = match self.auth_method.as_str() {
-            "oauth-google" => "gmail",
-            "oauth-microsoft" => "o365",
-            _ => "generic",
-        }
-        .to_string();
+            "oauth-google" => "gmail".to_string(),
+            "oauth-microsoft" => "o365".to_string(),
+            _ => {
+                // Fastmail is fronted by the dedicated "Fastmail" account
+                // tab but shares the JMAP wire path. Recover the provider
+                // tag from the saved JMAP URL so the list-view chip and
+                // the edit-form's type-readonly label both reflect it.
+                // Strict hostname match (not startsWith) so a lookalike
+                // host like api.fastmail.com.attacker.example does not
+                // get tagged as Fastmail.
+                let jmap_url = self.mail_jmap_config().map(|c| c.url).unwrap_or_default();
+                if is_fastmail_jmap_url(&jmap_url) {
+                    "fastmail".to_string()
+                } else {
+                    "generic".to_string()
+                }
+            }
+        };
 
+        // The Phase-2 `auth_method` column collapses "basic" and "bearer"
+        // both to "password" (since auth_method_for only special-cases
+        // OIDC). So for non-OIDC accounts we must read the actual JMAP
+        // binding to recover the user's choice — otherwise a Fastmail
+        // account saved as "bearer" reads back as "basic" and apply_auth
+        // sends HTTP Basic, which Fastmail rejects with 401.
         self.jmap_auth_method = if self.auth_method == "oauth-jmap-oidc" {
-            "oidc"
+            "oidc".to_string()
         } else {
-            "basic"
-        }
-        .to_string();
+            self.mail_jmap_config()
+                .map(|c| c.auth_method)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "basic".to_string())
+        };
 
         self.mail_protocol = self
             .mail_binding()
@@ -456,19 +550,56 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                        AND b.enabled = 1
                      LIMIT 1),
                     ''
-                ) AS meet_protocol
+                ) AS meet_protocol,
+                -- JMAP binding's config_json, used to recover the
+                -- Fastmail provider tag from the saved URL. Empty for
+                -- non-JMAP accounts. See get_account_full for the
+                -- equivalent full-account recovery path.
+                COALESCE(
+                    (SELECT b.config_json FROM service_bindings b
+                     WHERE b.account_id = a.id
+                       AND b.service = 'mail'
+                       AND b.protocol = 'jmap'
+                     LIMIT 1),
+                    ''
+                ) AS jmap_config_json
          FROM accounts a
          ORDER BY a.display_name",
     )?;
     let accounts = stmt
         .query_map([], |row| {
             let auth_method: String = row.get(3)?;
+            let jmap_config_json: String = row.get(13)?;
             let provider = match auth_method.as_str() {
-                "oauth-google" => "gmail",
-                "oauth-microsoft" => "o365",
-                _ => "generic",
-            }
-            .to_string();
+                "oauth-google" => "gmail".to_string(),
+                "oauth-microsoft" => "o365".to_string(),
+                _ => {
+                    // Fastmail accounts save via the dedicated tab but
+                    // share the password-based auth_method bucket, so
+                    // the provider lives in the JMAP binding's URL at
+                    // read time. Parse the binding JSON and validate
+                    // the URL's hostname strictly — a substring match
+                    // (or even startsWith) on the raw config_json
+                    // would mistag a lookalike host like
+                    // `api.fastmail.com.attacker.example` or any
+                    // other field that happened to contain the
+                    // string "api.fastmail.com" as Fastmail.
+                    let jmap_url = if jmap_config_json.is_empty() {
+                        String::new()
+                    } else {
+                        serde_json::from_str::<crate::db::service_bindings::JmapBindingConfig>(
+                            &jmap_config_json,
+                        )
+                        .map(|c| c.url)
+                        .unwrap_or_default()
+                    };
+                    if is_fastmail_jmap_url(&jmap_url) {
+                        "fastmail".to_string()
+                    } else {
+                        "generic".to_string()
+                    }
+                }
+            };
             Ok(Account {
                 id: row.get(0)?,
                 display_name: row.get(1)?,
@@ -571,12 +702,24 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
 }
 
 pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
-    // Store real passwords in system keyring; skip OIDC accounts and oauth2 migration markers
+    // Store real passwords in system keyring; skip OIDC accounts and oauth2 migration markers.
+    // For bearer mode the value is trimmed (so a paste-with-trailing-newline
+    // doesn't poison the Authorization header), AND the post-trim emptiness
+    // is checked separately so a whitespace-only field is treated like
+    // "leave empty" — otherwise the user could nuke the keyring token by
+    // pasting blank lines into the API-token input.
     if !config.password.is_empty()
         && config.jmap_auth_method != "oidc"
         && !config.password.starts_with("oauth2:")
     {
-        crate::keyring::set_password(id, &config.password)?;
+        let secret = if config.jmap_auth_method == "bearer" {
+            config.password.trim()
+        } else {
+            config.password.as_str()
+        };
+        if !secret.is_empty() {
+            crate::keyring::set_password(id, secret)?;
+        }
     }
 
     let auth_method =
@@ -647,11 +790,21 @@ fn config_to_legacy_fields<'a>(
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
     // Only update keyring if a real password was provided; skip OIDC accounts and oauth2 markers.
+    // Trim + post-trim empty check for bearer (see insert_account for the
+    // full rationale — whitespace-only must round-trip to "no change",
+    // not "clobber the existing token").
     if !config.password.is_empty()
         && config.jmap_auth_method != "oidc"
         && !config.password.starts_with("oauth2:")
     {
-        crate::keyring::set_password(id, &config.password)?;
+        let secret = if config.jmap_auth_method == "bearer" {
+            config.password.trim()
+        } else {
+            config.password.as_str()
+        };
+        if !secret.is_empty() {
+            crate::keyring::set_password(id, secret)?;
+        }
     }
 
     let auth_method =
@@ -864,6 +1017,137 @@ mod tests {
             "Graph accounts must fall back to the O365 SMTP relay for sending"
         );
         assert_eq!(full.smtp_port, 587);
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: a whitespace-only API token (e.g. user pasted blank
+    /// lines into the edit form) must not overwrite the existing
+    /// keyring entry. The original guard only checked
+    /// `!config.password.is_empty()`, so " \n" got past the gate, then
+    /// trim() reduced it to "" and the keyring write clobbered the
+    /// real token. apply_auth would then send `Bearer ` (empty value)
+    /// on every request. The trimmed-emptiness check inside the gate
+    /// makes whitespace-only input behave like "leave empty".
+    #[test]
+    fn test_update_account_whitespace_only_bearer_token_preserves_keyring() {
+        let conn = setup_db();
+        let id = unique_id();
+
+        // 1. Create the account with a real token.
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.provider = "fastmail".to_string();
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.password = "fmu1-real-token".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+        assert_eq!(
+            crate::keyring::get_password(&id).unwrap().as_deref(),
+            Some("fmu1-real-token"),
+            "setup precondition: real token must be in keyring",
+        );
+
+        // 2. Simulate the user pasting only whitespace into the
+        //    "API token" field on the edit form and saving.
+        let mut whitespace_update = config.clone();
+        whitespace_update.password = "   \n\t  ".to_string();
+        update_account(&conn, &id, &whitespace_update).unwrap();
+
+        // 3. Keyring must still hold the original token — the
+        //    whitespace-only paste should round-trip as "no change".
+        assert_eq!(
+            crate::keyring::get_password(&id).unwrap().as_deref(),
+            Some("fmu1-real-token"),
+            "whitespace-only bearer input must NOT overwrite the keyring entry",
+        );
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: the settings list view reads `Account` rows via
+    /// `list_accounts`, which derives `provider` from the Phase-2
+    /// `auth_method` column. That column collapses Fastmail (password
+    /// auth, no OAuth) to the same bucket as generic JMAP, so before
+    /// this query was widened the FASTMAIL chip in SettingsView.vue
+    /// would never trigger — Fastmail accounts displayed as
+    /// JMAP/GENERIC despite the UI branch existing. The query now
+    /// also pulls the JMAP binding's config_json and tags providers
+    /// matching `api.fastmail.com` as "fastmail".
+    #[test]
+    fn test_list_accounts_recovers_fastmail_provider_from_url() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.provider = "fastmail".to_string();
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let accounts = list_accounts(&conn).unwrap();
+        let fm = accounts
+            .iter()
+            .find(|a| a.id == id)
+            .expect("inserted account must appear in list");
+        assert_eq!(fm.provider, "fastmail");
+        assert_eq!(fm.mail_protocol, "jmap");
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: the Fastmail account-type tab saves `provider =
+    /// "fastmail"`, but the `provider` value is recomputed on read-back
+    /// from the Phase-2 `auth_method` column (which only knows "gmail" /
+    /// "o365" / "generic"). To keep the list-view chip and edit-form
+    /// label saying "FASTMAIL", `populate_legacy_from_bindings` recovers
+    /// the tag by inspecting the JMAP URL.
+    #[test]
+    fn test_get_account_full_recovers_fastmail_provider_from_url() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.provider = "fastmail".to_string();
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(full.provider, "fastmail");
+        assert_eq!(full.jmap_auth_method, "bearer");
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: a JMAP account saved with `jmap_auth_method = "bearer"`
+    /// must read back as "bearer", not "basic". The Phase-2 `auth_method`
+    /// column collapses both "basic" and "bearer" to "password", so
+    /// `populate_legacy_from_bindings` has to recover the real choice from
+    /// the JMAP binding's `config_json.auth_method`. Without that,
+    /// Fastmail accounts saved via the UI would round-trip as Basic auth
+    /// and the push loop would 401 with "Invalid Authorization header,
+    /// not bearer".
+    #[test]
+    fn test_get_account_full_round_trips_bearer_auth_method() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let full = get_account_full(&conn, &id).unwrap();
+        assert_eq!(
+            full.jmap_auth_method, "bearer",
+            "bearer auth must survive insert + read-back so apply_auth \
+             routes the token through Authorization: Bearer"
+        );
         crate::keyring::delete_password(&id).ok();
     }
 

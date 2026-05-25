@@ -188,19 +188,20 @@ pub async fn refresh_jmap_oidc_token(
 }
 
 /// Build a JmapConfig from an account, including OIDC token if applicable.
+///
+/// Delegates to `JmapConfig::from_account` so the bearer-mode promotion
+/// (password → access_token for Fastmail-style API tokens) is applied
+/// uniformly. For OIDC accounts we overlay the refreshed access token
+/// from the keyring afterwards; from_account leaves `access_token: None`
+/// for OIDC because it has no async refresh path.
 pub async fn build_jmap_config(
     account: &crate::db::accounts::AccountFull,
 ) -> crate::error::Result<crate::mail::jmap::JmapConfig> {
-    let access_token = get_jmap_oidc_token(account).await?;
-    Ok(crate::mail::jmap::JmapConfig {
-        jmap_url: account.jmap_url.clone(),
-        email: account.email.clone(),
-        username: account.username.clone(),
-        password: account.password.clone(),
-        access_token,
-        oidc_token_endpoint: account.oidc_token_endpoint.clone(),
-        oidc_client_id: account.oidc_client_id.clone(),
-    })
+    let mut config = crate::mail::jmap::JmapConfig::from_account(account);
+    if let Some(token) = get_jmap_oidc_token(account).await? {
+        config.access_token = Some(token);
+    }
+    Ok(config)
 }
 
 fn should_start_imap_idle(_auth_method: &str) -> bool {
