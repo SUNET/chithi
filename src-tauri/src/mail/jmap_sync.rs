@@ -186,6 +186,33 @@ async fn sync_jmap_account_inner(
 }
 
 /// Sync a single JMAP mailbox.
+///
+/// Known per-folder redundancy
+/// ---------------------------
+/// `fetch_emails` (below) calls `Email/changes` against the per-folder
+/// stored state. `Email/changes` itself is account-wide — it returns
+/// the same created/updated/destroyed lists regardless of which
+/// mailbox you're "syncing". When `sync_jmap_account_inner` iterates
+/// every folder and calls `sync_jmap_folder` for each, the same delta
+/// window is fetched and parsed once per folder, then filtered
+/// per-mailbox by the loop above. For an account with N folders all
+/// at the same JMAP state this is N times the network traffic and
+/// JSON parsing of the minimum needed.
+///
+/// We accept this redundancy in the current implementation because:
+///   * per-folder state lets the user trigger "sync only Inbox" (the
+///     right-click sync action) without advancing the global cursor
+///     and silently dropping changes that other folders still need;
+///   * folders can legitimately have different states (e.g. a freshly
+///     created folder starts with no state and gets a full scan
+///     while the inbox keeps its delta cursor);
+///   * a single Email/changes call is fast enough on Fastmail /
+///     Stalwart that the wasted work is not visible in practice.
+///
+/// The proper fix is an account-level Email/changes step that fans
+/// out per-folder, with a single per-account state column. That's a
+/// schema + sync-orchestration change tracked separately, not in the
+/// Fastmail-support PR that introduced delta sync.
 async fn sync_jmap_folder(
     db: &Arc<DbPool>,
     account_id: &str,

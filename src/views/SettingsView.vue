@@ -697,6 +697,32 @@ async function saveAccount() {
   saving.value = true;
   error.value = null;
   try {
+    // Fastmail save-time guard: the form's only secret is the API
+    // token (the "Password" input is relabelled to "API token" for
+    // this tab). On a new account it must be a non-empty token, since
+    // bearer-mode JmapConfig builds will otherwise fail fast at
+    // connect time with a generic error and the account is unusable.
+    // We check trim() too — whitespace-only input would have been
+    // silently dropped by the keyring write guard, leaving the field
+    // visually "set" but the keyring empty.
+    // When editing, blank means "leave the existing token alone", so
+    // we only reject a token that the user explicitly typed but that
+    // consists entirely of whitespace.
+    if (accountType.value === "fastmail") {
+      const trimmedToken = form.value.password.trim();
+      if (!editingAccountId.value && trimmedToken === "") {
+        throw new Error(
+          "Fastmail accounts require an API token. Generate one at " +
+            "Fastmail Settings → Privacy & Security → Manage API tokens.",
+        );
+      }
+      if (editingAccountId.value && form.value.password !== "" && trimmedToken === "") {
+        throw new Error(
+          "API token cannot be only whitespace. Leave the field blank " +
+            "to keep the existing token, or paste a valid token.",
+        );
+      }
+    }
     // Default username to email if not set (Gmail and most IMAP servers use email as username)
     if (!form.value.username.trim()) {
       form.value.username = form.value.email;

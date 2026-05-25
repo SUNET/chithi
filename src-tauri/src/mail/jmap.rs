@@ -39,6 +39,13 @@ pub struct JmapConfig {
     pub username: String,
     pub password: String,
     pub access_token: Option<String>,
+    /// One of `"basic"`, `"bearer"`, or `"oidc"`. Carried explicitly
+    /// (not just inferred from `access_token.is_some()`) so `connect()`
+    /// can fail fast when bearer mode is selected but no token is
+    /// available — otherwise the request silently downgrades to HTTP
+    /// Basic with an empty password and the user sees a generic 401
+    /// instead of "your API token is missing".
+    pub auth_method: String,
     /// OIDC metadata for token refresh (used by push loop on reconnect)
     pub oidc_token_endpoint: String,
     pub oidc_client_id: String,
@@ -55,6 +62,7 @@ mod connect_tests {
             username: "u".into(),
             password: "p".into(),
             access_token: None,
+            auth_method: "basic".into(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
         }
@@ -67,6 +75,36 @@ mod connect_tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    /// Regression: a Fastmail account configured with bearer auth but
+    /// no token (keyring entry missing, or the user saved the form
+    /// with an empty API token before the save-time guard landed) used
+    /// to silently fall through to HTTP Basic with an empty password.
+    /// Stalwart and Fastmail both reject that with a generic 401, so
+    /// the user saw a confusing auth failure instead of "your token is
+    /// missing". connect() now fails fast with an explicit error.
+    #[tokio::test]
+    async fn connect_rejects_bearer_without_token() {
+        let cfg = JmapConfig {
+            jmap_url: "https://api.fastmail.com".into(),
+            email: "u@fastmail.com".into(),
+            username: "u".into(),
+            password: String::new(),
+            access_token: None,
+            auth_method: "bearer".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let msg = match JmapConnection::connect(&cfg).await {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("bearer") && msg.contains("token"),
+            "expected bearer/token error, got: {}",
+            msg
+        );
     }
 }
 
@@ -96,6 +134,7 @@ impl JmapConfig {
             username: account.username.clone(),
             password,
             access_token,
+            auth_method: account.jmap_auth_method.clone(),
             oidc_token_endpoint: account.oidc_token_endpoint.clone(),
             oidc_client_id: account.oidc_client_id.clone(),
         }
@@ -207,6 +246,7 @@ mod from_account_tests {
             username: "u".into(),
             password: String::new(),
             access_token: Some("tok".into()),
+            auth_method: "bearer".into(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
         };
@@ -232,6 +272,7 @@ mod from_account_tests {
             username: "u".into(),
             password: "p".into(),
             access_token: None,
+            auth_method: "basic".into(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
         };
@@ -320,6 +361,23 @@ struct JmapSession {
 
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
+        // Fail fast if bearer mode was selected but no token resolved.
+        // Without this guard, apply_auth() would silently fall through
+        // to HTTP Basic with an empty password, the server would 401,
+        // and the user would see a generic auth failure instead of
+        // "your API token is missing or empty". The same fast-fail is
+        // wanted for OIDC — bearer_auth("") would otherwise emit an
+        // "Authorization: Bearer " header with no value.
+        if (config.auth_method == "bearer" || config.auth_method == "oidc")
+            && config.access_token.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(Error::Other(format!(
+                "JMAP {} mode is selected but no access token is available — \
+                 the keyring entry is missing or the API token is empty",
+                config.auth_method
+            )));
+        }
+
         let base_url = if !config.jmap_url.is_empty() {
             let url = config.jmap_url.trim_end_matches('/').to_string();
             let url = url.trim_end_matches("/.well-known/jmap").to_string();
@@ -2642,9 +2700,17 @@ fn rewrite_url(internal_url: &str, base_url: &str) -> String {
 /// `true` for:
 ///   - any URL with an explicit port (the proxied Stalwart case —
 ///     `http://host:8080/jmap/`)
-///   - any URL whose host parses as a loopback or RFC 1918 / RFC 4193
-///     private IP
 ///   - any URL whose host is `localhost`
+///   - any URL whose host parses as loopback (`127.0.0.0/8`, `::1`),
+///     RFC 1918 private IPv4 (`10/8`, `172.16/12`, `192.168/16`),
+///     IPv4 link-local (`169.254.0.0/16`, RFC 3927),
+///     IPv6 unique-local (`fc00::/7`, RFC 4193),
+///     or IPv6 link-local (`fe80::/10`, RFC 4291).
+///
+/// Link-local addresses are treated as "internal" because a session
+/// URL pointing at one only makes sense on the same L2 segment as
+/// the server — exactly the deployment shape this rewrite is
+/// designed for.
 ///
 /// `false` for everything else (DNS hostnames without ports, on the
 /// standard port for the scheme — Fastmail, public Stalwart, etc.).
