@@ -19,6 +19,24 @@ const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
 
+/// Strict Fastmail JMAP endpoint check. Mirrors the Rust
+/// `is_fastmail_jmap_url` helper in `db/accounts.rs`: returns
+/// `true` only when the URL parses, uses https, and its hostname
+/// is *exactly* `api.fastmail.com` (case-insensitive). A plain
+/// `startsWith("https://api.fastmail.com")` would also approve
+/// lookalike hosts like `api.fastmail.com.attacker.example`.
+function isFastmailJmapUrl(u: string): boolean {
+  try {
+    const parsed = new URL(u);
+    return (
+      parsed.protocol === "https:"
+      && parsed.hostname.toLowerCase() === "api.fastmail.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
 /// Long-form label for the type-selector buttons in the modal.
 /// Mostly the same as `accountTypeLabel` for the listing, but the
 /// modal is wider and benefits from "Nextcloud Talk" and "Matrix"
@@ -523,14 +541,16 @@ async function openEditForm(id: string) {
       } catch { oauthStatus.value = null; }
     } else if (
       config.mail_protocol === "jmap"
-      && (config.provider === "fastmail"
-        || config.jmap_url.startsWith("https://api.fastmail.com"))
+      && (config.provider === "fastmail" || isFastmailJmapUrl(config.jmap_url))
     ) {
       // Detect Fastmail accounts on edit-load: either provider was
       // set by the Fastmail-tab save path, or the URL points at
       // Fastmail's JMAP endpoint. populate_legacy_from_bindings
       // rewrites provider to "generic" on read-back, so URL-based
-      // detection is the durable signal.
+      // detection is the durable signal. The host match is strict
+      // (full hostname equality, not startsWith) so a lookalike
+      // host like `api.fastmail.com.attacker.example` does not
+      // silently load the Fastmail tab.
       accountType.value = "fastmail";
       oauthStatus.value = null;
     } else if (config.mail_protocol === "jmap") {

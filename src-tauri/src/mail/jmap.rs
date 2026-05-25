@@ -361,20 +361,29 @@ struct JmapSession {
 
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
-        // Fail fast if bearer mode was selected but no token resolved.
-        // Without this guard, apply_auth() would silently fall through
-        // to HTTP Basic with an empty password, the server would 401,
-        // and the user would see a generic auth failure instead of
-        // "your API token is missing or empty". The same fast-fail is
-        // wanted for OIDC — bearer_auth("") would otherwise emit an
-        // "Authorization: Bearer " header with no value.
+        // Fail fast if bearer/OIDC was selected but no access token
+        // resolved. Without this guard, apply_auth() would silently fall
+        // through to HTTP Basic with an empty password, the server would
+        // 401, and the user would see a generic auth failure instead of
+        // "your credential is missing". bearer_auth("") would otherwise
+        // emit an "Authorization: Bearer " header with no value, which
+        // is equally useless.
+        //
+        // The error message uses "access token" — accurate for both
+        // bearer mode (Fastmail API token used as Bearer) and OIDC
+        // (refreshed OIDC access token). The credential-source hint
+        // differs by mode so the user knows where to look.
         if (config.auth_method == "bearer" || config.auth_method == "oidc")
             && config.access_token.as_deref().unwrap_or("").is_empty()
         {
+            let source_hint = if config.auth_method == "bearer" {
+                "the API token in the keyring is missing or empty"
+            } else {
+                "the OIDC token refresh did not return an access token"
+            };
             return Err(Error::Other(format!(
-                "JMAP {} mode is selected but no access token is available — \
-                 the keyring entry is missing or the API token is empty",
-                config.auth_method
+                "JMAP {} mode is selected but no access token is available — {}",
+                config.auth_method, source_hint,
             )));
         }
 
@@ -415,25 +424,25 @@ impl JmapConnection {
                 .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
         };
 
-        // Diagnostic: enough to tell whether bearer was selected and to spot
-        // truncated/empty secrets without leaking any part of the token. The
-        // earlier version logged the first 4 characters of the bearer token
-        // as a "prefix" — even a partial secret can leak via logs, so log
-        // only mode + length now.
-        match config.access_token.as_ref() {
-            Some(t) => log::info!(
-                "JMAP connecting to {} as {} [auth=bearer token_len={}]",
-                base_url,
-                config.username,
-                t.len(),
-            ),
-            None => log::info!(
-                "JMAP connecting to {} as {} [auth=basic password_len={}]",
-                base_url,
-                config.username,
-                config.password.len(),
-            ),
-        }
+        // Diagnostic: enough to tell which auth mode is in play and to
+        // spot truncated/empty credentials without leaking any part of
+        // them. The auth mode comes from `auth_method` directly (not
+        // inferred from `access_token.is_some()`, which would misreport
+        // OIDC as "bearer"). Length is the post-trim credential the
+        // request will actually send, so basic shows password_len and
+        // bearer/oidc show token_len.
+        let credential_len = if config.auth_method == "basic" {
+            config.password.len()
+        } else {
+            config.access_token.as_deref().map(str::len).unwrap_or(0)
+        };
+        log::info!(
+            "JMAP connecting to {} as {} [auth={} credential_len={}]",
+            base_url,
+            config.username,
+            config.auth_method,
+            credential_len,
+        );
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))

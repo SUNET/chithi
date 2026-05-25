@@ -6,6 +6,74 @@ use crate::db::service_bindings::{
 };
 use crate::error::Result;
 
+/// Strict Fastmail JMAP endpoint check. Returns `true` only when
+/// the URL parses, uses https, and its host is *exactly*
+/// `api.fastmail.com` (case-insensitive). A plain
+/// `starts_with("https://api.fastmail.com")` would also match
+/// lookalike hosts such as `https://api.fastmail.com.attacker.example`
+/// and tag them as Fastmail. Used by both the per-account
+/// `populate_legacy_from_bindings` and the list-view `list_accounts`
+/// query so the two recovery paths stay in lock-step.
+fn is_fastmail_jmap_url(url_str: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url_str) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed
+        .host_str()
+        .map(|h| h.eq_ignore_ascii_case("api.fastmail.com"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod fastmail_url_tests {
+    use super::is_fastmail_jmap_url;
+
+    #[test]
+    fn accepts_canonical_fastmail() {
+        assert!(is_fastmail_jmap_url("https://api.fastmail.com"));
+        assert!(is_fastmail_jmap_url("https://api.fastmail.com/jmap"));
+        assert!(is_fastmail_jmap_url(
+            "https://api.fastmail.com/.well-known/jmap"
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_host() {
+        assert!(is_fastmail_jmap_url("https://API.Fastmail.COM/jmap"));
+    }
+
+    #[test]
+    fn rejects_lookalike_subdomains() {
+        // The whole reason this helper exists: a startsWith check
+        // would have approved these.
+        assert!(!is_fastmail_jmap_url(
+            "https://api.fastmail.com.attacker.example/jmap"
+        ));
+        assert!(!is_fastmail_jmap_url(
+            "https://api.fastmail.com.evil.com/jmap"
+        ));
+        assert!(!is_fastmail_jmap_url("https://api.fastmail.computer/jmap"));
+    }
+
+    #[test]
+    fn rejects_http() {
+        // Bearer credentials over plaintext is a hard no; downgrade
+        // the provider tag so the saved account stops claiming
+        // Fastmail-grade hardening.
+        assert!(!is_fastmail_jmap_url("http://api.fastmail.com/jmap"));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(!is_fastmail_jmap_url(""));
+        assert!(!is_fastmail_jmap_url("api.fastmail.com"));
+        assert!(!is_fastmail_jmap_url("not a url at all"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -324,8 +392,11 @@ impl AccountFull {
                 // tab but shares the JMAP wire path. Recover the provider
                 // tag from the saved JMAP URL so the list-view chip and
                 // the edit-form's type-readonly label both reflect it.
+                // Strict hostname match (not startsWith) so a lookalike
+                // host like api.fastmail.com.attacker.example does not
+                // get tagged as Fastmail.
                 let jmap_url = self.mail_jmap_config().map(|c| c.url).unwrap_or_default();
-                if jmap_url.starts_with("https://api.fastmail.com") {
+                if is_fastmail_jmap_url(&jmap_url) {
                     "fastmail".to_string()
                 } else {
                     "generic".to_string()
@@ -505,11 +576,24 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                 _ => {
                     // Fastmail accounts save via the dedicated tab but
                     // share the password-based auth_method bucket, so
-                    // the only place the provider lives at read time is
-                    // the JMAP binding's URL. Substring match (not full
-                    // JSON parse) is enough — "api.fastmail.com" only
-                    // appears in the url field of the binding config.
-                    if jmap_config_json.contains("api.fastmail.com") {
+                    // the provider lives in the JMAP binding's URL at
+                    // read time. Parse the binding JSON and validate
+                    // the URL's hostname strictly — a substring match
+                    // (or even startsWith) on the raw config_json
+                    // would mistag a lookalike host like
+                    // `api.fastmail.com.attacker.example` or any
+                    // other field that happened to contain the
+                    // string "api.fastmail.com" as Fastmail.
+                    let jmap_url = if jmap_config_json.is_empty() {
+                        String::new()
+                    } else {
+                        serde_json::from_str::<crate::db::service_bindings::JmapBindingConfig>(
+                            &jmap_config_json,
+                        )
+                        .map(|c| c.url)
+                        .unwrap_or_default()
+                    };
+                    if is_fastmail_jmap_url(&jmap_url) {
                         "fastmail".to_string()
                     } else {
                         "generic".to_string()
