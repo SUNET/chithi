@@ -164,13 +164,8 @@ describe("MessageList click handling", () => {
     expect(row.element.tagName).toBe("DIV");
   });
 
-  it("Save as .eml context-menu item invokes the backend with sanitized filename", async () => {
-    const store = setupStores();
-    // Subject containing characters illegal on Windows ("/", ":") plus a
-    // path separator, to verify the renderer-side sanitizer doesn't leak
-    // them into the suggested filename — and that the ".eml" suffix is
-    // appended exactly once.
-    store.messages[0] = { ...store.messages[0], subject: "Re: Project/Update " };
+  it("Save as .eml context-menu item invokes the backend with the default filename", async () => {
+    setupStores();
     const wrapper = mount(MessageList, {
       attachTo: document.body,
       global: { plugins: [router] },
@@ -193,8 +188,8 @@ describe("MessageList click handling", () => {
     const args = (api.saveMessageAsEml as any).mock.calls[0];
     expect(args[0]).toBe("acc1");
     expect(args[1]).toBe("msg1");
-    // "/" and ":" must be replaced; trailing whitespace stripped; one ".eml".
-    expect(args[2]).toBe("Re_ Project_Update.eml");
+    // Default filename — user can rename in the native save dialog.
+    expect(args[2]).toBe("message.eml");
 
     wrapper.unmount();
   });

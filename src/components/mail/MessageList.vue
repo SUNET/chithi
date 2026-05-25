@@ -381,26 +381,13 @@ const hasReadSelected = () => {
   return false;
 };
 
-function sanitizeFilename(name: string): string {
-  // Strip path separators, control chars, and chars that are illegal on
-  // Windows/macOS so the suggested filename works cross-platform.
-  const cleaned = name.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").trim();
-  // Avoid a leading dot (hidden file) and bound the length so the dialog
-  // remains usable on file systems with name-length limits.
-  const noDot = cleaned.replace(/^\.+/, "");
-  return noDot.slice(0, 200) || "message";
-}
-
 async function ctxSaveAsEml() {
   const msgId = contextMenu.value?.messageId;
   const accountId = accountsStore.activeAccountId;
   closeContextMenu();
   if (!msgId || !accountId) return;
-  const summary = messagesStore.messages.find(m => m.id === msgId);
-  const base = sanitizeFilename(summary?.subject || "message");
-  const suggested = base.toLowerCase().endsWith(".eml") ? base : `${base}.eml`;
   try {
-    await api.saveMessageAsEml(accountId, msgId, suggested);
+    await api.saveMessageAsEml(accountId, msgId, "message.eml");
   } catch (e) {
     console.error("Save as .eml failed:", e);
     const msg = e instanceof Error ? e.message : String(e);
