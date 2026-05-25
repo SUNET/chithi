@@ -333,11 +333,20 @@ function selectAccountType(type: AccountType) {
       f.mail_protocol = "jmap";
       // Same logic: any IMAP host pre-filled by Gmail / O365 / a
       // previous IMAP click is irrelevant for JMAP, clear it.
+      // Also reset the JMAP-specific fields so a previous click on
+      // the Fastmail tab (which hardcodes jmap_url to
+      // api.fastmail.com and jmap_auth_method to "bearer") doesn't
+      // leak through into the generic JMAP form — the JMAP UI only
+      // offers Basic / OIDC, so a stuck "bearer" would be
+      // unreachable from the user's perspective and the saved URL
+      // would auto-pick the Fastmail edit-load branch.
       if (!editingAccountId.value) {
         f.imap_host = "";
         f.imap_port = 0;
         f.smtp_host = "";
         f.smtp_port = 0;
+        f.jmap_url = "";
+        f.jmap_auth_method = "basic";
       }
       f.use_tls = true;
       break;

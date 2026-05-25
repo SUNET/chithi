@@ -537,18 +537,29 @@ impl JmapConnection {
         // skip the full pagination scan entirely — the common case after
         // the first sync, where 9000 envelopes shouldn't be re-fetched
         // just to discover 0–5 changed.
+        //
+        // Three signals fall through to a full re-sync rather than
+        // propagating an error:
+        //   * cannotCalculateChanges / invalidArguments — the server
+        //     forgot the state (TTL'd) or the state is from a different
+        //     account (RFC 8620 §5.2).
+        //   * Email/changes exceeded the page cap — too many changes to
+        //     paginate; faster to re-list the mailbox.
+        //   * hasMoreChanges: true with newState unchanged — server is
+        //     misbehaving and can't make progress.
+        // All three mean "delta path cannot finish"; the safe answer is
+        // the same in every case.
         if let Some(state) = since_state.filter(|s| !s.is_empty()) {
             match self.fetch_email_changes(config, state).await {
                 Ok(delta) => return Ok(delta),
                 Err(Error::Other(msg))
                     if msg.contains("cannotCalculateChanges")
-                        || msg.contains("invalidArguments") =>
+                        || msg.contains("invalidArguments")
+                        || msg.contains("Email/changes exceeded")
+                        || msg.contains("hasMoreChanges but newState") =>
                 {
-                    // Server forgot the state (TTL'd) or the state is
-                    // from a different account — fall through to full
-                    // re-sync. RFC 8620 §5.2.
                     log::info!(
-                        "JMAP Email/changes rejected stale state ({}); falling back to full sync of {}",
+                        "JMAP Email/changes could not complete ({}); falling back to full sync of {}",
                         msg,
                         mailbox_id
                     );
