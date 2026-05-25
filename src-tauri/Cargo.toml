@@ -60,7 +60,7 @@ clearurls = "0.0.4"
 # OpenPGP keystore + smartcard + WKD operations. Shares the on-disk
 # keystore at ~/.tumpa/keys.db with tumpa-cli and the tumpa desktop app
 # (honors $TUMPA_DIR / $TUMPA_KEYSTORE).
-libtumpa = { version = "0.4.0", default-features = false, features = ["card", "network"] }
+libtumpa = { version = "0.4.1", default-features = false, features = ["card", "network"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
