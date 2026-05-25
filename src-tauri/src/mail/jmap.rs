@@ -357,28 +357,24 @@ impl JmapConnection {
                 .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
         };
 
-        // Diagnostic: enough to tell whether bearer was selected and whether
-        // the token looks like a Fastmail API token (length + prefix). The
-        // token value itself is never logged.
+        // Diagnostic: enough to tell whether bearer was selected and to spot
+        // truncated/empty secrets without leaking any part of the token. The
+        // earlier version logged the first 4 characters of the bearer token
+        // as a "prefix" — even a partial secret can leak via logs, so log
+        // only mode + length now.
         match config.access_token.as_ref() {
-            Some(t) => {
-                let preview: String = t.chars().take(4).collect();
-                log::info!(
-                    "JMAP connecting to {} as {} [auth=bearer token_len={} token_prefix={:?}]",
-                    base_url,
-                    config.username,
-                    t.len(),
-                    preview,
-                );
-            }
-            None => {
-                log::info!(
-                    "JMAP connecting to {} as {} [auth=basic password_len={}]",
-                    base_url,
-                    config.username,
-                    config.password.len(),
-                );
-            }
+            Some(t) => log::info!(
+                "JMAP connecting to {} as {} [auth=bearer token_len={}]",
+                base_url,
+                config.username,
+                t.len(),
+            ),
+            None => log::info!(
+                "JMAP connecting to {} as {} [auth=basic password_len={}]",
+                base_url,
+                config.username,
+                config.password.len(),
+            ),
         }
 
         let http = reqwest::Client::builder()
@@ -568,6 +564,16 @@ impl JmapConnection {
     /// `is_full: false` so the caller knows to reconcile deletions
     /// using `destroyed` rather than the full-server-set comparison
     /// the initial-sync path needs.
+    ///
+    /// `Email/changes` caps each response at `maxChanges` and sets
+    /// `hasMoreChanges: true` when there is more to fetch. We loop,
+    /// advancing `sinceState` to the previous response's `newState`,
+    /// until the server reports no more. Without the loop a mailbox
+    /// that accumulated more than one page of changes between syncs
+    /// would silently drop created/updated/destroyed entries past the
+    /// first page even though state would advance to the end. A hard
+    /// cap on iterations prevents an infinite loop if a server keeps
+    /// reporting `hasMoreChanges` without advancing state.
     async fn fetch_email_changes(
         &self,
         config: &JmapConfig,
@@ -575,75 +581,108 @@ impl JmapConnection {
     ) -> Result<JmapFetchResult> {
         log::debug!("JMAP Email/changes since state={}", since_state);
 
-        let request = serde_json::json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                ["Email/changes", {
-                    "accountId": self.account_id,
-                    "sinceState": since_state,
-                    "maxChanges": 5000
-                }, "c1"],
-                ["Email/get", {
-                    "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/created" },
-                    "accountId": self.account_id,
-                    "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
-                                   "size", "keywords", "messageId", "inReplyTo",
-                                   "references", "hasAttachment", "preview", "mailboxIds"]
-                }, "g1"],
-                // Fetch full envelope properties for updated emails too,
-                // not just id+keywords: a message can appear in "updated"
-                // because its mailboxIds changed (moved into this folder),
-                // in which case the caller needs to insert it as a new
-                // row with the real subject/from/date, not an empty one.
-                ["Email/get", {
-                    "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/updated" },
-                    "accountId": self.account_id,
-                    "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
-                                   "size", "keywords", "messageId", "inReplyTo",
-                                   "references", "hasAttachment", "preview", "mailboxIds"]
-                }, "g2"]
-            ]
-        });
-
-        let resp = self.api_request(&request, config).await?;
-
-        // Surface server errors (cannotCalculateChanges, invalidArguments, …)
-        // so the caller can decide whether to fall back to a full sync.
-        if let Some(err_type) = resp["methodResponses"][0][1]["type"].as_str() {
-            return Err(Error::Other(format!("Email/changes error: {}", err_type)));
-        }
-
-        let changes = &resp["methodResponses"][0][1];
-        let new_state = changes["newState"].as_str().unwrap_or("").to_string();
-        let destroyed: Vec<String> = changes["destroyed"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        const MAX_CHANGES_PER_PAGE: u64 = 5000;
+        // 100 * 5000 = 500k changes per sync, far beyond anything a
+        // real mailbox produces between polls. If we hit this the
+        // server is misbehaving — bail to a full re-sync.
+        const MAX_PAGES: usize = 100;
 
         let mut emails = Vec::new();
-        for list_idx in [1usize, 2] {
-            if let Some(arr) = resp["methodResponses"][list_idx][1]["list"].as_array() {
-                for e in arr {
-                    emails.push(self.parse_jmap_email(e));
+        let mut destroyed: Vec<String> = Vec::new();
+        let mut cursor = since_state.to_string();
+        let final_state: String;
+        let mut pages = 0usize;
+
+        loop {
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/changes", {
+                        "accountId": self.account_id,
+                        "sinceState": cursor,
+                        "maxChanges": MAX_CHANGES_PER_PAGE
+                    }, "c1"],
+                    ["Email/get", {
+                        "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/created" },
+                        "accountId": self.account_id,
+                        "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
+                                       "size", "keywords", "messageId", "inReplyTo",
+                                       "references", "hasAttachment", "preview", "mailboxIds"]
+                    }, "g1"],
+                    // Fetch full envelope properties for updated emails too,
+                    // not just id+keywords: a message can appear in "updated"
+                    // because its mailboxIds changed (moved into this folder),
+                    // in which case the caller needs to insert it as a new
+                    // row with the real subject/from/date, not an empty one.
+                    ["Email/get", {
+                        "#ids": { "resultOf": "c1", "name": "Email/changes", "path": "/updated" },
+                        "accountId": self.account_id,
+                        "properties": ["id", "subject", "from", "to", "cc", "receivedAt",
+                                       "size", "keywords", "messageId", "inReplyTo",
+                                       "references", "hasAttachment", "preview", "mailboxIds"]
+                    }, "g2"]
+                ]
+            });
+
+            let resp = self.api_request(&request, config).await?;
+
+            // Surface server errors (cannotCalculateChanges, invalidArguments, …)
+            // so the caller can decide whether to fall back to a full sync.
+            if let Some(err_type) = resp["methodResponses"][0][1]["type"].as_str() {
+                return Err(Error::Other(format!("Email/changes error: {}", err_type)));
+            }
+
+            let changes = &resp["methodResponses"][0][1];
+            let new_state = changes["newState"].as_str().unwrap_or("").to_string();
+            let has_more = changes["hasMoreChanges"].as_bool().unwrap_or(false);
+
+            if let Some(arr) = changes["destroyed"].as_array() {
+                destroyed.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+
+            for list_idx in [1usize, 2] {
+                if let Some(arr) = resp["methodResponses"][list_idx][1]["list"].as_array() {
+                    for e in arr {
+                        emails.push(self.parse_jmap_email(e));
+                    }
                 }
             }
+
+            if !has_more {
+                final_state = new_state;
+                break;
+            }
+
+            pages += 1;
+            if pages >= MAX_PAGES {
+                return Err(Error::Other(format!(
+                    "Email/changes exceeded {} pages without finishing; falling back to full sync",
+                    MAX_PAGES
+                )));
+            }
+
+            // Guard against a server that returns hasMoreChanges: true
+            // without advancing state — would loop forever otherwise.
+            if new_state == cursor {
+                return Err(Error::Other(
+                    "Email/changes returned hasMoreChanges but newState == sinceState".into(),
+                ));
+            }
+            cursor = new_state;
         }
 
         log::info!(
-            "JMAP delta: {} created/updated, {} destroyed (newState={})",
+            "JMAP delta: {} created/updated, {} destroyed (pages={}, newState={})",
             emails.len(),
             destroyed.len(),
-            new_state
+            pages + 1,
+            final_state
         );
 
         Ok(JmapFetchResult {
             emails,
             destroyed,
-            state: new_state,
+            state: final_state,
             is_full: false,
         })
     }

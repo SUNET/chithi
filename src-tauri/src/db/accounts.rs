@@ -479,19 +479,43 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
                        AND b.enabled = 1
                      LIMIT 1),
                     ''
-                ) AS meet_protocol
+                ) AS meet_protocol,
+                -- JMAP binding's config_json, used to recover the
+                -- Fastmail provider tag from the saved URL. Empty for
+                -- non-JMAP accounts. See get_account_full for the
+                -- equivalent full-account recovery path.
+                COALESCE(
+                    (SELECT b.config_json FROM service_bindings b
+                     WHERE b.account_id = a.id
+                       AND b.service = 'mail'
+                       AND b.protocol = 'jmap'
+                     LIMIT 1),
+                    ''
+                ) AS jmap_config_json
          FROM accounts a
          ORDER BY a.display_name",
     )?;
     let accounts = stmt
         .query_map([], |row| {
             let auth_method: String = row.get(3)?;
+            let jmap_config_json: String = row.get(13)?;
             let provider = match auth_method.as_str() {
-                "oauth-google" => "gmail",
-                "oauth-microsoft" => "o365",
-                _ => "generic",
-            }
-            .to_string();
+                "oauth-google" => "gmail".to_string(),
+                "oauth-microsoft" => "o365".to_string(),
+                _ => {
+                    // Fastmail accounts save via the dedicated tab but
+                    // share the password-based auth_method bucket, so
+                    // the only place the provider lives at read time is
+                    // the JMAP binding's URL. Substring match (not full
+                    // JSON parse) is enough — "api.fastmail.com" only
+                    // appears in the url field of the binding config.
+                    if jmap_config_json.contains("api.fastmail.com") {
+                        "fastmail".to_string()
+                    } else {
+                        "generic".to_string()
+                    }
+                }
+            };
             Ok(Account {
                 id: row.get(0)?,
                 display_name: row.get(1)?,
@@ -900,6 +924,38 @@ mod tests {
             "Graph accounts must fall back to the O365 SMTP relay for sending"
         );
         assert_eq!(full.smtp_port, 587);
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: the settings list view reads `Account` rows via
+    /// `list_accounts`, which derives `provider` from the Phase-2
+    /// `auth_method` column. That column collapses Fastmail (password
+    /// auth, no OAuth) to the same bucket as generic JMAP, so before
+    /// this query was widened the FASTMAIL chip in SettingsView.vue
+    /// would never trigger — Fastmail accounts displayed as
+    /// JMAP/GENERIC despite the UI branch existing. The query now
+    /// also pulls the JMAP binding's config_json and tags providers
+    /// matching `api.fastmail.com` as "fastmail".
+    #[test]
+    fn test_list_accounts_recovers_fastmail_provider_from_url() {
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.provider = "fastmail".to_string();
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+
+        let accounts = list_accounts(&conn).unwrap();
+        let fm = accounts
+            .iter()
+            .find(|a| a.id == id)
+            .expect("inserted account must appear in list");
+        assert_eq!(fm.provider, "fastmail");
+        assert_eq!(fm.mail_protocol, "jmap");
         crate::keyring::delete_password(&id).ok();
     }
 
