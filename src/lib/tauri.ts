@@ -138,6 +138,18 @@ export async function saveAttachment(
   });
 }
 
+export async function saveMessageAsEml(
+  accountId: string,
+  messageId: string,
+  suggestedFilename: string,
+): Promise<void> {
+  return invoke("save_message_as_eml", {
+    accountId,
+    messageId,
+    suggestedFilename,
+  });
+}
+
 export async function syncFolder(
   accountId: string,
   folderPath: string,

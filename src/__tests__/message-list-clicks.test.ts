@@ -22,6 +22,7 @@ vi.mock("@/lib/tauri", () => ({
   triggerSync: vi.fn().mockResolvedValue(undefined),
   backfillThreads: vi.fn().mockResolvedValue(0),
   prefetchBodies: vi.fn().mockResolvedValue(0),
+  saveMessageAsEml: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -161,5 +162,35 @@ describe("MessageList click handling", () => {
     const wrapper = mount(MessageList, { global: { plugins: [router] } });
     const row = wrapper.find(".message-row");
     expect(row.element.tagName).toBe("DIV");
+  });
+
+  it("Save as .eml context-menu item invokes the backend with the default filename", async () => {
+    setupStores();
+    const wrapper = mount(MessageList, {
+      attachTo: document.body,
+      global: { plugins: [router] },
+    });
+
+    // Right-click first row to open the context menu (single-selection).
+    const rows = wrapper.findAll(".message-row");
+    await rows[0].trigger("contextmenu");
+    await wrapper.vm.$nextTick();
+
+    // The menu is rendered via `<Teleport to="body">` so it lives outside the
+    // component's mount root — query the document directly.
+    const api = await import("@/lib/tauri");
+    const saveBtn = document.querySelector<HTMLElement>('[data-testid="ctx-save-eml"]');
+    expect(saveBtn).not.toBeNull();
+    saveBtn!.click();
+    await wrapper.vm.$nextTick();
+
+    expect(api.saveMessageAsEml).toHaveBeenCalledTimes(1);
+    const args = (api.saveMessageAsEml as any).mock.calls[0];
+    expect(args[0]).toBe("acc1");
+    expect(args[1]).toBe("msg1");
+    // Default filename — user can rename in the native save dialog.
+    expect(args[2]).toBe("message.eml");
+
+    wrapper.unmount();
   });
 });

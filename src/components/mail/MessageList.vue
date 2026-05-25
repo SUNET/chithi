@@ -381,6 +381,20 @@ const hasReadSelected = () => {
   return false;
 };
 
+async function ctxSaveAsEml() {
+  const msgId = contextMenu.value?.messageId;
+  const accountId = accountsStore.activeAccountId;
+  closeContextMenu();
+  if (!msgId || !accountId) return;
+  try {
+    await api.saveMessageAsEml(accountId, msgId, "message.eml");
+  } catch (e) {
+    console.error("Save as .eml failed:", e);
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Save as .eml failed: ${msg}`, "error");
+  }
+}
+
 function ctxShowAsThread() {
   if (contextMenu.value) {
     messagesStore.showAsThread(contextMenu.value.messageId);
@@ -762,6 +776,10 @@ function resolveFolderName(path: string): string {
           <button class="ctx-item" data-testid="ctx-forward" @click="ctxForward">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7" /><path d="M4 18v-2a4 4 0 0 1 4-4h12" /></svg>
             Forward
+          </button>
+          <button class="ctx-item" data-testid="ctx-save-eml" @click="ctxSaveAsEml">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
+            Save as .eml…
           </button>
           <div class="ctx-separator"></div>
         </template>
