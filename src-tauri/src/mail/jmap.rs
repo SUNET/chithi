@@ -599,7 +599,11 @@ impl JmapConnection {
                 "methodCalls": [
                     ["Email/changes", {
                         "accountId": self.account_id,
-                        "sinceState": cursor,
+                        // Pass as &str (not the owned String) so the json!
+                        // macro's Value::from path borrows cleanly and
+                        // `cursor` stays available for the hasMoreChanges
+                        // comparison + reassignment after the request.
+                        "sinceState": cursor.as_str(),
                         "maxChanges": MAX_CHANGES_PER_PAGE
                     }, "c1"],
                     ["Email/get", {

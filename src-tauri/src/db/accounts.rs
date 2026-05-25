@@ -619,8 +619,11 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
 
 pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
     // Store real passwords in system keyring; skip OIDC accounts and oauth2 migration markers.
-    // Trim for bearer mode so a paste-with-trailing-newline doesn't poison
-    // the Authorization header on every subsequent request.
+    // For bearer mode the value is trimmed (so a paste-with-trailing-newline
+    // doesn't poison the Authorization header), AND the post-trim emptiness
+    // is checked separately so a whitespace-only field is treated like
+    // "leave empty" — otherwise the user could nuke the keyring token by
+    // pasting blank lines into the API-token input.
     if !config.password.is_empty()
         && config.jmap_auth_method != "oidc"
         && !config.password.starts_with("oauth2:")
@@ -630,7 +633,9 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         } else {
             config.password.as_str()
         };
-        crate::keyring::set_password(id, secret)?;
+        if !secret.is_empty() {
+            crate::keyring::set_password(id, secret)?;
+        }
     }
 
     let auth_method =
@@ -701,7 +706,9 @@ fn config_to_legacy_fields<'a>(
 
 pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Result<()> {
     // Only update keyring if a real password was provided; skip OIDC accounts and oauth2 markers.
-    // Trim for bearer mode (see insert_account for context).
+    // Trim + post-trim empty check for bearer (see insert_account for the
+    // full rationale — whitespace-only must round-trip to "no change",
+    // not "clobber the existing token").
     if !config.password.is_empty()
         && config.jmap_auth_method != "oidc"
         && !config.password.starts_with("oauth2:")
@@ -711,7 +718,9 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         } else {
             config.password.as_str()
         };
-        crate::keyring::set_password(id, secret)?;
+        if !secret.is_empty() {
+            crate::keyring::set_password(id, secret)?;
+        }
     }
 
     let auth_method =
@@ -924,6 +933,51 @@ mod tests {
             "Graph accounts must fall back to the O365 SMTP relay for sending"
         );
         assert_eq!(full.smtp_port, 587);
+        crate::keyring::delete_password(&id).ok();
+    }
+
+    /// Regression: a whitespace-only API token (e.g. user pasted blank
+    /// lines into the edit form) must not overwrite the existing
+    /// keyring entry. The original guard only checked
+    /// `!config.password.is_empty()`, so " \n" got past the gate, then
+    /// trim() reduced it to "" and the keyring write clobbered the
+    /// real token. apply_auth would then send `Bearer ` (empty value)
+    /// on every request. The trimmed-emptiness check inside the gate
+    /// makes whitespace-only input behave like "leave empty".
+    #[test]
+    fn test_update_account_whitespace_only_bearer_token_preserves_keyring() {
+        let conn = setup_db();
+        let id = unique_id();
+
+        // 1. Create the account with a real token.
+        let mut config = make_config("kushal@fastmail.com", "Kushal");
+        config.provider = "fastmail".to_string();
+        config.mail_protocol = "jmap".to_string();
+        config.jmap_url = "https://api.fastmail.com".to_string();
+        config.jmap_auth_method = "bearer".to_string();
+        config.password = "fmu1-real-token".to_string();
+        config.imap_host = String::new();
+        config.smtp_host = String::new();
+        insert_account(&conn, &id, &config).unwrap();
+        assert_eq!(
+            crate::keyring::get_password(&id).unwrap().as_deref(),
+            Some("fmu1-real-token"),
+            "setup precondition: real token must be in keyring",
+        );
+
+        // 2. Simulate the user pasting only whitespace into the
+        //    "API token" field on the edit form and saving.
+        let mut whitespace_update = config.clone();
+        whitespace_update.password = "   \n\t  ".to_string();
+        update_account(&conn, &id, &whitespace_update).unwrap();
+
+        // 3. Keyring must still hold the original token — the
+        //    whitespace-only paste should round-trip as "no change".
+        assert_eq!(
+            crate::keyring::get_password(&id).unwrap().as_deref(),
+            Some("fmu1-real-token"),
+            "whitespace-only bearer input must NOT overwrite the keyring entry",
+        );
         crate::keyring::delete_password(&id).ok();
     }
 

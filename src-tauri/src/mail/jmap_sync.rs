@@ -210,9 +210,16 @@ async fn sync_jmap_folder(
         is_full,
     } = fetch;
 
-    if emails.is_empty() && destroyed.is_empty() {
-        // Persist the new state even on a no-op delta so the next sync
-        // doesn't re-replay the same window of changes.
+    // Delta path only: an empty result with no destroyed IDs is a true
+    // no-op — persist the advanced state and skip the rest.
+    //
+    // Full path must NOT take this early return even when emails is
+    // empty: the deletion reconciliation below compares the server set
+    // against local rows, and a server-side empty mailbox means every
+    // local row is stale. Returning here would leave those orphans
+    // behind on first-sync-after-purge or after a state-expiry
+    // fallback that returns 0 messages.
+    if !is_full && emails.is_empty() && destroyed.is_empty() {
         if !new_state.is_empty() {
             let conn = db.writer().await;
             db::folders::update_jmap_state(&conn, account_id, mailbox_id, &new_state)?;

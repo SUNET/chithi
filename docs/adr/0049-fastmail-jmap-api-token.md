@@ -144,7 +144,10 @@ the heuristic.
 - ADR 0010 — Account type selection.
 - ADR 0011 — System keyring for passwords.
 - ADR 0020 — JMAP EventSource push notifications.
-- `docs/jmap-fastmail.md` — user-facing setup walkthrough.
 - `src-tauri/src/mail/jmap.rs` — `JmapConfig::from_account`,
-  `apply_auth`, `rewrite_url`, `is_internal_url`.
+  `apply_auth`, `rewrite_url`, `is_internal_url`,
+  `fetch_email_changes`.
+- `src-tauri/src/db/accounts.rs` —
+  `populate_legacy_from_bindings`, `list_accounts`
+  (Fastmail provider recovery from the JMAP binding URL).
 - `src/views/SettingsView.vue` — Fastmail tab and edit-load detection.
