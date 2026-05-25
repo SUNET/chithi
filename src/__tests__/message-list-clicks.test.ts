@@ -22,6 +22,7 @@ vi.mock("@/lib/tauri", () => ({
   triggerSync: vi.fn().mockResolvedValue(undefined),
   backfillThreads: vi.fn().mockResolvedValue(0),
   prefetchBodies: vi.fn().mockResolvedValue(0),
+  saveMessageAsEml: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -161,5 +162,40 @@ describe("MessageList click handling", () => {
     const wrapper = mount(MessageList, { global: { plugins: [router] } });
     const row = wrapper.find(".message-row");
     expect(row.element.tagName).toBe("DIV");
+  });
+
+  it("Save as .eml context-menu item invokes the backend with sanitized filename", async () => {
+    const store = setupStores();
+    // Subject containing characters illegal on Windows ("/", ":") plus a
+    // path separator, to verify the renderer-side sanitizer doesn't leak
+    // them into the suggested filename — and that the ".eml" suffix is
+    // appended exactly once.
+    store.messages[0] = { ...store.messages[0], subject: "Re: Project/Update " };
+    const wrapper = mount(MessageList, {
+      attachTo: document.body,
+      global: { plugins: [router] },
+    });
+
+    // Right-click first row to open the context menu (single-selection).
+    const rows = wrapper.findAll(".message-row");
+    await rows[0].trigger("contextmenu");
+    await wrapper.vm.$nextTick();
+
+    // The menu is rendered via `<Teleport to="body">` so it lives outside the
+    // component's mount root — query the document directly.
+    const api = await import("@/lib/tauri");
+    const saveBtn = document.querySelector<HTMLElement>('[data-testid="ctx-save-eml"]');
+    expect(saveBtn).not.toBeNull();
+    saveBtn!.click();
+    await wrapper.vm.$nextTick();
+
+    expect(api.saveMessageAsEml).toHaveBeenCalledTimes(1);
+    const args = (api.saveMessageAsEml as any).mock.calls[0];
+    expect(args[0]).toBe("acc1");
+    expect(args[1]).toBe("msg1");
+    // "/" and ":" must be replaced; trailing whitespace stripped; one ".eml".
+    expect(args[2]).toBe("Re_ Project_Update.eml");
+
+    wrapper.unmount();
   });
 });

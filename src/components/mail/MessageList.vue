@@ -381,6 +381,32 @@ const hasReadSelected = () => {
   return false;
 };
 
+function sanitizeFilename(name: string): string {
+  // Strip path separators, control chars, and chars that are illegal on
+  // Windows/macOS so the suggested filename works cross-platform.
+  const cleaned = name.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").trim();
+  // Avoid a leading dot (hidden file) and bound the length so the dialog
+  // remains usable on file systems with name-length limits.
+  const noDot = cleaned.replace(/^\.+/, "");
+  return noDot.slice(0, 200) || "message";
+}
+
+async function ctxSaveAsEml() {
+  const msgId = contextMenu.value?.messageId;
+  const accountId = accountsStore.activeAccountId;
+  closeContextMenu();
+  if (!msgId || !accountId) return;
+  const summary = messagesStore.messages.find(m => m.id === msgId);
+  const base = sanitizeFilename(summary?.subject || "message");
+  const suggested = base.toLowerCase().endsWith(".eml") ? base : `${base}.eml`;
+  try {
+    await api.saveMessageAsEml(accountId, msgId, suggested);
+  } catch (e) {
+    console.error("Save as .eml failed:", e);
+    showToast(`Save as .eml failed: ${e}`, "error");
+  }
+}
+
 function ctxShowAsThread() {
   if (contextMenu.value) {
     messagesStore.showAsThread(contextMenu.value.messageId);
@@ -762,6 +788,10 @@ function resolveFolderName(path: string): string {
           <button class="ctx-item" data-testid="ctx-forward" @click="ctxForward">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7" /><path d="M4 18v-2a4 4 0 0 1 4-4h12" /></svg>
             Forward
+          </button>
+          <button class="ctx-item" data-testid="ctx-save-eml" @click="ctxSaveAsEml">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
+            Save as .eml…
           </button>
           <div class="ctx-separator"></div>
         </template>

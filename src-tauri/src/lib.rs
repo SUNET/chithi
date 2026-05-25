@@ -59,6 +59,7 @@ pub fn run() {
             commands::mail::create_folder,
             commands::mail::delete_folder,
             commands::mail::save_attachment,
+            commands::mail::save_message_as_eml,
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::sync_folder,
             commands::sync_cmd::get_sync_status,

@@ -271,6 +271,146 @@ pub async fn import_search_hit(
     Ok(id)
 }
 
+/// Ensure the raw RFC822 body for `message_id` is on disk and return the
+/// relative maildir path that resolves under `state.data_dir`. If the body
+/// hasn't been downloaded yet (empty or legacy `graph:` prefix), fetches it
+/// on-demand from the appropriate backend (Graph / JMAP / IMAP).
+async fn ensure_message_body_on_disk(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    account_id: &str,
+    message_id: &str,
+    maildir_path: &str,
+    flags_json: &str,
+) -> Result<String> {
+    if !maildir_path.is_empty() && !maildir_path.starts_with("graph:") {
+        return Ok(maildir_path.to_string());
+    }
+
+    let (account, folder_path, uid) = {
+        let conn = state.db.reader();
+        let account = db::accounts::get_account_full(&conn, account_id)?;
+        let (fp, u) = db::messages::get_folder_and_uid(&conn, message_id)?;
+        (account, fp, u)
+    };
+
+    let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
+    let data_dir = state.data_dir.clone();
+
+    let relative_path = if account.mail_protocol_str() == "graph" {
+        log::info!("Body not on disk for {}, streaming from Graph", message_id);
+
+        let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
+            gid.to_string()
+        } else {
+            message_id
+                .strip_prefix(&format!("{}_", account_id))
+                .unwrap_or(message_id)
+                .to_string()
+        };
+
+        let token = crate::mail::graph::get_graph_token(account_id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+
+        let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
+        let maildir_base = data_dir.join(account_id).join(&folder_dir);
+        crate::mail::sync::create_maildir_dirs(&maildir_base)?;
+
+        let filename = format!(
+            "{}:2,{}",
+            graph_msg_id,
+            crate::mail::sync::flags_to_maildir_suffix(&flags)
+        );
+        let msg_path = maildir_base.join("cur").join(&filename);
+
+        let bytes_written = client
+            .download_mime_to_file(&graph_msg_id, &msg_path)
+            .await?;
+        let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
+        log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
+        rp
+    } else if account.mail_protocol_str() == "jmap" {
+        log::info!("Body not on disk for {}, fetching from JMAP", message_id);
+
+        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+
+        let jmap_email_id = message_id
+            .strip_prefix(&format!("{}_{}_", account_id, folder_path))
+            .unwrap_or(message_id);
+
+        jmap_sync::fetch_and_store_jmap_body(
+            &jmap_config,
+            &data_dir,
+            account_id,
+            &folder_path,
+            jmap_email_id,
+            &flags,
+        )
+        .await?
+    } else {
+        log::info!("Body not on disk for {}, fetching from IMAP", message_id);
+
+        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
+            suspend_imap_idle_for_account(state, account_id).await?
+        } else {
+            false
+        };
+        let resume_account = account.clone();
+
+        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
+            let tokens = crate::oauth::load_tokens(account_id)?
+                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+            let refresh = tokens
+                .refresh_token
+                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+            let new = crate::oauth::refresh_with_scopes(
+                &crate::oauth::MICROSOFT,
+                &refresh,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            )
+            .await?;
+            crate::oauth::store_tokens(account_id, &new)?;
+            (new.access_token, true)
+        } else {
+            (account.password, false)
+        };
+
+        let imap_config = ImapConfig {
+            host: account.imap_host,
+            port: account.imap_port,
+            username: account.username,
+            password,
+            use_tls: account.use_tls,
+            use_xoauth2,
+        };
+
+        let account_id_clone = account_id.to_string();
+        let relative_path = tokio::task::spawn_blocking(move || {
+            mail_sync::fetch_and_store_body(
+                &imap_config,
+                &data_dir,
+                &account_id_clone,
+                &folder_path,
+                uid,
+                &flags,
+            )
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??;
+
+        resume_imap_idle_for_account(app, state, &resume_account, suspended_idle).await?;
+
+        relative_path
+    };
+
+    {
+        let conn = state.db.writer().await;
+        db::messages::update_maildir_path(&conn, message_id, &relative_path)?;
+    }
+
+    Ok(relative_path)
+}
+
 #[tauri::command]
 pub async fn get_message_body(
     app: tauri::AppHandle,
@@ -285,139 +425,15 @@ pub async fn get_message_body(
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?
     };
 
-    // If body hasn't been downloaded yet (empty or legacy `graph:` prefix), fetch on-demand
-    let actual_maildir_path = if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
-        // Get account config and message details
-        let (account, folder_path, uid) = {
-            let conn = state.db.reader();
-            let account = db::accounts::get_account_full(&conn, &account_id)?;
-            let (fp, u) = db::messages::get_folder_and_uid(&conn, &message_id)?;
-            (account, fp, u)
-        };
-
-        let flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
-        let data_dir = state.data_dir.clone();
-
-        let relative_path = if account.mail_protocol_str() == "graph" {
-            // Graph: stream raw MIME to disk via GET /me/messages/{id}/$value
-            log::info!("Body not on disk for {}, streaming from Graph", message_id);
-
-            let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
-                gid.to_string()
-            } else {
-                message_id
-                    .strip_prefix(&format!("{}_", account_id))
-                    .unwrap_or(&message_id)
-                    .to_string()
-            };
-
-            let token = crate::mail::graph::get_graph_token(&account_id).await?;
-            let client = crate::mail::graph::GraphClient::new(&token);
-
-            let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
-            let maildir_base = data_dir.join(&account_id).join(&folder_dir);
-            crate::mail::sync::create_maildir_dirs(&maildir_base)?;
-
-            let filename = format!(
-                "{}:2,{}",
-                graph_msg_id,
-                crate::mail::sync::flags_to_maildir_suffix(&flags)
-            );
-            let msg_path = maildir_base.join("cur").join(&filename);
-
-            let bytes_written = client
-                .download_mime_to_file(&graph_msg_id, &msg_path)
-                .await?;
-            let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
-            log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
-            rp
-        } else if account.mail_protocol_str() == "jmap" {
-            log::info!("Body not on disk for {}, fetching from JMAP", message_id);
-
-            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
-
-            // Extract the JMAP email ID from our composite message ID
-            // Format: {account_id}_{folder_path}_{jmap_email_id}
-            let jmap_email_id = message_id
-                .strip_prefix(&format!("{}_{}_", account_id, folder_path))
-                .unwrap_or(&message_id);
-
-            jmap_sync::fetch_and_store_jmap_body(
-                &jmap_config,
-                &data_dir,
-                &account_id,
-                &folder_path,
-                jmap_email_id,
-                &flags,
-            )
-            .await?
-        } else {
-            log::info!("Body not on disk for {}, fetching from IMAP", message_id);
-
-            let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
-                suspend_imap_idle_for_account(&state, &account_id).await?
-            } else {
-                false
-            };
-            let resume_account = account.clone();
-
-            // For O365, refresh IMAP-scoped token for XOAUTH2
-            let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-                let tokens = crate::oauth::load_tokens(&account_id)?
-                    .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-                let refresh = tokens
-                    .refresh_token
-                    .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-                let new = crate::oauth::refresh_with_scopes(
-                    &crate::oauth::MICROSOFT,
-                    &refresh,
-                    crate::oauth::MICROSOFT_IMAP_SCOPES,
-                )
-                .await?;
-                crate::oauth::store_tokens(&account_id, &new)?;
-                (new.access_token, true)
-            } else {
-                (account.password, false)
-            };
-
-            let imap_config = ImapConfig {
-                host: account.imap_host,
-                port: account.imap_port,
-                username: account.username,
-                password,
-                use_tls: account.use_tls,
-                use_xoauth2,
-            };
-
-            let account_id_clone = account_id.clone();
-            let relative_path = tokio::task::spawn_blocking(move || {
-                mail_sync::fetch_and_store_body(
-                    &imap_config,
-                    &data_dir,
-                    &account_id_clone,
-                    &folder_path,
-                    uid,
-                    &flags,
-                )
-            })
-            .await
-            .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??;
-
-            resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
-
-            relative_path
-        };
-
-        // Update the maildir_path in the database
-        {
-            let conn = state.db.writer().await;
-            db::messages::update_maildir_path(&conn, &message_id, &relative_path)?;
-        }
-
-        relative_path
-    } else {
-        maildir_path
-    };
+    let actual_maildir_path = ensure_message_body_on_disk(
+        &app,
+        &state,
+        &account_id,
+        &message_id,
+        &maildir_path,
+        &flags_json,
+    )
+    .await?;
 
     // Read and parse the message from disk
     let full_path = crate::path_validation::resolve_under(&state.data_dir, &actual_maildir_path)?;
@@ -931,16 +947,29 @@ pub async fn save_attachment(
 
     let contents = attachment.contents().to_vec();
 
-    // Open the native save dialog from the backend (renderer cannot bypass).
-    // We use the non-blocking callback API and await a oneshot rather than
-    // `blocking_save_file()` because blocking the tokio worker that invoked
-    // this command starves the GTK main thread on Linux, which manifests as
-    // a dialog that opens but never renders its Save button.
+    prompt_save_and_write_bytes(&app, &suggested_filename, &contents, "attachment").await
+}
+
+/// Open the native save-as dialog with `suggested_filename`, then atomically
+/// write `contents` to the user-chosen path (refusing symlinks, temp file +
+/// fsync + rename). Returns `Ok(())` if the user cancelled the dialog, since
+/// cancellation isn't an error from the caller's perspective.
+///
+/// The non-blocking callback API + oneshot is intentional: calling
+/// `blocking_save_file()` on the tokio worker that invoked the command
+/// starves the GTK main thread on Linux, which manifests as a dialog that
+/// opens but never renders its Save button.
+async fn prompt_save_and_write_bytes(
+    app: &tauri::AppHandle,
+    suggested_filename: &str,
+    contents: &[u8],
+    what: &str,
+) -> Result<()> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_file_name(&suggested_filename)
+        .set_file_name(suggested_filename)
         .save_file(move |path| {
             let _ = tx.send(path);
         });
@@ -951,14 +980,13 @@ pub async fn save_attachment(
 
     let dest = match dest {
         Some(path) => path,
-        None => return Ok(()), // user cancelled
+        None => return Ok(()),
     };
 
     let dest_path = dest
         .as_path()
         .ok_or_else(|| Error::Other("Invalid save path".to_string()))?;
 
-    // Refuse to follow symlinks
     if let Ok(metadata) = std::fs::symlink_metadata(dest_path) {
         if metadata.file_type().is_symlink() {
             return Err(Error::Other(
@@ -967,7 +995,6 @@ pub async fn save_attachment(
         }
     }
 
-    // Write atomically: temp file + fsync + rename
     let dest_dir = dest_path
         .parent()
         .ok_or_else(|| Error::Other("Save path must have a parent directory".to_string()))?;
@@ -999,13 +1026,13 @@ pub async fn save_attachment(
             .open(&temp_path)
             .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
 
-        if let Err(e) = file.write_all(&contents) {
+        if let Err(e) = file.write_all(contents) {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+            return Err(Error::Other(format!("Failed to write {}: {}", what, e)));
         }
         if let Err(e) = file.sync_all() {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to flush attachment: {}", e)));
+            return Err(Error::Other(format!("Failed to flush {}: {}", what, e)));
         }
         drop(file);
 
@@ -1014,7 +1041,6 @@ pub async fn save_attachment(
             return Err(Error::Other(format!("Failed to rename temp file: {}", e)));
         }
 
-        // Fsync parent directory for durability
         if let Ok(dir) = std::fs::File::open(dest_dir) {
             let _ = dir.sync_all();
         }
@@ -1030,17 +1056,16 @@ pub async fn save_attachment(
             .open(&temp_path)
             .map_err(|e| Error::Other(format!("Failed to create temp file: {}", e)))?;
 
-        if let Err(e) = file.write_all(&contents) {
+        if let Err(e) = file.write_all(contents) {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to write attachment: {}", e)));
+            return Err(Error::Other(format!("Failed to write {}: {}", what, e)));
         }
         if let Err(e) = file.sync_all() {
             let _ = std::fs::remove_file(&temp_path);
-            return Err(Error::Other(format!("Failed to flush attachment: {}", e)));
+            return Err(Error::Other(format!("Failed to flush {}: {}", what, e)));
         }
         drop(file);
 
-        // On Windows, rename fails if dest exists. Remove it first.
         if dest_path.exists() {
             let _ = std::fs::remove_file(dest_path);
         }
@@ -1050,8 +1075,44 @@ pub async fn save_attachment(
         }
     }
 
-    log::info!("Attachment saved to {}", dest_path.display());
+    log::info!("{} saved to {}", what, dest_path.display());
     Ok(())
+}
+
+/// Save a message's raw RFC822 (.eml) bytes to a user-chosen path. Fetches
+/// the body on-demand if it isn't on disk yet, then opens the native save
+/// dialog. `suggested_filename` is provided by the caller (typically derived
+/// from the subject).
+#[tauri::command]
+pub async fn save_message_as_eml(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+    suggested_filename: String,
+) -> Result<()> {
+    log::info!("Saving message {} as .eml", message_id);
+
+    let (maildir_path, _, _, _, flags_json, _, _) = {
+        let conn = state.db.reader();
+        db::messages::get_message_metadata(&conn, &account_id, &message_id)?
+    };
+
+    let actual_maildir_path = ensure_message_body_on_disk(
+        &app,
+        &state,
+        &account_id,
+        &message_id,
+        &maildir_path,
+        &flags_json,
+    )
+    .await?;
+
+    let full_path = crate::path_validation::resolve_under(&state.data_dir, &actual_maildir_path)?;
+    let raw = std::fs::read(&full_path)
+        .map_err(|e| Error::Other(format!("Failed to read message file: {}", e)))?;
+
+    prompt_save_and_write_bytes(&app, &suggested_filename, &raw, "message").await
 }
 
 #[cfg(test)]
