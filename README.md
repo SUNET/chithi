@@ -70,6 +70,9 @@ sudo dnf install -y \
   libappindicator-gtk3-devel \
   librsvg2-devel \
   curl \
+  cargo \
+  pnpm \
+  pcsc-lite-devel \
   wget
 ```
 
