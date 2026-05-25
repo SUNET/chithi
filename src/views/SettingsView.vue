@@ -29,6 +29,8 @@ function accountTypeLabelLong(t: AccountType): string {
       return "Gmail";
     case "o365":
       return "Microsoft 365";
+    case "fastmail":
+      return "Fastmail";
     case "talk":
       return "Nextcloud Talk";
     case "matrix":
@@ -49,6 +51,7 @@ function accountTypeLabel(acc: {
 }): string {
   if (acc.provider === "gmail") return "GMAIL";
   if (acc.provider === "o365") return "MICROSOFT 365";
+  if (acc.provider === "fastmail") return "FASTMAIL";
   if (acc.mail_protocol) return acc.mail_protocol.toUpperCase();
   // Standalone DAV accounts: name them by the user-visible service
   // they provide rather than the protocol acronym. "Calendar" and
@@ -262,6 +265,7 @@ type AccountType =
   | "gmail"
   | "imap"
   | "jmap"
+  | "fastmail"
   | "caldav"
   | "carddav"
   | "o365"
@@ -329,6 +333,26 @@ function selectAccountType(type: AccountType) {
       f.mail_protocol = "jmap";
       // Same logic: any IMAP host pre-filled by Gmail / O365 / a
       // previous IMAP click is irrelevant for JMAP, clear it.
+      if (!editingAccountId.value) {
+        f.imap_host = "";
+        f.imap_port = 0;
+        f.smtp_host = "";
+        f.smtp_port = 0;
+      }
+      f.use_tls = true;
+      break;
+    case "fastmail":
+      // Fastmail-specific JMAP. Hardcoded URL + bearer auth, no
+      // user-visible toggles — Fastmail's api.fastmail.com endpoint
+      // requires `Authorization: Bearer <api-token>` and rejects
+      // HTTP Basic. The Fastmail form asks only for email + API
+      // token. `provider = "fastmail"` is set so the list view shows
+      // a FASTMAIL chip, but openEditForm re-detects by URL since
+      // populate_legacy_from_bindings rewrites provider on read-back.
+      f.provider = "fastmail";
+      f.mail_protocol = "jmap";
+      f.jmap_url = "https://api.fastmail.com";
+      f.jmap_auth_method = "bearer";
       if (!editingAccountId.value) {
         f.imap_host = "";
         f.imap_port = 0;
@@ -432,7 +456,9 @@ function accountTypeDescription(t: AccountType): string {
     case "imap":
       return "Generic IMAP / SMTP mail account";
     case "jmap":
-      return "JMAP mail (e.g. Fastmail, Stalwart)";
+      return "JMAP mail (Stalwart, generic JMAP servers)";
+    case "fastmail":
+      return "Fastmail mail, calendar and contacts via JMAP API token";
     case "caldav":
       return "Standalone calendar via CalDAV";
     case "carddav":
@@ -486,6 +512,18 @@ async function openEditForm(id: string) {
           oauthStatus.value = null;
         }
       } catch { oauthStatus.value = null; }
+    } else if (
+      config.mail_protocol === "jmap"
+      && (config.provider === "fastmail"
+        || config.jmap_url.startsWith("https://api.fastmail.com"))
+    ) {
+      // Detect Fastmail accounts on edit-load: either provider was
+      // set by the Fastmail-tab save path, or the URL points at
+      // Fastmail's JMAP endpoint. populate_legacy_from_bindings
+      // rewrites provider to "generic" on read-back, so URL-based
+      // detection is the durable signal.
+      accountType.value = "fastmail";
+      oauthStatus.value = null;
     } else if (config.mail_protocol === "jmap") {
       accountType.value = "jmap";
       if (config.jmap_auth_method === "oidc") {
@@ -1157,7 +1195,7 @@ onMounted(() => {
           <p class="picker-help">Pick the kind of account you want to add. You can add more later.</p>
           <div class="picker-grid">
             <button
-              v-for="t in (['gmail', 'o365', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix', 'zoom'] as AccountType[])"
+              v-for="t in (['gmail', 'o365', 'fastmail', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix', 'zoom'] as AccountType[])"
               :key="t"
               class="picker-card"
               :data-testid="`picker-${t}`"
@@ -1311,12 +1349,13 @@ onMounted(() => {
               </span>
             </div>
             <div v-if="accountType !== 'o365' && !(accountType === 'jmap' && form.jmap_auth_method === 'oidc') && !isMeetTab" class="form-group">
-              <label>{{ accountType === 'gmail' ? 'App Password' : 'Password' }}</label>
+              <label>{{ accountType === 'fastmail' ? 'API token' : (accountType === 'gmail' ? 'App Password' : 'Password') }}</label>
               <PasswordInput
                 v-model="form.password"
-                :placeholder="editingAccountId ? 'Leave empty to keep current password' : (accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••')"
+                :placeholder="editingAccountId ? (accountType === 'fastmail' ? 'Leave empty to keep current token' : 'Leave empty to keep current password') : (accountType === 'fastmail' ? 'Paste your Fastmail API token' : (accountType === 'gmail' ? 'Gmail app password (for IMAP/SMTP)' : '••••••••'))"
               />
-              <span class="field-hint">Passwords are stored securely in your OS keyring</span>
+              <span v-if="accountType === 'fastmail'" class="field-hint">Generate at Fastmail Settings → Privacy &amp; Security → Manage API tokens. Stored in your OS keyring.</span>
+              <span v-else class="field-hint">Passwords are stored securely in your OS keyring</span>
             </div>
 
             <template v-if="accountType === 'gmail'">
@@ -1450,6 +1489,18 @@ onMounted(() => {
                   <span class="field-hint">Opens your browser to authenticate with your identity provider.</span>
                 </div>
               </template>
+            </template>
+
+            <!-- Fastmail tab: hardcoded JMAP URL + bearer auth, so the
+                 form only needs an info row. The API-token field is
+                 rendered above by the shared password block (which
+                 relabels itself when accountType === 'fastmail'). -->
+            <template v-if="accountType === 'fastmail'">
+              <div class="form-group">
+                <label>JMAP endpoint</label>
+                <div class="type-readonly">https://api.fastmail.com</div>
+                <span class="field-hint">Fastmail's JMAP API. Authentication uses Authorization: Bearer with the API token above.</span>
+              </div>
             </template>
 
             <!-- For standalone CalDAV / CardDAV the URL is the entire

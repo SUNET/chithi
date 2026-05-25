@@ -55,7 +55,10 @@ pub async fn run_push_loop(
     while !stop.load(Ordering::Relaxed) {
         // For OIDC accounts, refresh the access token before each connect attempt
         // so reconnects after token expiry don't keep using a stale token.
-        if config.access_token.is_some() {
+        // Bearer-mode accounts (Fastmail API tokens) also have access_token set
+        // but have no refresh endpoint — gate on a non-empty endpoint so we
+        // don't fire useless refresh attempts for them.
+        if config.access_token.is_some() && !config.oidc_token_endpoint.is_empty() {
             match crate::commands::sync_cmd::refresh_jmap_oidc_token(
                 &account_id,
                 &config.oidc_token_endpoint,

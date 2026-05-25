@@ -6,7 +6,7 @@ export interface Account {
   // for standalone CalDAV / CardDAV accounts whose `email` was never
   // set (older accounts created before the DAV-tab email back-fill).
   username: string;
-  provider: "generic" | "gmail" | "microsoft365" | "o365";
+  provider: "generic" | "gmail" | "microsoft365" | "o365" | "fastmail";
   // Empty string means "no mail binding" — calendar-only / contacts-only
   // accounts (#43). Existing screens that need a mail account should
   // filter these out.
@@ -196,7 +196,7 @@ export interface SyncStatus {
 export interface AccountConfig {
   display_name: string;
   email: string;
-  provider: "generic" | "gmail" | "microsoft365" | "o365";
+  provider: "generic" | "gmail" | "microsoft365" | "o365" | "fastmail";
   /// Empty string means "no mail binding" (CalDAV-only / CardDAV-only).
   mail_protocol: "" | "imap" | "jmap" | "graph";
   imap_host: string;
@@ -221,7 +221,7 @@ export interface AccountConfig {
   password: string;
   use_tls: boolean;
   signature: string;
-  jmap_auth_method: "basic" | "oidc";
+  jmap_auth_method: "basic" | "bearer" | "oidc";
   oidc_token_endpoint: string;
   oidc_client_id: string;
   /// Whether the calendar binding is enabled. Mirrors mail_sync_enabled

@@ -52,6 +52,12 @@ impl Default for ImapBindingConfig {
 pub struct JmapBindingConfig {
     #[serde(default)]
     pub url: String,
+    /// Mirror of `AccountFull::jmap_auth_method` so the
+    /// "basic" / "bearer" / "oidc" choice round-trips. Older bindings
+    /// written before bearer support land here as empty strings; the
+    /// reader treats empty as "basic" for back-compat.
+    #[serde(default, rename = "auth_method")]
+    pub auth_method: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

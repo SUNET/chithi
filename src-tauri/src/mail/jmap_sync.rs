@@ -200,12 +200,19 @@ async fn sync_jmap_folder(
         db::folders::get_jmap_state(&conn, account_id, mailbox_id)?
     };
 
-    let (emails, new_state) = conn_jmap
+    let fetch = conn_jmap
         .fetch_emails(jmap_config, mailbox_id, jmap_state.as_deref())
         .await?;
+    let crate::mail::jmap::JmapFetchResult {
+        emails,
+        destroyed,
+        state: new_state,
+        is_full,
+    } = fetch;
 
-    if emails.is_empty() {
-        // Still update the state so we don't re-fetch next time
+    if emails.is_empty() && destroyed.is_empty() {
+        // Persist the new state even on a no-op delta so the next sync
+        // doesn't re-replay the same window of changes.
         if !new_state.is_empty() {
             let conn = db.writer().await;
             db::folders::update_jmap_state(&conn, account_id, mailbox_id, &new_state)?;
@@ -213,11 +220,45 @@ async fn sync_jmap_folder(
         return Ok(0);
     }
 
+    // Delta sync returns account-wide changes (Email/changes is global),
+    // so filter to just the messages whose mailboxIds contain this folder.
+    // For messages that USED to be in this folder but no longer are (moved
+    // out), drop the local row. Full sync uses Email/query with an
+    // `inMailbox` filter, so its result set is already per-mailbox — skip
+    // the filtering in that case and trust the server.
+    let mut moved_out: Vec<String> = Vec::new();
+    let filtered_emails: Vec<&crate::mail::jmap::JmapEmail> = if is_full {
+        emails.iter().collect()
+    } else {
+        emails
+            .iter()
+            .filter(|e| {
+                if e.mailbox_ids.iter().any(|m| m == mailbox_id) {
+                    true
+                } else {
+                    // Email is no longer in this mailbox (or never was).
+                    // Schedule a delete of its row in this folder; the row
+                    // may not exist, in which case the DELETE is a no-op.
+                    moved_out.push(e.id.clone());
+                    false
+                }
+            })
+            .collect()
+    };
+
     log::info!(
-        "JMAP found {} new/updated emails in {} ({})",
-        emails.len(),
+        "JMAP found {} new/updated emails in {} ({}){}",
+        filtered_emails.len(),
         folder_name,
-        mailbox_id
+        mailbox_id,
+        if !is_full && filtered_emails.len() < emails.len() {
+            format!(
+                " ({} skipped — not in this mailbox)",
+                emails.len() - filtered_emails.len()
+            )
+        } else {
+            String::new()
+        },
     );
 
     let mut total_synced = 0u32;
@@ -226,7 +267,7 @@ async fn sync_jmap_folder(
     {
         let conn = db.writer().await;
 
-        for email in &emails {
+        for email in &filtered_emails {
             // Use the JMAP email ID as the unique identifier
             let id = format!("{}_{}_{}", account_id, mailbox_id, email.id);
 
@@ -300,35 +341,54 @@ async fn sync_jmap_folder(
     }
 
     // Remove local messages that no longer exist on the server.
-    // Build a set of JMAP email IDs from the server response.
-    let server_ids: std::collections::HashSet<String> =
-        emails.iter().map(|e| e.id.clone()).collect();
+    // Delta sync (Email/changes): server told us exactly which IDs were
+    // destroyed since the previous state — apply those.
+    // Full sync (initial / state-expired): server returned the complete
+    // current set, so any local row not in that set is stale.
     {
         let conn = db.writer().await;
-        // Get all local message IDs for this folder
-        let mut stmt = conn
-            .prepare("SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2")
-            .map_err(Error::Database)?;
-        let local_ids: Vec<String> = stmt
-            .query_map(rusqlite::params![account_id, mailbox_id], |row| row.get(0))
-            .map_err(Error::Database)?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let _prefix = format!("{}_{}_{}", account_id, mailbox_id, "");
         let mut deleted = 0u32;
-        for local_id in &local_ids {
-            // Extract the JMAP email ID from the composite local ID
-            let jmap_id = local_id
-                .strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
-                .unwrap_or(local_id);
-            if !server_ids.contains(jmap_id) {
-                conn.execute(
-                    "DELETE FROM messages WHERE id = ?1",
-                    rusqlite::params![local_id],
-                )
-                .ok();
-                deleted += 1;
+        if is_full {
+            let server_ids: std::collections::HashSet<String> =
+                emails.iter().map(|e| e.id.clone()).collect();
+            let mut stmt = conn
+                .prepare("SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2")
+                .map_err(Error::Database)?;
+            let local_ids: Vec<String> = stmt
+                .query_map(rusqlite::params![account_id, mailbox_id], |row| row.get(0))
+                .map_err(Error::Database)?
+                .filter_map(|r| r.ok())
+                .collect();
+            for local_id in &local_ids {
+                let jmap_id = local_id
+                    .strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
+                    .unwrap_or(local_id);
+                if !server_ids.contains(jmap_id) {
+                    conn.execute(
+                        "DELETE FROM messages WHERE id = ?1",
+                        rusqlite::params![local_id],
+                    )
+                    .ok();
+                    deleted += 1;
+                }
+            }
+        } else {
+            // Email/changes destroyed list: emails removed from the account.
+            // moved_out: emails still in the account but no longer in this
+            // mailbox. Both reduce to the same DB op (drop the per-folder
+            // composite row); apply them together.
+            for jmap_id in destroyed.iter().chain(moved_out.iter()) {
+                let composite = format!("{}_{}_{}", account_id, mailbox_id, jmap_id);
+                if conn
+                    .execute(
+                        "DELETE FROM messages WHERE id = ?1",
+                        rusqlite::params![composite],
+                    )
+                    .unwrap_or(0)
+                    > 0
+                {
+                    deleted += 1;
+                }
             }
         }
         if deleted > 0 {
