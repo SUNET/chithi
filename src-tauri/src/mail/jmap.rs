@@ -359,6 +359,31 @@ struct JmapSession {
     primary_accounts: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DeltaSyncFallbackReason {
+    CannotCalculateChanges,
+    InvalidArguments,
+    ExceededPageCap,
+    StalledState,
+}
+
+impl DeltaSyncFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CannotCalculateChanges => "cannotCalculateChanges",
+            Self::InvalidArguments => "invalidArguments",
+            Self::ExceededPageCap => "Email/changes exceeded page cap",
+            Self::StalledState => "Email/changes returned hasMoreChanges without state advance",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FetchEmailChangesError {
+    Fallback(DeltaSyncFallbackReason),
+    Fatal(Error),
+}
+
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
         // Fail fast if bearer/OIDC was selected but no access token
@@ -429,8 +454,8 @@ impl JmapConnection {
         // them. The auth mode comes from `auth_method` directly (not
         // inferred from `access_token.is_some()`, which would misreport
         // OIDC as "bearer"). Length is the post-trim credential the
-        // request will actually send, so basic shows password_len and
-        // bearer/oidc show token_len.
+        // request will actually send, and is logged uniformly as
+        // `credential_len` for all auth methods.
         let credential_len = if config.auth_method == "basic" {
             config.password.len()
         } else {
@@ -619,19 +644,14 @@ impl JmapConnection {
         if let Some(state) = since_state.filter(|s| !s.is_empty()) {
             match self.fetch_email_changes(config, state).await {
                 Ok(delta) => return Ok(delta),
-                Err(Error::Other(msg))
-                    if msg.contains("cannotCalculateChanges")
-                        || msg.contains("invalidArguments")
-                        || msg.contains("Email/changes exceeded")
-                        || msg.contains("hasMoreChanges but newState") =>
-                {
+                Err(FetchEmailChangesError::Fallback(reason)) => {
                     log::info!(
                         "JMAP Email/changes could not complete ({}); falling back to full sync of {}",
-                        msg,
+                        reason.as_str(),
                         mailbox_id
                     );
                 }
-                Err(e) => return Err(e),
+                Err(FetchEmailChangesError::Fatal(e)) => return Err(e),
             }
         }
 
@@ -656,7 +676,7 @@ impl JmapConnection {
         &self,
         config: &JmapConfig,
         since_state: &str,
-    ) -> Result<JmapFetchResult> {
+    ) -> std::result::Result<JmapFetchResult, FetchEmailChangesError> {
         log::debug!("JMAP Email/changes since state={}", since_state);
 
         const MAX_CHANGES_PER_PAGE: u64 = 5000;
@@ -706,12 +726,28 @@ impl JmapConnection {
                 ]
             });
 
-            let resp = self.api_request(&request, config).await?;
+            let resp = self
+                .api_request(&request, config)
+                .await
+                .map_err(FetchEmailChangesError::Fatal)?;
 
             // Surface server errors (cannotCalculateChanges, invalidArguments, …)
             // so the caller can decide whether to fall back to a full sync.
             if let Some(err_type) = resp["methodResponses"][0][1]["type"].as_str() {
-                return Err(Error::Other(format!("Email/changes error: {}", err_type)));
+                let fallback_reason = match err_type {
+                    "cannotCalculateChanges" => {
+                        Some(DeltaSyncFallbackReason::CannotCalculateChanges)
+                    }
+                    "invalidArguments" => Some(DeltaSyncFallbackReason::InvalidArguments),
+                    _ => None,
+                };
+                if let Some(reason) = fallback_reason {
+                    return Err(FetchEmailChangesError::Fallback(reason));
+                }
+                return Err(FetchEmailChangesError::Fatal(Error::Other(format!(
+                    "Email/changes error: {}",
+                    err_type
+                ))));
             }
 
             let changes = &resp["methodResponses"][0][1];
@@ -737,17 +773,16 @@ impl JmapConnection {
 
             pages += 1;
             if pages >= MAX_PAGES {
-                return Err(Error::Other(format!(
-                    "Email/changes exceeded {} pages without finishing; falling back to full sync",
-                    MAX_PAGES
-                )));
+                return Err(FetchEmailChangesError::Fallback(
+                    DeltaSyncFallbackReason::ExceededPageCap,
+                ));
             }
 
             // Guard against a server that returns hasMoreChanges: true
             // without advancing state — would loop forever otherwise.
             if new_state == cursor {
-                return Err(Error::Other(
-                    "Email/changes returned hasMoreChanges but newState == sinceState".into(),
+                return Err(FetchEmailChangesError::Fallback(
+                    DeltaSyncFallbackReason::StalledState,
                 ));
             }
             cursor = new_state;

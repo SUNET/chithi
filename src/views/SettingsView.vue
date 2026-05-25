@@ -808,7 +808,7 @@ async function saveAccount() {
     editingAccountId.value = null;
     resetDefaultBookState();
   } catch (e) {
-    error.value = String(e);
+    error.value = e instanceof Error ? e.message : String(e);
   } finally {
     saving.value = false;
   }
