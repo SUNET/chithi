@@ -16,6 +16,8 @@ vi.mock("@/lib/tauri", () => ({
   respondToInvite: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn().mockResolvedValue(undefined),
   listFolders: vi.fn().mockResolvedValue([]),
+  getLastView: vi.fn().mockResolvedValue({ account_id: null, folder_path: null }),
+  saveLastView: vi.fn().mockResolvedValue(undefined),
   getMessages: vi.fn().mockResolvedValue({ messages: [], total: 0, page: 0, per_page: 100 }),
   getMessageBody: vi.fn().mockResolvedValue({
     id: "msg1", subject: "Test", from: { name: "Test", email: "test@example.com" },

@@ -11,6 +11,8 @@ vi.mock("@/lib/tauri", () => ({
     { name: "Inbox", path: "INBOX", folder_type: "inbox", unread_count: 0, total_count: 0, children: [] },
   ]),
   triggerSync: vi.fn().mockResolvedValue(undefined),
+  getLastView: vi.fn().mockResolvedValue({ account_id: null, folder_path: null }),
+  saveLastView: vi.fn().mockResolvedValue(undefined),
 }));
 
 import * as api from "@/lib/tauri";
