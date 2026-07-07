@@ -140,6 +140,7 @@ export const useFoldersStore = defineStore("folders", () => {
       if (!account || account.mail_protocol === "") return;
       if (saveViewTimer) clearTimeout(saveViewTimer);
       saveViewTimer = setTimeout(() => {
+        saveViewTimer = null;
         api.saveLastView(accountId, folderPath).catch((e) =>
           console.error("Failed to save last view:", e),
         );
