@@ -78,6 +78,14 @@ export interface Folder {
   children: Folder[];
 }
 
+// The account/folder the user was last viewing, persisted via
+// `save_last_view` and restored on startup (#191). Either field is
+// `null` on a fresh install or before the first navigation is saved.
+export interface LastView {
+  account_id: string | null;
+  folder_path: string | null;
+}
+
 export interface Address {
   name: string | null;
   email: string;

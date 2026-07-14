@@ -26,6 +26,36 @@ export const useAccountsStore = defineStore("accounts", () => {
   // makes every caller await the same result.
   let inFlight: Promise<void> | null = null;
 
+  // #191: on cold start (no active account yet), prefer the account the
+  // user was last viewing over the alphabetically-first one. Falls back
+  // to the first enabled account with a mail backend — calendar-/
+  // contacts-only accounts (#43) have no folders to show in Mail — and
+  // finally to today's plain "first account" behavior if none qualify.
+  // The restore is mail-protocol-gated too: FiltersView's account picker
+  // (unlike Mail's) lists every account and shares this same
+  // activeAccountId, so a calendar-/contacts-only id could in principle
+  // end up persisted — restoring into one would leave Mail empty.
+  async function resolveInitialAccountId(): Promise<string> {
+    try {
+      const lastView = await api.getLastView();
+      if (lastView.account_id) {
+        const restored = accounts.value.find(
+          (a) =>
+            a.id === lastView.account_id &&
+            a.enabled &&
+            a.mail_protocol !== "",
+        );
+        if (restored) return restored.id;
+      }
+    } catch (e) {
+      console.error("Failed to load last view:", e);
+    }
+    const firstEnabledMail = accounts.value.find(
+      (a) => a.mail_protocol !== "" && a.enabled,
+    );
+    return (firstEnabledMail ?? accounts.value[0]).id;
+  }
+
   async function fetchAccounts(): Promise<void> {
     if (inFlight) return inFlight;
     loading.value = true;
@@ -33,7 +63,7 @@ export const useAccountsStore = defineStore("accounts", () => {
       try {
         accounts.value = await api.listAccounts();
         if (accounts.value.length > 0 && !activeAccountId.value) {
-          activeAccountId.value = accounts.value[0].id;
+          activeAccountId.value = await resolveInitialAccountId();
         }
       } finally {
         loading.value = false;

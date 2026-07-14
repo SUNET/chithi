@@ -15,6 +15,8 @@ vi.mock("@/lib/tauri", () => ({
   setMessageFlags: vi.fn().mockResolvedValue(undefined),
   deleteMessages: vi.fn().mockResolvedValue(undefined),
   listFolders: vi.fn().mockResolvedValue([]),
+  getLastView: vi.fn().mockResolvedValue({ account_id: null, folder_path: null }),
+  saveLastView: vi.fn().mockResolvedValue(undefined),
   getThreadedMessages: vi.fn().mockResolvedValue({
     threads: [], total_threads: 0, total_messages: 0, page: 0, per_page: 100,
   }),

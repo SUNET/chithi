@@ -14,6 +14,8 @@ vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   listFolders: vi.fn().mockResolvedValue([]),
   triggerSync: vi.fn().mockResolvedValue(undefined),
+  getLastView: vi.fn().mockResolvedValue({ account_id: null, folder_path: null }),
+  saveLastView: vi.fn().mockResolvedValue(undefined),
   getMessages: vi
     .fn()
     .mockResolvedValue({ messages: [], total: 0, page: 0, per_page: 100 }),

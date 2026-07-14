@@ -4,6 +4,7 @@ import type {
   AccountConfig,
   AutoconfigResult,
   Folder,
+  LastView,
   MessagePage,
   MessageBody,
   SyncStatus,
@@ -14,6 +15,22 @@ import type {
 
 export async function listAccounts(): Promise<Account[]> {
   return invoke("list_accounts");
+}
+
+/// The account/folder the user was last viewing (#191), read once at
+/// startup by the accounts/folders stores to restore that view.
+export async function getLastView(): Promise<LastView> {
+  return invoke("get_last_view");
+}
+
+/// Persist the account/folder the user is currently viewing (#191).
+/// Called debounced, so callers should let rejections just log rather
+/// than surface an error to the user.
+export async function saveLastView(
+  accountId: string,
+  folderPath: string,
+): Promise<void> {
+  return invoke("save_last_view", { accountId, folderPath });
 }
 
 export async function addAccount(config: AccountConfig): Promise<string> {

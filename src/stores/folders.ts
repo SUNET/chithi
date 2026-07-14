@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import type { Folder } from "@/lib/types";
+import { OUTBOX_FOLDER, type Folder } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 
@@ -32,12 +32,31 @@ export const useFoldersStore = defineStore("folders", () => {
     try {
       folders.value = await api.listFolders(accountId);
       foldersByAccount.value = { ...foldersByAccount.value, [accountId]: folders.value };
+
+      // #191: on cold start (nothing selected yet), try restoring the
+      // folder the user was last viewing — but only if it was saved for
+      // *this* account. If accounts.ts had to fall back to a different
+      // account (the saved one no longer exists/is disabled), the saved
+      // folder path is meaningless here and we fall through to the
+      // Inbox-default logic below instead.
+      if (activeFolderPath.value === null) {
+        try {
+          const lastView = await api.getLastView();
+          if (lastView.account_id === accountId && lastView.folder_path) {
+            activeFolderPath.value = lastView.folder_path;
+          }
+        } catch (e) {
+          console.error("Failed to load last view:", e);
+        }
+      }
+
       if (folders.value.length > 0) {
         // If no folder is selected, or the selected folder doesn't exist
-        // in this account, default to Inbox.
+        // in this account, default to Inbox. The synthetic Outbox path
+        // (never a row in `folders`) is always considered valid.
         const active = activeFolderPath.value;
         const currentValid = active !== null &&
-          findFolderInTree(folders.value, active) !== undefined;
+          (active === OUTBOX_FOLDER || findFolderInTree(folders.value, active) !== undefined);
         if (!currentValid) {
           const inbox = folders.value.find((f) => f.folder_type === "inbox");
           activeFolderPath.value = inbox?.path ?? folders.value[0].path;
@@ -104,6 +123,31 @@ export const useFoldersStore = defineStore("folders", () => {
     },
   );
 
+  // #191: persist the active account/folder (debounced) so the next
+  // startup can restore this view. Skipped while either half is unset
+  // (cold start, or an account with no folders yet), and while the
+  // active account isn't mail-capable: FiltersView's account picker
+  // (unlike Mail's) lists every account and shares this same
+  // activeAccountId, so switching to a calendar-/contacts-only account
+  // there must not overwrite the last *mail* view with a folder path
+  // that belongs to a different, unrelated account.
+  let saveViewTimer: ReturnType<typeof setTimeout> | null = null;
+  watch(
+    () => [accountsStore.activeAccountId, activeFolderPath.value] as const,
+    ([accountId, folderPath]) => {
+      if (!accountId || !folderPath) return;
+      const account = accountsStore.accounts.find((a) => a.id === accountId);
+      if (!account || account.mail_protocol === "") return;
+      if (saveViewTimer) clearTimeout(saveViewTimer);
+      saveViewTimer = setTimeout(() => {
+        saveViewTimer = null;
+        api.saveLastView(accountId, folderPath).catch((e) =>
+          console.error("Failed to save last view:", e),
+        );
+      }, 500);
+    },
+  );
+
   // Subscribe to backend folder-change events with debounce
   let foldersRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let stopFoldersListener: null | (() => void) = null;
@@ -130,6 +174,7 @@ export const useFoldersStore = defineStore("folders", () => {
   onScopeDispose(() => {
     disposed = true;
     if (foldersRefreshTimer) clearTimeout(foldersRefreshTimer);
+    if (saveViewTimer) clearTimeout(saveViewTimer);
     stopFoldersListener?.();
   });
 
