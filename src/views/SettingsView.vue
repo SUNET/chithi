@@ -11,6 +11,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import PasswordInput from "@/components/common/PasswordInput.vue";
 import { acctColor } from "@/lib/account-colors";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
+import AccountTypePicker from "@/components/settings/AccountTypePicker.vue";
+import {
+  accountSecondaryLabel,
+  accountTypeLabel,
+  accountTypeLabelLong,
+  isFastmailJmapUrl,
+  type AccountType,
+} from "@/lib/account-types";
 
 const router = useRouter();
 const route = useRoute();
@@ -18,88 +26,6 @@ const accountsStore = useAccountsStore();
 const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
-
-/// Strict Fastmail JMAP endpoint check. Mirrors the Rust
-/// `is_fastmail_jmap_url` helper in `db/accounts.rs`: returns
-/// `true` only when the URL parses, uses https, and its hostname
-/// is *exactly* `api.fastmail.com` (case-insensitive). A plain
-/// `startsWith("https://api.fastmail.com")` would also approve
-/// lookalike hosts like `api.fastmail.com.attacker.example`.
-function isFastmailJmapUrl(u: string): boolean {
-  try {
-    const parsed = new URL(u);
-    return (
-      parsed.protocol === "https:"
-      && parsed.hostname.toLowerCase() === "api.fastmail.com"
-    );
-  } catch {
-    return false;
-  }
-}
-
-/// Long-form label for the type-selector buttons in the modal.
-/// Mostly the same as `accountTypeLabel` for the listing, but the
-/// modal is wider and benefits from "Nextcloud Talk" and "Matrix"
-/// spelled out instead of an upper-case acronym.
-function accountTypeLabelLong(t: AccountType): string {
-  switch (t) {
-    case "gmail":
-      return "Gmail";
-    case "o365":
-      return "Microsoft 365";
-    case "fastmail":
-      return "Fastmail";
-    case "talk":
-      return "Nextcloud Talk";
-    case "matrix":
-      return "Matrix";
-    case "zoom":
-      return "Zoom";
-    default:
-      return t.toUpperCase();
-  }
-}
-
-function accountTypeLabel(acc: {
-  provider?: string;
-  mail_protocol?: string;
-  has_calendar_binding?: boolean;
-  has_contacts_binding?: boolean;
-  meet_protocol?: string;
-}): string {
-  if (acc.provider === "gmail") return "GMAIL";
-  if (acc.provider === "o365") return "MICROSOFT 365";
-  if (acc.provider === "fastmail") return "FASTMAIL";
-  if (acc.mail_protocol) return acc.mail_protocol.toUpperCase();
-  // Standalone DAV accounts: name them by the user-visible service
-  // they provide rather than the protocol acronym. "Calendar" and
-  // "Contacts" mean something to a user; "CALDAV" and "CARDDAV"
-  // mean something to a protocol nerd.
-  const hasCal = !!acc.has_calendar_binding;
-  const hasCon = !!acc.has_contacts_binding;
-  if (hasCal && hasCon) return "Calendar and Contacts";
-  if (hasCal) return "Calendar";
-  if (hasCon) return "Contacts";
-  // Meet-only accounts (#148). Same user-visible naming approach.
-  switch (acc.meet_protocol) {
-    case "talk":
-      return "Nextcloud Talk";
-    case "matrix":
-      return "Matrix";
-    case "zoom":
-      return "Zoom";
-    default:
-      return "";
-  }
-}
-
-/// Secondary line for the settings account list. Standalone CalDAV /
-/// CardDAV accounts created before the email back-fill landed have
-/// `email = ""`; falling back to `username` means they still show
-/// something identifying instead of a blank gap.
-function accountSecondaryLabel(acc: { email: string; username: string }): string {
-  return acc.email || acc.username || "";
-}
 
 // Mobile toggles — persist to localStorage so they survive reloads.
 const blockRemoteImages = ref(localStorage.getItem("chithi-block-remote-images") !== "false");
@@ -279,17 +205,6 @@ const defaultForm = (): AccountConfig => ({
 
 const form = ref<AccountConfig>(defaultForm());
 
-type AccountType =
-  | "gmail"
-  | "imap"
-  | "jmap"
-  | "fastmail"
-  | "caldav"
-  | "carddav"
-  | "o365"
-  | "talk"
-  | "matrix"
-  | "zoom";
 const accountType = ref<AccountType>("gmail");
 
 function selectAccountType(type: AccountType) {
@@ -470,33 +385,6 @@ function pickAccountType(type: AccountType) {
 
 function cancelPicker() {
   showPicker.value = false;
-}
-
-/// Brief subtitle shown under each card in the picker dialog.
-/// Kept terse — the card's title already says what the type is.
-function accountTypeDescription(t: AccountType): string {
-  switch (t) {
-    case "gmail":
-      return "Mail, calendar and contacts via Google";
-    case "o365":
-      return "Mail, calendar and contacts via Microsoft 365";
-    case "imap":
-      return "Generic IMAP / SMTP mail account";
-    case "jmap":
-      return "JMAP mail (Stalwart, generic JMAP servers)";
-    case "fastmail":
-      return "Fastmail mail, calendar and contacts via JMAP API token";
-    case "caldav":
-      return "Standalone calendar via CalDAV";
-    case "carddav":
-      return "Standalone contacts via CardDAV";
-    case "talk":
-      return "Video conferencing on a Nextcloud server";
-    case "matrix":
-      return "Video conferencing via Matrix / Element Call";
-    case "zoom":
-      return "Video conferencing via Zoom";
-  }
 }
 
 async function openEditForm(id: string) {
@@ -1239,34 +1127,7 @@ onMounted(() => {
   </div>
 
   <!-- Step 1 of Add Account: pick a type. (#148 cleanup) -->
-  <Teleport to="body">
-    <div v-if="showPicker" class="modal-overlay" @click.self="cancelPicker">
-      <div class="modal modal-picker" data-testid="account-type-picker">
-        <div class="modal-header">
-          <h3>Add Account</h3>
-          <button class="modal-close" @click="cancelPicker">&times;</button>
-        </div>
-        <div class="modal-body">
-          <p class="picker-help">Pick the kind of account you want to add. You can add more later.</p>
-          <div class="picker-grid">
-            <button
-              v-for="t in (['gmail', 'o365', 'fastmail', 'imap', 'jmap', 'caldav', 'carddav', 'talk', 'matrix', 'zoom'] as AccountType[])"
-              :key="t"
-              class="picker-card"
-              :data-testid="`picker-${t}`"
-              @click="pickAccountType(t)"
-            >
-              <span class="picker-card-title">{{ accountTypeLabelLong(t) }}</span>
-              <span class="picker-card-desc">{{ accountTypeDescription(t) }}</span>
-            </button>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-secondary" @click="cancelPicker">Cancel</button>
-        </div>
-      </div>
-    </div>
-  </Teleport>
+  <AccountTypePicker :open="showPicker" @pick="pickAccountType" @cancel="cancelPicker" />
 
   <!-- Add/Edit Account Modal (shared by mobile + desktop) -->
   <Teleport to="body">
@@ -2174,45 +2035,6 @@ onMounted(() => {
 }
 
 /* Account-type picker (#148 cleanup). Two-column card grid. */
-.modal-picker {
-  max-width: 600px;
-}
-.picker-help {
-  margin: 0 0 12px;
-  font-size: 13px;
-  color: var(--color-text-muted);
-}
-.picker-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-.picker-card {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px 14px;
-  text-align: left;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: background 0.1s, border-color 0.1s;
-}
-.picker-card:hover {
-  background: var(--color-bg-hover);
-  border-color: var(--color-accent);
-}
-.picker-card-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text);
-}
-.picker-card-desc {
-  font-size: 12px;
-  color: var(--color-text-muted);
-}
-
 .signature-textarea {
   width: 100%;
   padding: 8px 10px;
