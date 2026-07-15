@@ -150,8 +150,7 @@ pub async fn move_messages(
                         )));
                     }
                 } else if account.mail_protocol_str() == "jmap" {
-                    let jmap_config =
-                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                    let jmap_config = crate::auth::build_jmap_config(&account).await?;
                     let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
                     for mid in &message_ids_bg {
                         let parts: Vec<&str> = mid.splitn(3, '_').collect();
@@ -322,8 +321,7 @@ pub async fn delete_messages(
                         )));
                     }
                 } else if account.mail_protocol_str() == "jmap" {
-                    let jmap_config =
-                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                    let jmap_config = crate::auth::build_jmap_config(&account).await?;
                     let jmap_ids: Vec<String> = message_ids_bg
                         .iter()
                         .filter_map(|mid| {
@@ -493,7 +491,7 @@ pub async fn move_messages_cross_account(
         }
         "jmap" => {
             // JMAP: read each message in a blocking task, then import async
-            let jmap_config = crate::commands::sync_cmd::build_jmap_config(&target_account).await?;
+            let jmap_config = crate::auth::build_jmap_config(&target_account).await?;
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             for path in &validated_paths {
                 let path_clone = path.clone();
@@ -615,7 +613,7 @@ pub async fn set_message_flags(
         }
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP path: extract JMAP email IDs and set flags via JMAP API
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
 
         // Extract JMAP email IDs from composite message IDs
         let jmap_ids: Vec<String> = message_ids
@@ -850,7 +848,7 @@ pub async fn mark_account_read(
         imap_result?;
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP: bulk update all unread emails to $seen via Email/set
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
 
         let unread_ids: Vec<String> = {

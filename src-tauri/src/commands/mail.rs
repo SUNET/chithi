@@ -134,7 +134,7 @@ pub async fn search_messages_server(
         let client = crate::mail::graph::GraphClient::new(&token);
         client.search_messages(&account_id, &query).await?
     } else if account.mail_protocol_str() == "jmap" {
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap
             .search_account(&jmap_config, &account_id, &query)
@@ -332,7 +332,7 @@ async fn ensure_message_body_on_disk(
     } else if account.mail_protocol_str() == "jmap" {
         log::info!("Body not on disk for {}, fetching from JMAP", message_id);
 
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
 
         let jmap_email_id = message_id
             .strip_prefix(&format!("{}_{}_", account_id, folder_path))
@@ -707,7 +707,7 @@ pub async fn create_folder(
             })?;
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set create
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
         // Split to get the parent mailbox ID and the new folder name.
@@ -833,7 +833,7 @@ pub async fn delete_folder(
         })?;
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
         let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
         conn_jmap
             .destroy_mailbox(&jmap_config, &folder_path, true)
