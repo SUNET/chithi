@@ -458,10 +458,9 @@ fn split_inner_part(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     // (Try 2, 2026-05-20).
     let (sep_idx, sep_len) = if let Some(i) = find_subslice(raw, b"\r\n\r\n") {
         (i + 2, 2)
-    } else if let Some(i) = find_subslice(raw, b"\n\n") {
-        (i + 1, 1)
     } else {
-        return None;
+        let i = find_subslice(raw, b"\n\n")?;
+        (i + 1, 1)
     };
     let header_bytes = &raw[..sep_idx];
     let body_bytes = &raw[sep_idx + sep_len..];
