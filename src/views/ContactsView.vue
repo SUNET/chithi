@@ -17,21 +17,10 @@ import {
   defaultChoices,
   type MergeChoices,
 } from "@/lib/contact-merge";
-import Select from "@/components/common/Select.vue";
+import { parseEmails, parseFirstEmail, parsePhones } from "@/lib/contact-json";
+import ContactFormModal from "@/components/contacts/ContactFormModal.vue";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import MobileIconButton from "@/components/mobile/MobileIconButton.vue";
-
-const EMAIL_LABEL_OPTIONS = [
-  { value: "work", label: "Work" },
-  { value: "home", label: "Home" },
-  { value: "other", label: "Other" },
-];
-
-const PHONE_LABEL_OPTIONS = [
-  { value: "mobile", label: "Mobile" },
-  { value: "work", label: "Work" },
-  { value: "home", label: "Home" },
-];
 
 const accountsStore = useAccountsStore();
 const contactsStore = useContactsStore();
@@ -49,21 +38,15 @@ const contacts = ref<Contact[]>([]);
 const searchQuery = ref("");
 const selectedBookId = ref<string | null>(storeSelectedBookId.value);
 const selectedContact = ref<Contact | null>(null);
-const showForm = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingContactId = ref<string | null>(null);
 
+// The new/edit contact form lives in ContactFormModal (#166); the view
+// drives it through the exposed openNew / openEdit handles.
+const contactForm = ref<InstanceType<typeof ContactFormModal> | null>(null);
+
 // Mobile: which account the list is filtered to ("all" or an account id).
 const mobileAccountFilter = ref<string>("all");
-
-function parseFirstEmail(json: string): string {
-  try {
-    const arr = JSON.parse(json) as Array<{ email?: string }>;
-    return arr[0]?.email ?? "";
-  } catch {
-    return "";
-  }
-}
 
 // Flatten every contact across every book so the mobile list can be
 // sorted alphabetically and filtered by account. Desktop still uses the
@@ -143,20 +126,6 @@ function mobileContactInitial(c: Contact): string {
 function bookAccountId(bookId: string): string {
   return contactBooks.value.find((b) => b.id === bookId)?.account_id ?? "";
 }
-
-// Form state
-const formFirstName = ref("");
-const formMiddleName = ref("");
-const formLastName = ref("");
-const formEmails = ref<{ email: string; label: string }[]>([{ email: "", label: "work" }]);
-const formPhones = ref<{ number: string; label: string }[]>([]);
-const formOrg = ref("");
-const formTitle = ref("");
-const formNotes = ref("");
-const formBookId = ref("");
-const editingContactId = ref<string | null>(null);
-const saving = ref(false);
-const error = ref<string | null>(null);
 
 // Multi-select state (#129). The detail panel still shows the
 // most-recently-clicked contact (`selectedContact`), but the contact
@@ -390,14 +359,6 @@ const filteredContacts = computed(() => {
   );
 });
 
-function parseEmails(json: string): { email: string; label: string }[] {
-  try { return JSON.parse(json); } catch { return []; }
-}
-
-function parsePhones(json: string): { number: string; label: string }[] {
-  try { return JSON.parse(json); } catch { return []; }
-}
-
 // RFC 6068 requires URI-encoding of reserved characters in the mailto:
 // path. encodeURIComponent over-encodes "@", "/" and other addr-spec
 // chars; selectively re-decode the ones that are safe inside an
@@ -506,103 +467,26 @@ function startMerge() {
   mergeChoices.value = defaultChoices(keeper, loser);
 }
 
-function splitDisplayName(name: string): { first: string; middle: string; last: string } {
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 1) return { first: parts[0], middle: "", last: "" };
-  if (parts.length === 2) return { first: parts[0], middle: "", last: parts[1] };
-  return { first: parts[0], middle: parts.slice(1, -1).join(" "), last: parts[parts.length - 1] };
-}
-
-function buildDisplayName(): string {
-  const parts = [formFirstName.value.trim(), formMiddleName.value.trim(), formLastName.value.trim()].filter(Boolean);
-  return parts.join(" ");
-}
-
 function openNewForm() {
-  editingContactId.value = null;
-  formFirstName.value = "";
-  formMiddleName.value = "";
-  formLastName.value = "";
-  formEmails.value = [{ email: "", label: "work" }];
-  formPhones.value = [];
-  formOrg.value = "";
-  formTitle.value = "";
-  formNotes.value = "";
-  formBookId.value = selectedBookId.value ?? contactBooks.value[0]?.id ?? "";
-  error.value = null;
-  showForm.value = true;
+  contactForm.value?.openNew(selectedBookId.value ?? contactBooks.value[0]?.id ?? "");
 }
 
 function openEditForm(contact: Contact) {
-  editingContactId.value = contact.id;
-  const nameParts = splitDisplayName(contact.display_name);
-  formFirstName.value = nameParts.first;
-  formMiddleName.value = nameParts.middle;
-  formLastName.value = nameParts.last;
-  formEmails.value = parseEmails(contact.emails_json);
-  if (formEmails.value.length === 0) formEmails.value = [{ email: "", label: "work" }];
-  formPhones.value = parsePhones(contact.phones_json);
-  formOrg.value = contact.organization ?? "";
-  formTitle.value = contact.title ?? "";
-  formNotes.value = contact.notes ?? "";
-  formBookId.value = contact.book_id;
-  error.value = null;
-  showForm.value = true;
+  contactForm.value?.openEdit(contact);
 }
 
-function addEmailField() { formEmails.value.push({ email: "", label: "work" }); }
-function removeEmailField(idx: number) { formEmails.value.splice(idx, 1); }
-function addPhoneField() { formPhones.value.push({ number: "", label: "mobile" }); }
-function removePhoneField(idx: number) { formPhones.value.splice(idx, 1); }
-
-async function saveContact() {
-  if (!formFirstName.value.trim()) { error.value = "First name is required"; return; }
-  if (!formLastName.value.trim()) { error.value = "Last name is required"; return; }
-  saving.value = true;
-  error.value = null;
-
-  const displayName = buildDisplayName();
-  const emailsFiltered = formEmails.value.filter((e) => e.email.trim());
-  const phonesFiltered = formPhones.value.filter((p) => p.number.trim());
-
-  try {
-    if (editingContactId.value) {
-      const existing = selectedContact.value!;
-      await api.updateContact({
-        ...existing,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        organization: formOrg.value || null,
-        title: formTitle.value || null,
-        notes: formNotes.value || null,
-        book_id: formBookId.value,
-      });
-    } else {
-      await api.createContact({
-        book_id: formBookId.value,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        addresses_json: "[]",
-        organization: formOrg.value || null,
-        title: formTitle.value || null,
-        notes: formNotes.value || null,
-      });
+/// Post-save tail, mirroring the pre-split saveContact: reload the
+/// visible list and re-point the detail panel at the updated row. The
+/// mobile flat list catches up via the contacts-changed event, as
+/// before.
+async function onContactSaved(editedId: string | null) {
+  if (selectedBookId.value) {
+    contacts.value = await api.listContacts(selectedBookId.value);
+    // Refresh the detail panel with the updated contact
+    if (editedId && selectedContact.value) {
+      const updated = contacts.value.find((c) => c.id === editedId);
+      if (updated) selectedContact.value = updated;
     }
-    showForm.value = false;
-    if (selectedBookId.value) {
-      contacts.value = await api.listContacts(selectedBookId.value);
-      // Refresh the detail panel with the updated contact
-      if (editingContactId.value && selectedContact.value) {
-        const updated = contacts.value.find(c => c.id === editingContactId.value);
-        if (updated) selectedContact.value = updated;
-      }
-    }
-  } catch (e) {
-    error.value = String(e);
-  } finally {
-    saving.value = false;
   }
 }
 
@@ -821,65 +705,6 @@ async function applyMerge() {
       </nav>
     </div>
 
-    <!-- Shared modal for new/edit contact (mobile uses the same form sheet) -->
-    <Teleport to="body">
-      <div v-if="showForm" class="modal-overlay" @click.self="showForm = false">
-        <div class="modal">
-          <div class="modal-header">
-            <h3>{{ editingContactId ? "Edit Contact" : "New Contact" }}</h3>
-            <button class="modal-close" @click="showForm = false">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-            </button>
-          </div>
-          <div class="modal-body">
-            <div v-if="error" class="form-error">{{ error }}</div>
-            <div class="form-group">
-              <label>Contact Book</label>
-              <Select
-                v-model="formBookId"
-                :options="contactBooks.map(b => ({ value: b.id, label: `${b.name} (${getAccountName(b.account_id)})` }))"
-              />
-            </div>
-            <div class="name-row">
-              <div class="form-group">
-                <label>First Name *</label>
-                <input v-model="formFirstName" type="text" placeholder="First" autofocus />
-              </div>
-              <div class="form-group">
-                <label>Last Name *</label>
-                <input v-model="formLastName" type="text" placeholder="Last" />
-              </div>
-            </div>
-            <div class="form-group">
-              <label>Email</label>
-              <div v-for="(em, idx) in formEmails" :key="idx" class="multi-row">
-                <input v-model="em.email" type="email" placeholder="email@example.com" />
-                <button v-if="formEmails.length > 1" class="rm-btn" @click="removeEmailField(idx)">&times;</button>
-              </div>
-              <button class="add-btn" @click="addEmailField">+ Add email</button>
-            </div>
-            <div class="form-group">
-              <label>Phone</label>
-              <div v-for="(ph, idx) in formPhones" :key="idx" class="multi-row">
-                <input v-model="ph.number" type="tel" placeholder="+1 (555) 123-4567" />
-                <button class="rm-btn" @click="removePhoneField(idx)">&times;</button>
-              </div>
-              <button class="add-btn" @click="addPhoneField">+ Add phone</button>
-            </div>
-            <div class="form-group">
-              <label>Organization</label>
-              <input v-model="formOrg" type="text" placeholder="Company name" />
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="showForm = false">Cancel</button>
-            <button class="btn-save" :disabled="saving" @click="saveContact">
-              {{ saving ? "Saving..." : editingContactId ? "Save" : "Add Contact" }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
   </div>
 
   <!-- Desktop layout — unchanged -->
@@ -1066,87 +891,6 @@ async function applyMerge() {
       </div><!-- /.contacts-content -->
       </div><!-- /.contacts-main -->
     </div>
-
-    <!-- New/Edit Contact Modal -->
-    <Teleport to="body">
-      <div v-if="showForm" class="modal-overlay" @click.self="showForm = false">
-        <div class="modal">
-          <div class="modal-header">
-            <h3>{{ editingContactId ? "Edit Contact" : "New Contact" }}</h3>
-            <button class="modal-close" @click="showForm = false">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-            </button>
-          </div>
-          <div class="modal-body">
-            <div v-if="error" class="form-error">{{ error }}</div>
-
-            <div class="form-group">
-              <label>Contact Book</label>
-              <Select
-                v-model="formBookId"
-                :options="contactBooks.map(b => ({ value: b.id, label: `${b.name} (${getAccountName(b.account_id)})` }))"
-              />
-            </div>
-
-            <div class="name-row">
-              <div class="form-group">
-                <label>First Name *</label>
-                <input v-model="formFirstName" type="text" placeholder="First" autofocus />
-              </div>
-              <div class="form-group">
-                <label>Middle Name</label>
-                <input v-model="formMiddleName" type="text" placeholder="Middle" />
-              </div>
-              <div class="form-group">
-                <label>Last Name *</label>
-                <input v-model="formLastName" type="text" placeholder="Last" />
-              </div>
-            </div>
-
-            <div class="form-group">
-              <label>Email</label>
-              <div v-for="(em, idx) in formEmails" :key="idx" class="multi-row">
-                <input v-model="em.email" type="email" placeholder="email@example.com" />
-                <Select v-model="em.label" :options="EMAIL_LABEL_OPTIONS" class="label-select" />
-                <button v-if="formEmails.length > 1" class="rm-btn" @click="removeEmailField(idx)">&times;</button>
-              </div>
-              <button class="add-btn" @click="addEmailField">+ Add email</button>
-            </div>
-
-            <div class="form-group">
-              <label>Phone</label>
-              <div v-for="(ph, idx) in formPhones" :key="idx" class="multi-row">
-                <input v-model="ph.number" type="tel" placeholder="+1 (555) 123-4567" />
-                <Select v-model="ph.label" :options="PHONE_LABEL_OPTIONS" class="label-select" />
-                <button class="rm-btn" @click="removePhoneField(idx)">&times;</button>
-              </div>
-              <button class="add-btn" @click="addPhoneField">+ Add phone</button>
-            </div>
-
-            <div class="form-group">
-              <label>Organization</label>
-              <input v-model="formOrg" type="text" placeholder="Company name" />
-            </div>
-
-            <div class="form-group">
-              <label>Job Title</label>
-              <input v-model="formTitle" type="text" placeholder="Job title" />
-            </div>
-
-            <div class="form-group">
-              <label>Notes</label>
-              <textarea v-model="formNotes" rows="3" placeholder="Notes"></textarea>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-cancel" @click="showForm = false">Cancel</button>
-            <button class="btn-save" :disabled="saving" data-testid="contact-save-btn" @click="saveContact">
-              {{ saving ? "Saving..." : editingContactId ? "Save" : "Add Contact" }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
 
     <!-- Delete Confirm -->
     <Teleport to="body">
@@ -1335,6 +1079,16 @@ async function applyMerge() {
       </div>
     </Teleport>
   </div>
+
+  <!-- Shared new/edit contact modal (desktop full form, mobile compact
+       field subset). Rendered outside the mobile/desktop branches so
+       one instance serves both. -->
+  <ContactFormModal
+    ref="contactForm"
+    :books="contactBooks"
+    :compact="isMobile"
+    @saved="onContactSaved"
+  />
 </template>
 
 <style scoped>
@@ -1731,41 +1485,6 @@ async function applyMerge() {
   padding: 8px 12px; background: rgba(251,44,54,0.06);
   color: var(--color-danger-text); border-radius: 6px; margin-bottom: 16px; font-size: 12px;
 }
-
-.form-group { margin-bottom: 16px; }
-.form-group label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500; color: var(--color-text-secondary); }
-.form-group {
-  --input-height: 36px;
-  --input-padding: 0 12px;
-  --input-border: 0.8px solid var(--color-border);
-  --input-bg: var(--color-bg-secondary);
-  --input-font-size: 16px;
-}
-
-.form-group input, .form-group textarea {
-  width: 100%; height: 36px; padding: 0 12px;
-  border: 0.8px solid var(--color-border); border-radius: 4px;
-  background: var(--color-bg-secondary); font-size: 16px;
-}
-.form-group textarea { height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.5; }
-.form-group input:focus, .form-group textarea:focus {
-  outline: none; border-color: var(--color-accent);
-}
-
-.name-row { display: flex; gap: 8px; margin-bottom: 16px; }
-.name-row .form-group { flex: 1; margin-bottom: 0; }
-
-.multi-row { display: flex; gap: 6px; margin-bottom: 6px; }
-.multi-row input { flex: 1; }
-.multi-row .label-select { width: 100px; flex-shrink: 0; }
-
-.rm-btn {
-  width: 36px; height: 36px; border-radius: 4px; font-size: 18px;
-  color: var(--color-text-muted); display: flex; align-items: center; justify-content: center;
-}
-.rm-btn:hover { background: rgba(251,44,54,0.08); color: var(--color-danger-text); }
-
-.add-btn { font-size: 13px; font-weight: 500; color: var(--color-accent); padding: 4px 0; }
 
 .btn-cancel {
   height: 32px; padding: 0 20px; background: var(--color-bg-tertiary);
