@@ -118,4 +118,8 @@ string-matching too — it demonstrates the *queue* architecture of ADR
   is reviewable per protocol.
 - Token failures inside a backend surface as logged errors at the
   command layer instead of being silently skipped in a few paths;
-  behaviour is otherwise unchanged.
+  behaviour is otherwise unchanged. The new log lines fire only on
+  user-initiated pushes (event/contact create, update, delete), so an
+  account with an expired or misconfigured OAuth grant logs once per
+  user action, not per sync tick — the recurring sync paths logged
+  their token failures before the refactor too.
