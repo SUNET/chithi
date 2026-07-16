@@ -17,6 +17,8 @@ RUN pacman -Syu --noconfirm \
     openssl \
     libsoup3 \
     librsvg \
+    # PC/SC smartcard support (pcsc-sys via libtumpa)
+    pcsclite \
     pango \
     gdk-pixbuf2 \
     curl wget file \
@@ -69,7 +71,7 @@ RUN VERSION=$(jq -r .version src-tauri/tauri.conf.json) && \
         'arch=("x86_64" "aarch64")' \
         'url="https://github.com/SUNET/chithi"' \
         'license=("GPL-3.0-only")' \
-        'depends=("webkit2gtk-4.1" "gtk3" "libayatana-appindicator" "openssl" "libsoup3")' \
+        'depends=("webkit2gtk-4.1" "gtk3" "libayatana-appindicator" "openssl" "libsoup3" "pcsclite")' \
         'source=("chithi" "icon.png" "LICENSE")' \
         'noextract=("chithi" "icon.png" "LICENSE")' \
         'sha256sums=("SKIP" "SKIP" "SKIP")' \

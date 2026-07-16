@@ -40,7 +40,8 @@
           "libayatana-appindicator3-1",
           "libssl3",
           "libsoup-3.0-0",
-          "libjavascriptcoregtk-4.1-0"
+          "libjavascriptcoregtk-4.1-0",
+          "libpcsclite1"
         ]
       },
       "rpm": {
@@ -49,7 +50,8 @@
           "gtk3",
           "libayatana-appindicator-gtk3",
           "openssl-libs",
-          "libsoup3"
+          "libsoup3",
+          "pcsc-lite-libs"
         ]
       }
     }

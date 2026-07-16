@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     libgdk-pixbuf-2.0-dev \
     libsoup-3.0-dev \
     libjavascriptcoregtk-4.1-dev \
+    # PC/SC smartcard support (pcsc-sys via libtumpa)
+    libpcsclite-dev \
     # Build essentials
     build-essential \
     pkg-config \
