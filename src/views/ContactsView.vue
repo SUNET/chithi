@@ -9,16 +9,16 @@ import { useUiStore } from "@/stores/ui";
 import type { ContactBook, Contact } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
-import LinkifiedText from "@/components/common/LinkifiedText.vue";
-import { openComposeWindow } from "@/lib/compose-window";
-import { parseMailto } from "@/lib/mailto";
 import {
   applyMergeChoices,
   defaultChoices,
   type MergeChoices,
 } from "@/lib/contact-merge";
-import { parseEmails, parseFirstEmail, parsePhones } from "@/lib/contact-json";
+import { parseFirstEmail } from "@/lib/contact-json";
 import ContactFormModal from "@/components/contacts/ContactFormModal.vue";
+import BooksSidebar from "@/components/contacts/BooksSidebar.vue";
+import ContactListPanel from "@/components/contacts/ContactListPanel.vue";
+import ContactDetailPanel from "@/components/contacts/ContactDetailPanel.vue";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import MobileIconButton from "@/components/mobile/MobileIconButton.vue";
 
@@ -118,13 +118,6 @@ const indexRailLetters = computed(() =>
 
 function mobileContactInitial(c: Contact): string {
   return (c.display_name.trim().charAt(0) || "?").toUpperCase();
-}
-
-// Per-book / per-contact color is derived from the owning account's UID
-// (see src/lib/account-colors.ts) so two books on the same provider get
-// distinct colors.
-function bookAccountId(bookId: string): string {
-  return contactBooks.value.find((b) => b.id === bookId)?.account_id ?? "";
 }
 
 // Multi-select state (#129). The detail panel still shows the
@@ -348,63 +341,6 @@ watch(contacts, (next) => {
   }
 });
 
-const filteredContacts = computed(() => {
-  if (!searchQuery.value.trim()) return contacts.value;
-  const q = searchQuery.value.toLowerCase();
-  return contacts.value.filter(
-    (c) =>
-      c.display_name.toLowerCase().includes(q) ||
-      c.emails_json.toLowerCase().includes(q) ||
-      (c.organization ?? "").toLowerCase().includes(q),
-  );
-});
-
-// RFC 6068 requires URI-encoding of reserved characters in the mailto:
-// path. encodeURIComponent over-encodes "@", "/" and other addr-spec
-// chars; selectively re-decode the ones that are safe inside an
-// addr-spec so the resulting URI looks natural in the status bar
-// preview while remaining well-formed.
-function encodeMailtoAddress(email: string): string {
-  return encodeURIComponent(email.trim())
-    .replace(/%40/g, "@")
-    .replace(/%2E/gi, ".")
-    .replace(/%2B/gi, "+");
-}
-
-// RFC 3966 visual-separator chars are kept verbatim; everything else
-// (spaces, parens, letters, "ext." suffix, ...) is stripped, since
-// the OS dialer interprets only digits and "+".
-function sanitizeTel(number: string): string {
-  return number.replace(/[^0-9+*#\-.]/g, "");
-}
-
-// Clicking a contact's email opens compose with `to` prefilled, matching
-// how a mailto: link inside a mail body behaves. The address is built
-// via mailto: so it goes through the same parser and routing.
-function onEmailClick(email: string) {
-  const params = parseMailto(`mailto:${encodeMailtoAddress(email)}`);
-  if (!params) return;
-  openComposeWindow({
-    accountId: accountsStore.activeAccountId ?? undefined,
-    ...params,
-  });
-}
-
-// Phone numbers hand off to the OS via the same backend command that
-// powers the LinkPopup's Open button; tel: is in its allow-list.
-function onPhoneClick(number: string) {
-  const tel = sanitizeTel(number);
-  if (!tel) return;
-  api.openLink(`tel:${tel}`).catch((e) => console.error("openLink tel: failed:", e));
-}
-
-function onLinkEnter(url: string) {
-  uiStore.setHoverUrl(url);
-}
-function onLinkLeave() {
-  uiStore.setHoverUrl(null);
-}
-
 function selectContact(contact: Contact, event?: MouseEvent) {
   // Ctrl/Cmd-click toggles the contact in the multi-select set without
   // disturbing the others. A plain click resets the selection to just
@@ -425,43 +361,17 @@ function selectContact(contact: Contact, event?: MouseEvent) {
   }
 }
 
-/// Whether the multi-select toolbar's "Merge" action is enabled.
-/// Only fires when exactly two contacts are selected AND both belong
-/// to the same address book — cross-book merges aren't supported
-/// because the loser's deletion would have to land on a different
-/// remote and the surviving vCard would have to be rewritten across
-/// two backends.
-const canMergeSelected = computed(() => {
-  if (selectedContactIds.value.length !== 2) return false;
-  const [a, b] = selectedContactIds.value
-    .map((id) => contacts.value.find((c) => c.id === id))
-    .filter((c): c is Contact => !!c);
-  if (!a || !b) return false;
-  return a.book_id === b.book_id;
-});
-
-const selectedContactNames = computed(() =>
-  selectedContactIds.value
-    .map((id) => contacts.value.find((c) => c.id === id)?.display_name ?? "")
-    .filter((s) => s.length > 0),
-);
-
 function clearSelection() {
   selectedContactIds.value = selectedContact.value
     ? [selectedContact.value.id]
     : [];
 }
 
-/// Open the field-picker dialog for the two currently-selected
-/// contacts. The first selected becomes the keeper; the second is
-/// the loser. Snapshot the pair so subsequent selection changes
-/// don't yank the dialog out from under the user.
-function startMerge() {
-  if (!canMergeSelected.value) return;
-  const [keeperId, loserId] = selectedContactIds.value;
-  const keeper = contacts.value.find((c) => c.id === keeperId);
-  const loser = contacts.value.find((c) => c.id === loserId);
-  if (!keeper || !loser) return;
+/// Open the field-picker dialog for the keeper/loser pair the list
+/// panel resolved (first selected wins). Snapshot the pair so
+/// subsequent selection changes don't yank the dialog out from under
+/// the user.
+function startMerge(keeper: Contact, loser: Contact) {
   mergeError.value = null;
   mergePair.value = { keeper, loser };
   mergeChoices.value = defaultChoices(keeper, loser);
@@ -502,10 +412,6 @@ async function doDelete() {
   if (selectedContact.value?.id === deletingContactId.value) selectedContact.value = null;
   deletingContactId.value = null;
   if (selectedBookId.value) contacts.value = await api.listContacts(selectedBookId.value);
-}
-
-function getAccountName(accountId: string): string {
-  return accountsStore.accounts.find((a) => a.id === accountId)?.display_name ?? "";
 }
 
 // ---------- Merge (#129) ----------------------------------------------------
@@ -714,33 +620,11 @@ async function applyMerge() {
       :class="`contacts-layout-${uiStore.contactViewMode}`"
     >
       <!-- Left: Contact Books -->
-      <div class="books-sidebar" data-testid="contacts-book-select">
-        <div class="app-sidebar-header">Address Books</div>
-        <div
-          v-for="book in contactBooks"
-          :key="book.id"
-          class="book-item"
-          :class="{ active: selectedBookId === book.id }"
-          @click="selectedBookId = book.id"
-        >
-          <span
-            class="book-avatar"
-            :style="{
-              background: acctColor(book.account_id).soft,
-              color: acctColor(book.account_id).fill,
-              boxShadow: 'inset 0 0 0 1.5px ' + acctColor(book.account_id).fill,
-            }"
-          >
-            {{ book.name.charAt(0).toUpperCase() }}
-          </span>
-          <span class="book-info">
-            <span class="book-name">{{ book.name }}</span>
-            <span class="book-meta">{{ getAccountName(book.account_id) }}</span>
-          </span>
-          <svg class="book-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
-        </div>
-        <div v-if="contactBooks.length === 0" class="empty-text">No contact books</div>
-      </div>
+      <BooksSidebar
+        :books="contactBooks"
+        :selected-book-id="selectedBookId"
+        @select="selectedBookId = $event"
+      />
 
       <!-- Middle + Right wrapper. Direction toggles via the
            `contacts-layout-{right,bottom}` class on the parent: row
@@ -768,126 +652,25 @@ async function applyMerge() {
            above stays at the top regardless of right-vs-bottom mode. -->
       <div class="contacts-content">
       <!-- Middle: Contact List -->
-      <div class="contact-list-panel">
-        <div class="search-bar">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input v-model="searchQuery" type="text" placeholder="Search contacts..." data-testid="contacts-search" />
-        </div>
-        <!-- Multi-select merge toolbar (#129). Visible whenever 2+
-             contacts are picked via Ctrl/Cmd-click; the Merge button
-             only enables when exactly two are selected within the
-             same book. -->
-        <div
-          v-if="selectedContactIds.length >= 2"
-          class="merge-toolbar"
-          data-testid="merge-toolbar"
-        >
-          <span class="merge-toolbar-text">
-            {{ selectedContactIds.length }} selected{{
-              selectedContactNames.length >= 2
-                ? `: ${selectedContactNames[0]} + ${selectedContactNames[1]}`
-                : ""
-            }}
-          </span>
-          <button
-            class="merge-toolbar-btn"
-            data-testid="merge-toolbar-btn"
-            :disabled="!canMergeSelected"
-            :title="canMergeSelected
-              ? 'Merge the two selected contacts'
-              : 'Pick two contacts in the same address book to merge'"
-            @click="startMerge"
-          >Merge</button>
-          <button class="merge-toolbar-cancel" @click="clearSelection">Clear</button>
-        </div>
-        <div class="contact-list">
-          <div
-            v-for="contact in filteredContacts"
-            :key="contact.id"
-            class="contact-row"
-            :class="{
-              active: selectedContact?.id === contact.id,
-              picked: selectedContactIds.includes(contact.id),
-            }"
-            :data-testid="`contact-${contact.id}`"
-            @click="selectContact(contact, $event)"
-          >
-            <div
-              class="contact-avatar"
-              :style="{ background: acctColor(bookAccountId(contact.book_id)).fill }"
-            >{{ contact.display_name.charAt(0).toUpperCase() }}</div>
-            <div class="contact-info">
-              <span class="contact-name">{{ contact.display_name }}</span>
-              <span class="contact-email">{{ parseEmails(contact.emails_json)[0]?.email ?? "" }}</span>
-              <span v-if="contact.organization" class="contact-org">{{ contact.organization }}</span>
-            </div>
-          </div>
-          <div v-if="filteredContacts.length === 0 && selectedBookId" class="empty-text">
-            {{ searchQuery ? "No matches" : "No contacts" }}
-          </div>
-        </div>
-      </div>
+      <ContactListPanel
+        v-model:search="searchQuery"
+        :contacts="contacts"
+        :books="contactBooks"
+        :selected-contact-id="selectedContact?.id ?? null"
+        :selected-ids="selectedContactIds"
+        :has-book="!!selectedBookId"
+        @select="selectContact"
+        @merge="startMerge"
+        @clear-selection="clearSelection"
+      />
 
       <!-- Right: Detail -->
-      <div class="detail-panel">
-        <template v-if="selectedContact">
-          <div class="detail-header">
-            <div
-              class="detail-avatar"
-              :style="{ background: acctColor(bookAccountId(selectedContact.book_id)).fill }"
-            >{{ selectedContact.display_name.charAt(0).toUpperCase() }}</div>
-            <div class="detail-info">
-              <h2 data-testid="contact-detail-name">{{ selectedContact.display_name }}</h2>
-              <span v-if="selectedContact.organization" class="detail-org">
-                {{ selectedContact.title ? `${selectedContact.title}, ` : "" }}{{ selectedContact.organization }}
-              </span>
-            </div>
-          </div>
-          <div class="detail-actions">
-            <button class="action-btn" data-testid="contact-edit-btn" @click="openEditForm(selectedContact!)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
-              Edit
-            </button>
-            <button class="action-btn danger" data-testid="contact-delete-btn" @click="confirmDelete(selectedContact!.id)">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
-              Delete
-            </button>
-          </div>
-          <div class="detail-fields">
-            <div v-for="em in parseEmails(selectedContact.emails_json)" :key="em.email" class="field-row">
-              <span class="field-label">{{ em.label }}</span>
-              <a
-                class="field-value field-link"
-                data-testid="contact-detail-email"
-                :href="`mailto:${encodeMailtoAddress(em.email)}`"
-                @click.prevent="onEmailClick(em.email)"
-                @mouseenter="onLinkEnter(`mailto:${encodeMailtoAddress(em.email)}`)"
-                @mouseleave="onLinkLeave"
-              >{{ em.email }}</a>
-            </div>
-            <div v-for="ph in parsePhones(selectedContact.phones_json)" :key="ph.number" class="field-row">
-              <span class="field-label">{{ ph.label }}</span>
-              <a
-                class="field-value field-link"
-                data-testid="contact-detail-phone"
-                :href="`tel:${sanitizeTel(ph.number)}`"
-                @click.prevent="onPhoneClick(ph.number)"
-                @mouseenter="onLinkEnter(`tel:${sanitizeTel(ph.number)}`)"
-                @mouseleave="onLinkLeave"
-              >{{ ph.number }}</a>
-            </div>
-            <div v-if="selectedContact.notes" class="field-row">
-              <span class="field-label">Notes</span>
-              <LinkifiedText
-                :text="selectedContact.notes"
-                class="field-value notes"
-                data-testid="contact-detail-notes"
-              />
-            </div>
-          </div>
-        </template>
-        <div v-else class="empty-text">Select a contact to view details</div>
-      </div>
+      <ContactDetailPanel
+        :contact="selectedContact"
+        :books="contactBooks"
+        @edit="openEditForm"
+        @delete="confirmDelete"
+      />
       </div><!-- /.contacts-content -->
       </div><!-- /.contacts-main -->
     </div>
@@ -1169,72 +952,6 @@ async function applyMerge() {
   flex-direction: column;
 }
 
-/* Inner items get the indent that used to live on .books-sidebar so
-   the .app-sidebar-header above sits flush with the toolbar's left
-   edge instead of being pushed in 8px from the container. (#150) */
-.books-sidebar .book-item,
-.books-sidebar .empty-text {
-  margin: 0 8px;
-}
-.books-sidebar > .app-sidebar-header + .book-item {
-  margin-top: 8px;
-}
-
-.book-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px;
-  border-radius: 6px;
-  text-align: left;
-  transition: background 0.12s;
-  margin-bottom: 2px;
-}
-.book-item:hover { background: var(--color-bg-hover); }
-.book-item.active {
-  background: var(--color-accent-light);
-  border: 1px solid var(--color-border);
-}
-
-.book-avatar {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-
-.book-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.book-name {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.book-meta {
-  font-size: 10px;
-  color: var(--color-text-muted);
-}
-
-.book-chevron {
-  flex-shrink: 0;
-  color: var(--color-text-muted);
-}
-
 /* Wrapper around the toolbar + contact-list + detail panes. The
    toolbar always sits at the top so its layout never depends on the
    View > Contact Pane choice (the toggle below applies to
@@ -1276,75 +993,6 @@ async function applyMerge() {
   border-bottom: 0.8px solid var(--color-border);
 }
 
-.search-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  margin: 8px;
-  padding: 0 12px;
-  background: var(--color-bg-secondary);
-  border: 0.8px solid var(--color-border);
-  border-radius: 6px;
-  color: var(--color-text-muted);
-  flex-shrink: 0;
-}
-
-.search-bar input {
-  flex: 1;
-  border: none;
-  background: transparent;
-  font-size: 14px;
-  outline: none;
-  color: var(--color-text);
-}
-
-.contact-list {
-  flex: 1;
-  overflow-y: auto;
-}
-
-.contact-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 0.8px solid var(--color-border);
-  cursor: pointer;
-  transition: background 0.12s;
-}
-.contact-row:hover { background: var(--color-bg-hover); }
-.contact-row.active {
-  background: var(--color-bg-active);
-  box-shadow: inset 3px 0 0 var(--color-accent);
-}
-
-.contact-avatar {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  /* background set inline by acctColor() */
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.contact-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.contact-name { font-size: 18px; font-weight: 500; color: var(--color-text); }
-.contact-email { font-size: 14px; color: var(--color-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.contact-org { font-size: 12px; color: var(--color-text-muted); }
-
 /* Detail Panel. Sized differently per layout mode:
    - "right": fixed 400px column, list takes the remaining width.
    - "bottom": flexible split, both panes share the column. */
@@ -1360,84 +1008,6 @@ async function applyMerge() {
   flex: 1;
   min-height: 0;
 }
-
-.detail-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 24px 20px;
-  border-bottom: 0.8px solid var(--color-border);
-}
-
-.detail-avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  /* background set inline by acctColor() */
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 20px;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.detail-info { flex: 1; }
-.detail-info h2 { font-size: 20px; font-weight: 600; }
-.detail-org { font-size: 14px; color: var(--color-text-muted); }
-
-.detail-actions {
-  display: flex;
-  gap: 8px;
-  padding: 12px 20px;
-  border-bottom: 0.8px solid var(--color-border);
-}
-
-.action-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 32px;
-  padding: 0 12px;
-  background: var(--color-bg-tertiary);
-  border-radius: 4px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--color-text);
-  transition: background 0.12s;
-}
-.action-btn:hover { background: var(--color-border); }
-.action-btn.danger { color: var(--color-danger-text); }
-.action-btn.danger:hover { background: rgba(251, 44, 54, 0.08); }
-
-.detail-fields { padding: 16px 20px; }
-
-.field-row {
-  display: flex;
-  gap: 12px;
-  padding: 10px 0;
-  border-bottom: 0.8px solid var(--color-border);
-  align-items: baseline;
-}
-
-.field-label {
-  width: 70px;
-  flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--color-text-muted);
-  text-transform: capitalize;
-}
-
-.field-value { font-size: 14px; color: var(--color-text); }
-.field-value.notes { white-space: pre-wrap; color: var(--color-text-secondary); }
-.field-link {
-  color: var(--color-accent);
-  text-decoration: underline;
-  cursor: pointer;
-}
-.field-link:hover { filter: brightness(1.1); }
 
 .empty-text { padding: 32px 20px; text-align: center; color: var(--color-text-muted); font-size: 14px; }
 
@@ -1721,57 +1291,6 @@ async function applyMerge() {
 }
 
 /* Merge UI (#129) ---------------------------------------------------------*/
-
-/* Multi-select toolbar above the contact list. Flat strip that
-   appears the moment a second contact is picked via Ctrl/Cmd-click. */
-.merge-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary);
-  border-top: 0.8px solid var(--color-border);
-  border-bottom: 0.8px solid var(--color-border);
-  font-size: 13px;
-}
-.merge-toolbar-text {
-  flex: 1;
-  color: var(--color-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.merge-toolbar-btn {
-  height: 28px;
-  padding: 0 12px;
-  border-radius: 4px;
-  background: var(--color-accent);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 500;
-}
-.merge-toolbar-btn:disabled {
-  background: var(--color-border);
-  color: var(--color-text-muted);
-  cursor: not-allowed;
-}
-.merge-toolbar-cancel {
-  height: 28px;
-  padding: 0 10px;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--color-text-muted);
-  font-size: 13px;
-}
-.merge-toolbar-cancel:hover { color: var(--color-text); }
-
-/* Picked-state highlight for rows in the contact list. Distinct
-   from `.active` (which marks the row currently shown in the
-   detail panel) so multi-select state stays visible. */
-.contact-row.picked {
-  outline: 2px solid var(--color-accent);
-  outline-offset: -2px;
-}
 
 .merge-picker-hint {
   margin: 0 0 12px 0;
