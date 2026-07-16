@@ -13,6 +13,11 @@ export type AccountType =
   | "matrix"
   | "zoom";
 
+/// Cross-account contact-book option for the default-book dropdowns.
+/// The label is "Account / Book" so the same book name on two
+/// different accounts (e.g. "Personal") stays distinguishable.
+export type BookOption = { id: string; label: string };
+
 /// Order of the cards in the add-account picker dialog.
 export const ADD_ACCOUNT_TYPES: AccountType[] = [
   "gmail",

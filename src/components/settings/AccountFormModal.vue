@@ -18,10 +18,18 @@ import * as api from "@/lib/tauri";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import PasswordInput from "@/components/common/PasswordInput.vue";
 import ModalShell from "@/components/common/ModalShell.vue";
+import MeetAccountSection from "@/components/settings/MeetAccountSection.vue";
+import OauthSignInSection from "@/components/settings/OauthSignInSection.vue";
+import ImapServerSection from "@/components/settings/ImapServerSection.vue";
+import JmapSection from "@/components/settings/JmapSection.vue";
+import DavSection from "@/components/settings/DavSection.vue";
+import SyncBindingsSection from "@/components/settings/SyncBindingsSection.vue";
+import PgpAdvancedSection from "@/components/settings/PgpAdvancedSection.vue";
 import {
   accountTypeLabelLong,
   isFastmailJmapUrl,
   type AccountType,
+  type BookOption,
 } from "@/lib/account-types";
 
 const router = useRouter();
@@ -34,35 +42,6 @@ const error = ref<string | null>(null);
 const editingAccountId = ref<string | null>(null);
 const oauthStatus = ref<string | null>(null);
 const oauthInProgress = ref(false);
-const discoveringMail = ref(false);
-const discoveryNote = ref<string | null>(null);
-
-// Wire form-side number inputs in minutes; convert to/from seconds when
-// reading and writing AccountConfig so the wire format keeps the
-// Tauri-friendly seconds unit.
-function makeMinutesField(key: "calendar_sync_interval_seconds" | "contacts_sync_interval_seconds" | "mail_sync_interval_seconds") {
-  return computed<number | null>({
-    get: () => {
-      const s = form.value[key];
-      return s == null ? null : Math.round(s / 60);
-    },
-    set: (m) => {
-      if (m == null || Number.isNaN(m)) {
-        form.value[key] = null;
-      } else {
-        // Clamp to a minimum of 1 minute. The browser already enforces
-        // `min="1"` on the input but a programmatic v-model write (or
-        // someone bypassing the input) could otherwise persist
-        // sub-minute values into *_sync_interval_seconds.
-        const minutes = Math.max(1, Math.round(m));
-        form.value[key] = minutes * 60;
-      }
-    },
-  });
-}
-
-const calendarIntervalMinutes = makeMinutesField("calendar_sync_interval_seconds");
-const contactsIntervalMinutes = makeMinutesField("contacts_sync_interval_seconds");
 
 // Default contact book per binding (#137). Stored separately from
 // `form` because it lives in service_bindings.config_json, not in
@@ -72,10 +51,7 @@ const contactsIntervalMinutes = makeMinutesField("contacts_sync_interval_seconds
 const defaultMailBookId = ref<string | null>(null);
 const defaultCalendarBookId = ref<string | null>(null);
 
-// Cross-account list of contact books shown in the dropdowns. Each
-// label is "Account / Book" so the same book name on two different
-// accounts (e.g. "Personal") stays distinguishable.
-type BookOption = { id: string; label: string };
+// Cross-account list of contact books shown in the dropdowns.
 const availableBooks = ref<BookOption[]>([]);
 
 async function loadAvailableBooks() {
@@ -464,121 +440,6 @@ async function openEdit(id: string) {
 
 defineExpose({ openNew, openEdit });
 
-/// Thunderbird-style mail-server autodiscovery for the IMAP tab.
-/// Applies any discovered IMAP/SMTP host+port+TLS settings to the
-/// form. CalDAV / CardDAV are intentionally not probed here: an
-/// IMAP account is mail-only by design now, and pretending
-/// otherwise turned out to silently glue mail and DAV bindings
-/// onto the same row, then collide with the dedicated CalDAV /
-/// CardDAV account types and produce duplicate calendars on sync.
-///
-/// Discovery never overwrites a value the user has already typed.
-/// MX-derived hosts in particular are an inbound-routing hint that
-/// frequently differs from the actual submission/IMAP servers
-/// (relay providers, hosted spam filters), so trusting them over
-/// user input would silently break the account; the same principle
-/// applies to higher-quality sources too — if the user typed a
-/// value, they have context the autoconfig database doesn't.
-async function discoverMailServers() {
-  discoveringMail.value = true;
-  discoveryNote.value = null;
-  try {
-    const result = await api.discoverMailServers(
-      form.value.email,
-      form.value.imap_host,
-      form.value.smtp_host,
-    );
-
-    const filled: string[] = [];
-    const skipped: string[] = [];
-
-    // Each field (host, port) is checked independently so a user
-    // who has the host typed but cleared the port can fill in just
-    // the port via discovery, and vice versa. Port `0` from the
-    // form (cleared <input type="number">) counts as empty.
-    const imapAvailable = !!result.imap_host;
-    const smtpAvailable = !!result.smtp_host;
-    const imapHostEmpty = !form.value.imap_host;
-    const imapPortEmpty = !form.value.imap_port;
-    const smtpHostEmpty = !form.value.smtp_host;
-    const smtpPortEmpty = !form.value.smtp_port;
-
-    let filledImapHost = false;
-    if (imapAvailable && imapHostEmpty) {
-      form.value.imap_host = result.imap_host;
-      filledImapHost = true;
-    }
-    let filledImapPort = false;
-    if (imapPortEmpty && result.imap_port) {
-      form.value.imap_port = result.imap_port;
-      filledImapPort = true;
-    }
-    if (filledImapHost || filledImapPort) {
-      filled.push("IMAP");
-    } else if (imapAvailable) {
-      skipped.push("IMAP");
-    }
-
-    let filledSmtpHost = false;
-    if (smtpAvailable && smtpHostEmpty) {
-      form.value.smtp_host = result.smtp_host;
-      filledSmtpHost = true;
-    }
-    let filledSmtpPort = false;
-    if (smtpPortEmpty && result.smtp_port) {
-      form.value.smtp_port = result.smtp_port;
-      filledSmtpPort = true;
-    }
-    if (filledSmtpHost || filledSmtpPort) {
-      filled.push("SMTP");
-    } else if (smtpAvailable) {
-      skipped.push("SMTP");
-    }
-
-    // Apply use_tls only when we filled the matching *host* — the
-    // TLS setting belongs to the host, not the port, so adjusting
-    // it after only filling a port could silently flip a user's
-    // intent on a host they typed manually. If both hosts were
-    // filled and disagree, prefer the more secure setting rather
-    // than silently downgrade.
-    if (filledImapHost && filledSmtpHost) {
-      if (result.imap_use_tls === result.smtp_use_tls) {
-        form.value.use_tls = result.imap_use_tls;
-      } else {
-        console.warn(
-          "autoconfig: imap_use_tls / smtp_use_tls disagree; keeping TLS on",
-        );
-        form.value.use_tls = true;
-      }
-    } else if (filledImapHost) {
-      form.value.use_tls = result.imap_use_tls;
-    } else if (filledSmtpHost) {
-      form.value.use_tls = result.smtp_use_tls;
-    }
-
-    const sourceLabel = result.source ? ` (via ${result.source})` : "";
-    if (filled.length === 0 && skipped.length === 0) {
-      discoveryNote.value = "No autoconfig data found for this domain.";
-    } else if (filled.length === 0) {
-      discoveryNote.value =
-        `Kept your existing ${skipped.join(" + ")} settings; autoconfig${sourceLabel} also returned values but did not overwrite.`;
-    } else if (skipped.length === 0) {
-      discoveryNote.value = `Filled ${filled.join(" + ")}${sourceLabel}.`;
-    } else {
-      discoveryNote.value =
-        `Filled ${filled.join(" + ")}${sourceLabel}. Kept your existing ${skipped.join(" + ")} settings.`;
-    }
-  } catch (e) {
-    // Match the rest of the UI: unwrap Error.message instead of
-    // template-stringifying the raw value, which can render
-    // "[object Object]" when the backend returns a structured error.
-    const msg = e instanceof Error ? e.message : String(e);
-    discoveryNote.value = `Discovery failed: ${msg}`;
-  } finally {
-    discoveringMail.value = false;
-  }
-}
-
 async function saveAccount() {
   saving.value = true;
   error.value = null;
@@ -921,6 +782,10 @@ async function signInWithZoom() {
     :title="editingAccountId ? 'Edit Account' : 'Add Account'"
     @close="cancelForm"
   >
+    <!-- Wrapper element so shared form primitives can be styled once
+         here and reach the per-type section components via :deep()
+         (scoped styles otherwise stop at child roots). -->
+    <div class="account-form">
     <div v-if="error" class="form-error">{{ error }}</div>
 
     <!-- Account type is picked via the picker dialog before this
@@ -944,74 +809,20 @@ async function signInWithZoom() {
          of the form, since neither account type has any
          mail / calendar / contacts surface to configure
          here. -->
-    <template v-if="accountType === 'talk' || accountType === 'matrix' || accountType === 'zoom'">
-      <!-- URL input hidden on Zoom because Zoom is hosted —
-           there's no per-user server to type. Talk and
-           Matrix both need the user's instance URL. -->
-      <div v-if="accountType !== 'zoom'" class="form-group">
-        <label>{{ accountType === 'matrix' ? 'Homeserver URL' : 'Nextcloud URL' }}</label>
-        <input
-          v-model="form.meet_url"
-          type="url"
-          :placeholder="accountType === 'matrix'
-            ? 'https://matrix.example.org'
-            : 'https://cloud.example.org'"
-          :data-testid="`${accountType}-url`"
-        />
-        <span class="field-hint">
-          {{ accountType === 'matrix'
-            ? 'Base URL of your Matrix homeserver. SSO will open in your browser.'
-            : 'Base URL of your Nextcloud server. Login Flow v2 will open in your browser.' }}
-        </span>
-      </div>
-      <!-- Sign-in button only shows on the new-account
-           flow. The login flow always inserts a fresh
-           account row (it can't update an existing one),
-           so on edit we hide the button to avoid
-           duplicating the account when the user clicks
-           it. Re-auth of an existing meet account is a
-           delete-and-add operation today. -->
-      <div v-if="!editingAccountId" class="form-group">
-        <button
-          type="button"
-          class="btn-oauth"
-          :disabled="meetSigningIn || (accountType !== 'zoom' && !form.meet_url)"
-          :data-testid="`${accountType}-signin-btn`"
-          @click="
-            accountType === 'talk'
-              ? signInWithTalk()
-              : accountType === 'matrix'
-                ? signInWithMatrix()
-                : signInWithZoom()
-          "
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
-          </svg>
-          {{
-            meetSigningIn
-              ? 'Waiting for browser…'
-              : accountType === 'matrix'
-                ? 'Sign in with Matrix'
-                : accountType === 'zoom'
-                  ? 'Sign in with Zoom'
-                  : 'Sign in with Nextcloud'
-          }}
-        </button>
-        <span class="field-hint">
-          Opens your browser to authenticate. {{
-            accountType === 'zoom'
-              ? 'Chithi receives an OAuth token tied to your Zoom account.'
-              : 'Your real password never reaches Chithi — we keep a long-lived app token tied to this device.'
-          }}
-        </span>
-      </div>
-      <div v-else class="form-group">
-        <span class="field-hint">
-          To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : accountType === 'zoom' ? 'Zoom' : 'Nextcloud' }} server.
-        </span>
-      </div>
-    </template>
+    <MeetAccountSection
+      v-if="accountType === 'talk' || accountType === 'matrix' || accountType === 'zoom'"
+      :form="form"
+      :account-type="accountType"
+      :editing="!!editingAccountId"
+      :signing-in="meetSigningIn"
+      @sign-in="
+        accountType === 'talk'
+          ? signInWithTalk()
+          : accountType === 'matrix'
+            ? signInWithMatrix()
+            : signInWithZoom()
+      "
+    />
 
     <!-- DAV-only and meet-only accounts have no mail
          identity, so they skip the email field. DAV uses an
@@ -1057,138 +868,43 @@ async function signInWithZoom() {
       <span v-else class="field-hint">Passwords are stored securely in your OS keyring</span>
     </div>
 
-    <template v-if="accountType === 'gmail'">
-      <div class="form-group">
-        <label>Calendar &amp; Contacts Sync</label>
-        <div v-if="oauthStatus" class="oauth-row">
-          <div class="oauth-status">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-            {{ oauthStatus }}
-          </div>
-          <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
-        </div>
-        <button
-          v-else
-          class="btn-oauth"
-          :disabled="oauthInProgress"
-          @click="startGoogleOAuth"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-            <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
-            <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
-            <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18A10.96 10.96 0 0 0 1 12c0 1.77.42 3.45 1.18 4.93l3.66-2.84z" fill="#FBBC05"/>
-            <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
-          </svg>
-          {{ oauthInProgress ? "Waiting for browser..." : "Sign in with Google" }}
-        </button>
-        <span class="field-hint">Sign in to sync Google Calendar and Contacts. IMAP/SMTP uses app password above.</span>
-      </div>
-    </template>
+    <OauthSignInSection
+      v-if="accountType === 'gmail'"
+      provider="google"
+      :status="oauthStatus"
+      :in-progress="oauthInProgress"
+      @sign-in="startGoogleOAuth"
+      @reauth="oauthStatus = null"
+    />
 
-    <template v-if="accountType === 'o365'">
-      <div class="form-group">
-        <label>Microsoft 365 Sign In</label>
-        <div v-if="oauthStatus" class="oauth-row">
-          <div class="oauth-status">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-            {{ oauthStatus }}
-          </div>
-          <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
-        </div>
-        <button
-          v-else
-          class="btn-oauth"
-          :disabled="oauthInProgress"
-          @click="startMicrosoftOAuth"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-            <rect x="1" y="1" width="10" height="10" fill="#F25022"/>
-            <rect x="13" y="1" width="10" height="10" fill="#7FBA00"/>
-            <rect x="1" y="13" width="10" height="10" fill="#00A4EF"/>
-            <rect x="13" y="13" width="10" height="10" fill="#FFB900"/>
-          </svg>
-          {{ oauthInProgress ? "Waiting for browser..." : "Sign in with Microsoft" }}
-        </button>
-        <span class="field-hint">Sign in to access mail, calendar, and contacts via Microsoft Graph API.</span>
-      </div>
-    </template>
+    <OauthSignInSection
+      v-if="accountType === 'o365'"
+      provider="microsoft"
+      :status="oauthStatus"
+      :in-progress="oauthInProgress"
+      @sign-in="startMicrosoftOAuth"
+      @reauth="oauthStatus = null"
+    />
 
-    <template v-if="accountType === 'imap'">
-      <div class="form-row">
-        <div class="form-group">
-          <label>IMAP Server</label>
-          <input v-model="form.imap_host" type="text" placeholder="imap.example.com" />
-        </div>
-        <div class="form-group port">
-          <label>Port</label>
-          <input v-model.number="form.imap_port" type="number" />
-        </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>SMTP Server</label>
-          <input v-model="form.smtp_host" type="text" placeholder="smtp.example.com" />
-        </div>
-        <div class="form-group port">
-          <label>Port</label>
-          <input v-model.number="form.smtp_port" type="number" />
-        </div>
-      </div>
-    </template>
+    <!-- Server rows + autodiscovery. Order-safe merge: for the IMAP
+         tab nothing renders between the old server-rows and
+         discovery positions. -->
+    <ImapServerSection
+      v-if="accountType === 'imap'"
+      :form="form"
+      :editing="!!editingAccountId"
+    />
 
-    <template v-if="accountType === 'jmap'">
-      <div class="form-group">
-        <label>Authentication</label>
-        <div class="type-selector">
-          <button
-            class="type-btn"
-            :class="{ active: form.jmap_auth_method === 'basic' }"
-            :disabled="!!editingAccountId"
-            @click="form.jmap_auth_method = 'basic'; oauthStatus = null"
-          >Password</button>
-          <button
-            class="type-btn"
-            :class="{ active: form.jmap_auth_method === 'oidc' }"
-            :disabled="!!editingAccountId"
-            @click="form.jmap_auth_method = 'oidc'"
-          >OIDC</button>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>JMAP URL</label>
-        <input v-model="form.jmap_url" type="url" placeholder="https://mail.example.com" />
-        <span class="field-hint">Leave blank for auto-discovery via .well-known/jmap</span>
-      </div>
-      <template v-if="form.jmap_auth_method === 'oidc'">
-        <div class="form-group">
-          <label>OIDC Sign In</label>
-          <div v-if="oauthStatus" class="oauth-row">
-            <div class="oauth-status">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00a63e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-              {{ oauthStatus }}
-            </div>
-            <button class="btn-reauth" @click="oauthStatus = null">Sign in again</button>
-          </div>
-          <div v-else-if="oidcUserCode" class="oidc-device-code">
-            <p class="device-code-label">Enter this code in your browser:</p>
-            <p class="device-code-value">{{ oidcUserCode }}</p>
-            <p class="device-code-hint">Waiting for authorization...</p>
-          </div>
-          <button
-            v-else
-            class="btn-oauth"
-            :disabled="oauthInProgress || !form.email"
-            @click="startJmapOidc"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
-            </svg>
-            {{ oauthInProgress ? "Starting..." : "Sign in with OIDC" }}
-          </button>
-          <span class="field-hint">Opens your browser to authenticate with your identity provider.</span>
-        </div>
-      </template>
-    </template>
+    <JmapSection
+      v-if="accountType === 'jmap'"
+      :form="form"
+      :editing="!!editingAccountId"
+      :oauth-status="oauthStatus"
+      :oidc-user-code="oidcUserCode"
+      :oauth-in-progress="oauthInProgress"
+      @oidc-sign-in="startJmapOidc"
+      @reauth="oauthStatus = null"
+    />
 
     <!-- Fastmail tab: hardcoded JMAP URL + bearer auth, so the
          form only needs an info row. The API-token field is
@@ -1205,61 +921,14 @@ async function signInWithZoom() {
     <!-- For standalone CalDAV / CardDAV the URL is the entire
          reason the account exists, so it stays as a manual
          input. IMAP accounts go through auto-discovery instead
-         (button below); the discovered URL drives whether the
-         calendar / contacts toggles appear in the per-service
-         section. -->
-    <template v-if="accountType === 'caldav' || accountType === 'carddav'">
-      <div class="form-group">
-        <label>{{ accountType === 'carddav' ? 'CardDAV URL' : 'CalDAV URL' }}</label>
-        <input
-          v-model="form.caldav_url"
-          type="url"
-          :placeholder="accountType === 'carddav'
-            ? 'https://contacts.example.com/dav'
-            : 'https://mail.example.com/dav/cal'"
-          :data-testid="`${accountType}-url`"
-        />
-      </div>
-    </template>
-
-    <template v-if="accountType === 'imap'">
-      <div class="form-group">
-        <label>Mail server auto-discovery</label>
-        <div class="mail-discovery-row">
-          <button
-            type="button"
-            class="btn-secondary"
-            data-testid="mail-discover-btn"
-            :disabled="discoveringMail || !form.email"
-            @click="discoverMailServers"
-          >
-            {{ discoveringMail ? 'Searching...' : 'Auto-discover IMAP / SMTP' }}
-          </button>
-          <span v-if="!form.email" class="field-hint">
-            Enter your email address first.
-          </span>
-        </div>
-        <span v-if="discoveryNote" class="field-hint" data-testid="mail-discovery-note">
-          {{ discoveryNote }}
-        </span>
-        <span class="field-hint">
-          Looks up the IMAP / SMTP host, port and TLS settings for your domain via Thunderbird-style autoconfig. Calendars and contacts are added as separate accounts on the CalDAV / CardDAV tabs.
-        </span>
-        <div v-if="editingAccountId && form.caldav_url" class="dav-link-cleanup-row">
-          <span class="field-hint dav-link-hint" data-testid="dav-link-hint">
-            This account is also linked to {{ form.caldav_url }}.
-          </span>
-          <button
-            type="button"
-            class="btn-secondary"
-            data-testid="dav-unlink-btn"
-            @click="form.caldav_url = ''"
-          >
-            Unlink calendar / contacts
-          </button>
-        </div>
-      </div>
-    </template>
+         (inside ImapServerSection); the discovered URL drives
+         whether the calendar / contacts toggles appear in the
+         per-service section. -->
+    <DavSection
+      v-if="accountType === 'caldav' || accountType === 'carddav'"
+      :form="form"
+      :account-type="accountType"
+    />
 
     <template v-if="accountType === 'gmail' && !editingAccountId">
       <div class="info-box">Gmail uses IMAP (imap.gmail.com:993) and SMTP (smtp.gmail.com:587). Sign in with Google above to authorize access.</div>
@@ -1277,170 +946,18 @@ async function signInWithZoom() {
 
     <!-- Per-binding sync controls. Only meaningful for accounts
          that have multiple bindings; the standalone CalDAV /
-         CardDAV tabs hide the irrelevant rows. Visually a
-         form-group that matches the other sections rather than
-         a bordered fieldset. -->
-    <div
+         CardDAV tabs hide the irrelevant rows. -->
+    <SyncBindingsSection
       v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
-      class="form-group bindings-section"
-      data-testid="binding-controls"
-    >
-      <label class="bindings-section-title">Per-service sync</label>
+      v-model:mail-book-id="defaultMailBookId"
+      v-model:calendar-book-id="defaultCalendarBookId"
+      :form="form"
+      :has-calendar-binding="hasCalendarBinding"
+      :has-contacts-binding="hasContactsBinding"
+      :available-books="availableBooks"
+    />
 
-      <!-- Mail toggle + interval: only show when there's actually
-           a mail binding. CalDAV/CardDAV-only accounts hide this. -->
-      <div v-if="form.mail_protocol" class="form-group form-group-checkbox">
-        <label class="checkbox-label">
-          <input
-            v-model="form.mail_sync_enabled"
-            type="checkbox"
-            data-testid="mail-sync-enabled"
-          />
-          Sync mail
-        </label>
-        <p class="form-help">
-          Turn off to keep using calendars and contacts on this server without fetching mail. Useful for JMAP accounts you only treat as a calendar source.
-        </p>
-      </div>
-
-      <div v-if="hasCalendarBinding" class="form-group form-group-checkbox binding-row">
-        <label class="checkbox-label">
-          <input
-            v-model="form.calendar_sync_enabled"
-            type="checkbox"
-            data-testid="calendar-sync-enabled"
-          />
-          Sync calendar
-        </label>
-        <div class="interval-row">
-          <span>Every</span>
-          <input
-            v-model="calendarIntervalMinutes"
-            type="number"
-            min="1"
-            max="1440"
-            placeholder="5"
-            class="interval-input"
-            data-testid="calendar-sync-interval"
-          />
-          <span>minutes</span>
-          <span class="field-hint inline-hint">default 5 if blank</span>
-        </div>
-      </div>
-
-      <div v-if="hasContactsBinding" class="form-group form-group-checkbox binding-row">
-        <label class="checkbox-label">
-          <input
-            v-model="form.contacts_sync_enabled"
-            type="checkbox"
-            data-testid="contacts-sync-enabled"
-          />
-          Sync contacts
-        </label>
-        <div class="interval-row">
-          <span>Every</span>
-          <input
-            v-model="contactsIntervalMinutes"
-            type="number"
-            min="1"
-            max="1440"
-            placeholder="30"
-            class="interval-input"
-            data-testid="contacts-sync-interval"
-          />
-          <span>minutes</span>
-          <span class="field-hint inline-hint">default 30 if blank</span>
-        </div>
-      </div>
-
-      <p class="form-help bindings-footer">
-        When a service is off, the corresponding data is not fetched from the server. Already-synced data remains available offline.
-      </p>
-
-      <div v-if="form.mail_protocol" class="form-group binding-row">
-        <label>Default address book for compose</label>
-        <select
-          v-model="defaultMailBookId"
-          class="form-control"
-          data-testid="default-contact-book-mail"
-        >
-          <option :value="null">Auto (first synced book on this account)</option>
-          <option v-for="b in availableBooks" :key="b.id" :value="b.id">{{ b.label }}</option>
-        </select>
-        <span class="field-hint">Recipient autocomplete in the composer ranks matches from this book first.</span>
-      </div>
-
-      <div v-if="hasCalendarBinding" class="form-group binding-row">
-        <label>Default address book for event attendees</label>
-        <select
-          v-model="defaultCalendarBookId"
-          class="form-control"
-          data-testid="default-contact-book-calendar"
-        >
-          <option :value="null">Auto (first synced book on this account)</option>
-          <option v-for="b in availableBooks" :key="b.id" :value="b.id">{{ b.label }}</option>
-        </select>
-        <span class="field-hint">Attendee autocomplete in the event editor ranks matches from this book first.</span>
-      </div>
-    </div>
-
-    <!-- Per-account OpenPGP "Advanced settings". Only shown for
-         accounts that actually have a mail binding (mail_protocol
-         non-empty) — CalDAV-only / CardDAV-only / Meet accounts
-         don't send mail so these toggles would be meaningless.
-         All four ship default-on; the user opts out by unticking.
-         Backend reads these on the compose / draft commands. -->
-    <div
-      v-if="!isMeetTab && form.mail_protocol"
-      class="form-group bindings-section"
-      data-testid="pgp-advanced-settings"
-    >
-      <label class="bindings-section-title">Advanced settings</label>
-
-      <div class="form-group form-group-checkbox">
-        <label class="checkbox-label">
-          <input
-            v-model="form.pgp_attach_pubkey_on_sign"
-            type="checkbox"
-            data-testid="pgp-attach-pubkey-on-sign"
-          />
-          Attach my public key when adding an OpenPGP digital signature
-        </label>
-      </div>
-
-      <div class="form-group form-group-checkbox">
-        <label class="checkbox-label">
-          <input
-            v-model="form.pgp_autocrypt_header"
-            type="checkbox"
-            data-testid="pgp-autocrypt-header"
-          />
-          Send OpenPGP public key(s) in the email headers for compatibility with Autocrypt
-        </label>
-      </div>
-
-      <div class="form-group form-group-checkbox">
-        <label class="checkbox-label">
-          <input
-            v-model="form.pgp_encrypt_subject"
-            type="checkbox"
-            data-testid="pgp-encrypt-subject"
-          />
-          Encrypt the subject of OpenPGP messages
-        </label>
-      </div>
-
-      <div class="form-group form-group-checkbox">
-        <label class="checkbox-label">
-          <input
-            v-model="form.pgp_encrypt_drafts"
-            type="checkbox"
-            data-testid="pgp-encrypt-drafts"
-          />
-          Store draft messages in encrypted format
-        </label>
-      </div>
-    </div>
+    <PgpAdvancedSection v-if="!isMeetTab && form.mail_protocol" :form="form" />
 
     <!-- For standalone CalDAV/CardDAV the only relevant toggle is
          the calendar/contacts one for the matching service. -->
@@ -1470,6 +987,7 @@ async function signInWithZoom() {
         Sync contacts
       </label>
     </div>
+    </div>
 
     <template #footer>
       <button class="btn-secondary" @click="cancelForm">Cancel</button>
@@ -1489,20 +1007,17 @@ async function signInWithZoom() {
 </template>
 
 <style scoped>
-.form-error {
-  padding: 8px 12px;
-  background: rgba(220, 53, 69, 0.06);
-  color: var(--color-danger);
-  border-radius: 6px;
-  margin-bottom: 16px;
-  font-size: 12px;
-}
+/* Shared form primitives, styled once and reaching the per-type
+   section components through :deep() — scoped styles otherwise stop
+   at child component roots. Rules the modal alone uses (form-error,
+   type-readonly, signature, info-box, footer buttons) stay plain;
+   section-specific rules live in their section components. */
 
-.form-group {
+.account-form :deep(.form-group) {
   margin-bottom: 14px;
 }
 
-.form-group label {
+.account-form :deep(.form-group label) {
   display: block;
   margin-bottom: 4px;
   font-size: 12px;
@@ -1510,7 +1025,7 @@ async function signInWithZoom() {
   color: var(--color-text-secondary);
 }
 
-.form-group input {
+.account-form :deep(.form-group input) {
   width: 100%;
   height: 40px;
   padding: 0 12px;
@@ -1520,66 +1035,131 @@ async function signInWithZoom() {
   font-size: 16px;
 }
 
-.form-group input:focus {
+.account-form :deep(.form-group input:focus) {
   outline: none;
   border-color: var(--color-accent);
   box-shadow: 0 0 0 2px var(--color-accent-light);
 }
 
-.form-group input:disabled {
+.account-form :deep(.form-group input:disabled) {
   opacity: 0.5;
 }
 
-.field-hint {
+.account-form :deep(.field-hint) {
   display: block;
   font-size: 11px;
   color: var(--color-text-muted);
   margin-top: 4px;
 }
 
-.form-row {
+.account-form :deep(.form-row) {
   display: flex;
   gap: 12px;
 }
 
-.form-row .form-group {
+.account-form :deep(.form-row .form-group) {
   flex: 1;
 }
 
-.form-row .form-group.port {
+.account-form :deep(.form-row .form-group.port) {
   flex: 1;
 }
 
-.type-selector {
+.account-form :deep(.form-group-checkbox .checkbox-label) {
   display: flex;
+  align-items: center;
   gap: 8px;
-}
-
-.type-btn {
-  flex: 1;
-  height: 40px;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--color-text);
-  background: transparent;
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  transition: all 0.12s;
+  margin-bottom: 4px;
 }
 
-.type-btn:hover:not(:disabled) {
+.account-form :deep(.form-group-checkbox .checkbox-label input[type="checkbox"]) {
+  width: auto;
+  height: auto;
+  margin: 0;
+}
+
+.account-form :deep(.form-group-checkbox .form-help) {
+  margin: 0 0 0 24px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.account-form :deep(.btn-oauth) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 20px;
+  background: var(--color-bg-secondary);
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  transition: all 0.12s;
+  width: 100%;
+  justify-content: center;
+}
+
+.account-form :deep(.btn-oauth:hover) {
+  background: var(--color-bg-secondary);
   border-color: var(--color-text-muted);
 }
 
-.type-btn.active {
-  background: var(--color-accent-light);
-  border-color: var(--color-accent);
-  color: var(--color-accent);
+.account-form :deep(.btn-oauth:disabled) {
+  opacity: 0.6;
 }
 
-.type-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
+.account-form :deep(.oauth-row) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.account-form :deep(.oauth-status) {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 12px;
+  background: rgba(0, 166, 62, 0.06);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #00a63e;
+  flex: 1;
+}
+
+.account-form :deep(.btn-reauth) {
+  height: 40px;
+  padding: 0 12px;
+  border: 0.8px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  transition: all 0.12s;
+}
+
+.account-form :deep(.btn-reauth:hover) {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+/* Modal-own rules below. */
+
+.form-error {
+  padding: 8px 12px;
+  background: rgba(220, 53, 69, 0.06);
+  color: var(--color-danger);
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 12px;
 }
 
 /* Read-only label that replaces the per-type tab row inside the
@@ -1620,90 +1200,6 @@ async function signInWithZoom() {
   color: var(--color-text-muted);
 }
 
-.form-group-checkbox .checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text);
-  margin-bottom: 4px;
-}
-
-.form-group-checkbox .checkbox-label input[type="checkbox"] {
-  width: auto;
-  height: auto;
-  margin: 0;
-}
-
-.form-group-checkbox .form-help {
-  margin: 0 0 0 24px;
-  font-size: 12px;
-  color: var(--color-text-muted);
-  line-height: 1.4;
-}
-
-.bindings-section {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.bindings-section-title {
-  /* Mirror .form-group label so this section reads like a labelled field
-     (no border, no fieldset chrome). */
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text);
-}
-
-.binding-row {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.interval-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 24px;
-  font-size: 12px;
-  color: var(--color-text-muted);
-}
-
-.interval-input {
-  /* Override the full-width form input style — the timer field is a
-     short inline number input, not a text field. */
-  width: 64px;
-  height: 28px;
-  padding: 0 8px;
-  font-size: 12px;
-}
-
-.inline-hint {
-  margin-left: 4px;
-  font-style: italic;
-}
-
-.bindings-footer {
-  margin: 4px 0 0 0;
-  font-size: 12px;
-  color: var(--color-text-muted);
-  line-height: 1.4;
-}
-
-.mail-discovery-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.dav-link-hint {
-  word-break: break-all;
-}
-
 .btn-primary {
   height: 40px;
   padding: 0 20px;
@@ -1736,96 +1232,5 @@ async function signInWithZoom() {
 
 .btn-secondary:hover {
   background: var(--color-border);
-}
-
-.btn-oauth {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 40px;
-  padding: 0 20px;
-  background: var(--color-bg-secondary);
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--color-text);
-  transition: all 0.12s;
-  width: 100%;
-  justify-content: center;
-}
-
-.btn-oauth:hover {
-  background: var(--color-bg-secondary);
-  border-color: var(--color-text-muted);
-}
-
-.btn-oauth:disabled {
-  opacity: 0.6;
-}
-
-.oauth-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.oauth-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 40px;
-  padding: 0 12px;
-  background: rgba(0, 166, 62, 0.06);
-  border-radius: 4px;
-  font-size: 14px;
-  font-weight: 500;
-  color: #00a63e;
-  flex: 1;
-}
-
-.btn-reauth {
-  height: 40px;
-  padding: 0 12px;
-  border: 0.8px solid var(--color-border);
-  border-radius: 4px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
-  white-space: nowrap;
-  transition: all 0.12s;
-}
-
-.btn-reauth:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text);
-}
-
-.oidc-device-code {
-  text-align: center;
-  padding: 16px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  background: var(--color-bg-secondary);
-}
-
-.device-code-label {
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  margin-bottom: 8px;
-}
-
-.device-code-value {
-  font-size: 28px;
-  font-weight: 700;
-  font-family: 'Liberation Mono', monospace;
-  letter-spacing: 4px;
-  color: var(--color-accent);
-  margin-bottom: 8px;
-}
-
-.device-code-hint {
-  font-size: 12px;
-  color: var(--color-text-muted);
 }
 </style>
