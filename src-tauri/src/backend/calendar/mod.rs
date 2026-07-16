@@ -172,57 +172,11 @@ pub(crate) fn get_unpushed_events(
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use crate::db::service_bindings::ServiceBinding;
 
     fn account(calendar_protocol: &str, caldav_url: &str) -> AccountFull {
-        let bindings = if calendar_protocol.is_empty() {
-            Vec::new()
-        } else {
-            vec![ServiceBinding {
-                id: "b1".into(),
-                account_id: "acc1".into(),
-                service: "calendar".into(),
-                protocol: calendar_protocol.into(),
-                enabled: true,
-                sync_interval_seconds: None,
-                config_json: "{}".into(),
-            }]
-        };
-        AccountFull {
-            id: "acc1".into(),
-            display_name: "Test".into(),
-            email: "u@example.com".into(),
-            provider: "generic".into(),
-            mail_protocol: String::new(),
-            imap_host: String::new(),
-            imap_port: 0,
-            smtp_host: String::new(),
-            smtp_port: 0,
-            jmap_url: String::new(),
-            caldav_url: caldav_url.into(),
-            meet_url: String::new(),
-            meet_protocol: String::new(),
-            username: "u@example.com".into(),
-            password: String::new(),
-            use_tls: true,
-            enabled: true,
-            signature: String::new(),
-            jmap_auth_method: String::new(),
-            oidc_token_endpoint: String::new(),
-            oidc_client_id: String::new(),
-            calendar_sync_enabled: true,
-            auth_method: String::new(),
-            bindings,
-            mail_sync_enabled: true,
-            contacts_sync_enabled: false,
-            mail_sync_interval_seconds: None,
-            calendar_sync_interval_seconds: None,
-            contacts_sync_interval_seconds: None,
-            pgp_attach_pubkey_on_sign: false,
-            pgp_autocrypt_header: false,
-            pgp_encrypt_subject: false,
-            pgp_encrypt_drafts: false,
-        }
+        let mut account = crate::backend::testutil::account("calendar", calendar_protocol);
+        account.caldav_url = caldav_url.into();
+        account
     }
 
     #[test]
@@ -249,5 +203,83 @@ mod registry_tests {
     #[test]
     fn no_binding_no_caldav_url_is_none() {
         assert!(for_account(&account("", "")).is_none());
+    }
+}
+
+/// Per-provider semantics ADR 0050 calls load-bearing. The fixture
+/// account has no credentials or server URLs, so any I/O attempt fails
+/// before the network — which is exactly what these tests lean on:
+/// deferred/no-op paths must succeed without I/O, swallowing backends
+/// must turn the failure into `Ok`, propagating backends into `Err`.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::backend::testutil::{account, event, temp_pool};
+
+    /// CalDAV never pushes at create time — events go out with the
+    /// next sync's unpushed-rows pass.
+    #[tokio::test]
+    async fn caldav_defers_event_creation_to_sync() {
+        let pushed = caldav::CalDavCalendarBackend
+            .push_created_event(&account("calendar", "caldav"), &event(), "cal-href")
+            .await
+            .unwrap();
+        assert!(pushed.is_none());
+    }
+
+    /// JMAP and CalDAV do not push event updates (trait default
+    /// no-op). An override that starts pushing would hit the missing
+    /// server config and fail this test.
+    #[tokio::test]
+    async fn jmap_and_caldav_do_not_push_event_updates() {
+        jmap::JmapCalendarBackend
+            .push_updated_event(&account("calendar", "jmap"), "r1", &event())
+            .await
+            .unwrap();
+        caldav::CalDavCalendarBackend
+            .push_updated_event(&account("calendar", "caldav"), "r1", &event())
+            .await
+            .unwrap();
+    }
+
+    /// Google color pushes swallow a missing OAuth token — the local
+    /// pick sticks.
+    #[tokio::test]
+    async fn google_color_push_swallows_missing_token() {
+        google::GoogleCalendarBackend
+            .push_calendar_color(&account("calendar", "google"), "r1", "#a1b2c3")
+            .await
+            .unwrap();
+    }
+
+    /// Graph color pushes swallow only Graph API errors; a missing
+    /// token propagates (pre-trait behaviour, kept verbatim).
+    #[tokio::test]
+    async fn graph_color_push_propagates_missing_token() {
+        let result = graph::GraphCalendarBackend
+            .push_calendar_color(&account("calendar", "graph"), "r1", "#a1b2c3")
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// Google sync falls back to CalDAV only when `caldav_url` is
+    /// set; without one the failure propagates.
+    #[tokio::test]
+    async fn google_sync_without_caldav_fallback_propagates() {
+        let (_dir, db) = temp_pool();
+        let result = google::GoogleCalendarBackend
+            .sync(&db, &account("calendar", "google"))
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// Graph calendar sync propagates credential failures.
+    #[tokio::test]
+    async fn graph_sync_propagates_missing_token() {
+        let (_dir, db) = temp_pool();
+        let result = graph::GraphCalendarBackend
+            .sync(&db, &account("calendar", "graph"))
+            .await;
+        assert!(result.is_err());
     }
 }

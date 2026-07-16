@@ -286,3 +286,28 @@ impl CalendarBackend for JmapCalendarBackend {
             .await
     }
 }
+
+#[cfg(test)]
+mod payload_tests {
+    use super::to_jmap_event;
+    use crate::backend::testutil::event;
+
+    #[test]
+    fn create_payload_leaves_id_to_server_and_targets_given_calendar() {
+        let local = event();
+        let wire = to_jmap_event(&local, "remote-cal-7");
+        assert_eq!(wire.id, "");
+        assert_eq!(wire.calendar_id, "remote-cal-7");
+        assert_eq!(wire.title, local.title);
+        assert_eq!(wire.start, local.start_time);
+        assert_eq!(wire.end, local.end_time);
+        assert!(!wire.all_day);
+    }
+
+    #[test]
+    fn all_day_flag_carries_through() {
+        let mut local = event();
+        local.all_day = true;
+        assert!(to_jmap_event(&local, "c").all_day);
+    }
+}

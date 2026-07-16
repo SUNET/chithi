@@ -109,57 +109,9 @@ pub fn for_sync_type(sync_type: &str) -> Option<&'static dyn ContactBackend> {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use crate::db::service_bindings::ServiceBinding;
 
     fn account(contacts_protocol: &str) -> AccountFull {
-        let bindings = if contacts_protocol.is_empty() {
-            Vec::new()
-        } else {
-            vec![ServiceBinding {
-                id: "b1".into(),
-                account_id: "acc1".into(),
-                service: "contacts".into(),
-                protocol: contacts_protocol.into(),
-                enabled: true,
-                sync_interval_seconds: None,
-                config_json: "{}".into(),
-            }]
-        };
-        AccountFull {
-            id: "acc1".into(),
-            display_name: "Test".into(),
-            email: "u@example.com".into(),
-            provider: "generic".into(),
-            mail_protocol: String::new(),
-            imap_host: String::new(),
-            imap_port: 0,
-            smtp_host: String::new(),
-            smtp_port: 0,
-            jmap_url: String::new(),
-            caldav_url: String::new(),
-            meet_url: String::new(),
-            meet_protocol: String::new(),
-            username: "u@example.com".into(),
-            password: String::new(),
-            use_tls: true,
-            enabled: true,
-            signature: String::new(),
-            jmap_auth_method: String::new(),
-            oidc_token_endpoint: String::new(),
-            oidc_client_id: String::new(),
-            calendar_sync_enabled: false,
-            auth_method: String::new(),
-            bindings,
-            mail_sync_enabled: true,
-            contacts_sync_enabled: true,
-            mail_sync_interval_seconds: None,
-            calendar_sync_interval_seconds: None,
-            contacts_sync_interval_seconds: None,
-            pgp_attach_pubkey_on_sign: false,
-            pgp_autocrypt_header: false,
-            pgp_encrypt_subject: false,
-            pgp_encrypt_drafts: false,
-        }
+        crate::backend::testutil::account("contacts", contacts_protocol)
     }
 
     #[test]
@@ -181,5 +133,78 @@ mod registry_tests {
         assert!(for_sync_type("gopher").is_none());
         assert!(for_sync_type("").is_none());
         assert!(for_account(&account("")).is_none());
+    }
+}
+
+/// Per-provider semantics ADR 0050 calls load-bearing. The fixture
+/// account has no credentials or server URLs, so any I/O attempt fails
+/// before the network — which is exactly what these tests lean on:
+/// deferred paths must succeed without I/O, swallowing backends must
+/// turn the failure into `Ok`, propagating backends into `Err`.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::backend::testutil::{account, contact, temp_pool};
+
+    /// JMAP contact creation is deferred to the next sync's
+    /// unpushed-rows pass — never pushed at create time.
+    #[tokio::test]
+    async fn jmap_defers_contact_creation_to_sync() {
+        let book = BookRef {
+            book_id: "b1",
+            remote_id: Some("ab1"),
+        };
+        let pushed = jmap::JmapContactBackend
+            .push_created_contact(&account("contacts", "jmap"), &book, &contact())
+            .await
+            .unwrap();
+        assert!(pushed.is_none());
+    }
+
+    /// A CardDAV book without a collection href has nowhere to push;
+    /// the create is deferred instead of erroring.
+    #[tokio::test]
+    async fn carddav_create_without_collection_href_is_deferred() {
+        let book = BookRef {
+            book_id: "b1",
+            remote_id: None,
+        };
+        let pushed = carddav::CardDavContactBackend
+            .push_created_contact(&account("contacts", "carddav"), &book, &contact())
+            .await
+            .unwrap();
+        assert!(pushed.is_none());
+    }
+
+    /// Google and CardDAV contact syncs swallow failures (warn + Ok)
+    /// so one broken provider can't fail the whole contacts sync.
+    #[tokio::test]
+    async fn google_and_carddav_sync_swallow_failures() {
+        let (_dir, db) = temp_pool();
+        google::GoogleContactBackend
+            .sync(&db, &account("contacts", "google"))
+            .await
+            .unwrap();
+        let mut acc = account("contacts", "carddav");
+        // Non-empty invalid URL: fails validation without triggering
+        // live `.well-known` auto-discovery.
+        acc.caldav_url = "not a url".into();
+        carddav::CardDavContactBackend
+            .sync(&db, &acc)
+            .await
+            .unwrap();
+    }
+
+    /// JMAP and Graph contact syncs propagate failures.
+    #[tokio::test]
+    async fn jmap_and_graph_sync_propagate_failures() {
+        let (_dir, db) = temp_pool();
+        let mut acc = account("contacts", "jmap");
+        acc.jmap_url = "not a url".into();
+        assert!(jmap::JmapContactBackend.sync(&db, &acc).await.is_err());
+        assert!(graph::GraphContactBackend
+            .sync(&db, &account("contacts", "graph"))
+            .await
+            .is_err());
     }
 }
