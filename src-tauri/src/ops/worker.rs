@@ -78,8 +78,7 @@ impl AccountWorker {
 
             let mut sync_succeeded = false;
             for entry in ops {
-                let is_sync =
-                    matches!(entry.op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+                let is_sync = entry.op.is_sync();
                 match self.execute(entry.op).await {
                     Ok(()) => {
                         if is_sync {
@@ -250,23 +249,28 @@ impl AccountWorker {
     }
 
     /// Execute a single operation, dispatching sync ops to the backend
-    /// and everything else to the executor.
-    /// On failure of user operations, queues them to the offline outbox for retry.
+    /// and everything else to the executor. The match is deliberately
+    /// exhaustive (no wildcard): adding a `MailOp` variant forces a
+    /// routing decision here at compile time.
     async fn execute(&mut self, op: MailOp) -> Result<()> {
-        let is_sync = matches!(op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+        match op {
+            MailOp::SyncAll { current_folder } => self.sync_all(current_folder).await,
+            MailOp::SyncFolder { folder_path } => self.sync_folder(folder_path).await,
+            op @ (MailOp::MoveMessages { .. }
+            | MailOp::DeleteMessages { .. }
+            | MailOp::SetFlags { .. }
+            | MailOp::CopyMessages { .. }
+            | MailOp::SendRaw { .. }) => self.execute_user_op(op).await,
+        }
+    }
 
+    /// Run a user op through the executor; on failure, queue it to the
+    /// offline outbox for replay after the next successful sync.
+    async fn execute_user_op(&mut self, op: MailOp) -> Result<()> {
         // Serialize the op for outbox before executing (we move op into the executor)
-        let outbox_data = if !is_sync {
-            super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p))
-        } else {
-            None
-        };
+        let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
 
-        let result = if is_sync {
-            self.execute_sync(op).await
-        } else {
-            self.execute_op(op).await
-        };
+        let result = self.execute_op(op).await;
 
         // On failure of user operations, queue to outbox for later replay
         if let Err(ref e) = result {
@@ -308,45 +312,53 @@ impl AccountWorker {
         result
     }
 
-    /// Delegate sync to the backend's sync entry points.
-    /// Sync creates its own connections (including parallel ones for IMAP).
-    ///
-    /// Two deliberate carve-outs from the trait's command-path
-    /// semantics:
-    /// - Graph account syncs are owned by `sync_cmd` (queued SyncAll is
-    ///   a no-op here) and Graph has no per-folder fetch at all.
-    /// - Queued IMAP folder syncs are "quiet" — no `sync-started`
-    ///   spinner, but folders/messages-changed — unlike the command's
-    ///   `sync_folder`, which drives the UI spinner.
-    async fn execute_sync(&mut self, op: MailOp) -> Result<()> {
+    /// The account row and resolved backend for a sync op — `None`
+    /// when the account has no mail backend. Sync creates its own
+    /// connections (including parallel ones for IMAP); it never uses
+    /// the executor's.
+    fn sync_target(
+        &self,
+    ) -> Result<Option<(&'static dyn MailBackend, crate::db::accounts::AccountFull)>> {
         let account = {
             let conn = self.db.reader();
             crate::db::accounts::get_account_full(&conn, &self.account_id)?
         };
-        let Some(backend) = self.backend else {
+        Ok(self.backend.map(|b| (b, account)))
+    }
+
+    /// Delegate a full account sync to the backend. Deliberate
+    /// carve-out from the trait's command-path semantics: Graph account
+    /// syncs are owned by `sync_cmd`, so a queued SyncAll is a no-op.
+    async fn sync_all(&mut self, current_folder: Option<String>) -> Result<()> {
+        let Some((backend, account)) = self.sync_target()? else {
+            return Ok(());
+        };
+        if backend.protocol() == "graph" {
+            // Graph sync handled by sync_cmd directly
+            return Ok(());
+        }
+        let ctx = self.ctx.as_ref().expect("worker initialized");
+        backend.sync_account(ctx, &account, current_folder).await
+    }
+
+    /// Sync a single folder. Deliberate carve-outs from the trait's
+    /// command-path semantics: queued IMAP folder syncs are "quiet" —
+    /// no `sync-started` spinner, but folders/messages-changed — unlike
+    /// the command's `sync_folder`, which drives the UI spinner; and
+    /// Graph has no per-folder fetch at all.
+    async fn sync_folder(&mut self, folder_path: String) -> Result<()> {
+        let Some((backend, account)) = self.sync_target()? else {
             return Ok(());
         };
         let ctx = self.ctx.as_ref().expect("worker initialized");
-
-        match op {
-            MailOp::SyncAll { current_folder } => {
-                if backend.protocol() == "graph" {
-                    // Graph sync handled by sync_cmd directly
-                    return Ok(());
-                }
-                backend.sync_account(ctx, &account, current_folder).await?;
+        match backend.protocol() {
+            "jmap" => {
+                backend.sync_folder(ctx, &account, &folder_path).await?;
             }
-            MailOp::SyncFolder { folder_path } => match backend.protocol() {
-                "jmap" => {
-                    backend.sync_folder(ctx, &account, &folder_path).await?;
-                }
-                "imap" => {
-                    crate::backend::mail::imap::sync_folder_quiet(ctx, &account, &folder_path)
-                        .await?;
-                }
-                _ => {}
-            },
-            _ => unreachable!(),
+            "imap" => {
+                crate::backend::mail::imap::sync_folder_quiet(ctx, &account, &folder_path).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
