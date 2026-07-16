@@ -6,22 +6,10 @@ import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
-import Select from "@/components/common/Select.vue";
+import ContactFormModal from "@/components/contacts/ContactFormModal.vue";
 import { openComposeWindow } from "@/lib/compose-window";
 import { parseMailto } from "@/lib/mailto";
 import * as api from "@/lib/tauri";
-
-const EMAIL_LABEL_OPTIONS = [
-  { value: "work", label: "Work" },
-  { value: "home", label: "Home" },
-  { value: "other", label: "Other" },
-];
-
-const PHONE_LABEL_OPTIONS = [
-  { value: "mobile", label: "Mobile" },
-  { value: "work", label: "Work" },
-  { value: "home", label: "Home" },
-];
 
 defineProps<{
   standalone?: boolean;
@@ -403,22 +391,11 @@ async function loadRemoteImages() {
 
 const addrMenu = ref<{ x: number; y: number; email: string; name: string } | null>(null);
 const addrMenuContact = ref<Contact | null>(null);
-const showContactForm = ref(false);
-const contactFormSaving = ref(false);
-const contactFormError = ref<string | null>(null);
 const contactBooks = ref<ContactBook[]>([]);
 
-// Contact form fields
-const cfFirstName = ref("");
-const cfMiddleName = ref("");
-const cfLastName = ref("");
-const cfEmails = ref<{ email: string; label: string }[]>([]);
-const cfPhones = ref<{ number: string; label: string }[]>([]);
-const cfOrg = ref("");
-const cfTitle = ref("");
-const cfNotes = ref("");
-const cfBookId = ref("");
-const cfEditingId = ref<string | null>(null);
+// The new/edit form itself is the shared ContactFormModal (#166); the
+// reader only decides edit-vs-new and hands over the prefill.
+const contactForm = ref<InstanceType<typeof ContactFormModal> | null>(null);
 
 function closeAddrMenu() {
   addrMenu.value = null;
@@ -470,80 +447,21 @@ async function openContactForm() {
   const defaultBookId = activeAccountBooks[0]?.id ?? allBooks[0]?.id ?? "";
 
   if (addrMenuContact.value) {
-    // Edit existing contact
-    const c = addrMenuContact.value;
-    cfEditingId.value = c.id;
-    const parts = c.display_name.trim().split(/\s+/);
-    cfFirstName.value = parts[0] || "";
-    cfMiddleName.value = parts.length > 2 ? parts.slice(1, -1).join(" ") : "";
-    cfLastName.value = parts.length > 1 ? parts[parts.length - 1] : "";
-    try { cfEmails.value = JSON.parse(c.emails_json); } catch { cfEmails.value = []; }
-    if (cfEmails.value.length === 0) cfEmails.value = [{ email: "", label: "work" }];
-    try { cfPhones.value = JSON.parse(c.phones_json); } catch { cfPhones.value = []; }
-    cfOrg.value = c.organization ?? "";
-    cfTitle.value = c.title ?? "";
-    cfNotes.value = c.notes ?? "";
-    cfBookId.value = c.book_id;
+    contactForm.value?.openEdit(addrMenuContact.value);
   } else {
-    // New contact — prefill from the address
-    cfEditingId.value = null;
+    // New contact — prefill from the clicked address
     const nameParts = clickedName.trim().split(/\s+/).filter(Boolean);
-    cfFirstName.value = nameParts[0] || "";
-    cfMiddleName.value = nameParts.length > 2 ? nameParts.slice(1, -1).join(" ") : "";
-    cfLastName.value = nameParts.length > 1 ? nameParts[nameParts.length - 1] : "";
-    cfEmails.value = [{ email: clickedEmail, label: "work" }];
-    cfPhones.value = [];
-    cfOrg.value = "";
-    cfTitle.value = "";
-    cfNotes.value = "";
-    cfBookId.value = defaultBookId;
+    contactForm.value?.openNew(defaultBookId, {
+      firstName: nameParts[0] || "",
+      middleName: nameParts.length > 2 ? nameParts.slice(1, -1).join(" ") : "",
+      lastName: nameParts.length > 1 ? nameParts[nameParts.length - 1] : "",
+      email: clickedEmail,
+    });
   }
-  contactFormError.value = null;
-  showContactForm.value = true;
 }
 
-async function saveContactForm() {
-  if (!cfFirstName.value.trim()) { contactFormError.value = "First name is required"; return; }
-  if (!cfLastName.value.trim()) { contactFormError.value = "Last name is required"; return; }
-  contactFormSaving.value = true;
-  try {
-    const displayName = [cfFirstName.value.trim(), cfMiddleName.value.trim(), cfLastName.value.trim()]
-      .filter(Boolean).join(" ");
-    const emailsFiltered = cfEmails.value.filter((e) => e.email.trim());
-    const phonesFiltered = cfPhones.value.filter((p) => p.number.trim());
-
-    if (cfEditingId.value) {
-      const existing = addrMenuContact.value!;
-      await api.updateContact({
-        ...existing,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        organization: cfOrg.value || null,
-        title: cfTitle.value || null,
-        notes: cfNotes.value || null,
-        book_id: cfBookId.value,
-      });
-      showToast("Contact updated");
-    } else {
-      await api.createContact({
-        book_id: cfBookId.value,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        addresses_json: "[]",
-        organization: cfOrg.value || null,
-        title: cfTitle.value || null,
-        notes: cfNotes.value || null,
-      });
-      showToast("Contact added");
-    }
-    showContactForm.value = false;
-  } catch (e) {
-    contactFormError.value = String(e);
-  } finally {
-    contactFormSaving.value = false;
-  }
+function onContactSaved(editedId: string | null) {
+  showToast(editedId ? "Contact updated" : "Contact added");
 }
 
 // --- Message actions ---
@@ -934,86 +852,12 @@ async function markSpam() {
       <div v-if="addrMenu" class="addr-menu-overlay" @click="closeAddrMenu"></div>
     </Teleport>
 
-    <!-- Contact form modal -->
-    <Teleport to="body">
-      <div v-if="showContactForm" class="modal-overlay" @click.self="showContactForm = false">
-        <div class="modal contact-form-modal">
-          <div class="modal-header">
-            <h3>{{ cfEditingId ? 'Edit Contact' : 'Add to Contacts' }}</h3>
-            <button class="close-btn" @click="showContactForm = false">&times;</button>
-          </div>
-          <div class="modal-body">
-            <div v-if="contactFormError" class="form-error">{{ contactFormError }}</div>
-
-            <div v-if="contactBooks.length > 0" class="form-group">
-              <label>Contact Book</label>
-              <Select
-                v-model="cfBookId"
-                :options="contactBooks.map(b => ({ value: b.id, label: b.name }))"
-                class="form-select"
-              />
-            </div>
-
-            <div class="form-row">
-              <div class="form-group">
-                <label>First Name *</label>
-                <input v-model="cfFirstName" type="text" class="form-input" />
-              </div>
-              <div class="form-group">
-                <label>Middle</label>
-                <input v-model="cfMiddleName" type="text" class="form-input" />
-              </div>
-              <div class="form-group">
-                <label>Last Name *</label>
-                <input v-model="cfLastName" type="text" class="form-input" />
-              </div>
-            </div>
-
-            <div class="form-group">
-              <label>Emails</label>
-              <div v-for="(e, i) in cfEmails" :key="i" class="multi-field-row">
-                <input v-model="e.email" type="email" class="form-input" placeholder="email@example.com" />
-                <Select v-model="e.label" :options="EMAIL_LABEL_OPTIONS" class="form-select form-select-sm" />
-                <button v-if="cfEmails.length > 1" class="remove-btn" @click="cfEmails.splice(i, 1)">&times;</button>
-              </div>
-              <button class="add-field-btn" @click="cfEmails.push({ email: '', label: 'work' })">+ Add Email</button>
-            </div>
-
-            <div class="form-group">
-              <label>Phones</label>
-              <div v-for="(p, i) in cfPhones" :key="i" class="multi-field-row">
-                <input v-model="p.number" type="tel" class="form-input" placeholder="+1 555-0100" />
-                <Select v-model="p.label" :options="PHONE_LABEL_OPTIONS" class="form-select form-select-sm" />
-                <button class="remove-btn" @click="cfPhones.splice(i, 1)">&times;</button>
-              </div>
-              <button class="add-field-btn" @click="cfPhones.push({ number: '', label: 'mobile' })">+ Add Phone</button>
-            </div>
-
-            <div class="form-row">
-              <div class="form-group">
-                <label>Organization</label>
-                <input v-model="cfOrg" type="text" class="form-input" />
-              </div>
-              <div class="form-group">
-                <label>Job Title</label>
-                <input v-model="cfTitle" type="text" class="form-input" />
-              </div>
-            </div>
-
-            <div class="form-group">
-              <label>Notes</label>
-              <textarea v-model="cfNotes" rows="2" class="form-input"></textarea>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button class="btn-secondary" @click="showContactForm = false">Cancel</button>
-            <button class="btn-primary" :disabled="contactFormSaving" @click="saveContactForm">
-              {{ contactFormSaving ? 'Saving...' : (cfEditingId ? 'Save' : 'Add Contact') }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
+    <!-- Shared new/edit contact modal (#166) -->
+    <ContactFormModal
+      ref="contactForm"
+      :books="contactBooks"
+      @saved="onContactSaved"
+    />
   </div>
 </template>
 
@@ -1364,192 +1208,6 @@ async function markSpam() {
 
 .addr-context-menu .ctx-item:hover {
   background: var(--color-bg-hover);
-}
-
-.contact-form-modal {
-  width: 480px;
-  max-height: 80vh;
-  overflow-y: auto;
-}
-
-.contact-form-modal .modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.contact-form-modal .modal-header h3 {
-  margin: 0;
-  font-size: 15px;
-}
-
-.contact-form-modal .close-btn {
-  font-size: 20px;
-  background: none;
-  border: none;
-  color: var(--color-text-muted);
-  cursor: pointer;
-}
-
-.contact-form-modal .modal-body {
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.contact-form-modal .modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--color-border);
-}
-
-.contact-form-modal .form-error {
-  color: var(--color-danger-text);
-  font-size: 12px;
-  padding: 6px 8px;
-  background: rgba(251, 44, 54, 0.06);
-  border-radius: 4px;
-}
-
-.contact-form-modal .form-group {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.contact-form-modal .form-group label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-text-secondary);
-}
-
-.contact-form-modal .form-row {
-  display: flex;
-  gap: 8px;
-}
-
-.contact-form-modal .form-row .form-group {
-  flex: 1;
-  min-width: 0;
-}
-
-.contact-form-modal .form-input,
-.contact-form-modal .form-select {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 6px 8px;
-  font-size: 13px;
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-bg);
-  color: var(--color-text);
-}
-
-.contact-form-modal .form-select {
-  --input-padding: 6px 8px;
-  --input-border: 1px solid var(--color-border);
-  --input-bg: var(--color-bg);
-  --input-font-size: 13px;
-}
-
-.contact-form-modal .form-input:focus,
-.contact-form-modal .form-select:focus {
-  outline: none;
-  border-color: var(--color-accent);
-}
-
-.contact-form-modal .form-select-sm {
-  width: 80px;
-  flex-shrink: 0;
-}
-
-.contact-form-modal .multi-field-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  margin-bottom: 4px;
-}
-
-.contact-form-modal .multi-field-row .form-input {
-  flex: 1;
-}
-
-.contact-form-modal .remove-btn {
-  width: 22px;
-  height: 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: none;
-  border: none;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  font-size: 16px;
-}
-
-.contact-form-modal .remove-btn:hover {
-  color: var(--color-danger-text);
-  background: rgba(251, 44, 54, 0.06);
-}
-
-.contact-form-modal .add-field-btn {
-  background: none;
-  border: none;
-  color: var(--color-accent);
-  font-size: 12px;
-  cursor: pointer;
-  padding: 2px 0;
-}
-
-.contact-form-modal .add-field-btn:hover {
-  text-decoration: underline;
-}
-
-.contact-form-modal .btn-primary {
-  padding: 6px 16px;
-  background: var(--color-accent);
-  color: white;
-  border: none;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.contact-form-modal .btn-primary:hover {
-  background: var(--color-accent-hover);
-}
-
-.contact-form-modal .btn-secondary {
-  padding: 6px 16px;
-  background: var(--color-bg-hover);
-  color: var(--color-text);
-  border: none;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.3);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10000;
-}
-
-.modal {
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: 10px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
 }
 
 /* OpenPGP banner — shown above the message body. */
