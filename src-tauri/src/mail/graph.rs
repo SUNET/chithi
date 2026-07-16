@@ -1924,6 +1924,138 @@ fn nearest_outlook_color(hex: &str) -> &'static str {
     best
 }
 
+// ---------------------------------------------------------------------------
+// Payload builders (pure — unit-tested below)
+// ---------------------------------------------------------------------------
+
+/// Graph start/end object. All-day events must be midnight-anchored
+/// (`isAllDay` requires `T00:00:00` boundaries).
+fn graph_time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
+    if all_day {
+        serde_json::json!({
+            "dateTime": format!("{}T00:00:00", timestamp.split('T').next().unwrap_or_default()),
+            "timeZone": "UTC",
+        })
+    } else {
+        serde_json::json!({"dateTime": timestamp, "timeZone": "UTC"})
+    }
+}
+
+/// Graph payload for creating an event. Includes the attendee list plus
+/// the organizer as an attendee with `response: organizer` — Exchange
+/// needs it to render the organizer row correctly.
+pub fn event_to_graph_json(event: &crate::db::calendar::CalendarEvent) -> serde_json::Value {
+    let mut graph_event = serde_json::json!({
+        "subject": event.title,
+        "start": graph_time_json(&event.start_time, event.all_day),
+        "end": graph_time_json(&event.end_time, event.all_day),
+        "isAllDay": event.all_day,
+    });
+    if let Some(ref desc) = event.description {
+        graph_event["body"] = serde_json::json!({"contentType": "text", "content": desc});
+    }
+    if let Some(ref loc) = event.location {
+        graph_event["location"] = serde_json::json!({"displayName": loc});
+    }
+    if let Some(ref att_json) = event.attendees_json {
+        if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
+            let mut graph_atts: Vec<serde_json::Value> = atts
+                .iter()
+                .filter_map(|a| {
+                    a["email"].as_str().map(|e| {
+                        serde_json::json!({
+                            "emailAddress": {"address": e, "name": a["name"].as_str().unwrap_or("")},
+                            "type": "required",
+                        })
+                    })
+                })
+                .collect();
+            // Add the organizer as an attendee with isOrganizer=true
+            if let Some(ref org_email) = event.organizer_email {
+                graph_atts.push(serde_json::json!({
+                    "emailAddress": {"address": org_email, "name": ""},
+                    "type": "required",
+                    "status": {"response": "organizer"},
+                }));
+            }
+            if !graph_atts.is_empty() {
+                graph_event["attendees"] = serde_json::json!(graph_atts);
+            }
+        }
+    }
+    graph_event
+}
+
+/// Graph payload for patching an event. Narrower than the create
+/// payload: raw timestamps (no all-day midnight anchoring) and no
+/// attendee rewrite, matching what update_event has always sent.
+pub fn event_patch_to_graph_json(event: &crate::db::calendar::CalendarEvent) -> serde_json::Value {
+    let mut patch = serde_json::json!({
+        "subject": event.title,
+        "start": {"dateTime": event.start_time, "timeZone": "UTC"},
+        "end": {"dateTime": event.end_time, "timeZone": "UTC"},
+        "isAllDay": event.all_day,
+    });
+    if let Some(ref desc) = event.description {
+        patch["body"] = serde_json::json!({"contentType": "text", "content": desc});
+    }
+    if let Some(ref loc) = event.location {
+        patch["location"] = serde_json::json!({"displayName": loc});
+    }
+    patch
+}
+
+/// Graph `contact` payload from our contact fields. Phones split into
+/// `mobilePhone` (first mobile-labelled number) and `businessPhones`
+/// (work-labelled numbers) because that is how Outlook models them.
+pub fn contact_to_graph_json(
+    display_name: &str,
+    emails_json: &str,
+    phones_json: &str,
+    organization: Option<&str>,
+    title: Option<&str>,
+) -> serde_json::Value {
+    let mut gc = serde_json::json!({
+        "displayName": display_name,
+    });
+    if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(emails_json) {
+        let ge: Vec<_> = emails
+            .iter()
+            .filter_map(|e| {
+                e["email"]
+                    .as_str()
+                    .map(|addr| serde_json::json!({"address": addr, "name": ""}))
+            })
+            .collect();
+        if !ge.is_empty() {
+            gc["emailAddresses"] = serde_json::json!(ge);
+        }
+    }
+    if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(phones_json) {
+        let mobile = phones
+            .iter()
+            .find(|p| p["label"].as_str() == Some("mobile"));
+        if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
+            gc["mobilePhone"] = serde_json::json!(m);
+        }
+        let biz: Vec<&str> = phones
+            .iter()
+            .filter(|p| p["label"].as_str() == Some("work"))
+            .filter_map(|p| p["number"].as_str())
+            .collect();
+        if !biz.is_empty() {
+            gc["businessPhones"] = serde_json::json!(biz);
+        }
+    }
+    if let Some(org) = organization {
+        gc["companyName"] = serde_json::json!(org);
+    }
+    if let Some(t) = title {
+        gc["jobTitle"] = serde_json::json!(t);
+    }
+    gc
+}
+
 /// Get a valid Graph API access token for an O365 account.
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
@@ -2331,5 +2463,84 @@ mod color_tests {
 
         let availability = parse_graph_room_availability(&value);
         assert_eq!(availability.state, "unknown");
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::{contact_to_graph_json, event_patch_to_graph_json, event_to_graph_json};
+    use crate::db::calendar::CalendarEvent;
+
+    fn event(all_day: bool, attendees_json: Option<&str>) -> CalendarEvent {
+        CalendarEvent {
+            id: "local-id".into(),
+            account_id: "acct".into(),
+            calendar_id: "cal".into(),
+            uid: Some("uid-1@chithi".into()),
+            title: "Standup".into(),
+            description: None,
+            location: Some("Room 1".into()),
+            start_time: "2026-07-14T09:00:00Z".into(),
+            end_time: "2026-07-14T09:15:00Z".into(),
+            all_day,
+            timezone: None,
+            recurrence_rule: None,
+            organizer_email: Some("me@example.org".into()),
+            attendees_json: attendees_json.map(|s| s.to_string()),
+            my_status: None,
+            source_message_id: None,
+            ical_data: None,
+            remote_id: None,
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn all_day_event_is_midnight_anchored() {
+        let v = event_to_graph_json(&event(true, None));
+        assert_eq!(v["start"]["dateTime"], "2026-07-14T00:00:00");
+        assert_eq!(v["isAllDay"], true);
+    }
+
+    #[test]
+    fn create_appends_organizer_as_attendee() {
+        let v = event_to_graph_json(&event(false, Some(r#"[{"email":"a@x.org","name":"A"}]"#)));
+        let atts = v["attendees"].as_array().unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0]["emailAddress"]["address"], "a@x.org");
+        assert_eq!(atts[1]["emailAddress"]["address"], "me@example.org");
+        assert_eq!(atts[1]["status"]["response"], "organizer");
+    }
+
+    #[test]
+    fn patch_keeps_raw_times_and_no_attendees() {
+        let v = event_patch_to_graph_json(&event(true, Some(r#"[{"email":"a@x.org"}]"#)));
+        // The patch path has never midnight-anchored all-day times.
+        assert_eq!(v["start"]["dateTime"], "2026-07-14T09:00:00Z");
+        assert!(v["attendees"].is_null());
+    }
+
+    #[test]
+    fn contact_splits_mobile_and_business_phones() {
+        let v = contact_to_graph_json(
+            "Ada",
+            r#"[{"email":"ada@x.org"}]"#,
+            r#"[{"number":"+4670","label":"mobile"},{"number":"+4608","label":"work"}]"#,
+            Some("Analytical Engines"),
+            None,
+        );
+        assert_eq!(v["mobilePhone"], "+4670");
+        assert_eq!(v["businessPhones"][0], "+4608");
+        assert_eq!(v["companyName"], "Analytical Engines");
+        assert_eq!(v["emailAddresses"][0]["address"], "ada@x.org");
+        assert!(v["jobTitle"].is_null());
+    }
+
+    #[test]
+    fn contact_handles_malformed_json() {
+        let v = contact_to_graph_json("X", "not json", "not json", None, None);
+        assert!(v["emailAddresses"].is_null());
+        assert!(v["mobilePhone"].is_null());
+        assert!(v["businessPhones"].is_null());
     }
 }

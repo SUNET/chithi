@@ -59,7 +59,7 @@ pub async fn run_push_loop(
         // but have no refresh endpoint — gate on a non-empty endpoint so we
         // don't fire useless refresh attempts for them.
         if config.access_token.is_some() && !config.oidc_token_endpoint.is_empty() {
-            match crate::commands::sync_cmd::refresh_jmap_oidc_token(
+            match crate::auth::refresh_jmap_oidc_token(
                 &account_id,
                 &config.oidc_token_endpoint,
                 &config.oidc_client_id,

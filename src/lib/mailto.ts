@@ -1,5 +1,24 @@
 import type { ComposeParams } from "./compose-window";
 
+/// RFC 6068 requires URI-encoding of reserved characters in the mailto:
+/// path. encodeURIComponent over-encodes "@", "/" and other addr-spec
+/// chars; selectively re-decode the ones that are safe inside an
+/// addr-spec so the resulting URI looks natural in the status bar
+/// preview while remaining well-formed.
+export function encodeMailtoAddress(email: string): string {
+  return encodeURIComponent(email.trim())
+    .replace(/%40/g, "@")
+    .replace(/%2E/gi, ".")
+    .replace(/%2B/gi, "+");
+}
+
+/// RFC 3966 visual-separator chars are kept verbatim; everything else
+/// (spaces, parens, letters, "ext." suffix, ...) is stripped, since
+/// the OS dialer interprets only digits and "+".
+export function sanitizeTel(number: string): string {
+  return number.replace(/[^0-9+*#\-.]/g, "");
+}
+
 /// Parse a `mailto:` URI into the compose-window's parameter shape per
 /// RFC 6068. Returns null when the input doesn't look like mailto: so
 /// callers can fall back to their generic link handling.

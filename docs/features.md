@@ -229,3 +229,4 @@ All design decisions are documented in `docs/adr/`:
 | 0030 | Google OAuth PKCE public client |
 | 0031 | Per-window Tauri capabilities |
 | 0032 | Remote image loading via backend proxy |
+| 0050 | Per-provider backend traits for mail/calendar/contacts |

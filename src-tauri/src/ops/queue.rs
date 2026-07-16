@@ -46,6 +46,18 @@ pub enum MailOp {
     },
 }
 
+impl MailOp {
+    /// Background-sync ops are routed to the account's `MailBackend`;
+    /// everything else is a user op that goes through the
+    /// `MailOpExecutor` and, on failure, the offline outbox. The
+    /// worker's `execute` match enforces the same split exhaustively —
+    /// this is the shared classification for callers that only need
+    /// the boolean.
+    pub fn is_sync(&self) -> bool {
+        matches!(self, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. })
+    }
+}
+
 /// Priority level for operations. Lower numeric value = higher priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpPriority {

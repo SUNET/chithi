@@ -626,6 +626,42 @@ pub fn generate_vcard(
     lines.join("\r\n")
 }
 
+/// Generate a vCard from a stored contact row, converting its JSON
+/// email/phone lists to vCard entries (labels default to "work").
+pub fn contact_to_vcard(uid: &str, contact: &crate::db::contacts::Contact) -> String {
+    let emails: Vec<VCardEmail> =
+        serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| {
+                Some(VCardEmail {
+                    email: e["email"].as_str()?.to_string(),
+                    label: e["label"].as_str().unwrap_or("work").to_string(),
+                })
+            })
+            .collect();
+    let phones: Vec<VCardPhone> =
+        serde_json::from_str::<Vec<serde_json::Value>>(&contact.phones_json)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| {
+                Some(VCardPhone {
+                    number: p["number"].as_str()?.to_string(),
+                    label: p["label"].as_str().unwrap_or("work").to_string(),
+                })
+            })
+            .collect();
+    generate_vcard(
+        uid,
+        &contact.display_name,
+        &emails,
+        &phones,
+        contact.organization.as_deref(),
+        contact.title.as_deref(),
+        contact.notes.as_deref(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -695,6 +731,57 @@ mod tests {
         assert_eq!(parsed.organization, Some("Acme Corp".to_string()));
         assert_eq!(parsed.title, Some("Engineer".to_string()));
         assert_eq!(parsed.note, Some("A note".to_string()));
+    }
+
+    #[test]
+    fn contact_to_vcard_converts_json_lists() {
+        let contact = crate::db::contacts::Contact {
+            id: "c1".into(),
+            book_id: "b1".into(),
+            uid: Some("uid-1".into()),
+            display_name: "Alice Smith".into(),
+            emails_json: r#"[{"email":"alice@example.com","label":"home"},{"label":"broken"}]"#
+                .into(),
+            phones_json: r#"[{"number":"+46701"}]"#.into(),
+            addresses_json: "[]".into(),
+            organization: Some("Acme".into()),
+            title: None,
+            notes: None,
+            vcard_data: None,
+            remote_id: None,
+            etag: None,
+        };
+        let vcard = contact_to_vcard("uid-1", &contact);
+        assert!(vcard.contains("UID:uid-1"));
+        assert!(vcard.contains("EMAIL;TYPE=HOME:alice@example.com"));
+        // Entry without an email address is dropped, not emitted empty.
+        assert_eq!(vcard.matches("EMAIL;").count(), 1);
+        // Label defaults to "work" -> TEL;TYPE=WORK.
+        assert!(vcard.contains("TEL;TYPE=WORK:+46701"));
+        assert!(vcard.contains("ORG:Acme"));
+        assert!(!vcard.contains("TITLE:"));
+    }
+
+    #[test]
+    fn contact_to_vcard_handles_malformed_json() {
+        let contact = crate::db::contacts::Contact {
+            id: "c1".into(),
+            book_id: "b1".into(),
+            uid: None,
+            display_name: "X".into(),
+            emails_json: "not json".into(),
+            phones_json: "not json".into(),
+            addresses_json: "[]".into(),
+            organization: None,
+            title: None,
+            notes: None,
+            vcard_data: None,
+            remote_id: None,
+            etag: None,
+        };
+        let vcard = contact_to_vcard("u", &contact);
+        assert!(!vcard.contains("EMAIL"));
+        assert!(!vcard.contains("TEL"));
     }
 
     #[test]

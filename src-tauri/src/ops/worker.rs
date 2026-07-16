@@ -1,62 +1,33 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+use crate::backend::mail::{MailBackend, MailOpExecutor, MailSyncCtx};
 use crate::db::pool::DbPool;
-use crate::error::{Error, Result};
-use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::error::Result;
 
 use super::coalesce::coalesce;
 use super::queue::{MailOp, OpEntry};
 
-/// Per-account worker that processes mail operations on a persistent connection.
+/// Per-account worker that processes mail operations.
 ///
 /// Each enabled account gets one worker. The worker:
-/// - Maintains a persistent IMAP connection (reused across operations)
 /// - Drains and coalesces pending operations on each iteration
 /// - Prioritises user ops (move/delete/flag) over background sync
-/// - Reconnects automatically if the connection goes stale
-///
-/// For JMAP and Graph accounts the worker delegates to async operations
-/// directly (no persistent connection needed — they use HTTP).
-///
-/// Wrapper around ImapConnection + selected folder state.
-/// Stored separately so it can be moved into `spawn_blocking` without
-/// requiring the whole `AccountWorker` to be `Send + Sync`.
-///
-/// # Safety
-///
-/// `ImapState` is manually marked `Send` because `ImapConnection` contains
-/// a `Receiver<UnsolicitedResponse>` which is `!Sync`. However, we guarantee
-/// exclusive single-threaded access: the value is always moved (not shared)
-/// into a `tokio::task::spawn_blocking` closure, used within that closure,
-/// and then moved back. It is never accessed concurrently from multiple
-/// threads.
-struct ImapState {
-    conn: ImapConnection,
-    selected_folder: Option<String>,
-}
-
-// SAFETY: see doc-comment on `ImapState` above. The value is only ever
-// moved into `spawn_blocking` for single-threaded access — never shared.
-unsafe impl Send for ImapState {}
-
+/// - Executes ops through the account's [`MailOpExecutor`] (the IMAP
+///   executor maintains a persistent connection and reconnects when it
+///   goes stale; JMAP/Graph executors are stateless HTTP)
+/// - Routes sync ops through the account's [`MailBackend`]
 pub struct AccountWorker {
     pub account_id: String,
     rx: mpsc::Receiver<OpEntry>,
     db: Arc<DbPool>,
     app: AppHandle,
-    /// Persistent IMAP connection state, if this is an IMAP account.
-    imap_state: Option<ImapState>,
-    imap_config: Option<ImapConfig>,
-    last_used: Instant,
-    /// Mail protocol for this account ("imap", "jmap", "graph").
-    protocol: String,
-    /// Consecutive connection failures — used for exponential backoff to
-    /// avoid burning OAuth token refreshes in a tight reconnect loop.
-    consecutive_failures: u32,
+    /// Resolved once at startup from the account's mail binding.
+    backend: Option<&'static dyn MailBackend>,
+    executor: Option<Box<dyn MailOpExecutor>>,
+    ctx: Option<MailSyncCtx>,
 }
 
 impl AccountWorker {
@@ -71,11 +42,9 @@ impl AccountWorker {
             rx,
             db,
             app,
-            imap_state: None,
-            imap_config: None,
-            last_used: Instant::now(),
-            protocol: String::new(),
-            consecutive_failures: 0,
+            backend: None,
+            executor: None,
+            ctx: None,
         }
     }
 
@@ -83,8 +52,8 @@ impl AccountWorker {
     pub async fn run(mut self) {
         log::info!("Worker started for account {}", self.account_id);
 
-        // Look up protocol on first run
-        if let Err(e) = self.init_protocol().await {
+        // Resolve the backend on first run
+        if let Err(e) = self.init_backend().await {
             log::error!(
                 "Worker for account {} failed to init: {}",
                 self.account_id,
@@ -109,8 +78,7 @@ impl AccountWorker {
 
             let mut sync_succeeded = false;
             for entry in ops {
-                let is_sync =
-                    matches!(entry.op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+                let is_sync = entry.op.is_sync();
                 match self.execute(entry.op).await {
                     Ok(()) => {
                         if is_sync {
@@ -131,17 +99,42 @@ impl AccountWorker {
         }
 
         // Channel closed — clean up
-        if let Some(state) = self.imap_state.take() {
-            state.conn.logout();
+        if let Some(mut executor) = self.executor.take() {
+            executor.shutdown().await;
         }
         log::info!("Worker stopped for account {}", self.account_id);
     }
 
-    async fn init_protocol(&mut self) -> Result<()> {
-        let conn = self.db.reader();
-        let account = crate::db::accounts::get_account_full(&conn, &self.account_id)?;
-        self.protocol = account.mail_protocol.clone();
+    async fn init_backend(&mut self) -> Result<()> {
+        let account = {
+            let conn = self.db.reader();
+            crate::db::accounts::get_account_full(&conn, &self.account_id)?
+        };
+        self.backend = crate::backend::mail::for_account(&account);
+        self.executor = self.backend.map(|b| b.op_executor());
+        let data_dir = self.app.state::<crate::state::AppState>().data_dir.clone();
+        self.ctx = Some(MailSyncCtx {
+            app: self.app.clone(),
+            db: self.db.clone(),
+            data_dir,
+        });
         Ok(())
+    }
+
+    /// Run `op` through the account's executor. `Ok(())` when the
+    /// account has no mail backend (nothing to execute against).
+    async fn execute_op(&mut self, op: MailOp) -> Result<()> {
+        let ctx = self.ctx.as_ref().expect("worker initialized");
+        match self.executor.as_mut() {
+            Some(executor) => executor.execute(ctx, &self.account_id, op).await,
+            None => {
+                log::warn!(
+                    "Worker: no mail backend for account {}, dropping op",
+                    self.account_id
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Replay pending offline operations after a successful sync.
@@ -200,12 +193,7 @@ impl AccountWorker {
 
             // Execute the replayed op directly (not through execute() to avoid
             // re-queuing to outbox on failure — we handle retries here)
-            let result = match self.protocol.as_str() {
-                "imap" => self.execute_imap(op).await,
-                "jmap" => self.execute_jmap(op).await,
-                "graph" => self.execute_graph(op).await,
-                _ => Ok(()),
-            };
+            let result = self.execute_op(op).await;
 
             match result {
                 Ok(()) => {
@@ -260,34 +248,29 @@ impl AccountWorker {
         }
     }
 
-    /// Execute a single operation, dispatching by protocol.
-    /// On failure of user operations, queues them to the offline outbox for retry.
+    /// Execute a single operation, dispatching sync ops to the backend
+    /// and everything else to the executor. The match is deliberately
+    /// exhaustive (no wildcard): adding a `MailOp` variant forces a
+    /// routing decision here at compile time.
     async fn execute(&mut self, op: MailOp) -> Result<()> {
-        let is_sync = matches!(op, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. });
+        match op {
+            MailOp::SyncAll { current_folder } => self.sync_all(current_folder).await,
+            MailOp::SyncFolder { folder_path } => self.sync_folder(folder_path).await,
+            op @ (MailOp::MoveMessages { .. }
+            | MailOp::DeleteMessages { .. }
+            | MailOp::SetFlags { .. }
+            | MailOp::CopyMessages { .. }
+            | MailOp::SendRaw { .. }) => self.execute_user_op(op).await,
+        }
+    }
 
-        // Serialize the op for outbox before executing (we move op into execute_*)
-        let outbox_data = if !is_sync {
-            super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p))
-        } else {
-            None
-        };
+    /// Run a user op through the executor; on failure, queue it to the
+    /// offline outbox for replay after the next successful sync.
+    async fn execute_user_op(&mut self, op: MailOp) -> Result<()> {
+        // Serialize the op for outbox before executing (we move op into the executor)
+        let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
 
-        let result = match &op {
-            MailOp::SyncAll { .. } | MailOp::SyncFolder { .. } => self.execute_sync(op).await,
-            _ => match self.protocol.as_str() {
-                "imap" => self.execute_imap(op).await,
-                "jmap" => self.execute_jmap(op).await,
-                "graph" => self.execute_graph(op).await,
-                _ => {
-                    log::warn!(
-                        "Worker: unknown protocol '{}' for account {}",
-                        self.protocol,
-                        self.account_id
-                    );
-                    Ok(())
-                }
-            },
-        };
+        let result = self.execute_op(op).await;
 
         // On failure of user operations, queue to outbox for later replay
         if let Err(ref e) = result {
@@ -329,465 +312,56 @@ impl AccountWorker {
         result
     }
 
-    /// Delegate sync to the existing sync engine.
-    /// Sync creates its own connections (including parallel ones for IMAP).
-    async fn execute_sync(&mut self, op: MailOp) -> Result<()> {
+    /// The account row and resolved backend for a sync op — `None`
+    /// when the account has no mail backend. Sync creates its own
+    /// connections (including parallel ones for IMAP); it never uses
+    /// the executor's.
+    fn sync_target(
+        &self,
+    ) -> Result<Option<(&'static dyn MailBackend, crate::db::accounts::AccountFull)>> {
         let account = {
             let conn = self.db.reader();
             crate::db::accounts::get_account_full(&conn, &self.account_id)?
         };
-
-        match op {
-            MailOp::SyncAll { current_folder } => {
-                if account.mail_protocol_str() == "graph" {
-                    // Graph sync handled by sync_cmd directly
-                    return Ok(());
-                } else if account.mail_protocol_str() == "jmap" {
-                    let jmap_config =
-                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
-                    crate::mail::jmap_sync::sync_jmap_account(
-                        self.app.clone(),
-                        self.db.clone(),
-                        std::path::PathBuf::new(), // unused for JMAP
-                        self.account_id.clone(),
-                        account.display_name.clone(),
-                        jmap_config,
-                        current_folder,
-                    )
-                    .await?;
-                } else {
-                    let imap_config = self.build_imap_config(&account).await?;
-                    let data_dir = {
-                        let state_data_dir = self.app.state::<crate::state::AppState>();
-                        state_data_dir.data_dir.clone()
-                    };
-                    crate::mail::sync::sync_account(
-                        self.app.clone(),
-                        self.db.clone(),
-                        data_dir,
-                        self.account_id.clone(),
-                        account.display_name.clone(),
-                        imap_config,
-                        current_folder,
-                    )
-                    .await?;
-                }
-            }
-            MailOp::SyncFolder { folder_path } => {
-                if account.mail_protocol_str() == "jmap" {
-                    let jmap_config =
-                        crate::commands::sync_cmd::build_jmap_config(&account).await?;
-                    crate::mail::jmap_sync::sync_jmap_folder_public(
-                        self.app.clone(),
-                        self.db.clone(),
-                        self.account_id.clone(),
-                        account.display_name.clone(),
-                        folder_path,
-                        jmap_config,
-                    )
-                    .await?;
-                } else if account.mail_protocol_str() == "imap" {
-                    let imap_config = self.build_imap_config(&account).await?;
-                    let db = self.db.clone();
-                    let account_id = self.account_id.clone();
-                    let app = self.app.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mut conn = ImapConnection::connect(&imap_config)?;
-                        crate::mail::sync::sync_folder_envelopes_public(
-                            &db,
-                            &account_id,
-                            &mut conn,
-                            &folder_path,
-                        )?;
-                        conn.logout();
-                        crate::commands::events::emit_folders_changed(&app, &account_id);
-                        crate::commands::events::emit_messages_changed(&app, &account_id);
-                        Ok::<_, Error>(())
-                    })
-                    .await
-                    .map_err(|e| Error::Sync(format!("Sync folder panicked: {}", e)))??;
-                }
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
+        Ok(self.backend.map(|b| (b, account)))
     }
 
-    // --- IMAP operations on persistent connection ---
-
-    async fn execute_imap(&mut self, op: MailOp) -> Result<()> {
-        // SendRaw on an IMAP account goes out over SMTP, not the persistent
-        // IMAP connection. Branch before we touch IMAP state so a stalled
-        // mail server doesn't gate retries of a queued send.
-        if let MailOp::SendRaw { .. } = op {
-            return self.execute_smtp_send(op).await;
-        }
-
-        // Ensure we have a live connection
-        self.ensure_imap_connection().await?;
-
-        // Move the ImapState into spawn_blocking (ImapConnection is !Sync)
-        let mut imap_state = self.imap_state.take().unwrap();
-
-        let (result, state_back) = tokio::task::spawn_blocking(move || {
-            let result = execute_imap_op(&mut imap_state.conn, &mut imap_state.selected_folder, op);
-            (result, imap_state)
-        })
-        .await
-        .map_err(|e| Error::Other(format!("IMAP op task panicked: {}", e)))?;
-
-        if result.is_ok() {
-            self.imap_state = Some(state_back);
-            self.last_used = Instant::now();
-            self.consecutive_failures = 0;
-        } else {
-            // Connection is likely dead — drop it so next op reconnects
-            log::warn!("IMAP op failed, dropping connection for reconnect");
-            self.consecutive_failures += 1;
-            state_back.conn.logout();
-        }
-
-        result
-    }
-
-    /// Ensure the persistent IMAP connection is alive.
-    /// Reconnects if the connection is stale (>5 min) or missing.
-    /// Uses exponential backoff on consecutive failures to avoid burning
-    /// OAuth token refreshes in a tight reconnect loop.
-    async fn ensure_imap_connection(&mut self) -> Result<()> {
-        let stale = self.last_used.elapsed() > std::time::Duration::from_secs(5 * 60);
-
-        if self.imap_state.is_none() || stale {
-            // Exponential backoff: 1s, 2s, 4s, 8s, ... max 60s
-            if self.consecutive_failures > 0 {
-                let delay_secs = std::cmp::min(1u64 << (self.consecutive_failures - 1), 60);
-                log::info!(
-                    "Worker: backoff {}s before reconnect (failures={}) for account {}",
-                    delay_secs,
-                    self.consecutive_failures,
-                    self.account_id
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-            }
-
-            // Drop old connection if stale
-            if let Some(state) = self.imap_state.take() {
-                let _ = tokio::task::spawn_blocking(move || state.conn.logout()).await;
-            }
-
-            let account = {
-                let conn = self.db.reader();
-                crate::db::accounts::get_account_full(&conn, &self.account_id)?
-            };
-            let config = self.build_imap_config(&account).await?;
-            self.imap_config = Some(config.clone());
-
-            let conn = tokio::task::spawn_blocking(move || ImapConnection::connect(&config))
-                .await
-                .map_err(|e| Error::Other(format!("IMAP connect task panicked: {}", e)))??;
-
-            self.imap_state = Some(ImapState {
-                conn,
-                selected_folder: None,
-            });
-            self.last_used = Instant::now();
-            self.consecutive_failures = 0;
-            log::info!(
-                "Worker: IMAP connection established for account {}",
-                self.account_id
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn build_imap_config(
-        &mut self,
-        account: &crate::db::accounts::AccountFull,
-    ) -> Result<ImapConfig> {
-        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account.id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
-            .await?;
-            crate::oauth::store_tokens(&account.id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password.clone(), false)
+    /// Delegate a full account sync to the backend. Deliberate
+    /// carve-out from the trait's command-path semantics: Graph account
+    /// syncs are owned by `sync_cmd`, so a queued SyncAll is a no-op.
+    async fn sync_all(&mut self, current_folder: Option<String>) -> Result<()> {
+        let Some((backend, account)) = self.sync_target()? else {
+            return Ok(());
         };
-        Ok(ImapConfig {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: account.username.clone(),
-            password,
-            use_tls: account.use_tls,
-            use_xoauth2,
-        })
+        if backend.protocol() == "graph" {
+            // Graph sync handled by sync_cmd directly
+            return Ok(());
+        }
+        let ctx = self.ctx.as_ref().expect("worker initialized");
+        backend.sync_account(ctx, &account, current_folder).await
     }
 
-    // --- JMAP operations (async HTTP, no persistent connection needed) ---
-
-    async fn execute_jmap(&mut self, op: MailOp) -> Result<()> {
-        let account = {
-            let conn = self.db.reader();
-            crate::db::accounts::get_account_full(&conn, &self.account_id)?
+    /// Sync a single folder. Deliberate carve-outs from the trait's
+    /// command-path semantics: queued IMAP folder syncs are "quiet" —
+    /// no `sync-started` spinner, but folders/messages-changed — unlike
+    /// the command's `sync_folder`, which drives the UI spinner; and
+    /// Graph has no per-folder fetch at all.
+    async fn sync_folder(&mut self, folder_path: String) -> Result<()> {
+        let Some((backend, account)) = self.sync_target()? else {
+            return Ok(());
         };
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-
-        match op {
-            MailOp::MoveMessages {
-                by_folder,
-                target_folder,
-            } => {
-                for (source_mailbox, uids) in &by_folder {
-                    // UIDs are actually JMAP email IDs stored as u32 — extract from message IDs
-                    // For JMAP, `by_folder` won't have actual UIDs, so this path isn't used.
-                    // JMAP moves are handled differently (by JMAP email ID, not UID).
-                    let _ = (source_mailbox, uids, &target_folder);
-                }
-                log::debug!("JMAP move handled by optimistic path");
+        let ctx = self.ctx.as_ref().expect("worker initialized");
+        match backend.protocol() {
+            "jmap" => {
+                backend.sync_folder(ctx, &account, &folder_path).await?;
             }
-            MailOp::DeleteMessages { by_folder } => {
-                let _ = by_folder;
-                log::debug!("JMAP delete handled by optimistic path");
-            }
-            MailOp::SetFlags { flags, add, .. } => {
-                let _ = (jmap_config.clone(), flags, add);
-                log::debug!("JMAP set_flags handled by optimistic path");
-            }
-            MailOp::SendRaw { raw_message, .. } => {
-                conn_jmap.send_email(&jmap_config, &raw_message).await?;
+            "imap" => {
+                crate::backend::mail::imap::sync_folder_quiet(ctx, &account, &folder_path).await?;
             }
             _ => {}
         }
         Ok(())
     }
-
-    // --- Graph operations (async HTTP) ---
-
-    async fn execute_graph(&mut self, op: MailOp) -> Result<()> {
-        match op {
-            MailOp::MoveMessages { .. }
-            | MailOp::DeleteMessages { .. }
-            | MailOp::SetFlags { .. } => {
-                log::debug!("Graph op handled by optimistic path");
-            }
-            MailOp::SendRaw { .. } => {
-                // Graph's server-side `/me/mailFolders/outbox` already holds
-                // messages that were accepted by `sendMail`. Client-side
-                // replay would require re-parsing the raw MIME back into
-                // Graph's structured payload, which is error-prone. Fail
-                // here so the row eventually marks dead and the user can
-                // surface it via the Outbox view.
-                return Err(Error::Other(
-                    "Graph send replay is not implemented; the server-side Outbox folder owns delivery from this point. Discard or recompose this message.".into(),
-                ));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Send a queued `MailOp::SendRaw` over the account's SMTP host. Used
-    /// by `execute_imap` to bypass the persistent IMAP connection for
-    /// outgoing mail.
-    async fn execute_smtp_send(&mut self, op: MailOp) -> Result<()> {
-        let MailOp::SendRaw {
-            raw_message,
-            from,
-            to,
-            cc,
-            bcc,
-            ..
-        } = op
-        else {
-            return Err(Error::Other(
-                "execute_smtp_send called with non-SendRaw op".into(),
-            ));
-        };
-
-        let account = {
-            let conn = self.db.reader();
-            crate::db::accounts::get_account_full(&conn, &self.account_id)?
-        };
-
-        // For O365 SMTP, refresh the OAuth token (XOAUTH2). For password
-        // accounts, just use the stored password.
-        let (smtp_username, smtp_password, use_xoauth2) =
-            if account.auth_method == "oauth-microsoft" {
-                let tokens = crate::oauth::load_tokens(&self.account_id)?
-                    .ok_or_else(|| Error::Other("No O365 tokens for SMTP replay".into()))?;
-                let refresh = tokens
-                    .refresh_token
-                    .ok_or_else(|| Error::Other("No O365 refresh token for SMTP replay".into()))?;
-                let new = crate::oauth::refresh_with_scopes(
-                    &crate::oauth::MICROSOFT,
-                    &refresh,
-                    crate::oauth::MICROSOFT_IMAP_SCOPES,
-                )
-                .await?;
-                crate::oauth::store_tokens(&self.account_id, &new)?;
-                (account.username.clone(), new.access_token, true)
-            } else {
-                (account.username.clone(), account.password.clone(), false)
-            };
-
-        crate::mail::smtp::send_raw(
-            &account.smtp_host,
-            account.smtp_port,
-            &smtp_username,
-            &smtp_password,
-            account.use_tls,
-            use_xoauth2,
-            &from,
-            &to,
-            &cc,
-            &bcc,
-            &raw_message,
-        )
-        .await?;
-
-        // Best-effort APPEND to Sent (#189). Same rule as the live-send
-        // path in `commands::compose`: a failure here MUST NOT propagate,
-        // because the message has been delivered and the outbox would
-        // otherwise retry the send and duplicate it for the recipient.
-        let sent_folder_path = {
-            let conn = self.db.reader();
-            crate::db::folders::folder_path_by_type(&conn, &self.account_id, "sent")
-                .ok()
-                .flatten()
-        };
-        let imap_config = crate::mail::imap::ImapConfig {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: smtp_username,
-            password: smtp_password,
-            use_tls: account.use_tls,
-            use_xoauth2,
-        };
-        let account_id_append = self.account_id.clone();
-        let append_result = tokio::task::spawn_blocking(move || {
-            crate::mail::imap::append_message_to_sent(
-                &imap_config,
-                sent_folder_path.as_deref(),
-                &raw_message,
-            )
-        })
-        .await;
-        match append_result {
-            Ok(Ok(sent_folder)) => {
-                log::info!(
-                    "Outbox replay: APPENDed sent message to '{}' for account {}",
-                    sent_folder,
-                    account_id_append
-                );
-                // Nudge a targeted sync of the Sent folder so the
-                // freshly-APPENDed message surfaces in the UI without
-                // waiting for the next scheduled sync.
-                if let Err(e) = self
-                    .execute_sync(MailOp::SyncFolder {
-                        folder_path: sent_folder,
-                    })
-                    .await
-                {
-                    log::warn!(
-                        "Outbox replay: Sent-folder sync nudge failed for account {}: {}",
-                        account_id_append,
-                        e
-                    );
-                }
-            }
-            Ok(Err(e)) => log::warn!(
-                "Outbox replay: delivered but APPEND to Sent failed for account {}: {}",
-                account_id_append,
-                e
-            ),
-            Err(e) => {
-                let kind = if e.is_panic() {
-                    "panicked"
-                } else if e.is_cancelled() {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                log::warn!(
-                    "Outbox replay: APPEND-to-Sent task {} for account {}: {}",
-                    kind,
-                    account_id_append,
-                    e
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Execute a single IMAP operation on a connection (runs in spawn_blocking).
-fn execute_imap_op(
-    conn: &mut ImapConnection,
-    selected: &mut Option<String>,
-    op: MailOp,
-) -> Result<()> {
-    match op {
-        MailOp::MoveMessages {
-            by_folder,
-            target_folder,
-        } => {
-            for (folder_path, uids) in &by_folder {
-                select_folder_if_needed(conn, selected, folder_path)?;
-                conn.move_messages(uids, &target_folder)?;
-            }
-        }
-        MailOp::DeleteMessages { by_folder } => {
-            for (folder_path, uids) in &by_folder {
-                select_folder_if_needed(conn, selected, folder_path)?;
-                conn.delete_messages(uids)?;
-            }
-        }
-        MailOp::SetFlags {
-            by_folder,
-            flags,
-            add,
-        } => {
-            let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
-            for (folder_path, uids) in &by_folder {
-                select_folder_if_needed(conn, selected, folder_path)?;
-                conn.set_flags(uids, &flag_strs, add)?;
-            }
-        }
-        MailOp::CopyMessages {
-            by_folder,
-            target_folder,
-        } => {
-            for (folder_path, uids) in &by_folder {
-                select_folder_if_needed(conn, selected, folder_path)?;
-                conn.copy_messages(uids, &target_folder)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// SELECT a folder on the IMAP connection, skipping if already selected.
-fn select_folder_if_needed(
-    conn: &mut ImapConnection,
-    selected: &mut Option<String>,
-    folder: &str,
-) -> Result<()> {
-    if selected.as_deref() != Some(folder) {
-        conn.select_folder(folder)?;
-        *selected = Some(folder.to_string());
-    }
-    Ok(())
 }
 
 /// Emit an `op-failed` event to the frontend.

@@ -278,7 +278,7 @@ pub async fn send_message(
         let result: std::result::Result<(), Error> = async {
             if account.mail_protocol_str() == "jmap" {
                 log::info!("Sending via JMAP for account {}", account.email);
-                let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
                 let conn_jmap = JmapConnection::connect(&jmap_config).await?;
                 conn_jmap.send_email(&jmap_config, &raw_message).await?;
             } else {
@@ -579,7 +579,7 @@ pub async fn save_draft(
             })
             .await?;
     } else if account.mail_protocol_str() == "jmap" {
-        let jmap_config = crate::commands::sync_cmd::build_jmap_config(&account).await?;
+        let jmap_config = crate::auth::build_jmap_config(&account).await?;
         let conn_jmap = JmapConnection::connect(&jmap_config).await?;
         conn_jmap.save_draft(&jmap_config, &raw_message).await?;
     } else {

@@ -772,7 +772,7 @@ async fn execute_jmap_filter_actions(
     folder_path: &str,
     action_plan: &[(MessageData, Vec<FilterAction>)],
 ) -> Result<ExecutionResult> {
-    let jmap_config = crate::commands::sync_cmd::build_jmap_config(account).await?;
+    let jmap_config = crate::auth::build_jmap_config(account).await?;
     let conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
 
     // (db_id, jmap_id, target) for moves; (db_id, jmap_id) for deletes
