@@ -1402,7 +1402,10 @@ mod markdown_body_tests {
         let html = resolve_body_html(&msg("# Title\n\nsome **bold** text", None, true))
             .expect("markdown should render html");
         assert!(html.contains("<h1>"), "heading should render: {html}");
-        assert!(html.contains("<strong>bold</strong>"), "bold should render: {html}");
+        assert!(
+            html.contains("<strong>bold</strong>"),
+            "bold should render: {html}"
+        );
     }
 
     /// Safety: raw HTML in the Markdown source must NOT pass through as
@@ -1410,12 +1413,8 @@ mod markdown_body_tests {
     /// default), so a `<script>` becomes inert text, never an element.
     #[test]
     fn markdown_escapes_raw_html() {
-        let html = resolve_body_html(&msg(
-            "hi <script>alert('xss')</script> there",
-            None,
-            true,
-        ))
-        .expect("render");
+        let html = resolve_body_html(&msg("hi <script>alert('xss')</script> there", None, true))
+            .expect("render");
         assert!(
             !html.contains("<script>"),
             "raw <script> must be escaped, not emitted live: {html}"
