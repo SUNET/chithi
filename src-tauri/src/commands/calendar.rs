@@ -54,6 +54,11 @@ pub struct NewEventInput {
     /// Frontend obtains this from the `meet_create_url` response.
     #[serde(default)]
     pub meet_binding: Option<MeetBindingInput>,
+    /// Add a native Microsoft Teams meeting to this event (O365 accounts
+    /// only, ADR 0050). When `true`, the Graph event is created with
+    /// `isOnlineMeeting: true` and Graph mints the Teams join URL.
+    #[serde(default)]
+    pub add_teams_meeting: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +78,11 @@ pub struct UpdateEventInput {
     /// the same event (one binding per event).
     #[serde(default)]
     pub meet_binding: Option<MeetBindingInput>,
+    /// Desired Teams-meeting state for this event (O365 only, ADR 0050).
+    /// `None` = leave as-is; `Some(true)` = add a Teams meeting if the
+    /// event doesn't already have one; `Some(false)` = best-effort remove.
+    #[serde(default)]
+    pub add_teams_meeting: Option<bool>,
 }
 
 /// Frontend-supplied meet binding metadata returned from a previous
@@ -537,9 +547,11 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         ical_data: None,
         remote_id: None,
         etag: None,
+        online_meeting_url: None,
     };
 
     let meet_binding = event.meet_binding;
+    let add_teams_meeting = event.add_teams_meeting;
 
     // Insert locally first, then push to server
     {
@@ -698,17 +710,31 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                         );
                     }
                 }
+                // Native Teams meeting (ADR 0050). The provider value
+                // (teamsForBusiness vs teamsForConsumer) is derived from
+                // the account's Graph token; Graph mints the join URL on
+                // POST and echoes it back under `onlineMeeting`.
+                if add_teams_meeting {
+                    let provider = crate::mail::graph::teams_provider_for_token(&token);
+                    graph_event["isOnlineMeeting"] = serde_json::json!(true);
+                    graph_event["onlineMeetingProvider"] = serde_json::json!(provider);
+                    log::info!(
+                        "create_event: requesting Teams meeting (provider={})",
+                        provider
+                    );
+                }
                 // Graph sends invite emails automatically when attendees are present
                 log::debug!(
                     "create_event: O365 graph_event JSON: {}",
                     serde_json::to_string_pretty(&graph_event).unwrap_or_default()
                 );
                 match client.create_event(&graph_event).await {
-                    Ok((remote_id, ical_uid)) => {
+                    Ok((remote_id, ical_uid, join_url)) => {
                         log::info!(
-                            "create_event: pushed to Graph Calendar, id={}, iCalUid={:?}",
+                            "create_event: pushed to Graph Calendar, id={}, iCalUid={:?}, teams={}",
                             remote_id,
-                            ical_uid
+                            ical_uid,
+                            join_url.is_some()
                         );
                         let conn = state.db.writer().await;
                         conn.execute(
@@ -716,6 +742,19 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
                             rusqlite::params![remote_id, id],
                         )
                         .ok();
+                        // Persist the Graph-minted Teams join URL so the
+                        // event detail can render a Join button.
+                        if let Some(ref url) = join_url {
+                            conn.execute(
+                                "UPDATE calendar_events SET online_meeting_url = ?1 WHERE id = ?2",
+                                rusqlite::params![url, id],
+                            )
+                            .ok();
+                        } else if add_teams_meeting {
+                            log::warn!(
+                                "create_event: Teams meeting requested but Graph returned no joinUrl"
+                            );
+                        }
                         // Update the local UID to match Exchange's iCalUid so that
                         // incoming RSVP reply emails (which reference this UID) can
                         // be matched back to the event by process_invite_reply.
@@ -890,6 +929,40 @@ async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &s
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamsMeetingChange {
+    None,
+    Add,
+    Remove,
+}
+
+fn requested_teams_meeting_change(
+    requested: Option<bool>,
+    current_join_url: Option<&str>,
+) -> TeamsMeetingChange {
+    match (requested, current_join_url.is_some()) {
+        (Some(true), false) => TeamsMeetingChange::Add,
+        (Some(false), true) => TeamsMeetingChange::Remove,
+        _ => TeamsMeetingChange::None,
+    }
+}
+
+fn teams_join_url_after_graph_update(
+    current_join_url: Option<&str>,
+    change: TeamsMeetingChange,
+    graph_response: Option<&serde_json::Value>,
+) -> Option<String> {
+    match (change, graph_response) {
+        (TeamsMeetingChange::Add, Some(resp)) => resp["onlineMeeting"]["joinUrl"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| current_join_url.map(|s| s.to_string())),
+        (TeamsMeetingChange::Remove, Some(_)) => None,
+        _ => current_join_url.map(|s| s.to_string()),
+    }
+}
+
 #[tauri::command]
 pub async fn update_event(
     state: State<'_, AppState>,
@@ -939,6 +1012,15 @@ pub async fn update_event(
             Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
         };
     }
+
+    // Teams meeting toggle (ADR 0050). Only clear or populate the local
+    // join URL after a successful Graph PATCH. Otherwise a transient Graph
+    // failure would make the join button disappear locally even though the
+    // server-side meeting still exists.
+    let teams_change = requested_teams_meeting_change(
+        event.add_teams_meeting,
+        existing.online_meeting_url.as_deref(),
+    );
 
     db::calendar::update_event(&conn, &existing)?;
     log::info!("update_event: updated event {}", event_id);
@@ -1068,8 +1150,39 @@ pub async fn update_event(
                 if let Some(ref loc) = existing.location {
                     patch["location"] = serde_json::json!({"displayName": loc});
                 }
+                // Teams meeting add/remove (ADR 0050). Adding embeds
+                // isOnlineMeeting+provider so Graph mints a join URL on the
+                // existing event. Removing sets isOnlineMeeting:false, which
+                // is best-effort (Graph may keep the meeting server-side).
+                if teams_change == TeamsMeetingChange::Add {
+                    let provider = crate::mail::graph::teams_provider_for_token(&token);
+                    patch["isOnlineMeeting"] = serde_json::json!(true);
+                    patch["onlineMeetingProvider"] = serde_json::json!(provider);
+                } else if teams_change == TeamsMeetingChange::Remove {
+                    patch["isOnlineMeeting"] = serde_json::json!(false);
+                }
                 match client.update_event(remote_id, &patch).await {
-                    Ok(()) => log::info!("update_event: updated on Graph Calendar"),
+                    Ok(resp) => {
+                        log::info!("update_event: updated on Graph Calendar");
+                        if teams_change != TeamsMeetingChange::None {
+                            let join_url = teams_join_url_after_graph_update(
+                                existing.online_meeting_url.as_deref(),
+                                teams_change,
+                                Some(&resp),
+                            );
+                            let conn = state.db.writer().await;
+                            conn.execute(
+                                "UPDATE calendar_events SET online_meeting_url = ?1 WHERE id = ?2",
+                                rusqlite::params![join_url.as_deref(), &event_id],
+                            )
+                            .ok();
+                            if teams_change == TeamsMeetingChange::Add && join_url.is_none() {
+                                log::warn!(
+                                    "update_event: Teams add requested but Graph returned no joinUrl"
+                                );
+                            }
+                        }
+                    }
                     Err(e) => log::error!("update_event: Graph Calendar PATCH failed: {}", e),
                 }
             }
@@ -1457,6 +1570,7 @@ async fn sync_calendars_jmap(
                 ical_data: None,
                 remote_id: Some(ev.id.clone()),
                 etag: None,
+                online_meeting_url: None,
             };
 
             if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
@@ -1816,6 +1930,7 @@ async fn sync_calendars_google(
                     ical_data: None,
                     remote_id: Some(event_id_remote.to_string()),
                     etag: ev["etag"].as_str().map(|s| s.to_string()),
+                    online_meeting_url: None,
                 };
 
                 if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
@@ -2065,6 +2180,7 @@ async fn sync_calendars_caldav(
                 ical_data: Some(ev.ical_data.clone()),
                 remote_id: Some(ev.href.clone()),
                 etag: Some(ev.etag.clone()),
+                online_meeting_url: None,
             };
 
             if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
@@ -2541,6 +2657,7 @@ async fn apply_invite_response(
             ical_data: Some(invite.ical_raw.clone()),
             remote_id: None,
             etag: None,
+            online_meeting_url: None,
         };
         db::calendar::insert_event(&conn, &cal_event)?;
         log::info!(
@@ -3045,6 +3162,7 @@ fn get_unpushed_events(
                 ical_data: row.get(16)?,
                 remote_id: row.get(17)?,
                 etag: row.get(18)?,
+                online_meeting_url: None,
             })
         })?
         .filter_map(|r| r.ok())
@@ -3754,8 +3872,9 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                     conn.execute(
                         "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                          all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                         description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11
-                         WHERE id = ?12",
+                         description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11,
+                         online_meeting_url = ?12
+                         WHERE id = ?13",
                         rusqlite::params![
                             ge.subject,
                             ge.start,
@@ -3768,6 +3887,7 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                             ge.timezone,
                             ge.my_status,
                             local_cal_id,
+                            ge.online_meeting_url,
                             local_id,
                         ],
                     )
@@ -3794,6 +3914,7 @@ async fn sync_calendars_graph(state: &State<'_, AppState>, account_id: &str) -> 
                         ical_data: None,
                         remote_id: Some(ge.id.clone()),
                         etag: None,
+                        online_meeting_url: ge.online_meeting_url.clone(),
                     };
                     db::calendar::insert_event(&conn, &event)?;
                 }
@@ -3881,5 +4002,41 @@ mod tests {
         assert_eq!(invite_reply_transport("google"), InviteReplyTransport::Smtp);
         // An account with no calendar binding still falls back to SMTP.
         assert_eq!(invite_reply_transport(""), InviteReplyTransport::Smtp);
+    }
+
+    #[test]
+    fn requested_teams_meeting_change_detects_add_and_remove() {
+        assert_eq!(
+            requested_teams_meeting_change(Some(true), None),
+            TeamsMeetingChange::Add
+        );
+        assert_eq!(
+            requested_teams_meeting_change(Some(false), Some("https://teams.example/join")),
+            TeamsMeetingChange::Remove
+        );
+        assert_eq!(
+            requested_teams_meeting_change(Some(true), Some("https://teams.example/join")),
+            TeamsMeetingChange::None
+        );
+    }
+
+    #[test]
+    fn failed_teams_remove_keeps_existing_join_url() {
+        assert_eq!(
+            teams_join_url_after_graph_update(
+                Some("https://teams.example/join"),
+                TeamsMeetingChange::Remove,
+                None,
+            ),
+            Some("https://teams.example/join".to_string())
+        );
+        assert_eq!(
+            teams_join_url_after_graph_update(
+                Some("https://teams.example/join"),
+                TeamsMeetingChange::Remove,
+                Some(&serde_json::Value::Null),
+            ),
+            None
+        );
     }
 }

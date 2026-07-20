@@ -331,6 +331,10 @@ export interface CalendarEvent {
   attendees_json: string | null;
   my_status: string | null;
   source_message_id: string | null;
+  /** Teams (or other) online-meeting join URL, when the event carries
+   * one. Populated for O365 events created/synced with a Teams meeting
+   * (ADR 0050); null otherwise. */
+  online_meeting_url?: string | null;
 }
 
 export interface Attendee {
@@ -381,6 +385,9 @@ export interface NewEventInput {
    * reschedule / cancel calls can act on the right remote meeting.
    * Comes from `meetCreateUrl` when the user adds a video link. */
   meet_binding?: MeetBinding | null;
+  /** Add a native Microsoft Teams meeting to this event (O365 accounts
+   * only, ADR 0050). Graph mints the join URL on create. */
+  add_teams_meeting?: boolean;
 }
 
 /** Provider-agnostic handle for a remote meeting Chithi created on

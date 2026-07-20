@@ -717,6 +717,7 @@ async fn sync_jmap_calendars(
                 ical_data: None,
                 remote_id: Some(ev.id.clone()),
                 etag: None,
+                online_meeting_url: None,
             };
 
             if let Err(e) = crate::db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {

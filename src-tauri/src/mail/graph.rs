@@ -242,6 +242,43 @@ impl GraphClient {
         Ok(())
     }
 
+    /// Like `patch_json` but returns the response body. Graph echoes the
+    /// full updated resource on a successful PATCH, which we need to read
+    /// back server-minted fields (e.g. a Teams `onlineMeeting.joinUrl`).
+    async fn patch_json_returning(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}{}", GRAPH_BASE, path);
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Graph PATCH {} failed: {}", path, e)))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "Graph PATCH {} returned {}: {}",
+                path,
+                status,
+                truncate(&text, 500)
+            )));
+        }
+
+        if text.is_empty() {
+            Ok(serde_json::Value::Null)
+        } else {
+            serde_json::from_str(&text)
+                .map_err(|e| Error::Other(format!("Graph PATCH parse failed: {}", e)))
+        }
+    }
+
     async fn delete(&self, path: &str) -> Result<()> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
@@ -1035,7 +1072,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus,isOnlineMeeting,onlineMeeting"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -1108,7 +1145,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus,isOnlineMeeting,onlineMeeting"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -1148,19 +1185,33 @@ impl GraphClient {
 
     /// Create a calendar event.
     /// Create a calendar event. Returns (graph_id, iCalUid).
+    /// Create a calendar event. Returns `(remote_id, ical_uid,
+    /// online_meeting_join_url)`. The join URL is only present when the
+    /// event was created with `isOnlineMeeting: true` — Graph mints it
+    /// server-side on the POST and echoes it back under `onlineMeeting`.
     pub async fn create_event(
         &self,
         event: &serde_json::Value,
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<(String, Option<String>, Option<String>)> {
         let resp = self.post_json("/me/events", event).await?;
         let id = resp["id"].as_str().unwrap_or("").to_string();
         let ical_uid = resp["iCalUId"].as_str().map(|s| s.to_string());
-        Ok((id, ical_uid))
+        let join_url = resp["onlineMeeting"]["joinUrl"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        Ok((id, ical_uid, join_url))
     }
 
-    /// Update a calendar event.
-    pub async fn update_event(&self, event_id: &str, updates: &serde_json::Value) -> Result<()> {
-        self.patch_json(&format!("/me/events/{}", event_id), updates)
+    /// Update a calendar event. Returns the updated event body so callers
+    /// can read back server-minted fields (e.g. `onlineMeeting.joinUrl`
+    /// after toggling a Teams meeting on).
+    pub async fn update_event(
+        &self,
+        event_id: &str,
+        updates: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.patch_json_returning(&format!("/me/events/{}", event_id), updates)
             .await
     }
 
@@ -1393,6 +1444,10 @@ pub struct GraphCalendarEvent {
     pub my_status: Option<String>,
     pub ical_uid: Option<String>,
     pub is_recurring: bool,
+    /// Teams (or other) online-meeting join URL, when the event carries
+    /// one (`onlineMeeting.joinUrl`). `None` for events with no online
+    /// meeting attached.
+    pub online_meeting_url: Option<String>,
 }
 
 fn parse_graph_rooms(value: &serde_json::Value) -> Vec<GraphRoom> {
@@ -1790,6 +1845,10 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         ),
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
         is_recurring: e["recurrence"].is_object(),
+        online_meeting_url: e["onlineMeeting"]["joinUrl"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -1924,6 +1983,42 @@ fn nearest_outlook_color(hex: &str) -> &'static str {
     best
 }
 
+/// Well-known tenant id that personal Microsoft (MSA) accounts always
+/// carry in their token `tid` claim. Work/school (Azure AD) accounts use
+/// their own tenant id instead.
+const MSA_TENANT_ID: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+
+/// Pick the Graph `onlineMeetingProvider` value for an O365 account from
+/// its Graph access token. Work/school tenants get `"teamsForBusiness"`;
+/// personal MSA accounts get `"teamsForConsumer"`.
+///
+/// Detection reads the `tid` (tenant id) claim from the access token. For
+/// work/school accounts the Graph access token is a standard JWT carrying
+/// `tid`. Personal MSA Graph access tokens are opaque (not a decodable
+/// JWT) — that opacity is itself the signal for a consumer account, so a
+/// decode failure maps to `"teamsForConsumer"`.
+pub fn teams_provider_for_token(access_token: &str) -> &'static str {
+    match jwt_tid(access_token) {
+        Some(tid) if tid == MSA_TENANT_ID => "teamsForConsumer",
+        Some(_) => "teamsForBusiness",
+        None => "teamsForConsumer",
+    }
+}
+
+/// Extract the `tid` claim from a JWT access token without verifying the
+/// signature — we only need the tenant discriminator, and the token came
+/// straight from our own authenticated refresh. Returns `None` when the
+/// token isn't a decodable three-part JWT (e.g. an opaque MSA token).
+fn jwt_tid(token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json["tid"].as_str().map(|s| s.to_string())
+}
+
 /// Get a valid Graph API access token for an O365 account.
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
@@ -1976,8 +2071,72 @@ mod color_tests {
         dedupe_graph_rooms, graph_color_to_hex, graph_response_to_my_status,
         graph_response_to_partstat, looks_like_smtp_address, nearest_outlook_color,
         normalize_schedule_datetime, parse_graph_event, parse_graph_named_addresses,
-        parse_graph_room_availability, parse_graph_rooms, GraphRoom,
+        parse_graph_room_availability, parse_graph_rooms, teams_provider_for_token, GraphRoom,
+        MSA_TENANT_ID,
     };
+
+    /// Build a minimal unsigned JWT (`header.payload.signature`) whose
+    /// payload carries the given `tid`, for exercising the work/school
+    /// vs personal detection without a live token.
+    fn fake_jwt_with_tid(tid: &str) -> String {
+        use base64::Engine;
+        let enc = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let payload = serde_json::json!({ "tid": tid, "aud": "graph" }).to_string();
+        format!("{}.{}.{}", enc("{\"alg\":\"none\"}"), enc(&payload), "sig")
+    }
+
+    #[test]
+    fn teams_provider_work_school_account() {
+        let token = fake_jwt_with_tid("11111111-2222-3333-4444-555555555555");
+        assert_eq!(teams_provider_for_token(&token), "teamsForBusiness");
+    }
+
+    #[test]
+    fn teams_provider_personal_msa_account() {
+        let token = fake_jwt_with_tid(MSA_TENANT_ID);
+        assert_eq!(teams_provider_for_token(&token), "teamsForConsumer");
+    }
+
+    #[test]
+    fn teams_provider_opaque_token_treated_as_personal() {
+        // Personal MSA Graph tokens are opaque (not a decodable JWT);
+        // an undecodable token must fall back to the consumer provider.
+        assert_eq!(
+            teams_provider_for_token("an-opaque-non-jwt-token"),
+            "teamsForConsumer"
+        );
+    }
+
+    #[test]
+    fn parse_graph_event_extracts_online_meeting_url() {
+        let e = serde_json::json!({
+            "id": "evt1",
+            "subject": "Standup",
+            "start": {"dateTime": "2026-06-22T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-06-22T10:30:00", "timeZone": "UTC"},
+            "isAllDay": false,
+            "isOnlineMeeting": true,
+            "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/xyz"},
+        });
+        let parsed = parse_graph_event(&e);
+        assert_eq!(
+            parsed.online_meeting_url.as_deref(),
+            Some("https://teams.microsoft.com/l/meetup-join/xyz")
+        );
+    }
+
+    #[test]
+    fn parse_graph_event_without_online_meeting_is_none() {
+        let e = serde_json::json!({
+            "id": "evt2",
+            "subject": "No call",
+            "start": {"dateTime": "2026-06-22T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-06-22T10:30:00", "timeZone": "UTC"},
+            "isAllDay": false,
+        });
+        let parsed = parse_graph_event(&e);
+        assert_eq!(parsed.online_meeting_url, None);
+    }
 
     /// Regression: `get_me`'s mailbox-address heuristic must reject a
     /// legacy Exchange X.500 / "EX" distinguished name. Graph returns

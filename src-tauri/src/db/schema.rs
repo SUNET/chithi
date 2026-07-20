@@ -94,6 +94,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             ical_data TEXT,
             remote_id TEXT,
             etag TEXT,
+            online_meeting_url TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -493,6 +494,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 "ALTER TABLE accounts ADD COLUMN {col} INTEGER NOT NULL DEFAULT 1;"
             ))?;
         }
+    }
+
+    // Add online_meeting_url column to calendar_events (Teams meetings,
+    // ADR 0050). Holds the Graph-minted Teams join URL for O365 events.
+    let has_online_meeting_url: bool = conn
+        .prepare("SELECT online_meeting_url FROM calendar_events LIMIT 0")
+        .is_ok();
+    if !has_online_meeting_url {
+        log::info!("Migration: adding online_meeting_url column to calendar_events table");
+        conn.execute_batch("ALTER TABLE calendar_events ADD COLUMN online_meeting_url TEXT;")?;
     }
 
     Ok(())

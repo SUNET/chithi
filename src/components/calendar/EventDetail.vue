@@ -229,6 +229,20 @@ async function handleDelete() {
           <LinkifiedText :text="event.location" data-testid="event-location" />
         </div>
 
+        <!-- ADR 0050: native Teams meeting join link. Routed through the
+             tracked link popup (ADR 0045) like every other external URL. -->
+        <div v-if="event.online_meeting_url" class="detail-row">
+          <span class="detail-icon">&#x1F4F9;</span>
+          <button
+            type="button"
+            class="teams-join-btn"
+            data-testid="event-join-teams"
+            @click="uiStore.openLinkPopup(event.online_meeting_url!)"
+          >
+            Join Teams meeting
+          </button>
+        </div>
+
         <div v-if="event.my_status" class="detail-row">
           <span class="detail-icon">&#x2713;</span>
           <span :class="statusClass(event.my_status)">
@@ -394,6 +408,17 @@ async function handleDelete() {
   flex-shrink: 0;
   width: 20px;
   text-align: center;
+}
+
+.teams-join-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-primary, #4285f4);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: underline;
 }
 
 .calendar-dot {

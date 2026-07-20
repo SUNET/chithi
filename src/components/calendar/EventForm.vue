@@ -65,6 +65,11 @@ const meetError = ref<string | null>(null);
  * user replaces the meet URL (handled in `save()`). */
 const pendingMeetBinding = ref<import("@/lib/types").MeetBinding | null>(null);
 
+/** Native Teams meeting toggle (ADR 0050). Unlike the meet providers
+ * above, Teams is intrinsic to an O365 account: no pre-flight call —
+ * Graph mints the join URL when the event is POSTed on save. */
+const addTeamsMeeting = ref(false);
+
 async function addVideoLink(accountId: string) {
   if (!accountId || generatingMeetUrl.value) return;
   generatingMeetUrl.value = true;
@@ -165,6 +170,15 @@ const calendarId = ref(calendarStore.calendars[0]?.id ?? "");
 const selectedCalendarAccountId = computed(() => {
   const cal = calendarStore.calendars.find((c) => c.id === calendarId.value);
   return cal?.account_id ?? null;
+});
+
+/** Whether the selected calendar belongs to an O365 account — gates the
+ * native "Add Teams meeting" toggle (ADR 0050). */
+const isO365Selected = computed(() => {
+  const account = accountsStore.accounts.find(
+    (a) => a.id === selectedCalendarAccountId.value,
+  );
+  return account?.provider === "o365" || account?.provider === "microsoft365";
 });
 const recurrenceRule = ref<string | null>(null);
 const attendeeEmails = ref<string[]>([]);
@@ -316,6 +330,11 @@ async function refreshRoomSuggestions() {
 
 watch(selectedCalendarAccountId, () => {
   void refreshRoomSuggestions();
+  // Teams is O365-only; clear the toggle when switching to a calendar
+  // whose account can't host one.
+  if (!isO365Selected.value) {
+    addTeamsMeeting.value = false;
+  }
 }, { immediate: true });
 
 watch([location, startDate, startTime, endDate, endTime, allDay], () => {
@@ -379,6 +398,7 @@ async function save() {
       recurrence_rule: recurrenceRule.value,
       attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
       meet_binding: meetBinding,
+      add_teams_meeting: addTeamsMeeting.value,
     });
 
     // Send invite emails if attendees were added
@@ -511,6 +531,25 @@ async function save() {
           <span v-if="meetError" class="meet-error" data-testid="event-form-meet-error">
             {{ meetError }}
           </span>
+          <!-- ADR 0050: native Teams meeting for O365 accounts. Unlike
+               the provider buttons above, there's no join URL until the
+               event is saved — Graph mints it on create — so this is a
+               save-time toggle rather than an eager "Add" button. -->
+          <label
+            v-if="isO365Selected"
+            class="teams-toggle"
+            data-testid="event-form-teams-toggle"
+          >
+            <input
+              type="checkbox"
+              v-model="addTeamsMeeting"
+              data-testid="event-form-teams-checkbox"
+            />
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+            </svg>
+            Add Teams meeting
+          </label>
         </div>
 
         <div class="form-group">
@@ -577,6 +616,20 @@ async function save() {
   margin-top: 6px;
   font-size: 11px;
   color: var(--color-danger, #c0392b);
+}
+
+.teams-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--color-text, #333);
+  cursor: pointer;
+}
+
+.teams-toggle input {
+  cursor: pointer;
 }
 
 .room-suggestions-loading {

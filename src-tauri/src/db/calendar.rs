@@ -47,6 +47,11 @@ pub struct CalendarEvent {
     pub ical_data: Option<String>,
     pub remote_id: Option<String>,
     pub etag: Option<String>,
+    /// Online-meeting (Teams) join URL attached to this event. Populated
+    /// for O365 events created/synced with `isOnlineMeeting` (ADR 0050);
+    /// `None` for everything else.
+    #[serde(default)]
+    pub online_meeting_url: Option<String>,
 }
 
 /// Attendee for JSON serialization inside `attendees_json`.
@@ -245,9 +250,9 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     location = ?5, start_time = ?6, end_time = ?7, all_day = ?8,
                     timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
                     attendees_json = ?12, my_status = ?13, source_message_id = ?14,
-                    ical_data = ?15, remote_id = ?16, etag = ?17,
+                    ical_data = ?15, remote_id = ?16, etag = ?17, online_meeting_url = ?18,
                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?18",
+                 WHERE id = ?19",
                 params![
                     event.calendar_id,
                     event.uid,
@@ -266,6 +271,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     event.ical_data,
                     event.remote_id,
                     event.etag,
+                    event.online_meeting_url,
                     existing_id,
                 ],
             )?;
@@ -301,7 +307,7 @@ pub fn list_events(
             "SELECT id, account_id, calendar_id, uid, title, description, location,
                     start_time, end_time, all_day, timezone, recurrence_rule,
                     organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag
+                    ical_data, remote_id, etag, online_meeting_url
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
                AND ((start_time < ?4 AND end_time > ?3)
@@ -314,7 +320,7 @@ pub fn list_events(
             "SELECT id, account_id, calendar_id, uid, title, description, location,
                     start_time, end_time, all_day, timezone, recurrence_rule,
                     organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag
+                    ical_data, remote_id, etag, online_meeting_url
              FROM calendar_events
              WHERE account_id = ?1
                AND ((start_time < ?3 AND end_time > ?2)
@@ -359,7 +365,7 @@ pub fn list_invites(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag, created_at
+                ical_data, remote_id, etag, online_meeting_url, created_at
          FROM calendar_events
          WHERE account_id = ?1
            AND organizer_email IS NOT NULL
@@ -373,7 +379,7 @@ pub fn list_invites(
         .query_map(params![account_id, account_email, since], |row| {
             Ok(Invite {
                 event: map_event_row(row)?,
-                created_at: row.get(19)?,
+                created_at: row.get(20)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -399,7 +405,7 @@ pub fn get_event(conn: &Connection, id: &str) -> Result<CalendarEvent> {
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
+                ical_data, remote_id, etag, online_meeting_url
          FROM calendar_events WHERE id = ?1",
         params![id],
         map_event_row,
@@ -418,8 +424,8 @@ pub fn insert_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
          (id, account_id, calendar_id, uid, title, description, location,
           start_time, end_time, all_day, timezone, recurrence_rule,
           organizer_email, attendees_json, my_status, source_message_id,
-          ical_data, remote_id, etag)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          ical_data, remote_id, etag, online_meeting_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             event.id,
             event.account_id,
@@ -440,6 +446,7 @@ pub fn insert_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             event.ical_data,
             event.remote_id,
             event.etag,
+            event.online_meeting_url,
         ],
     )?;
     Ok(())
@@ -452,9 +459,9 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             location = ?5, start_time = ?6, end_time = ?7, all_day = ?8,
             timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
             attendees_json = ?12, my_status = ?13, source_message_id = ?14,
-            ical_data = ?15, remote_id = ?16, etag = ?17,
+            ical_data = ?15, remote_id = ?16, etag = ?17, online_meeting_url = ?18,
             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?18",
+         WHERE id = ?19",
         params![
             event.calendar_id,
             event.uid,
@@ -473,6 +480,7 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             event.ical_data,
             event.remote_id,
             event.etag,
+            event.online_meeting_url,
             event.id,
         ],
     )?;
@@ -499,7 +507,7 @@ pub fn get_event_by_uid(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
+                ical_data, remote_id, etag, online_meeting_url
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2
          LIMIT 1",
@@ -539,6 +547,7 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
         ical_data: row.get(16)?,
         remote_id: row.get(17)?,
         etag: row.get(18)?,
+        online_meeting_url: row.get(19)?,
     })
 }
 
@@ -599,6 +608,7 @@ mod tests {
                 ical_data TEXT,
                 remote_id TEXT,
                 etag TEXT,
+                online_meeting_url TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -631,6 +641,7 @@ mod tests {
             ical_data: None,
             remote_id: remote_id.map(|s| s.to_string()),
             etag: None,
+            online_meeting_url: None,
         }
     }
 
@@ -644,6 +655,32 @@ mod tests {
         assert_eq!(fetched.title, "Meeting");
         assert_eq!(fetched.uid, Some("e1@test".to_string()));
         assert!(fetched.remote_id.is_none());
+    }
+
+    #[test]
+    fn test_online_meeting_url_roundtrips() {
+        let conn = setup_db();
+        // Insert with a Teams join URL, then read it back (ADR 0050).
+        let mut event = make_event("e1", "Teams call", None);
+        event.online_meeting_url =
+            Some("https://teams.microsoft.com/l/meetup-join/abc".to_string());
+        insert_event(&conn, &event).unwrap();
+        let fetched = get_event(&conn, "e1").unwrap();
+        assert_eq!(
+            fetched.online_meeting_url.as_deref(),
+            Some("https://teams.microsoft.com/l/meetup-join/abc")
+        );
+
+        // Clearing it (best-effort Teams removal) round-trips through update.
+        let mut cleared = fetched;
+        cleared.online_meeting_url = None;
+        update_event(&conn, &cleared).unwrap();
+        assert_eq!(get_event(&conn, "e1").unwrap().online_meeting_url, None);
+
+        // Events created without a meeting have a NULL URL.
+        let plain = make_event("e2", "No call", None);
+        insert_event(&conn, &plain).unwrap();
+        assert_eq!(get_event(&conn, "e2").unwrap().online_meeting_url, None);
     }
 
     #[test]
