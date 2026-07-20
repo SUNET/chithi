@@ -429,13 +429,19 @@ async function loadDraft(accountId: string) {
     // Subject). For a plaintext draft it also gives the body.
     const envelope = await api.getMessageBody(accountId, draftId);
     let body = envelope.body_text ?? "";
+    // An HTML alternative on a chithi-authored draft means it was composed
+    // in Markdown (that's the only path that stores one). Re-arm the toggle
+    // so a resumed-then-sent Markdown draft keeps its HTML alternative.
+    let htmlAlternative = envelope.body_html;
     if (envelope.pgp_kind === "mimeEncrypted") {
       // Encrypted draft: decrypt for the real body. pgp_decrypt_message
       // drives the passphrase / card-PIN dialog through the pgp-prompts
       // store, which this window is already subscribed to.
       const decrypted = await api.pgpDecryptMessage(accountId, draftId);
       body = decrypted.plaintextBody.body_text ?? "";
+      htmlAlternative = decrypted.plaintextBody.body_html;
     }
+    markdownMode.value = !!htmlAlternative && htmlAlternative.trim().length > 0;
     prefillFromDraft(envelope, body);
   } catch (e) {
     draftDecryptError.value = String(e);
@@ -583,6 +589,7 @@ async function saveDraft(): Promise<boolean> {
       body_html: null,
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
+      markdown: markdownMode.value,
     });
     // The account asked for encrypted drafts but the backend had to
     // store this one in plaintext (Graph account, or no usable public

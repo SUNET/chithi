@@ -552,6 +552,12 @@ pub async fn save_draft(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
+    // Render the HTML alternative for Markdown drafts too, so the draft is
+    // stored as multipart/alternative(Markdown source, rendered HTML). On
+    // resume the composer detects that HTML alternative and re-arms
+    // Markdown mode, so a resumed-then-sent Markdown draft keeps its HTML.
+    let body_html = resolve_body_html(&message);
+
     let raw_message = smtp::build_raw_message(
         &account.email,
         &draft_to,
@@ -559,7 +565,7 @@ pub async fn save_draft(
         &message.bcc,
         &message.subject,
         &message.body_text,
-        message.body_html.as_deref(),
+        body_html.as_deref(),
         &attachment_data,
         in_reply_to.as_deref(),
         &references,
@@ -604,7 +610,16 @@ pub async fn save_draft(
     };
 
     if account.mail_protocol_str() == "graph" {
-        // Save draft via Graph API: POST /me/messages creates a draft without sending
+        // Save draft via Graph API: POST /me/messages creates a draft
+        // without sending. Known limitation: this JSON path stores only
+        // `body_text` as a single `contentType: Text` body, so it drops
+        // the `multipart/alternative` we built in `raw_message` — a
+        // Markdown draft's rendered-HTML alternative is not persisted, and
+        // on resume Markdown mode can't be re-armed (the user re-toggles
+        // before sending; the send itself is unaffected). Same root cause
+        // as the encrypted-drafts-on-Graph fallback above. Fixing this
+        // means saving the draft as MIME (`Content-Type: text/plain`,
+        // base64 `raw_message`) — tracked in #215.
         log::info!(
             "Saving draft via Microsoft Graph for account {}",
             account.email
