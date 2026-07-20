@@ -45,4 +45,18 @@ ignore = [
                         # practical exposure is minimal. Drop this once
                         # `rsa` ships a constant-time release.
                         # Upstream: https://github.com/RustCrypto/RSA/issues/19
+
+    # --- quick-xml < 0.41 DoS on untrusted XML, both copies transitive via
+    # the Tauri toolchain and un-bumpable without a new Tauri release:
+    #   quick-xml 0.39.4 <- plist <- tauri-utils (config / macOS bundling)
+    #   quick-xml 0.37.5 <- tauri-winrt-notification <- notify-rust
+    #                       <- tauri-plugin-notification (Windows toasts)
+    # 0.41 is a semver-major bump the parents pin below; Tauri 2.11.2 is
+    # the latest 2.x, so there is no compatible bump for us to take.
+    # Neither path parses attacker-supplied XML in Chithi (local Info.plist
+    # / self-generated toast XML), so the DoS is not reachable in our
+    # threat model. Drop when a Tauri release moves plist / notify-rust to
+    # a quick-xml 0.41 line.
+    "RUSTSEC-2026-0194", # quick-xml quadratic dup-attribute check (CPU DoS)
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace-decl alloc (mem DoS)
 ]
