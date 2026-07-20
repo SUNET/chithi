@@ -29,6 +29,42 @@ pub struct ComposeMessage {
     pub pgp_sign: bool,
     #[serde(default)]
     pub pgp_encrypt: bool,
+    /// "Compose in Markdown" toggle. When true, `body_text` is treated as
+    /// Markdown source: the backend renders it to safe HTML and ships a
+    /// `multipart/alternative` carrying the Markdown source as the
+    /// plaintext part and the rendered HTML as the html part. Ignored
+    /// when `body_html` is already populated (an explicit HTML body wins).
+    #[serde(default)]
+    pub markdown: bool,
+}
+
+/// Resolve the effective HTML body for an outgoing message.
+///
+/// An explicit `body_html` always wins — the renderer already decided
+/// the HTML. Otherwise, when the "Compose in Markdown" toggle is on, the
+/// Markdown source in `body_text` is rendered to HTML with the `markdown`
+/// crate's GFM flavour. Raw-HTML passthrough and dangerous protocols stay
+/// disabled (markdown-rs's default), so the output is safe to send
+/// without further sanitisation. On the rare render error we log and fall
+/// back to `None` so the message still goes out as plaintext-only rather
+/// than failing the send.
+///
+/// Shared by every send path (and reusable by the mobile composer once it
+/// exists) so Markdown rendering lives in one place, not per-platform.
+fn resolve_body_html(message: &ComposeMessage) -> Option<String> {
+    if let Some(html) = &message.body_html {
+        return Some(html.clone());
+    }
+    if !message.markdown {
+        return None;
+    }
+    match markdown::to_html_with_options(&message.body_text, &markdown::Options::gfm()) {
+        Ok(html) => Some(html),
+        Err(e) => {
+            log::warn!("Markdown render failed, sending plaintext only: {e}");
+            None
+        }
+    }
 }
 
 /// An attachment referenced by the renderer. `token` is the opaque handle
@@ -111,6 +147,12 @@ pub async fn send_message(
     let (in_reply_to, references) =
         resolve_reply_headers(&state, &account_id, message.reply_to_message_id.as_deref());
 
+    // Resolve the HTML alternative: an explicit body_html, or Markdown
+    // rendered to safe HTML when "Compose in Markdown" is on. `body_text`
+    // (the Markdown source, when in Markdown mode) always rides as the
+    // plaintext part, so recipients get both.
+    let body_html = resolve_body_html(&message);
+
     // Build the plain MIME bytes. `plain_raw` stays a `Vec<u8>` so the
     // optional PGP wrap and Autocrypt header inject below can each
     // consume and replace it cheaply. Only the FINAL `raw_message` is
@@ -124,7 +166,7 @@ pub async fn send_message(
         &message.bcc,
         &message.subject,
         &message.body_text,
-        message.body_html.as_deref(),
+        body_html.as_deref(),
         &attachment_data,
         in_reply_to.as_deref(),
         &references,
@@ -1323,6 +1365,75 @@ pub async fn pgp_check_recipients(
         out.push(status);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod markdown_body_tests {
+    use super::{resolve_body_html, ComposeMessage};
+
+    fn msg(body_text: &str, body_html: Option<&str>, markdown: bool) -> ComposeMessage {
+        ComposeMessage {
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: String::new(),
+            body_text: body_text.to_string(),
+            body_html: body_html.map(|s| s.to_string()),
+            attachments: vec![],
+            reply_to_message_id: None,
+            pgp_sign: false,
+            pgp_encrypt: false,
+            markdown,
+        }
+    }
+
+    /// Markdown off and no explicit HTML → plaintext-only (None), so the
+    /// message keeps shipping as a single text/plain part.
+    #[test]
+    fn no_markdown_no_html_is_none() {
+        assert!(resolve_body_html(&msg("# Hello", None, false)).is_none());
+    }
+
+    /// Markdown on → body_text is rendered to HTML. GFM constructs work
+    /// (heading, bold), and the Markdown source is preserved as-is for the
+    /// plaintext part by the caller.
+    #[test]
+    fn markdown_on_renders_html() {
+        let html = resolve_body_html(&msg("# Title\n\nsome **bold** text", None, true))
+            .expect("markdown should render html");
+        assert!(html.contains("<h1>"), "heading should render: {html}");
+        assert!(html.contains("<strong>bold</strong>"), "bold should render: {html}");
+    }
+
+    /// Safety: raw HTML in the Markdown source must NOT pass through as
+    /// live markup — markdown-rs escapes it (dangerous-HTML off by
+    /// default), so a `<script>` becomes inert text, never an element.
+    #[test]
+    fn markdown_escapes_raw_html() {
+        let html = resolve_body_html(&msg(
+            "hi <script>alert('xss')</script> there",
+            None,
+            true,
+        ))
+        .expect("render");
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> must be escaped, not emitted live: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "the script tag should survive as escaped text: {html}"
+        );
+    }
+
+    /// An explicit body_html always wins, even with the Markdown toggle
+    /// on — the renderer already decided the HTML.
+    #[test]
+    fn explicit_html_wins_over_markdown() {
+        let html = resolve_body_html(&msg("# ignored", Some("<p>explicit</p>"), true))
+            .expect("explicit html");
+        assert_eq!(html, "<p>explicit</p>");
+    }
 }
 
 #[cfg(test)]
