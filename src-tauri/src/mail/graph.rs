@@ -17,9 +17,19 @@ const BATCH_SIZE: usize = 20;
 /// Fold a `$batch` response into per-item results. Sub-responses are keyed
 /// by the request "id" we set to the item's global index; they may arrive
 /// out of order.
-fn apply_batch_responses(resp: &serde_json::Value, results: &mut [Result<()>]) {
+///
+/// A batch can return outer HTTP 200 while individual sub-responses are
+/// throttled (429) or transient (503/504). Those items are NOT written
+/// into `results`; they come back as `(index, retry_after_secs)` so the
+/// caller can retry just the affected sub-requests after the per-item
+/// delay. Everything else is recorded as a final outcome.
+fn apply_batch_responses(
+    resp: &serde_json::Value,
+    results: &mut [Result<()>],
+) -> Vec<(usize, u64)> {
+    let mut retryable = Vec::new();
     let Some(responses) = resp["responses"].as_array() else {
-        return;
+        return retryable;
     };
     for r in responses {
         let Some(idx) = r["id"].as_str().and_then(|s| s.parse::<usize>().ok()) else {
@@ -29,17 +39,32 @@ fn apply_batch_responses(resp: &serde_json::Value, results: &mut [Result<()>]) {
             continue;
         }
         let status = r["status"].as_u64().unwrap_or(0) as u16;
-        results[idx] = if (200..300).contains(&status) {
-            Ok(())
+        if (200..300).contains(&status) {
+            results[idx] = Ok(());
+        } else if matches!(status, 429 | 503 | 504) {
+            let delay = batch_item_retry_after(r).unwrap_or(5);
+            retryable.push((idx, delay));
         } else {
             let body = r["body"].to_string();
-            Err(Error::Other(format!(
+            results[idx] = Err(Error::Other(format!(
                 "Graph $batch item returned {}: {}",
                 status,
                 truncate(&body, 300)
-            )))
-        };
+            )));
+        }
     }
+    retryable
+}
+
+/// Pull `Retry-After` (seconds) out of a `$batch` sub-response's headers,
+/// tolerating header-name casing differences.
+fn batch_item_retry_after(r: &serde_json::Value) -> Option<u64> {
+    let headers = r["headers"].as_object()?;
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, v)| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -72,14 +97,23 @@ impl GraphClient {
         }
     }
 
-    /// Send a request, retrying on throttled (429) and transient (503/504)
-    /// responses while honoring `Retry-After`. Exchange throttles mailbox
-    /// access aggressively; without this every 429 aborted the whole
-    /// account sync and the retry storm made the throttling worse.
+    /// Send a request, retrying on throttled (429) and — for idempotent
+    /// requests only — transient (503/504) responses, honoring
+    /// `Retry-After`. Exchange throttles mailbox access aggressively;
+    /// without this every 429 aborted the whole account sync and the
+    /// retry storm made the throttling worse.
+    ///
+    /// `retry_transient` must be `false` for non-idempotent requests
+    /// (POSTs like `/sendMail`, resource creation, `$batch` with moves):
+    /// a gateway 503/504 can arrive after Graph has already committed the
+    /// request, and a blind retry would duplicate mail or resources. 429
+    /// is always safe to retry — it means the request was rejected before
+    /// processing.
     async fn send_with_retry(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
         what: &str,
+        retry_transient: bool,
     ) -> Result<reqwest::Response> {
         const MAX_ATTEMPTS: u32 = 3;
         const MAX_RETRY_AFTER_SECS: u64 = 120;
@@ -92,7 +126,8 @@ impl GraphClient {
                 .await
                 .map_err(|e| Error::Other(format!("Graph {} failed: {}", what, e)))?;
             let code = resp.status().as_u16();
-            if matches!(code, 429 | 503 | 504) && attempt < MAX_ATTEMPTS {
+            let retryable = code == 429 || (retry_transient && matches!(code, 503 | 504));
+            if retryable && attempt < MAX_ATTEMPTS {
                 let retry_after = resp
                     .headers()
                     .get("Retry-After")
@@ -126,6 +161,7 @@ impl GraphClient {
                         .query(params)
                 },
                 &format!("GET {}", path),
+                true,
             )
             .await?;
 
@@ -177,6 +213,7 @@ impl GraphClient {
             .send_with_retry(
                 || self.http.get(url).bearer_auth(&self.access_token),
                 "GET (absolute)",
+                true,
             )
             .await?;
 
@@ -275,6 +312,9 @@ impl GraphClient {
                         .json(body)
                 },
                 &format!("POST {}", path),
+                // POST is not idempotent (sendMail, resource creation,
+                // $batch moves): 429-only retry.
+                false,
             )
             .await?;
 
@@ -308,6 +348,7 @@ impl GraphClient {
                         .json(body)
                 },
                 &format!("PATCH {}", path),
+                true,
             )
             .await?;
 
@@ -330,6 +371,7 @@ impl GraphClient {
             .send_with_retry(
                 || self.http.delete(&url).bearer_auth(&self.access_token),
                 &format!("DELETE {}", path),
+                true,
             )
             .await?;
 
@@ -600,6 +642,7 @@ impl GraphClient {
                         .header("Prefer", "odata.maxpagesize=200")
                 },
                 &what,
+                true,
             )
             .await?;
 
@@ -830,7 +873,81 @@ impl GraphClient {
         Ok(())
     }
 
-    /// Move a message to a different folder.
+    /// Execute pre-built `$batch` sub-requests (each carrying an `id` set
+    /// to its global index), chunked at [`BATCH_SIZE`]. Sub-responses that
+    /// come back 429/503/504 are retried after their per-item
+    /// `Retry-After` delay, up to 3 rounds; a retried operation that
+    /// already committed server-side resolves to a 404
+    /// `ErrorItemNotFound`, which callers treat as a stale local row —
+    /// so retrying moves/deletes converges instead of duplicating work.
+    async fn execute_batch_with_retry(
+        &self,
+        requests: Vec<serde_json::Value>,
+    ) -> Result<Vec<Result<()>>> {
+        const MAX_ROUNDS: u32 = 3;
+        const MAX_RETRY_AFTER_SECS: u64 = 120;
+
+        let total = requests.len();
+        let mut results: Vec<Result<()>> = (0..total)
+            .map(|_| Err(Error::Other("no $batch response for item".into())))
+            .collect();
+
+        let mut pending = requests;
+        let mut round = 0u32;
+        while !pending.is_empty() {
+            round += 1;
+            let mut retry_indices: Vec<(usize, u64)> = Vec::new();
+            for chunk in pending.chunks(BATCH_SIZE) {
+                let resp = self
+                    .post_json("/$batch", &serde_json::json!({ "requests": chunk }))
+                    .await?;
+                retry_indices.extend(apply_batch_responses(&resp, &mut results));
+            }
+
+            if round >= MAX_ROUNDS {
+                for (idx, _) in &retry_indices {
+                    if *idx < total {
+                        results[*idx] = Err(Error::Other(
+                            "Graph $batch item still throttled after retries".into(),
+                        ));
+                    }
+                }
+                break;
+            }
+
+            let next: Vec<serde_json::Value> = pending
+                .iter()
+                .filter(|req| {
+                    req["id"]
+                        .as_str()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map(|idx| retry_indices.iter().any(|(i, _)| *i == idx))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if !next.is_empty() {
+                let delay = retry_indices
+                    .iter()
+                    .map(|(_, d)| *d)
+                    .max()
+                    .unwrap_or(5)
+                    .min(MAX_RETRY_AFTER_SECS);
+                log::warn!(
+                    "Graph $batch: {} throttled sub-request(s), retrying after {}s (round {}/{})",
+                    next.len(),
+                    delay,
+                    round,
+                    MAX_ROUNDS
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            pending = next;
+        }
+
+        Ok(results)
+    }
+
     /// Move messages to a destination folder using JSON batching (20
     /// sub-requests per round trip instead of one round trip per message).
     /// Returns one outcome per input id, in order. Item-level failures
@@ -841,63 +958,37 @@ impl GraphClient {
         message_ids: &[String],
         dest_folder_id: &str,
     ) -> Result<Vec<Result<()>>> {
-        let mut results: Vec<Result<()>> = message_ids
+        let requests: Vec<serde_json::Value> = message_ids
             .iter()
-            .map(|_| Err(Error::Other("no $batch response for item".into())))
-            .collect();
-
-        for (chunk_idx, chunk) in message_ids.chunks(BATCH_SIZE).enumerate() {
-            let base = chunk_idx * BATCH_SIZE;
-            let requests: Vec<serde_json::Value> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, id)| {
-                    serde_json::json!({
-                        "id": format!("{}", base + i),
-                        "method": "POST",
-                        "url": format!("/me/messages/{}/move", id),
-                        "headers": { "Content-Type": "application/json" },
-                        "body": { "destinationId": dest_folder_id }
-                    })
+            .enumerate()
+            .map(|(i, id)| {
+                serde_json::json!({
+                    "id": format!("{}", i),
+                    "method": "POST",
+                    "url": format!("/me/messages/{}/move", id),
+                    "headers": { "Content-Type": "application/json" },
+                    "body": { "destinationId": dest_folder_id }
                 })
-                .collect();
-            let resp = self
-                .post_json("/$batch", &serde_json::json!({ "requests": requests }))
-                .await?;
-            apply_batch_responses(&resp, &mut results);
-        }
-
-        Ok(results)
+            })
+            .collect();
+        self.execute_batch_with_retry(requests).await
     }
 
     /// Delete messages using JSON batching. Same contract as
     /// [`Self::move_messages_batch`].
     pub async fn delete_messages_batch(&self, message_ids: &[String]) -> Result<Vec<Result<()>>> {
-        let mut results: Vec<Result<()>> = message_ids
+        let requests: Vec<serde_json::Value> = message_ids
             .iter()
-            .map(|_| Err(Error::Other("no $batch response for item".into())))
-            .collect();
-
-        for (chunk_idx, chunk) in message_ids.chunks(BATCH_SIZE).enumerate() {
-            let base = chunk_idx * BATCH_SIZE;
-            let requests: Vec<serde_json::Value> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, id)| {
-                    serde_json::json!({
-                        "id": format!("{}", base + i),
-                        "method": "DELETE",
-                        "url": format!("/me/messages/{}", id),
-                    })
+            .enumerate()
+            .map(|(i, id)| {
+                serde_json::json!({
+                    "id": format!("{}", i),
+                    "method": "DELETE",
+                    "url": format!("/me/messages/{}", id),
                 })
-                .collect();
-            let resp = self
-                .post_json("/$batch", &serde_json::json!({ "requests": requests }))
-                .await?;
-            apply_batch_responses(&resp, &mut results);
-        }
-
-        Ok(results)
+            })
+            .collect();
+        self.execute_batch_with_retry(requests).await
     }
 
     pub async fn move_message(&self, message_id: &str, dest_folder_id: &str) -> Result<()> {
@@ -1607,6 +1698,8 @@ pub struct GraphMessage {
     pub cc_addresses: String,
     pub date: String,
     pub is_read: bool,
+    /// Graph `flag.flagStatus == "flagged"` — the server-side star/flag.
+    pub is_flagged: bool,
     pub has_attachments: bool,
     pub internet_message_id: Option<String>,
     pub conversation_id: Option<String>,
@@ -1846,6 +1939,7 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
         cc_addresses,
         date,
         is_read: m["isRead"].as_bool().unwrap_or(false),
+        is_flagged: m["flag"]["flagStatus"].as_str() == Some("flagged"),
         has_attachments: m["hasAttachments"].as_bool().unwrap_or(false),
         internet_message_id: m["internetMessageId"]
             .as_str()
@@ -2431,6 +2525,31 @@ mod batch_tests {
             results[1].is_err(),
             "unanswered items must not report success"
         );
+    }
+
+    /// Throttled sub-responses are returned for retry with their per-item
+    /// `Retry-After` (header casing varies), not recorded as final errors.
+    #[test]
+    fn batch_responses_report_throttled_items_for_retry() {
+        let resp = serde_json::json!({
+            "responses": [
+                { "id": "0", "status": 201 },
+                {
+                    "id": "1",
+                    "status": 429,
+                    "headers": { "Retry-After": "17" },
+                    "body": { "error": { "code": "ApplicationThrottled" } }
+                },
+                { "id": "2", "status": 503, "headers": { "retry-after": "3" } },
+            ]
+        });
+        let mut results = fresh_results(3);
+        let retryable = apply_batch_responses(&resp, &mut results);
+        assert!(results[0].is_ok());
+        // Throttled items keep their placeholder (not a final outcome yet).
+        assert!(results[1].is_err());
+        assert!(results[2].is_err());
+        assert_eq!(retryable, vec![(1, 17), (2, 3)]);
     }
 
     #[test]

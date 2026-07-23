@@ -1319,9 +1319,6 @@ fn clear_reauth_required(account_id: &str) {
 }
 
 pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
-    // Fresh tokens (sign-in or successful refresh) mean the account no
-    // longer needs re-authentication.
-    clear_reauth_required(account_id);
     #[cfg(target_os = "android")]
     {
         android_store::store(account_id, tokens)?;
@@ -1329,10 +1326,21 @@ pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
             "OAuth2: tokens stored in file store for account {}",
             account_id
         );
+        // Fresh tokens (sign-in or successful refresh) mean the account no
+        // longer needs re-authentication. Cleared only after persistence
+        // succeeded — clearing on a failed store would re-open the refresh
+        // retry loop with the old, rejected token still in place.
+        clear_reauth_required(account_id);
         return Ok(());
     }
     #[cfg(not(target_os = "android"))]
-    store_tokens_keyring(account_id, tokens)
+    {
+        store_tokens_keyring(account_id, tokens)?;
+        // See the android branch above: only a persisted fresh token set
+        // clears the re-auth flag.
+        clear_reauth_required(account_id);
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "android"))]

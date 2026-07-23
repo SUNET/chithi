@@ -169,6 +169,22 @@ async fn sync_graph_folder_delta(
         ids
     };
 
+    // A full (re-)enumeration — no stored link, e.g. first sync or after
+    // HTTP 410 expired the delta token — lists what exists NOW; it does
+    // not emit tombstones for messages deleted while no delta state was
+    // held. Track what the enumeration returns and prune the local rows
+    // it never mentioned once it completes. Full enumerations run to
+    // completion (no page cap) so that prune is sound; steady-state delta
+    // rounds are capped instead.
+    let full_enumeration = link.is_none();
+    let pre_existing: std::collections::HashSet<String> = if full_enumeration {
+        existing_ids.clone()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut completed = false;
+
     let mut synced = 0u32;
     let mut new_ids: Vec<String> = Vec::new();
     let mut pages = 0usize;
@@ -191,28 +207,38 @@ async fn sync_graph_folder_delta(
 
         {
             let conn = db_arc.writer().await;
-            conn.execute_batch("BEGIN")?;
+            // rusqlite::Transaction rolls back on drop, so any `?` below
+            // cannot leave an open transaction on the pooled connection.
+            let tx = conn.unchecked_transaction()?;
 
             for removed in &page.removed_ids {
                 let id = format!("{}_{}", account_id, removed);
-                conn.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])
+                tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])
                     .ok();
                 existing_ids.remove(&id);
             }
 
             for msg in &page.messages {
                 let id = format!("{}_{}", account_id, msg.id);
-                let flags = if msg.is_read {
-                    vec!["seen".to_string()]
-                } else {
-                    vec![]
-                };
+                if full_enumeration {
+                    seen_ids.insert(id.clone());
+                }
+                // Mirror the full server-side flag state (read + flagged),
+                // not just read: replacing the array with only `seen`
+                // erased an existing `flagged` on every update.
+                let mut flags: Vec<String> = Vec::new();
+                if msg.is_read {
+                    flags.push("seen".to_string());
+                }
+                if msg.is_flagged {
+                    flags.push("flagged".to_string());
+                }
                 let flags_json = serde_json::to_string(&flags).unwrap_or_default();
 
                 if existing_ids.contains(&id) {
-                    // Updated message: mirror the server-side read state
-                    // (read/unread toggled on webmail).
-                    let _ = db::messages::update_flags(&conn, &id, &flags_json);
+                    // Updated message: mirror server-side flag changes
+                    // (read/unread or flag toggled on webmail).
+                    let _ = db::messages::update_flags(&tx, &id, &flags_json);
                     continue;
                 }
 
@@ -242,7 +268,7 @@ async fn sync_graph_folder_delta(
                     maildir_path: String::new(),
                     snippet: msg.preview.clone(),
                 };
-                db::messages::insert_message(&conn, &new_msg)?;
+                db::messages::insert_message(&tx, &new_msg)?;
                 existing_ids.insert(id.clone());
                 new_ids.push(id);
                 synced += 1;
@@ -252,15 +278,17 @@ async fn sync_graph_folder_delta(
             // sync continues from here instead of restarting the folder.
             let resume = page.next_link.as_deref().or(page.delta_link.as_deref());
             if let Some(l) = resume {
-                db::folders::update_graph_delta_link(&conn, account_id, &gf.id, Some(l))?;
+                db::folders::update_graph_delta_link(&tx, account_id, &gf.id, Some(l))?;
             }
 
-            conn.execute_batch("COMMIT")?;
+            tx.commit()?;
         }
 
         pages += 1;
         match page.next_link {
-            Some(next) if pages < MAX_DELTA_PAGES_PER_CYCLE => link = Some(next),
+            Some(next) if full_enumeration || pages < MAX_DELTA_PAGES_PER_CYCLE => {
+                link = Some(next)
+            }
             Some(_) => {
                 log::info!(
                     "Graph sync: '{}' has more pages after {} ({} new so far); resuming next cycle",
@@ -270,7 +298,36 @@ async fn sync_graph_folder_delta(
                 );
                 break;
             }
-            None => break,
+            None => {
+                completed = true;
+                break;
+            }
+        }
+    }
+
+    // Reconcile a completed full enumeration: local rows the snapshot
+    // never mentioned were deleted (or moved out) server-side while we
+    // had no delta state. A resumed enumeration (interrupted earlier;
+    // `full_enumeration` is false because a nextLink was stored) skips
+    // this — conservative, and the next 410-triggered resync heals it.
+    if full_enumeration && completed {
+        let stale: Vec<&String> = pre_existing.difference(&seen_ids).collect();
+        if !stale.is_empty() {
+            let conn = db_arc.writer().await;
+            let tx = conn.unchecked_transaction()?;
+            for id in &stale {
+                tx.execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    rusqlite::params![id.as_str()],
+                )
+                .ok();
+            }
+            tx.commit()?;
+            log::info!(
+                "Graph sync: pruned {} stale local row(s) in '{}' after full enumeration",
+                stale.len(),
+                gf.display_name
+            );
         }
     }
 
