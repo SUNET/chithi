@@ -41,6 +41,12 @@ pub fn matches_message(rule: &FilterRule, msg: &MessageData) -> bool {
 /// Run through all rules sorted by priority (highest first), collect actions
 /// from matching rules. If a matching rule has `stop_processing` set, stop
 /// evaluating further rules.
+///
+/// Move/Copy actions whose target equals the message's current folder are
+/// dropped: they are no-ops at best, and on Microsoft Graph a same-folder
+/// move mints a new message id, which made sync see the message as "new"
+/// again and re-run the same filter — an infinite download/move loop that
+/// also wiped the folder's local rows on every cycle.
 pub fn apply_filters(rules: &[FilterRule], msg: &MessageData) -> Vec<FilterAction> {
     let mut sorted: Vec<&FilterRule> = rules.iter().filter(|r| r.enabled).collect();
     sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
@@ -56,7 +62,26 @@ pub fn apply_filters(rules: &[FilterRule], msg: &MessageData) -> Vec<FilterActio
                 msg.id,
                 msg.subject
             );
-            collected_actions.extend(rule.actions.clone());
+            collected_actions.extend(
+                rule.actions
+                    .iter()
+                    .filter(|action| match action {
+                        FilterAction::Move { target } | FilterAction::Copy { target }
+                            if *target == msg.folder_path =>
+                        {
+                            log::debug!(
+                                "Filter '{}': skipping {:?} — message {} is already in '{}'",
+                                rule.name,
+                                action,
+                                msg.id,
+                                msg.folder_path
+                            );
+                            false
+                        }
+                        _ => true,
+                    })
+                    .cloned(),
+            );
 
             if rule.stop_processing {
                 log::debug!(
@@ -470,6 +495,76 @@ mod tests {
         };
 
         assert!(!matches_message(&rule, &msg));
+    }
+
+    /// Regression test for the Graph filter/sync infinite loop: a Move
+    /// action targeting the folder the message is already in must be
+    /// dropped, otherwise sync re-moves the message forever (Graph mints
+    /// a new id on every move) and prunes the local rows each cycle.
+    #[test]
+    fn test_move_to_current_folder_is_skipped() {
+        let mut msg = make_msg();
+        msg.folder_path = "oauth-wg-folder-id".to_string();
+
+        let rules = vec![FilterRule {
+            id: "r_loop".to_string(),
+            account_id: None,
+            name: "oauth".to_string(),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::From,
+                op: ConditionOp::Contains,
+                value: "alice".to_string(),
+            }],
+            actions: vec![
+                FilterAction::Move {
+                    target: "oauth-wg-folder-id".to_string(),
+                },
+                FilterAction::MarkRead,
+            ],
+            stop_processing: false,
+        }];
+
+        let actions = apply_filters(&rules, &msg);
+        // The Move is dropped; unrelated actions from the same rule survive.
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], FilterAction::MarkRead));
+    }
+
+    /// A Move to a *different* folder must still go through, and Copy to
+    /// the current folder is dropped like Move.
+    #[test]
+    fn test_move_to_other_folder_and_copy_guard() {
+        let msg = make_msg(); // folder_path = "INBOX"
+
+        let rules = vec![FilterRule {
+            id: "r_ok".to_string(),
+            account_id: None,
+            name: "sort".to_string(),
+            enabled: true,
+            priority: 0,
+            match_type: MatchType::All,
+            conditions: vec![Condition {
+                field: ConditionField::From,
+                op: ConditionOp::Contains,
+                value: "alice".to_string(),
+            }],
+            actions: vec![
+                FilterAction::Move {
+                    target: "Archive".to_string(),
+                },
+                FilterAction::Copy {
+                    target: "INBOX".to_string(),
+                },
+            ],
+            stop_processing: false,
+        }];
+
+        let actions = apply_filters(&rules, &msg);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], FilterAction::Move { target } if target == "Archive"));
     }
 
     #[test]

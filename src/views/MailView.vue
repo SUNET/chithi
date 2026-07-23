@@ -242,17 +242,25 @@ let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 
 async function periodicSync() {
   // Skip calendar-/contacts-only accounts (mail_protocol === "" via #43).
-  for (const account of accountsStore.mailAccounts) {
-    if (!account.enabled) continue;
-    try {
-      await api.triggerSync(
-        account.id,
-        foldersStore.activeFolderPath ?? undefined,
-      );
-    } catch (e) {
-      console.error("Periodic sync error:", e);
-    }
-  }
+  // Accounts sync concurrently — the backend serializes per account via
+  // its sync guard, but one slow account (a large JMAP delta round, an
+  // O365 Graph cycle) must not delay the others' start. The active folder
+  // is a priority hint that only makes sense for the account it belongs to.
+  const enabled = accountsStore.mailAccounts.filter((a) => a.enabled);
+  await Promise.allSettled(
+    enabled.map(async (account) => {
+      try {
+        await api.triggerSync(
+          account.id,
+          accountsStore.activeAccountId === account.id
+            ? (foldersStore.activeFolderPath ?? undefined)
+            : undefined,
+        );
+      } catch (e) {
+        console.error("Periodic sync error:", e);
+      }
+    }),
+  );
 }
 
 onMounted(async () => {

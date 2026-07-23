@@ -699,29 +699,52 @@ async fn execute_graph_filter_actions(
         }
     }
 
-    log::info!("Graph: moving {} messages", moves.len());
+    // Moves and deletes go through Graph JSON batching (20 sub-requests
+    // per round trip). The old one-HTTP-call-per-message loop turned a
+    // filter run over a large folder into hundreds of sequential round
+    // trips and a large slice of the mailbox throttling budget.
     let mut moved_db_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stale_count = 0u32;
+
+    let mut moves_by_target: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (db_id, graph_id, target) in &moves {
-        match client.move_message(graph_id, target).await {
-            Ok(_) => {
-                moved_db_set.insert(db_id.clone());
-                result.moved_db_ids.push(db_id.clone());
-            }
-            Err(e) if is_graph_item_not_found(&e) => {
-                // Message no longer exists at this id — treat the local row
-                // as stale and prune it. A sync will repopulate the folder
-                // with current server state.
-                log::info!(
-                    "Graph move 404 for id={}: pruning stale local row",
-                    graph_id
-                );
-                result.deleted_db_ids.push(db_id.clone());
-                stale_count += 1;
+        moves_by_target
+            .entry(target.clone())
+            .or_default()
+            .push((db_id.clone(), graph_id.clone()));
+    }
+    for (target, items) in &moves_by_target {
+        log::info!("Graph: moving {} messages to '{}'", items.len(), target);
+        let graph_ids: Vec<String> = items.iter().map(|(_, gid)| gid.clone()).collect();
+        match client.move_messages_batch(&graph_ids, target).await {
+            Ok(outcomes) => {
+                for ((db_id, graph_id), outcome) in items.iter().zip(outcomes) {
+                    match outcome {
+                        Ok(()) => {
+                            moved_db_set.insert(db_id.clone());
+                            result.moved_db_ids.push(db_id.clone());
+                        }
+                        Err(e) if is_graph_item_not_found(&e) => {
+                            // Message no longer exists at this id — treat the
+                            // local row as stale and prune it. A sync will
+                            // repopulate the folder with current server state.
+                            log::info!(
+                                "Graph move 404 for id={}: pruning stale local row",
+                                graph_id
+                            );
+                            result.deleted_db_ids.push(db_id.clone());
+                            stale_count += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("Graph move failed for id={}: {}", graph_id, e);
+                            result.errors.push(format!("move: {}", e));
+                        }
+                    }
+                }
             }
             Err(e) => {
-                log::warn!("Graph move failed for id={}: {}", graph_id, e);
-                result.errors.push(format!("move: {}", e));
+                log::warn!("Graph move batch to '{}' failed: {}", target, e);
+                result.errors.push(format!("move batch: {}", e));
             }
         }
     }
@@ -734,21 +757,30 @@ async fn execute_graph_filter_actions(
         .collect();
     if !to_delete.is_empty() {
         log::info!("Graph: deleting {} messages", to_delete.len());
-        for (db_id, graph_id) in &to_delete {
-            match client.delete_message(graph_id).await {
-                Ok(_) => result.deleted_db_ids.push(db_id.clone()),
-                Err(e) if is_graph_item_not_found(&e) => {
-                    log::info!(
-                        "Graph delete 404 for id={}: pruning stale local row",
-                        graph_id
-                    );
-                    result.deleted_db_ids.push(db_id.clone());
-                    stale_count += 1;
+        let graph_ids: Vec<String> = to_delete.iter().map(|(_, gid)| gid.clone()).collect();
+        match client.delete_messages_batch(&graph_ids).await {
+            Ok(outcomes) => {
+                for ((db_id, graph_id), outcome) in to_delete.iter().zip(outcomes) {
+                    match outcome {
+                        Ok(()) => result.deleted_db_ids.push(db_id.clone()),
+                        Err(e) if is_graph_item_not_found(&e) => {
+                            log::info!(
+                                "Graph delete 404 for id={}: pruning stale local row",
+                                graph_id
+                            );
+                            result.deleted_db_ids.push(db_id.clone());
+                            stale_count += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("Graph delete failed for id={}: {}", graph_id, e);
+                            result.errors.push(format!("delete: {}", e));
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::warn!("Graph delete failed for id={}: {}", graph_id, e);
-                    result.errors.push(format!("delete: {}", e));
-                }
+            }
+            Err(e) => {
+                log::warn!("Graph delete batch failed: {}", e);
+                result.errors.push(format!("delete batch: {}", e));
             }
         }
     }

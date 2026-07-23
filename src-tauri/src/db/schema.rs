@@ -43,6 +43,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             total_count INTEGER DEFAULT 0,
             uid_next INTEGER DEFAULT 0,
             parent_id TEXT,
+            graph_delta_link TEXT,
             UNIQUE(account_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_folders_account ON folders(account_id);
@@ -493,6 +494,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 "ALTER TABLE accounts ADD COLUMN {col} INTEGER NOT NULL DEFAULT 1;"
             ))?;
         }
+    }
+
+    // Microsoft Graph incremental sync: per-folder delta/next link, the
+    // Graph analogue of `jmap_state`. NULL means "no delta state yet" and
+    // triggers a full initial enumeration of the folder.
+    let has_graph_delta_link: bool = conn
+        .prepare("SELECT graph_delta_link FROM folders LIMIT 0")
+        .is_ok();
+    if !has_graph_delta_link {
+        log::info!("Migration: adding graph_delta_link column to folders table");
+        conn.execute_batch("ALTER TABLE folders ADD COLUMN graph_delta_link TEXT;")?;
     }
 
     Ok(())

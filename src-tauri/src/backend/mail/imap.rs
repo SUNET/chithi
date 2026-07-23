@@ -41,6 +41,17 @@ async fn build_imap_config(account: &AccountFull) -> Result<ImapConfig> {
 /// the Graph backend — O365 accounts keep IMAP access and their
 /// Graph sync can leave on-demand rows behind.
 pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
+    // Graph-protocol accounts without an IMAP binding have no host to
+    // connect to. Without this guard every sync-complete kicked off a
+    // doomed connect to ":993" plus keyring/token reads for credentials.
+    if account.imap_host.is_empty() {
+        log::debug!(
+            "Prefetch: account {} has no IMAP host configured, skipping",
+            account.id
+        );
+        return Ok(0);
+    }
+
     let account_id = account.id.clone();
     let imap_config = build_imap_config(account).await?;
     let data_dir = ctx.data_dir.clone();

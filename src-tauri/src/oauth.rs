@@ -1258,7 +1258,70 @@ pub fn init_token_store(_data_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Accounts whose refresh token was rejected with `invalid_grant`.
+///
+/// Once a refresh token is dead (expired, revoked, or past a
+/// conditional-access lifetime cap like AADSTS70043), every refresh attempt
+/// fails the same way — but the periodic sync retried it every cycle,
+/// hammering the token endpoint and burying the real problem in log noise.
+/// This registry lets token getters fail fast until the user signs in
+/// again; a successful `store_tokens` clears the flag.
+static REAUTH_REQUIRED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn reauth_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    REAUTH_REQUIRED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Fail fast if the account is already known to need re-authentication.
+pub fn ensure_not_reauth_required(account_id: &str) -> Result<()> {
+    let flagged = reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(account_id);
+    if flagged {
+        return Err(Error::AuthRequired(format!(
+            "Sign-in expired for account {}. Open Settings and sign in again.",
+            account_id
+        )));
+    }
+    Ok(())
+}
+
+/// Inspect a token-refresh error: on `invalid_grant` mark the account as
+/// requiring re-authentication and convert the error into
+/// [`Error::AuthRequired`] so callers stop retrying. Other errors (network,
+/// keyring, throttling) pass through unchanged and stay retryable.
+pub fn auth_required_on_invalid_grant(account_id: &str, err: Error) -> Error {
+    if err.to_string().contains("invalid_grant") {
+        log::warn!(
+            "OAuth2: refresh token rejected (invalid_grant) for account {}; re-authentication required",
+            account_id
+        );
+        reauth_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account_id.to_string());
+        Error::AuthRequired(format!(
+            "Sign-in expired for account {}. Open Settings and sign in again.",
+            account_id
+        ))
+    } else {
+        err
+    }
+}
+
+fn clear_reauth_required(account_id: &str) {
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(account_id);
+}
+
 pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+    // Fresh tokens (sign-in or successful refresh) mean the account no
+    // longer needs re-authentication.
+    clear_reauth_required(account_id);
     #[cfg(target_os = "android")]
     {
         android_store::store(account_id, tokens)?;

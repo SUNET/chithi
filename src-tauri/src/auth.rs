@@ -196,6 +196,9 @@ pub async fn get_imap_credentials(account: &AccountFull) -> Result<(String, bool
         return Ok((account.password.clone(), false));
     }
 
+    // Dead refresh token (invalid_grant)? Fail fast without a network call.
+    crate::oauth::ensure_not_reauth_required(&account.id)?;
+
     let tokens = crate::oauth::load_tokens(&account.id)?.ok_or_else(|| {
         Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
     })?;
@@ -207,7 +210,8 @@ pub async fn get_imap_credentials(account: &AccountFull) -> Result<(String, bool
         &refresh_token,
         crate::oauth::MICROSOFT_IMAP_SCOPES,
     )
-    .await?;
+    .await
+    .map_err(|e| crate::oauth::auth_required_on_invalid_grant(&account.id, e))?;
     // Save the potentially rotated refresh token
     crate::oauth::store_tokens(&account.id, &imap_tokens)?;
     Ok((imap_tokens.access_token, true))

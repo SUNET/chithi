@@ -259,39 +259,9 @@ pub async fn sync_folder(
         data_dir: state.data_dir.clone(),
     };
 
-    if backend.folder_sync_backgrounds() {
-        // No cheap per-folder fetch for this provider (Graph) — every
-        // sync runs against the whole account. Spawn it in the
-        // background and return immediately so the UI's per-folder
-        // spinner doesn't sit there for multiple minutes. The
-        // per-account `_guard` rides along into the spawned task so
-        // the flag stays held for the real work and is released
-        // exactly once when the sync finishes.
-        let app_bg = app.clone();
-        let account_bg = account.clone();
-        let account_id_bg = account_id.clone();
-        tokio::spawn(async move {
-            let _hold_guard = _guard;
-            let result = backend.sync_account(&ctx, &account_bg, None).await;
-            match result {
-                Ok(()) => log::info!("Background Graph sync done for {}", account_id_bg),
-                Err(e) => {
-                    log::error!("Background Graph sync failed for {}: {}", account_id_bg, e);
-                    app_bg
-                        .emit(
-                            "sync-error",
-                            serde_json::json!({
-                                "account_id": account_id_bg,
-                                "error": e.to_string(),
-                            }),
-                        )
-                        .ok();
-                }
-            }
-        });
-        return Ok(0);
-    }
-
+    // Every backend syncs exactly the requested folder synchronously —
+    // a right-click "sync folder" must never escalate to a whole-account
+    // sync (Graph used to background one here before delta sync).
     let sync_result: Result<u32> = backend.sync_folder(&ctx, &account, &folder_path).await;
 
     let resume_result =

@@ -11,6 +11,37 @@ use serde::{Deserialize, Serialize};
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 
+/// Graph JSON batching allows at most 20 sub-requests per `$batch` call.
+const BATCH_SIZE: usize = 20;
+
+/// Fold a `$batch` response into per-item results. Sub-responses are keyed
+/// by the request "id" we set to the item's global index; they may arrive
+/// out of order.
+fn apply_batch_responses(resp: &serde_json::Value, results: &mut [Result<()>]) {
+    let Some(responses) = resp["responses"].as_array() else {
+        return;
+    };
+    for r in responses {
+        let Some(idx) = r["id"].as_str().and_then(|s| s.parse::<usize>().ok()) else {
+            continue;
+        };
+        if idx >= results.len() {
+            continue;
+        }
+        let status = r["status"].as_u64().unwrap_or(0) as u16;
+        results[idx] = if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            let body = r["body"].to_string();
+            Err(Error::Other(format!(
+                "Graph $batch item returned {}: {}",
+                status,
+                truncate(&body, 300)
+            )))
+        };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Graph client
 // ---------------------------------------------------------------------------
@@ -41,16 +72,62 @@ impl GraphClient {
         }
     }
 
+    /// Send a request, retrying on throttled (429) and transient (503/504)
+    /// responses while honoring `Retry-After`. Exchange throttles mailbox
+    /// access aggressively; without this every 429 aborted the whole
+    /// account sync and the retry storm made the throttling worse.
+    async fn send_with_retry(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const MAX_RETRY_AFTER_SECS: u64 = 120;
+
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let resp = build()
+                .send()
+                .await
+                .map_err(|e| Error::Other(format!("Graph {} failed: {}", what, e)))?;
+            let code = resp.status().as_u16();
+            if matches!(code, 429 | 503 | 504) && attempt < MAX_ATTEMPTS {
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5)
+                    .min(MAX_RETRY_AFTER_SECS);
+                log::warn!(
+                    "Graph {} returned {} (attempt {}/{}), retrying after {}s",
+                    what,
+                    code,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    retry_after
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || {
+                    self.http
+                        .get(&url)
+                        .bearer_auth(&self.access_token)
+                        .query(params)
+                },
+                &format!("GET {}", path),
+            )
+            .await?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -97,12 +174,11 @@ impl GraphClient {
     /// which Graph returns as a fully-qualified URL rather than a path).
     async fn get_absolute(&self, url: &str) -> Result<serde_json::Value> {
         let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", url, e)))?;
+            .send_with_retry(
+                || self.http.get(url).bearer_auth(&self.access_token),
+                "GET (absolute)",
+            )
+            .await?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -191,13 +267,16 @@ impl GraphClient {
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.access_token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph POST {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || {
+                    self.http
+                        .post(&url)
+                        .bearer_auth(&self.access_token)
+                        .json(body)
+                },
+                &format!("POST {}", path),
+            )
+            .await?;
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -221,13 +300,16 @@ impl GraphClient {
     async fn patch_json(&self, path: &str, body: &serde_json::Value) -> Result<()> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
-            .http
-            .patch(&url)
-            .bearer_auth(&self.access_token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph PATCH {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || {
+                    self.http
+                        .patch(&url)
+                        .bearer_auth(&self.access_token)
+                        .json(body)
+                },
+                &format!("PATCH {}", path),
+            )
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -245,12 +327,11 @@ impl GraphClient {
     async fn delete(&self, path: &str) -> Result<()> {
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
-            .http
-            .delete(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph DELETE {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || self.http.delete(&url).bearer_auth(&self.access_token),
+                &format!("DELETE {}", path),
+            )
+            .await?;
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 {
@@ -364,64 +445,48 @@ impl GraphClient {
     // Mail folders
     // -----------------------------------------------------------------------
 
-    /// List all mail folders.
+    /// List all mail folders, walking the entire hierarchy.
+    ///
+    /// Graph's `/me/mailFolders` returns only top-level folders, so children
+    /// are fetched per parent (breadth-first) with full pagination. The old
+    /// implementation fetched exactly one level of children with no `$top`
+    /// and no `nextLink` follow, which silently dropped grandchildren and
+    /// any child past Graph's default page size (10) — folders created in a
+    /// nested position on the web never appeared locally.
     pub async fn list_mail_folders(&self) -> Result<Vec<GraphMailFolder>> {
-        let mut folders = Vec::new();
-        let mut url = "/me/mailFolders".to_string();
+        const FOLDER_SELECT: &str =
+            "id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount";
 
-        loop {
-            let resp = self
+        let mut folders = Vec::new();
+        // Parents whose children still need fetching; None = top level.
+        let mut pending_parents: Vec<Option<String>> = vec![None];
+
+        while let Some(parent) = pending_parents.pop() {
+            let path = match &parent {
+                None => "/me/mailFolders".to_string(),
+                Some(pid) => format!("/me/mailFolders/{}/childFolders", pid),
+            };
+
+            let mut page = self
                 .get(
-                    &url,
+                    &path,
                     &[
-                        (
-                            "$select",
-                            "id,displayName,totalItemCount,unreadItemCount,parentFolderId",
-                        ),
+                        ("$select", FOLDER_SELECT),
                         ("$top", "100"),
                         ("includeHiddenFolders", "true"),
                     ],
                 )
                 .await?;
 
-            if let Some(values) = resp["value"].as_array() {
-                for f in values {
-                    folders.push(GraphMailFolder {
-                        id: f["id"].as_str().unwrap_or("").to_string(),
-                        display_name: f["displayName"].as_str().unwrap_or("").to_string(),
-                        total_count: f["totalItemCount"].as_i64().unwrap_or(0),
-                        unread_count: f["unreadItemCount"].as_i64().unwrap_or(0),
-                        parent_folder_id: f["parentFolderId"].as_str().map(|s| s.to_string()),
-                    });
-                }
-            }
-
-            // Pagination
-            if let Some(next) = resp["@odata.nextLink"].as_str() {
-                // nextLink is a full URL — strip the base
-                url = next.replace(GRAPH_BASE, "");
-            } else {
-                break;
-            }
-        }
-
-        // Also fetch child folders (Graph only returns top-level by default)
-        let top_ids: Vec<String> = folders.iter().map(|f| f.id.clone()).collect();
-        for parent_id in &top_ids {
-            let child_resp = self
-                .get(
-                    &format!("/me/mailFolders/{}/childFolders", parent_id),
-                    &[(
-                        "$select",
-                        "id,displayName,totalItemCount,unreadItemCount,parentFolderId",
-                    )],
-                )
-                .await;
-            if let Ok(resp) = child_resp {
-                if let Some(values) = resp["value"].as_array() {
+            loop {
+                if let Some(values) = page["value"].as_array() {
                     for f in values {
+                        let id = f["id"].as_str().unwrap_or("").to_string();
+                        if f["childFolderCount"].as_i64().unwrap_or(0) > 0 && !id.is_empty() {
+                            pending_parents.push(Some(id.clone()));
+                        }
                         folders.push(GraphMailFolder {
-                            id: f["id"].as_str().unwrap_or("").to_string(),
+                            id,
                             display_name: f["displayName"].as_str().unwrap_or("").to_string(),
                             total_count: f["totalItemCount"].as_i64().unwrap_or(0),
                             unread_count: f["unreadItemCount"].as_i64().unwrap_or(0),
@@ -429,11 +494,38 @@ impl GraphClient {
                         });
                     }
                 }
+                let next = page["@odata.nextLink"].as_str().map(String::from);
+                match next {
+                    Some(next) => page = self.get_absolute(&next).await?,
+                    None => break,
+                }
             }
         }
 
         log::info!("Graph: found {} mail folders", folders.len());
         Ok(folders)
+    }
+
+    /// Fetch a single mail folder (fresh display name and counts).
+    /// Used by per-folder sync so it works even for folders the local DB
+    /// hasn't seen yet.
+    pub async fn get_mail_folder(&self, folder_id: &str) -> Result<GraphMailFolder> {
+        let f = self
+            .get(
+                &format!("/me/mailFolders/{}", folder_id),
+                &[(
+                    "$select",
+                    "id,displayName,totalItemCount,unreadItemCount,parentFolderId",
+                )],
+            )
+            .await?;
+        Ok(GraphMailFolder {
+            id: f["id"].as_str().unwrap_or(folder_id).to_string(),
+            display_name: f["displayName"].as_str().unwrap_or("").to_string(),
+            total_count: f["totalItemCount"].as_i64().unwrap_or(0),
+            unread_count: f["unreadItemCount"].as_i64().unwrap_or(0),
+            parent_folder_id: f["parentFolderId"].as_str().map(|s| s.to_string()),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -468,6 +560,87 @@ impl GraphClient {
         }
 
         Ok((messages, total))
+    }
+
+    /// Fetch one page of a messages delta query for a folder.
+    ///
+    /// With `link == None` this starts a fresh (full) enumeration; with a
+    /// stored `@odata.nextLink`/`@odata.deltaLink` it resumes/continues
+    /// incremental sync. `$select` deliberately omits
+    /// `internetMessageHeaders`: it forces Exchange to open the full
+    /// property bag per item, and threading on Graph uses `conversationId`.
+    ///
+    /// A stored link that the server has expired (HTTP 410) surfaces as an
+    /// error matched by [`is_delta_resync_required`]; the caller must clear
+    /// its stored link and restart a full enumeration.
+    pub async fn messages_delta_page(
+        &self,
+        folder_id: &str,
+        link: Option<&str>,
+    ) -> Result<GraphDeltaPage> {
+        const DELTA_SELECT: &str = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,\
+                                    isRead,hasAttachments,flag,internetMessageId,conversationId,\
+                                    bodyPreview,importance";
+
+        let what = format!("GET messages/delta for {}", folder_id);
+        let resp = self
+            .send_with_retry(
+                || {
+                    let req = match link {
+                        Some(url) => self.http.get(url),
+                        None => self
+                            .http
+                            .get(format!(
+                                "{}/me/mailFolders/{}/messages/delta",
+                                GRAPH_BASE, folder_id
+                            ))
+                            .query(&[("$select", DELTA_SELECT)]),
+                    };
+                    req.bearer_auth(&self.access_token)
+                        .header("Prefer", "odata.maxpagesize=200")
+                },
+                &what,
+            )
+            .await?;
+
+        let status = resp.status();
+        if status.as_u16() == 410 {
+            return Err(Error::Other(format!(
+                "{DELTA_RESYNC_MARKER} for folder {folder_id}"
+            )));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "Graph {} returned {}: {}",
+                what,
+                status,
+                truncate(&body, 500)
+            )));
+        }
+        let resp: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?;
+
+        let mut messages = Vec::new();
+        let mut removed_ids = Vec::new();
+        if let Some(values) = resp["value"].as_array() {
+            for m in values {
+                if m.get("@removed").is_some() {
+                    if let Some(id) = m["id"].as_str() {
+                        removed_ids.push(id.to_string());
+                    }
+                } else {
+                    messages.push(parse_graph_message(m));
+                }
+            }
+        }
+
+        Ok(GraphDeltaPage {
+            messages,
+            removed_ids,
+            next_link: resp["@odata.nextLink"].as_str().map(String::from),
+            delta_link: resp["@odata.deltaLink"].as_str().map(String::from),
+        })
     }
 
     /// Search messages across all folders using `$search` (KQL).
@@ -658,6 +831,75 @@ impl GraphClient {
     }
 
     /// Move a message to a different folder.
+    /// Move messages to a destination folder using JSON batching (20
+    /// sub-requests per round trip instead of one round trip per message).
+    /// Returns one outcome per input id, in order. Item-level failures
+    /// carry the sub-response status and body, so a stale id shows up as
+    /// `404 ... ErrorItemNotFound` exactly like the single-message call.
+    pub async fn move_messages_batch(
+        &self,
+        message_ids: &[String],
+        dest_folder_id: &str,
+    ) -> Result<Vec<Result<()>>> {
+        let mut results: Vec<Result<()>> = message_ids
+            .iter()
+            .map(|_| Err(Error::Other("no $batch response for item".into())))
+            .collect();
+
+        for (chunk_idx, chunk) in message_ids.chunks(BATCH_SIZE).enumerate() {
+            let base = chunk_idx * BATCH_SIZE;
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    serde_json::json!({
+                        "id": format!("{}", base + i),
+                        "method": "POST",
+                        "url": format!("/me/messages/{}/move", id),
+                        "headers": { "Content-Type": "application/json" },
+                        "body": { "destinationId": dest_folder_id }
+                    })
+                })
+                .collect();
+            let resp = self
+                .post_json("/$batch", &serde_json::json!({ "requests": requests }))
+                .await?;
+            apply_batch_responses(&resp, &mut results);
+        }
+
+        Ok(results)
+    }
+
+    /// Delete messages using JSON batching. Same contract as
+    /// [`Self::move_messages_batch`].
+    pub async fn delete_messages_batch(&self, message_ids: &[String]) -> Result<Vec<Result<()>>> {
+        let mut results: Vec<Result<()>> = message_ids
+            .iter()
+            .map(|_| Err(Error::Other("no $batch response for item".into())))
+            .collect();
+
+        for (chunk_idx, chunk) in message_ids.chunks(BATCH_SIZE).enumerate() {
+            let base = chunk_idx * BATCH_SIZE;
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    serde_json::json!({
+                        "id": format!("{}", base + i),
+                        "method": "DELETE",
+                        "url": format!("/me/messages/{}", id),
+                    })
+                })
+                .collect();
+            let resp = self
+                .post_json("/$batch", &serde_json::json!({ "requests": requests }))
+                .await?;
+            apply_batch_responses(&resp, &mut results);
+        }
+
+        Ok(results)
+    }
+
     pub async fn move_message(&self, message_id: &str, dest_folder_id: &str) -> Result<()> {
         let body = serde_json::json!({ "destinationId": dest_folder_id });
         self.post_json(&format!("/me/messages/{}/move", message_id), &body)
@@ -1320,6 +1562,30 @@ fn looks_like_smtp_address(s: &str) -> bool {
         Some((local, domain)) => !local.is_empty() && domain.contains('.'),
         None => false,
     }
+}
+
+/// One page of a Graph messages-delta response.
+#[derive(Debug, Clone)]
+pub struct GraphDeltaPage {
+    /// Created or updated messages (full selected properties).
+    pub messages: Vec<GraphMessage>,
+    /// Graph ids of messages removed from the folder (deleted or moved out).
+    pub removed_ids: Vec<String>,
+    /// More pages are available right now (`@odata.nextLink`).
+    pub next_link: Option<String>,
+    /// Checkpoint to store for the next sync cycle (`@odata.deltaLink`).
+    /// Present only on the final page of a round.
+    pub delta_link: Option<String>,
+}
+
+/// Marker embedded in the error for HTTP 410 on a delta call: the stored
+/// delta token expired server-side and the folder needs a full resync.
+const DELTA_RESYNC_MARKER: &str = "graph delta resync required";
+
+/// True if the error is a delta-state expiry (HTTP 410). The caller should
+/// clear the stored delta link and restart a full enumeration.
+pub fn is_delta_resync_required(err: &crate::error::Error) -> bool {
+    err.to_string().contains(DELTA_RESYNC_MARKER)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2075,6 +2341,10 @@ pub async fn get_graph_token_for_rooms(account_id: &str) -> Result<String> {
 }
 
 async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<String> {
+    // Dead refresh token (invalid_grant)? Fail fast without a network call
+    // until the user signs in again — see oauth::auth_required_on_invalid_grant.
+    crate::oauth::ensure_not_reauth_required(account_id)?;
+
     let tokens = crate::oauth::load_tokens(account_id)?.ok_or_else(|| {
         Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
     })?;
@@ -2085,7 +2355,9 @@ async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<S
 
     // Always refresh with Graph scopes — the cached token is likely IMAP-scoped
     let new_tokens =
-        crate::oauth::refresh_with_scopes(&crate::oauth::MICROSOFT, &refresh_token, scopes).await?;
+        crate::oauth::refresh_with_scopes(&crate::oauth::MICROSOFT, &refresh_token, scopes)
+            .await
+            .map_err(|e| crate::oauth::auth_required_on_invalid_grant(account_id, e))?;
     // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
     // The refresh_token may rotate, so save that part only.
     if new_tokens.refresh_token.is_some() {
@@ -2100,6 +2372,75 @@ async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<S
     }
 
     Ok(new_tokens.access_token)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{apply_batch_responses, is_delta_resync_required, DELTA_RESYNC_MARKER};
+    use crate::error::Error;
+
+    fn fresh_results(n: usize) -> Vec<crate::error::Result<()>> {
+        (0..n)
+            .map(|_| Err(Error::Other("no $batch response for item".into())))
+            .collect()
+    }
+
+    #[test]
+    fn batch_responses_map_out_of_order_by_id() {
+        let resp = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 204 },
+                { "id": "0", "status": 201 },
+            ]
+        });
+        let mut results = fresh_results(2);
+        apply_batch_responses(&resp, &mut results);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+    }
+
+    #[test]
+    fn batch_responses_keep_item_errors_detectable() {
+        let resp = serde_json::json!({
+            "responses": [
+                { "id": "0", "status": 201 },
+                {
+                    "id": "1",
+                    "status": 404,
+                    "body": { "error": { "code": "ErrorItemNotFound" } }
+                },
+            ]
+        });
+        let mut results = fresh_results(2);
+        apply_batch_responses(&resp, &mut results);
+        assert!(results[0].is_ok());
+        // The stale-id detection in commands::filters matches on "404" +
+        // "ErrorItemNotFound" appearing in the error text.
+        let err = results[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("404"), "missing status in: {err}");
+        assert!(err.contains("ErrorItemNotFound"), "missing code in: {err}");
+    }
+
+    #[test]
+    fn batch_responses_missing_item_stays_err() {
+        let resp = serde_json::json!({ "responses": [ { "id": "0", "status": 200 } ] });
+        let mut results = fresh_results(2);
+        apply_batch_responses(&resp, &mut results);
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "unanswered items must not report success"
+        );
+    }
+
+    #[test]
+    fn delta_resync_marker_is_detected() {
+        let err = Error::Other(format!("{DELTA_RESYNC_MARKER} for folder abc"));
+        assert!(is_delta_resync_required(&err));
+        assert!(!is_delta_resync_required(&Error::Other(
+            "Graph GET x returned 429".into()
+        )));
+    }
 }
 
 #[cfg(test)]
