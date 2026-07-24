@@ -172,21 +172,49 @@ async fn sync_graph_folder_delta(
     // A full (re-)enumeration — no stored link, e.g. first sync or after
     // HTTP 410 expired the delta token — lists what exists NOW; it does
     // not emit tombstones for messages deleted while no delta state was
-    // held. Track what the enumeration returns and prune the local rows
-    // it never mentioned once it completes. Full enumerations run to
-    // completion (no page cap) so that prune is sound; steady-state delta
-    // rounds are capped instead.
-    let full_enumeration = link.is_none();
-    let pre_existing: std::collections::HashSet<String> = if full_enumeration {
-        existing_ids.clone()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut completed = false;
+    // held. Mark every current row `graph_prune_pending` up front; the
+    // enumeration clears the mark on each message it lists, and whatever
+    // is still marked when the enumeration COMPLETES (possibly several
+    // capped cycles later — the marks are durable, unlike an in-memory
+    // seen-set) was deleted server-side and gets pruned.
+    if link.is_none() && !existing_ids.is_empty() {
+        let conn = db_arc.writer().await;
+        conn.execute(
+            "UPDATE messages SET graph_prune_pending = 1
+             WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, gf.id],
+        )?;
+    }
 
+    // Rows whose sync-time filter pass never ran (crash or error after
+    // the insert transaction committed): pick them up in this cycle's
+    // filter batch. They are already in `existing_ids`, so the page loop
+    // below won't re-add them.
+    let mut new_ids: Vec<String> = {
+        let conn = db_arc.reader();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages
+                 WHERE account_id = ?1 AND folder_path = ?2 AND graph_filters_pending = 1",
+            )
+            .map_err(Error::Database)?;
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![account_id, gf.id], |row| row.get(0))
+            .map_err(Error::Database)?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids
+    };
+    if !new_ids.is_empty() {
+        log::info!(
+            "Graph sync: {} message(s) in '{}' still awaiting their filter pass",
+            new_ids.len(),
+            gf.display_name
+        );
+    }
+
+    let mut completed = false;
     let mut synced = 0u32;
-    let mut new_ids: Vec<String> = Vec::new();
     let mut pages = 0usize;
 
     loop {
@@ -220,9 +248,6 @@ async fn sync_graph_folder_delta(
 
             for msg in &page.messages {
                 let id = format!("{}_{}", account_id, msg.id);
-                if full_enumeration {
-                    seen_ids.insert(id.clone());
-                }
                 // Mirror the full server-side flag state (read + flagged),
                 // not just read: replacing the array with only `seen`
                 // erased an existing `flagged` on every update.
@@ -236,9 +261,14 @@ async fn sync_graph_folder_delta(
                 let flags_json = serde_json::to_string(&flags).unwrap_or_default();
 
                 if existing_ids.contains(&id) {
-                    // Updated message: mirror server-side flag changes
-                    // (read/unread or flag toggled on webmail).
+                    // Updated message: mirror server-side flag changes and
+                    // mark it as confirmed-alive for a running full
+                    // enumeration (see graph_prune_pending above).
                     let _ = db::messages::update_flags(&tx, &id, &flags_json);
+                    tx.execute(
+                        "UPDATE messages SET graph_prune_pending = 0 WHERE id = ?1",
+                        rusqlite::params![id],
+                    )?;
                     continue;
                 }
 
@@ -269,6 +299,13 @@ async fn sync_graph_folder_delta(
                     snippet: msg.preview.clone(),
                 };
                 db::messages::insert_message(&tx, &new_msg)?;
+                // Durable "filter pass still owed" marker, committed with
+                // the insert: a crash before the filter run is retried on
+                // the next cycle instead of silently skipped.
+                tx.execute(
+                    "UPDATE messages SET graph_filters_pending = 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
                 existing_ids.insert(id.clone());
                 new_ids.push(id);
                 synced += 1;
@@ -286,9 +323,7 @@ async fn sync_graph_folder_delta(
 
         pages += 1;
         match page.next_link {
-            Some(next) if full_enumeration || pages < MAX_DELTA_PAGES_PER_CYCLE => {
-                link = Some(next)
-            }
+            Some(next) if pages < MAX_DELTA_PAGES_PER_CYCLE => link = Some(next),
             Some(_) => {
                 log::info!(
                     "Graph sync: '{}' has more pages after {} ({} new so far); resuming next cycle",
@@ -305,27 +340,23 @@ async fn sync_graph_folder_delta(
         }
     }
 
-    // Reconcile a completed full enumeration: local rows the snapshot
-    // never mentioned were deleted (or moved out) server-side while we
-    // had no delta state. A resumed enumeration (interrupted earlier;
-    // `full_enumeration` is false because a nextLink was stored) skips
-    // this — conservative, and the next 410-triggered resync heals it.
-    if full_enumeration && completed {
-        let stale: Vec<&String> = pre_existing.difference(&seen_ids).collect();
-        if !stale.is_empty() {
-            let conn = db_arc.writer().await;
-            let tx = conn.unchecked_transaction()?;
-            for id in &stale {
-                tx.execute(
-                    "DELETE FROM messages WHERE id = ?1",
-                    rusqlite::params![id.as_str()],
-                )
-                .ok();
-            }
-            tx.commit()?;
+    // Reconcile on completion (reached the deltaLink): rows still marked
+    // graph_prune_pending were never listed by the enumeration that
+    // marked them — deleted or moved out server-side while we had no
+    // delta state. The marks are durable, so this fires correctly even
+    // when the enumeration spanned several page-capped cycles; ordinary
+    // delta rounds mark nothing, making this a no-op for them.
+    if completed {
+        let conn = db_arc.writer().await;
+        let pruned = conn.execute(
+            "DELETE FROM messages
+             WHERE account_id = ?1 AND folder_path = ?2 AND graph_prune_pending = 1",
+            rusqlite::params![account_id, gf.id],
+        )?;
+        if pruned > 0 {
             log::info!(
                 "Graph sync: pruned {} stale local row(s) in '{}' after full enumeration",
-                stale.len(),
+                pruned,
                 gf.display_name
             );
         }
@@ -339,9 +370,11 @@ async fn sync_graph_folder_delta(
         );
     }
 
-    // Run filter rules against newly inserted messages. Errors are logged
-    // and swallowed so a transient Graph hiccup can't poison the sync —
-    // messages already landed in the DB.
+    // Run filter rules against newly inserted messages (plus any picked
+    // up from an interrupted earlier run). Errors are logged and
+    // swallowed so a transient Graph hiccup can't poison the sync — the
+    // rows keep their graph_filters_pending marker and are retried on
+    // the next cycle.
     if !new_ids.is_empty() {
         match crate::commands::filters::apply_filters_to_new_messages(
             db_arc, account_id, &gf.id, &new_ids,
@@ -349,6 +382,20 @@ async fn sync_graph_folder_delta(
         .await
         {
             Ok(filtered) => {
+                // Filter pass done: clear the pending markers. Rows the
+                // filters moved or deleted are already gone from the DB,
+                // so the UPDATE simply no-ops on them.
+                {
+                    let conn = db_arc.writer().await;
+                    let tx = conn.unchecked_transaction()?;
+                    for id in &new_ids {
+                        tx.execute(
+                            "UPDATE messages SET graph_filters_pending = 0 WHERE id = ?1",
+                            rusqlite::params![id],
+                        )?;
+                    }
+                    tx.commit()?;
+                }
                 if filtered > 0 {
                     log::info!(
                         "Graph filters matched {} of {} new messages in '{}'",

@@ -68,7 +68,9 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             is_signed INTEGER DEFAULT 0,
             flags TEXT DEFAULT '[]',
             maildir_path TEXT,
-            snippet TEXT
+            snippet TEXT,
+            graph_prune_pending INTEGER NOT NULL DEFAULT 0,
+            graph_filters_pending INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_msg_folder ON messages(account_id, folder_path);
         CREATE INDEX IF NOT EXISTS idx_msg_date ON messages(date);
@@ -507,6 +509,28 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE folders ADD COLUMN graph_delta_link TEXT;")?;
     }
 
+    // Graph sync durability markers on messages:
+    // - graph_prune_pending: set on every row of a folder when a full
+    //   delta enumeration starts, cleared as the enumeration lists each
+    //   message; rows still marked when the enumeration completes were
+    //   deleted server-side while we had no delta state. Survives
+    //   interrupted multi-cycle enumerations, unlike in-memory tracking.
+    // - graph_filters_pending: set (in the same transaction as the
+    //   insert) on rows whose sync-time filter run hasn't happened yet,
+    //   cleared after the filter pass; a crash between insert and filter
+    //   run is retried on the next cycle instead of silently skipped.
+    for col in ["graph_prune_pending", "graph_filters_pending"] {
+        let has_col: bool = conn
+            .prepare(&format!("SELECT {col} FROM messages LIMIT 0"))
+            .is_ok();
+        if !has_col {
+            log::info!("Migration: adding {col} column to messages table");
+            conn.execute_batch(&format!(
+                "ALTER TABLE messages ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -757,4 +781,53 @@ pub fn set_migration(conn: &Connection, key: &str) -> crate::error::Result<()> {
         rusqlite::params![key, chrono::Utc::now().to_rfc3339()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh install and migration re-run must both yield the Graph sync
+    /// columns (delta link + durability markers) and be idempotent.
+    #[test]
+    fn graph_sync_columns_exist_and_migrations_are_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+
+        for probe in [
+            "SELECT graph_delta_link FROM folders LIMIT 0",
+            "SELECT graph_prune_pending FROM messages LIMIT 0",
+            "SELECT graph_filters_pending FROM messages LIMIT 0",
+        ] {
+            conn.prepare(probe)
+                .unwrap_or_else(|e| panic!("missing column for `{probe}`: {e}"));
+        }
+
+        // Running initialize again must not fail (existence probes skip
+        // the ALTERs on an already-migrated database).
+        initialize(&conn).unwrap();
+
+        // Marker defaults: inserted rows start unmarked.
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('a1', 'Test', 't@example.com', 't@example.com')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, account_id, folder_path, date)
+             VALUES ('a1_m1', 'a1', 'f1', '2026-07-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (prune, filters): (i64, i64) = conn
+            .query_row(
+                "SELECT graph_prune_pending, graph_filters_pending
+                 FROM messages WHERE id = 'a1_m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((prune, filters), (0, 0));
+    }
 }

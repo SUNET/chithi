@@ -1288,27 +1288,42 @@ pub fn ensure_not_reauth_required(account_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Inspect a token-refresh error: on `invalid_grant` mark the account as
-/// requiring re-authentication and convert the error into
+/// Inspect a token-refresh error: on a terminal `invalid_grant` mark the
+/// account as requiring re-authentication and convert the error into
 /// [`Error::AuthRequired`] so callers stop retrying. Other errors (network,
 /// keyring, throttling) pass through unchanged and stay retryable.
+///
+/// Microsoft also encodes *scope-consent* failures as `invalid_grant`
+/// (AADSTS65001 / `"suberror":"consent_required"`) — e.g. the optional
+/// room-scope refresh (`Place.Read.All`) on an account that never
+/// consented to it. Those mean "this scope needs consent", not "the
+/// refresh token is dead": the same token keeps working for the baseline
+/// scopes, so latching them would let a room-suggestion click take down
+/// mail/calendar/contacts sync until the user signs in again.
 pub fn auth_required_on_invalid_grant(account_id: &str, err: Error) -> Error {
-    if err.to_string().contains("invalid_grant") {
-        log::warn!(
-            "OAuth2: refresh token rejected (invalid_grant) for account {}; re-authentication required",
+    let msg = err.to_string();
+    if !msg.contains("invalid_grant") {
+        return err;
+    }
+    if msg.contains("consent_required") || msg.contains("AADSTS65001") {
+        log::info!(
+            "OAuth2: refresh for account {} needs additional scope consent (not latching re-auth)",
             account_id
         );
-        reauth_registry()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(account_id.to_string());
-        Error::AuthRequired(format!(
-            "Sign-in expired for account {}. Open Settings and sign in again.",
-            account_id
-        ))
-    } else {
-        err
+        return err;
     }
+    log::warn!(
+        "OAuth2: refresh token rejected (invalid_grant) for account {}; re-authentication required",
+        account_id
+    );
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(account_id.to_string());
+    Error::AuthRequired(format!(
+        "Sign-in expired for account {}. Open Settings and sign in again.",
+        account_id
+    ))
 }
 
 fn clear_reauth_required(account_id: &str) {
@@ -1450,6 +1465,60 @@ pub fn delete_tokens(account_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_flagged(account_id: &str) -> bool {
+        reauth_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(account_id)
+    }
+
+    /// A terminal invalid_grant (dead refresh token, e.g. AADSTS70043)
+    /// latches the re-auth flag and converts to AuthRequired.
+    #[test]
+    fn invalid_grant_latches_reauth() {
+        let acc = "test-latch-terminal";
+        let err = Error::Other(
+            "Token refresh error: {\"error\":\"invalid_grant\",\
+             \"error_description\":\"AADSTS70043: The refresh token has expired\",\
+             \"suberror\":\"token_expired\"}"
+                .into(),
+        );
+        let out = auth_required_on_invalid_grant(acc, err);
+        assert!(matches!(out, Error::AuthRequired(_)));
+        assert!(is_flagged(acc));
+        assert!(ensure_not_reauth_required(acc).is_err());
+        clear_reauth_required(acc);
+    }
+
+    /// A scope-consent failure (AADSTS65001 / consent_required) is also
+    /// encoded as invalid_grant by Microsoft, but the refresh token is
+    /// still good for baseline scopes — it must NOT latch, or a room
+    /// lookup on a pre-room-consent account would kill mail sync.
+    #[test]
+    fn consent_required_does_not_latch_reauth() {
+        let acc = "test-latch-consent";
+        let err = Error::Other(
+            "Token refresh error: {\"error\":\"invalid_grant\",\
+             \"error_description\":\"AADSTS65001: The user or administrator has not \
+             consented to use the application\",\"suberror\":\"consent_required\"}"
+                .into(),
+        );
+        let out = auth_required_on_invalid_grant(acc, err);
+        assert!(!matches!(out, Error::AuthRequired(_)));
+        assert!(!is_flagged(acc));
+        assert!(ensure_not_reauth_required(acc).is_ok());
+    }
+
+    /// Unrelated errors (network, throttling) pass through untouched.
+    #[test]
+    fn other_errors_do_not_latch_reauth() {
+        let acc = "test-latch-other";
+        let out =
+            auth_required_on_invalid_grant(acc, Error::Other("Token refresh failed: 503".into()));
+        assert!(!matches!(out, Error::AuthRequired(_)));
+        assert!(!is_flagged(acc));
+    }
 
     #[test]
     fn test_pkce_verifier_is_valid_length() {

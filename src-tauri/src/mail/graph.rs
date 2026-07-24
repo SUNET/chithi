@@ -2420,7 +2420,7 @@ pub fn contact_to_graph_json(
 /// Always refreshes with Graph-specific scopes because the stored token
 /// may be IMAP-scoped (both share the same keyring entry and refresh token).
 pub async fn get_graph_token(account_id: &str) -> Result<String> {
-    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_SCOPES).await
+    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_SCOPES, true).await
 }
 
 /// Like [`get_graph_token`] but requests the room scopes (`Place.Read.All`).
@@ -2430,11 +2430,17 @@ pub async fn get_graph_token(account_id: &str) -> Result<String> {
 /// is expected: callers (room suggestion/availability commands) treat the
 /// error as "rooms unavailable" and never let it disrupt baseline Graph
 /// operations, which keep using the consent-safe [`get_graph_token`].
+/// Because this whole scope set is optional, failures here never latch the
+/// re-auth flag — a room lookup must not be able to take down mail sync.
 pub async fn get_graph_token_for_rooms(account_id: &str) -> Result<String> {
-    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_ROOM_SCOPES).await
+    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_ROOM_SCOPES, false).await
 }
 
-async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<String> {
+async fn get_graph_token_with_scopes(
+    account_id: &str,
+    scopes: &str,
+    latch_reauth: bool,
+) -> Result<String> {
     // Dead refresh token (invalid_grant)? Fail fast without a network call
     // until the user signs in again — see oauth::auth_required_on_invalid_grant.
     crate::oauth::ensure_not_reauth_required(account_id)?;
@@ -2451,7 +2457,13 @@ async fn get_graph_token_with_scopes(account_id: &str, scopes: &str) -> Result<S
     let new_tokens =
         crate::oauth::refresh_with_scopes(&crate::oauth::MICROSOFT, &refresh_token, scopes)
             .await
-            .map_err(|e| crate::oauth::auth_required_on_invalid_grant(account_id, e))?;
+            .map_err(|e| {
+                if latch_reauth {
+                    crate::oauth::auth_required_on_invalid_grant(account_id, e)
+                } else {
+                    e
+                }
+            })?;
     // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
     // The refresh_token may rotate, so save that part only.
     if new_tokens.refresh_token.is_some() {

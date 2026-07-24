@@ -706,8 +706,23 @@ async fn execute_graph_filter_actions(
     let mut moved_db_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stale_count = 0u32;
 
+    // A message can carry several Move actions (multiple matching rules
+    // without stop-processing). Only the FIRST planned move is executed —
+    // `moves` preserves rule-priority order, and executing later ones
+    // would race a stale id anyway. Deduplicate BEFORE grouping by
+    // target: the group map iterates in arbitrary order, so without this
+    // the winning destination would be nondeterministic.
+    let mut planned_move: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut moves_by_target: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (db_id, graph_id, target) in &moves {
+        if !planned_move.insert(db_id.clone()) {
+            log::debug!(
+                "Graph: ignoring secondary move of {} to '{}' (first planned target wins)",
+                db_id,
+                target
+            );
+            continue;
+        }
         moves_by_target
             .entry(target.clone())
             .or_default()
