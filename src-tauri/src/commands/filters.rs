@@ -359,25 +359,36 @@ fn load_messages_by_ids_chunk(
     Ok(messages)
 }
 
+/// Outcome of a sync-time filter pass. `affected` counts messages that had
+/// at least one action planned; `failed_db_ids` lists messages whose
+/// planned server-side actions did not all complete — the Graph sync keeps
+/// their durable `graph_filters_pending` markers set so the pass is
+/// retried on the next cycle instead of being silently dropped.
+#[derive(Default)]
+pub(crate) struct FilterPassOutcome {
+    pub(crate) affected: u32,
+    pub(crate) failed_db_ids: Vec<String>,
+}
+
 /// Apply enabled filter rules to a bounded set of newly-synced messages in
 /// one folder, dispatching to the protocol-specific executor that matches the
 /// account's mail binding. Called from the sync paths for JMAP and Graph
 /// accounts; IMAP sync handles its own filter pass inline so it can reuse
 /// the open `imap::Session`.
 ///
-/// Returns the number of messages that had at least one action planned.
-/// Executor errors are logged and swallowed (returning `Ok(0)`) so a
-/// transient JMAP/Graph failure cannot poison the surrounding sync — the
-/// messages are already in the DB and the user can retry via the manual
-/// "Apply Filters" button.
+/// Executor errors are logged and folded into the outcome's
+/// `failed_db_ids` (a total executor failure marks every matched message
+/// failed) so a transient JMAP/Graph failure cannot poison the
+/// surrounding sync — the messages are already in the DB and are retried
+/// on the next cycle (Graph) or via the manual "Apply Filters" button.
 pub(crate) async fn apply_filters_to_new_messages(
     db: &Arc<DbPool>,
     account_id: &str,
     folder_path: &str,
     new_ids: &[String],
-) -> Result<u32> {
+) -> Result<FilterPassOutcome> {
     if new_ids.is_empty() {
-        return Ok(0);
+        return Ok(FilterPassOutcome::default());
     }
 
     let (rules, messages, account) = {
@@ -385,11 +396,11 @@ pub(crate) async fn apply_filters_to_new_messages(
         let all_rules = db::filters::list_filters(&conn, Some(account_id))?;
         let enabled_rules: Vec<FilterRule> = all_rules.into_iter().filter(|r| r.enabled).collect();
         if enabled_rules.is_empty() {
-            return Ok(0);
+            return Ok(FilterPassOutcome::default());
         }
         let messages = load_messages_by_ids(&conn, account_id, folder_path, new_ids)?;
         if messages.is_empty() {
-            return Ok(0);
+            return Ok(FilterPassOutcome::default());
         }
         let account = db::accounts::get_account_full(&conn, account_id)?;
         (enabled_rules, messages, account)
@@ -397,9 +408,10 @@ pub(crate) async fn apply_filters_to_new_messages(
 
     let action_plan = build_filter_action_plan(&rules, &messages);
     if action_plan.is_empty() {
-        return Ok(0);
+        return Ok(FilterPassOutcome::default());
     }
     let affected_count = action_plan.len() as u32;
+    let matched_ids: Vec<String> = action_plan.iter().map(|(m, _)| m.id.clone()).collect();
 
     log::info!(
         "Sync-time filters: {} new messages, {} matched in '{}' (protocol={})",
@@ -421,7 +433,10 @@ pub(crate) async fn apply_filters_to_new_messages(
                     folder_path,
                     e
                 );
-                return Ok(0);
+                return Ok(FilterPassOutcome {
+                    affected: 0,
+                    failed_db_ids: matched_ids,
+                });
             }
         },
         "graph" => match execute_graph_filter_actions(account_id, &action_plan).await {
@@ -432,16 +447,19 @@ pub(crate) async fn apply_filters_to_new_messages(
                     folder_path,
                     e
                 );
-                return Ok(0);
+                return Ok(FilterPassOutcome {
+                    affected: 0,
+                    failed_db_ids: matched_ids,
+                });
             }
         },
-        "imap" => return Ok(0),
+        "imap" => return Ok(FilterPassOutcome::default()),
         other => {
             log::debug!(
                 "Sync-time filters: protocol '{}' has no sync-time executor; skipping",
                 other
             );
-            return Ok(0);
+            return Ok(FilterPassOutcome::default());
         }
     };
 
@@ -465,7 +483,13 @@ pub(crate) async fn apply_filters_to_new_messages(
         );
     }
 
-    Ok(affected_count)
+    let mut failed_db_ids = result.failed_db_ids;
+    failed_db_ids.sort();
+    failed_db_ids.dedup();
+    Ok(FilterPassOutcome {
+        affected: affected_count,
+        failed_db_ids,
+    })
 }
 
 /// Result of executing a filter action plan against the server.
@@ -477,6 +501,11 @@ struct ExecutionResult {
     moved_db_ids: Vec<String>,
     deleted_db_ids: Vec<String>,
     errors: Vec<String>,
+    /// DB ids whose planned actions did NOT all complete server-side.
+    /// The Graph sync uses this to keep those messages' durable
+    /// `graph_filters_pending` markers set so the pass is retried, while
+    /// still clearing markers for messages that finished.
+    failed_db_ids: Vec<String>,
 }
 
 /// Execute filter actions over IMAP using a blocking connection.
@@ -638,11 +667,12 @@ async fn execute_graph_filter_actions(
     let client = crate::mail::graph::GraphClient::new(&token);
 
     // Pair every operation with its DB id so we can report which messages
-    // really changed server-side.
+    // really changed server-side — and, on failure, WHICH messages still
+    // owe their filter pass (result.failed_db_ids).
     let mut moves: Vec<(String, String, String)> = Vec::new(); // (db_id, graph_id, target)
     let mut deletes: Vec<(String, String)> = Vec::new(); // (db_id, graph_id)
-    let mut mark_read_ids: Vec<String> = Vec::new();
-    let mut mark_unread_ids: Vec<String> = Vec::new();
+    let mut mark_read: Vec<(String, String)> = Vec::new(); // (db_id, graph_id)
+    let mut mark_unread: Vec<(String, String)> = Vec::new(); // (db_id, graph_id)
 
     for (msg, actions) in action_plan {
         let graph_id = graph_id_from_db_id(account_id, &msg.id).to_string();
@@ -654,13 +684,13 @@ async fn execute_graph_filter_actions(
                 FilterAction::Delete => {
                     deletes.push((msg.id.clone(), graph_id.clone()));
                 }
-                FilterAction::MarkRead => mark_read_ids.push(graph_id.clone()),
-                FilterAction::MarkUnread => mark_unread_ids.push(graph_id.clone()),
+                FilterAction::MarkRead => mark_read.push((msg.id.clone(), graph_id.clone())),
+                FilterAction::MarkUnread => mark_unread.push((msg.id.clone(), graph_id.clone())),
                 FilterAction::Flag { value } if value.eq_ignore_ascii_case("seen") => {
-                    mark_read_ids.push(graph_id.clone());
+                    mark_read.push((msg.id.clone(), graph_id.clone()));
                 }
                 FilterAction::Unflag { value } if value.eq_ignore_ascii_case("seen") => {
-                    mark_unread_ids.push(graph_id.clone());
+                    mark_unread.push((msg.id.clone(), graph_id.clone()));
                 }
                 FilterAction::Flag { value } | FilterAction::Unflag { value } => {
                     log::warn!(
@@ -681,21 +711,26 @@ async fn execute_graph_filter_actions(
 
     let mut result = ExecutionResult::default();
 
-    if !mark_read_ids.is_empty() {
-        log::info!("Graph: marking {} messages as read", mark_read_ids.len());
-        if let Err(e) = client.set_read_status(&mark_read_ids, true).await {
+    if !mark_read.is_empty() {
+        log::info!("Graph: marking {} messages as read", mark_read.len());
+        let graph_ids: Vec<String> = mark_read.iter().map(|(_, g)| g.clone()).collect();
+        if let Err(e) = client.set_read_status(&graph_ids, true).await {
             log::warn!("Graph mark-read batch failed: {}", e);
             result.errors.push(format!("mark-read: {}", e));
+            result
+                .failed_db_ids
+                .extend(mark_read.iter().map(|(d, _)| d.clone()));
         }
     }
-    if !mark_unread_ids.is_empty() {
-        log::info!(
-            "Graph: marking {} messages as unread",
-            mark_unread_ids.len()
-        );
-        if let Err(e) = client.set_read_status(&mark_unread_ids, false).await {
+    if !mark_unread.is_empty() {
+        log::info!("Graph: marking {} messages as unread", mark_unread.len());
+        let graph_ids: Vec<String> = mark_unread.iter().map(|(_, g)| g.clone()).collect();
+        if let Err(e) = client.set_read_status(&graph_ids, false).await {
             log::warn!("Graph mark-unread batch failed: {}", e);
             result.errors.push(format!("mark-unread: {}", e));
+            result
+                .failed_db_ids
+                .extend(mark_unread.iter().map(|(d, _)| d.clone()));
         }
     }
 
@@ -753,6 +788,7 @@ async fn execute_graph_filter_actions(
                         Err(e) => {
                             log::warn!("Graph move failed for id={}: {}", graph_id, e);
                             result.errors.push(format!("move: {}", e));
+                            result.failed_db_ids.push(db_id.clone());
                         }
                     }
                 }
@@ -760,6 +796,9 @@ async fn execute_graph_filter_actions(
             Err(e) => {
                 log::warn!("Graph move batch to '{}' failed: {}", target, e);
                 result.errors.push(format!("move batch: {}", e));
+                result
+                    .failed_db_ids
+                    .extend(items.iter().map(|(d, _)| d.clone()));
             }
         }
     }
@@ -789,6 +828,7 @@ async fn execute_graph_filter_actions(
                         Err(e) => {
                             log::warn!("Graph delete failed for id={}: {}", graph_id, e);
                             result.errors.push(format!("delete: {}", e));
+                            result.failed_db_ids.push(db_id.clone());
                         }
                     }
                 }
@@ -796,6 +836,9 @@ async fn execute_graph_filter_actions(
             Err(e) => {
                 log::warn!("Graph delete batch failed: {}", e);
                 result.errors.push(format!("delete batch: {}", e));
+                result
+                    .failed_db_ids
+                    .extend(to_delete.iter().map(|(d, _)| d.clone()));
             }
         }
     }

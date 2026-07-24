@@ -664,26 +664,7 @@ impl GraphClient {
         let resp: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?;
 
-        let mut messages = Vec::new();
-        let mut removed_ids = Vec::new();
-        if let Some(values) = resp["value"].as_array() {
-            for m in values {
-                if m.get("@removed").is_some() {
-                    if let Some(id) = m["id"].as_str() {
-                        removed_ids.push(id.to_string());
-                    }
-                } else {
-                    messages.push(parse_graph_message(m));
-                }
-            }
-        }
-
-        Ok(GraphDeltaPage {
-            messages,
-            removed_ids,
-            next_link: resp["@odata.nextLink"].as_str().map(String::from),
-            delta_link: resp["@odata.deltaLink"].as_str().map(String::from),
-        })
+        Ok(parse_delta_page(&resp))
     }
 
     /// Search messages across all folders using `$search` (KQL).
@@ -1655,18 +1636,54 @@ fn looks_like_smtp_address(s: &str) -> bool {
     }
 }
 
+/// One entry of a messages-delta response, in server order.
+///
+/// The same message id can appear several times in one delta response
+/// (e.g. an update followed by a removal). Order matters: applying all
+/// removals first and all upserts second would resurrect a message whose
+/// final state is "removed".
+#[derive(Debug, Clone)]
+pub enum GraphDeltaEvent {
+    /// Created or updated message (full selected properties). Boxed to
+    /// keep the enum small next to the `Removed` variant.
+    Upsert(Box<GraphMessage>),
+    /// Message removed from the folder (deleted or moved out).
+    Removed(String),
+}
+
 /// One page of a Graph messages-delta response.
 #[derive(Debug, Clone)]
 pub struct GraphDeltaPage {
-    /// Created or updated messages (full selected properties).
-    pub messages: Vec<GraphMessage>,
-    /// Graph ids of messages removed from the folder (deleted or moved out).
-    pub removed_ids: Vec<String>,
+    /// Delta entries in the exact order the server returned them.
+    pub events: Vec<GraphDeltaEvent>,
     /// More pages are available right now (`@odata.nextLink`).
     pub next_link: Option<String>,
     /// Checkpoint to store for the next sync cycle (`@odata.deltaLink`).
     /// Present only on the final page of a round.
     pub delta_link: Option<String>,
+}
+
+/// Parse a delta-response body into an ordered page. Preserves server
+/// order: the same id can appear as an update and then a removal in one
+/// response, and the LAST event must win when applied sequentially.
+fn parse_delta_page(resp: &serde_json::Value) -> GraphDeltaPage {
+    let mut events = Vec::new();
+    if let Some(values) = resp["value"].as_array() {
+        for m in values {
+            if m.get("@removed").is_some() {
+                if let Some(id) = m["id"].as_str() {
+                    events.push(GraphDeltaEvent::Removed(id.to_string()));
+                }
+            } else {
+                events.push(GraphDeltaEvent::Upsert(Box::new(parse_graph_message(m))));
+            }
+        }
+    }
+    GraphDeltaPage {
+        events,
+        next_link: resp["@odata.nextLink"].as_str().map(String::from),
+        delta_link: resp["@odata.deltaLink"].as_str().map(String::from),
+    }
 }
 
 /// Marker embedded in the error for HTTP 410 on a delta call: the stored
@@ -2562,6 +2579,38 @@ mod batch_tests {
         assert!(results[1].is_err());
         assert!(results[2].is_err());
         assert_eq!(retryable, vec![(1, 17), (2, 3)]);
+    }
+
+    /// Regression: delta events must keep server order. An update followed
+    /// by an @removed tombstone for the same id must yield Upsert then
+    /// Removed — applying removals first would resurrect the message.
+    #[test]
+    fn delta_page_preserves_event_order() {
+        use super::{parse_delta_page, GraphDeltaEvent};
+        let resp = serde_json::json!({
+            "value": [
+                { "id": "m1", "subject": "updated then deleted", "isRead": true },
+                { "id": "m2", "subject": "still alive" },
+                { "id": "m1", "@removed": { "reason": "deleted" } },
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?$deltatoken=t1"
+        });
+        let page = parse_delta_page(&resp);
+        assert_eq!(page.events.len(), 3);
+        assert!(
+            matches!(&page.events[0], GraphDeltaEvent::Upsert(m) if m.id == "m1"),
+            "first event must be the m1 upsert"
+        );
+        assert!(matches!(&page.events[1], GraphDeltaEvent::Upsert(m) if m.id == "m2"));
+        assert!(
+            matches!(&page.events[2], GraphDeltaEvent::Removed(id) if id == "m1"),
+            "the m1 removal must come after its upsert"
+        );
+        assert!(page.next_link.is_none());
+        assert_eq!(
+            page.delta_link.as_deref(),
+            Some("https://graph.microsoft.com/v1.0/delta?$deltatoken=t1")
+        );
     }
 
     #[test]

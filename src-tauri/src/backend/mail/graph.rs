@@ -239,76 +239,95 @@ async fn sync_graph_folder_delta(
             // cannot leave an open transaction on the pooled connection.
             let tx = conn.unchecked_transaction()?;
 
-            for removed in &page.removed_ids {
-                let id = format!("{}_{}", account_id, removed);
-                tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])
-                    .ok();
-                existing_ids.remove(&id);
-            }
+            // Apply events strictly in server order: the same id can carry
+            // an update followed by a removal within one page, and playing
+            // removals and upserts as separate passes would resurrect the
+            // message. Errors propagate — a failed delete must roll the
+            // whole page (checkpoint included) back, or the server would
+            // never resend the tombstone.
+            for event in &page.events {
+                match event {
+                    graph::GraphDeltaEvent::Removed(removed) => {
+                        let id = format!("{}_{}", account_id, removed);
+                        tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])?;
+                        existing_ids.remove(&id);
+                        // A removed row owes no filter pass; drop it from
+                        // the batch if it was inserted earlier this cycle.
+                        new_ids.retain(|n| n != &id);
+                    }
+                    graph::GraphDeltaEvent::Upsert(msg) => {
+                        let id = format!("{}_{}", account_id, msg.id);
+                        // Mirror the full server-side flag state (read +
+                        // flagged), not just read: replacing the array with
+                        // only `seen` erased an existing `flagged` on every
+                        // update.
+                        let mut flags: Vec<String> = Vec::new();
+                        if msg.is_read {
+                            flags.push("seen".to_string());
+                        }
+                        if msg.is_flagged {
+                            flags.push("flagged".to_string());
+                        }
+                        let flags_json = serde_json::to_string(&flags).unwrap_or_default();
 
-            for msg in &page.messages {
-                let id = format!("{}_{}", account_id, msg.id);
-                // Mirror the full server-side flag state (read + flagged),
-                // not just read: replacing the array with only `seen`
-                // erased an existing `flagged` on every update.
-                let mut flags: Vec<String> = Vec::new();
-                if msg.is_read {
-                    flags.push("seen".to_string());
-                }
-                if msg.is_flagged {
-                    flags.push("flagged".to_string());
-                }
-                let flags_json = serde_json::to_string(&flags).unwrap_or_default();
+                        if existing_ids.contains(&id) {
+                            // Updated message: mirror server-side flag
+                            // changes and mark it as confirmed-alive for a
+                            // running full enumeration (see
+                            // graph_prune_pending above).
+                            let _ = db::messages::update_flags(&tx, &id, &flags_json);
+                            tx.execute(
+                                "UPDATE messages SET graph_prune_pending = 0 WHERE id = ?1",
+                                rusqlite::params![id],
+                            )?;
+                            continue;
+                        }
 
-                if existing_ids.contains(&id) {
-                    // Updated message: mirror server-side flag changes and
-                    // mark it as confirmed-alive for a running full
-                    // enumeration (see graph_prune_pending above).
-                    let _ = db::messages::update_flags(&tx, &id, &flags_json);
-                    tx.execute(
-                        "UPDATE messages SET graph_prune_pending = 0 WHERE id = ?1",
-                        rusqlite::params![id],
-                    )?;
-                    continue;
+                        let new_msg = db::messages::NewMessage {
+                            id: id.clone(),
+                            account_id: account_id.to_string(),
+                            folder_path: gf.id.clone(),
+                            uid: 0,
+                            message_id: msg.internet_message_id.clone(),
+                            in_reply_to: msg.in_reply_to.clone(),
+                            thread_id: msg.conversation_id.clone(),
+                            subject: msg.subject.clone(),
+                            from_name: msg.from_name.clone(),
+                            from_email: msg
+                                .from_email
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            to_addresses: msg.to_addresses.clone(),
+                            cc_addresses: msg.cc_addresses.clone(),
+                            date: msg.date.clone(),
+                            size: 0,
+                            has_attachments: msg.has_attachments,
+                            is_encrypted: false,
+                            is_signed: false,
+                            flags: flags_json,
+                            // `graph:` marks the body as not yet downloaded
+                            // AND keeps the row out of the IMAP prefetch
+                            // pipeline (which selects `maildir_path = ''`
+                            // rows and cannot fetch Graph folders/UID 0).
+                            maildir_path: format!("graph:{}", msg.id),
+                            snippet: msg.preview.clone(),
+                        };
+                        db::messages::insert_message(&tx, &new_msg)?;
+                        // Durable "filter pass still owed" marker, committed
+                        // with the insert: a crash before the filter run is
+                        // retried on the next cycle instead of silently
+                        // skipped.
+                        tx.execute(
+                            "UPDATE messages SET graph_filters_pending = 1 WHERE id = ?1",
+                            rusqlite::params![id],
+                        )?;
+                        existing_ids.insert(id.clone());
+                        if !new_ids.contains(&id) {
+                            new_ids.push(id);
+                        }
+                        synced += 1;
+                    }
                 }
-
-                let new_msg = db::messages::NewMessage {
-                    id: id.clone(),
-                    account_id: account_id.to_string(),
-                    folder_path: gf.id.clone(),
-                    uid: 0,
-                    message_id: msg.internet_message_id.clone(),
-                    in_reply_to: msg.in_reply_to.clone(),
-                    thread_id: msg.conversation_id.clone(),
-                    subject: msg.subject.clone(),
-                    from_name: msg.from_name.clone(),
-                    from_email: msg
-                        .from_email
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    to_addresses: msg.to_addresses.clone(),
-                    cc_addresses: msg.cc_addresses.clone(),
-                    date: msg.date.clone(),
-                    size: 0,
-                    has_attachments: msg.has_attachments,
-                    is_encrypted: false,
-                    is_signed: false,
-                    flags: flags_json,
-                    // Empty = body fetched on demand when the message is opened.
-                    maildir_path: String::new(),
-                    snippet: msg.preview.clone(),
-                };
-                db::messages::insert_message(&tx, &new_msg)?;
-                // Durable "filter pass still owed" marker, committed with
-                // the insert: a crash before the filter run is retried on
-                // the next cycle instead of silently skipped.
-                tx.execute(
-                    "UPDATE messages SET graph_filters_pending = 1 WHERE id = ?1",
-                    rusqlite::params![id],
-                )?;
-                existing_ids.insert(id.clone());
-                new_ids.push(id);
-                synced += 1;
             }
 
             // Persist the resume point after every page: an interrupted
@@ -381,14 +400,18 @@ async fn sync_graph_folder_delta(
         )
         .await
         {
-            Ok(filtered) => {
-                // Filter pass done: clear the pending markers. Rows the
+            Ok(outcome) => {
+                // Clear the pending marker ONLY for messages whose filter
+                // pass completed — messages with failed server-side
+                // actions stay marked and are retried next cycle. Rows the
                 // filters moved or deleted are already gone from the DB,
-                // so the UPDATE simply no-ops on them.
+                // so their UPDATE simply no-ops.
+                let failed: std::collections::HashSet<&String> =
+                    outcome.failed_db_ids.iter().collect();
                 {
                     let conn = db_arc.writer().await;
                     let tx = conn.unchecked_transaction()?;
-                    for id in &new_ids {
+                    for id in new_ids.iter().filter(|id| !failed.contains(id)) {
                         tx.execute(
                             "UPDATE messages SET graph_filters_pending = 0 WHERE id = ?1",
                             rusqlite::params![id],
@@ -396,10 +419,17 @@ async fn sync_graph_folder_delta(
                     }
                     tx.commit()?;
                 }
-                if filtered > 0 {
+                if !failed.is_empty() {
+                    log::warn!(
+                        "Graph filters: {} message(s) in '{}' kept pending after failed actions",
+                        failed.len(),
+                        gf.display_name
+                    );
+                }
+                if outcome.affected > 0 {
                     log::info!(
                         "Graph filters matched {} of {} new messages in '{}'",
-                        filtered,
+                        outcome.affected,
                         new_ids.len(),
                         gf.display_name
                     );
@@ -480,11 +510,81 @@ impl MailBackend for GraphMailBackend {
         sync_graph_folder_delta(ctx, &client, &account.id, &gf).await
     }
 
-    /// O365 accounts keep IMAP access alongside Graph, and their Graph
-    /// sync can leave rows behind for on-demand fetch — reuse the IMAP
-    /// prefetch pipeline exactly as the pre-trait command did.
+    /// Graph-native body prefetch. Graph message rows store the folder's
+    /// Graph id in `folder_path` and `uid = 0`, so the IMAP prefetch
+    /// pipeline (folder SELECT + fetch-by-UID) can never retrieve them —
+    /// delegating there just produced failed selects after every sync.
+    /// Instead, stream full MIME for the newest unfetched rows via the
+    /// same `download_mime_to_file` path the on-demand fetch uses.
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
-        super::imap::prefetch_pipeline(ctx, account).await
+        use crate::mail::graph::{self, GraphClient};
+        use crate::mail::sync::{
+            create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name,
+        };
+
+        /// Bodies fetched per prefetch pass; the pass re-runs after every
+        /// sync, so the backlog drains across cycles.
+        const MAX_PREFETCH_PER_PASS: u32 = 100;
+
+        let unfetched = {
+            let conn = ctx.db.reader();
+            db::messages::get_unfetched_graph_messages(&conn, &account.id, MAX_PREFETCH_PER_PASS)?
+        };
+        if unfetched.is_empty() {
+            return Ok(0);
+        }
+        log::info!(
+            "Graph prefetch: {} unfetched bodies for account {}",
+            unfetched.len(),
+            account.id
+        );
+
+        let token = graph::get_graph_token(&account.id).await?;
+        let client = GraphClient::new(&token);
+
+        let mut fetched = 0u32;
+        for (db_id, folder_path, maildir_path, flags_json) in &unfetched {
+            let graph_msg_id = maildir_path
+                .strip_prefix("graph:")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    db_id
+                        .strip_prefix(&format!("{}_", account.id))
+                        .unwrap_or(db_id)
+                        .to_string()
+                });
+            let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
+
+            let folder_dir = sanitize_folder_name(folder_path);
+            let maildir_base = ctx.data_dir.join(&account.id).join(&folder_dir);
+            create_maildir_dirs(&maildir_base)?;
+            let filename = format!("{}:2,{}", graph_msg_id, flags_to_maildir_suffix(&flags));
+            let msg_path = maildir_base.join("cur").join(&filename);
+
+            match client.download_mime_to_file(&graph_msg_id, &msg_path).await {
+                Ok(bytes) => {
+                    let relative = format!("{}/{}/cur/{}", account.id, folder_dir, filename);
+                    let conn = ctx.db.writer().await;
+                    db::messages::update_maildir_path(&conn, db_id, &relative)?;
+                    log::debug!("Graph prefetch: {} ({} bytes)", relative, bytes);
+                    fetched += 1;
+                }
+                Err(e) => {
+                    // Clean up any partial file; the row stays unfetched
+                    // and is retried on a later pass or on demand.
+                    let _ = std::fs::remove_file(&msg_path);
+                    log::warn!("Graph prefetch: failed for {}: {}", graph_msg_id, e);
+                }
+            }
+        }
+
+        log::info!(
+            "Graph prefetch: {} of {} bodies fetched for account {}",
+            fetched,
+            unfetched.len(),
+            account.id
+        );
+        Ok(fetched)
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {
