@@ -26,6 +26,9 @@ const pgpPrompts = usePgpPromptsStore();
 // PGP toggles.
 const pgpSign = ref(false);
 const pgpEncrypt = ref(false);
+// "Compose in Markdown": when on, the body is Markdown source and the
+// backend renders it to HTML, sending both plaintext + HTML parts.
+const markdownMode = ref(false);
 // Per-recipient key availability for the encrypt flow.
 const recipientStatuses = ref<PgpRecipientStatus[]>([]);
 const missingRecipientCount = computed(
@@ -426,13 +429,19 @@ async function loadDraft(accountId: string) {
     // Subject). For a plaintext draft it also gives the body.
     const envelope = await api.getMessageBody(accountId, draftId);
     let body = envelope.body_text ?? "";
+    // An HTML alternative on a chithi-authored draft means it was composed
+    // in Markdown (that's the only path that stores one). Re-arm the toggle
+    // so a resumed-then-sent Markdown draft keeps its HTML alternative.
+    let htmlAlternative = envelope.body_html;
     if (envelope.pgp_kind === "mimeEncrypted") {
       // Encrypted draft: decrypt for the real body. pgp_decrypt_message
       // drives the passphrase / card-PIN dialog through the pgp-prompts
       // store, which this window is already subscribed to.
       const decrypted = await api.pgpDecryptMessage(accountId, draftId);
       body = decrypted.plaintextBody.body_text ?? "";
+      htmlAlternative = decrypted.plaintextBody.body_html;
     }
+    markdownMode.value = !!htmlAlternative && htmlAlternative.trim().length > 0;
     prefillFromDraft(envelope, body);
   } catch (e) {
     draftDecryptError.value = String(e);
@@ -580,6 +589,7 @@ async function saveDraft(): Promise<boolean> {
       body_html: null,
       attachments: attachments.value,
       reply_to_message_id: replyToMessageId || null,
+      markdown: markdownMode.value,
     });
     // The account asked for encrypted drafts but the backend had to
     // store this one in plaintext (Graph account, or no usable public
@@ -717,6 +727,7 @@ async function send() {
       reply_to_message_id: replyToMessageId || null,
       pgp_sign: pgpSign.value,
       pgp_encrypt: pgpEncrypt.value,
+      markdown: markdownMode.value,
     });
     if (replyToMessageId) {
       api.setMessageFlags(accountId, [replyToMessageId], ["answered"], true)
@@ -783,6 +794,19 @@ async function send() {
           class="pgp-missing-badge"
           :title="`Missing keys: ${recipientStatuses.filter(s => !s.hasKey).map(s => s.email).join(', ')}`"
         >{{ missingRecipientCount }}</span>
+      </button>
+      <button
+        class="toolbar-btn"
+        :class="{ active: markdownMode }"
+        data-testid="compose-markdown"
+        title="Compose in Markdown — sends both plain text and rendered HTML"
+        :aria-pressed="markdownMode"
+        @click="markdownMode = !markdownMode"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="5" width="20" height="14" rx="2" /><path d="M6 15V9l3 3 3-3v6" /><path d="M17 9v6M14.5 12.5 17 15l2.5-2.5" />
+        </svg>
+        Markdown
       </button>
       <button class="toolbar-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -971,6 +995,14 @@ async function send() {
         data-testid="compose-body"
         autofocus
       ></textarea>
+
+      <div
+        v-if="markdownMode"
+        class="compose-markdown-hint"
+        data-testid="compose-markdown-hint"
+      >
+        Markdown mode — sent as plain text and rendered HTML.
+      </div>
 
       <!-- Attachment list -->
       <div v-if="attachments.length > 0" class="attachment-bar">
@@ -1304,6 +1336,13 @@ async function send() {
 .compose-textarea:focus {
   outline: none;
   border-color: var(--color-accent);
+}
+
+.compose-markdown-hint {
+  margin: -8px 16px 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 /* Attachment bar */
