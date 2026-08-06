@@ -1330,8 +1330,10 @@ fn profile_email_from_me(mail: Option<&str>, user_principal_name: Option<&str>) 
         mail.to_string()
     } else if looks_like_smtp_address(user_principal_name) {
         user_principal_name.to_string()
-    } else {
+    } else if !mail.is_empty() {
         mail.to_string()
+    } else {
+        user_principal_name.to_string()
     }
 }
 
@@ -2160,6 +2162,14 @@ mod color_tests {
         assert_eq!(
             profile_email_from_me(None, Some("login@sunet.se")),
             "login@sunet.se"
+        );
+        assert_eq!(
+            profile_email_from_me(None, Some("non-email-upn")),
+            "non-email-upn"
+        );
+        assert_eq!(
+            profile_email_from_me(Some("  "), Some("non-email-upn")),
+            "non-email-upn"
         );
     }
 
