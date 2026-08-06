@@ -406,13 +406,13 @@ impl GraphClient {
             .await?;
 
         let display_name = resp["displayName"].as_str().unwrap_or("").to_string();
-        let mut email = resp["mail"]
-            .as_str()
-            .or_else(|| resp["userPrincipalName"].as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let login_email = email.clone();
+        let user_principal_name = resp["userPrincipalName"].as_str().unwrap_or("");
+        let mut email = profile_email_from_me(resp["mail"].as_str(), Some(user_principal_name));
+        let login_email = if looks_like_smtp_address(user_principal_name) {
+            user_principal_name.trim().to_string()
+        } else {
+            email.clone()
+        };
         log::info!(
             "Graph /me: displayName={}, login_email={}",
             display_name,
@@ -1646,7 +1646,7 @@ pub struct GraphUser {
 /// EX DN gets shown to the user as their email address and overwrites
 /// the real SMTP address that `/me` already returned correctly.
 fn looks_like_smtp_address(s: &str) -> bool {
-    match s.split_once('@') {
+    match s.trim().split_once('@') {
         Some((local, domain)) => !local.is_empty() && domain.contains('.'),
         None => false,
     }
@@ -1710,6 +1710,21 @@ const DELTA_RESYNC_MARKER: &str = "graph delta resync required";
 /// clear the stored delta link and restart a full enumeration.
 pub fn is_delta_resync_required(err: &crate::error::Error) -> bool {
     err.to_string().contains(DELTA_RESYNC_MARKER)
+}
+
+fn profile_email_from_me(mail: Option<&str>, user_principal_name: Option<&str>) -> String {
+    let mail = mail.unwrap_or("").trim();
+    let user_principal_name = user_principal_name.unwrap_or("").trim();
+
+    if looks_like_smtp_address(mail) {
+        mail.to_string()
+    } else if looks_like_smtp_address(user_principal_name) {
+        user_principal_name.to_string()
+    } else if !mail.is_empty() {
+        mail.to_string()
+    } else {
+        user_principal_name.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2645,7 +2660,7 @@ mod color_tests {
         dedupe_graph_rooms, graph_color_to_hex, graph_response_to_my_status,
         graph_response_to_partstat, looks_like_smtp_address, nearest_outlook_color,
         normalize_schedule_datetime, parse_graph_event, parse_graph_named_addresses,
-        parse_graph_room_availability, parse_graph_rooms, GraphRoom,
+        parse_graph_room_availability, parse_graph_rooms, profile_email_from_me, GraphRoom,
     };
 
     /// Regression: `get_me`'s mailbox-address heuristic must reject a
@@ -2661,11 +2676,38 @@ mod color_tests {
         // Real SMTP addresses still pass.
         assert!(looks_like_smtp_address("chithiapp@outlook.com"));
         assert!(looks_like_smtp_address("kushal.das@example.co.uk"));
+        assert!(looks_like_smtp_address(" kushal.das@example.co.uk "));
         // Degenerate inputs are rejected.
         assert!(!looks_like_smtp_address(""));
         assert!(!looks_like_smtp_address("noatsign"));
         assert!(!looks_like_smtp_address("@outlook.com"));
         assert!(!looks_like_smtp_address("user@localhost"));
+    }
+
+    #[test]
+    fn profile_email_from_me_falls_back_from_ex_dn_to_upn() {
+        let ex_dn = "/O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP \
+                     (FYDIBOHF23SPDLT)/CN=RECIPIENTS/CN=abc123";
+        assert_eq!(
+            profile_email_from_me(Some(ex_dn), Some("kano@sunet.se")),
+            "kano@sunet.se"
+        );
+        assert_eq!(
+            profile_email_from_me(Some("alias@sunet.se"), Some("login@sunet.se")),
+            "alias@sunet.se"
+        );
+        assert_eq!(
+            profile_email_from_me(None, Some("login@sunet.se")),
+            "login@sunet.se"
+        );
+        assert_eq!(
+            profile_email_from_me(None, Some("non-email-upn")),
+            "non-email-upn"
+        );
+        assert_eq!(
+            profile_email_from_me(Some("  "), Some("non-email-upn")),
+            "non-email-upn"
+        );
     }
 
     // Graph emits its own responseType enum; the UI only understands iCal

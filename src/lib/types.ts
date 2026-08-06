@@ -416,6 +416,10 @@ export interface ComposeMessage {
   /** OpenPGP toggles. Default false. */
   pgp_sign?: boolean;
   pgp_encrypt?: boolean;
+  /** "Compose in Markdown": when true the backend treats `body_text` as
+   *  Markdown, rendering it to safe HTML and sending both parts. Ignored
+   *  when `body_html` is already set. Default false. */
+  markdown?: boolean;
 }
 
 export interface PgpRecipientStatus {
