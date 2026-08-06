@@ -442,11 +442,11 @@ async fn sync_jmap_folder(
         )
         .await
         {
-            Ok(filtered) => {
-                if filtered > 0 {
+            Ok(outcome) => {
+                if outcome.affected > 0 {
                     log::info!(
                         "JMAP filters matched {} of {} new messages in '{}'",
-                        filtered,
+                        outcome.affected,
                         new_ids.len(),
                         folder_name
                     );

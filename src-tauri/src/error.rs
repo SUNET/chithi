@@ -29,6 +29,12 @@ pub enum Error {
     #[error("Keyring error: {0}")]
     Keyring(String),
 
+    /// The account's OAuth refresh token was rejected (`invalid_grant`,
+    /// e.g. AADSTS70043 conditional-access lifetime limits). The user must
+    /// sign in again; automated retries are pointless until then.
+    #[error("Re-authentication required: {0}")]
+    AuthRequired(String),
+
     #[error("{0}")]
     Other(String),
 }

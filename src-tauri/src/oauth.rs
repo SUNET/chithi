@@ -1258,6 +1258,72 @@ pub fn init_token_store(_data_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Accounts whose refresh token was rejected with `invalid_grant`.
+///
+/// Once a refresh token is dead (expired, revoked, or past a
+/// conditional-access lifetime cap like AADSTS70043), every refresh attempt
+/// fails the same way — but the periodic sync retried it every cycle,
+/// hammering the token endpoint and burying the real problem in log noise.
+/// This registry lets token getters fail fast until the user signs in
+/// again; a successful `store_tokens` clears the flag.
+static REAUTH_REQUIRED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn reauth_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    REAUTH_REQUIRED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Fail fast if the account is already known to need re-authentication.
+pub fn ensure_not_reauth_required(account_id: &str) -> Result<()> {
+    let flagged = reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(account_id);
+    if flagged {
+        return Err(Error::AuthRequired(format!(
+            "Sign-in expired for account {}. Open Settings and sign in again.",
+            account_id
+        )));
+    }
+    Ok(())
+}
+
+/// Inspect a token-refresh error: on a terminal `invalid_grant` mark the
+/// account as requiring re-authentication and convert the error into
+/// [`Error::AuthRequired`] so callers stop retrying. Other errors (network,
+/// keyring, throttling) pass through unchanged and stay retryable.
+///
+/// Baseline Microsoft refreshes also encode scope-consent failures as
+/// `invalid_grant` (AADSTS65001 / `"suberror":"consent_required"`). Those
+/// still need user action and should latch here so periodic sync does not
+/// keep retrying the same rejected refresh. Optional scope probes, such as
+/// room lookup, bypass this helper instead of calling it.
+pub fn auth_required_on_invalid_grant(account_id: &str, err: Error) -> Error {
+    let msg = err.to_string();
+    if !msg.contains("invalid_grant") {
+        return err;
+    }
+    log::warn!(
+        "OAuth2: refresh token rejected (invalid_grant) for account {}; re-authentication required",
+        account_id
+    );
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(account_id.to_string());
+    Error::AuthRequired(format!(
+        "Sign-in expired for account {}. Open Settings and sign in again.",
+        account_id
+    ))
+}
+
+fn clear_reauth_required(account_id: &str) {
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(account_id);
+}
+
 pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
     #[cfg(target_os = "android")]
     {
@@ -1266,10 +1332,21 @@ pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
             "OAuth2: tokens stored in file store for account {}",
             account_id
         );
+        // Fresh tokens (sign-in or successful refresh) mean the account no
+        // longer needs re-authentication. Cleared only after persistence
+        // succeeded — clearing on a failed store would re-open the refresh
+        // retry loop with the old, rejected token still in place.
+        clear_reauth_required(account_id);
         return Ok(());
     }
     #[cfg(not(target_os = "android"))]
-    store_tokens_keyring(account_id, tokens)
+    {
+        store_tokens_keyring(account_id, tokens)?;
+        // See the android branch above: only a persisted fresh token set
+        // clears the re-auth flag.
+        clear_reauth_required(account_id);
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1379,6 +1456,60 @@ pub fn delete_tokens(account_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_flagged(account_id: &str) -> bool {
+        reauth_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(account_id)
+    }
+
+    /// A terminal invalid_grant (dead refresh token, e.g. AADSTS70043)
+    /// latches the re-auth flag and converts to AuthRequired.
+    #[test]
+    fn invalid_grant_latches_reauth() {
+        let acc = "test-latch-terminal";
+        let err = Error::Other(
+            "Token refresh error: {\"error\":\"invalid_grant\",\
+             \"error_description\":\"AADSTS70043: The refresh token has expired\",\
+             \"suberror\":\"token_expired\"}"
+                .into(),
+        );
+        let out = auth_required_on_invalid_grant(acc, err);
+        assert!(matches!(out, Error::AuthRequired(_)));
+        assert!(is_flagged(acc));
+        assert!(ensure_not_reauth_required(acc).is_err());
+        clear_reauth_required(acc);
+    }
+
+    /// Baseline scope-consent failures (AADSTS65001 / consent_required)
+    /// are invalid_grant responses too and need user action. Optional
+    /// room-scope probes avoid latching by not calling this helper.
+    #[test]
+    fn consent_required_latches_reauth_for_baseline_refresh() {
+        let acc = "test-latch-consent";
+        let err = Error::Other(
+            "Token refresh error: {\"error\":\"invalid_grant\",\
+             \"error_description\":\"AADSTS65001: The user or administrator has not \
+             consented to use the application\",\"suberror\":\"consent_required\"}"
+                .into(),
+        );
+        let out = auth_required_on_invalid_grant(acc, err);
+        assert!(matches!(out, Error::AuthRequired(_)));
+        assert!(is_flagged(acc));
+        assert!(ensure_not_reauth_required(acc).is_err());
+        clear_reauth_required(acc);
+    }
+
+    /// Unrelated errors (network, throttling) pass through untouched.
+    #[test]
+    fn other_errors_do_not_latch_reauth() {
+        let acc = "test-latch-other";
+        let out =
+            auth_required_on_invalid_grant(acc, Error::Other("Token refresh failed: 503".into()));
+        assert!(!matches!(out, Error::AuthRequired(_)));
+        assert!(!is_flagged(acc));
+    }
 
     #[test]
     fn test_pkce_verifier_is_valid_length() {

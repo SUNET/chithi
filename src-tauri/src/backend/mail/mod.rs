@@ -42,14 +42,6 @@ pub trait MailBackend: Send + Sync {
         false
     }
 
-    /// This provider has no cheap per-folder fetch — the command
-    /// spawns a whole-account [`Self::sync_account`] in the background
-    /// (holding the sync guard) and returns immediately so the UI's
-    /// per-folder spinner doesn't sit there for minutes.
-    fn folder_sync_backgrounds(&self) -> bool {
-        false
-    }
-
     /// Full account sync. Emits its own `sync-started` /
     /// `sync-complete` progress events (inside the provider sync
     /// loops); errors are emitted as `sync-error` by the command.
@@ -61,7 +53,10 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<()>;
 
     /// Sync one folder's envelopes; returns the new-message count.
-    /// Not called when [`Self::folder_sync_backgrounds`] is true.
+    /// This must touch ONLY the requested folder — a user right-clicking
+    /// "sync" on a folder expects exactly that folder to sync and then
+    /// the operation to stop (Graph used to background a whole-account
+    /// sync here; delta sync made a true per-folder fetch possible).
     async fn sync_folder(
         &self,
         ctx: &MailSyncCtx,
@@ -211,18 +206,5 @@ mod registry_tests {
             .unwrap()
             .suspends_idle_for_ops(&imap_plain));
         assert!(!for_account(&graph).unwrap().suspends_idle_for_ops(&graph));
-    }
-
-    #[test]
-    fn only_graph_backgrounds_folder_sync() {
-        assert!(for_account(&account("graph", "oauth-microsoft"))
-            .unwrap()
-            .folder_sync_backgrounds());
-        assert!(!for_account(&account("imap", "password"))
-            .unwrap()
-            .folder_sync_backgrounds());
-        assert!(!for_account(&account("jmap", "password"))
-            .unwrap()
-            .folder_sync_backgrounds());
     }
 }

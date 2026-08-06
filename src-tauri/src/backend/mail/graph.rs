@@ -13,17 +13,31 @@ use super::{MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct GraphMailBackend;
 
-/// Sync an O365 account via Microsoft Graph API.
-/// Downloads full MIME bodies during sync and streams them to Maildir,
-/// so message reading works offline without live API calls.
-/// Two-phase: download without DB lock (UI stays responsive), then fast batch insert.
-async fn sync_graph_account(ctx: &MailSyncCtx, account_id: &str) -> Result<()> {
+/// Max delta pages (of up to 200 messages each) applied per folder per
+/// sync cycle. The initial enumeration of a huge folder resumes on the
+/// next cycle from the persisted `nextLink` instead of monopolizing this
+/// one; steady-state delta rounds are one page.
+const MAX_DELTA_PAGES_PER_CYCLE: usize = 25;
+
+/// Sync an O365 account via Microsoft Graph delta queries.
+///
+/// Envelope-only: message bodies are fetched on demand when a message is
+/// opened (`commands/mail.rs` handles the `graph:`/empty `maildir_path`
+/// cases). Each folder keeps a persisted delta link (`graph_delta_link`),
+/// so steady-state sync is ~1 request per folder and the server reports
+/// creations, flag changes, and removals (deletes *and* moves out of the
+/// folder) explicitly — the previous full-crawl implementation re-listed
+/// the newest 200 messages of every folder and downloaded full MIME for
+/// anything it didn't recognize, every cycle.
+async fn sync_graph_account(
+    ctx: &MailSyncCtx,
+    account_id: &str,
+    current_folder: Option<&str>,
+) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
-    use crate::mail::sync::{create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name};
 
     let app = &ctx.app;
     let db_arc = &ctx.db;
-    let data_dir = ctx.data_dir.clone();
 
     // Mirror sync_account / sync_jmap_account: emit sync-started so the
     // activity store can mark the operation running and spin the StatusBar
@@ -64,7 +78,7 @@ async fn sync_graph_account(ctx: &MailSyncCtx, account_id: &str) -> Result<()> {
                 &gf.display_name,
                 &gf.id,
                 folder_type,
-                None,
+                gf.parent_folder_id.as_deref(),
             )?;
             db::folders::update_folder_counts(
                 &conn,
@@ -76,188 +90,29 @@ async fn sync_graph_account(ctx: &MailSyncCtx, account_id: &str) -> Result<()> {
         }
     }
 
-    // Sync messages for each folder
+    // Sync order: the folder the user is looking at first, then Inbox,
+    // then the rest in walk order — same priority scheme as IMAP/JMAP.
+    // Matters most during the initial delta enumeration, which can take
+    // a while on big mailboxes.
+    let mut graph_folders = graph_folders;
+    graph_folders.sort_by_key(|gf| {
+        if current_folder == Some(gf.id.as_str()) {
+            0u8
+        } else if graph::guess_folder_type(&gf.display_name) == Some("inbox") {
+            1
+        } else {
+            2
+        }
+    });
+
+    // Sync messages for each folder via delta queries. Per-folder errors
+    // are logged and skipped so one throttled or broken folder can't
+    // starve the folders after it (new folders sort last in the walk).
     let mut grand_total = 0u32;
     for gf in &graph_folders {
-        let (messages, _total) = client.list_messages(&gf.id, 200, 0).await?;
-
-        if messages.is_empty() {
-            continue;
-        }
-
-        let existing_ids = {
-            let conn = db_arc.reader();
-            let mut stmt = conn
-                .prepare("SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2")
-                .map_err(Error::Database)?;
-            let ids: std::collections::HashSet<String> = stmt
-                .query_map(rusqlite::params![account_id, gf.id], |row| row.get(0))
-                .map_err(Error::Database)?
-                .filter_map(|r| r.ok())
-                .collect();
-            ids
-        };
-
-        // Backfill: existing rows synced before threading worked have an
-        // empty thread_id. We also have a fresh In-Reply-To from
-        // internetMessageHeaders, which lets the frontend render the
-        // reply hierarchy for already-stored Graph messages without a
-        // re-download.
-        {
-            let conn = db_arc.writer().await;
-            let mut update_thread = conn.prepare(
-                "UPDATE messages SET thread_id = ?1
-                 WHERE id = ?2 AND (thread_id IS NULL OR thread_id = '')",
-            )?;
-            let mut update_irt = conn.prepare(
-                "UPDATE messages SET in_reply_to = ?1
-                 WHERE id = ?2 AND (in_reply_to IS NULL OR in_reply_to = '')",
-            )?;
-            for msg in &messages {
-                let id = format!("{}_{}", account_id, msg.id);
-                if !existing_ids.contains(&id) {
-                    continue;
-                }
-                if let Some(cid) = msg.conversation_id.as_deref() {
-                    if !cid.is_empty() {
-                        update_thread.execute(rusqlite::params![cid, id])?;
-                    }
-                }
-                if let Some(irt) = msg.in_reply_to.as_deref() {
-                    if !irt.is_empty() {
-                        update_irt.execute(rusqlite::params![irt, id])?;
-                    }
-                }
-            }
-        }
-
-        // Collect new messages
-        let mut new_messages = Vec::new();
-        for msg in &messages {
-            let id = format!("{}_{}", account_id, msg.id);
-            if existing_ids.contains(&id) {
-                continue;
-            }
-            new_messages.push(msg);
-        }
-
-        if new_messages.is_empty() {
-            continue;
-        }
-
-        // Prepare Maildir directory
-        let folder_dir = sanitize_folder_name(&gf.id);
-        let maildir_base = data_dir.join(account_id).join(&folder_dir);
-        create_maildir_dirs(&maildir_base)?;
-
-        // Phase 1: Stream MIME bodies to disk (no DB lock — UI stays responsive)
-        let mut downloaded: Vec<(&graph::GraphMessage, String)> = Vec::new();
-        for msg in &new_messages {
-            let flags = if msg.is_read {
-                vec!["seen".to_string()]
-            } else {
-                vec![]
-            };
-            let filename = format!("{}:2,{}", msg.id, flags_to_maildir_suffix(&flags));
-            let msg_path = maildir_base.join("cur").join(&filename);
-
-            let maildir_path = match client.download_mime_to_file(&msg.id, &msg_path).await {
-                Ok(bytes_written) => {
-                    log::debug!(
-                        "Graph sync: downloaded {} bytes for {}",
-                        bytes_written,
-                        msg.id
-                    );
-                    format!("{}/{}/cur/{}", account_id, folder_dir, filename)
-                }
-                Err(e) => {
-                    log::warn!("Graph sync: failed to download MIME for {}: {}", msg.id, e);
-                    // Clean up partial file
-                    let _ = std::fs::remove_file(&msg_path);
-                    String::new() // Empty = on-demand fetch later
-                }
-            };
-            downloaded.push((msg, maildir_path));
-        }
-
-        // Phase 2: Fast batch DB insert (lock held <10ms, not during downloads)
-        let conn = db_arc.writer().await;
-        conn.execute_batch("BEGIN")?;
-
-        let mut synced = 0u32;
-        let mut new_ids: Vec<String> = Vec::new();
-        for (msg, maildir_path) in &downloaded {
-            let id = format!("{}_{}", account_id, msg.id);
-            let flags = if msg.is_read {
-                vec!["seen".to_string()]
-            } else {
-                vec![]
-            };
-            let thread_id = msg.conversation_id.clone();
-
-            let new_msg = db::messages::NewMessage {
-                id: id.clone(),
-                account_id: account_id.to_string(),
-                folder_path: gf.id.clone(),
-                uid: 0,
-                message_id: msg.internet_message_id.clone(),
-                in_reply_to: msg.in_reply_to.clone(),
-                thread_id,
-                subject: msg.subject.clone(),
-                from_name: msg.from_name.clone(),
-                from_email: msg
-                    .from_email
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                to_addresses: msg.to_addresses.clone(),
-                cc_addresses: msg.cc_addresses.clone(),
-                date: msg.date.clone(),
-                size: 0,
-                has_attachments: msg.has_attachments,
-                is_encrypted: false,
-                is_signed: false,
-                flags: serde_json::to_string(&flags).unwrap_or_default(),
-                maildir_path: maildir_path.clone(),
-                snippet: msg.preview.clone(),
-            };
-            db::messages::insert_message(&conn, &new_msg)?;
-            new_ids.push(id);
-            synced += 1;
-        }
-
-        conn.execute_batch("COMMIT")?;
-        drop(conn);
-
-        if synced > 0 {
-            log::info!(
-                "Graph sync: {} new messages in '{}' (bodies streamed to disk)",
-                synced,
-                gf.display_name
-            );
-            grand_total += synced;
-        }
-
-        // Run filter rules against newly inserted messages. Errors are
-        // logged and swallowed so a transient Graph hiccup can't poison
-        // the sync — messages already landed in the DB.
-        if !new_ids.is_empty() {
-            match crate::commands::filters::apply_filters_to_new_messages(
-                db_arc, account_id, &gf.id, &new_ids,
-            )
-            .await
-            {
-                Ok(filtered) => {
-                    if filtered > 0 {
-                        log::info!(
-                            "Graph filters matched {} of {} new messages in '{}'",
-                            filtered,
-                            new_ids.len(),
-                            gf.display_name
-                        );
-                    }
-                }
-                Err(e) => log::warn!("Graph filter pass failed for '{}': {}", gf.display_name, e),
-            }
+        match sync_graph_folder_delta(ctx, &client, account_id, gf).await {
+            Ok(synced) => grand_total += synced,
+            Err(e) => log::warn!("Graph sync: skipping folder '{}': {}", gf.display_name, e),
         }
     }
 
@@ -280,50 +135,456 @@ async fn sync_graph_account(ctx: &MailSyncCtx, account_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delta-sync one folder: apply creations, flag updates, and removals
+/// reported by Graph since the folder's stored delta link. With no stored
+/// link this is the initial full enumeration (paged, resumable). Returns
+/// the number of newly inserted messages.
+async fn sync_graph_folder_delta(
+    ctx: &MailSyncCtx,
+    client: &crate::mail::graph::GraphClient,
+    account_id: &str,
+    gf: &crate::mail::graph::GraphMailFolder,
+) -> Result<u32> {
+    use crate::mail::graph;
+
+    let db_arc = &ctx.db;
+
+    let mut link = {
+        let conn = db_arc.reader();
+        db::folders::get_graph_delta_link(&conn, account_id, &gf.id)?
+    };
+
+    // Known message ids in this folder, so delta "created or updated"
+    // entries split into insert vs flag-update without a per-row query.
+    let mut existing_ids: std::collections::HashSet<String> = {
+        let conn = db_arc.reader();
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE account_id = ?1 AND folder_path = ?2")
+            .map_err(Error::Database)?;
+        let ids: std::collections::HashSet<String> = stmt
+            .query_map(rusqlite::params![account_id, gf.id], |row| row.get(0))
+            .map_err(Error::Database)?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids
+    };
+
+    // A full (re-)enumeration — no stored link, e.g. first sync or after
+    // HTTP 410 expired the delta token — lists what exists NOW; it does
+    // not emit tombstones for messages deleted while no delta state was
+    // held. Mark every current row `graph_prune_pending` up front; the
+    // enumeration clears the mark on each message it lists, and whatever
+    // is still marked when the enumeration COMPLETES (possibly several
+    // capped cycles later — the marks are durable, unlike an in-memory
+    // seen-set) was deleted server-side and gets pruned.
+    if link.is_none() && !existing_ids.is_empty() {
+        let conn = db_arc.writer().await;
+        conn.execute(
+            "UPDATE messages SET graph_prune_pending = 1
+             WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, gf.id],
+        )?;
+    }
+
+    // Rows whose sync-time filter pass never ran (crash or error after
+    // the insert transaction committed): pick them up in this cycle's
+    // filter batch. They are already in `existing_ids`, so the page loop
+    // below won't re-add them.
+    let mut new_ids: Vec<String> = {
+        let conn = db_arc.reader();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM messages
+                 WHERE account_id = ?1 AND folder_path = ?2 AND graph_filters_pending = 1",
+            )
+            .map_err(Error::Database)?;
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![account_id, gf.id], |row| row.get(0))
+            .map_err(Error::Database)?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids
+    };
+    if !new_ids.is_empty() {
+        log::info!(
+            "Graph sync: {} message(s) in '{}' still awaiting their filter pass",
+            new_ids.len(),
+            gf.display_name
+        );
+    }
+
+    let mut completed = false;
+    let mut synced = 0u32;
+    let mut pages = 0usize;
+
+    loop {
+        let page = match client.messages_delta_page(&gf.id, link.as_deref()).await {
+            Ok(p) => p,
+            Err(e) if graph::is_delta_resync_required(&e) => {
+                // Stored delta token expired server-side (HTTP 410). Clear
+                // it so the next cycle restarts with a full enumeration.
+                let conn = db_arc.writer().await;
+                db::folders::update_graph_delta_link(&conn, account_id, &gf.id, None)?;
+                return Err(Error::Sync(format!(
+                    "delta state expired for '{}'; full resync on next cycle",
+                    gf.display_name
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+
+        {
+            let conn = db_arc.writer().await;
+            // rusqlite::Transaction rolls back on drop, so any `?` below
+            // cannot leave an open transaction on the pooled connection.
+            let tx = conn.unchecked_transaction()?;
+
+            // Apply events strictly in server order: the same id can carry
+            // an update followed by a removal within one page, and playing
+            // removals and upserts as separate passes would resurrect the
+            // message. Errors propagate — a failed delete must roll the
+            // whole page (checkpoint included) back, or the server would
+            // never resend the tombstone.
+            for event in &page.events {
+                match event {
+                    graph::GraphDeltaEvent::Removed(removed) => {
+                        let id = format!("{}_{}", account_id, removed);
+                        tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])?;
+                        existing_ids.remove(&id);
+                        // A removed row owes no filter pass; drop it from
+                        // the batch if it was inserted earlier this cycle.
+                        new_ids.retain(|n| n != &id);
+                    }
+                    graph::GraphDeltaEvent::Upsert(msg) => {
+                        let id = format!("{}_{}", account_id, msg.id);
+                        // Mirror the full server-side flag state (read +
+                        // flagged), not just read: replacing the array with
+                        // only `seen` erased an existing `flagged` on every
+                        // update.
+                        let mut flags: Vec<String> = Vec::new();
+                        if msg.is_read {
+                            flags.push("seen".to_string());
+                        }
+                        if msg.is_flagged {
+                            flags.push("flagged".to_string());
+                        }
+                        let flags_json = serde_json::to_string(&flags).unwrap_or_default();
+
+                        if existing_ids.contains(&id) {
+                            // Updated message: mirror server-side flag
+                            // changes and mark it as confirmed-alive for a
+                            // running full enumeration (see
+                            // graph_prune_pending above).
+                            db::messages::update_flags(&tx, &id, &flags_json)?;
+                            tx.execute(
+                                "UPDATE messages SET graph_prune_pending = 0 WHERE id = ?1",
+                                rusqlite::params![id],
+                            )?;
+                            continue;
+                        }
+
+                        let new_msg = db::messages::NewMessage {
+                            id: id.clone(),
+                            account_id: account_id.to_string(),
+                            folder_path: gf.id.clone(),
+                            uid: 0,
+                            message_id: msg.internet_message_id.clone(),
+                            in_reply_to: msg.in_reply_to.clone(),
+                            thread_id: msg.conversation_id.clone(),
+                            subject: msg.subject.clone(),
+                            from_name: msg.from_name.clone(),
+                            from_email: msg
+                                .from_email
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            to_addresses: msg.to_addresses.clone(),
+                            cc_addresses: msg.cc_addresses.clone(),
+                            date: msg.date.clone(),
+                            size: 0,
+                            has_attachments: msg.has_attachments,
+                            is_encrypted: false,
+                            is_signed: false,
+                            flags: flags_json,
+                            // `graph:` marks the body as not yet downloaded
+                            // AND keeps the row out of the IMAP prefetch
+                            // pipeline (which selects `maildir_path = ''`
+                            // rows and cannot fetch Graph folders/UID 0).
+                            maildir_path: format!("graph:{}", msg.id),
+                            snippet: msg.preview.clone(),
+                        };
+                        db::messages::insert_message(&tx, &new_msg)?;
+                        // Durable "filter pass still owed" marker, committed
+                        // with the insert: a crash before the filter run is
+                        // retried on the next cycle instead of silently
+                        // skipped.
+                        tx.execute(
+                            "UPDATE messages SET graph_filters_pending = 1 WHERE id = ?1",
+                            rusqlite::params![id],
+                        )?;
+                        existing_ids.insert(id.clone());
+                        if !new_ids.contains(&id) {
+                            new_ids.push(id);
+                        }
+                        synced += 1;
+                    }
+                }
+            }
+
+            // Persist the resume point after every page: an interrupted
+            // sync continues from here instead of restarting the folder.
+            let resume = page.next_link.as_deref().or(page.delta_link.as_deref());
+            if let Some(l) = resume {
+                db::folders::update_graph_delta_link(&tx, account_id, &gf.id, Some(l))?;
+            }
+
+            tx.commit()?;
+        }
+
+        pages += 1;
+        match page.next_link {
+            Some(next) if pages < MAX_DELTA_PAGES_PER_CYCLE => link = Some(next),
+            Some(_) => {
+                log::info!(
+                    "Graph sync: '{}' has more pages after {} ({} new so far); resuming next cycle",
+                    gf.display_name,
+                    pages,
+                    synced
+                );
+                break;
+            }
+            None => {
+                completed = true;
+                break;
+            }
+        }
+    }
+
+    // Reconcile on completion (reached the deltaLink): rows still marked
+    // graph_prune_pending were never listed by the enumeration that
+    // marked them — deleted or moved out server-side while we had no
+    // delta state. The marks are durable, so this fires correctly even
+    // when the enumeration spanned several page-capped cycles; ordinary
+    // delta rounds mark nothing, making this a no-op for them.
+    if completed {
+        let conn = db_arc.writer().await;
+        let pruned = conn.execute(
+            "DELETE FROM messages
+             WHERE account_id = ?1 AND folder_path = ?2 AND graph_prune_pending = 1",
+            rusqlite::params![account_id, gf.id],
+        )?;
+        if pruned > 0 {
+            log::info!(
+                "Graph sync: pruned {} stale local row(s) in '{}' after full enumeration",
+                pruned,
+                gf.display_name
+            );
+        }
+    }
+
+    if synced > 0 {
+        log::info!(
+            "Graph sync: {} new messages in '{}' (envelopes only; bodies on demand)",
+            synced,
+            gf.display_name
+        );
+    }
+
+    // Run filter rules against newly inserted messages (plus any picked
+    // up from an interrupted earlier run). Errors are logged and
+    // swallowed so a transient Graph hiccup can't poison the sync — the
+    // rows keep their graph_filters_pending marker and are retried on
+    // the next cycle.
+    if !new_ids.is_empty() {
+        match crate::commands::filters::apply_filters_to_new_messages(
+            db_arc, account_id, &gf.id, &new_ids,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // Clear the pending marker ONLY for messages whose filter
+                // pass completed — messages with failed server-side
+                // actions stay marked and are retried next cycle. Rows the
+                // filters moved or deleted are already gone from the DB,
+                // so their UPDATE simply no-ops.
+                let failed: std::collections::HashSet<&String> =
+                    outcome.failed_db_ids.iter().collect();
+                {
+                    let conn = db_arc.writer().await;
+                    let tx = conn.unchecked_transaction()?;
+                    for id in new_ids.iter().filter(|id| !failed.contains(id)) {
+                        tx.execute(
+                            "UPDATE messages SET graph_filters_pending = 0 WHERE id = ?1",
+                            rusqlite::params![id],
+                        )?;
+                    }
+                    tx.commit()?;
+                }
+                if !failed.is_empty() {
+                    log::warn!(
+                        "Graph filters: {} message(s) in '{}' kept pending after failed actions",
+                        failed.len(),
+                        gf.display_name
+                    );
+                }
+                if outcome.affected > 0 {
+                    log::info!(
+                        "Graph filters matched {} of {} new messages in '{}'",
+                        outcome.affected,
+                        new_ids.len(),
+                        gf.display_name
+                    );
+                }
+            }
+            Err(e) => log::warn!("Graph filter pass failed for '{}': {}", gf.display_name, e),
+        }
+    }
+
+    Ok(synced)
+}
+
 #[async_trait]
 impl MailBackend for GraphMailBackend {
     fn protocol(&self) -> &'static str {
         "graph"
     }
 
-    /// Microsoft Graph has no cheap per-folder fetch — every sync runs
-    /// against the whole account, so the command backgrounds it.
-    fn folder_sync_backgrounds(&self) -> bool {
-        true
-    }
-
     async fn sync_account(
         &self,
         ctx: &MailSyncCtx,
         account: &AccountFull,
-        _current_folder: Option<String>,
+        current_folder: Option<String>,
     ) -> Result<()> {
         log::info!(
             "Syncing account {} ({}) via Microsoft Graph",
             account.display_name,
             account.email,
         );
-        sync_graph_account(ctx, &account.id).await
+        sync_graph_account(ctx, &account.id, current_folder.as_deref()).await
     }
 
-    /// Never called: `folder_sync_backgrounds` routes the command to a
-    /// background [`Self::sync_account`] instead.
+    /// Sync exactly one folder via its delta link. Refreshes the folder's
+    /// name/counts from the server first, so this works even for a folder
+    /// the local DB hasn't seen yet.
     async fn sync_folder(
         &self,
-        _ctx: &MailSyncCtx,
-        _account: &AccountFull,
-        _folder_path: &str,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        folder_path: &str,
     ) -> Result<u32> {
-        Err(Error::Sync(
-            "Graph per-folder sync runs as a background account sync".into(),
-        ))
+        use crate::mail::graph::{self, GraphClient};
+
+        ctx.app
+            .emit(
+                "sync-started",
+                serde_json::json!({
+                    "account_id": account.id,
+                    "account_name": account.display_name,
+                }),
+            )
+            .ok();
+
+        let token = graph::get_graph_token(&account.id).await?;
+        let client = GraphClient::new(&token);
+
+        let gf = client.get_mail_folder(folder_path).await?;
+        {
+            let conn = ctx.db.writer().await;
+            let folder_type = graph::guess_folder_type(&gf.display_name);
+            db::folders::upsert_folder(
+                &conn,
+                &account.id,
+                &gf.display_name,
+                &gf.id,
+                folder_type,
+                gf.parent_folder_id.as_deref(),
+            )?;
+            db::folders::update_folder_counts(
+                &conn,
+                &account.id,
+                &gf.id,
+                gf.unread_count,
+                gf.total_count,
+            )?;
+        }
+
+        sync_graph_folder_delta(ctx, &client, &account.id, &gf).await
     }
 
-    /// O365 accounts keep IMAP access alongside Graph, and their Graph
-    /// sync can leave rows behind for on-demand fetch — reuse the IMAP
-    /// prefetch pipeline exactly as the pre-trait command did.
+    /// Graph-native body prefetch. Graph message rows store the folder's
+    /// Graph id in `folder_path` and `uid = 0`, so the IMAP prefetch
+    /// pipeline (folder SELECT + fetch-by-UID) can never retrieve them —
+    /// delegating there just produced failed selects after every sync.
+    /// Instead, stream full MIME for the newest unfetched rows via the
+    /// same `download_mime_to_file` path the on-demand fetch uses.
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
-        super::imap::prefetch_pipeline(ctx, account).await
+        use crate::mail::graph::{self, GraphClient};
+        use crate::mail::sync::{
+            create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name,
+        };
+
+        /// Bodies fetched per prefetch pass; the pass re-runs after every
+        /// sync, so the backlog drains across cycles.
+        const MAX_PREFETCH_PER_PASS: u32 = 100;
+
+        let unfetched = {
+            let conn = ctx.db.reader();
+            db::messages::get_unfetched_graph_messages(&conn, &account.id, MAX_PREFETCH_PER_PASS)?
+        };
+        if unfetched.is_empty() {
+            return Ok(0);
+        }
+        log::info!(
+            "Graph prefetch: {} unfetched bodies for account {}",
+            unfetched.len(),
+            account.id
+        );
+
+        let token = graph::get_graph_token(&account.id).await?;
+        let client = GraphClient::new(&token);
+
+        let mut fetched = 0u32;
+        for (db_id, folder_path, maildir_path, flags_json) in &unfetched {
+            let graph_msg_id = maildir_path
+                .strip_prefix("graph:")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    db_id
+                        .strip_prefix(&format!("{}_", account.id))
+                        .unwrap_or(db_id)
+                        .to_string()
+                });
+            let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
+
+            let folder_dir = sanitize_folder_name(folder_path);
+            let maildir_base = ctx.data_dir.join(&account.id).join(&folder_dir);
+            create_maildir_dirs(&maildir_base)?;
+            let filename = format!("{}:2,{}", graph_msg_id, flags_to_maildir_suffix(&flags));
+            let msg_path = maildir_base.join("cur").join(&filename);
+
+            match client.download_mime_to_file(&graph_msg_id, &msg_path).await {
+                Ok(bytes) => {
+                    let relative = format!("{}/{}/cur/{}", account.id, folder_dir, filename);
+                    let conn = ctx.db.writer().await;
+                    db::messages::update_maildir_path(&conn, db_id, &relative)?;
+                    log::debug!("Graph prefetch: {} ({} bytes)", relative, bytes);
+                    fetched += 1;
+                }
+                Err(e) => {
+                    // Clean up any partial file; the row stays unfetched
+                    // and is retried on a later pass or on demand.
+                    let _ = std::fs::remove_file(&msg_path);
+                    log::warn!("Graph prefetch: failed for {}: {}", graph_msg_id, e);
+                }
+            }
+        }
+
+        log::info!(
+            "Graph prefetch: {} of {} bodies fetched for account {}",
+            fetched,
+            unfetched.len(),
+            account.id
+        );
+        Ok(fetched)
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {

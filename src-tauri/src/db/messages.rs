@@ -650,6 +650,38 @@ pub fn get_unfetched_messages(
     Ok(rows)
 }
 
+/// Messages of a Graph account whose body is not on disk yet: either the
+/// `graph:{id}` marker written by delta sync or a legacy empty path from
+/// the pre-delta crawler. Returns `(id, folder_path, maildir_path, flags)`
+/// newest first. Kept separate from [`get_unfetched_messages`], which
+/// feeds the IMAP prefetch pipeline and must not see Graph rows (Graph
+/// folder ids and UID 0 cannot be fetched over IMAP).
+pub fn get_unfetched_graph_messages(
+    conn: &Connection,
+    account_id: &str,
+    limit: u32,
+) -> Result<Vec<(String, String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_path, maildir_path, flags
+         FROM messages
+         WHERE account_id = ?1
+           AND (maildir_path = '' OR maildir_path LIKE 'graph:%')
+         ORDER BY date DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Compute a thread_id for a message using a multi-step strategy:
 ///
 /// 1. **In-Reply-To lookup**: If the message has an `In-Reply-To` header, find the

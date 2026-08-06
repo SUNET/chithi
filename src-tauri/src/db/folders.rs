@@ -306,6 +306,40 @@ pub fn update_jmap_state(
     Ok(())
 }
 
+/// Get the stored Microsoft Graph delta/next link for a folder.
+/// `None` means the folder has no delta state and needs an initial
+/// full enumeration.
+pub fn get_graph_delta_link(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT graph_delta_link FROM folders WHERE account_id = ?1 AND path = ?2",
+        params![account_id, path],
+        |row| row.get(0),
+    ) {
+        Ok(link) => Ok(link),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Store the Graph delta/next link for a folder. Pass `None` to clear it
+/// (forces a full re-enumeration on the next sync, e.g. after HTTP 410).
+pub fn update_graph_delta_link(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+    link: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET graph_delta_link = ?1 WHERE account_id = ?2 AND path = ?3",
+        params![link, account_id, path],
+    )?;
+    Ok(())
+}
+
 /// Recalculate folder counts from the messages table for all folders of an account.
 pub fn recalculate_folder_counts(conn: &Connection, account_id: &str) -> Result<()> {
     log::debug!("Recalculating folder counts for account {}", account_id);
@@ -556,6 +590,48 @@ mod tests {
             folder_path_by_type(&conn, "acc-none", "sent").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn test_graph_delta_link_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                graph_delta_link TEXT,
+                UNIQUE(account_id, path)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path) VALUES ('acc1', 'Inbox', 'fid-1')",
+            [],
+        )
+        .unwrap();
+
+        // No link stored yet; unknown folders are None, not an error.
+        assert_eq!(get_graph_delta_link(&conn, "acc1", "fid-1").unwrap(), None);
+        assert_eq!(
+            get_graph_delta_link(&conn, "acc1", "missing").unwrap(),
+            None
+        );
+
+        let link =
+            "https://graph.microsoft.com/v1.0/me/mailFolders/fid-1/messages/delta?$deltatoken=abc";
+        update_graph_delta_link(&conn, "acc1", "fid-1", Some(link)).unwrap();
+        assert_eq!(
+            get_graph_delta_link(&conn, "acc1", "fid-1")
+                .unwrap()
+                .as_deref(),
+            Some(link)
+        );
+
+        // Clearing (used on HTTP 410 resync) resets to None.
+        update_graph_delta_link(&conn, "acc1", "fid-1", None).unwrap();
+        assert_eq!(get_graph_delta_link(&conn, "acc1", "fid-1").unwrap(), None);
     }
 
     fn create_delete_test_db() -> Connection {
