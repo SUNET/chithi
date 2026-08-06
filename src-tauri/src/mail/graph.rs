@@ -183,13 +183,17 @@ impl GraphClient {
     async fn get_beta(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         let url = format!("{}{}", GRAPH_BETA_BASE, path);
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph beta GET {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || {
+                    self.http
+                        .get(&url)
+                        .bearer_auth(&self.access_token)
+                        .query(params)
+                },
+                &format!("beta GET {}", path),
+                true,
+            )
+            .await?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -260,12 +264,12 @@ impl GraphClient {
 
         let url = format!("{}{}", GRAPH_BASE, path);
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Graph GET {} failed: {}", path, e)))?;
+            .send_with_retry(
+                || self.http.get(&url).bearer_auth(&self.access_token),
+                &format!("GET {}", path),
+                true,
+            )
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1024,26 +1028,38 @@ impl GraphClient {
             .await
     }
 
+    /// Mark messages as read or unread and return one outcome per input id.
+    pub async fn set_read_status_batch(
+        &self,
+        message_ids: &[String],
+        is_read: bool,
+    ) -> Result<Vec<Result<()>>> {
+        let requests: Vec<serde_json::Value> = message_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                serde_json::json!({
+                    "id": format!("{}", i),
+                    "method": "PATCH",
+                    "url": format!("/me/messages/{}", id),
+                    "headers": { "Content-Type": "application/json" },
+                    "body": { "isRead": is_read }
+                })
+            })
+            .collect();
+        self.execute_batch_with_retry(requests).await
+    }
+
     /// Mark messages as read or unread.
     pub async fn set_read_status(&self, message_ids: &[String], is_read: bool) -> Result<()> {
-        // Batch up to 20 requests per $batch call (Graph API limit)
-        for chunk in message_ids.chunks(20) {
-            let requests: Vec<serde_json::Value> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, id)| {
-                    serde_json::json!({
-                        "id": format!("{}", i),
-                        "method": "PATCH",
-                        "url": format!("/me/messages/{}", id),
-                        "headers": { "Content-Type": "application/json" },
-                        "body": { "isRead": is_read }
-                    })
-                })
-                .collect();
-
-            let batch_body = serde_json::json!({ "requests": requests });
-            self.post_json("/$batch", &batch_body).await?;
+        let outcomes = self.set_read_status_batch(message_ids, is_read).await?;
+        for outcome in outcomes {
+            if let Err(e) = outcome {
+                return Err(Error::Other(format!(
+                    "Graph set-read-status batch item failed: {}",
+                    e
+                )));
+            }
         }
         Ok(())
     }

@@ -314,14 +314,15 @@ pub fn get_graph_delta_link(
     account_id: &str,
     path: &str,
 ) -> Result<Option<String>> {
-    let link: Option<String> = conn
-        .query_row(
-            "SELECT graph_delta_link FROM folders WHERE account_id = ?1 AND path = ?2",
-            params![account_id, path],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
-    Ok(link)
+    match conn.query_row(
+        "SELECT graph_delta_link FROM folders WHERE account_id = ?1 AND path = ?2",
+        params![account_id, path],
+        |row| row.get(0),
+    ) {
+        Ok(link) => Ok(link),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Store the Graph delta/next link for a folder. Pass `None` to clear it

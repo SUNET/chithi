@@ -78,7 +78,7 @@ async fn sync_graph_account(
                 &gf.display_name,
                 &gf.id,
                 folder_type,
-                None,
+                gf.parent_folder_id.as_deref(),
             )?;
             db::folders::update_folder_counts(
                 &conn,
@@ -275,7 +275,7 @@ async fn sync_graph_folder_delta(
                             // changes and mark it as confirmed-alive for a
                             // running full enumeration (see
                             // graph_prune_pending above).
-                            let _ = db::messages::update_flags(&tx, &id, &flags_json);
+                            db::messages::update_flags(&tx, &id, &flags_json)?;
                             tx.execute(
                                 "UPDATE messages SET graph_prune_pending = 0 WHERE id = ?1",
                                 rusqlite::params![id],
@@ -496,7 +496,7 @@ impl MailBackend for GraphMailBackend {
                 &gf.display_name,
                 &gf.id,
                 folder_type,
-                None,
+                gf.parent_folder_id.as_deref(),
             )?;
             db::folders::update_folder_counts(
                 &conn,

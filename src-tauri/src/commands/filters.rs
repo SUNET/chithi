@@ -714,23 +714,47 @@ async fn execute_graph_filter_actions(
     if !mark_read.is_empty() {
         log::info!("Graph: marking {} messages as read", mark_read.len());
         let graph_ids: Vec<String> = mark_read.iter().map(|(_, g)| g.clone()).collect();
-        if let Err(e) = client.set_read_status(&graph_ids, true).await {
-            log::warn!("Graph mark-read batch failed: {}", e);
-            result.errors.push(format!("mark-read: {}", e));
-            result
-                .failed_db_ids
-                .extend(mark_read.iter().map(|(d, _)| d.clone()));
+        match client.set_read_status_batch(&graph_ids, true).await {
+            Ok(outcomes) => {
+                for ((db_id, graph_id), outcome) in mark_read.iter().zip(outcomes) {
+                    if let Err(e) = outcome {
+                        log::warn!("Graph mark-read failed for id={}: {}", graph_id, e);
+                        result.errors.push(format!("mark-read {}: {}", graph_id, e));
+                        result.failed_db_ids.push(db_id.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Graph mark-read batch failed: {}", e);
+                result.errors.push(format!("mark-read: {}", e));
+                result
+                    .failed_db_ids
+                    .extend(mark_read.iter().map(|(d, _)| d.clone()));
+            }
         }
     }
     if !mark_unread.is_empty() {
         log::info!("Graph: marking {} messages as unread", mark_unread.len());
         let graph_ids: Vec<String> = mark_unread.iter().map(|(_, g)| g.clone()).collect();
-        if let Err(e) = client.set_read_status(&graph_ids, false).await {
-            log::warn!("Graph mark-unread batch failed: {}", e);
-            result.errors.push(format!("mark-unread: {}", e));
-            result
-                .failed_db_ids
-                .extend(mark_unread.iter().map(|(d, _)| d.clone()));
+        match client.set_read_status_batch(&graph_ids, false).await {
+            Ok(outcomes) => {
+                for ((db_id, graph_id), outcome) in mark_unread.iter().zip(outcomes) {
+                    if let Err(e) = outcome {
+                        log::warn!("Graph mark-unread failed for id={}: {}", graph_id, e);
+                        result
+                            .errors
+                            .push(format!("mark-unread {}: {}", graph_id, e));
+                        result.failed_db_ids.push(db_id.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Graph mark-unread batch failed: {}", e);
+                result.errors.push(format!("mark-unread: {}", e));
+                result
+                    .failed_db_ids
+                    .extend(mark_unread.iter().map(|(d, _)| d.clone()));
+            }
         }
     }
 

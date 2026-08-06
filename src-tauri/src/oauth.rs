@@ -1293,23 +1293,14 @@ pub fn ensure_not_reauth_required(account_id: &str) -> Result<()> {
 /// [`Error::AuthRequired`] so callers stop retrying. Other errors (network,
 /// keyring, throttling) pass through unchanged and stay retryable.
 ///
-/// Microsoft also encodes *scope-consent* failures as `invalid_grant`
-/// (AADSTS65001 / `"suberror":"consent_required"`) — e.g. the optional
-/// room-scope refresh (`Place.Read.All`) on an account that never
-/// consented to it. Those mean "this scope needs consent", not "the
-/// refresh token is dead": the same token keeps working for the baseline
-/// scopes, so latching them would let a room-suggestion click take down
-/// mail/calendar/contacts sync until the user signs in again.
+/// Baseline Microsoft refreshes also encode scope-consent failures as
+/// `invalid_grant` (AADSTS65001 / `"suberror":"consent_required"`). Those
+/// still need user action and should latch here so periodic sync does not
+/// keep retrying the same rejected refresh. Optional scope probes, such as
+/// room lookup, bypass this helper instead of calling it.
 pub fn auth_required_on_invalid_grant(account_id: &str, err: Error) -> Error {
     let msg = err.to_string();
     if !msg.contains("invalid_grant") {
-        return err;
-    }
-    if msg.contains("consent_required") || msg.contains("AADSTS65001") {
-        log::info!(
-            "OAuth2: refresh for account {} needs additional scope consent (not latching re-auth)",
-            account_id
-        );
         return err;
     }
     log::warn!(
@@ -1491,12 +1482,11 @@ mod tests {
         clear_reauth_required(acc);
     }
 
-    /// A scope-consent failure (AADSTS65001 / consent_required) is also
-    /// encoded as invalid_grant by Microsoft, but the refresh token is
-    /// still good for baseline scopes — it must NOT latch, or a room
-    /// lookup on a pre-room-consent account would kill mail sync.
+    /// Baseline scope-consent failures (AADSTS65001 / consent_required)
+    /// are invalid_grant responses too and need user action. Optional
+    /// room-scope probes avoid latching by not calling this helper.
     #[test]
-    fn consent_required_does_not_latch_reauth() {
+    fn consent_required_latches_reauth_for_baseline_refresh() {
         let acc = "test-latch-consent";
         let err = Error::Other(
             "Token refresh error: {\"error\":\"invalid_grant\",\
@@ -1505,9 +1495,10 @@ mod tests {
                 .into(),
         );
         let out = auth_required_on_invalid_grant(acc, err);
-        assert!(!matches!(out, Error::AuthRequired(_)));
-        assert!(!is_flagged(acc));
-        assert!(ensure_not_reauth_required(acc).is_ok());
+        assert!(matches!(out, Error::AuthRequired(_)));
+        assert!(is_flagged(acc));
+        assert!(ensure_not_reauth_required(acc).is_err());
+        clear_reauth_required(acc);
     }
 
     /// Unrelated errors (network, throttling) pass through untouched.
