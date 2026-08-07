@@ -53,6 +53,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: true
 
       # Tauri 2 system deps on Ubuntu. Required by the Rust build even for
       # check/clippy/test because tauri links against webkit2gtk at compile.
