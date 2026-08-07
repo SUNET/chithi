@@ -591,7 +591,7 @@ pub async fn get_participant_schedules(
     };
     match account.calendar_protocol_str() {
         "graph" => {
-            let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
+            let token = crate::mail::graph::get_graph_token(&account.id).await?;
             let schedules = crate::mail::graph::GraphClient::new(&token)
                 .get_schedules(&emails, &start_time, &end_time)
                 .await?;

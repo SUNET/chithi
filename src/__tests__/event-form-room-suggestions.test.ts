@@ -11,6 +11,8 @@ vi.mock("@/lib/tauri", () => ({
 }));
 
 import EventForm from "@/components/calendar/EventForm.vue";
+import DateInput from "@/components/common/DateInput.vue";
+import TimeInput from "@/components/common/TimeInput.vue";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "@/stores/accounts";
 import { useCalendarStore } from "@/stores/calendar";
@@ -186,6 +188,8 @@ describe("EventForm room suggestions", () => {
 
     await flushPromises();
     await wrapper.get('[data-testid="add-test-attendee"]').trigger("click");
+    wrapper.findAllComponents(TimeInput)[1].vm.$emit("update:modelValue", "09:15");
+    await flushPromises();
     await wrapper.get('[data-testid="event-form-scheduling-open"]').trigger("click");
     await flushPromises();
 
@@ -199,5 +203,10 @@ describe("EventForm room suggestions", () => {
     expect(firstSlot.text()).toContain("10:00");
     await firstSlot.trigger("click");
     expect((wrapper.get('[data-testid="event-form-start-time"]').element as HTMLInputElement).value).toContain("10:00");
+    expect((wrapper.get('[data-testid="event-form-end-time"]').element as HTMLInputElement).value).toContain("10:15");
+
+    wrapper.findAllComponents(DateInput)[0].vm.$emit("update:modelValue", "2026-08-11");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="scheduling-assistant"]').exists()).toBe(false);
   });
 });

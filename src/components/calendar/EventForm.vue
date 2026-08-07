@@ -190,7 +190,7 @@ const eventDurationMinutes = computed(() => {
   if (allDay.value) return 24 * 60;
   const start = new Date(localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone));
   const end = new Date(localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone));
-  return Math.max(30, Math.round((end.getTime() - start.getTime()) / 60000));
+  return Math.max(1, Math.round((end.getTime() - start.getTime()) / 60000));
 });
 
 const unknownParticipants = computed(() =>
@@ -204,7 +204,7 @@ const suggestedSlots = computed(() => {
   const durationMs = eventDurationMinutes.value * 60_000;
   const slots: Array<{ start: Date; end: Date }> = [];
   const cursor = new Date(`${startDate.value}T12:00:00Z`);
-  for (let offset = 0; offset < 10 && slots.length < 8; offset += 1) {
+  for (let offset = 0; offset < 14 && slots.length < 8; offset += 1) {
     const day = new Date(cursor.getTime() + offset * 86_400_000);
     const date = day.toISOString().slice(0, 10);
     const weekday = new Intl.DateTimeFormat("en", { weekday: "short", timeZone: "UTC" }).format(day);
@@ -264,7 +264,7 @@ async function loadSchedulingAssistant() {
   }
 }
 
-watch([attendeeEmails, selectedCalendarAccountId], () => {
+watch([attendeeEmails, selectedCalendarAccountId, startDate, () => uiStore.displayTimezone], () => {
   schedulingOpen.value = false;
   participantSchedules.value = [];
 }, { deep: true });

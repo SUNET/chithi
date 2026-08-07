@@ -1307,14 +1307,19 @@ impl GraphClient {
     ) -> Result<Vec<GraphSchedule>> {
         let start_utc = normalize_schedule_datetime(start)?;
         let end_utc = normalize_schedule_datetime(end)?;
-        let body = serde_json::json!({
-            "schedules": emails,
-            "startTime": { "dateTime": start_utc, "timeZone": "UTC" },
-            "endTime": { "dateTime": end_utc, "timeZone": "UTC" },
-            "availabilityViewInterval": 30,
-        });
-        let resp = self.post_json("/me/calendar/getSchedule", &body).await?;
-        Ok(parse_graph_schedules(&resp))
+        let mut schedules = Vec::with_capacity(emails.len());
+        // Graph limits getSchedule to 20 addresses per request.
+        for batch in emails.chunks(20) {
+            let body = serde_json::json!({
+                "schedules": batch,
+                "startTime": { "dateTime": start_utc, "timeZone": "UTC" },
+                "endTime": { "dateTime": end_utc, "timeZone": "UTC" },
+                "availabilityViewInterval": 30,
+            });
+            let resp = self.post_json("/me/calendar/getSchedule", &body).await?;
+            schedules.extend(parse_graph_schedules(&resp));
+        }
+        Ok(schedules)
     }
 
     /// Rename a calendar via PATCH /me/calendars/{id}.
@@ -1928,7 +1933,7 @@ fn parse_graph_schedules(value: &serde_json::Value) -> Vec<GraphSchedule> {
                             .unwrap_or("")
                             .to_ascii_lowercase()
                             .as_str(),
-                        "busy" | "tentative" | "oof" | "workingelsewhere"
+                        "busy" | "tentative" | "oof" | "workingelsewhere" | "unknown"
                     )
                 })
                 .filter_map(|item| {
@@ -1956,13 +1961,14 @@ mod schedule_tests {
         let value = serde_json::json!({ "value": [
             { "scheduleId": "known@example.org", "scheduleItems": [
                 { "status": "free", "start": { "dateTime": "2026-08-10T08:00:00" }, "end": { "dateTime": "2026-08-10T09:00:00" } },
-                { "status": "tentative", "start": { "dateTime": "2026-08-10T09:00:00" }, "end": { "dateTime": "2026-08-10T10:00:00" } }
+                { "status": "tentative", "start": { "dateTime": "2026-08-10T09:00:00" }, "end": { "dateTime": "2026-08-10T10:00:00" } },
+                { "status": "unknown", "start": { "dateTime": "2026-08-10T10:00:00" }, "end": { "dateTime": "2026-08-10T11:00:00" } }
             ] },
             { "scheduleId": "hidden@example.org", "error": { "code": "ErrorMailRecipientNotFound" } }
         ]});
         let schedules = parse_graph_schedules(&value);
         assert!(schedules[0].available);
-        assert_eq!(schedules[0].busy.len(), 1);
+        assert_eq!(schedules[0].busy.len(), 2);
         assert!(!schedules[1].available);
         assert!(schedules[1].busy.is_empty());
     }
