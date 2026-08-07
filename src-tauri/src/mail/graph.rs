@@ -89,6 +89,19 @@ pub struct GraphRoomAvailability {
     pub busy_end: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GraphSchedule {
+    pub email: String,
+    pub available: bool,
+    pub busy: Vec<GraphBusyPeriod>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GraphBusyPeriod {
+    pub start: String,
+    pub end: String,
+}
+
 impl GraphClient {
     pub fn new(access_token: &str) -> Self {
         Self {
@@ -1283,6 +1296,27 @@ impl GraphClient {
         Ok(parse_graph_room_availability(&resp))
     }
 
+    /// Fetch free/busy data for meeting participants. Per-recipient
+    /// Graph errors are represented as `available: false` with no busy
+    /// periods so callers never mistake unavailable data for free time.
+    pub async fn get_schedules(
+        &self,
+        emails: &[String],
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<GraphSchedule>> {
+        let start_utc = normalize_schedule_datetime(start)?;
+        let end_utc = normalize_schedule_datetime(end)?;
+        let body = serde_json::json!({
+            "schedules": emails,
+            "startTime": { "dateTime": start_utc, "timeZone": "UTC" },
+            "endTime": { "dateTime": end_utc, "timeZone": "UTC" },
+            "availabilityViewInterval": 30,
+        });
+        let resp = self.post_json("/me/calendar/getSchedule", &body).await?;
+        Ok(parse_graph_schedules(&resp))
+    }
+
     /// Rename a calendar via PATCH /me/calendars/{id}.
     pub async fn rename_calendar(&self, calendar_id: &str, new_name: &str) -> Result<()> {
         log::info!("Graph rename calendar: id={} -> {}", calendar_id, new_name);
@@ -1872,6 +1906,65 @@ fn parse_graph_room_availability(value: &serde_json::Value) -> GraphRoomAvailabi
         state: "available".into(),
         busy_start: None,
         busy_end: None,
+    }
+}
+
+fn parse_graph_schedules(value: &serde_json::Value) -> Vec<GraphSchedule> {
+    value["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|schedule| {
+            let email = schedule["scheduleId"].as_str()?.to_string();
+            let items = schedule["scheduleItems"].as_array();
+            let available = schedule["error"].is_null() && items.is_some();
+            let busy = items
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    matches!(
+                        item["status"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "busy" | "tentative" | "oof" | "workingelsewhere"
+                    )
+                })
+                .filter_map(|item| {
+                    Some(GraphBusyPeriod {
+                        start: item["start"]["dateTime"].as_str()?.to_string(),
+                        end: item["end"]["dateTime"].as_str()?.to_string(),
+                    })
+                })
+                .collect();
+            Some(GraphSchedule {
+                email,
+                available,
+                busy,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn parser_keeps_blocking_statuses_and_marks_errors_unknown() {
+        let value = serde_json::json!({ "value": [
+            { "scheduleId": "known@example.org", "scheduleItems": [
+                { "status": "free", "start": { "dateTime": "2026-08-10T08:00:00" }, "end": { "dateTime": "2026-08-10T09:00:00" } },
+                { "status": "tentative", "start": { "dateTime": "2026-08-10T09:00:00" }, "end": { "dateTime": "2026-08-10T10:00:00" } }
+            ] },
+            { "scheduleId": "hidden@example.org", "error": { "code": "ErrorMailRecipientNotFound" } }
+        ]});
+        let schedules = parse_graph_schedules(&value);
+        assert!(schedules[0].available);
+        assert_eq!(schedules[0].busy.len(), 1);
+        assert!(!schedules[1].available);
+        assert!(schedules[1].busy.is_empty());
     }
 }
 

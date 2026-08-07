@@ -5,6 +5,7 @@ import { createPinia, setActivePinia } from "pinia";
 vi.mock("@/lib/tauri", () => ({
   listRoomSuggestions: vi.fn().mockResolvedValue([]),
   checkRoomAvailability: vi.fn().mockResolvedValue({ state: "unknown", busy_start: null, busy_end: null }),
+  getParticipantSchedules: vi.fn().mockResolvedValue([]),
   meetCreateUrl: vi.fn(),
   sendInvites: vi.fn(),
 }));
@@ -159,5 +160,44 @@ describe("EventForm room suggestions", () => {
     expect(lastCall?.[1]).toBe("board@example.com");
     expect(lastCall?.[2]).toBe("2026-05-18T22:00:00.000Z");
     expect(lastCall?.[3]).toBe("2026-05-19T21:59:00.000Z");
+  });
+
+  it("offers conflict-free participant slots and applies the chosen time", async () => {
+    vi.mocked(api.getParticipantSchedules).mockResolvedValueOnce([
+      {
+        email: "me@work.example",
+        available: true,
+        busy: [{ start: "2026-08-10T09:00:00Z", end: "2026-08-10T10:00:00Z" }],
+      },
+      { email: "guest@example.org", available: true, busy: [] },
+    ]);
+    const wrapper = mount(EventForm, {
+      props: { initialStart: "2026-08-10T09:00:00Z" },
+      global: {
+        stubs: {
+          RecurrenceEditor: { template: "<div />" },
+          AttendeeEditor: {
+            template: `<button data-testid="add-test-attendee" @click="$emit('update:modelValue', ['guest@example.org'])">add</button>`,
+          },
+          Select: { template: "<div />" },
+        },
+      },
+    });
+
+    await flushPromises();
+    await wrapper.get('[data-testid="add-test-attendee"]').trigger("click");
+    await wrapper.get('[data-testid="event-form-scheduling-open"]').trigger("click");
+    await flushPromises();
+
+    expect(api.getParticipantSchedules).toHaveBeenCalledWith(
+      "acc-o365",
+      ["me@work.example", "guest@example.org"],
+      "2026-08-10T00:00:00.000Z",
+      "2026-08-24T00:00:00.000Z",
+    );
+    const firstSlot = wrapper.findAll('[data-testid^="scheduling-slot-"]')[0];
+    expect(firstSlot.text()).toContain("10:00");
+    await firstSlot.trigger("click");
+    expect((wrapper.get('[data-testid="event-form-start-time"]').element as HTMLInputElement).value).toContain("10:00");
   });
 });
