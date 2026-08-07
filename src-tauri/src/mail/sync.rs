@@ -318,14 +318,48 @@ fn sync_folder_envelopes(
     conn_imap: &mut ImapConnection,
     folder_path: &str,
 ) -> Result<u32> {
-    let (last_uid, stored_uid_next, stored_total) = {
+    let (mut last_uid, stored_uid_validity, stored_uid_next, stored_total) = {
         let conn = db.reader();
         let last_uid = db::folders::get_last_seen_uid(&conn, account_id, folder_path)?;
-        let (uid_next, total) = db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
-        (last_uid, uid_next, total)
+        let (uid_validity, uid_next, total) =
+            db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
+        (last_uid, uid_validity, uid_next, total)
     };
 
-    let (exists, _uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+    let (exists, uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+
+    let uidvalidity_changed =
+        stored_uid_validity > 0 && uid_validity > 0 && stored_uid_validity != uid_validity;
+    let stale_uid_epoch = uid_next > 0 && last_uid >= uid_next;
+    if uidvalidity_changed || stale_uid_epoch {
+        if uidvalidity_changed {
+            log::warn!(
+                "Folder '{}' UIDVALIDITY changed from {} to {}; resetting local IMAP sync state",
+                folder_path,
+                stored_uid_validity,
+                uid_validity
+            );
+        } else {
+            log::warn!(
+                "Folder '{}' has stale IMAP UID state (last_seen_uid={} >= uidnext={}); resetting",
+                folder_path,
+                last_uid,
+                uid_next
+            );
+        }
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.writer());
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
+        db::folders::update_last_seen_uid(&tx, account_id, folder_path, 0)?;
+        db::folders::update_uid_state(&tx, account_id, folder_path, uid_validity, uid_next)?;
+        db::folders::update_folder_counts(&tx, account_id, folder_path, 0, 0)?;
+        tx.commit()?;
+        last_uid = 0;
+    }
 
     // Preflight: if UIDNEXT and EXISTS haven't changed since last sync, the
     // folder is unchanged — skip deletion reconciliation, flag sync, and
@@ -430,7 +464,7 @@ fn sync_folder_envelopes(
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         if uid_next > 0 {
-            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+            db::folders::update_uid_state(&conn, account_id, folder_path, uid_validity, uid_next)?;
         }
         return Ok(0);
     }
@@ -576,7 +610,7 @@ fn sync_folder_envelopes(
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         // Store uid_next for preflight optimization on next sync
         if uid_next > 0 {
-            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+            db::folders::update_uid_state(&conn, account_id, folder_path, uid_validity, uid_next)?;
         }
     }
 
