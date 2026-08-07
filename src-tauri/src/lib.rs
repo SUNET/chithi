@@ -125,6 +125,7 @@ pub fn run() {
             commands::calendar::list_invites,
             commands::calendar::list_room_suggestions,
             commands::calendar::check_room_availability,
+            commands::calendar::get_participant_schedules,
             commands::calendar::create_event,
             commands::calendar::update_event,
             commands::calendar::delete_event,

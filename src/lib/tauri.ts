@@ -364,6 +364,20 @@ export async function checkRoomAvailability(
   });
 }
 
+export async function getParticipantSchedules(
+  accountId: string,
+  emails: string[],
+  startTime: string,
+  endTime: string,
+): Promise<import("./types").ParticipantSchedule[]> {
+  return invoke("get_participant_schedules", {
+    accountId,
+    emails,
+    startTime,
+    endTime,
+  });
+}
+
 export async function createEvent(
   event: import("./types").NewEventInput,
 ): Promise<string> {

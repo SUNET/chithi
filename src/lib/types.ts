@@ -102,6 +102,13 @@ export interface RoomAvailability {
   busy_end: string | null;
 }
 
+export interface ParticipantSchedule {
+  email: string;
+  /** False means the provider could not disclose this calendar's availability. */
+  available: boolean;
+  busy: Array<{ start: string; end: string }>;
+}
+
 export interface MessageSummary {
   id: string;
   subject: string | null;

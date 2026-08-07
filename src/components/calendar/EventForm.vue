@@ -168,6 +168,10 @@ const selectedCalendarAccountId = computed(() => {
 });
 const recurrenceRule = ref<string | null>(null);
 const attendeeEmails = ref<string[]>([]);
+const schedulingOpen = ref(false);
+const loadingSchedules = ref(false);
+const schedulingError = ref<string | null>(null);
+const participantSchedules = ref<import("@/lib/types").ParticipantSchedule[]>([]);
 const saving = ref(false);
 const error = ref<string | null>(null);
 const roomSuggestions = ref<import("@/lib/types").RoomSuggestion[]>([]);
@@ -176,6 +180,94 @@ const roomAvailability = ref<import("@/lib/types").RoomAvailability | null>(null
 const checkingRoomAvailability = ref(false);
 let roomAvailabilityRequestId = 0;
 let roomSuggestionsRequestId = 0;
+
+const supportsScheduling = computed(() => {
+  const account = accountsStore.accounts.find((entry) => entry.id === selectedCalendarAccountId.value);
+  return account?.provider === "gmail" || account?.provider === "o365" || account?.provider === "microsoft365";
+});
+
+const eventDurationMinutes = computed(() => {
+  if (allDay.value) return 24 * 60;
+  const start = new Date(localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone));
+  const end = new Date(localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone));
+  return Math.max(1, Math.round((end.getTime() - start.getTime()) / 60000));
+});
+
+const unknownParticipants = computed(() =>
+  participantSchedules.value.filter((schedule) => !schedule.available).map((schedule) => schedule.email),
+);
+
+const suggestedSlots = computed(() => {
+  if (participantSchedules.value.length === 0 || allDay.value) return [];
+  const known = participantSchedules.value.filter((schedule) => schedule.available);
+  if (known.length === 0) return [];
+  const durationMs = eventDurationMinutes.value * 60_000;
+  const slots: Array<{ start: Date; end: Date }> = [];
+  const cursor = new Date(`${startDate.value}T12:00:00Z`);
+  for (let offset = 0; offset < 14 && slots.length < 8; offset += 1) {
+    const day = new Date(cursor.getTime() + offset * 86_400_000);
+    const date = day.toISOString().slice(0, 10);
+    const weekday = new Intl.DateTimeFormat("en", { weekday: "short", timeZone: "UTC" }).format(day);
+    if (weekday === "Sat" || weekday === "Sun") continue;
+    const dayStart = new Date(localInputToUTC(date, "09:00", uiStore.displayTimezone));
+    const dayEnd = new Date(localInputToUTC(date, "17:00", uiStore.displayTimezone));
+    for (let candidate = dayStart.getTime(); candidate + durationMs <= dayEnd.getTime(); candidate += 30 * 60_000) {
+      const candidateEnd = candidate + durationMs;
+      const conflicts = known.some((schedule) => schedule.busy.some((period) => {
+        const busyStart = new Date(period.start.endsWith("Z") ? period.start : `${period.start}Z`).getTime();
+        const busyEnd = new Date(period.end.endsWith("Z") ? period.end : `${period.end}Z`).getTime();
+        return candidate < busyEnd && candidateEnd > busyStart;
+      }));
+      if (!conflicts) slots.push({ start: new Date(candidate), end: new Date(candidateEnd) });
+      if (slots.length >= 8) break;
+    }
+  }
+  return slots;
+});
+
+function formatSlot(slot: { start: Date; end: Date }) {
+  const date = new Intl.DateTimeFormat(undefined, {
+    weekday: "short", month: "short", day: "numeric", timeZone: uiStore.displayTimezone,
+  }).format(slot.start);
+  const time = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric", minute: "2-digit", timeZone: uiStore.displayTimezone,
+  });
+  return `${date}, ${time.format(slot.start)}–${time.format(slot.end)}`;
+}
+
+function chooseSlot(slot: { start: Date; end: Date }) {
+  startDate.value = toDateInTimezone(slot.start, uiStore.displayTimezone);
+  startTime.value = toTimeInTimezone(slot.start, uiStore.displayTimezone);
+  endDate.value = toDateInTimezone(slot.end, uiStore.displayTimezone);
+  endTime.value = toTimeInTimezone(slot.end, uiStore.displayTimezone);
+}
+
+async function loadSchedulingAssistant() {
+  const accountId = selectedCalendarAccountId.value;
+  const account = accountsStore.accounts.find((entry) => entry.id === accountId);
+  if (!accountId || !account || attendeeEmails.value.length === 0) return;
+  schedulingOpen.value = true;
+  loadingSchedules.value = true;
+  schedulingError.value = null;
+  participantSchedules.value = [];
+  try {
+    const emails = [...new Set([account.email, ...attendeeEmails.value].filter(Boolean))];
+    const rangeStart = localInputToUTC(startDate.value, "00:00", uiStore.displayTimezone);
+    const rangeEndDate = new Date(`${startDate.value}T12:00:00Z`);
+    rangeEndDate.setUTCDate(rangeEndDate.getUTCDate() + 14);
+    const rangeEnd = localInputToUTC(rangeEndDate.toISOString().slice(0, 10), "00:00", uiStore.displayTimezone);
+    participantSchedules.value = await api.getParticipantSchedules(accountId, emails, rangeStart, rangeEnd);
+  } catch (e) {
+    schedulingError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    loadingSchedules.value = false;
+  }
+}
+
+watch([attendeeEmails, selectedCalendarAccountId, startDate, () => uiStore.displayTimezone], () => {
+  schedulingOpen.value = false;
+  participantSchedules.value = [];
+}, { deep: true });
 
 function selectedRoom() {
   const query = location.value.trim().toLowerCase();
@@ -524,6 +616,36 @@ async function save() {
             v-model="attendeeEmails"
             :account-id="selectedCalendarAccountId"
           />
+          <button
+            v-if="attendeeEmails.length > 0 && supportsScheduling"
+            type="button"
+            class="scheduling-toggle"
+            data-testid="event-form-scheduling-open"
+            :disabled="loadingSchedules"
+            @click="loadSchedulingAssistant"
+          >
+            {{ loadingSchedules ? "Checking availability…" : "Find a time" }}
+          </button>
+          <section v-if="schedulingOpen" class="scheduling-assistant" data-testid="scheduling-assistant">
+            <strong>Scheduling assistant</strong>
+            <p v-if="schedulingError" class="scheduling-error">Could not load availability: {{ schedulingError }}</p>
+            <template v-else-if="!loadingSchedules">
+              <p v-if="unknownParticipants.length > 0" class="scheduling-warning" data-testid="scheduling-unknown">
+                Availability unknown for {{ unknownParticipants.join(", ") }}. Suggestions only reflect calendars shown by the provider.
+              </p>
+              <p v-if="suggestedSlots.length === 0">No conflict-free working-hour slots found in the next two weeks.</p>
+              <div v-else class="scheduling-slots">
+                <button
+                  v-for="slot in suggestedSlots"
+                  :key="slot.start.toISOString()"
+                  type="button"
+                  class="scheduling-slot"
+                  :data-testid="`scheduling-slot-${slot.start.toISOString()}`"
+                  @click="chooseSlot(slot)"
+                >{{ formatSlot(slot) }}</button>
+              </div>
+            </template>
+          </section>
         </div>
 
         <div class="form-group">
@@ -546,6 +668,35 @@ async function save() {
 </template>
 
 <style scoped>
+.scheduling-toggle {
+  margin-top: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.scheduling-assistant {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-secondary);
+  font-size: 13px;
+}
+.scheduling-assistant p { margin: 6px 0; }
+.scheduling-warning { color: var(--color-warning); }
+.scheduling-error { color: var(--color-danger-text); }
+.scheduling-slots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.scheduling-slot {
+  padding: 5px 8px;
+  border: 1px solid var(--color-accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-accent);
+  cursor: pointer;
+}
 /* "Add video conference" buttons under the Location input (#148). */
 .meet-row {
   display: flex;

@@ -8,6 +8,19 @@
 use crate::db::calendar::CalendarEvent;
 use crate::error::{Error, Result};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoogleSchedule {
+    pub email: String,
+    pub available: bool,
+    pub busy: Vec<GoogleBusyPeriod>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoogleBusyPeriod {
+    pub start: String,
+    pub end: String,
+}
+
 pub struct GoogleClient {
     http: reqwest::Client,
     token: String,
@@ -53,6 +66,40 @@ impl GoogleClient {
         resp.json()
             .await
             .map_err(|e| Error::Other(format!("Google Calendar API parse error: {}", e)))
+    }
+
+    /// Query Calendar FreeBusy for participant calendar addresses.
+    pub async fn get_schedules(
+        &self,
+        emails: &[String],
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<GoogleSchedule>> {
+        let body = serde_json::json!({
+            "timeMin": start,
+            "timeMax": end,
+            "items": emails.iter().map(|email| serde_json::json!({ "id": email })).collect::<Vec<_>>(),
+        });
+        let resp = self
+            .http
+            .post("https://www.googleapis.com/calendar/v3/freeBusy")
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Other(format!("Google Calendar FreeBusy failed: {}", e)))?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Other(format!(
+                "Google Calendar FreeBusy error: {}",
+                body
+            )));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Other(format!("Google Calendar FreeBusy parse error: {}", e)))?;
+        Ok(parse_google_schedules(&value, emails))
     }
 
     /// Incremental events listing using a stored sync token.
@@ -459,6 +506,55 @@ impl GoogleClient {
         resp.json()
             .await
             .map_err(|e| Error::Other(format!("Google People API parse error: {}", e)))
+    }
+}
+
+fn parse_google_schedules(value: &serde_json::Value, requested: &[String]) -> Vec<GoogleSchedule> {
+    requested
+        .iter()
+        .map(|email| {
+            let calendar = &value["calendars"][email];
+            let available = calendar.is_object()
+                && calendar["errors"]
+                    .as_array()
+                    .is_none_or(|errors| errors.is_empty());
+            let busy = calendar["busy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|period| {
+                    Some(GoogleBusyPeriod {
+                        start: period["start"].as_str()?.to_string(),
+                        end: period["end"].as_str()?.to_string(),
+                    })
+                })
+                .collect();
+            GoogleSchedule {
+                email: email.clone(),
+                available,
+                busy,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod free_busy_tests {
+    use super::*;
+
+    #[test]
+    fn parser_preserves_busy_periods_and_calendar_errors() {
+        let value = serde_json::json!({ "calendars": {
+            "free@example.org": { "busy": [{ "start": "2026-08-10T09:00:00Z", "end": "2026-08-10T10:00:00Z" }] },
+            "hidden@example.org": { "errors": [{ "reason": "notFound" }], "busy": [] }
+        }});
+        let schedules = parse_google_schedules(
+            &value,
+            &["free@example.org".into(), "hidden@example.org".into()],
+        );
+        assert!(schedules[0].available);
+        assert_eq!(schedules[0].busy.len(), 1);
+        assert!(!schedules[1].available);
     }
 }
 

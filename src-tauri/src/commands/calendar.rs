@@ -100,6 +100,19 @@ pub struct RoomAvailability {
     pub busy_end: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ParticipantSchedule {
+    pub email: String,
+    pub available: bool,
+    pub busy: Vec<BusyPeriod>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BusyPeriod {
+    pub start: String,
+    pub end: String,
+}
+
 /// Defence-in-depth check on a client-supplied meet binding before
 /// it touches the keyring or any provider API. The frontend always
 /// sends bindings that round-tripped through `meet_create_url`, but
@@ -539,6 +552,88 @@ pub async fn check_room_availability(
         busy_start: availability.busy_start,
         busy_end: availability.busy_end,
     })
+}
+
+#[tauri::command]
+pub async fn get_participant_schedules(
+    state: State<'_, AppState>,
+    account_id: String,
+    emails: Vec<String>,
+    start_time: String,
+    end_time: String,
+) -> Result<Vec<ParticipantSchedule>> {
+    let mut emails: Vec<String> = emails
+        .into_iter()
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty())
+        .collect();
+    emails.sort();
+    emails.dedup();
+    if emails.len() > 50 {
+        return Err(crate::error::Error::Other(
+            "Scheduling assistant supports at most 50 participants".into(),
+        ));
+    }
+
+    let start = chrono::DateTime::parse_from_rfc3339(&start_time)
+        .map_err(|e| crate::error::Error::Other(format!("Invalid schedule start: {}", e)))?;
+    let end = chrono::DateTime::parse_from_rfc3339(&end_time)
+        .map_err(|e| crate::error::Error::Other(format!("Invalid schedule end: {}", e)))?;
+    if end <= start || end - start > chrono::Duration::days(31) {
+        return Err(crate::error::Error::Other(
+            "Scheduling range must be positive and no longer than 31 days".into(),
+        ));
+    }
+
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+    match account.calendar_protocol_str() {
+        "graph" => {
+            let token = crate::mail::graph::get_graph_token(&account.id).await?;
+            let schedules = crate::mail::graph::GraphClient::new(&token)
+                .get_schedules(&emails, &start_time, &end_time)
+                .await?;
+            Ok(schedules
+                .into_iter()
+                .map(|schedule| ParticipantSchedule {
+                    email: schedule.email,
+                    available: schedule.available,
+                    busy: schedule
+                        .busy
+                        .into_iter()
+                        .map(|period| BusyPeriod {
+                            start: period.start,
+                            end: period.end,
+                        })
+                        .collect(),
+                })
+                .collect())
+        }
+        "google" => {
+            let token = get_google_token(&account.id).await?;
+            let schedules = crate::mail::google::GoogleClient::new(&token)
+                .get_schedules(&emails, &start_time, &end_time)
+                .await?;
+            Ok(schedules
+                .into_iter()
+                .map(|schedule| ParticipantSchedule {
+                    email: schedule.email,
+                    available: schedule.available,
+                    busy: schedule
+                        .busy
+                        .into_iter()
+                        .map(|period| BusyPeriod {
+                            start: period.start,
+                            end: period.end,
+                        })
+                        .collect(),
+                })
+                .collect())
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Push the event title back to the meet provider as the meeting's
