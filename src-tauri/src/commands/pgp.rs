@@ -157,27 +157,35 @@ fn summary_to_dto(s: KeySummary, card_idents: Vec<String>) -> PgpKeySummary {
 #[tauri::command]
 pub async fn pgp_list_keys(state: State<'_, AppState>) -> Result<Vec<PgpKeySummary>> {
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let summaries = guard.list_keys_summary().map_err(|e| lt_err(e.into()))?;
-    let links = card_link::card_idents_map(&guard).map_err(lt_err)?;
-    Ok(summaries
-        .into_iter()
-        .map(|s| {
-            let idents = links.get(&s.fingerprint).cloned().unwrap_or_default();
-            summary_to_dto(s, idents)
-        })
-        .collect())
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        let summaries = guard.list_keys_summary().map_err(|e| lt_err(e.into()))?;
+        let links = card_link::card_idents_map(&guard).map_err(lt_err)?;
+        Ok(summaries
+            .into_iter()
+            .map(|s| {
+                let idents = links.get(&s.fingerprint).cloned().unwrap_or_default();
+                summary_to_dto(s, idents)
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("key list task join failed: {e}")))?
 }
 
 #[tauri::command]
 pub async fn pgp_get_key(state: State<'_, AppState>, fingerprint: String) -> Result<PgpKeySummary> {
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let summary = guard
-        .get_key_summary(&fingerprint)
-        .map_err(|e| lt_err(e.into()))?;
-    let idents = card_link::card_idents_for_key(&guard, &fingerprint).map_err(lt_err)?;
-    Ok(summary_to_dto(summary, idents))
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        let summary = guard
+            .get_key_summary(&fingerprint)
+            .map_err(|e| lt_err(e.into()))?;
+        let idents = card_link::card_idents_for_key(&guard, &fingerprint).map_err(lt_err)?;
+        Ok(summary_to_dto(summary, idents))
+    })
+    .await
+    .map_err(|e| Error::Other(format!("key get task join failed: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -187,12 +195,16 @@ pub async fn pgp_get_key(state: State<'_, AppState>, fingerprint: String) -> Res
 #[tauri::command]
 pub async fn pgp_import_key(state: State<'_, AppState>, data: Vec<u8>) -> Result<PgpImportResult> {
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let info = key::import_any(&guard, &data).map_err(lt_err)?;
-    Ok(PgpImportResult {
-        fingerprint: info.fingerprint,
-        is_secret: info.is_secret,
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        let info = key::import_any(&guard, &data).map_err(lt_err)?;
+        Ok(PgpImportResult {
+            fingerprint: info.fingerprint,
+            is_secret: info.is_secret,
+        })
     })
+    .await
+    .map_err(|e| Error::Other(format!("key import task join failed: {e}")))?
 }
 
 /// Open the native file picker, read the chosen file, and import it.
@@ -222,27 +234,39 @@ pub async fn pgp_pick_and_import_key(
         .ok_or_else(|| Error::Other("picked path was not on local filesystem".into()))?;
     let bytes = std::fs::read(path)?;
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let info = key::import_any(&guard, &bytes).map_err(lt_err)?;
-    Ok(Some(PgpImportResult {
-        fingerprint: info.fingerprint,
-        is_secret: info.is_secret,
-    }))
+    let result = tokio::task::spawn_blocking(move || -> Result<PgpImportResult> {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        let info = key::import_any(&guard, &bytes).map_err(lt_err)?;
+        Ok(PgpImportResult {
+            fingerprint: info.fingerprint,
+            is_secret: info.is_secret,
+        })
+    })
+    .await
+    .map_err(|e| Error::Other(format!("key import task join failed: {e}")))??;
+    Ok(Some(result))
 }
 
 #[tauri::command]
 pub async fn pgp_delete_key(state: State<'_, AppState>, fingerprint: String) -> Result<()> {
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    key::delete(&guard, &fingerprint).map_err(lt_err)?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        key::delete(&guard, &fingerprint).map_err(lt_err)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("key delete task join failed: {e}")))?
 }
 
 #[tauri::command]
 pub async fn pgp_export_public(state: State<'_, AppState>, fingerprint: String) -> Result<String> {
     let store = state.pgp_store().map_err(lt_err)?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    key::export_public_armored(&guard, &fingerprint).map_err(lt_err)
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        key::export_public_armored(&guard, &fingerprint).map_err(lt_err)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("key export task join failed: {e}")))?
 }
 
 // ---------------------------------------------------------------------------

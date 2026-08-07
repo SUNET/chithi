@@ -187,16 +187,17 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
                                     let relative_path =
                                         format!("{}/{}/cur/{}", account_id, sanitized, filename);
                                     db_updates.push((message_id.clone(), relative_path));
-                                    count += 1;
                                 }
 
                                 if !db_updates.is_empty() {
+                                    let saved = db_updates.len() as u32;
                                     let conn = rt.block_on(db.writer());
-                                    conn.execute_batch("BEGIN").ok();
+                                    let tx = conn.unchecked_transaction()?;
                                     for (msg_id, path) in &db_updates {
-                                        db::messages::update_maildir_path(&conn, msg_id, path).ok();
+                                        db::messages::update_maildir_path(&tx, msg_id, path)?;
                                     }
-                                    conn.execute_batch("COMMIT").ok();
+                                    tx.commit()?;
+                                    count += saved;
                                     log::info!(
                                         "Prefetch[{}]: saved {} bodies in '{}'",
                                         thread_idx,

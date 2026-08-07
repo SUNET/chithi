@@ -459,8 +459,7 @@ fn sync_folder_envelopes(
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
-
-        conn.execute_batch("BEGIN")?;
+        let tx = conn.unchecked_transaction()?;
 
         for env in &envelopes {
             // In-memory existence check instead of per-message DB query
@@ -489,7 +488,7 @@ fn sync_folder_envelopes(
                 Some(env.references.as_slice())
             };
             let thread_id = db::messages::compute_thread_id(
-                &conn,
+                &tx,
                 account_id,
                 env.message_id.as_deref(),
                 env.in_reply_to.as_deref(),
@@ -522,16 +521,16 @@ fn sync_folder_envelopes(
                 maildir_path: String::new(),
                 snippet,
             };
-            db::messages::insert_message(&conn, &new_msg)?;
+            db::messages::insert_message(&tx, &new_msg)?;
             new_message_ids.push(id);
             total_synced += 1;
         }
 
         if let Some(&max_uid) = chunk.iter().max() {
-            db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+            db::folders::update_last_seen_uid(&tx, account_id, folder_path, max_uid)?;
         }
 
-        conn.execute_batch("COMMIT")?;
+        tx.commit()?;
     }
 
     // Run filter rules on newly synced messages
