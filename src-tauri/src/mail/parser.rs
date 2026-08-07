@@ -241,3 +241,105 @@ pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
             .to_string()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_envelope, parse_message_body};
+    use crate::db::messages::{Address, MessageBody, NewMessage};
+
+    const ADDRESSES: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/addresses");
+    const ATTACHMENT: &[u8] =
+        include_bytes!("../../../tests/fixtures/eai-test-messages/attachment");
+    const FROM: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/from");
+    const MIMEFIELD: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/mimefield");
+    const NOT_EMOJI: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/not-emoji");
+    const PUNYCODE: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/punycode");
+
+    fn envelope(raw: &[u8]) -> NewMessage {
+        parse_envelope("account", "INBOX", 1, raw, "message.eml").expect("EAI message should parse")
+    }
+
+    fn body(raw: &[u8]) -> MessageBody {
+        let envelope = envelope(raw);
+        parse_message_body(
+            &envelope.id,
+            raw,
+            &envelope.from_email,
+            &envelope.to_addresses,
+            &envelope.cc_addresses,
+            &envelope.flags,
+            envelope.is_encrypted,
+            envelope.is_signed,
+        )
+        .expect("EAI message body should parse")
+    }
+
+    fn addresses(json: &str) -> Vec<Address> {
+        serde_json::from_str(json).expect("parser should emit valid address JSON")
+    }
+
+    #[test]
+    fn parses_unicode_addresses_in_structured_headers() {
+        let message = envelope(ADDRESSES);
+
+        assert_eq!(message.from_name.as_deref(), Some("Jøran Øygårdvær"));
+        assert_eq!(message.from_email, "jøran@example.com");
+        let cc = addresses(&message.cc_addresses);
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].name.as_deref(), Some("Jøran Øygårdvær"));
+        assert_eq!(cc[0].email, "jøran@example.com");
+    }
+
+    #[test]
+    fn parses_unicode_from_header() {
+        let message = body(FROM);
+
+        assert_eq!(message.from.name.as_deref(), Some("Jøran Øygårdvær"));
+        assert_eq!(message.from.email, "jøran@example.com");
+        assert_eq!(
+            message.body_text.as_deref().map(str::trim_end),
+            Some("asdf")
+        );
+    }
+
+    #[test]
+    fn preserves_punycode_domains_and_unicode_local_parts() {
+        let message = envelope(PUNYCODE);
+        let to = addresses(&message.to_addresses);
+
+        assert_eq!(message.from_email, "info@xn--dmi-0na.fo");
+        assert_eq!(to[0].email, "dømi@xn--dmi-0na.fo");
+    }
+
+    #[test]
+    fn does_not_decode_punycode_like_local_part() {
+        let message = envelope(NOT_EMOJI);
+
+        assert_eq!(message.from_email, "xn--ls8ha@outlook.com");
+    }
+
+    #[test]
+    fn parses_unicode_filename_on_single_part_attachment() {
+        let message = body(MIMEFIELD);
+
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(
+            message.attachments[0].filename.as_deref(),
+            Some("blåbærsyltetøy")
+        );
+        assert_eq!(message.attachments[0].content_type, "text/plain");
+    }
+
+    #[test]
+    fn parses_unicode_filename_on_multipart_attachment() {
+        let message = body(ATTACHMENT);
+
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(
+            message.attachments[0].filename.as_deref(),
+            Some("blåbærsyltetøy")
+        );
+        assert_eq!(message.attachments[0].content_type, "image/jpeg");
+        assert!(message.attachments[0].size > 1_000);
+    }
+}

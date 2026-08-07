@@ -1,0 +1,3 @@
+[submodule "tests/fixtures/eai-test-messages"]
+	path = tests/fixtures/eai-test-messages
+	url = https://github.com/arnt/eai-test-messages.git
