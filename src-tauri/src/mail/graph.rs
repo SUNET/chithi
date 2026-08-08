@@ -1102,7 +1102,7 @@ impl GraphClient {
         flags: &[String],
         add: bool,
     ) -> Result<()> {
-        let updates = graph_flag_updates(flags, add)?;
+        let updates = graph_flag_updates(flags, add);
         if updates.as_object().is_none_or(serde_json::Map::is_empty) {
             return Ok(());
         }
@@ -1699,7 +1699,7 @@ impl GraphClient {
     }
 }
 
-fn graph_flag_updates(flags: &[String], add: bool) -> Result<serde_json::Value> {
+fn graph_flag_updates(flags: &[String], add: bool) -> serde_json::Value {
     let mut updates = serde_json::Map::new();
     for flag in flags {
         match flag.as_str() {
@@ -1714,15 +1714,15 @@ fn graph_flag_updates(flags: &[String], add: bool) -> Result<serde_json::Value> 
                     }),
                 );
             }
-            unsupported => {
-                return Err(Error::Other(format!(
-                    "Graph does not support the '{}' mail flag",
-                    unsupported
-                )));
+            local_only => {
+                log::debug!(
+                    "Graph keeps mail flag '{}' local-only because it has no remote mapping",
+                    local_only
+                );
             }
         }
     }
-    Ok(serde_json::Value::Object(updates))
+    serde_json::Value::Object(updates)
 }
 
 #[cfg(test)]
@@ -1733,14 +1733,14 @@ mod flag_update_tests {
     fn maps_seen_and_flagged_updates() {
         let flags = vec!["seen".to_string(), "flagged".to_string()];
         assert_eq!(
-            graph_flag_updates(&flags, true).unwrap(),
+            graph_flag_updates(&flags, true),
             serde_json::json!({
                 "isRead": true,
                 "flag": { "flagStatus": "flagged" },
             })
         );
         assert_eq!(
-            graph_flag_updates(&flags, false).unwrap(),
+            graph_flag_updates(&flags, false),
             serde_json::json!({
                 "isRead": false,
                 "flag": { "flagStatus": "notFlagged" },
@@ -1749,9 +1749,15 @@ mod flag_update_tests {
     }
 
     #[test]
-    fn rejects_unsupported_flags() {
-        let error = graph_flag_updates(&["answered".to_string()], true).unwrap_err();
-        assert!(error.to_string().contains("does not support"));
+    fn keeps_unmapped_flags_local_only() {
+        let updates = graph_flag_updates(&["answered".to_string()], true);
+        assert_eq!(updates, serde_json::json!({}));
+    }
+
+    #[test]
+    fn mixed_flags_still_apply_supported_updates() {
+        let updates = graph_flag_updates(&["seen".to_string(), "answered".to_string()], true);
+        assert_eq!(updates, serde_json::json!({ "isRead": true }));
     }
 }
 
