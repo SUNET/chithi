@@ -6,14 +6,8 @@ use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::{FilterAction, FilterRule};
+use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
-
-/// Strip the `{account_id}_` prefix from a composite DB id to recover the Graph message id.
-fn graph_id_from_db_id<'a>(account_id: &str, db_id: &'a str) -> &'a str {
-    db_id
-        .strip_prefix(&format!("{}_", account_id))
-        .unwrap_or(db_id)
-}
 
 /// Detect Graph "item not found" errors — i.e. the local id is stale because
 /// the message was moved or deleted server-side. Matches both the HTTP 404
@@ -22,16 +16,6 @@ fn graph_id_from_db_id<'a>(account_id: &str, db_id: &'a str) -> &'a str {
 fn is_graph_item_not_found(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("404") && s.contains("ErrorItemNotFound")
-}
-
-/// Extract the JMAP email id from a composite DB id of form
-/// `{account_id}_{mailbox_id}_{email_id}` by stripping the known
-/// `{account_id}_{mailbox_id}_` prefix. Splitting on `_` is unsafe because
-/// JMAP mailbox ids and email ids are server-opaque and may legally contain
-/// underscores.
-fn jmap_id_from_db_id(account_id: &str, mailbox_id: &str, db_id: &str) -> Option<String> {
-    let prefix = format!("{}_{}_", account_id, mailbox_id);
-    db_id.strip_prefix(&prefix).map(|s| s.to_string())
 }
 
 /// Apply all enabled filters for an account to all messages in a given folder.
@@ -623,7 +607,9 @@ async fn execute_graph_filter_actions(
     let mut mark_unread: Vec<(String, String)> = Vec::new(); // (db_id, graph_id)
 
     for (msg, actions) in action_plan {
-        let graph_id = graph_id_from_db_id(account_id, &msg.id).to_string();
+        let graph_id = BackendMessageRef::graph_from_db_id(account_id, &msg.id)
+            .into_graph_item_id()
+            .expect("Graph parser must return a Graph reference");
         for action in actions {
             match action {
                 FilterAction::Move { target } => {
@@ -849,7 +835,10 @@ async fn execute_jmap_filter_actions(
         // The JMAP mailbox id is stored as `folder_path`; use that to strip
         // the exact prefix instead of splitting on `_`, which is unsafe
         // because mailbox ids and email ids are server-opaque.
-        let Some(jmap_id) = jmap_id_from_db_id(&account.id, &msg.folder_path, &msg.id) else {
+        let Some(jmap_id) =
+            BackendMessageRef::jmap_from_db_id(&account.id, &msg.folder_path, &msg.id)
+                .and_then(BackendMessageRef::into_jmap_email_id)
+        else {
             log::warn!(
                 "Skipping JMAP filter action for message '{}' with unexpected id format",
                 msg.id
@@ -1032,50 +1021,6 @@ fn capitalize_flag(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_graph_id_from_db_id_strips_account_prefix() {
-        let acc = "acc123";
-        let db_id = "acc123_AAMkAGI2T-foo_bar";
-        assert_eq!(graph_id_from_db_id(acc, db_id), "AAMkAGI2T-foo_bar");
-    }
-
-    #[test]
-    fn test_graph_id_from_db_id_returns_input_when_prefix_missing() {
-        assert_eq!(
-            graph_id_from_db_id("acc123", "raw_graph_id"),
-            "raw_graph_id"
-        );
-    }
-
-    #[test]
-    fn test_jmap_id_from_db_id_strips_known_prefix() {
-        let id = jmap_id_from_db_id("acc1", "inbox", "acc1_inbox_M123");
-        assert_eq!(id.as_deref(), Some("M123"));
-    }
-
-    #[test]
-    fn test_jmap_id_from_db_id_preserves_underscores_in_email_id() {
-        // Email id contains underscores; previous splitn(3, '_') would have
-        // truncated this. Prefix-strip handles it correctly.
-        let id = jmap_id_from_db_id("acc1", "box", "acc1_box_email_with_underscores");
-        assert_eq!(id.as_deref(), Some("email_with_underscores"));
-    }
-
-    #[test]
-    fn test_jmap_id_from_db_id_handles_underscore_in_mailbox_id() {
-        // Server-opaque mailbox id with underscores — splitn-based parsing
-        // would have returned "child_M9" or worse here; prefix-strip is exact.
-        let id = jmap_id_from_db_id("acc1", "parent_child", "acc1_parent_child_M9");
-        assert_eq!(id.as_deref(), Some("M9"));
-    }
-
-    #[test]
-    fn test_jmap_id_from_db_id_returns_none_when_prefix_missing() {
-        assert!(jmap_id_from_db_id("acc1", "inbox", "different_acc_inbox_M1").is_none());
-        assert!(jmap_id_from_db_id("acc1", "inbox", "acc1_other_M1").is_none());
-        assert!(jmap_id_from_db_id("acc1", "inbox", "no_underscores").is_none());
-    }
 
     #[test]
     fn test_is_graph_item_not_found_matches_404_with_code() {

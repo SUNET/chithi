@@ -1,6 +1,7 @@
 pub mod autoconfig;
 pub mod caldav;
 pub mod carddav;
+pub mod compat;
 pub mod dav_http;
 pub mod google;
 pub mod graph;

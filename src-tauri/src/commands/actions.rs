@@ -8,6 +8,7 @@ use crate::commands::sync_cmd::{
 use crate::db;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::mail::compat::BodyLocation;
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 use crate::state::AppState;
@@ -448,15 +449,16 @@ pub async fn move_messages_cross_account(
         })?;
         let mut paths = Vec::with_capacity(maildir_paths.len());
         for (msg_id, maildir_path) in &maildir_paths {
-            if maildir_path.starts_with("graph:") {
+            let body_location = BodyLocation::from_persisted(maildir_path);
+            let Some(local_path) = body_location.local_path() else {
                 return Err(Error::Other(format!(
                     "Message {} is not stored on disk (Graph API). \
                      Cross-account move requires locally synced messages.",
                     msg_id
                 )));
-            }
+            };
             let canonical =
-                crate::path_validation::resolve_under_canonical(&canonical_data_dir, maildir_path)
+                crate::path_validation::resolve_under_canonical(&canonical_data_dir, local_path)
                     .map_err(|e| {
                         Error::Other(format!(
                             "Invalid maildir path for message {}: {}",

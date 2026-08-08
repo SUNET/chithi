@@ -7,6 +7,7 @@ use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
 use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
+use crate::mail::compat::BodyLocation;
 use crate::meet;
 use crate::state::AppState;
 
@@ -1028,7 +1029,7 @@ pub async fn get_email_invites(
     let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
         db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
 
-    if maildir_path.is_empty() {
+    if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
         log::debug!("get_email_invites: message body not fetched yet");
         return Ok(vec![]);
     }
@@ -1110,7 +1111,7 @@ pub async fn respond_to_invite(
         let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
 
-        if maildir_path.is_empty() {
+        if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
             return Err(crate::error::Error::Other(
                 "Message body not fetched yet".to_string(),
             ));
@@ -1917,6 +1918,11 @@ pub async fn process_invite_reply(
         let conn = state.db.writer().await;
         let (maildir_path, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
+            return Err(crate::error::Error::Other(
+                "Message body not fetched yet".to_string(),
+            ));
+        }
         let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
         std::fs::read(&full_path)
             .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
@@ -2057,6 +2063,11 @@ pub async fn process_cancelled_invite(
         let conn = state.db.reader();
         let (maildir_path, _, _, _, _, _, _) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+        if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
+            return Err(crate::error::Error::Other(
+                "Message body not fetched yet".to_string(),
+            ));
+        }
         let full_path = crate::path_validation::resolve_under(&state.data_dir, &maildir_path)?;
         std::fs::read(&full_path)
             .map_err(|e| crate::error::Error::Other(format!("Failed to read message: {}", e)))?
@@ -2154,7 +2165,7 @@ pub fn auto_process_calendar_emails(
             }
         };
 
-        if maildir_path.is_empty() {
+        if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
             continue; // Body not fetched yet
         }
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
@@ -85,6 +85,14 @@ The explicit refinements are:
    remains keyed on the book's `sync_type`. ADR 0051 allows lookup-boundary
    normalization only; no `contact_books.sync_type` migration is part of this
    ADR.
+7. **ADR 0025 Graph body download timing.** ADR 0025 described normal Graph
+   sync as downloading full MIME before inserting each message. The current
+   delta-sync architecture instead inserts envelope metadata with a
+   `graph:{message_id}` remote-body marker, then streams full MIME to Maildir
+   during explicit prefetch or the first body request. ADR 0051 accepts that
+   timing while preserving ADR 0025's bounded-memory streaming, short database
+   lock durations, partial-file cleanup and offline-local-body goals. Once
+   fetched, the marker is replaced with the relative Maildir path.
 
 ## Compatibility and security invariants
 
@@ -156,10 +164,11 @@ Every phase of this refactor must preserve these prior-ADR invariants.
 - OpenPGP-enabled outgoing mail preserves ADR 0047's raw-MIME invariant. The
   PGP-wrapped bytes are persisted to outbox and sent/replayed verbatim unless a
   future ADR explicitly changes the send architecture.
-- Graph normal sync must remain two-phase as in ADR 0025: stream full MIME to
-  Maildir with bounded memory and without holding the DB lock, then perform a
-  short DB transaction. Legacy `graph:` body paths are compatibility/self-heal
-  paths, not a return to normal live Graph body fetching for synced messages.
+- Graph delta sync may persist envelope metadata with a `graph:{message_id}`
+  remote-body marker. Explicit prefetch or the first body request must stream
+  full MIME to Maildir with bounded memory and without holding the DB lock,
+  then replace the marker in a short DB transaction. Failed downloads must not
+  replace the marker with a local path, and partial files must be cleaned up.
 - IMAP TLS mode remains port-authoritative (993 = implicit TLS; other ports =
   STARTTLS) and plaintext authentication remains unsupported (ADR 0024).
 - IMAP sync optimizations from ADR 0041 and ADR 0023 remain regression
@@ -363,8 +372,9 @@ centralize parsing and formatting so commands no longer call `splitn(3, '_')`,
 `strip_prefix("graph:")` or similar provider-specific parsing directly.
 
 This is a compatibility/parser refactor, not a change to normal sync storage
-semantics. In particular, Graph normal sync continues to download full MIME to
-Maildir; `graph:` handling is legacy/self-heal compatibility.
+semantics. In particular, Graph delta sync continues to persist
+`graph:{message_id}` until explicit prefetch or the first body request streams
+full MIME to Maildir and replaces the marker with the relative local path.
 
 ### 5. Expand provider traits by capability, not by rewrite
 

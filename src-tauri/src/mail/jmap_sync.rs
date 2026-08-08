@@ -6,6 +6,7 @@ use crate::db;
 use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::mail::compat::BackendMessageRef;
 use crate::mail::jmap::{JmapConfig, JmapConnection};
 
 #[derive(Clone, serde::Serialize)]
@@ -303,13 +304,14 @@ async fn sync_jmap_folder(
 
         for email in &filtered_emails {
             // Use the JMAP email ID as the unique identifier
-            let id = format!("{}_{}_{}", account_id, mailbox_id, email.id);
+            let message_ref = BackendMessageRef::jmap(mailbox_id, &email.id);
+            let id = message_ref.to_db_id(account_id);
 
             // Check if this message already exists (by JMAP ID in the folder)
             if jmap_message_exists(&conn, account_id, mailbox_id, &email.id)? {
                 // Update flags in case they changed on the server (read/unread, flagged, etc.)
                 let new_flags = serde_json::to_string(&email.flags).unwrap_or_default();
-                let msg_id = format!("{}_{}_{}", account_id, mailbox_id, email.id);
+                let msg_id = message_ref.to_db_id(account_id);
                 let _ = db::messages::update_flags(&conn, &msg_id, &new_flags);
                 continue;
             }
@@ -394,10 +396,10 @@ async fn sync_jmap_folder(
                 .filter_map(|r| r.ok())
                 .collect();
             for local_id in &local_ids {
-                let jmap_id = local_id
-                    .strip_prefix(&format!("{}_{}_", account_id, mailbox_id))
-                    .unwrap_or(local_id);
-                if !server_ids.contains(jmap_id) {
+                let jmap_id = BackendMessageRef::jmap_from_db_id(account_id, mailbox_id, local_id)
+                    .and_then(BackendMessageRef::into_jmap_email_id)
+                    .unwrap_or_else(|| local_id.clone());
+                if !server_ids.contains(&jmap_id) {
                     conn.execute(
                         "DELETE FROM messages WHERE id = ?1",
                         rusqlite::params![local_id],
@@ -412,7 +414,7 @@ async fn sync_jmap_folder(
             // mailbox. Both reduce to the same DB op (drop the per-folder
             // composite row); apply them together.
             for jmap_id in destroyed.iter().chain(moved_out.iter()) {
-                let composite = format!("{}_{}_{}", account_id, mailbox_id, jmap_id);
+                let composite = BackendMessageRef::jmap(mailbox_id, jmap_id).to_db_id(account_id);
                 if conn
                     .execute(
                         "DELETE FROM messages WHERE id = ?1",
@@ -484,7 +486,7 @@ fn jmap_message_exists(
     mailbox_id: &str,
     jmap_email_id: &str,
 ) -> Result<bool> {
-    let id = format!("{}_{}_{}", account_id, mailbox_id, jmap_email_id);
+    let id = BackendMessageRef::jmap(mailbox_id, jmap_email_id).to_db_id(account_id);
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE id = ?1",
         rusqlite::params![id],
