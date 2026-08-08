@@ -298,24 +298,42 @@ impl GraphClient {
         let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
             Error::Other(format!("Failed to create file {}: {}", dest.display(), e))
         })?;
-        let mut stream = resp.bytes_stream();
-        let mut total: u64 = 0;
+        let result = async {
+            let mut stream = resp.bytes_stream();
+            let mut total: u64 = 0;
 
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
-            file.write_all(&chunk).await.map_err(|e| {
-                Error::Other(format!("Failed to write to {}: {}", dest.display(), e))
-            })?;
-            total += chunk.len() as u64;
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|e| Error::Other(format!("Graph stream read failed: {}", e)))?;
+                file.write_all(&chunk).await.map_err(|e| {
+                    Error::Other(format!("Failed to write to {}: {}", dest.display(), e))
+                })?;
+                total += chunk.len() as u64;
+            }
+
+            file.flush()
+                .await
+                .map_err(|e| Error::Other(format!("Failed to flush {}: {}", dest.display(), e)))?;
+
+            Ok(total)
+        }
+        .await;
+
+        drop(file);
+        if result.is_err() {
+            if let Err(cleanup_err) = tokio::fs::remove_file(dest).await {
+                if cleanup_err.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "Failed to remove partial Graph download {}: {}",
+                        dest.display(),
+                        cleanup_err
+                    );
+                }
+            }
         }
 
-        file.flush()
-            .await
-            .map_err(|e| Error::Other(format!("Failed to flush {}: {}", dest.display(), e)))?;
-
-        Ok(total)
+        result
     }
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
