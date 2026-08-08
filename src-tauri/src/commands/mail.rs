@@ -1,8 +1,8 @@
 use tauri::State;
 
 use crate::commands::sync_cmd::{
-    resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
-    suspend_imap_idle_for_account,
+    restart_imap_idle_after_failed_suspend, resume_imap_idle_for_account,
+    should_suspend_idle_for_imap_operation, suspend_imap_idle_for_account,
 };
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
@@ -355,14 +355,16 @@ async fn ensure_message_body_on_disk(
 
         let resume_account = account.clone();
         let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
-            suspend_imap_idle_for_body_fetch(
-                account_id,
-                suspend_imap_idle_for_account(state, account_id),
-                resume_imap_idle_for_account(app, state, &resume_account, true),
+            Some(
+                suspend_imap_idle_for_body_fetch(
+                    account_id,
+                    suspend_imap_idle_for_account(state, account_id),
+                    restart_imap_idle_after_failed_suspend(app, state, &resume_account),
+                )
+                .await?,
             )
-            .await?
         } else {
-            false
+            None
         };
 
         run_imap_body_fetch_with_resume(
@@ -422,13 +424,13 @@ async fn ensure_message_body_on_disk(
     Ok(relative_path)
 }
 
-async fn suspend_imap_idle_for_body_fetch<S, R>(
+async fn suspend_imap_idle_for_body_fetch<T, S, R>(
     account_id: &str,
     suspend: S,
     resume_after_failure: R,
-) -> Result<bool>
+) -> Result<T>
 where
-    S: std::future::Future<Output = Result<bool>>,
+    S: std::future::Future<Output = Result<T>>,
     R: std::future::Future<Output = Result<()>>,
 {
     match suspend.await {
@@ -1215,7 +1217,7 @@ mod tests {
     async fn body_fetch_suspend_failure_attempts_restart() {
         let resumed = Arc::new(AtomicBool::new(false));
         let resumed_in_future = resumed.clone();
-        let result = suspend_imap_idle_for_body_fetch(
+        let result = suspend_imap_idle_for_body_fetch::<String, _, _>(
             "account",
             async { Err(Error::Other("suspend failed".into())) },
             async move {

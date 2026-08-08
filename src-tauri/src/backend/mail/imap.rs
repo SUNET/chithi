@@ -22,6 +22,14 @@ pub struct ImapMailBackend;
 /// (message_id, uid, flags_json) tuple for prefetch grouping.
 type PrefetchMsg = (String, u32, String);
 
+fn prefetch_connection_limit(auth_method: &str, folder_count: usize) -> usize {
+    if auth_method == "oauth-microsoft" {
+        1.min(folder_count)
+    } else {
+        3.min(folder_count)
+    }
+}
+
 /// Build the connection config, refreshing the O365 IMAP-scoped token
 /// when needed.
 async fn build_imap_config(account: &AccountFull) -> Result<ImapConfig> {
@@ -86,7 +94,7 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
 
     let db = ctx.db.clone();
     let folder_count = by_folder.len();
-    let max_connections = 3.min(folder_count);
+    let max_connections = prefetch_connection_limit(&account.auth_method, folder_count);
 
     log::info!(
         "Prefetch: {} folders with {} parallel connections",
@@ -791,7 +799,7 @@ fn select_folder_if_needed(
 
 #[cfg(test)]
 mod tests {
-    use super::group_imap_message_refs;
+    use super::{group_imap_message_refs, prefetch_connection_limit};
     use crate::mail::compat::BackendMessageRef;
 
     #[test]
@@ -810,5 +818,11 @@ mod tests {
     fn copy_rejects_non_imap_references() {
         let result = group_imap_message_refs(vec![BackendMessageRef::graph("item")]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn o365_prefetch_uses_one_connection() {
+        assert_eq!(prefetch_connection_limit("oauth-microsoft", 3), 1);
+        assert_eq!(prefetch_connection_limit("password", 3), 3);
     }
 }
