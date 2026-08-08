@@ -8,6 +8,7 @@ use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
+use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
@@ -605,23 +606,32 @@ impl MailOpExecutor for GraphOpExecutor {
                 log::debug!("Graph op handled by optimistic path");
             }
             MailOp::SetFlags { mutations } => {
+                let prepared = mutations
+                    .into_iter()
+                    .map(|mutation| {
+                        let FlagTarget::Messages(message_refs) = mutation.target else {
+                            return Err(Error::Other(
+                                "Graph executor received an IMAP bulk flag target".into(),
+                            ));
+                        };
+                        let item_ids = message_refs
+                            .into_iter()
+                            .map(|message_ref| {
+                                message_ref.into_graph_item_id().ok_or_else(|| {
+                                    Error::Other(
+                                        "Graph executor received a non-Graph message reference"
+                                            .into(),
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((item_ids, mutation.flags, mutation.add))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let token = crate::mail::graph::get_graph_token(account_id).await?;
                 let client = crate::mail::graph::GraphClient::new(&token);
-                for mutation in mutations {
-                    let item_ids = mutation
-                        .message_refs
-                        .into_iter()
-                        .map(|message_ref| {
-                            message_ref.into_graph_item_id().ok_or_else(|| {
-                                Error::Other(
-                                    "Graph executor received a non-Graph message reference".into(),
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    client
-                        .set_flags(&item_ids, &mutation.flags, mutation.add)
-                        .await?;
+                for (item_ids, flags, add) in prepared {
+                    client.set_flags(&item_ids, &flags, add).await?;
                 }
             }
             MailOp::SendRaw { .. } => {

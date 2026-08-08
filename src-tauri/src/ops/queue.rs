@@ -1,17 +1,9 @@
 use std::collections::HashMap;
 
-use crate::mail::compat::BackendMessageRef;
-
-/// One ordered flag mutation within a queued flag operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlagMutation {
-    pub message_refs: Vec<BackendMessageRef>,
-    pub flags: Vec<String>,
-    pub add: bool,
-}
+use super::flags::FlagMutation;
 
 /// A single mail operation to be processed by the per-account worker.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MailOp {
     // --- Sync (lower priority) ---
     /// Full account sync. The worker delegates to the existing sync engine.

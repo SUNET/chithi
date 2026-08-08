@@ -513,6 +513,45 @@ pub fn get_message_uids(
     Ok(rows)
 }
 
+/// Return locally known unread messages as `(id, folder_path, uid)` rows.
+/// Flag membership is checked as JSON rather than by substring.
+pub fn get_unread_message_uids(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<(String, String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, folder_path, uid
+         FROM messages
+         WHERE account_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM json_each(messages.flags)
+               WHERE json_each.value = 'seen'
+           )",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Optimistically mark every locally known message in an account as read.
+/// Returns the number of rows that changed and preserves all other flags.
+pub fn mark_account_read(conn: &Connection, account_id: &str) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE messages
+         SET flags = json_insert(flags, '$[#]', 'seen')
+         WHERE account_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM json_each(messages.flags)
+               WHERE json_each.value = 'seen'
+           )",
+        params![account_id],
+    )?;
+    Ok(changed)
+}
+
 /// Returns (message_id, maildir_path) pairs for the given IDs within a specific account.
 /// Rows with empty maildir_path are omitted (message body not yet synced).
 pub fn get_maildir_paths(
@@ -1240,6 +1279,51 @@ mod tests {
         let conn = setup_db();
         let paths = get_maildir_paths(&conn, "acc1", &[]).unwrap();
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn account_read_targets_only_exact_unread_rows_and_preserves_flags() {
+        let conn = setup_db();
+        for (id, account, uid, flags) in [
+            ("unread", "acc1", 1, r#"["flagged"]"#),
+            ("read", "acc1", 2, r#"["seen","flagged"]"#),
+            ("keyword", "acc1", 3, r#"["unseen-keyword"]"#),
+            ("other", "acc2", 4, r#"[]"#),
+        ] {
+            conn.execute(
+                "INSERT INTO messages
+                 (id, account_id, folder_path, uid, date, flags, maildir_path)
+                 VALUES (?1, ?2, 'INBOX', ?3, '2026-08-08', ?4, '')",
+                params![id, account, uid, flags],
+            )
+            .unwrap();
+        }
+
+        let unread = get_unread_message_uids(&conn, "acc1").unwrap();
+        assert_eq!(unread.len(), 2);
+        assert!(unread.iter().any(|row| row.0 == "unread"));
+        assert!(unread.iter().any(|row| row.0 == "keyword"));
+
+        assert_eq!(mark_account_read(&conn, "acc1").unwrap(), 2);
+        assert_eq!(mark_account_read(&conn, "acc1").unwrap(), 0);
+
+        let flags: String = conn
+            .query_row(
+                "SELECT flags FROM messages WHERE id = 'unread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&flags).unwrap(),
+            vec!["flagged", "seen"]
+        );
+        let other_flags: String = conn
+            .query_row("SELECT flags FROM messages WHERE id = 'other'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(other_flags, "[]");
     }
 
     /// Regression: in an expanded thread the first (oldest) email must stay
