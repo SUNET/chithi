@@ -223,7 +223,24 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
                 .collect()
         });
 
-        let total: u32 = results.into_iter().flatten().sum();
+        let mut total = 0u32;
+        let mut first_error: Option<Error> = None;
+        for result in results {
+            match result {
+                Ok(count) => total += count,
+                Err(e) => {
+                    log::error!("Prefetch worker failed for account {}: {}", account_id, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
         log::info!(
             "Prefetch: completed for account {}, {} bodies fetched",
             account_id,

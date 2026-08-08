@@ -546,9 +546,7 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
         let mut threads = Vec::new();
         for (account_id, mut handle) in handles.drain() {
             log::info!("Stopping IDLE loop for account {}", account_id);
-            handle
-                .stop_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            handle.stop_flag.store(true, Ordering::Relaxed);
             if let Some(thread) = handle.thread.take() {
                 threads.push((account_id, thread));
             }
@@ -556,38 +554,18 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
         threads
     };
 
-    let mut stop_error: Option<Error> = None;
-    for (account_id, thread) in idle_threads {
-        match tokio::task::spawn_blocking(move || thread.join()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                let msg = format!("IDLE loop for account {} panicked during stop", account_id);
-                log::error!("{}", msg);
-                stop_error.get_or_insert_with(|| Error::Sync(msg));
-            }
-            Err(e) => {
-                let msg = format!(
-                    "Stopping IDLE loop for account {} panicked: {}",
-                    account_id, e
-                );
-                log::error!("{}", msg);
-                stop_error.get_or_insert_with(|| Error::Sync(msg));
-            }
-        }
-    }
-
     let jmap_tasks = {
         let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
         let mut tasks = Vec::new();
         for (account_id, handle) in jmap_handles.drain() {
             log::info!("Stopping JMAP push for account {}", account_id);
-            handle
-                .stop_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            handle.stop_flag.store(true, Ordering::Relaxed);
             tasks.push((account_id, handle.task));
         }
         tasks
     };
+
+    let mut stop_error: Option<Error> = None;
 
     for (account_id, mut task) in jmap_tasks {
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await {
@@ -622,6 +600,32 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
                         stop_error.get_or_insert_with(|| Error::Sync(msg));
                     }
                 }
+            }
+        }
+    }
+
+    for (account_id, thread) in idle_threads {
+        let join_task = tokio::task::spawn_blocking(move || thread.join());
+        match tokio::time::timeout(std::time::Duration::from_secs(5), join_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_))) => {
+                let msg = format!("IDLE loop for account {} panicked during stop", account_id);
+                log::error!("{}", msg);
+                stop_error.get_or_insert_with(|| Error::Sync(msg));
+            }
+            Ok(Err(e)) => {
+                let msg = format!(
+                    "Stopping IDLE loop for account {} panicked: {}",
+                    account_id, e
+                );
+                log::error!("{}", msg);
+                stop_error.get_or_insert_with(|| Error::Sync(msg));
+            }
+            Err(_) => {
+                log::warn!(
+                    "IDLE loop for account {} did not stop within 5s; it will exit after IDLE returns",
+                    account_id
+                );
             }
         }
     }

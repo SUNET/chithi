@@ -328,11 +328,19 @@ fn sync_folder_envelopes(
 
     let (exists, uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
 
+    let has_local_uid_state = last_uid > 0 || stored_uid_next > 0 || stored_total > 0;
+    let unknown_uidvalidity_with_local_state =
+        stored_uid_validity == 0 && uid_validity > 0 && has_local_uid_state;
     let uidvalidity_changed =
         stored_uid_validity > 0 && uid_validity > 0 && stored_uid_validity != uid_validity;
     let stale_uid_epoch = uid_next > 0 && last_uid >= uid_next;
-    if uidvalidity_changed || stale_uid_epoch {
-        if uidvalidity_changed {
+    if unknown_uidvalidity_with_local_state || uidvalidity_changed || stale_uid_epoch {
+        if unknown_uidvalidity_with_local_state {
+            log::warn!(
+                "Folder '{}' has local IMAP UID state without UIDVALIDITY; resetting",
+                folder_path
+            );
+        } else if uidvalidity_changed {
             log::warn!(
                 "Folder '{}' UIDVALIDITY changed from {} to {}; resetting local IMAP sync state",
                 folder_path,
