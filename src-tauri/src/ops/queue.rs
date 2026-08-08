@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use super::flags::FlagMutation;
 use crate::mail::compat::BackendMessageRef;
 
@@ -25,9 +23,9 @@ pub enum MailOp {
     },
     /// Set or remove flags on provider-specific message references.
     SetFlags { mutations: Vec<FlagMutation> },
-    /// Copy messages by IMAP UID, grouped by source folder.
+    /// Copy provider-specific message objects to a target folder.
     CopyMessages {
-        by_folder: HashMap<String, Vec<u32>>,
+        message_refs: Vec<BackendMessageRef>,
         target_folder: String,
     },
     /// Replay a previously-built RFC 5322 message.
@@ -61,7 +59,7 @@ impl MailOp {
 /// Priority level for operations. Lower numeric value = higher priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpPriority {
-    /// User-initiated actions (move, delete, flag) — process first.
+    /// User-initiated actions (move, copy, delete, flag) — process first.
     User = 0,
     /// Background sync — yields to user operations.
     Sync = 1,

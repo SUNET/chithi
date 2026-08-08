@@ -77,6 +77,36 @@ pub(super) struct JmapOpExecutor;
 impl MailOpExecutor for JmapOpExecutor {
     async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
         match op {
+            MailOp::CopyMessages {
+                message_refs,
+                target_folder,
+            } => {
+                let email_ids = message_refs
+                    .into_iter()
+                    .map(|message_ref| {
+                        message_ref.into_jmap_email_id().ok_or_else(|| {
+                            Error::Other(
+                                "JMAP executor received a non-JMAP message reference".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let email_ids = email_ids.into_iter().fold(Vec::new(), |mut unique, id| {
+                    if !unique.contains(&id) {
+                        unique.push(id);
+                    }
+                    unique
+                });
+                let account = {
+                    let conn = ctx.db.reader();
+                    crate::db::accounts::get_account_full(&conn, account_id)?
+                };
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                conn_jmap
+                    .copy_emails(&jmap_config, &email_ids, &target_folder)
+                    .await?;
+            }
             MailOp::MoveMessages {
                 message_refs,
                 target_folder,

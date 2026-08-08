@@ -14,7 +14,7 @@ use super::queue::{MailOp, OpEntry};
 ///
 /// Each enabled account gets one worker. The worker:
 /// - Drains and coalesces pending operations on each iteration
-/// - Prioritises user ops (move/delete/flag) over background sync
+/// - Prioritises user ops (move/copy/delete/flag) over background sync
 /// - Executes ops through the account's [`MailOpExecutor`] (the IMAP
 ///   executor maintains a persistent connection and reconnects when it
 ///   goes stale; JMAP/Graph executors are stateless HTTP)

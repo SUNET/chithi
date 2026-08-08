@@ -6,6 +6,7 @@ use super::queue::{MailOp, OpEntry};
 /// Inspired by Thunderbird's `nsImapMoveCoalescer`:
 /// - Multiple `DeleteMessages` are merged and deduplicated.
 /// - Multiple `MoveMessages` to the same target are merged.
+/// - `CopyMessages` remain separate because copying is not idempotent.
 /// - Adjacent `SetFlags` with the same flags+add value are merged.
 /// - Sync operations are deduplicated (only one SyncAll kept).
 pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
@@ -147,7 +148,6 @@ mod tests {
     use crate::mail::compat::BackendMessageRef;
     use crate::ops::flags::FlagMutation;
     use crate::ops::queue::OpPriority;
-    use std::collections::HashMap;
 
     #[test]
     fn coalesce_multiple_deletes() {
@@ -375,13 +375,29 @@ mod tests {
             flag_entry(1, true),
             OpEntry {
                 op: MailOp::CopyMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![1])]),
+                    message_refs: vec![BackendMessageRef::imap("INBOX", 1)],
                     target_folder: "Archive".into(),
                 },
                 priority: OpPriority::User,
             },
         ]);
         assert!(matches!(result[0].op, MailOp::SetFlags { .. }));
+        assert!(matches!(result[1].op, MailOp::CopyMessages { .. }));
+    }
+
+    #[test]
+    fn copy_operations_are_not_coalesced_or_deduplicated() {
+        let copy = || OpEntry {
+            op: MailOp::CopyMessages {
+                message_refs: vec![BackendMessageRef::imap("INBOX", 1)],
+                target_folder: "Archive".into(),
+            },
+            priority: OpPriority::User,
+        };
+
+        let result = coalesce(vec![copy(), copy()]);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].op, MailOp::CopyMessages { .. }));
         assert!(matches!(result[1].op, MailOp::CopyMessages { .. }));
     }
 
