@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::ops::flags::{subtract_flag_mutation, FlagMutation, FlagTarget};
+use crate::mail::compat::BackendMessageRef;
+use crate::ops::flags::{remove_deleted_refs, subtract_flag_mutation, FlagMutation, FlagTarget};
 use crate::ops::queue::MailOp;
 
 /// Replay order matching Thunderbird's `nsImapOfflineSync`:
@@ -161,6 +162,16 @@ pub fn mark_dead(conn: &Connection, outbox_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Mark an operation with an unrecoverable payload as dead.
+pub fn mark_invalid(conn: &Connection, outbox_id: i64, error: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbox SET status = 'dead', error_message = ?1 WHERE id = ?2",
+        rusqlite::params![error, outbox_id],
+    )
+    .map_err(Error::Database)?;
+    Ok(())
+}
+
 /// Get dead operations (retry_count >= max_retries) for surfacing to user.
 pub fn get_dead_ops(conn: &Connection, account_id: &str) -> Result<Vec<OutboxEntry>> {
     let mut stmt = conn
@@ -204,9 +215,28 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
                 "target_folder": target_folder,
             }),
         )),
-        MailOp::DeleteMessages { by_folder } => {
+        MailOp::DeleteMessages { message_refs }
+            if message_refs
+                .iter()
+                .all(|message_ref| matches!(message_ref, BackendMessageRef::Imap { .. })) =>
+        {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                if let BackendMessageRef::Imap { folder_path, uid } = message_ref {
+                    by_folder.entry(folder_path.clone()).or_default().push(*uid);
+                }
+            }
             Some(("delete", serde_json::json!({ "by_folder": by_folder })))
         }
+        MailOp::DeleteMessages { message_refs } => Some((
+            "delete",
+            serde_json::json!({
+                "message_refs": message_refs
+                    .iter()
+                    .map(message_ref_to_json)
+                    .collect::<Vec<_>>()
+            }),
+        )),
         MailOp::SetFlags { mutations } => {
             let payload = if let [mutation] = mutations.as_slice() {
                 flag_mutation_to_json(mutation)
@@ -305,6 +335,75 @@ pub fn supersede_pending_flag_ops(
     }
 
     transaction.commit().map_err(Error::Database)
+}
+
+/// Remove explicit pending flag mutations made obsolete by a newer delete.
+pub fn supersede_pending_flags_for_delete(
+    conn: &Connection,
+    account_id: &str,
+    deleted_refs: &[BackendMessageRef],
+) -> Result<()> {
+    let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+    rewrite_pending_flags_for_delete(&transaction, account_id, deleted_refs)?;
+    transaction.commit().map_err(Error::Database)
+}
+
+/// Atomically preserve an unqueued delete and prune stale flag intent.
+pub fn queue_failed_delete(
+    conn: &Connection,
+    account_id: &str,
+    message_refs: &[BackendMessageRef],
+) -> Result<i64> {
+    let (_, payload) = mail_op_to_outbox(&MailOp::DeleteMessages {
+        message_refs: message_refs.to_vec(),
+    })
+    .expect("DeleteMessages is serializable");
+    let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+    let outbox_id = queue_offline_op(&transaction, account_id, "delete", &payload)?;
+    rewrite_pending_flags_for_delete(&transaction, account_id, message_refs)?;
+    transaction.commit().map_err(Error::Database)?;
+    Ok(outbox_id)
+}
+
+fn rewrite_pending_flags_for_delete(
+    conn: &Connection,
+    account_id: &str,
+    deleted_refs: &[BackendMessageRef],
+) -> Result<()> {
+    let pending = get_pending_ops(conn, account_id)?;
+    for entry in pending
+        .into_iter()
+        .filter(|entry| entry.action_type == "set_flags")
+    {
+        let Some(MailOp::SetFlags { mutations }) = outbox_to_mail_op(&entry) else {
+            continue;
+        };
+        let remaining: Vec<_> = mutations
+            .into_iter()
+            .filter_map(|mutation| remove_deleted_refs(mutation, deleted_refs))
+            .collect();
+        if remaining.is_empty() {
+            conn.execute(
+                "DELETE FROM outbox WHERE id = ?1",
+                rusqlite::params![entry.id],
+            )
+            .map_err(Error::Database)?;
+            continue;
+        }
+
+        let payload = mail_op_to_outbox(&MailOp::SetFlags {
+            mutations: remaining,
+        })
+        .expect("SetFlags is serializable")
+        .1
+        .to_string();
+        conn.execute(
+            "UPDATE outbox SET payload_json = ?1 WHERE id = ?2",
+            rusqlite::params![payload, entry.id],
+        )
+        .map_err(Error::Database)?;
+    }
+    Ok(())
 }
 
 /// Validate that a folder path doesn't contain characters that could be
@@ -480,6 +579,41 @@ fn message_ref_from_json(
     }
 }
 
+fn valid_delete_ref(message_ref: &BackendMessageRef) -> bool {
+    match message_ref {
+        BackendMessageRef::Imap { folder_path, uid } => valid_folder_path(folder_path) && *uid > 0,
+        BackendMessageRef::Jmap {
+            mailbox_id,
+            email_id,
+        } => !mailbox_id.is_empty() && !email_id.is_empty(),
+        BackendMessageRef::Graph { item_id } => !item_id.is_empty(),
+    }
+}
+
+fn legacy_delete_refs(
+    entry: &OutboxEntry,
+    payload: &serde_json::Value,
+) -> Option<Vec<BackendMessageRef>> {
+    let protocol = payload.get("protocol")?.as_str()?;
+    let message_ids = payload.get("message_ids")?.as_array()?;
+    match protocol {
+        "graph" => message_ids
+            .iter()
+            .map(|id| {
+                Some(BackendMessageRef::graph_from_db_id(
+                    &entry.account_id,
+                    id.as_str()?,
+                ))
+            })
+            .collect(),
+        "jmap" => {
+            log::error!("Rejecting legacy JMAP delete payload with ambiguous message identity");
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Convert an outbox entry back to a MailOp for replay.
 pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload_json).ok()?;
@@ -502,13 +636,30 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             })
         }
         "delete" => {
-            let by_folder: std::collections::HashMap<String, Vec<u32>> =
-                serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
-            if !validate_folder_paths(&by_folder) {
-                log::warn!("outbox_to_mail_op: rejected delete op with invalid folder path");
+            let message_refs = if let Some(by_folder) = payload.get("by_folder") {
+                let by_folder: std::collections::HashMap<String, Vec<u32>> =
+                    serde_json::from_value(by_folder.clone()).ok()?;
+                by_folder
+                    .into_iter()
+                    .flat_map(|(folder_path, uids)| {
+                        uids.into_iter()
+                            .map(move |uid| BackendMessageRef::imap(folder_path.clone(), uid))
+                    })
+                    .collect()
+            } else if let Some(message_refs) = payload.get("message_refs") {
+                message_refs
+                    .as_array()?
+                    .iter()
+                    .map(message_ref_from_json)
+                    .collect::<Option<Vec<_>>>()?
+            } else {
+                legacy_delete_refs(entry, &payload)?
+            };
+            if message_refs.is_empty() || !message_refs.iter().all(valid_delete_ref) {
+                log::warn!("outbox_to_mail_op: rejected delete op with invalid message reference");
                 return None;
             }
-            Some(MailOp::DeleteMessages { by_folder })
+            Some(MailOp::DeleteMessages { message_refs })
         }
         "set_flags" => {
             let mutations = if let Some(mutations) = payload.get("mutations") {
@@ -623,6 +774,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_payload_is_marked_dead_with_an_error() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "delete", &serde_json::json!({})).unwrap();
+        mark_invalid(&conn, id, "invalid delete payload").unwrap();
+
+        let dead = get_dead_ops(&conn, "acc1").unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(
+            dead[0].error_message.as_deref(),
+            Some("invalid delete payload")
+        );
+    }
+
+    #[test]
     fn test_mark_failed_increments_retry() {
         let conn = setup_db();
         let id = queue_offline_op(&conn, "acc1", "move", &serde_json::json!({})).unwrap();
@@ -676,6 +841,111 @@ mod tests {
             _ => panic!("Expected MoveMessages"),
         }
         mark_completed(&conn, id).unwrap();
+    }
+
+    fn outbox_entry(action_type: &str, payload: serde_json::Value) -> OutboxEntry {
+        OutboxEntry {
+            id: 1,
+            account_id: "acc1".into(),
+            action_type: action_type.into(),
+            payload_json: payload.to_string(),
+            status: "pending".into(),
+            retry_count: 0,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn imap_delete_preserves_legacy_payload() {
+        let op = MailOp::DeleteMessages {
+            message_refs: vec![
+                BackendMessageRef::imap("INBOX", 1),
+                BackendMessageRef::imap("INBOX", 2),
+            ],
+        };
+        let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+        assert_eq!(action_type, "delete");
+        assert_eq!(
+            payload,
+            serde_json::json!({ "by_folder": { "INBOX": [1, 2] } })
+        );
+        assert_eq!(
+            outbox_to_mail_op(&outbox_entry(action_type, payload)),
+            Some(op)
+        );
+    }
+
+    #[test]
+    fn provider_delete_references_round_trip_without_delimiter_parsing() {
+        for message_ref in [
+            BackendMessageRef::jmap("box_with_under", "email_with_under"),
+            BackendMessageRef::graph("AAMk_with_under"),
+        ] {
+            let op = MailOp::DeleteMessages {
+                message_refs: vec![message_ref],
+            };
+            let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+            assert!(payload.get("message_refs").is_some());
+            assert_eq!(
+                outbox_to_mail_op(&outbox_entry(action_type, payload)),
+                Some(op)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_graph_delete_is_recovered_but_ambiguous_jmap_is_rejected() {
+        let graph = outbox_entry(
+            "delete",
+            serde_json::json!({
+                "protocol": "graph",
+                "message_ids": ["acc1_AAMk_with_under"]
+            }),
+        );
+        assert_eq!(
+            outbox_to_mail_op(&graph),
+            Some(MailOp::DeleteMessages {
+                message_refs: vec![BackendMessageRef::graph("AAMk_with_under")]
+            })
+        );
+
+        let jmap = outbox_entry(
+            "delete",
+            serde_json::json!({
+                "protocol": "jmap",
+                "message_ids": ["acc1_mailbox_email_with_under"]
+            }),
+        );
+        assert!(outbox_to_mail_op(&jmap).is_none());
+
+        let mut underscored_account = outbox_entry(
+            "delete",
+            serde_json::json!({
+                "protocol": "jmap",
+                "message_ids": ["acc_1_mailbox_email"]
+            }),
+        );
+        underscored_account.account_id = "acc_1".into();
+        assert!(outbox_to_mail_op(&underscored_account).is_none());
+    }
+
+    #[test]
+    fn delete_rejects_invalid_provider_references() {
+        for payload in [
+            serde_json::json!({ "by_folder": { "INBOX\nBAD": [1] } }),
+            serde_json::json!({
+                "message_refs": [{ "kind": "graph", "item_id": "" }]
+            }),
+            serde_json::json!({
+                "message_refs": [{
+                    "kind": "jmap",
+                    "mailbox_id": "box",
+                    "email_id": ""
+                }]
+            }),
+        ] {
+            assert!(outbox_to_mail_op(&outbox_entry("delete", payload)).is_none());
+        }
     }
 
     #[test]
@@ -837,6 +1107,83 @@ mod tests {
         )
         .unwrap();
         assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_prunes_matching_pending_explicit_flags() {
+        let conn = setup_db();
+        let flags = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::messages(vec![
+                    BackendMessageRef::jmap("inbox", "email_1"),
+                    BackendMessageRef::jmap("inbox", "email_2"),
+                ]),
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&flags).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flags_for_delete(
+            &conn,
+            "acc1",
+            &[BackendMessageRef::jmap("archive", "email_1")],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target.message_refs().unwrap(),
+                &[BackendMessageRef::jmap("inbox", "email_2")]
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+
+        supersede_pending_flags_for_delete(
+            &conn,
+            "acc1",
+            &[BackendMessageRef::jmap("other", "email_2")],
+        )
+        .unwrap();
+        assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_enqueue_persists_delete_and_prunes_flags_atomically() {
+        let conn = setup_db();
+        let flags = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::messages(vec![
+                    BackendMessageRef::graph("deleted"),
+                    BackendMessageRef::graph("retained"),
+                ]),
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&flags).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        let deleted = BackendMessageRef::graph("deleted");
+        queue_failed_delete(&conn, "acc1", std::slice::from_ref(&deleted)).unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 2);
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target.message_refs().unwrap(),
+                &[BackendMessageRef::graph("retained")]
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+        assert_eq!(
+            outbox_to_mail_op(&pending[1]),
+            Some(MailOp::DeleteMessages {
+                message_refs: vec![deleted]
+            })
+        );
     }
 
     #[test]

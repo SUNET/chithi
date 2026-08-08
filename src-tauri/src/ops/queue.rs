@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::flags::FlagMutation;
+use crate::mail::compat::BackendMessageRef;
 
 /// A single mail operation to be processed by the per-account worker.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,9 +19,9 @@ pub enum MailOp {
         by_folder: HashMap<String, Vec<u32>>,
         target_folder: String,
     },
-    /// Delete messages by IMAP UID, grouped by source folder.
+    /// Delete provider-specific message objects.
     DeleteMessages {
-        by_folder: HashMap<String, Vec<u32>>,
+        message_refs: Vec<BackendMessageRef>,
     },
     /// Set or remove flags on provider-specific message references.
     SetFlags { mutations: Vec<FlagMutation> },

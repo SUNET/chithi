@@ -70,9 +70,7 @@ impl MailBackend for JmapMailBackend {
     }
 }
 
-/// Stateless executor: JMAP ops are async HTTP, no persistent
-/// connection needed. Move/delete/flag ops are already applied by the
-/// optimistic command path — only queued sends do real work here.
+/// Stateless executor: JMAP operations use an async HTTP connection per op.
 pub(super) struct JmapOpExecutor;
 
 #[async_trait]
@@ -91,9 +89,30 @@ impl MailOpExecutor for JmapOpExecutor {
                 }
                 log::debug!("JMAP move handled by optimistic path");
             }
-            MailOp::DeleteMessages { by_folder } => {
-                let _ = by_folder;
-                log::debug!("JMAP delete handled by optimistic path");
+            MailOp::DeleteMessages { message_refs } => {
+                let email_ids = message_refs
+                    .into_iter()
+                    .map(|message_ref| {
+                        message_ref.into_jmap_email_id().ok_or_else(|| {
+                            Error::Other(
+                                "JMAP executor received a non-JMAP message reference".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let email_ids = email_ids.into_iter().fold(Vec::new(), |mut unique, id| {
+                    if !unique.contains(&id) {
+                        unique.push(id);
+                    }
+                    unique
+                });
+                let account = {
+                    let conn = ctx.db.reader();
+                    crate::db::accounts::get_account_full(&conn, account_id)?
+                };
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                conn_jmap.delete_emails(&jmap_config, &email_ids).await?;
             }
             MailOp::SetFlags { mutations } => {
                 let prepared = mutations

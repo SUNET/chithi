@@ -188,11 +188,35 @@ impl AccountWorker {
             }
 
             let Some(op) = super::offline::outbox_to_mail_op(entry) else {
+                let error = format!(
+                    "Invalid or unsupported offline {} payload",
+                    entry.action_type
+                );
                 log::warn!(
-                    "Failed to deserialize offline op {} ({}), skipping",
+                    "Failed to deserialize offline op {} ({}), marking dead",
                     entry.id,
                     entry.action_type
                 );
+                let conn = self.db.writer().await;
+                if let Err(mark_error) = super::offline::mark_invalid(&conn, entry.id, &error) {
+                    log::error!(
+                        "Failed to mark invalid offline op {} dead: {}",
+                        entry.id,
+                        mark_error
+                    );
+                    break;
+                }
+                drop(conn);
+                self.app
+                    .emit(
+                        "offline-queue-changed",
+                        serde_json::json!({
+                            "account_id": self.account_id,
+                            "dead_op_id": entry.id,
+                            "action_type": entry.action_type,
+                        }),
+                    )
+                    .ok();
                 continue;
             };
 
@@ -276,11 +300,20 @@ impl AccountWorker {
         // Serialize the op for outbox before executing (we move op into the executor)
         let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
 
-        let preflight = if let MailOp::SetFlags { mutations } = &op {
-            let conn = self.db.writer().await;
-            super::offline::supersede_pending_flag_ops(&conn, &self.account_id, mutations)
-        } else {
-            Ok(())
+        let preflight = match &op {
+            MailOp::SetFlags { mutations } => {
+                let conn = self.db.writer().await;
+                super::offline::supersede_pending_flag_ops(&conn, &self.account_id, mutations)
+            }
+            MailOp::DeleteMessages { message_refs } => {
+                let conn = self.db.writer().await;
+                super::offline::supersede_pending_flags_for_delete(
+                    &conn,
+                    &self.account_id,
+                    message_refs,
+                )
+            }
+            _ => Ok(()),
         };
         let result = match preflight {
             Ok(()) => self.execute_op(op).await,
