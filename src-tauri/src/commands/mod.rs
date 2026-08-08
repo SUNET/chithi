@@ -5,7 +5,6 @@ pub mod attachments;
 pub mod calendar;
 pub mod compose;
 pub mod contacts;
-pub mod events;
 pub mod filters;
 pub mod links;
 pub mod mail;

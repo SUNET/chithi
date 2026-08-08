@@ -3,10 +3,10 @@
 use async_trait::async_trait;
 use tauri::Emitter;
 
-use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
+use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};

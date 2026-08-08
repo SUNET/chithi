@@ -369,8 +369,8 @@ pub(crate) async fn sync_folder_quiet(
         let mut conn = ImapConnection::connect(&imap_config)?;
         crate::mail::sync::sync_folder_envelopes_public(&db, &account_id, &mut conn, &folder_path)?;
         conn.logout();
-        crate::commands::events::emit_folders_changed(&app, &account_id);
-        crate::commands::events::emit_messages_changed(&app, &account_id);
+        crate::event::emit_folders_changed(&app, &account_id);
+        crate::event::emit_messages_changed(&app, &account_id);
         Ok::<_, Error>(())
     })
     .await
