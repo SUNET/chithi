@@ -557,8 +557,8 @@ impl JmapConnection {
                 }, "d1"]
             ]
         });
-        self.api_request(&request, config).await?;
-        Ok(())
+        let response = self.api_request(&request, config).await?;
+        validate_delete_response(&response, email_ids)
     }
 
     /// Search emails across the account using `Email/query` + `Email/get`.
@@ -998,6 +998,76 @@ fn validate_set_flags_response(response: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_delete_response(response: &serde_json::Value, email_ids: &[String]) -> Result<()> {
+    let method_response = response
+        .get("methodResponses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|responses| responses.first())
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Other("JMAP delete returned no method response".into()))?;
+    let method_name = method_response
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let body = method_response.get(1).cloned().unwrap_or_default();
+    if method_name == "error" {
+        let description = body
+            .get("description")
+            .or_else(|| body.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown method error");
+        return Err(Error::Other(format!("JMAP delete failed: {}", description)));
+    }
+    if method_name != "Email/set" {
+        return Err(Error::Other(format!(
+            "JMAP delete returned unexpected method response '{}'",
+            method_name
+        )));
+    }
+    let destroyed = body
+        .get("destroyed")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let not_destroyed = body
+        .get("notDestroyed")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    {
+        let failures: serde_json::Map<String, serde_json::Value> = not_destroyed
+            .iter()
+            .filter(|(_, error)| {
+                error.get("type").and_then(serde_json::Value::as_str) != Some("notFound")
+            })
+            .map(|(id, error)| (id.clone(), error.clone()))
+            .collect();
+        if !failures.is_empty() {
+            return Err(Error::Other(format!(
+                "JMAP delete rejected {} message(s): {}",
+                failures.len(),
+                serde_json::Value::Object(failures)
+            )));
+        }
+    }
+    let unreported: Vec<_> = email_ids
+        .iter()
+        .filter(|email_id| {
+            !destroyed
+                .iter()
+                .any(|destroyed_id| destroyed_id.as_str() == Some(email_id))
+                && !not_destroyed.contains_key(*email_id)
+        })
+        .collect();
+    if !unreported.is_empty() {
+        return Err(Error::Other(format!(
+            "JMAP delete omitted {} message(s) from its response",
+            unreported.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct AddrJson {
     name: Option<String>,
@@ -1069,7 +1139,7 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
 
 #[cfg(test)]
 mod set_flags_tests {
-    use super::validate_set_flags_response;
+    use super::{validate_delete_response, validate_set_flags_response};
 
     #[test]
     fn accepts_successful_email_set() {
@@ -1095,5 +1165,42 @@ mod set_flags_tests {
             }, "s1"]]
         });
         assert!(validate_set_flags_response(&method_error).is_err());
+    }
+
+    #[test]
+    fn delete_accepts_destroyed_and_not_found_messages() {
+        let ids = vec!["id".to_string()];
+        let destroyed = serde_json::json!({
+            "methodResponses": [["Email/set", { "destroyed": ["id"] }, "d1"]]
+        });
+        assert!(validate_delete_response(&destroyed, &ids).is_ok());
+
+        let not_found = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notDestroyed": { "id": { "type": "notFound" } }
+            }, "d1"]]
+        });
+        assert!(validate_delete_response(&not_found, &ids).is_ok());
+    }
+
+    #[test]
+    fn delete_rejects_item_and_method_errors() {
+        let ids = vec!["id".to_string()];
+        let forbidden = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notDestroyed": { "id": { "type": "forbidden" } }
+            }, "d1"]]
+        });
+        assert!(validate_delete_response(&forbidden, &ids).is_err());
+
+        let method_error = serde_json::json!({
+            "methodResponses": [["error", { "type": "serverFail" }, "d1"]]
+        });
+        assert!(validate_delete_response(&method_error, &ids).is_err());
+
+        let omitted = serde_json::json!({
+            "methodResponses": [["Email/set", {}, "d1"]]
+        });
+        assert!(validate_delete_response(&omitted, &ids).is_err());
     }
 }

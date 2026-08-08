@@ -14,6 +14,12 @@ const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 /// Graph JSON batching allows at most 20 sub-requests per `$batch` call.
 const BATCH_SIZE: usize = 20;
 
+/// Whether a Graph item-level failure means the requested object is absent.
+pub(crate) fn is_item_not_found(error: &Error) -> bool {
+    let message = error.to_string();
+    message.contains("404") && message.contains("ErrorItemNotFound")
+}
+
 /// Fold a `$batch` response into per-item results. Sub-responses are keyed
 /// by the request "id" we set to the item's global index; they may arrive
 /// out of order.
@@ -2741,7 +2747,9 @@ async fn get_graph_token_with_scopes(
 
 #[cfg(test)]
 mod batch_tests {
-    use super::{apply_batch_responses, is_delta_resync_required, DELTA_RESYNC_MARKER};
+    use super::{
+        apply_batch_responses, is_delta_resync_required, is_item_not_found, DELTA_RESYNC_MARKER,
+    };
     use crate::error::Error;
 
     fn fresh_results(n: usize) -> Vec<crate::error::Result<()>> {
@@ -2784,6 +2792,10 @@ mod batch_tests {
         let err = results[1].as_ref().unwrap_err().to_string();
         assert!(err.contains("404"), "missing status in: {err}");
         assert!(err.contains("ErrorItemNotFound"), "missing code in: {err}");
+        assert!(is_item_not_found(results[1].as_ref().unwrap_err()));
+        assert!(!is_item_not_found(&Error::Other(
+            "Graph $batch item returned 403: forbidden".into()
+        )));
     }
 
     #[test]

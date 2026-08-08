@@ -650,7 +650,17 @@ fn execute_imap_op(
                 conn.move_messages(uids, &target_folder)?;
             }
         }
-        MailOp::DeleteMessages { by_folder } => {
+        MailOp::DeleteMessages { message_refs } => {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref
+                else {
+                    return Err(Error::Other(
+                        "IMAP executor received a non-IMAP message reference".into(),
+                    ));
+                };
+                by_folder.entry(folder_path).or_default().push(uid);
+            }
             for (folder_path, uids) in &by_folder {
                 select_folder_if_needed(conn, selected, folder_path)?;
                 conn.delete_messages(uids)?;

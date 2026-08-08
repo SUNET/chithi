@@ -276,11 +276,20 @@ impl AccountWorker {
         // Serialize the op for outbox before executing (we move op into the executor)
         let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
 
-        let preflight = if let MailOp::SetFlags { mutations } = &op {
-            let conn = self.db.writer().await;
-            super::offline::supersede_pending_flag_ops(&conn, &self.account_id, mutations)
-        } else {
-            Ok(())
+        let preflight = match &op {
+            MailOp::SetFlags { mutations } => {
+                let conn = self.db.writer().await;
+                super::offline::supersede_pending_flag_ops(&conn, &self.account_id, mutations)
+            }
+            MailOp::DeleteMessages { message_refs } => {
+                let conn = self.db.writer().await;
+                super::offline::supersede_pending_flags_for_delete(
+                    &conn,
+                    &self.account_id,
+                    message_refs,
+                )
+            }
+            _ => Ok(()),
         };
         let result = match preflight {
             Ok(()) => self.execute_op(op).await,

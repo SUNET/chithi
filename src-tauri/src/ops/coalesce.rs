@@ -6,12 +6,12 @@ use super::queue::{MailOp, OpEntry};
 /// Coalesce a batch of pending operations to reduce network round-trips.
 ///
 /// Inspired by Thunderbird's `nsImapMoveCoalescer`:
-/// - Multiple `DeleteMessages` are merged into one with combined UIDs.
+/// - Multiple `DeleteMessages` are merged and deduplicated.
 /// - Multiple `MoveMessages` to the same target are merged.
 /// - Adjacent `SetFlags` with the same flags+add value are merged.
 /// - Sync operations are deduplicated (only one SyncAll kept).
 pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
-    if ops.len() <= 1 {
+    if ops.is_empty() {
         return ops;
     }
 
@@ -21,16 +21,27 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     let mut result: Vec<OpEntry> = Vec::new();
     for entry in ops {
         match entry.op {
-            MailOp::DeleteMessages { by_folder } => {
+            MailOp::DeleteMessages { message_refs } => {
                 if let Some(OpEntry {
-                    op: MailOp::DeleteMessages { by_folder: pending },
+                    op:
+                        MailOp::DeleteMessages {
+                            message_refs: pending,
+                        },
                     ..
                 }) = result.last_mut()
                 {
-                    merge_by_folder(pending, by_folder);
+                    for message_ref in message_refs {
+                        push_unique_ref(pending, message_ref);
+                    }
                 } else {
+                    let mut unique_refs = Vec::new();
+                    for message_ref in message_refs {
+                        push_unique_ref(&mut unique_refs, message_ref);
+                    }
                     result.push(OpEntry {
-                        op: MailOp::DeleteMessages { by_folder },
+                        op: MailOp::DeleteMessages {
+                            message_refs: unique_refs,
+                        },
                         priority: entry.priority,
                     });
                 }
@@ -116,6 +127,18 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     result
 }
 
+fn push_unique_ref(
+    message_refs: &mut Vec<crate::mail::compat::BackendMessageRef>,
+    candidate: crate::mail::compat::BackendMessageRef,
+) {
+    if !message_refs
+        .iter()
+        .any(|existing| existing.same_message(&candidate))
+    {
+        message_refs.push(candidate);
+    }
+}
+
 /// Merge UIDs from `source` into `target`, combining by folder key.
 fn merge_by_folder(target: &mut HashMap<String, Vec<u32>>, source: HashMap<String, Vec<u32>>) {
     for (folder, uids) in source {
@@ -135,13 +158,20 @@ mod tests {
         let ops = vec![
             OpEntry {
                 op: MailOp::DeleteMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![1, 2])]),
+                    message_refs: vec![
+                        BackendMessageRef::imap("INBOX", 1),
+                        BackendMessageRef::jmap("inbox", "email_1"),
+                    ],
                 },
                 priority: OpPriority::User,
             },
             OpEntry {
                 op: MailOp::DeleteMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![3])]),
+                    message_refs: vec![
+                        BackendMessageRef::imap("INBOX", 2),
+                        BackendMessageRef::jmap("archive", "email_1"),
+                        BackendMessageRef::graph("item_1"),
+                    ],
                 },
                 priority: OpPriority::User,
             },
@@ -150,9 +180,36 @@ mod tests {
         let result = coalesce(ops);
         assert_eq!(result.len(), 1);
         match &result[0].op {
-            MailOp::DeleteMessages { by_folder } => {
-                assert_eq!(by_folder["INBOX"].len(), 3);
+            MailOp::DeleteMessages { message_refs } => {
+                assert_eq!(message_refs.len(), 4);
+                assert_eq!(
+                    message_refs
+                        .iter()
+                        .filter(|message_ref| {
+                            message_ref.same_message(&BackendMessageRef::jmap("other", "email_1"))
+                        })
+                        .count(),
+                    1
+                );
             }
+            _ => panic!("Expected DeleteMessages"),
+        }
+    }
+
+    #[test]
+    fn singleton_delete_is_deduplicated() {
+        let result = coalesce(vec![OpEntry {
+            op: MailOp::DeleteMessages {
+                message_refs: vec![
+                    BackendMessageRef::jmap("inbox", "email_1"),
+                    BackendMessageRef::jmap("archive", "email_1"),
+                ],
+            },
+            priority: OpPriority::User,
+        }]);
+
+        match &result[0].op {
+            MailOp::DeleteMessages { message_refs } => assert_eq!(message_refs.len(), 1),
             _ => panic!("Expected DeleteMessages"),
         }
     }
@@ -233,7 +290,7 @@ mod tests {
             },
             OpEntry {
                 op: MailOp::DeleteMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![1])]),
+                    message_refs: vec![BackendMessageRef::imap("INBOX", 1)],
                 },
                 priority: OpPriority::User,
             },

@@ -618,6 +618,37 @@ pub fn delete_messages_by_ids(conn: &Connection, message_ids: &[String]) -> Resu
     Ok(())
 }
 
+/// Delete messages by ID only when they belong to the specified account.
+pub fn delete_messages_for_account(
+    conn: &Connection,
+    account_id: &str,
+    message_ids: &[String],
+) -> Result<usize> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "DELETE FROM messages WHERE account_id = ?1 AND id IN ({})",
+        placeholders
+    );
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(message_ids.len() + 1);
+    params.push(&account_id);
+    params.extend(
+        message_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql),
+    );
+
+    Ok(conn.execute(&query, params.as_slice())?)
+}
+
 /// Update the flags JSON string for a specific message.
 pub fn update_flags(conn: &Connection, message_id: &str, flags: &str) -> Result<()> {
     conn.execute(
@@ -1279,6 +1310,23 @@ mod tests {
         let conn = setup_db();
         let paths = get_maildir_paths(&conn, "acc1", &[]).unwrap();
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn delete_messages_for_account_does_not_cross_account_boundary() {
+        let conn = setup_db();
+        insert_row(&conn, "msg1", "acc1", "");
+        insert_row(&conn, "msg2", "acc2", "");
+
+        let requested = vec!["msg1".to_string(), "msg2".to_string()];
+        assert_eq!(
+            delete_messages_for_account(&conn, "acc1", &requested).unwrap(),
+            1
+        );
+        let remaining: String = conn
+            .query_row("SELECT id FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, "msg2");
     }
 
     #[test]

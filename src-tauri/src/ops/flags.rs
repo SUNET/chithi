@@ -80,6 +80,18 @@ pub struct FlagMutation {
     pub add: bool,
 }
 
+/// Remove explicitly targeted messages that a newer delete makes obsolete.
+/// Server-wide IMAP targets are retained because they remain valid operations.
+pub fn remove_deleted_refs(
+    mut mutation: FlagMutation,
+    deleted_refs: &[BackendMessageRef],
+) -> Option<FlagMutation> {
+    if let FlagTarget::Messages(message_refs) = &mut mutation.target {
+        message_refs.retain(|message_ref| !contains_ref(deleted_refs, message_ref));
+    }
+    (!mutation.target.is_empty()).then_some(mutation)
+}
+
 /// Remove portions of `older` overwritten by `newer` while preserving the
 /// original operation's position in the outbox.
 pub fn subtract_flag_mutation(older: FlagMutation, newer: &FlagMutation) -> Vec<FlagMutation> {
@@ -354,5 +366,25 @@ mod tests {
             FlagTarget::for_mark_account_read("legacy", vec!["INBOX".into()], Vec::new()),
             FlagTarget::AllMessagesInFolders { .. }
         ));
+    }
+
+    #[test]
+    fn deletion_removes_only_matching_explicit_refs() {
+        let mutation = FlagMutation {
+            target: FlagTarget::messages(vec![
+                BackendMessageRef::jmap("inbox", "email_1"),
+                BackendMessageRef::jmap("inbox", "email_2"),
+            ]),
+            flags: vec!["seen".into()],
+            add: true,
+        };
+
+        let remaining =
+            remove_deleted_refs(mutation, &[BackendMessageRef::jmap("archive", "email_1")])
+                .unwrap();
+        assert_eq!(
+            remaining.target.message_refs().unwrap(),
+            &[BackendMessageRef::jmap("inbox", "email_2")]
+        );
     }
 }
