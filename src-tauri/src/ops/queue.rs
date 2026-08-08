@@ -14,9 +14,9 @@ pub enum MailOp {
     /// Replay queued offline operations after a successful direct sync.
     ReplayOffline,
     // --- User operations (higher priority) ---
-    /// Move messages by IMAP UID, grouped by source folder.
+    /// Move provider-specific message objects to a target folder.
     MoveMessages {
-        by_folder: HashMap<String, Vec<u32>>,
+        message_refs: Vec<BackendMessageRef>,
         target_folder: String,
     },
     /// Delete provider-specific message objects.

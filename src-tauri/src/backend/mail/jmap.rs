@@ -78,16 +78,36 @@ impl MailOpExecutor for JmapOpExecutor {
     async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
         match op {
             MailOp::MoveMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             } => {
-                for (source_mailbox, uids) in &by_folder {
-                    // UIDs are actually JMAP email IDs stored as u32 — extract from message IDs
-                    // For JMAP, `by_folder` won't have actual UIDs, so this path isn't used.
-                    // JMAP moves are handled differently (by JMAP email ID, not UID).
-                    let _ = (source_mailbox, uids, &target_folder);
+                let mut by_mailbox = std::collections::HashMap::<String, Vec<String>>::new();
+                for message_ref in message_refs {
+                    let crate::mail::compat::BackendMessageRef::Jmap {
+                        mailbox_id,
+                        email_id,
+                    } = message_ref
+                    else {
+                        return Err(Error::Other(
+                            "JMAP executor received a non-JMAP message reference".into(),
+                        ));
+                    };
+                    let email_ids = by_mailbox.entry(mailbox_id).or_default();
+                    if !email_ids.contains(&email_id) {
+                        email_ids.push(email_id);
+                    }
                 }
-                log::debug!("JMAP move handled by optimistic path");
+                let account = {
+                    let conn = ctx.db.reader();
+                    crate::db::accounts::get_account_full(&conn, account_id)?
+                };
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                for (source_mailbox, email_ids) in by_mailbox {
+                    conn_jmap
+                        .move_emails(&jmap_config, &email_ids, &source_mailbox, &target_folder)
+                        .await?;
+                }
             }
             MailOp::DeleteMessages { message_refs } => {
                 let email_ids = message_refs
