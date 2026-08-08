@@ -18,6 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::mail::compat::BodyLocation;
 use crate::state::{AppState, PendingSecret};
 
 /// Tauri event emitted when the backend needs a passphrase or PIN.
@@ -976,7 +977,7 @@ async fn load_raw_with_metadata(
         let conn = state.db.reader();
         crate::db::messages::get_message_metadata(&conn, account_id, message_id)?
     };
-    if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+    if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
         return Err(Error::Other(
             "pgp: message body not on disk — open the message normally once first".into(),
         ));

@@ -1,6 +1,7 @@
 use mail_parser::{Address as MailAddress, HeaderValue, MessageParser, MimeHeaders};
 
 use crate::db::messages::{Address, Attachment, MessageBody, NewMessage};
+use crate::mail::compat::BackendMessageRef;
 
 fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
     match addr {
@@ -91,7 +92,7 @@ pub fn parse_envelope(
         .map(|ct| ct.ctype() == "multipart" && ct.subtype().map(|s| s == "signed").unwrap_or(false))
         .unwrap_or(false);
 
-    let id = format!("{}_{}_{}", account_id, folder_path, uid);
+    let id = BackendMessageRef::imap(folder_path, uid).to_db_id(account_id);
 
     Some(NewMessage {
         id,

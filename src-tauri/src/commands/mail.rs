@@ -8,6 +8,7 @@ use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::imap::ImapConfig;
 use crate::mail::jmap_sync;
 use crate::mail::parser;
@@ -212,19 +213,20 @@ pub async fn import_search_hit(
         // Format matches sync_cmd::sync_graph_account: `{account_id}_{graph_id}`,
         // and `graph:{graph_id}` in maildir_path triggers the on-demand stream
         // path in get_message_body.
-        let id = format!("{}_{}", account_id, hit.backend_id);
-        let maildir = format!("graph:{}", hit.backend_id);
+        let message_ref = BackendMessageRef::graph(&hit.backend_id);
+        let id = message_ref.to_db_id(&account_id);
+        let maildir = BodyLocation::GraphRemote(hit.backend_id.clone()).to_persisted();
         (id, 0u32, maildir)
     } else if account.mail_protocol_str() == "jmap" {
         // Format matches jmap_sync: `{account_id}_{mailbox_id}_{email_id}`.
-        let id = format!("{}_{}_{}", account_id, hit.folder_path, hit.backend_id);
+        let id = BackendMessageRef::jmap(&hit.folder_path, &hit.backend_id).to_db_id(&account_id);
         (id, 0u32, String::new())
     } else {
         // IMAP: `{account_id}_{folder_path}_{uid}`.
         let uid = hit
             .uid
             .ok_or_else(|| Error::Other("IMAP search hit is missing UID".into()))?;
-        let id = format!("{}_{}_{}", account_id, hit.folder_path, uid);
+        let id = BackendMessageRef::imap(&hit.folder_path, uid).to_db_id(&account_id);
         (id, uid, String::new())
     };
 
@@ -283,8 +285,9 @@ async fn ensure_message_body_on_disk(
     maildir_path: &str,
     flags_json: &str,
 ) -> Result<String> {
-    if !maildir_path.is_empty() && !maildir_path.starts_with("graph:") {
-        return Ok(maildir_path.to_string());
+    let body_location = BodyLocation::from_persisted(maildir_path);
+    if let Some(local_path) = body_location.local_path() {
+        return Ok(local_path.to_string());
     }
 
     let (account, folder_path, uid) = {
@@ -300,13 +303,12 @@ async fn ensure_message_body_on_disk(
     let relative_path = if account.mail_protocol_str() == "graph" {
         log::info!("Body not on disk for {}, streaming from Graph", message_id);
 
-        let graph_msg_id = if let Some(gid) = maildir_path.strip_prefix("graph:") {
-            gid.to_string()
+        let graph_msg_id = if let Some(item_id) = body_location.graph_item_id() {
+            item_id.to_string()
         } else {
-            message_id
-                .strip_prefix(&format!("{}_", account_id))
-                .unwrap_or(message_id)
-                .to_string()
+            BackendMessageRef::graph_from_db_id(account_id, message_id)
+                .into_graph_item_id()
+                .expect("Graph parser must return a Graph reference")
         };
 
         let token = crate::mail::graph::get_graph_token(account_id).await?;
@@ -334,16 +336,17 @@ async fn ensure_message_body_on_disk(
 
         let jmap_config = crate::auth::build_jmap_config(&account).await?;
 
-        let jmap_email_id = message_id
-            .strip_prefix(&format!("{}_{}_", account_id, folder_path))
-            .unwrap_or(message_id);
+        let jmap_email_id =
+            BackendMessageRef::jmap_from_db_id(account_id, &folder_path, message_id)
+                .and_then(BackendMessageRef::into_jmap_email_id)
+                .unwrap_or_else(|| message_id.to_string());
 
         jmap_sync::fetch_and_store_jmap_body(
             &jmap_config,
             &data_dir,
             account_id,
             &folder_path,
-            jmap_email_id,
+            &jmap_email_id,
             &flags,
         )
         .await?
@@ -479,7 +482,7 @@ pub async fn get_message_html_with_images(
         mp
     };
 
-    if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+    if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
         return Err(Error::Other(
             "Remote images not supported for messages without local body".to_string(),
         ));
@@ -925,7 +928,7 @@ pub async fn save_attachment(
         mp
     };
 
-    if maildir_path.is_empty() || maildir_path.starts_with("graph:") {
+    if BodyLocation::from_persisted(&maildir_path).needs_fetch() {
         return Err(Error::Other(
             "Attachment save not supported for messages without local body".to_string(),
         ));

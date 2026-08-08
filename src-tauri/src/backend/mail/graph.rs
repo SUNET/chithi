@@ -7,6 +7,7 @@ use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
@@ -248,7 +249,7 @@ async fn sync_graph_folder_delta(
             for event in &page.events {
                 match event {
                     graph::GraphDeltaEvent::Removed(removed) => {
-                        let id = format!("{}_{}", account_id, removed);
+                        let id = BackendMessageRef::graph(removed).to_db_id(account_id);
                         tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])?;
                         existing_ids.remove(&id);
                         // A removed row owes no filter pass; drop it from
@@ -256,7 +257,8 @@ async fn sync_graph_folder_delta(
                         new_ids.retain(|n| n != &id);
                     }
                     graph::GraphDeltaEvent::Upsert(msg) => {
-                        let id = format!("{}_{}", account_id, msg.id);
+                        let message_ref = BackendMessageRef::graph(&msg.id);
+                        let id = message_ref.to_db_id(account_id);
                         // Mirror the full server-side flag state (read +
                         // flagged), not just read: replacing the array with
                         // only `seen` erased an existing `flagged` on every
@@ -309,7 +311,7 @@ async fn sync_graph_folder_delta(
                             // AND keeps the row out of the IMAP prefetch
                             // pipeline (which selects `maildir_path = ''`
                             // rows and cannot fetch Graph folders/UID 0).
-                            maildir_path: format!("graph:{}", msg.id),
+                            maildir_path: BodyLocation::GraphRemote(msg.id.clone()).to_persisted(),
                             snippet: msg.preview.clone(),
                         };
                         db::messages::insert_message(&tx, &new_msg)?;
@@ -544,14 +546,14 @@ impl MailBackend for GraphMailBackend {
 
         let mut fetched = 0u32;
         for (db_id, folder_path, maildir_path, flags_json) in &unfetched {
-            let graph_msg_id = maildir_path
-                .strip_prefix("graph:")
-                .map(|s| s.to_string())
+            let body_location = BodyLocation::from_persisted(maildir_path);
+            let graph_msg_id = body_location
+                .graph_item_id()
+                .map(str::to_string)
                 .unwrap_or_else(|| {
-                    db_id
-                        .strip_prefix(&format!("{}_", account.id))
-                        .unwrap_or(db_id)
-                        .to_string()
+                    BackendMessageRef::graph_from_db_id(&account.id, db_id)
+                        .into_graph_item_id()
+                        .expect("Graph parser must return a Graph reference")
                 });
             let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
 

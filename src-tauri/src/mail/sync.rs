@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::FilterAction;
+use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
 
 #[derive(Clone, serde::Serialize)]
@@ -520,7 +521,7 @@ fn sync_folder_envelopes(
                 .as_deref()
                 .map(|s| s.chars().take(200).collect());
 
-            let id = format!("{}_{}_{}", account_id, folder_path, env.uid);
+            let id = BackendMessageRef::imap(folder_path, env.uid).to_db_id(account_id);
 
             // Thread computation still needs DB queries for cross-references,
             // but the in_reply_to lookup is fast with index.
