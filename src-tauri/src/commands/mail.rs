@@ -353,57 +353,65 @@ async fn ensure_message_body_on_disk(
     } else {
         log::info!("Body not on disk for {}, fetching from IMAP", message_id);
 
+        let resume_account = account.clone();
         let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
-            suspend_imap_idle_for_account(state, account_id).await?
+            suspend_imap_idle_for_body_fetch(
+                account_id,
+                suspend_imap_idle_for_account(state, account_id),
+                resume_imap_idle_for_account(app, state, &resume_account, true),
+            )
+            .await?
         } else {
             false
         };
-        let resume_account = account.clone();
 
-        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(account_id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
-            .await?;
-            crate::oauth::store_tokens(account_id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password, false)
-        };
+        run_imap_body_fetch_with_resume(
+            account_id,
+            async {
+                let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
+                    let tokens = crate::oauth::load_tokens(account_id)?
+                        .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
+                    let refresh = tokens
+                        .refresh_token
+                        .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
+                    let new = crate::oauth::refresh_with_scopes(
+                        &crate::oauth::MICROSOFT,
+                        &refresh,
+                        crate::oauth::MICROSOFT_IMAP_SCOPES,
+                    )
+                    .await?;
+                    crate::oauth::store_tokens(account_id, &new)?;
+                    (new.access_token, true)
+                } else {
+                    (account.password, false)
+                };
 
-        let imap_config = ImapConfig {
-            host: account.imap_host,
-            port: account.imap_port,
-            username: account.username,
-            password,
-            use_tls: account.use_tls,
-            use_xoauth2,
-        };
+                let imap_config = ImapConfig {
+                    host: account.imap_host,
+                    port: account.imap_port,
+                    username: account.username,
+                    password,
+                    use_tls: account.use_tls,
+                    use_xoauth2,
+                };
 
-        let account_id_clone = account_id.to_string();
-        let relative_path = tokio::task::spawn_blocking(move || {
-            mail_sync::fetch_and_store_body(
-                &imap_config,
-                &data_dir,
-                &account_id_clone,
-                &folder_path,
-                uid,
-                &flags,
-            )
-        })
-        .await
-        .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))??;
-
-        resume_imap_idle_for_account(app, state, &resume_account, suspended_idle).await?;
-
-        relative_path
+                let account_id_clone = account_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    mail_sync::fetch_and_store_body(
+                        &imap_config,
+                        &data_dir,
+                        &account_id_clone,
+                        &folder_path,
+                        uid,
+                        &flags,
+                    )
+                })
+                .await
+                .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))?
+            },
+            resume_imap_idle_for_account(app, state, &resume_account, suspended_idle),
+        )
+        .await?
     };
 
     {
@@ -412,6 +420,58 @@ async fn ensure_message_body_on_disk(
     }
 
     Ok(relative_path)
+}
+
+async fn suspend_imap_idle_for_body_fetch<S, R>(
+    account_id: &str,
+    suspend: S,
+    resume_after_failure: R,
+) -> Result<bool>
+where
+    S: std::future::Future<Output = Result<bool>>,
+    R: std::future::Future<Output = Result<()>>,
+{
+    match suspend.await {
+        Ok(suspended) => Ok(suspended),
+        Err(suspend_error) => {
+            let resume_result = resume_after_failure.await;
+            finish_imap_body_fetch(account_id, Err(suspend_error), resume_result)
+        }
+    }
+}
+
+async fn run_imap_body_fetch_with_resume<T, F, R>(
+    account_id: &str,
+    fetch: F,
+    resume: R,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+    R: std::future::Future<Output = Result<()>>,
+{
+    let fetch_result = fetch.await;
+    let resume_result = resume.await;
+    finish_imap_body_fetch(account_id, fetch_result, resume_result)
+}
+
+fn finish_imap_body_fetch<T>(
+    account_id: &str,
+    fetch_result: Result<T>,
+    resume_result: Result<()>,
+) -> Result<T> {
+    match (fetch_result, resume_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(resume_error)) => Err(resume_error),
+        (Err(fetch_error), Ok(())) => Err(fetch_error),
+        (Err(fetch_error), Err(resume_error)) => {
+            log::error!(
+                "Failed to resume IMAP IDLE after body fetch error for account {}: {}",
+                account_id,
+                resume_error
+            );
+            Err(fetch_error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1123,7 +1183,87 @@ pub async fn save_message_as_eml(
 
 #[cfg(test)]
 mod tests {
-    use super::split_folder_path;
+    use super::{
+        finish_imap_body_fetch, run_imap_body_fetch_with_resume, split_folder_path,
+        suspend_imap_idle_for_body_fetch,
+    };
+    use crate::error::Error;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn body_fetch_failure_still_runs_resume() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let result = run_imap_body_fetch_with_resume::<String, _, _>(
+            "account",
+            async { Err(Error::Other("fetch failed".into())) },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(resumed.load(Ordering::Relaxed));
+        assert_eq!(result.unwrap_err().to_string(), "fetch failed");
+    }
+
+    #[tokio::test]
+    async fn body_fetch_suspend_failure_attempts_restart() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let result = suspend_imap_idle_for_body_fetch(
+            "account",
+            async { Err(Error::Other("suspend failed".into())) },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(resumed.load(Ordering::Relaxed));
+        assert_eq!(result.unwrap_err().to_string(), "suspend failed");
+    }
+
+    #[test]
+    fn body_fetch_result_preserves_fetch_error_when_resume_also_fails() {
+        let result = finish_imap_body_fetch::<String>(
+            "account",
+            Err(Error::Other("fetch failed".into())),
+            Err(Error::Other("resume failed".into())),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "fetch failed");
+    }
+
+    #[test]
+    fn body_fetch_result_returns_resume_error_after_successful_fetch() {
+        let result = finish_imap_body_fetch(
+            "account",
+            Ok("path".to_string()),
+            Err(Error::Other("resume failed".into())),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "resume failed");
+    }
+
+    #[test]
+    fn body_fetch_result_returns_fetch_error_after_successful_resume() {
+        let result = finish_imap_body_fetch::<String>(
+            "account",
+            Err(Error::Other("fetch failed".into())),
+            Ok(()),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "fetch failed");
+    }
+
+    #[test]
+    fn body_fetch_result_returns_value_when_fetch_and_resume_succeed() {
+        let result = finish_imap_body_fetch("account", Ok("path"), Ok(()));
+        assert_eq!(result.unwrap(), "path");
+    }
 
     // A bare name with no slash is a top-level folder.
     #[test]
