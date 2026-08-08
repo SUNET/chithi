@@ -235,20 +235,31 @@ async fn run_deferred_mail_syncs(
     first_folder: Option<String>,
 ) -> Result<()> {
     let mut current_folder = first_folder;
+    let mut first_error: Option<Error> = None;
+
     loop {
         let Some(guard) = try_acquire_account_sync_guard(state, account_id, "Deferred sync") else {
             defer_mail_sync(state, account_id, current_folder);
-            return Ok(());
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         };
 
         log::info!("Running deferred sync for account {}", account_id);
         let sync_result = run_mail_sync_once(app, state, account_id, current_folder).await;
-        let next = take_deferred_mail_sync(state, account_id);
         drop(guard);
-        sync_result?;
+        let next = take_deferred_mail_sync(state, account_id);
+
+        if let Err(error) = sync_result {
+            first_error.get_or_insert(error);
+        }
 
         let Some(next_folder) = next else {
-            return Ok(());
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         };
         current_folder = next_folder;
     }
@@ -267,15 +278,17 @@ pub async fn trigger_sync(
     };
 
     let sync_result = run_mail_sync_once(&app, &state, &account_id, current_folder).await;
-    let deferred = take_deferred_mail_sync(&state, &account_id);
     drop(guard);
-    sync_result?;
+    let deferred = take_deferred_mail_sync(&state, &account_id);
 
-    if let Some(deferred_folder) = deferred {
-        run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await?;
-    }
+    let deferred_result = match deferred {
+        Some(deferred_folder) => {
+            run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await
+        }
+        None => Ok(()),
+    };
 
-    Ok(())
+    sync_result.and(deferred_result)
 }
 
 #[tauri::command]
@@ -409,65 +422,74 @@ pub async fn prefetch_bodies(
 
     log::info!("Prefetch bodies requested for account {}", account_id);
 
-    let account = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)?
-    };
+    let prefetch_result = async {
+        let account = {
+            let conn = state.db.reader();
+            db::accounts::get_account_full(&conn, &account_id)?
+        };
 
-    // JMAP inherits the trait's no-op prefetch (bodies are fetched on
-    // demand via the JMAP API); accounts without a mail binding have
-    // nothing to prefetch.
-    let Some(backend) = crate::backend::mail::for_account(&account) else {
-        log::debug!(
-            "Prefetch: account {} has no enabled mail binding, skipping",
-            account_id
-        );
-        return Ok(0);
-    };
-
-    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
-        log::info!(
-            "Suspending IMAP IDLE for account {} before body prefetch",
-            account_id
-        );
-        suspend_imap_idle_for_account(&state, &account_id).await?
-    } else {
-        false
-    };
-    let resume_account = account.clone();
-
-    // For O365: get IMAP-scoped OAuth token
-    let ctx = crate::backend::mail::MailSyncCtx {
-        app: app.clone(),
-        db: state.db.clone(),
-        data_dir: state.data_dir.clone(),
-    };
-    let prefetch_result = backend.prefetch_bodies(&ctx, &account).await;
-    let resume_result =
-        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
-
-    let deferred = take_deferred_mail_sync(&state, &account_id);
-    drop(guard);
-
-    let fetched_count = match (prefetch_result, resume_result) {
-        (Ok(fetched_count), Ok(())) => fetched_count,
-        (Ok(_), Err(e)) => return Err(e),
-        (Err(prefetch_error), Ok(())) => return Err(prefetch_error),
-        (Err(prefetch_error), Err(resume_error)) => {
-            log::error!(
-                "Failed to resume IMAP IDLE after prefetch error for account {}: {}",
-                account_id,
-                resume_error
+        // JMAP inherits the trait's no-op prefetch (bodies are fetched on
+        // demand via the JMAP API); accounts without a mail binding have
+        // nothing to prefetch.
+        let Some(backend) = crate::backend::mail::for_account(&account) else {
+            log::debug!(
+                "Prefetch: account {} has no enabled mail binding, skipping",
+                account_id
             );
-            return Err(prefetch_error);
+            return Ok(0);
+        };
+
+        let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+            log::info!(
+                "Suspending IMAP IDLE for account {} before body prefetch",
+                account_id
+            );
+            suspend_imap_idle_for_account(&state, &account_id).await?
+        } else {
+            false
+        };
+        let resume_account = account.clone();
+
+        // For O365: get IMAP-scoped OAuth token
+        let ctx = crate::backend::mail::MailSyncCtx {
+            app: app.clone(),
+            db: state.db.clone(),
+            data_dir: state.data_dir.clone(),
+        };
+        let prefetch_result = backend.prefetch_bodies(&ctx, &account).await;
+        let resume_result =
+            resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
+
+        match (prefetch_result, resume_result) {
+            (Ok(fetched_count), Ok(())) => Ok(fetched_count),
+            (Ok(_), Err(e)) => Err(e),
+            (Err(prefetch_error), Ok(())) => Err(prefetch_error),
+            (Err(prefetch_error), Err(resume_error)) => {
+                log::error!(
+                    "Failed to resume IMAP IDLE after prefetch error for account {}: {}",
+                    account_id,
+                    resume_error
+                );
+                Err(prefetch_error)
+            }
         }
+    }
+    .await;
+
+    drop(guard);
+    let deferred = take_deferred_mail_sync(&state, &account_id);
+    let deferred_result = match deferred {
+        Some(deferred_folder) => {
+            run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await
+        }
+        None => Ok(()),
     };
 
-    if let Some(deferred_folder) = deferred {
-        run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await?;
+    match (prefetch_result, deferred_result) {
+        (Err(prefetch_error), _) => Err(prefetch_error),
+        (Ok(_), Err(deferred_error)) => Err(deferred_error),
+        (Ok(fetched_count), Ok(())) => Ok(fetched_count),
     }
-
-    Ok(fetched_count)
 }
 
 /// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
