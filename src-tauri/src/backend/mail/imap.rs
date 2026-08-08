@@ -12,6 +12,7 @@ use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::mail::sync as mail_sync;
+use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
@@ -657,21 +658,71 @@ fn execute_imap_op(
         }
         MailOp::SetFlags { mutations } => {
             for mutation in mutations {
-                let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
-                for message_ref in mutation.message_refs {
-                    let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
-                        message_ref
-                    else {
-                        return Err(Error::Other(
-                            "IMAP executor received a non-IMAP message reference".into(),
-                        ));
-                    };
-                    by_folder.entry(folder_path).or_default().push(uid);
-                }
-                let flag_strs: Vec<&str> = mutation.flags.iter().map(|s| s.as_str()).collect();
-                for (folder_path, uids) in &by_folder {
-                    select_folder_if_needed(conn, selected, folder_path)?;
-                    conn.set_flags(uids, &flag_strs, mutation.add)?;
+                match mutation.target {
+                    FlagTarget::Messages(message_refs) => {
+                        let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+                        for message_ref in message_refs {
+                            let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                                message_ref
+                            else {
+                                return Err(Error::Other(
+                                    "IMAP executor received a non-IMAP message reference".into(),
+                                ));
+                            };
+                            by_folder.entry(folder_path).or_default().push(uid);
+                        }
+                        let flag_strs: Vec<&str> =
+                            mutation.flags.iter().map(String::as_str).collect();
+                        for (folder_path, uids) in &by_folder {
+                            select_folder_if_needed(conn, selected, folder_path)?;
+                            conn.set_flags(uids, &flag_strs, mutation.add)?;
+                        }
+                    }
+                    FlagTarget::AllMessagesInFolders {
+                        folder_paths,
+                        excluded_refs,
+                    } => {
+                        if !mutation.add
+                            || mutation.flags.len() != 1
+                            || !mutation.flags[0].eq_ignore_ascii_case("seen")
+                        {
+                            return Err(Error::Other(
+                                "IMAP bulk flag target only supports adding seen".into(),
+                            ));
+                        }
+                        let mut excluded_by_folder =
+                            std::collections::HashMap::<String, Vec<u32>>::new();
+                        for message_ref in excluded_refs {
+                            let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                                message_ref
+                            else {
+                                return Err(Error::Other(
+                                    "IMAP bulk target received a non-IMAP exclusion".into(),
+                                ));
+                            };
+                            if !folder_paths.contains(&folder_path) {
+                                return Err(Error::Other(
+                                    "IMAP bulk target exclusion is outside its folders".into(),
+                                ));
+                            }
+                            excluded_by_folder.entry(folder_path).or_default().push(uid);
+                        }
+                        let selectable_folders = conn.list_selectable_folder_paths()?;
+                        for folder_path in &folder_paths {
+                            if !selectable_folders.contains(folder_path) {
+                                log::debug!(
+                                    "Skipping non-selectable or stale IMAP folder '{}' for bulk read",
+                                    folder_path
+                                );
+                                continue;
+                            }
+                            select_folder_if_needed(conn, selected, folder_path)?;
+                            conn.mark_all_seen()?;
+                            if let Some(uids) = excluded_by_folder.get(folder_path) {
+                                conn.set_flags(uids, &["seen"], false)?;
+                            }
+                        }
+                    }
                 }
             }
         }

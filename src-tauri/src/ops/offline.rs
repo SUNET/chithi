@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::ops::queue::{FlagMutation, MailOp};
+use crate::ops::flags::{subtract_flag_mutation, FlagMutation, FlagTarget};
+use crate::ops::queue::MailOp;
 
 /// Replay order matching Thunderbird's `nsImapOfflineSync`:
 /// flags (0) -> moves (1) -> copies (2) -> deletes (3).
@@ -306,70 +307,6 @@ pub fn supersede_pending_flag_ops(
     transaction.commit().map_err(Error::Database)
 }
 
-fn subtract_flag_mutation(older: FlagMutation, newer: &FlagMutation) -> Vec<FlagMutation> {
-    let overlapping_refs: Vec<_> = older
-        .message_refs
-        .iter()
-        .filter(|old_ref| {
-            newer
-                .message_refs
-                .iter()
-                .any(|new_ref| old_ref.same_message(new_ref))
-        })
-        .cloned()
-        .collect();
-    if overlapping_refs.is_empty() {
-        return vec![older];
-    }
-    let remaining_refs: Vec<_> = older
-        .message_refs
-        .iter()
-        .filter(|old_ref| {
-            !newer
-                .message_refs
-                .iter()
-                .any(|new_ref| old_ref.same_message(new_ref))
-        })
-        .cloned()
-        .collect();
-    let remaining_flags: Vec<_> = older
-        .flags
-        .iter()
-        .filter(|old_flag| {
-            let old_flag = normalize_flag_for_comparison(old_flag);
-            !newer
-                .flags
-                .iter()
-                .any(|new_flag| normalize_flag_for_comparison(new_flag) == old_flag)
-        })
-        .cloned()
-        .collect();
-    if remaining_flags.len() == older.flags.len() {
-        return vec![older];
-    }
-
-    let mut remaining = Vec::new();
-    if !remaining_refs.is_empty() {
-        remaining.push(FlagMutation {
-            message_refs: remaining_refs,
-            flags: older.flags.clone(),
-            add: older.add,
-        });
-    }
-    if !remaining_flags.is_empty() {
-        remaining.push(FlagMutation {
-            message_refs: overlapping_refs,
-            flags: remaining_flags,
-            add: older.add,
-        });
-    }
-    remaining
-}
-
-fn normalize_flag_for_comparison(flag: &str) -> String {
-    flag.trim_start_matches('\\').to_lowercase()
-}
-
 /// Validate that a folder path doesn't contain characters that could be
 /// injected into IMAP commands (null bytes, bare newlines).
 fn validate_folder_paths(by_folder: &std::collections::HashMap<String, Vec<u32>>) -> bool {
@@ -379,67 +316,125 @@ fn validate_folder_paths(by_folder: &std::collections::HashMap<String, Vec<u32>>
 }
 
 fn flag_mutation_to_json(mutation: &FlagMutation) -> serde_json::Value {
-    if mutation.message_refs.iter().all(|message_ref| {
-        matches!(
-            message_ref,
-            crate::mail::compat::BackendMessageRef::Imap { .. }
-        )
-    }) {
-        let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
-        for message_ref in &mutation.message_refs {
-            if let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref {
-                by_folder.entry(folder_path.clone()).or_default().push(*uid);
+    match &mutation.target {
+        FlagTarget::Messages(message_refs)
+            if message_refs.iter().all(|message_ref| {
+                matches!(
+                    message_ref,
+                    crate::mail::compat::BackendMessageRef::Imap { .. }
+                )
+            }) =>
+        {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                if let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                    message_ref
+                {
+                    by_folder.entry(folder_path.clone()).or_default().push(*uid);
+                }
             }
+            serde_json::json!({
+                "by_folder": by_folder,
+                "flags": mutation.flags,
+                "add": mutation.add,
+            })
         }
-        serde_json::json!({
-            "by_folder": by_folder,
-            "flags": mutation.flags,
-            "add": mutation.add,
-        })
-    } else {
-        serde_json::json!({
-            "message_refs": mutation
-                .message_refs
+        FlagTarget::Messages(message_refs) => serde_json::json!({
+            "message_refs": message_refs
                 .iter()
                 .map(message_ref_to_json)
                 .collect::<Vec<_>>(),
             "flags": mutation.flags,
             "add": mutation.add,
-        })
+        }),
+        FlagTarget::AllMessagesInFolders {
+            folder_paths,
+            excluded_refs,
+        } => serde_json::json!({
+            "target": {
+                "kind": "all_messages_in_folders",
+                "folder_paths": folder_paths,
+                "excluded_refs": excluded_refs
+                    .iter()
+                    .map(message_ref_to_json)
+                    .collect::<Vec<_>>(),
+            },
+            "flags": mutation.flags,
+            "add": mutation.add,
+        }),
     }
 }
 
 fn flag_mutation_from_json(value: &serde_json::Value) -> Option<FlagMutation> {
-    let flags = serde_json::from_value(value.get("flags")?.clone()).ok()?;
+    let flags: Vec<String> = serde_json::from_value(value.get("flags")?.clone()).ok()?;
     let add = value.get("add")?.as_bool()?;
-    let message_refs = if let Some(by_folder) = value.get("by_folder") {
+    let target = if let Some(target) = value.get("target") {
+        if target.get("kind")?.as_str()? != "all_messages_in_folders"
+            || !add
+            || flags.len() != 1
+            || !flags[0].eq_ignore_ascii_case("seen")
+        {
+            log::warn!("outbox_to_mail_op: rejected unsupported bulk flag target");
+            return None;
+        }
+        let folder_paths: Vec<String> =
+            serde_json::from_value(target.get("folder_paths")?.clone()).ok()?;
+        if !folder_paths.iter().all(|path| valid_folder_path(path)) {
+            log::warn!("outbox_to_mail_op: rejected bulk target with invalid folder path");
+            return None;
+        }
+        let excluded_refs = target
+            .get("excluded_refs")?
+            .as_array()?
+            .iter()
+            .map(message_ref_from_json)
+            .collect::<Option<Vec<_>>>()?;
+        if !excluded_refs.iter().all(|message_ref| {
+            matches!(
+                message_ref,
+                crate::mail::compat::BackendMessageRef::Imap { folder_path, .. }
+                    if folder_paths.contains(folder_path)
+            )
+        }) {
+            log::warn!("outbox_to_mail_op: rejected invalid bulk target exclusion");
+            return None;
+        }
+        FlagTarget::AllMessagesInFolders {
+            folder_paths,
+            excluded_refs,
+        }
+    } else if let Some(by_folder) = value.get("by_folder") {
         let by_folder: std::collections::HashMap<String, Vec<u32>> =
             serde_json::from_value(by_folder.clone()).ok()?;
         if !validate_folder_paths(&by_folder) {
             log::warn!("outbox_to_mail_op: rejected set_flags op with invalid folder path");
             return None;
         }
-        by_folder
-            .into_iter()
-            .flat_map(|(folder_path, uids)| {
-                uids.into_iter().map(move |uid| {
-                    crate::mail::compat::BackendMessageRef::imap(folder_path.clone(), uid)
+        FlagTarget::Messages(
+            by_folder
+                .into_iter()
+                .flat_map(|(folder_path, uids)| {
+                    uids.into_iter().map(move |uid| {
+                        crate::mail::compat::BackendMessageRef::imap(folder_path.clone(), uid)
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        )
     } else {
-        value
-            .get("message_refs")?
-            .as_array()?
-            .iter()
-            .map(message_ref_from_json)
-            .collect::<Option<Vec<_>>>()?
+        FlagTarget::Messages(
+            value
+                .get("message_refs")?
+                .as_array()?
+                .iter()
+                .map(message_ref_from_json)
+                .collect::<Option<Vec<_>>>()?,
+        )
     };
-    Some(FlagMutation {
-        message_refs,
-        flags,
-        add,
-    })
+    Some(FlagMutation { target, flags, add })
+}
+
+fn valid_folder_path(path: &str) -> bool {
+    !path.contains('\0') && !path.contains('\n') && !path.contains('\r')
 }
 
 fn message_ref_to_json(message_ref: &crate::mail::compat::BackendMessageRef) -> serde_json::Value {
@@ -687,10 +682,10 @@ mod tests {
     fn set_flags_preserves_legacy_imap_payload() {
         let op = MailOp::SetFlags {
             mutations: vec![FlagMutation {
-                message_refs: vec![
+                target: FlagTarget::messages(vec![
                     BackendMessageRef::imap("INBOX", 1),
                     BackendMessageRef::imap("INBOX", 2),
-                ],
+                ]),
                 flags: vec!["seen".into()],
                 add: true,
             }],
@@ -717,7 +712,7 @@ mod tests {
         };
         match outbox_to_mail_op(&entry).unwrap() {
             MailOp::SetFlags { mutations } => assert_eq!(
-                mutations[0].message_refs,
+                mutations[0].target.message_refs().unwrap(),
                 vec![
                     BackendMessageRef::imap("INBOX", 1),
                     BackendMessageRef::imap("INBOX", 2),
@@ -735,7 +730,7 @@ mod tests {
         ] {
             let op = MailOp::SetFlags {
                 mutations: vec![FlagMutation {
-                    message_refs: vec![message_ref.clone()],
+                    target: FlagTarget::messages(vec![message_ref.clone()]),
                     flags: vec!["flagged".into()],
                     add: false,
                 }],
@@ -754,7 +749,7 @@ mod tests {
             };
             match outbox_to_mail_op(&entry).unwrap() {
                 MailOp::SetFlags { mutations } => {
-                    assert_eq!(mutations[0].message_refs, vec![message_ref]);
+                    assert_eq!(mutations[0].target.message_refs().unwrap(), &[message_ref]);
                 }
                 _ => panic!("Expected SetFlags"),
             }
@@ -766,10 +761,10 @@ mod tests {
         let conn = setup_db();
         let old = MailOp::SetFlags {
             mutations: vec![FlagMutation {
-                message_refs: vec![
+                target: FlagTarget::messages(vec![
                     BackendMessageRef::imap("INBOX", 1),
                     BackendMessageRef::imap("INBOX", 2),
-                ],
+                ]),
                 flags: vec!["seen".into(), "flagged".into()],
                 add: true,
             }],
@@ -779,7 +774,7 @@ mod tests {
 
         let later = MailOp::SetFlags {
             mutations: vec![FlagMutation {
-                message_refs: vec![BackendMessageRef::imap("INBOX", 2)],
+                target: FlagTarget::messages(vec![BackendMessageRef::imap("INBOX", 2)]),
                 flags: vec!["flagged".into()],
                 add: false,
             }],
@@ -791,7 +786,7 @@ mod tests {
             &conn,
             "acc1",
             &[FlagMutation {
-                message_refs: vec![BackendMessageRef::imap("INBOX", 2)],
+                target: FlagTarget::messages(vec![BackendMessageRef::imap("INBOX", 2)]),
                 flags: vec!["\\Seen".into()],
                 add: false,
             }],
@@ -804,13 +799,13 @@ mod tests {
             MailOp::SetFlags { mutations } => {
                 assert_eq!(mutations.len(), 2);
                 assert_eq!(
-                    mutations[0].message_refs,
-                    vec![BackendMessageRef::imap("INBOX", 1)]
+                    mutations[0].target.message_refs().unwrap(),
+                    &[BackendMessageRef::imap("INBOX", 1)]
                 );
                 assert_eq!(mutations[0].flags, vec!["seen", "flagged"]);
                 assert_eq!(
-                    mutations[1].message_refs,
-                    vec![BackendMessageRef::imap("INBOX", 2)]
+                    mutations[1].target.message_refs().unwrap(),
+                    &[BackendMessageRef::imap("INBOX", 2)]
                 );
                 assert_eq!(mutations[1].flags, vec!["flagged"]);
             }
@@ -819,8 +814,8 @@ mod tests {
         match outbox_to_mail_op(&pending[1]).unwrap() {
             MailOp::SetFlags { mutations } => {
                 assert_eq!(
-                    mutations[0].message_refs,
-                    vec![BackendMessageRef::imap("INBOX", 2)]
+                    mutations[0].target.message_refs().unwrap(),
+                    &[BackendMessageRef::imap("INBOX", 2)]
                 );
                 assert_eq!(mutations[0].flags, vec!["flagged"]);
                 assert!(!mutations[0].add);
@@ -832,15 +827,242 @@ mod tests {
             &conn,
             "acc1",
             &[FlagMutation {
-                message_refs: vec![
+                target: FlagTarget::messages(vec![
                     BackendMessageRef::imap("INBOX", 1),
                     BackendMessageRef::imap("INBOX", 2),
-                ],
+                ]),
                 flags: vec!["seen".into(), "flagged".into()],
                 add: false,
             }],
         )
         .unwrap();
         assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bulk_flag_target_round_trips_with_exclusions() {
+        let op = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into(), "Archive".into()],
+                    excluded_refs: vec![BackendMessageRef::imap("INBOX", 7)],
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+        let entry = OutboxEntry {
+            id: 1,
+            account_id: "acc1".into(),
+            action_type: action_type.into(),
+            payload_json: payload.to_string(),
+            status: "pending".into(),
+            retry_count: 0,
+            error_message: None,
+        };
+
+        assert_eq!(outbox_to_mail_op(&entry).unwrap(), op);
+    }
+
+    #[test]
+    fn newer_unread_adds_an_exclusion_to_pending_bulk_read() {
+        let conn = setup_db();
+        let bulk = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into(), "Archive".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&bulk).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                target: FlagTarget::messages(vec![BackendMessageRef::imap("INBOX", 9)]),
+                flags: vec!["seen".into()],
+                add: false,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target,
+                FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into(), "Archive".into()],
+                    excluded_refs: vec![BackendMessageRef::imap("INBOX", 9)],
+                }
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn newest_read_removes_an_older_bulk_exclusion() {
+        let conn = setup_db();
+        let bulk = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&bulk).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        let message_ref = BackendMessageRef::imap("INBOX", 9);
+        let unread = FlagMutation {
+            target: FlagTarget::messages(vec![message_ref.clone()]),
+            flags: vec!["seen".into()],
+            add: false,
+        };
+        supersede_pending_flag_ops(&conn, "acc1", std::slice::from_ref(&unread)).unwrap();
+        let (_, payload) = mail_op_to_outbox(&MailOp::SetFlags {
+            mutations: vec![unread],
+        })
+        .unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                target: FlagTarget::messages(vec![message_ref]),
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 1);
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target,
+                FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                }
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn newer_bulk_read_supersedes_older_message_intent_in_covered_folders() {
+        let conn = setup_db();
+        let old = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::messages(vec![
+                    BackendMessageRef::imap("INBOX", 1),
+                    BackendMessageRef::imap("Other", 2),
+                ]),
+                flags: vec!["seen".into()],
+                add: false,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&old).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target.message_refs().unwrap(),
+                &[BackendMessageRef::imap("Other", 2)]
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn overlapping_newer_bulk_read_keeps_only_uncovered_folders() {
+        let conn = setup_db();
+        let old = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into(), "Archive".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&old).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target,
+                FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["Archive".into()],
+                    excluded_refs: Vec::new(),
+                }
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn bulk_target_rejects_invalid_folder_paths() {
+        let entry = OutboxEntry {
+            id: 1,
+            account_id: "acc1".into(),
+            action_type: "set_flags".into(),
+            payload_json: serde_json::json!({
+                "target": {
+                    "kind": "all_messages_in_folders",
+                    "folder_paths": ["INBOX\nBAD"],
+                    "excluded_refs": [],
+                },
+                "flags": ["seen"],
+                "add": true,
+            })
+            .to_string(),
+            status: "pending".into(),
+            retry_count: 0,
+            error_message: None,
+        };
+
+        assert!(outbox_to_mail_op(&entry).is_none());
     }
 }

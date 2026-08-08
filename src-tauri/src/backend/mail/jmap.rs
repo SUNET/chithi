@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::jmap_sync;
+use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
@@ -77,13 +78,6 @@ pub(super) struct JmapOpExecutor;
 #[async_trait]
 impl MailOpExecutor for JmapOpExecutor {
     async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
-        let account = {
-            let conn = ctx.db.reader();
-            crate::db::accounts::get_account_full(&conn, account_id)?
-        };
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-
         match op {
             MailOp::MoveMessages {
                 by_folder,
@@ -102,25 +96,48 @@ impl MailOpExecutor for JmapOpExecutor {
                 log::debug!("JMAP delete handled by optimistic path");
             }
             MailOp::SetFlags { mutations } => {
-                for mutation in mutations {
-                    let email_ids = mutation
-                        .message_refs
-                        .into_iter()
-                        .map(|message_ref| {
-                            message_ref.into_jmap_email_id().ok_or_else(|| {
-                                Error::Other(
-                                    "JMAP executor received a non-JMAP message reference".into(),
-                                )
+                let prepared = mutations
+                    .into_iter()
+                    .map(|mutation| {
+                        let FlagTarget::Messages(message_refs) = mutation.target else {
+                            return Err(Error::Other(
+                                "JMAP executor received an IMAP bulk flag target".into(),
+                            ));
+                        };
+                        let email_ids = message_refs
+                            .into_iter()
+                            .map(|message_ref| {
+                                message_ref.into_jmap_email_id().ok_or_else(|| {
+                                    Error::Other(
+                                        "JMAP executor received a non-JMAP message reference"
+                                            .into(),
+                                    )
+                                })
                             })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let flag_strs: Vec<&str> = mutation.flags.iter().map(String::as_str).collect();
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((email_ids, mutation.flags, mutation.add))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let account = {
+                    let conn = ctx.db.reader();
+                    crate::db::accounts::get_account_full(&conn, account_id)?
+                };
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                for (email_ids, flags, add) in prepared {
+                    let flag_strs: Vec<&str> = flags.iter().map(String::as_str).collect();
                     conn_jmap
-                        .set_flags(&jmap_config, &email_ids, &flag_strs, mutation.add)
+                        .set_flags(&jmap_config, &email_ids, &flag_strs, add)
                         .await?;
                 }
             }
             MailOp::SendRaw { raw_message, .. } => {
+                let account = {
+                    let conn = ctx.db.reader();
+                    crate::db::accounts::get_account_full(&conn, account_id)?
+                };
+                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
                 conn_jmap.send_email(&jmap_config, &raw_message).await?;
             }
             _ => {}

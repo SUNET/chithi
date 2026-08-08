@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::flags::FlagTarget;
 use super::queue::{MailOp, OpEntry};
 
 /// Coalesce a batch of pending operations to reduce network round-trips.
@@ -72,10 +73,14 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                         if pending_mutation.flags == mutation.flags
                             && pending_mutation.add == mutation.add
                         {
-                            pending_mutation
-                                .message_refs
-                                .extend(mutation.message_refs.clone());
-                            continue;
+                            if let (
+                                FlagTarget::Messages(pending_refs),
+                                FlagTarget::Messages(message_refs),
+                            ) = (&mut pending_mutation.target, &mutation.target)
+                            {
+                                pending_refs.extend(message_refs.clone());
+                                continue;
+                            }
                         }
                     }
                 }
@@ -122,7 +127,8 @@ fn merge_by_folder(target: &mut HashMap<String, Vec<u32>>, source: HashMap<Strin
 mod tests {
     use super::*;
     use crate::mail::compat::BackendMessageRef;
-    use crate::ops::queue::{FlagMutation, OpPriority};
+    use crate::ops::flags::FlagMutation;
+    use crate::ops::queue::OpPriority;
 
     #[test]
     fn coalesce_multiple_deletes() {
@@ -243,7 +249,7 @@ mod tests {
         OpEntry {
             op: MailOp::SetFlags {
                 mutations: vec![FlagMutation {
-                    message_refs: vec![BackendMessageRef::imap("INBOX", uid)],
+                    target: FlagTarget::messages(vec![BackendMessageRef::imap("INBOX", uid)]),
                     flags: vec!["seen".into()],
                     add,
                 }],
@@ -258,7 +264,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0].op {
             MailOp::SetFlags { mutations } => {
-                assert_eq!(mutations[0].message_refs.len(), 2)
+                assert_eq!(mutations[0].target.message_refs().unwrap().len(), 2)
             }
             _ => panic!("Expected SetFlags"),
         }
@@ -279,6 +285,28 @@ mod tests {
             })
             .collect();
         assert_eq!(adds, vec![true, false, true]);
+    }
+
+    #[test]
+    fn bulk_flags_are_not_coalesced_with_message_flags() {
+        let bulk = OpEntry {
+            op: MailOp::SetFlags {
+                mutations: vec![FlagMutation {
+                    target: FlagTarget::AllMessagesInFolders {
+                        folder_paths: vec!["INBOX".into()],
+                        excluded_refs: Vec::new(),
+                    },
+                    flags: vec!["seen".into()],
+                    add: true,
+                }],
+            },
+            priority: OpPriority::User,
+        };
+
+        let result = coalesce(vec![bulk, flag_entry(1, true)]);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].op, MailOp::SetFlags { .. }));
+        assert!(matches!(result[1].op, MailOp::SetFlags { .. }));
     }
 
     #[test]
