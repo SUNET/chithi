@@ -8,9 +8,9 @@ use crate::commands::sync_cmd::{
 use crate::db;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
-use crate::mail::compat::BodyLocation;
+use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::imap::{ImapConfig, ImapConnection};
-use crate::ops::queue::{MailOp, OpEntry, OpPriority};
+use crate::ops::queue::{FlagMutation, MailOp, OpEntry, OpPriority};
 use crate::state::AppState;
 
 /// Build an ImapConfig for an account, handling O365 XOAUTH2 token refresh.
@@ -74,7 +74,7 @@ pub async fn move_messages(
     let imap_by_folder =
         if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
             let conn = state.db.reader();
-            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let uid_rows = db::messages::get_message_uids(&conn, &account_id, &message_ids)?;
             let grouped = group_by_folder(uid_rows);
             if grouped.is_empty() {
                 log::warn!("No messages found for move operation");
@@ -244,7 +244,7 @@ pub async fn delete_messages(
     let imap_by_folder =
         if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
             let conn = state.db.reader();
-            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+            let uid_rows = db::messages::get_message_uids(&conn, &account_id, &message_ids)?;
             let grouped = group_by_folder(uid_rows);
             if grouped.is_empty() {
                 log::warn!("No messages found for delete operation");
@@ -566,15 +566,45 @@ pub async fn set_message_flags(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
+    let normalized_flags: Vec<String> = flags.iter().map(|f| normalize_flag_name(f)).collect();
+    let message_rows = {
+        let conn = state.db.reader();
+        db::messages::get_message_uids(&conn, &account_id, &message_ids)?
+    };
+    let resolved: Vec<(String, BackendMessageRef)> = message_rows
+        .into_iter()
+        .map(|(db_id, folder_path, uid)| {
+            let message_ref = BackendMessageRef::from_db_row(
+                account.mail_protocol_str(),
+                &account_id,
+                &db_id,
+                &folder_path,
+                uid,
+            )
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Invalid {} message id '{}' for folder '{}'",
+                    account.mail_protocol_str(),
+                    db_id,
+                    folder_path
+                ))
+            })?;
+            Ok((db_id, message_ref))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if resolved.is_empty() {
+        log::warn!("No messages found for set_flags operation");
+        return Ok(());
+    }
+
     // Update local DB FIRST (before slow network ops) so that any
     // concurrent re-fetch from a "messages-changed" event always sees
     // the latest flags, preventing race conditions with rapid toggles.
     {
         let conn = state.db.writer().await;
 
-        let normalized_flags: Vec<String> = flags.iter().map(|f| normalize_flag_name(f)).collect();
-
-        for msg_id in &message_ids {
+        for (msg_id, _) in &resolved {
             if let Ok((_, _, _, _, flags_json, _, _)) =
                 db::messages::get_message_metadata(&conn, &account_id, msg_id)
             {
@@ -594,85 +624,48 @@ pub async fn set_message_flags(
                 db::messages::update_flags(&conn, msg_id, &updated_json)?;
             }
         }
+        if normalized_flags.iter().any(|flag| flag == "seen") {
+            db::folders::recalculate_folder_counts(&conn, &account_id)?;
+        }
     }
 
-    // Now perform the remote operation (slow, network I/O)
-    if account.mail_protocol_str() == "graph" {
-        // Graph path: use PATCH to update isRead
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        let is_seen_flag = flags.iter().any(|f| f == "seen" || f == "\\Seen");
-        if is_seen_flag {
-            let graph_ids: Vec<String> = message_ids
-                .iter()
-                .map(|mid| {
-                    mid.strip_prefix(&format!("{}_", account_id))
-                        .unwrap_or(mid)
-                        .to_string()
-                })
-                .collect();
-            client.set_read_status(&graph_ids, add).await?;
-        }
-    } else if account.mail_protocol_str() == "jmap" {
-        // JMAP path: extract JMAP email IDs and set flags via JMAP API
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
+    emit_messages_changed(&app, &account_id);
+    if normalized_flags.iter().any(|flag| flag == "seen") {
+        emit_folders_changed(&app, &account_id);
+    }
 
-        // Extract JMAP email IDs from composite message IDs
-        let jmap_ids: Vec<String> = message_ids
-            .iter()
-            .map(|mid| {
-                // Format: {account_id}_{folder}_{jmap_email_id}
-                let parts: Vec<&str> = mid.splitn(3, '_').collect();
-                if parts.len() == 3 {
-                    parts[2].to_string()
-                } else {
-                    mid.clone()
-                }
-            })
-            .collect();
-
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
-        conn_jmap
-            .set_flags(&jmap_config, &jmap_ids, &flag_strs, add)
-            .await?;
-    } else {
-        // IMAP path: send through worker queue (persistent connection, no IDLE suspend needed)
-        let by_folder = {
-            let conn = state.db.reader();
-            let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
-            group_by_folder(uid_rows)
-        };
-
-        if !by_folder.is_empty() {
-            let sender = state.get_op_sender(&account_id, &app);
-            if let Err(e) = sender
-                .send(OpEntry {
-                    op: MailOp::SetFlags {
-                        by_folder,
-                        flags: flags.clone(),
-                        add,
-                    },
-                    priority: OpPriority::User,
-                })
-                .await
-            {
-                log::error!(
-                    "Failed to queue set_flags op for account {}: {}",
-                    account_id,
-                    e
-                );
-                app.emit(
-                    "op-failed",
-                    serde_json::json!({
-                        "account_id": account_id,
-                        "op_type": "set_flags",
-                        "error": format!("Failed to queue operation: {}", e),
-                    }),
-                )
-                .ok();
-            }
-        }
+    let message_refs = resolved
+        .into_iter()
+        .map(|(_, message_ref)| message_ref)
+        .collect();
+    let sender = state.get_op_sender(&account_id, &app);
+    if let Err(e) = sender
+        .send(OpEntry {
+            op: MailOp::SetFlags {
+                mutations: vec![FlagMutation {
+                    message_refs,
+                    flags: normalized_flags,
+                    add,
+                }],
+            },
+            priority: OpPriority::User,
+        })
+        .await
+    {
+        log::error!(
+            "Failed to queue set_flags op for account {}: {}",
+            account_id,
+            e
+        );
+        app.emit(
+            "op-failed",
+            serde_json::json!({
+                "account_id": account_id,
+                "op_type": "set_flags",
+                "error": format!("Failed to queue operation: {}", e),
+            }),
+        )
+        .ok();
     }
 
     log::info!(
@@ -681,8 +674,6 @@ pub async fn set_message_flags(
         flags.join(", "),
         message_ids.len()
     );
-
-    emit_messages_changed(&app, &account_id);
 
     Ok(())
 }
@@ -723,7 +714,7 @@ pub async fn copy_messages(
 
     let by_folder = {
         let conn = state.db.reader();
-        let uid_rows = db::messages::get_message_uids(&conn, &message_ids)?;
+        let uid_rows = db::messages::get_message_uids(&conn, &account_id, &message_ids)?;
         group_by_folder(uid_rows)
     };
 

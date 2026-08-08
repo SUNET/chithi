@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 
 use crate::db::accounts::AccountFull;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mail::jmap_sync;
 use crate::ops::queue::MailOp;
 
@@ -101,9 +101,24 @@ impl MailOpExecutor for JmapOpExecutor {
                 let _ = by_folder;
                 log::debug!("JMAP delete handled by optimistic path");
             }
-            MailOp::SetFlags { flags, add, .. } => {
-                let _ = (jmap_config.clone(), flags, add);
-                log::debug!("JMAP set_flags handled by optimistic path");
+            MailOp::SetFlags { mutations } => {
+                for mutation in mutations {
+                    let email_ids = mutation
+                        .message_refs
+                        .into_iter()
+                        .map(|message_ref| {
+                            message_ref.into_jmap_email_id().ok_or_else(|| {
+                                Error::Other(
+                                    "JMAP executor received a non-JMAP message reference".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let flag_strs: Vec<&str> = mutation.flags.iter().map(String::as_str).collect();
+                    conn_jmap
+                        .set_flags(&jmap_config, &email_ids, &flag_strs, mutation.add)
+                        .await?;
+                }
             }
             MailOp::SendRaw { raw_message, .. } => {
                 conn_jmap.send_email(&jmap_config, &raw_message).await?;

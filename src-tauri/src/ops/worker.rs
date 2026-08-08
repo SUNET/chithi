@@ -77,7 +77,12 @@ impl AccountWorker {
             let ops = coalesce(batch);
 
             let mut sync_succeeded = false;
+            let mut replay_requested = false;
             for entry in ops {
+                if matches!(entry.op, MailOp::ReplayOffline) {
+                    replay_requested = true;
+                    continue;
+                }
                 let is_sync = entry.op.is_sync();
                 match self.execute(entry.op).await {
                     Ok(()) => {
@@ -93,7 +98,7 @@ impl AccountWorker {
             }
 
             // After a successful sync, replay any pending offline operations
-            if sync_succeeded {
+            if sync_succeeded || replay_requested {
                 self.replay_offline_ops().await;
             }
         }
@@ -256,6 +261,7 @@ impl AccountWorker {
         match op {
             MailOp::SyncAll { current_folder } => self.sync_all(current_folder).await,
             MailOp::SyncFolder { folder_path } => self.sync_folder(folder_path).await,
+            MailOp::ReplayOffline => Ok(()),
             op @ (MailOp::MoveMessages { .. }
             | MailOp::DeleteMessages { .. }
             | MailOp::SetFlags { .. }
@@ -270,7 +276,16 @@ impl AccountWorker {
         // Serialize the op for outbox before executing (we move op into the executor)
         let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
 
-        let result = self.execute_op(op).await;
+        let preflight = if let MailOp::SetFlags { mutations } = &op {
+            let conn = self.db.writer().await;
+            super::offline::supersede_pending_flag_ops(&conn, &self.account_id, mutations)
+        } else {
+            Ok(())
+        };
+        let result = match preflight {
+            Ok(()) => self.execute_op(op).await,
+            Err(error) => Err(error),
+        };
 
         // On failure of user operations, queue to outbox for later replay
         if let Err(ref e) = result {

@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::ops::queue::MailOp;
+use crate::ops::queue::{FlagMutation, MailOp};
 
 /// Replay order matching Thunderbird's `nsImapOfflineSync`:
 /// flags (0) -> moves (1) -> copies (2) -> deletes (3).
@@ -206,18 +206,19 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
         MailOp::DeleteMessages { by_folder } => {
             Some(("delete", serde_json::json!({ "by_folder": by_folder })))
         }
-        MailOp::SetFlags {
-            by_folder,
-            flags,
-            add,
-        } => Some((
-            "set_flags",
-            serde_json::json!({
-                "by_folder": by_folder,
-                "flags": flags,
-                "add": add,
-            }),
-        )),
+        MailOp::SetFlags { mutations } => {
+            let payload = if let [mutation] = mutations.as_slice() {
+                flag_mutation_to_json(mutation)
+            } else {
+                serde_json::json!({
+                    "mutations": mutations
+                        .iter()
+                        .map(flag_mutation_to_json)
+                        .collect::<Vec<_>>(),
+                })
+            };
+            Some(("set_flags", payload))
+        }
         MailOp::CopyMessages {
             by_folder,
             target_folder,
@@ -255,12 +256,233 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
     }
 }
 
+/// Remove portions of older pending flag operations superseded by newer user
+/// intent while retaining all replacements in their original outbox row.
+pub fn supersede_pending_flag_ops(
+    conn: &Connection,
+    account_id: &str,
+    new_mutations: &[FlagMutation],
+) -> Result<()> {
+    let pending = get_pending_ops(conn, account_id)?;
+    let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+
+    for entry in pending
+        .into_iter()
+        .filter(|entry| entry.action_type == "set_flags")
+    {
+        let Some(MailOp::SetFlags { mutations }) = outbox_to_mail_op(&entry) else {
+            continue;
+        };
+        let remaining = new_mutations.iter().fold(mutations, |current, newer| {
+            current
+                .into_iter()
+                .flat_map(|older| subtract_flag_mutation(older, newer))
+                .collect()
+        });
+        if remaining.is_empty() {
+            transaction
+                .execute(
+                    "DELETE FROM outbox WHERE id = ?1",
+                    rusqlite::params![entry.id],
+                )
+                .map_err(Error::Database)?;
+            continue;
+        }
+
+        let payload = mail_op_to_outbox(&MailOp::SetFlags {
+            mutations: remaining,
+        })
+        .expect("SetFlags is serializable")
+        .1
+        .to_string();
+        transaction
+            .execute(
+                "UPDATE outbox SET payload_json = ?1 WHERE id = ?2",
+                rusqlite::params![payload, entry.id],
+            )
+            .map_err(Error::Database)?;
+    }
+
+    transaction.commit().map_err(Error::Database)
+}
+
+fn subtract_flag_mutation(older: FlagMutation, newer: &FlagMutation) -> Vec<FlagMutation> {
+    let overlapping_refs: Vec<_> = older
+        .message_refs
+        .iter()
+        .filter(|old_ref| {
+            newer
+                .message_refs
+                .iter()
+                .any(|new_ref| old_ref.same_message(new_ref))
+        })
+        .cloned()
+        .collect();
+    if overlapping_refs.is_empty() {
+        return vec![older];
+    }
+    let remaining_refs: Vec<_> = older
+        .message_refs
+        .iter()
+        .filter(|old_ref| {
+            !newer
+                .message_refs
+                .iter()
+                .any(|new_ref| old_ref.same_message(new_ref))
+        })
+        .cloned()
+        .collect();
+    let remaining_flags: Vec<_> = older
+        .flags
+        .iter()
+        .filter(|old_flag| {
+            let old_flag = normalize_flag_for_comparison(old_flag);
+            !newer
+                .flags
+                .iter()
+                .any(|new_flag| normalize_flag_for_comparison(new_flag) == old_flag)
+        })
+        .cloned()
+        .collect();
+    if remaining_flags.len() == older.flags.len() {
+        return vec![older];
+    }
+
+    let mut remaining = Vec::new();
+    if !remaining_refs.is_empty() {
+        remaining.push(FlagMutation {
+            message_refs: remaining_refs,
+            flags: older.flags.clone(),
+            add: older.add,
+        });
+    }
+    if !remaining_flags.is_empty() {
+        remaining.push(FlagMutation {
+            message_refs: overlapping_refs,
+            flags: remaining_flags,
+            add: older.add,
+        });
+    }
+    remaining
+}
+
+fn normalize_flag_for_comparison(flag: &str) -> String {
+    flag.trim_start_matches('\\').to_lowercase()
+}
+
 /// Validate that a folder path doesn't contain characters that could be
 /// injected into IMAP commands (null bytes, bare newlines).
 fn validate_folder_paths(by_folder: &std::collections::HashMap<String, Vec<u32>>) -> bool {
     by_folder
         .keys()
         .all(|path| !path.contains('\0') && !path.contains('\n') && !path.contains('\r'))
+}
+
+fn flag_mutation_to_json(mutation: &FlagMutation) -> serde_json::Value {
+    if mutation.message_refs.iter().all(|message_ref| {
+        matches!(
+            message_ref,
+            crate::mail::compat::BackendMessageRef::Imap { .. }
+        )
+    }) {
+        let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+        for message_ref in &mutation.message_refs {
+            if let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref {
+                by_folder.entry(folder_path.clone()).or_default().push(*uid);
+            }
+        }
+        serde_json::json!({
+            "by_folder": by_folder,
+            "flags": mutation.flags,
+            "add": mutation.add,
+        })
+    } else {
+        serde_json::json!({
+            "message_refs": mutation
+                .message_refs
+                .iter()
+                .map(message_ref_to_json)
+                .collect::<Vec<_>>(),
+            "flags": mutation.flags,
+            "add": mutation.add,
+        })
+    }
+}
+
+fn flag_mutation_from_json(value: &serde_json::Value) -> Option<FlagMutation> {
+    let flags = serde_json::from_value(value.get("flags")?.clone()).ok()?;
+    let add = value.get("add")?.as_bool()?;
+    let message_refs = if let Some(by_folder) = value.get("by_folder") {
+        let by_folder: std::collections::HashMap<String, Vec<u32>> =
+            serde_json::from_value(by_folder.clone()).ok()?;
+        if !validate_folder_paths(&by_folder) {
+            log::warn!("outbox_to_mail_op: rejected set_flags op with invalid folder path");
+            return None;
+        }
+        by_folder
+            .into_iter()
+            .flat_map(|(folder_path, uids)| {
+                uids.into_iter().map(move |uid| {
+                    crate::mail::compat::BackendMessageRef::imap(folder_path.clone(), uid)
+                })
+            })
+            .collect()
+    } else {
+        value
+            .get("message_refs")?
+            .as_array()?
+            .iter()
+            .map(message_ref_from_json)
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some(FlagMutation {
+        message_refs,
+        flags,
+        add,
+    })
+}
+
+fn message_ref_to_json(message_ref: &crate::mail::compat::BackendMessageRef) -> serde_json::Value {
+    use crate::mail::compat::BackendMessageRef;
+
+    match message_ref {
+        BackendMessageRef::Imap { folder_path, uid } => serde_json::json!({
+            "kind": "imap",
+            "folder_path": folder_path,
+            "uid": uid,
+        }),
+        BackendMessageRef::Jmap {
+            mailbox_id,
+            email_id,
+        } => serde_json::json!({
+            "kind": "jmap",
+            "mailbox_id": mailbox_id,
+            "email_id": email_id,
+        }),
+        BackendMessageRef::Graph { item_id } => serde_json::json!({
+            "kind": "graph",
+            "item_id": item_id,
+        }),
+    }
+}
+
+fn message_ref_from_json(
+    value: &serde_json::Value,
+) -> Option<crate::mail::compat::BackendMessageRef> {
+    use crate::mail::compat::BackendMessageRef;
+
+    match value.get("kind")?.as_str()? {
+        "imap" => Some(BackendMessageRef::imap(
+            value.get("folder_path")?.as_str()?,
+            u32::try_from(value.get("uid")?.as_u64()?).ok()?,
+        )),
+        "jmap" => Some(BackendMessageRef::jmap(
+            value.get("mailbox_id")?.as_str()?,
+            value.get("email_id")?.as_str()?,
+        )),
+        "graph" => Some(BackendMessageRef::graph(value.get("item_id")?.as_str()?)),
+        _ => None,
+    }
 }
 
 /// Convert an outbox entry back to a MailOp for replay.
@@ -294,14 +516,16 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             Some(MailOp::DeleteMessages { by_folder })
         }
         "set_flags" => {
-            let by_folder = serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
-            let flags = serde_json::from_value(payload.get("flags")?.clone()).ok()?;
-            let add = payload.get("add")?.as_bool()?;
-            Some(MailOp::SetFlags {
-                by_folder,
-                flags,
-                add,
-            })
+            let mutations = if let Some(mutations) = payload.get("mutations") {
+                mutations
+                    .as_array()?
+                    .iter()
+                    .map(flag_mutation_from_json)
+                    .collect::<Option<Vec<_>>>()?
+            } else {
+                vec![flag_mutation_from_json(&payload)?]
+            };
+            Some(MailOp::SetFlags { mutations })
         }
         "copy" => {
             let by_folder = serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
@@ -359,6 +583,7 @@ pub fn is_dead(entry: &OutboxEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mail::compat::BackendMessageRef;
     use std::collections::HashMap;
 
     fn setup_db() -> Connection {
@@ -456,5 +681,166 @@ mod tests {
             _ => panic!("Expected MoveMessages"),
         }
         mark_completed(&conn, id).unwrap();
+    }
+
+    #[test]
+    fn set_flags_preserves_legacy_imap_payload() {
+        let op = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                message_refs: vec![
+                    BackendMessageRef::imap("INBOX", 1),
+                    BackendMessageRef::imap("INBOX", 2),
+                ],
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+        assert_eq!(action_type, "set_flags");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "by_folder": { "INBOX": [1, 2] },
+                "flags": ["seen"],
+                "add": true,
+            })
+        );
+
+        let entry = OutboxEntry {
+            id: 1,
+            account_id: "acc1".into(),
+            action_type: action_type.into(),
+            payload_json: payload.to_string(),
+            status: "pending".into(),
+            retry_count: 0,
+            error_message: None,
+        };
+        match outbox_to_mail_op(&entry).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].message_refs,
+                vec![
+                    BackendMessageRef::imap("INBOX", 1),
+                    BackendMessageRef::imap("INBOX", 2),
+                ]
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn provider_flag_references_round_trip_without_delimiter_parsing() {
+        for message_ref in [
+            BackendMessageRef::jmap("box_with_under", "email_with_under"),
+            BackendMessageRef::graph("AAMk_with_under"),
+        ] {
+            let op = MailOp::SetFlags {
+                mutations: vec![FlagMutation {
+                    message_refs: vec![message_ref.clone()],
+                    flags: vec!["flagged".into()],
+                    add: false,
+                }],
+            };
+            let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+            assert!(payload.get("message_refs").is_some());
+            assert!(payload.get("by_folder").is_none());
+            let entry = OutboxEntry {
+                id: 1,
+                account_id: "acc1".into(),
+                action_type: action_type.into(),
+                payload_json: payload.to_string(),
+                status: "pending".into(),
+                retry_count: 0,
+                error_message: None,
+            };
+            match outbox_to_mail_op(&entry).unwrap() {
+                MailOp::SetFlags { mutations } => {
+                    assert_eq!(mutations[0].message_refs, vec![message_ref]);
+                }
+                _ => panic!("Expected SetFlags"),
+            }
+        }
+    }
+
+    #[test]
+    fn newer_flags_split_and_supersede_overlapping_pending_intent() {
+        let conn = setup_db();
+        let old = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                message_refs: vec![
+                    BackendMessageRef::imap("INBOX", 1),
+                    BackendMessageRef::imap("INBOX", 2),
+                ],
+                flags: vec!["seen".into(), "flagged".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&old).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        let later = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                message_refs: vec![BackendMessageRef::imap("INBOX", 2)],
+                flags: vec!["flagged".into()],
+                add: false,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&later).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                message_refs: vec![BackendMessageRef::imap("INBOX", 2)],
+                flags: vec!["\\Seen".into()],
+                add: false,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 2);
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => {
+                assert_eq!(mutations.len(), 2);
+                assert_eq!(
+                    mutations[0].message_refs,
+                    vec![BackendMessageRef::imap("INBOX", 1)]
+                );
+                assert_eq!(mutations[0].flags, vec!["seen", "flagged"]);
+                assert_eq!(
+                    mutations[1].message_refs,
+                    vec![BackendMessageRef::imap("INBOX", 2)]
+                );
+                assert_eq!(mutations[1].flags, vec!["flagged"]);
+            }
+            _ => panic!("Expected SetFlags"),
+        }
+        match outbox_to_mail_op(&pending[1]).unwrap() {
+            MailOp::SetFlags { mutations } => {
+                assert_eq!(
+                    mutations[0].message_refs,
+                    vec![BackendMessageRef::imap("INBOX", 2)]
+                );
+                assert_eq!(mutations[0].flags, vec!["flagged"]);
+                assert!(!mutations[0].add);
+            }
+            _ => panic!("Expected SetFlags"),
+        }
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                message_refs: vec![
+                    BackendMessageRef::imap("INBOX", 1),
+                    BackendMessageRef::imap("INBOX", 2),
+                ],
+                flags: vec!["seen".into(), "flagged".into()],
+                add: false,
+            }],
+        )
+        .unwrap();
+        assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
     }
 }

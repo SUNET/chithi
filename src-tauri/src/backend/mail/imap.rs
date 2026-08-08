@@ -655,15 +655,24 @@ fn execute_imap_op(
                 conn.delete_messages(uids)?;
             }
         }
-        MailOp::SetFlags {
-            by_folder,
-            flags,
-            add,
-        } => {
-            let flag_strs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
-            for (folder_path, uids) in &by_folder {
-                select_folder_if_needed(conn, selected, folder_path)?;
-                conn.set_flags(uids, &flag_strs, add)?;
+        MailOp::SetFlags { mutations } => {
+            for mutation in mutations {
+                let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+                for message_ref in mutation.message_refs {
+                    let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                        message_ref
+                    else {
+                        return Err(Error::Other(
+                            "IMAP executor received a non-IMAP message reference".into(),
+                        ));
+                    };
+                    by_folder.entry(folder_path).or_default().push(uid);
+                }
+                let flag_strs: Vec<&str> = mutation.flags.iter().map(|s| s.as_str()).collect();
+                for (folder_path, uids) in &by_folder {
+                    select_folder_if_needed(conn, selected, folder_path)?;
+                    conn.set_flags(uids, &flag_strs, mutation.add)?;
+                }
             }
         }
         MailOp::CopyMessages {

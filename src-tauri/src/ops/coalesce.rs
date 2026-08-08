@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use super::queue::{MailOp, OpEntry, OpPriority};
+use super::queue::{MailOp, OpEntry};
 
 /// Coalesce a batch of pending operations to reduce network round-trips.
 ///
 /// Inspired by Thunderbird's `nsImapMoveCoalescer`:
 /// - Multiple `DeleteMessages` are merged into one with combined UIDs.
 /// - Multiple `MoveMessages` to the same target are merged.
-/// - Multiple `SetFlags` with the same flags+add value are merged.
+/// - Adjacent `SetFlags` with the same flags+add value are merged.
 /// - Sync operations are deduplicated (only one SyncAll kept).
 pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     if ops.len() <= 1 {
@@ -18,95 +18,96 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     ops.sort_by_key(|e| e.priority);
 
     let mut result: Vec<OpEntry> = Vec::new();
-    let mut pending_deletes: Option<HashMap<String, Vec<u32>>> = None;
-    let mut pending_moves: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new(); // target -> by_folder
-    let mut pending_flags: HashMap<(Vec<String>, bool), HashMap<String, Vec<u32>>> = HashMap::new();
-    let mut sync_all_folder: Option<Option<String>> = None;
-
     for entry in ops {
         match entry.op {
             MailOp::DeleteMessages { by_folder } => {
-                let deletes = pending_deletes.get_or_insert_with(HashMap::new);
-                merge_by_folder(deletes, by_folder);
+                if let Some(OpEntry {
+                    op: MailOp::DeleteMessages { by_folder: pending },
+                    ..
+                }) = result.last_mut()
+                {
+                    merge_by_folder(pending, by_folder);
+                } else {
+                    result.push(OpEntry {
+                        op: MailOp::DeleteMessages { by_folder },
+                        priority: entry.priority,
+                    });
+                }
             }
             MailOp::MoveMessages {
                 by_folder,
                 target_folder,
             } => {
-                let moves = pending_moves.entry(target_folder).or_default();
-                merge_by_folder(moves, by_folder);
-            }
-            MailOp::SetFlags {
-                by_folder,
-                flags,
-                add,
-            } => {
-                let key = (flags, add);
-                let flag_ops = pending_flags.entry(key).or_default();
-                merge_by_folder(flag_ops, by_folder);
-            }
-            MailOp::SyncAll { current_folder } => {
-                // Always keep the LAST current_folder value — the user may
-                // have navigated between folders while ops were queued.
-                sync_all_folder = Some(current_folder);
-            }
-            // Pass through non-coalescable ops
-            other => {
+                if let Some(OpEntry {
+                    op:
+                        MailOp::MoveMessages {
+                            by_folder: pending,
+                            target_folder: pending_target,
+                        },
+                    ..
+                }) = result.last_mut()
+                {
+                    if *pending_target == target_folder {
+                        merge_by_folder(pending, by_folder);
+                        continue;
+                    }
+                }
                 result.push(OpEntry {
-                    op: other,
+                    op: MailOp::MoveMessages {
+                        by_folder,
+                        target_folder,
+                    },
                     priority: entry.priority,
                 });
             }
+            MailOp::SetFlags { mutations } => {
+                if let Some(OpEntry {
+                    op: MailOp::SetFlags { mutations: pending },
+                    ..
+                }) = result.last_mut()
+                {
+                    if let ([pending_mutation], [mutation]) =
+                        (pending.as_mut_slice(), mutations.as_slice())
+                    {
+                        if pending_mutation.flags == mutation.flags
+                            && pending_mutation.add == mutation.add
+                        {
+                            pending_mutation
+                                .message_refs
+                                .extend(mutation.message_refs.clone());
+                            continue;
+                        }
+                    }
+                }
+                result.push(OpEntry {
+                    op: MailOp::SetFlags { mutations },
+                    priority: entry.priority,
+                });
+            }
+            MailOp::SyncAll { current_folder } => {
+                result.retain(|pending| !matches!(pending.op, MailOp::SyncAll { .. }));
+                result.push(OpEntry {
+                    op: MailOp::SyncAll { current_folder },
+                    priority: entry.priority,
+                });
+            }
+            MailOp::ReplayOffline => {
+                if !result
+                    .iter()
+                    .any(|pending| matches!(pending.op, MailOp::ReplayOffline))
+                {
+                    result.push(OpEntry {
+                        op: MailOp::ReplayOffline,
+                        priority: entry.priority,
+                    });
+                }
+            }
+            other => result.push(OpEntry {
+                op: other,
+                priority: entry.priority,
+            }),
         }
     }
-
-    // Emit the single coalesced SyncAll with the last folder value
-    if let Some(current_folder) = sync_all_folder {
-        result.push(OpEntry {
-            op: MailOp::SyncAll { current_folder },
-            priority: OpPriority::Sync,
-        });
-    }
-
-    // Emit coalesced flag operations
-    for ((flags, add), by_folder) in pending_flags {
-        if !by_folder.is_empty() {
-            result.push(OpEntry {
-                op: MailOp::SetFlags {
-                    by_folder,
-                    flags,
-                    add,
-                },
-                priority: OpPriority::User,
-            });
-        }
-    }
-
-    // Emit coalesced move operations
-    for (target_folder, by_folder) in pending_moves {
-        if !by_folder.is_empty() {
-            result.push(OpEntry {
-                op: MailOp::MoveMessages {
-                    by_folder,
-                    target_folder,
-                },
-                priority: OpPriority::User,
-            });
-        }
-    }
-
-    // Emit coalesced delete operation
-    if let Some(by_folder) = pending_deletes {
-        if !by_folder.is_empty() {
-            result.push(OpEntry {
-                op: MailOp::DeleteMessages { by_folder },
-                priority: OpPriority::User,
-            });
-        }
-    }
-
-    // Re-sort so user ops come first
-    result.sort_by_key(|e| e.priority);
     result
 }
 
@@ -120,6 +121,8 @@ fn merge_by_folder(target: &mut HashMap<String, Vec<u32>>, source: HashMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mail::compat::BackendMessageRef;
+    use crate::ops::queue::{FlagMutation, OpPriority};
 
     #[test]
     fn coalesce_multiple_deletes() {
@@ -234,5 +237,79 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].priority, OpPriority::User);
         assert_eq!(result[1].priority, OpPriority::Sync);
+    }
+
+    fn flag_entry(uid: u32, add: bool) -> OpEntry {
+        OpEntry {
+            op: MailOp::SetFlags {
+                mutations: vec![FlagMutation {
+                    message_refs: vec![BackendMessageRef::imap("INBOX", uid)],
+                    flags: vec!["seen".into()],
+                    add,
+                }],
+            },
+            priority: OpPriority::User,
+        }
+    }
+
+    #[test]
+    fn adjacent_matching_flags_are_merged() {
+        let result = coalesce(vec![flag_entry(1, true), flag_entry(2, true)]);
+        assert_eq!(result.len(), 1);
+        match &result[0].op {
+            MailOp::SetFlags { mutations } => {
+                assert_eq!(mutations[0].message_refs.len(), 2)
+            }
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
+    fn conflicting_flags_preserve_order() {
+        let result = coalesce(vec![
+            flag_entry(1, true),
+            flag_entry(1, false),
+            flag_entry(1, true),
+        ]);
+        let adds: Vec<bool> = result
+            .iter()
+            .filter_map(|entry| match &entry.op {
+                MailOp::SetFlags { mutations } => Some(mutations[0].add),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adds, vec![true, false, true]);
+    }
+
+    #[test]
+    fn flags_remain_before_following_copy() {
+        let result = coalesce(vec![
+            flag_entry(1, true),
+            OpEntry {
+                op: MailOp::CopyMessages {
+                    by_folder: HashMap::from([("INBOX".into(), vec![1])]),
+                    target_folder: "Archive".into(),
+                },
+                priority: OpPriority::User,
+            },
+        ]);
+        assert!(matches!(result[0].op, MailOp::SetFlags { .. }));
+        assert!(matches!(result[1].op, MailOp::CopyMessages { .. }));
+    }
+
+    #[test]
+    fn replay_signals_are_deduplicated() {
+        let result = coalesce(vec![
+            OpEntry {
+                op: MailOp::ReplayOffline,
+                priority: OpPriority::Sync,
+            },
+            OpEntry {
+                op: MailOp::ReplayOffline,
+                priority: OpPriority::Sync,
+            },
+        ]);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].op, MailOp::ReplayOffline));
     }
 }

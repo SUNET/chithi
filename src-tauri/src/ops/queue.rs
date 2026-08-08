@@ -1,5 +1,15 @@
 use std::collections::HashMap;
 
+use crate::mail::compat::BackendMessageRef;
+
+/// One ordered flag mutation within a queued flag operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagMutation {
+    pub message_refs: Vec<BackendMessageRef>,
+    pub flags: Vec<String>,
+    pub add: bool,
+}
+
 /// A single mail operation to be processed by the per-account worker.
 #[derive(Debug)]
 pub enum MailOp {
@@ -8,7 +18,8 @@ pub enum MailOp {
     SyncAll { current_folder: Option<String> },
     /// Sync a single folder.
     SyncFolder { folder_path: String },
-
+    /// Replay queued offline operations after a successful direct sync.
+    ReplayOffline,
     // --- User operations (higher priority) ---
     /// Move messages by IMAP UID, grouped by source folder.
     MoveMessages {
@@ -19,12 +30,8 @@ pub enum MailOp {
     DeleteMessages {
         by_folder: HashMap<String, Vec<u32>>,
     },
-    /// Set or remove flags by IMAP UID, grouped by source folder.
-    SetFlags {
-        by_folder: HashMap<String, Vec<u32>>,
-        flags: Vec<String>,
-        add: bool,
-    },
+    /// Set or remove flags on provider-specific message references.
+    SetFlags { mutations: Vec<FlagMutation> },
     /// Copy messages by IMAP UID, grouped by source folder.
     CopyMessages {
         by_folder: HashMap<String, Vec<u32>>,
