@@ -437,7 +437,7 @@ async fn sync_jmap_folder(
     // Run filter rules against newly inserted messages. Errors are logged
     // and swallowed so a transient JMAP hiccup can't poison the sync.
     if !new_ids.is_empty() {
-        match crate::commands::filters::apply_filters_to_new_messages(
+        match crate::filters::service::apply_filters_to_new_messages(
             db, account_id, mailbox_id, &new_ids,
         )
         .await

@@ -395,7 +395,7 @@ async fn sync_graph_folder_delta(
     // rows keep their graph_filters_pending marker and are retried on
     // the next cycle.
     if !new_ids.is_empty() {
-        match crate::commands::filters::apply_filters_to_new_messages(
+        match crate::filters::service::apply_filters_to_new_messages(
             db_arc, account_id, &gf.id, &new_ids,
         )
         .await
