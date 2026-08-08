@@ -219,6 +219,7 @@ impl AccountWorker {
                     .ok();
                 continue;
             };
+            let retry_safe = op.can_retry_after_execution_failure();
 
             // Execute the replayed op directly (not through execute() to avoid
             // re-queuing to outbox on failure — we handle retries here)
@@ -255,6 +256,40 @@ impl AccountWorker {
                     }
                 }
                 Err(e) => {
+                    if !retry_safe {
+                        let error = format!(
+                            "Copy outcome may be ambiguous; automatic retry disabled to avoid duplicates: {}",
+                            e
+                        );
+                        let conn = self.db.writer().await;
+                        if let Err(mark_error) =
+                            super::offline::mark_invalid(&conn, entry.id, &error)
+                        {
+                            log::error!(
+                                "Failed to mark ambiguous copy op {} dead: {}",
+                                entry.id,
+                                mark_error
+                            );
+                            break;
+                        }
+                        drop(conn);
+                        log::warn!(
+                            "Replay of copy op {} failed; marked dead without automatic retry: {}",
+                            entry.id,
+                            e
+                        );
+                        self.app
+                            .emit(
+                                "offline-queue-changed",
+                                serde_json::json!({
+                                    "account_id": self.account_id,
+                                    "dead_op_id": entry.id,
+                                    "action_type": entry.action_type,
+                                }),
+                            )
+                            .ok();
+                        continue;
+                    }
                     let conn = self.db.writer().await;
                     let _ = super::offline::mark_failed(&conn, entry.id, &e.to_string());
                     log::warn!(
@@ -299,6 +334,7 @@ impl AccountWorker {
     async fn execute_user_op(&mut self, op: MailOp) -> Result<()> {
         // Serialize the op for outbox before executing (we move op into the executor)
         let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
+        let retry_safe = op.can_retry_after_execution_failure();
 
         let preflight = match &op {
             MailOp::SetFlags { mutations } => {
@@ -324,26 +360,60 @@ impl AccountWorker {
         if let Err(ref e) = result {
             if let Some((action_type, payload)) = outbox_data {
                 let conn = self.db.writer().await;
-                match super::offline::queue_offline_op(
-                    &conn,
-                    &self.account_id,
-                    &action_type,
-                    &payload,
-                ) {
+                let error = if retry_safe {
+                    format!("{} (will retry)", e)
+                } else {
+                    format!(
+                        "Copy outcome may be ambiguous; automatic retry disabled to avoid duplicates: {}",
+                        e
+                    )
+                };
+                let queued = if retry_safe {
+                    super::offline::queue_offline_op(
+                        &conn,
+                        &self.account_id,
+                        &action_type,
+                        &payload,
+                    )
+                } else {
+                    super::offline::queue_dead_op(
+                        &conn,
+                        &self.account_id,
+                        &action_type,
+                        &payload,
+                        &error,
+                    )
+                };
+                match queued {
                     Ok(id) => {
-                        log::info!(
-                            "Queued failed {} op to outbox (id={}) for account {}: {}",
-                            action_type,
-                            id,
-                            self.account_id,
-                            e
-                        );
-                        emit_op_failed(
-                            &self.app,
-                            &self.account_id,
-                            &action_type,
-                            &format!("{} (will retry)", e),
-                        );
+                        if retry_safe {
+                            log::info!(
+                                "Queued failed {} op to outbox (id={}) for account {}: {}",
+                                action_type,
+                                id,
+                                self.account_id,
+                                e
+                            );
+                        } else {
+                            log::warn!(
+                                "Stored ambiguous {} op as dead (id={}) for account {}: {}",
+                                action_type,
+                                id,
+                                self.account_id,
+                                e
+                            );
+                            self.app
+                                .emit(
+                                    "offline-queue-changed",
+                                    serde_json::json!({
+                                        "account_id": self.account_id,
+                                        "dead_op_id": id,
+                                        "action_type": action_type,
+                                    }),
+                                )
+                                .ok();
+                        }
+                        emit_op_failed(&self.app, &self.account_id, &action_type, &error);
                     }
                     Err(db_err) => {
                         log::error!(

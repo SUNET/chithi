@@ -68,6 +68,23 @@ pub fn queue_offline_op_with_status(
     Ok(id)
 }
 
+/// Preserve an operation for visibility without scheduling automatic replay.
+pub fn queue_dead_op(
+    conn: &Connection,
+    account_id: &str,
+    action_type: &str,
+    payload: &serde_json::Value,
+    error: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outbox (account_id, action_type, payload_json, status, retry_count, error_message)
+         VALUES (?1, ?2, ?3, 'dead', 0, ?4)",
+        rusqlite::params![account_id, action_type, payload.to_string(), error],
+    )
+    .map_err(Error::Database)?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Flip a 'sending' row back to 'pending' so the worker will retry it
 /// on the next sync.
 pub fn mark_pending(conn: &Connection, outbox_id: i64) -> Result<()> {
@@ -958,6 +975,28 @@ mod tests {
         assert_eq!(
             dead[0].error_message.as_deref(),
             Some("invalid delete payload")
+        );
+    }
+
+    #[test]
+    fn queue_dead_op_is_visible_but_not_pending() {
+        let conn = setup_db();
+        let id = queue_dead_op(
+            &conn,
+            "acc1",
+            "copy",
+            &serde_json::json!({ "message_refs": [] }),
+            "ambiguous copy outcome",
+        )
+        .unwrap();
+
+        assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+        let dead = get_dead_ops(&conn, "acc1").unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
+        assert_eq!(
+            dead[0].error_message.as_deref(),
+            Some("ambiguous copy outcome")
         );
     }
 

@@ -54,6 +54,21 @@ impl MailOp {
     pub fn is_sync(&self) -> bool {
         matches!(self, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. })
     }
+
+    /// Whether replaying the complete operation after an execution failure is
+    /// safe. JMAP copy adds mailbox membership idempotently; IMAP and Graph
+    /// copy can create duplicates when a prior attempt committed remotely.
+    pub fn can_retry_after_execution_failure(&self) -> bool {
+        match self {
+            MailOp::CopyMessages { message_refs, .. } => {
+                !message_refs.is_empty()
+                    && message_refs
+                        .iter()
+                        .all(|message_ref| matches!(message_ref, BackendMessageRef::Jmap { .. }))
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Priority level for operations. Lower numeric value = higher priority.
@@ -69,4 +84,34 @@ pub enum OpPriority {
 pub struct OpEntry {
     pub op: MailOp,
     pub priority: OpPriority,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MailOp;
+    use crate::mail::compat::BackendMessageRef;
+
+    #[test]
+    fn only_jmap_copy_is_safe_to_retry_after_execution_failure() {
+        for (message_refs, expected) in [
+            (vec![BackendMessageRef::imap("INBOX", 1)], false),
+            (vec![BackendMessageRef::graph("item")], false),
+            (vec![BackendMessageRef::jmap("inbox", "email")], true),
+            (Vec::new(), false),
+        ] {
+            let op = MailOp::CopyMessages {
+                message_refs,
+                target_folder: "archive".into(),
+            };
+            assert_eq!(op.can_retry_after_execution_failure(), expected);
+        }
+    }
+
+    #[test]
+    fn convergent_operations_remain_retryable() {
+        let op = MailOp::DeleteMessages {
+            message_refs: vec![BackendMessageRef::graph("item")],
+        };
+        assert!(op.can_retry_after_execution_failure());
+    }
 }
