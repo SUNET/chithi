@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use tauri::{Emitter, State};
 
-use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::commands::sync_cmd::{
     resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
     suspend_imap_idle_for_account,
 };
 use crate::db;
 use crate::error::{Error, Result};
+use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 use crate::state::AppState;

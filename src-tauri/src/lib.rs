@@ -7,6 +7,7 @@ mod calendar;
 mod commands;
 mod db;
 mod error;
+mod event;
 mod filters;
 mod keyring;
 mod logging;

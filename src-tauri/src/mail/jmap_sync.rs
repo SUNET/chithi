@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
-use crate::commands::events::{emit_folders_changed, emit_messages_changed};
 use crate::db;
 use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
+use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::mail::jmap::{JmapConfig, JmapConnection};
 
 #[derive(Clone, serde::Serialize)]

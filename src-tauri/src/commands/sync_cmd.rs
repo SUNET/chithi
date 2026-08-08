@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::commands::events::{emit_folders_changed, emit_messages_changed};
+use crate::event::{emit_folders_changed, emit_messages_changed};
 
 /// RAII guard that clears the sync-in-progress flag on drop.
 pub(crate) struct SyncGuard(Arc<AtomicBool>);
