@@ -162,6 +162,16 @@ pub fn mark_dead(conn: &Connection, outbox_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Mark an operation with an unrecoverable payload as dead.
+pub fn mark_invalid(conn: &Connection, outbox_id: i64, error: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbox SET status = 'dead', error_message = ?1 WHERE id = ?2",
+        rusqlite::params![error, outbox_id],
+    )
+    .map_err(Error::Database)?;
+    Ok(())
+}
+
 /// Get dead operations (retry_count >= max_retries) for surfacing to user.
 pub fn get_dead_ops(conn: &Connection, account_id: &str) -> Result<Vec<OutboxEntry>> {
     let mut stmt = conn
@@ -333,9 +343,34 @@ pub fn supersede_pending_flags_for_delete(
     account_id: &str,
     deleted_refs: &[BackendMessageRef],
 ) -> Result<()> {
-    let pending = get_pending_ops(conn, account_id)?;
     let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+    rewrite_pending_flags_for_delete(&transaction, account_id, deleted_refs)?;
+    transaction.commit().map_err(Error::Database)
+}
 
+/// Atomically preserve an unqueued delete and prune stale flag intent.
+pub fn queue_failed_delete(
+    conn: &Connection,
+    account_id: &str,
+    message_refs: &[BackendMessageRef],
+) -> Result<i64> {
+    let (_, payload) = mail_op_to_outbox(&MailOp::DeleteMessages {
+        message_refs: message_refs.to_vec(),
+    })
+    .expect("DeleteMessages is serializable");
+    let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+    let outbox_id = queue_offline_op(&transaction, account_id, "delete", &payload)?;
+    rewrite_pending_flags_for_delete(&transaction, account_id, message_refs)?;
+    transaction.commit().map_err(Error::Database)?;
+    Ok(outbox_id)
+}
+
+fn rewrite_pending_flags_for_delete(
+    conn: &Connection,
+    account_id: &str,
+    deleted_refs: &[BackendMessageRef],
+) -> Result<()> {
+    let pending = get_pending_ops(conn, account_id)?;
     for entry in pending
         .into_iter()
         .filter(|entry| entry.action_type == "set_flags")
@@ -348,12 +383,11 @@ pub fn supersede_pending_flags_for_delete(
             .filter_map(|mutation| remove_deleted_refs(mutation, deleted_refs))
             .collect();
         if remaining.is_empty() {
-            transaction
-                .execute(
-                    "DELETE FROM outbox WHERE id = ?1",
-                    rusqlite::params![entry.id],
-                )
-                .map_err(Error::Database)?;
+            conn.execute(
+                "DELETE FROM outbox WHERE id = ?1",
+                rusqlite::params![entry.id],
+            )
+            .map_err(Error::Database)?;
             continue;
         }
 
@@ -363,15 +397,13 @@ pub fn supersede_pending_flags_for_delete(
         .expect("SetFlags is serializable")
         .1
         .to_string();
-        transaction
-            .execute(
-                "UPDATE outbox SET payload_json = ?1 WHERE id = ?2",
-                rusqlite::params![payload, entry.id],
-            )
-            .map_err(Error::Database)?;
+        conn.execute(
+            "UPDATE outbox SET payload_json = ?1 WHERE id = ?2",
+            rusqlite::params![payload, entry.id],
+        )
+        .map_err(Error::Database)?;
     }
-
-    transaction.commit().map_err(Error::Database)
+    Ok(())
 }
 
 /// Validate that a folder path doesn't contain characters that could be
@@ -574,18 +606,10 @@ fn legacy_delete_refs(
                 ))
             })
             .collect(),
-        "jmap" => message_ids
-            .iter()
-            .map(|id| {
-                let prefix = format!("{}_", entry.account_id);
-                let remainder = id.as_str()?.strip_prefix(&prefix)?;
-                let (mailbox_id, email_id) = remainder.split_once('_')?;
-                log::warn!(
-                    "Recovering legacy JMAP delete identity with ambiguous underscore delimiters"
-                );
-                Some(BackendMessageRef::jmap(mailbox_id, email_id))
-            })
-            .collect(),
+        "jmap" => {
+            log::error!("Rejecting legacy JMAP delete payload with ambiguous message identity");
+            None
+        }
         _ => None,
     }
 }
@@ -750,6 +774,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_payload_is_marked_dead_with_an_error() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "delete", &serde_json::json!({})).unwrap();
+        mark_invalid(&conn, id, "invalid delete payload").unwrap();
+
+        let dead = get_dead_ops(&conn, "acc1").unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(
+            dead[0].error_message.as_deref(),
+            Some("invalid delete payload")
+        );
+    }
+
+    #[test]
     fn test_mark_failed_increments_retry() {
         let conn = setup_db();
         let id = queue_offline_op(&conn, "acc1", "move", &serde_json::json!({})).unwrap();
@@ -856,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_http_delete_payloads_are_recovered() {
+    fn legacy_graph_delete_is_recovered_but_ambiguous_jmap_is_rejected() {
         let graph = outbox_entry(
             "delete",
             serde_json::json!({
@@ -878,12 +916,7 @@ mod tests {
                 "message_ids": ["acc1_mailbox_email_with_under"]
             }),
         );
-        assert_eq!(
-            outbox_to_mail_op(&jmap),
-            Some(MailOp::DeleteMessages {
-                message_refs: vec![BackendMessageRef::jmap("mailbox", "email_with_under")]
-            })
-        );
+        assert!(outbox_to_mail_op(&jmap).is_none());
 
         let mut underscored_account = outbox_entry(
             "delete",
@@ -893,12 +926,7 @@ mod tests {
             }),
         );
         underscored_account.account_id = "acc_1".into();
-        assert_eq!(
-            outbox_to_mail_op(&underscored_account),
-            Some(MailOp::DeleteMessages {
-                message_refs: vec![BackendMessageRef::jmap("mailbox", "email")]
-            })
-        );
+        assert!(outbox_to_mail_op(&underscored_account).is_none());
     }
 
     #[test]
@@ -1120,6 +1148,42 @@ mod tests {
         )
         .unwrap();
         assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_enqueue_persists_delete_and_prunes_flags_atomically() {
+        let conn = setup_db();
+        let flags = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::messages(vec![
+                    BackendMessageRef::graph("deleted"),
+                    BackendMessageRef::graph("retained"),
+                ]),
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&flags).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        let deleted = BackendMessageRef::graph("deleted");
+        queue_failed_delete(&conn, "acc1", std::slice::from_ref(&deleted)).unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 2);
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target.message_refs().unwrap(),
+                &[BackendMessageRef::graph("retained")]
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+        assert_eq!(
+            outbox_to_mail_op(&pending[1]),
+            Some(MailOp::DeleteMessages {
+                message_refs: vec![deleted]
+            })
+        );
     }
 
     #[test]

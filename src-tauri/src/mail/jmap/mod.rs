@@ -300,6 +300,7 @@ pub struct JmapConnection {
     upload_url_template: String,
     event_source_url_template: Option<String>,
     account_id: String,
+    max_objects_in_set: usize,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +315,58 @@ struct JmapSession {
     event_source_url: Option<String>,
     #[serde(rename = "primaryAccounts")]
     primary_accounts: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    capabilities: std::collections::HashMap<String, JmapCoreCapability>,
+}
+
+#[derive(Deserialize, Default)]
+struct JmapCoreCapability {
+    #[serde(rename = "maxObjectsInSet")]
+    max_objects_in_set: Option<usize>,
+}
+
+impl JmapSession {
+    fn max_objects_in_set(&self) -> usize {
+        const DEFAULT_MAX_OBJECTS_IN_SET: usize = 500;
+        self.capabilities
+            .get("urn:ietf:params:jmap:core")
+            .and_then(|capability| capability.max_objects_in_set)
+            .filter(|limit| *limit > 0)
+            .unwrap_or(DEFAULT_MAX_OBJECTS_IN_SET)
+    }
+}
+
+#[cfg(test)]
+mod session_limit_tests {
+    use super::JmapSession;
+
+    fn session(capabilities: serde_json::Value) -> JmapSession {
+        serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/download/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "account" },
+            "capabilities": capabilities
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reads_max_objects_in_set_from_core_capability() {
+        let session = session(serde_json::json!({
+            "urn:ietf:params:jmap:core": { "maxObjectsInSet": 37 }
+        }));
+        assert_eq!(session.max_objects_in_set(), 37);
+    }
+
+    #[test]
+    fn defaults_invalid_or_missing_set_limits() {
+        assert_eq!(session(serde_json::json!({})).max_objects_in_set(), 500);
+        let zero = session(serde_json::json!({
+            "urn:ietf:params:jmap:core": { "maxObjectsInSet": 0 }
+        }));
+        assert_eq!(zero.max_objects_in_set(), 500);
+    }
 }
 
 impl JmapConnection {
@@ -425,6 +478,8 @@ impl JmapConnection {
             .await
             .map_err(|e| Error::Other(format!("JMAP session parse failed: {}", e)))?;
 
+        let max_objects_in_set = session.max_objects_in_set();
+
         // Get the default account ID
         let account_id = session
             .primary_accounts
@@ -457,6 +512,7 @@ impl JmapConnection {
             upload_url_template: upload_url,
             event_source_url_template: event_source_url,
             account_id,
+            max_objects_in_set,
         })
     }
 

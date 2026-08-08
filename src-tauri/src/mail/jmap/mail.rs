@@ -548,17 +548,20 @@ impl JmapConnection {
 
     pub async fn delete_emails(&self, config: &JmapConfig, email_ids: &[String]) -> Result<()> {
         log::debug!("JMAP deleting {} emails", email_ids.len());
-        let request = serde_json::json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                ["Email/set", {
-                    "accountId": self.account_id,
-                    "destroy": email_ids
-                }, "d1"]
-            ]
-        });
-        let response = self.api_request(&request, config).await?;
-        validate_delete_response(&response, email_ids)
+        for (index, chunk) in delete_chunks(email_ids, self.max_objects_in_set).enumerate() {
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/set", {
+                        "accountId": self.account_id,
+                        "destroy": chunk
+                    }, format!("d{}", index + 1)]
+                ]
+            });
+            let response = self.api_request(&request, config).await?;
+            validate_delete_response(&response, chunk)?;
+        }
+        Ok(())
     }
 
     /// Search emails across the account using `Email/query` + `Email/get`.
@@ -945,6 +948,13 @@ impl JmapConnection {
     }
 }
 
+fn delete_chunks(
+    email_ids: &[String],
+    max_objects_in_set: usize,
+) -> std::slice::Chunks<'_, String> {
+    email_ids.chunks(max_objects_in_set.max(1))
+}
+
 fn flag_to_keyword(flag: &str) -> &str {
     match flag {
         "seen" => "$seen",
@@ -1139,7 +1149,7 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
 
 #[cfg(test)]
 mod set_flags_tests {
-    use super::{validate_delete_response, validate_set_flags_response};
+    use super::{delete_chunks, validate_delete_response, validate_set_flags_response};
 
     #[test]
     fn accepts_successful_email_set() {
@@ -1181,6 +1191,13 @@ mod set_flags_tests {
             }, "d1"]]
         });
         assert!(validate_delete_response(&not_found, &ids).is_ok());
+    }
+
+    #[test]
+    fn delete_chunks_respect_the_session_limit() {
+        let ids: Vec<String> = (0..5).map(|id| id.to_string()).collect();
+        let sizes: Vec<usize> = delete_chunks(&ids, 2).map(<[_]>::len).collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
     }
 
     #[test]

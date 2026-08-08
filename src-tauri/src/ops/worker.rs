@@ -188,11 +188,35 @@ impl AccountWorker {
             }
 
             let Some(op) = super::offline::outbox_to_mail_op(entry) else {
+                let error = format!(
+                    "Invalid or unsupported offline {} payload",
+                    entry.action_type
+                );
                 log::warn!(
-                    "Failed to deserialize offline op {} ({}), skipping",
+                    "Failed to deserialize offline op {} ({}), marking dead",
                     entry.id,
                     entry.action_type
                 );
+                let conn = self.db.writer().await;
+                if let Err(mark_error) = super::offline::mark_invalid(&conn, entry.id, &error) {
+                    log::error!(
+                        "Failed to mark invalid offline op {} dead: {}",
+                        entry.id,
+                        mark_error
+                    );
+                    break;
+                }
+                drop(conn);
+                self.app
+                    .emit(
+                        "offline-queue-changed",
+                        serde_json::json!({
+                            "account_id": self.account_id,
+                            "dead_op_id": entry.id,
+                            "action_type": entry.action_type,
+                        }),
+                    )
+                    .ok();
                 continue;
             };
 

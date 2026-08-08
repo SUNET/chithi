@@ -271,9 +271,11 @@ pub async fn delete_messages(
     // --- Optimistic: update local DB and notify UI immediately ---
     {
         let conn = state.db.writer().await;
+        let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
         let resolved_ids: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();
-        db::messages::delete_messages_for_account(&conn, &account_id, &resolved_ids)?;
-        db::folders::recalculate_folder_counts(&conn, &account_id)?;
+        db::messages::delete_messages_for_account(&transaction, &account_id, &resolved_ids)?;
+        db::folders::recalculate_folder_counts(&transaction, &account_id)?;
+        transaction.commit().map_err(Error::Database)?;
     }
     emit_messages_changed(&app, &account_id);
     emit_folders_changed(&app, &account_id);
@@ -290,17 +292,31 @@ pub async fn delete_messages(
         })
         .await
     {
+        let queue_error = e.to_string();
         log::error!(
             "Failed to queue delete op for account {}: {}",
             account_id,
-            e
+            queue_error
+        );
+        let message_refs = match e.0.op {
+            MailOp::DeleteMessages { message_refs } => message_refs,
+            _ => unreachable!("failed operation was constructed as a delete"),
+        };
+        let persist_result = {
+            let conn = state.db.writer().await;
+            crate::ops::offline::queue_failed_delete(&conn, &account_id, &message_refs)?
+        };
+        log::info!(
+            "Persisted unqueued delete to outbox (id={}) for account {}",
+            persist_result,
+            account_id
         );
         app.emit(
             "op-failed",
             serde_json::json!({
                 "account_id": account_id,
                 "op_type": "delete",
-                "error": format!("Failed to queue operation: {}", e),
+                "error": format!("Failed to queue operation: {} (will retry)", queue_error),
             }),
         )
         .ok();
