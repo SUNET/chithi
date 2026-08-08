@@ -31,11 +31,15 @@ pub struct AppState {
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub jmap_push_handles: std::sync::Mutex<HashMap<String, JmapPushHandle>>,
-    /// Per-account mail-sync-in-progress flags. If true, a mail sync is
-    /// running and new mail sync requests for that account should be
-    /// skipped. Kept separate from calendar so the two domains don't block
-    /// each other.
+    /// Per-account mail-sync-in-progress flags. If true, a mail sync or
+    /// prefetch is running and new mail sync requests for that account are
+    /// deferred until the current guarded operation releases the account.
+    /// Kept separate from calendar so the two domains don't block each other.
     pub sync_in_progress: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-account mail sync requests that arrived while `sync_in_progress`
+    /// was held. This keeps IMAP IDLE notifications from being dropped during
+    /// long O365 body-prefetch passes.
+    pub pending_mail_sync: std::sync::Mutex<HashMap<String, Option<String>>>,
     /// Per-account calendar-sync-in-progress flags. Same shape and intent
     /// as `sync_in_progress` but for `sync_calendars`, so overlapping
     /// calendar-sync triggers (toolbar button + periodic tick + context
@@ -138,6 +142,7 @@ impl AppState {
             idle_handles: std::sync::Mutex::new(HashMap::new()),
             jmap_push_handles: std::sync::Mutex::new(HashMap::new()),
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
+            pending_mail_sync: std::sync::Mutex::new(HashMap::new()),
             calendar_sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             op_senders: std::sync::Mutex::new(HashMap::new()),
             data_dir,

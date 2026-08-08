@@ -125,21 +125,45 @@ fn try_acquire_account_sync_guard(
     try_acquire_sync_guard(&state.sync_in_progress, account_id, operation)
 }
 
-#[tauri::command]
-pub async fn trigger_sync(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    account_id: String,
+fn record_deferred_mail_sync(
+    pending: &Mutex<HashMap<String, Option<String>>>,
+    account_id: &str,
+    current_folder: Option<String>,
+) {
+    let mut pending = pending.lock().unwrap();
+    pending
+        .entry(account_id.to_string())
+        .and_modify(|folder| {
+            if current_folder.is_none() {
+                *folder = None;
+            } else if folder.is_some() {
+                *folder = current_folder.clone();
+            }
+        })
+        .or_insert(current_folder);
+}
+
+fn defer_mail_sync(state: &State<'_, AppState>, account_id: &str, current_folder: Option<String>) {
+    record_deferred_mail_sync(&state.pending_mail_sync, account_id, current_folder);
+}
+
+fn take_deferred_mail_sync(
+    state: &State<'_, AppState>,
+    account_id: &str,
+) -> Option<Option<String>> {
+    state.pending_mail_sync.lock().unwrap().remove(account_id)
+}
+
+async fn run_mail_sync_once(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account_id: &str,
     current_folder: Option<String>,
 ) -> Result<()> {
-    let Some(_guard) = try_acquire_account_sync_guard(&state, &account_id, "Sync") else {
-        return Ok(());
-    };
-
     log::info!("Sync requested for account {}", account_id);
     let account_result = {
         let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)
+        db::accounts::get_account_full(&conn, account_id)
     };
     let account = match account_result {
         Ok(a) => a,
@@ -175,7 +199,7 @@ pub async fn trigger_sync(
             "Suspending IMAP IDLE for account {} before sync",
             account_id
         );
-        suspend_imap_idle_for_account(&state, &account_id).await?
+        suspend_imap_idle_for_account(state, account_id).await?
     } else {
         false
     };
@@ -191,7 +215,7 @@ pub async fn trigger_sync(
     let sync_result = backend.sync_account(&ctx, &account, current_folder).await;
 
     let resume_result =
-        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
+        resume_imap_idle_for_account(app, state, &resume_account, suspended_idle).await;
     if let Err(e) = &sync_result {
         app.emit(
             "sync-error",
@@ -202,6 +226,56 @@ pub async fn trigger_sync(
     resume_result?;
 
     sync_result
+}
+
+async fn run_deferred_mail_syncs(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account_id: &str,
+    first_folder: Option<String>,
+) -> Result<()> {
+    let mut current_folder = first_folder;
+    loop {
+        let Some(guard) = try_acquire_account_sync_guard(state, account_id, "Deferred sync") else {
+            defer_mail_sync(state, account_id, current_folder);
+            return Ok(());
+        };
+
+        log::info!("Running deferred sync for account {}", account_id);
+        let sync_result = run_mail_sync_once(app, state, account_id, current_folder).await;
+        let next = take_deferred_mail_sync(state, account_id);
+        drop(guard);
+        sync_result?;
+
+        let Some(next_folder) = next else {
+            return Ok(());
+        };
+        current_folder = next_folder;
+    }
+}
+
+#[tauri::command]
+pub async fn trigger_sync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    current_folder: Option<String>,
+) -> Result<()> {
+    let Some(guard) = try_acquire_account_sync_guard(&state, &account_id, "Sync") else {
+        defer_mail_sync(&state, &account_id, current_folder);
+        return Ok(());
+    };
+
+    let sync_result = run_mail_sync_once(&app, &state, &account_id, current_folder).await;
+    let deferred = take_deferred_mail_sync(&state, &account_id);
+    drop(guard);
+    sync_result?;
+
+    if let Some(deferred_folder) = deferred {
+        run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -329,7 +403,7 @@ pub async fn prefetch_bodies(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<u32> {
-    let Some(_guard) = try_acquire_account_sync_guard(&state, &account_id, "Prefetch") else {
+    let Some(guard) = try_acquire_account_sync_guard(&state, &account_id, "Prefetch") else {
         return Ok(0);
     };
 
@@ -372,19 +446,28 @@ pub async fn prefetch_bodies(
     let resume_result =
         resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
 
-    match (prefetch_result, resume_result) {
-        (Ok(fetched_count), Ok(())) => Ok(fetched_count),
-        (Ok(_), Err(e)) => Err(e),
-        (Err(prefetch_error), Ok(())) => Err(prefetch_error),
+    let deferred = take_deferred_mail_sync(&state, &account_id);
+    drop(guard);
+
+    let fetched_count = match (prefetch_result, resume_result) {
+        (Ok(fetched_count), Ok(())) => fetched_count,
+        (Ok(_), Err(e)) => return Err(e),
+        (Err(prefetch_error), Ok(())) => return Err(prefetch_error),
         (Err(prefetch_error), Err(resume_error)) => {
             log::error!(
                 "Failed to resume IMAP IDLE after prefetch error for account {}: {}",
                 account_id,
                 resume_error
             );
-            Err(prefetch_error)
+            return Err(prefetch_error);
         }
+    };
+
+    if let Some(deferred_folder) = deferred {
+        run_deferred_mail_syncs(&app, &state, &account_id, deferred_folder).await?;
     }
+
+    Ok(fetched_count)
 }
 
 /// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
@@ -679,5 +762,27 @@ mod tests {
         drop(first);
         let retry = try_acquire_sync_guard(&flags, "acc-1", "test");
         assert!(retry.is_some());
+    }
+
+    #[test]
+    fn deferred_mail_sync_coalesces_to_broadest_request() {
+        let pending: Mutex<HashMap<String, Option<String>>> = Mutex::new(HashMap::new());
+
+        record_deferred_mail_sync(&pending, "acc-1", Some("INBOX".into()));
+        record_deferred_mail_sync(&pending, "acc-1", Some("Important".into()));
+        assert_eq!(
+            pending.lock().unwrap().get("acc-1").cloned(),
+            Some(Some("Important".into()))
+        );
+
+        record_deferred_mail_sync(&pending, "acc-1", None);
+        assert_eq!(pending.lock().unwrap().get("acc-1").cloned(), Some(None));
+
+        record_deferred_mail_sync(&pending, "acc-1", Some("INBOX".into()));
+        assert_eq!(
+            pending.lock().unwrap().get("acc-1").cloned(),
+            Some(None),
+            "a full-account pending sync must not be narrowed by a later folder hint",
+        );
     }
 }
