@@ -470,6 +470,7 @@ pub fn update_subject(conn: &Connection, message_id: &str, subject: &str) -> Res
 /// can be performed on them.
 pub fn get_message_uids(
     conn: &Connection,
+    account_id: &str,
     message_ids: &[String],
 ) -> Result<Vec<(String, String, u32)>> {
     if message_ids.is_empty() {
@@ -479,21 +480,25 @@ pub fn get_message_uids(
     let placeholders: String = message_ids
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
+        .map(|(i, _)| format!("?{}", i + 2))
         .collect::<Vec<_>>()
         .join(",");
 
     let query = format!(
-        "SELECT id, folder_path, uid FROM messages WHERE id IN ({})",
+        "SELECT id, folder_path, uid FROM messages \
+         WHERE account_id = ?1 AND id IN ({})",
         placeholders
     );
 
     let mut stmt = conn.prepare(&query)?;
 
-    let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::types::ToSql)
-        .collect();
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(message_ids.len() + 1);
+    params.push(&account_id);
+    params.extend(
+        message_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql),
+    );
 
     let rows = stmt
         .query_map(params.as_slice(), |row| {

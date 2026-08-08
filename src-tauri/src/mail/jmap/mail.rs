@@ -542,8 +542,8 @@ impl JmapConnection {
             ]
         });
 
-        self.api_request(&request, config).await?;
-        Ok(())
+        let response = self.api_request(&request, config).await?;
+        validate_set_flags_response(&response)
     }
 
     pub async fn delete_emails(&self, config: &JmapConfig, email_ids: &[String]) -> Result<()> {
@@ -955,6 +955,49 @@ fn flag_to_keyword(flag: &str) -> &str {
     }
 }
 
+fn validate_set_flags_response(response: &serde_json::Value) -> Result<()> {
+    let method_response = response
+        .get("methodResponses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|responses| responses.first())
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Other("JMAP set_flags returned no method response".into()))?;
+    let method_name = method_response
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let body = method_response.get(1).cloned().unwrap_or_default();
+    if method_name == "error" {
+        let description = body
+            .get("description")
+            .or_else(|| body.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown method error");
+        return Err(Error::Other(format!(
+            "JMAP set_flags failed: {}",
+            description
+        )));
+    }
+    if method_name != "Email/set" {
+        return Err(Error::Other(format!(
+            "JMAP set_flags returned unexpected method response '{}'",
+            method_name
+        )));
+    }
+    if let Some(not_updated) = body
+        .get("notUpdated")
+        .and_then(serde_json::Value::as_object)
+        .filter(|items| !items.is_empty())
+    {
+        return Err(Error::Other(format!(
+            "JMAP set_flags rejected {} message(s): {}",
+            not_updated.len(),
+            serde_json::Value::Object(not_updated.clone())
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct AddrJson {
     name: Option<String>,
@@ -1021,5 +1064,36 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
         from_email,
         date,
         snippet,
+    }
+}
+
+#[cfg(test)]
+mod set_flags_tests {
+    use super::validate_set_flags_response;
+
+    #[test]
+    fn accepts_successful_email_set() {
+        let response = serde_json::json!({
+            "methodResponses": [["Email/set", { "updated": { "id": null } }, "s1"]]
+        });
+        assert!(validate_set_flags_response(&response).is_ok());
+    }
+
+    #[test]
+    fn rejects_not_updated_and_method_errors() {
+        let not_updated = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notUpdated": { "id": { "type": "notFound" } }
+            }, "s1"]]
+        });
+        assert!(validate_set_flags_response(&not_updated).is_err());
+
+        let method_error = serde_json::json!({
+            "methodResponses": [["error", {
+                "type": "serverFail",
+                "description": "temporary failure"
+            }, "s1"]]
+        });
+        assert!(validate_set_flags_response(&method_error).is_err());
     }
 }

@@ -594,19 +594,35 @@ impl MailBackend for GraphMailBackend {
     }
 }
 
-/// Stateless executor. Move/delete/flag ops are already applied by the
-/// optimistic command path; queued sends cannot be replayed (see
-/// `execute`).
+/// Stateless executor for queued Graph operations.
 pub(super) struct GraphOpExecutor;
 
 #[async_trait]
 impl MailOpExecutor for GraphOpExecutor {
-    async fn execute(&mut self, _ctx: &MailSyncCtx, _account_id: &str, op: MailOp) -> Result<()> {
+    async fn execute(&mut self, _ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
         match op {
-            MailOp::MoveMessages { .. }
-            | MailOp::DeleteMessages { .. }
-            | MailOp::SetFlags { .. } => {
+            MailOp::MoveMessages { .. } | MailOp::DeleteMessages { .. } => {
                 log::debug!("Graph op handled by optimistic path");
+            }
+            MailOp::SetFlags { mutations } => {
+                let token = crate::mail::graph::get_graph_token(account_id).await?;
+                let client = crate::mail::graph::GraphClient::new(&token);
+                for mutation in mutations {
+                    let item_ids = mutation
+                        .message_refs
+                        .into_iter()
+                        .map(|message_ref| {
+                            message_ref.into_graph_item_id().ok_or_else(|| {
+                                Error::Other(
+                                    "Graph executor received a non-Graph message reference".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    client
+                        .set_flags(&item_ids, &mutation.flags, mutation.add)
+                        .await?;
+                }
             }
             MailOp::SendRaw { .. } => {
                 // Graph's server-side `/me/mailFolders/outbox` already holds

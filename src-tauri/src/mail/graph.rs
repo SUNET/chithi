@@ -1095,6 +1095,38 @@ impl GraphClient {
         Ok(())
     }
 
+    /// Set supported mail flags through Graph JSON batching.
+    pub async fn set_flags(
+        &self,
+        message_ids: &[String],
+        flags: &[String],
+        add: bool,
+    ) -> Result<()> {
+        let updates = graph_flag_updates(flags, add);
+        if updates.as_object().is_none_or(serde_json::Map::is_empty) {
+            return Ok(());
+        }
+        let requests: Vec<serde_json::Value> = message_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                serde_json::json!({
+                    "id": i.to_string(),
+                    "method": "PATCH",
+                    "url": format!("/me/messages/{}", id),
+                    "headers": { "Content-Type": "application/json" },
+                    "body": updates,
+                })
+            })
+            .collect();
+        for outcome in self.execute_batch_with_retry(requests).await? {
+            outcome.map_err(|error| {
+                Error::Other(format!("Graph set-flags batch item failed: {}", error))
+            })?;
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Calendar
     // -----------------------------------------------------------------------
@@ -1664,6 +1696,68 @@ impl GraphClient {
     /// Delete a contact.
     pub async fn delete_contact(&self, contact_id: &str) -> Result<()> {
         self.delete(&format!("/me/contacts/{}", contact_id)).await
+    }
+}
+
+fn graph_flag_updates(flags: &[String], add: bool) -> serde_json::Value {
+    let mut updates = serde_json::Map::new();
+    for flag in flags {
+        match flag.as_str() {
+            "seen" => {
+                updates.insert("isRead".into(), serde_json::Value::Bool(add));
+            }
+            "flagged" => {
+                updates.insert(
+                    "flag".into(),
+                    serde_json::json!({
+                        "flagStatus": if add { "flagged" } else { "notFlagged" }
+                    }),
+                );
+            }
+            local_only => {
+                log::debug!(
+                    "Graph keeps mail flag '{}' local-only because it has no remote mapping",
+                    local_only
+                );
+            }
+        }
+    }
+    serde_json::Value::Object(updates)
+}
+
+#[cfg(test)]
+mod flag_update_tests {
+    use super::graph_flag_updates;
+
+    #[test]
+    fn maps_seen_and_flagged_updates() {
+        let flags = vec!["seen".to_string(), "flagged".to_string()];
+        assert_eq!(
+            graph_flag_updates(&flags, true),
+            serde_json::json!({
+                "isRead": true,
+                "flag": { "flagStatus": "flagged" },
+            })
+        );
+        assert_eq!(
+            graph_flag_updates(&flags, false),
+            serde_json::json!({
+                "isRead": false,
+                "flag": { "flagStatus": "notFlagged" },
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_unmapped_flags_local_only() {
+        let updates = graph_flag_updates(&["answered".to_string()], true);
+        assert_eq!(updates, serde_json::json!({}));
+    }
+
+    #[test]
+    fn mixed_flags_still_apply_supported_updates() {
+        let updates = graph_flag_updates(&["seen".to_string(), "answered".to_string()], true);
+        assert_eq!(updates, serde_json::json!({ "isRead": true }));
     }
 }
 

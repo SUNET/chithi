@@ -4,7 +4,7 @@
 ///
 /// Database ids retain their existing underscore-delimited representation.
 /// Parsing therefore requires the account and, for JMAP, mailbox context.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BackendMessageRef {
     Imap {
         folder_path: String,
@@ -37,6 +37,25 @@ impl BackendMessageRef {
     pub fn graph(item_id: impl Into<String>) -> Self {
         Self::Graph {
             item_id: item_id.into(),
+        }
+    }
+
+    /// Recover a provider reference from an existing message database row.
+    ///
+    /// Unknown protocols retain the legacy IMAP fallback used by backend
+    /// resolution. JMAP parsing needs the exact mailbox context because all
+    /// components of its persisted id may contain underscores.
+    pub fn from_db_row(
+        protocol: &str,
+        account_id: &str,
+        db_id: &str,
+        folder_path: &str,
+        uid: u32,
+    ) -> Option<Self> {
+        match protocol {
+            "graph" => Some(Self::graph_from_db_id(account_id, db_id)),
+            "jmap" => Self::jmap_from_db_id(account_id, folder_path, db_id),
+            _ => Some(Self::imap(folder_path, uid)),
         }
     }
 
@@ -98,6 +117,21 @@ impl BackendMessageRef {
         match self {
             Self::Jmap { email_id, .. } => Some(email_id),
             _ => None,
+        }
+    }
+
+    /// Whether two references identify the same provider object for message
+    /// mutations. JMAP flags belong to the email object, which can appear in
+    /// multiple mailboxes, so mailbox membership is not part of this check.
+    pub fn same_message(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Jmap { email_id: left, .. },
+                Self::Jmap {
+                    email_id: right, ..
+                },
+            ) => left == right,
+            _ => self == other,
         }
     }
 }
@@ -189,6 +223,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_database_rows_by_protocol() {
+        assert_eq!(
+            BackendMessageRef::from_db_row("imap", "acc", "id", "INBOX", 7),
+            Some(BackendMessageRef::imap("INBOX", 7))
+        );
+        assert_eq!(
+            BackendMessageRef::from_db_row("jmap", "acc_1", "acc_1_box_one_mail_id", "box_one", 0,),
+            Some(BackendMessageRef::jmap("box_one", "mail_id"))
+        );
+        assert_eq!(
+            BackendMessageRef::from_db_row("graph", "acc_1", "acc_1_AAMk_id", "Inbox", 0),
+            Some(BackendMessageRef::graph("AAMk_id"))
+        );
+    }
+
+    #[test]
     fn rejects_jmap_ids_with_the_wrong_context() {
         assert!(
             BackendMessageRef::jmap_from_db_id("acc_1", "inbox", "different_inbox_email").is_none()
@@ -196,6 +246,14 @@ mod tests {
         assert!(
             BackendMessageRef::jmap_from_db_id("acc_1", "inbox", "acc_1_archive_email").is_none()
         );
+    }
+
+    #[test]
+    fn jmap_message_identity_ignores_mailbox_membership() {
+        assert!(BackendMessageRef::jmap("inbox", "email_1")
+            .same_message(&BackendMessageRef::jmap("archive", "email_1")));
+        assert!(!BackendMessageRef::jmap("inbox", "email_1")
+            .same_message(&BackendMessageRef::jmap("inbox", "email_2")));
     }
 
     #[test]

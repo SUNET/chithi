@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 
 /// RAII guard that clears the sync-in-progress flag on drop.
 pub(crate) struct SyncGuard(Arc<AtomicBool>);
@@ -224,6 +225,23 @@ async fn run_mail_sync_once(
         .ok();
     }
     resume_result?;
+
+    if sync_result.is_ok() {
+        let sender = state.get_op_sender(account_id, app);
+        if let Err(error) = sender
+            .send(OpEntry {
+                op: MailOp::ReplayOffline,
+                priority: OpPriority::Sync,
+            })
+            .await
+        {
+            log::warn!(
+                "Failed to request offline replay for account {}: {}",
+                account_id,
+                error
+            );
+        }
+    }
 
     sync_result
 }
