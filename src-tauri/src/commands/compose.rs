@@ -136,7 +136,7 @@ pub async fn send_message(
     // pattern as the existing encrypt-to-self fallback in
     // apply_pgp_envelope.
     if message.pgp_sign && account.pgp_attach_pubkey_on_sign {
-        if let Some(att) = build_signer_pubkey_attachment(&state, &account.email) {
+        if let Some(att) = build_signer_pubkey_attachment(&state, &account.email).await {
             attachment_data.push(att);
         }
     }
@@ -204,7 +204,7 @@ pub async fn send_message(
     // silently when the sender has no usable key in the keystore — the
     // header is an enhancement, not a guarantee.
     let raw_message = if account.pgp_autocrypt_header {
-        match build_autocrypt_header(&state, &account.email) {
+        match build_autocrypt_header(&state, &account.email).await {
             Some(header_line) => smtp::insert_header_before_body(&raw_message, &header_line),
             None => raw_message,
         }
@@ -990,7 +990,7 @@ async fn apply_pgp_envelope(
             .filter(|s| !s.trim().is_empty())
             .cloned()
             .collect();
-        if has_resolvable_public_key(&store, &account.email) {
+        if has_resolvable_public_key(&store, &account.email).await {
             if !recipients_contain(&visible_recipients, &account.email)
                 && !recipients_contain(&hidden_recipients, &account.email)
             {
@@ -1162,13 +1162,19 @@ fn recipients_contain(list: &[String], email: &str) -> bool {
 /// convention matches Thunderbird and Enigmail: `OpenPGP_0x<long-keyid>.asc`
 /// where `<long-keyid>` is the last 16 hex chars of the fingerprint, so
 /// receiving MUAs that file attached keys by name don't collide.
-fn build_signer_pubkey_attachment(
+async fn build_signer_pubkey_attachment(
     state: &State<'_, AppState>,
     sender_email: &str,
 ) -> Option<smtp::AttachmentData> {
     let store = state.pgp_store().ok()?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    signer_pubkey_attachment_from_store(&guard, sender_email)
+    let sender_email = sender_email.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        signer_pubkey_attachment_from_store(&guard, &sender_email)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Pure helper extracted out of `build_signer_pubkey_attachment` so the
@@ -1214,21 +1220,28 @@ fn signer_pubkey_attachment_from_store(
 /// `smtp::format_autocrypt_header`. The returned string is the header
 /// line WITHOUT a trailing CRLF — `insert_header_before_body` adds the
 /// framing.
-fn build_autocrypt_header(state: &State<'_, AppState>, sender_email: &str) -> Option<String> {
+async fn build_autocrypt_header(state: &State<'_, AppState>, sender_email: &str) -> Option<String> {
     let store = state.pgp_store().ok()?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let (_signer_data, signer_info) = libtumpa::store::resolve_signer(&guard, sender_email).ok()?;
-    let addr = extract_addr_spec(sender_email);
-    match libtumpa::key::export_public_for_autocrypt(&guard, &signer_info.fingerprint, &addr) {
-        Ok(keydata) => Some(smtp::format_autocrypt_header(&addr, &keydata)),
-        Err(e) => {
-            log::debug!(
-                "openpgp: no Autocrypt header for {} — export_public_for_autocrypt failed: {e}",
-                sender_email
-            );
-            None
+    let sender_email = sender_email.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        let (_signer_data, signer_info) =
+            libtumpa::store::resolve_signer(&guard, &sender_email).ok()?;
+        let addr = extract_addr_spec(&sender_email);
+        match libtumpa::key::export_public_for_autocrypt(&guard, &signer_info.fingerprint, &addr) {
+            Ok(keydata) => Some(smtp::format_autocrypt_header(&addr, &keydata)),
+            Err(e) => {
+                log::debug!(
+                    "openpgp: no Autocrypt header for {} — export_public_for_autocrypt failed: {e}",
+                    sender_email
+                );
+                None
+            }
         }
-    }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Encrypt a draft `raw_message` to the sender's own public key, in the
@@ -1248,8 +1261,7 @@ async fn encrypt_draft_to_self(
     raw_message: &[u8],
 ) -> Option<Vec<u8>> {
     let store = state.pgp_store().ok()?;
-    // Cheap precheck so we don't spawn a blocking task just to fail.
-    if !has_resolvable_public_key(&store, sender_email) {
+    if !has_resolvable_public_key(&store, sender_email).await {
         log::warn!(
             "openpgp: encrypt-drafts is on but no usable public key for {} — \
              saving plaintext draft",
@@ -1299,15 +1311,21 @@ fn encrypt_draft_core(
 /// true iff `resolve_recipient` returns Ok AND the key passes
 /// `ensure_key_usable_for_encryption`. Used as a precheck for the
 /// encrypt-to-self addition so we can skip it instead of failing the send.
-fn has_resolvable_public_key(
+async fn has_resolvable_public_key(
     store: &std::sync::Arc<std::sync::Mutex<libtumpa::KeyStore>>,
     id: &str,
 ) -> bool {
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    match libtumpa::store::resolve_recipient(&guard, id) {
-        Ok((_data, info)) => libtumpa::store::ensure_key_usable_for_encryption(&info).is_ok(),
-        Err(_) => false,
-    }
+    let store = store.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = store.lock().expect("pgp keystore mutex poisoned");
+        match libtumpa::store::resolve_recipient(&guard, &id) {
+            Ok((_data, info)) => libtumpa::store::ensure_key_usable_for_encryption(&info).is_ok(),
+            Err(_) => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Strip a display name to just the addr-spec ("Alice <a@x>" -> "a@x").

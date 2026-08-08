@@ -368,13 +368,23 @@ pub async fn prefetch_bodies(
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
     };
-    // Errors propagate without resuming IDLE, matching the pre-trait
-    // flow (only the success and nothing-to-do paths resume).
-    let fetched_count = backend.prefetch_bodies(&ctx, &account).await?;
+    let prefetch_result = backend.prefetch_bodies(&ctx, &account).await;
+    let resume_result =
+        resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
 
-    resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await?;
-
-    Ok(fetched_count)
+    match (prefetch_result, resume_result) {
+        (Ok(fetched_count), Ok(())) => Ok(fetched_count),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(prefetch_error), Ok(())) => Err(prefetch_error),
+        (Err(prefetch_error), Err(resume_error)) => {
+            log::error!(
+                "Failed to resume IMAP IDLE after prefetch error for account {}: {}",
+                account_id,
+                resume_error
+            );
+            Err(prefetch_error)
+        }
+    }
 }
 
 /// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
@@ -531,27 +541,97 @@ async fn start_jmap_push(
 /// Stop all IMAP IDLE loops and JMAP push tasks.
 #[tauri::command]
 pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
-    // Stop IMAP IDLE threads
-    let mut handles = state.idle_handles.lock().unwrap();
-    for (account_id, handle) in handles.drain() {
-        log::info!("Stopping IDLE loop for account {}", account_id);
-        handle
-            .stop_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = handle.thread {
-            drop(thread);
+    let idle_threads = {
+        let mut handles = state.idle_handles.lock().unwrap();
+        let mut threads = Vec::new();
+        for (account_id, mut handle) in handles.drain() {
+            log::info!("Stopping IDLE loop for account {}", account_id);
+            handle.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(thread) = handle.thread.take() {
+                threads.push((account_id, thread));
+            }
+        }
+        threads
+    };
+
+    let jmap_tasks = {
+        let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
+        let mut tasks = Vec::new();
+        for (account_id, handle) in jmap_handles.drain() {
+            log::info!("Stopping JMAP push for account {}", account_id);
+            handle.stop_flag.store(true, Ordering::Relaxed);
+            tasks.push((account_id, handle.task));
+        }
+        tasks
+    };
+
+    let mut stop_error: Option<Error> = None;
+
+    for (account_id, mut task) in jmap_tasks {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if e.is_cancelled() => {
+                log::debug!(
+                    "JMAP push task for account {} was already cancelled",
+                    account_id
+                );
+            }
+            Ok(Err(e)) => {
+                let msg = format!(
+                    "JMAP push task for account {} failed during stop: {}",
+                    account_id, e
+                );
+                log::error!("{}", msg);
+                stop_error.get_or_insert_with(|| Error::Sync(msg));
+            }
+            Err(_) => {
+                log::warn!(
+                    "JMAP push task for account {} did not stop gracefully; aborting",
+                    account_id
+                );
+                task.abort();
+                if let Err(e) = task.await {
+                    if !e.is_cancelled() {
+                        let msg = format!(
+                            "JMAP push task for account {} failed after abort: {}",
+                            account_id, e
+                        );
+                        log::error!("{}", msg);
+                        stop_error.get_or_insert_with(|| Error::Sync(msg));
+                    }
+                }
+            }
         }
     }
-    drop(handles);
 
-    // Stop JMAP push tasks
-    let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
-    for (account_id, handle) in jmap_handles.drain() {
-        log::info!("Stopping JMAP push for account {}", account_id);
-        handle
-            .stop_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        handle.task.abort();
+    for (account_id, thread) in idle_threads {
+        let join_task = tokio::task::spawn_blocking(move || thread.join());
+        match tokio::time::timeout(std::time::Duration::from_secs(5), join_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_))) => {
+                let msg = format!("IDLE loop for account {} panicked during stop", account_id);
+                log::error!("{}", msg);
+                stop_error.get_or_insert_with(|| Error::Sync(msg));
+            }
+            Ok(Err(e)) => {
+                let msg = format!(
+                    "Stopping IDLE loop for account {} panicked: {}",
+                    account_id, e
+                );
+                log::error!("{}", msg);
+                stop_error.get_or_insert_with(|| Error::Sync(msg));
+            }
+            Err(_) => {
+                log::warn!(
+                    "IDLE loop for account {} did not stop within 5s; it will exit after IDLE returns",
+                    account_id
+                );
+            }
+        }
+    }
+
+    if let Some(error) = stop_error {
+        return Err(error);
     }
 
     Ok(())

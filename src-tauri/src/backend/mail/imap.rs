@@ -187,16 +187,17 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
                                     let relative_path =
                                         format!("{}/{}/cur/{}", account_id, sanitized, filename);
                                     db_updates.push((message_id.clone(), relative_path));
-                                    count += 1;
                                 }
 
                                 if !db_updates.is_empty() {
+                                    let saved = db_updates.len() as u32;
                                     let conn = rt.block_on(db.writer());
-                                    conn.execute_batch("BEGIN").ok();
+                                    let tx = conn.unchecked_transaction()?;
                                     for (msg_id, path) in &db_updates {
-                                        db::messages::update_maildir_path(&conn, msg_id, path).ok();
+                                        db::messages::update_maildir_path(&tx, msg_id, path)?;
                                     }
-                                    conn.execute_batch("COMMIT").ok();
+                                    tx.commit()?;
+                                    count += saved;
                                     log::info!(
                                         "Prefetch[{}]: saved {} bodies in '{}'",
                                         thread_idx,
@@ -222,7 +223,24 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
                 .collect()
         });
 
-        let total: u32 = results.into_iter().flatten().sum();
+        let mut total = 0u32;
+        let mut first_error: Option<Error> = None;
+        for result in results {
+            match result {
+                Ok(count) => total += count,
+                Err(e) => {
+                    log::error!("Prefetch worker failed for account {}: {}", account_id, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
         log::info!(
             "Prefetch: completed for account {}, {} bodies fetched",
             account_id,

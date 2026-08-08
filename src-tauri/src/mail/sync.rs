@@ -318,14 +318,56 @@ fn sync_folder_envelopes(
     conn_imap: &mut ImapConnection,
     folder_path: &str,
 ) -> Result<u32> {
-    let (last_uid, stored_uid_next, stored_total) = {
+    let (mut last_uid, stored_uid_validity, stored_uid_next, stored_total) = {
         let conn = db.reader();
         let last_uid = db::folders::get_last_seen_uid(&conn, account_id, folder_path)?;
-        let (uid_next, total) = db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
-        (last_uid, uid_next, total)
+        let (uid_validity, uid_next, total) =
+            db::folders::get_folder_sync_state(&conn, account_id, folder_path)?;
+        (last_uid, uid_validity, uid_next, total)
     };
 
-    let (exists, _uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+    let (exists, uid_validity, uid_next) = conn_imap.select_folder(folder_path)?;
+
+    let has_local_uid_state = last_uid > 0 || stored_uid_next > 0 || stored_total > 0;
+    let unknown_uidvalidity_with_local_state =
+        stored_uid_validity == 0 && uid_validity > 0 && has_local_uid_state;
+    let uidvalidity_changed =
+        stored_uid_validity > 0 && uid_validity > 0 && stored_uid_validity != uid_validity;
+    let stale_uid_epoch = uid_next > 0 && last_uid >= uid_next;
+    if unknown_uidvalidity_with_local_state || uidvalidity_changed || stale_uid_epoch {
+        if unknown_uidvalidity_with_local_state {
+            log::warn!(
+                "Folder '{}' has local IMAP UID state without UIDVALIDITY; resetting",
+                folder_path
+            );
+        } else if uidvalidity_changed {
+            log::warn!(
+                "Folder '{}' UIDVALIDITY changed from {} to {}; resetting local IMAP sync state",
+                folder_path,
+                stored_uid_validity,
+                uid_validity
+            );
+        } else {
+            log::warn!(
+                "Folder '{}' has stale IMAP UID state (last_seen_uid={} >= uidnext={}); resetting",
+                folder_path,
+                last_uid,
+                uid_next
+            );
+        }
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.writer());
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
+        db::folders::update_last_seen_uid(&tx, account_id, folder_path, 0)?;
+        db::folders::update_uid_state(&tx, account_id, folder_path, uid_validity, uid_next)?;
+        db::folders::update_folder_counts(&tx, account_id, folder_path, 0, 0)?;
+        tx.commit()?;
+        last_uid = 0;
+    }
 
     // Preflight: if UIDNEXT and EXISTS haven't changed since last sync, the
     // folder is unchanged — skip deletion reconciliation, flag sync, and
@@ -430,7 +472,7 @@ fn sync_folder_envelopes(
         let unread = count_unread(&conn, account_id, folder_path)?;
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         if uid_next > 0 {
-            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+            db::folders::update_uid_state(&conn, account_id, folder_path, uid_validity, uid_next)?;
         }
         return Ok(0);
     }
@@ -459,8 +501,7 @@ fn sync_folder_envelopes(
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
-
-        conn.execute_batch("BEGIN")?;
+        let tx = conn.unchecked_transaction()?;
 
         for env in &envelopes {
             // In-memory existence check instead of per-message DB query
@@ -489,7 +530,7 @@ fn sync_folder_envelopes(
                 Some(env.references.as_slice())
             };
             let thread_id = db::messages::compute_thread_id(
-                &conn,
+                &tx,
                 account_id,
                 env.message_id.as_deref(),
                 env.in_reply_to.as_deref(),
@@ -522,16 +563,16 @@ fn sync_folder_envelopes(
                 maildir_path: String::new(),
                 snippet,
             };
-            db::messages::insert_message(&conn, &new_msg)?;
+            db::messages::insert_message(&tx, &new_msg)?;
             new_message_ids.push(id);
             total_synced += 1;
         }
 
         if let Some(&max_uid) = chunk.iter().max() {
-            db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+            db::folders::update_last_seen_uid(&tx, account_id, folder_path, max_uid)?;
         }
 
-        conn.execute_batch("COMMIT")?;
+        tx.commit()?;
     }
 
     // Run filter rules on newly synced messages
@@ -577,7 +618,7 @@ fn sync_folder_envelopes(
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         // Store uid_next for preflight optimization on next sync
         if uid_next > 0 {
-            db::folders::update_uid_next(&conn, account_id, folder_path, uid_next)?;
+            db::folders::update_uid_state(&conn, account_id, folder_path, uid_validity, uid_next)?;
         }
     }
 

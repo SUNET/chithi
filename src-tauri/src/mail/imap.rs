@@ -70,6 +70,11 @@ pub struct ImapConnection {
     session: Session<TlsStream<TcpStream>>,
 }
 
+/// Keep comma-separated UID FETCH commands below conservative server argument
+/// limits. Exchange/M365 rejects large explicit UID sets before we reach the
+/// database batch size used by sync.
+const IMAP_FETCH_UID_CHUNK_SIZE: usize = 100;
+
 impl ImapConnection {
     /// Connect and authenticate. Must be called from a blocking context.
     pub fn connect(config: &ImapConfig) -> Result<Self> {
@@ -216,39 +221,46 @@ impl ImapConnection {
             return Ok(vec![]);
         }
 
-        let uid_set: String = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        log::debug!(
-            "IMAP fetching {} envelopes (UIDs: {}...)",
-            uids.len(),
-            &uid_set[..uid_set.len().min(80)]
-        );
-
-        let fetches = self
-            .session
-            .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
-            .map_err(|e| {
-                log::error!("IMAP FETCH envelopes failed: {}", e);
-                Error::Imap(e.to_string())
-            })?;
+        log::debug!("IMAP fetching {} envelopes", uids.len());
 
         let mut results = Vec::new();
-        for fetch in fetches.iter() {
-            let uid = match fetch.uid {
-                Some(u) => u,
-                None => continue,
-            };
-            let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
-            let size = fetch.size.unwrap_or(0) as u64;
+        for chunk in uids.chunks(IMAP_FETCH_UID_CHUNK_SIZE) {
+            let uid_set = uid_set_string(chunk);
+            log::debug!(
+                "IMAP fetching {} envelopes (UIDs: {}...)",
+                chunk.len(),
+                &uid_set[..uid_set.len().min(80)]
+            );
 
-            // Parse ENVELOPE
-            let envelope = fetch.envelope();
-            let (subject, from_name, from_email, to_json, cc_json, date_str, msg_id, in_reply_to) =
-                if let Some(env) = envelope {
+            let fetches = self
+                .session
+                .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
+                .map_err(|e| {
+                    log::error!("IMAP FETCH envelopes failed: {}", e);
+                    Error::Imap(e.to_string())
+                })?;
+
+            let mut chunk_results = Vec::new();
+            for fetch in fetches.iter() {
+                let uid = match fetch.uid {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
+                let size = fetch.size.unwrap_or(0) as u64;
+
+                // Parse ENVELOPE
+                let envelope = fetch.envelope();
+                let (
+                    subject,
+                    from_name,
+                    from_email,
+                    to_json,
+                    cc_json,
+                    date_str,
+                    msg_id,
+                    in_reply_to,
+                ) = if let Some(env) = envelope {
                     let subject = env.subject.as_ref().map(|s| decode_imap_str(s));
 
                     let (fname, femail) = env
@@ -302,38 +314,40 @@ impl ImapConnection {
                     )
                 };
 
-            // Check for attachments from BODYSTRUCTURE
-            // Simple heuristic: if the response text mentions "attachment", it likely has one
-            // More accurate: check if it's multipart/mixed (indicates attachments)
-            let has_attachments = size > 10000; // rough heuristic; will improve later
+                // Check for attachments from BODYSTRUCTURE
+                // Simple heuristic: if the response text mentions "attachment", it likely has one
+                // More accurate: check if it's multipart/mixed (indicates attachments)
+                let has_attachments = size > 10000; // rough heuristic; will improve later
 
-            results.push(EnvelopeData {
-                uid,
-                subject,
-                from_name,
-                from_email,
-                to_addresses: to_json,
-                cc_addresses: cc_json,
-                date: date_str,
-                message_id: msg_id,
-                in_reply_to,
-                references: Vec::new(),
-                flags,
-                size,
-                has_attachments,
-            });
+                chunk_results.push(EnvelopeData {
+                    uid,
+                    subject,
+                    from_name,
+                    from_email,
+                    to_addresses: to_json,
+                    cc_addresses: cc_json,
+                    date: date_str,
+                    message_id: msg_id,
+                    in_reply_to,
+                    references: Vec::new(),
+                    flags,
+                    size,
+                    has_attachments,
+                });
+            }
+
+            // References travels in a second, header-only fetch. Combining it
+            // with ENVELOPE in one FETCH triggers an imap-proto parse error on
+            // some servers (the literal-string framing of the body fetch leaks
+            // into the next command's response). A second pass is one extra
+            // round-trip per chunk but keeps the connection state clean.
+            if !chunk_results.is_empty() {
+                self.populate_references(&mut chunk_results, &uid_set);
+                results.extend(chunk_results);
+            }
         }
+
         log::info!("IMAP envelope batch: {} envelopes fetched", results.len());
-
-        // References travels in a second, header-only fetch. Combining it
-        // with ENVELOPE in one FETCH triggers an imap-proto parse error on
-        // some servers (the literal-string framing of the body fetch leaks
-        // into the next command's response). A second pass is one extra
-        // round-trip per batch but keeps the connection state clean.
-        if !results.is_empty() {
-            self.populate_references(&mut results, &uid_set);
-        }
-
         Ok(results)
     }
 
