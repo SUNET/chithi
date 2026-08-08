@@ -906,6 +906,60 @@ mod tests {
     }
 
     #[test]
+    fn newest_read_removes_an_older_bulk_exclusion() {
+        let conn = setup_db();
+        let bulk = MailOp::SetFlags {
+            mutations: vec![FlagMutation {
+                target: FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                },
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        };
+        let (_, payload) = mail_op_to_outbox(&bulk).unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        let message_ref = BackendMessageRef::imap("INBOX", 9);
+        let unread = FlagMutation {
+            target: FlagTarget::messages(vec![message_ref.clone()]),
+            flags: vec!["seen".into()],
+            add: false,
+        };
+        supersede_pending_flag_ops(&conn, "acc1", std::slice::from_ref(&unread)).unwrap();
+        let (_, payload) = mail_op_to_outbox(&MailOp::SetFlags {
+            mutations: vec![unread],
+        })
+        .unwrap();
+        queue_offline_op(&conn, "acc1", "set_flags", &payload).unwrap();
+
+        supersede_pending_flag_ops(
+            &conn,
+            "acc1",
+            &[FlagMutation {
+                target: FlagTarget::messages(vec![message_ref]),
+                flags: vec!["seen".into()],
+                add: true,
+            }],
+        )
+        .unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 1);
+        match outbox_to_mail_op(&pending[0]).unwrap() {
+            MailOp::SetFlags { mutations } => assert_eq!(
+                mutations[0].target,
+                FlagTarget::AllMessagesInFolders {
+                    folder_paths: vec!["INBOX".into()],
+                    excluded_refs: Vec::new(),
+                }
+            ),
+            _ => panic!("Expected SetFlags"),
+        }
+    }
+
+    #[test]
     fn newer_bulk_read_supersedes_older_message_intent_in_covered_folders() {
         let conn = setup_db();
         let old = MailOp::SetFlags {

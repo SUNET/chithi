@@ -707,7 +707,15 @@ fn execute_imap_op(
                             }
                             excluded_by_folder.entry(folder_path).or_default().push(uid);
                         }
+                        let selectable_folders = conn.list_selectable_folder_paths()?;
                         for folder_path in &folder_paths {
+                            if !selectable_folders.contains(folder_path) {
+                                log::debug!(
+                                    "Skipping non-selectable or stale IMAP folder '{}' for bulk read",
+                                    folder_path
+                                );
+                                continue;
+                            }
                             select_folder_if_needed(conn, selected, folder_path)?;
                             conn.mark_all_seen()?;
                             if let Some(uids) = excluded_by_folder.get(folder_path) {

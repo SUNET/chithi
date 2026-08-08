@@ -1,3 +1,4 @@
+use imap::types::NameAttribute;
 use imap::Session;
 use native_tls::TlsStream;
 use std::net::TcpStream;
@@ -5,6 +6,10 @@ use std::net::TcpStream;
 use crate::error::{Error, Result};
 use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
+
+fn mailbox_is_selectable(attributes: &[NameAttribute<'_>]) -> bool {
+    !attributes.contains(&NameAttribute::NoSelect)
+}
 
 #[derive(Clone)]
 pub struct ImapConfig {
@@ -168,6 +173,21 @@ impl ImapConnection {
             log::debug!("  folder: {} ({})", display, path);
         }
         Ok(folders)
+    }
+
+    /// Return the raw paths of mailboxes that currently accept `SELECT`.
+    /// LIST entries marked `\Noselect` remain visible to folder sync but must
+    /// not be used by bulk mailbox operations.
+    pub fn list_selectable_folder_paths(&mut self) -> Result<std::collections::HashSet<String>> {
+        let mailboxes = self.session.list(None, Some("*")).map_err(|e| {
+            log::error!("IMAP LIST failed while resolving selectable folders: {}", e);
+            Error::Imap(e.to_string())
+        })?;
+        Ok(mailboxes
+            .iter()
+            .filter(|mailbox| mailbox_is_selectable(mailbox.attributes()))
+            .map(|mailbox| mailbox.name().to_string())
+            .collect())
     }
 
     /// SELECT a folder. Returns (exists, uid_validity, uid_next).
@@ -1062,6 +1082,18 @@ mod quote_mailbox_tests {
                 bad
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mailbox_selectability_tests {
+    use super::{mailbox_is_selectable, NameAttribute};
+
+    #[test]
+    fn noselect_attribute_is_not_executable() {
+        assert!(!mailbox_is_selectable(&[NameAttribute::NoSelect]));
+        assert!(mailbox_is_selectable(&[NameAttribute::NoInferiors]));
+        assert!(mailbox_is_selectable(&[]));
     }
 }
 

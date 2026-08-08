@@ -139,11 +139,39 @@ pub fn subtract_flag_mutation(older: FlagMutation, newer: &FlagMutation) -> Vec<
             },
             FlagTarget::Messages(new_refs),
         ) => {
-            // A same-value per-message write is already fulfilled by the
-            // older bulk write. Excluding it would incorrectly undo a newer
-            // successful write when only the older operation later replays.
             if older.add == newer.add {
-                return vec![older];
+                let exclusions_left: Vec<_> = excluded_refs
+                    .iter()
+                    .filter(|excluded_ref| !contains_ref(new_refs, excluded_ref))
+                    .cloned()
+                    .collect();
+                if exclusions_left.len() == excluded_refs.len() {
+                    return vec![older];
+                }
+
+                let restored_target = FlagTarget::AllMessagesInFolders {
+                    folder_paths: folder_paths.clone(),
+                    excluded_refs: exclusions_left,
+                };
+                if remaining_flags.is_empty() {
+                    return vec![FlagMutation {
+                        target: restored_target,
+                        flags: older.flags,
+                        add: older.add,
+                    }];
+                }
+                return vec![
+                    FlagMutation {
+                        target: older.target,
+                        flags: remaining_flags,
+                        add: older.add,
+                    },
+                    FlagMutation {
+                        target: restored_target,
+                        flags: overlapping_flags,
+                        add: older.add,
+                    },
+                ];
             }
             let additions: Vec<_> = new_refs
                 .iter()
