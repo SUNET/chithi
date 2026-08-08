@@ -206,12 +206,36 @@ pub fn get_dead_ops(conn: &Connection, account_id: &str) -> Result<Vec<OutboxEnt
 pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value)> {
     match op {
         MailOp::MoveMessages {
-            by_folder,
+            message_refs,
+            target_folder,
+        } if message_refs
+            .iter()
+            .all(|message_ref| matches!(message_ref, BackendMessageRef::Imap { .. })) =>
+        {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                if let BackendMessageRef::Imap { folder_path, uid } = message_ref {
+                    by_folder.entry(folder_path.clone()).or_default().push(*uid);
+                }
+            }
+            Some((
+                "move",
+                serde_json::json!({
+                    "by_folder": by_folder,
+                    "target_folder": target_folder,
+                }),
+            ))
+        }
+        MailOp::MoveMessages {
+            message_refs,
             target_folder,
         } => Some((
             "move",
             serde_json::json!({
-                "by_folder": by_folder,
+                "message_refs": message_refs
+                    .iter()
+                    .map(message_ref_to_json)
+                    .collect::<Vec<_>>(),
                 "target_folder": target_folder,
             }),
         )),
@@ -363,6 +387,21 @@ pub fn queue_failed_delete(
     rewrite_pending_flags_for_delete(&transaction, account_id, message_refs)?;
     transaction.commit().map_err(Error::Database)?;
     Ok(outbox_id)
+}
+
+/// Preserve a move that could not be sent to the account worker.
+pub fn queue_failed_move(
+    conn: &Connection,
+    account_id: &str,
+    message_refs: &[BackendMessageRef],
+    target_folder: &str,
+) -> Result<i64> {
+    let (_, payload) = mail_op_to_outbox(&MailOp::MoveMessages {
+        message_refs: message_refs.to_vec(),
+        target_folder: target_folder.to_string(),
+    })
+    .expect("MoveMessages is serializable");
+    queue_offline_op(conn, account_id, "move", &payload)
 }
 
 fn rewrite_pending_flags_for_delete(
@@ -614,24 +653,69 @@ fn legacy_delete_refs(
     }
 }
 
+fn legacy_move_refs(
+    entry: &OutboxEntry,
+    payload: &serde_json::Value,
+) -> Option<Vec<BackendMessageRef>> {
+    let protocol = payload.get("protocol")?.as_str()?;
+    let message_ids = payload.get("message_ids")?.as_array()?;
+    match protocol {
+        "graph" => message_ids
+            .iter()
+            .map(|id| {
+                Some(BackendMessageRef::graph_from_db_id(
+                    &entry.account_id,
+                    id.as_str()?,
+                ))
+            })
+            .collect(),
+        "jmap" => {
+            log::error!("Rejecting legacy JMAP move payload with ambiguous message identity");
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Convert an outbox entry back to a MailOp for replay.
 pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload_json).ok()?;
     match entry.action_type.as_str() {
         "move" => {
-            let by_folder: std::collections::HashMap<String, Vec<u32>> =
-                serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
-            if !validate_folder_paths(&by_folder) {
-                log::warn!("outbox_to_mail_op: rejected move op with invalid folder path");
+            let message_refs = if let Some(by_folder) = payload.get("by_folder") {
+                let by_folder: std::collections::HashMap<String, Vec<u32>> =
+                    serde_json::from_value(by_folder.clone()).ok()?;
+                if !validate_folder_paths(&by_folder) {
+                    log::warn!("outbox_to_mail_op: rejected move op with invalid folder path");
+                    return None;
+                }
+                by_folder
+                    .into_iter()
+                    .flat_map(|(folder_path, uids)| {
+                        uids.into_iter()
+                            .map(move |uid| BackendMessageRef::imap(folder_path.clone(), uid))
+                    })
+                    .collect()
+            } else if let Some(message_refs) = payload.get("message_refs") {
+                message_refs
+                    .as_array()?
+                    .iter()
+                    .map(message_ref_from_json)
+                    .collect::<Option<Vec<_>>>()?
+            } else {
+                legacy_move_refs(entry, &payload)?
+            };
+            if message_refs.is_empty() || !message_refs.iter().all(valid_delete_ref) {
+                log::warn!("outbox_to_mail_op: rejected move op with invalid message reference");
                 return None;
             }
             let target_folder = payload.get("target_folder")?.as_str()?.to_string();
-            if target_folder.contains('\0') || target_folder.contains('\n') {
+            if target_folder.is_empty() || !valid_folder_path(&target_folder) {
                 log::warn!("outbox_to_mail_op: rejected move op with invalid target folder");
                 return None;
             }
             Some(MailOp::MoveMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             })
         }
@@ -730,8 +814,6 @@ pub fn is_dead(entry: &OutboxEntry) -> bool {
 mod tests {
     use super::*;
     use crate::mail::compat::BackendMessageRef;
-    use std::collections::HashMap;
-
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -819,7 +901,11 @@ mod tests {
     #[test]
     fn test_roundtrip_mail_op() {
         let op = MailOp::MoveMessages {
-            by_folder: HashMap::from([("INBOX".to_string(), vec![1, 2, 3])]),
+            message_refs: vec![
+                BackendMessageRef::imap("INBOX", 1),
+                BackendMessageRef::imap("INBOX", 2),
+                BackendMessageRef::imap("INBOX", 3),
+            ],
             target_folder: "Trash".to_string(),
         };
         let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
@@ -832,15 +918,86 @@ mod tests {
 
         match restored {
             MailOp::MoveMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             } => {
                 assert_eq!(target_folder, "Trash");
-                assert_eq!(by_folder["INBOX"], vec![1, 2, 3]);
+                assert_eq!(message_refs.len(), 3);
+                assert!(message_refs.contains(&BackendMessageRef::imap("INBOX", 1)));
+                assert!(message_refs.contains(&BackendMessageRef::imap("INBOX", 2)));
+                assert!(message_refs.contains(&BackendMessageRef::imap("INBOX", 3)));
             }
             _ => panic!("Expected MoveMessages"),
         }
         mark_completed(&conn, id).unwrap();
+    }
+
+    #[test]
+    fn provider_move_references_round_trip_without_delimiter_parsing() {
+        for message_ref in [
+            BackendMessageRef::jmap("box_with_under", "email_with_under"),
+            BackendMessageRef::graph("AAMk_with_under"),
+        ] {
+            let op = MailOp::MoveMessages {
+                message_refs: vec![message_ref],
+                target_folder: "target_with_under".into(),
+            };
+            let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+            assert!(payload.get("message_refs").is_some());
+            assert_eq!(
+                outbox_to_mail_op(&outbox_entry(action_type, payload)),
+                Some(op)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_graph_move_is_recovered_but_ambiguous_jmap_is_rejected() {
+        let graph = outbox_entry(
+            "move",
+            serde_json::json!({
+                "protocol": "graph",
+                "message_ids": ["acc1_AAMk_with_under"],
+                "target_folder": "archive"
+            }),
+        );
+        assert_eq!(
+            outbox_to_mail_op(&graph),
+            Some(MailOp::MoveMessages {
+                message_refs: vec![BackendMessageRef::graph("AAMk_with_under")],
+                target_folder: "archive".into()
+            })
+        );
+
+        let jmap = outbox_entry(
+            "move",
+            serde_json::json!({
+                "protocol": "jmap",
+                "message_ids": ["acc1_mailbox_email_with_under"],
+                "target_folder": "archive"
+            }),
+        );
+        assert!(outbox_to_mail_op(&jmap).is_none());
+    }
+
+    #[test]
+    fn move_rejects_invalid_references_and_targets() {
+        for payload in [
+            serde_json::json!({
+                "message_refs": [{ "kind": "graph", "item_id": "" }],
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "message_refs": [{ "kind": "graph", "item_id": "id" }],
+                "target_folder": ""
+            }),
+            serde_json::json!({
+                "by_folder": { "INBOX": [1] },
+                "target_folder": "bad\rpath"
+            }),
+        ] {
+            assert!(outbox_to_mail_op(&outbox_entry("move", payload)).is_none());
+        }
     }
 
     fn outbox_entry(action_type: &str, payload: serde_json::Value) -> OutboxEntry {
@@ -1182,6 +1339,26 @@ mod tests {
             outbox_to_mail_op(&pending[1]),
             Some(MailOp::DeleteMessages {
                 message_refs: vec![deleted]
+            })
+        );
+    }
+
+    #[test]
+    fn failed_enqueue_persists_typed_move() {
+        let conn = setup_db();
+        let message_refs = vec![BackendMessageRef::jmap(
+            "mailbox_with_under",
+            "email_with_under",
+        )];
+        queue_failed_move(&conn, "acc1", &message_refs, "archive").unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            outbox_to_mail_op(&pending[0]),
+            Some(MailOp::MoveMessages {
+                message_refs,
+                target_folder: "archive".into(),
             })
         );
     }

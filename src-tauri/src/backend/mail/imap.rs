@@ -642,9 +642,19 @@ fn execute_imap_op(
 ) -> Result<()> {
     match op {
         MailOp::MoveMessages {
-            by_folder,
+            message_refs,
             target_folder,
         } => {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref
+                else {
+                    return Err(Error::Other(
+                        "IMAP executor received a non-IMAP message reference".into(),
+                    ));
+                };
+                by_folder.entry(folder_path).or_default().push(uid);
+            }
             for (folder_path, uids) in &by_folder {
                 select_folder_if_needed(conn, selected, folder_path)?;
                 conn.move_messages(uids, &target_folder)?;

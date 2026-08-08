@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use super::flags::FlagTarget;
 use super::queue::{MailOp, OpEntry};
 
@@ -47,26 +45,30 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                 }
             }
             MailOp::MoveMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             } => {
                 if let Some(OpEntry {
                     op:
                         MailOp::MoveMessages {
-                            by_folder: pending,
+                            message_refs: pending,
                             target_folder: pending_target,
                         },
                     ..
                 }) = result.last_mut()
                 {
                     if *pending_target == target_folder {
-                        merge_by_folder(pending, by_folder);
+                        for message_ref in message_refs {
+                            if !pending.contains(&message_ref) {
+                                pending.push(message_ref);
+                            }
+                        }
                         continue;
                     }
                 }
                 result.push(OpEntry {
                     op: MailOp::MoveMessages {
-                        by_folder,
+                        message_refs,
                         target_folder,
                     },
                     priority: entry.priority,
@@ -139,19 +141,13 @@ fn push_unique_ref(
     }
 }
 
-/// Merge UIDs from `source` into `target`, combining by folder key.
-fn merge_by_folder(target: &mut HashMap<String, Vec<u32>>, source: HashMap<String, Vec<u32>>) {
-    for (folder, uids) in source {
-        target.entry(folder).or_default().extend(uids);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mail::compat::BackendMessageRef;
     use crate::ops::flags::FlagMutation;
     use crate::ops::queue::OpPriority;
+    use std::collections::HashMap;
 
     #[test]
     fn coalesce_multiple_deletes() {
@@ -219,14 +215,19 @@ mod tests {
         let ops = vec![
             OpEntry {
                 op: MailOp::MoveMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![1])]),
+                    message_refs: vec![BackendMessageRef::imap("INBOX", 1)],
                     target_folder: "Trash".into(),
                 },
                 priority: OpPriority::User,
             },
             OpEntry {
                 op: MailOp::MoveMessages {
-                    by_folder: HashMap::from([("INBOX".into(), vec![2, 3])]),
+                    message_refs: vec![
+                        BackendMessageRef::imap("INBOX", 1),
+                        BackendMessageRef::imap("INBOX", 2),
+                        BackendMessageRef::jmap("inbox", "email_1"),
+                        BackendMessageRef::jmap("archive", "email_1"),
+                    ],
                     target_folder: "Trash".into(),
                 },
                 priority: OpPriority::User,
@@ -237,11 +238,13 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0].op {
             MailOp::MoveMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             } => {
                 assert_eq!(target_folder, "Trash");
-                assert_eq!(by_folder["INBOX"].len(), 3);
+                assert_eq!(message_refs.len(), 4);
+                assert!(message_refs.contains(&BackendMessageRef::jmap("inbox", "email_1")));
+                assert!(message_refs.contains(&BackendMessageRef::jmap("archive", "email_1")));
             }
             _ => panic!("Expected MoveMessages"),
         }

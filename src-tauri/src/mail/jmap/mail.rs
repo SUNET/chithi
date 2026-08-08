@@ -620,26 +620,29 @@ impl JmapConnection {
             from_mailbox,
             to_mailbox
         );
-        let mut update = serde_json::Map::new();
-        for id in email_ids {
-            update.insert(
-                id.clone(),
-                serde_json::json!({
-                    format!("mailboxIds/{}", from_mailbox): null,
-                    format!("mailboxIds/{}", to_mailbox): true,
-                }),
-            );
+        for (index, chunk) in delete_chunks(email_ids, self.max_objects_in_set).enumerate() {
+            let mut update = serde_json::Map::new();
+            for id in chunk {
+                update.insert(
+                    id.clone(),
+                    serde_json::json!({
+                        format!("mailboxIds/{}", from_mailbox): null,
+                        format!("mailboxIds/{}", to_mailbox): true,
+                    }),
+                );
+            }
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/set", {
+                        "accountId": self.account_id,
+                        "update": update
+                    }, format!("mv{}", index + 1)]
+                ]
+            });
+            let response = self.api_request(&request, config).await?;
+            validate_move_response(&response, chunk)?;
         }
-        let request = serde_json::json!({
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                ["Email/set", {
-                    "accountId": self.account_id,
-                    "update": update
-                }, "mv1"]
-            ]
-        });
-        self.api_request(&request, config).await?;
         Ok(())
     }
 
@@ -1078,6 +1081,69 @@ fn validate_delete_response(response: &serde_json::Value, email_ids: &[String]) 
     Ok(())
 }
 
+fn validate_move_response(response: &serde_json::Value, email_ids: &[String]) -> Result<()> {
+    let method_response = response
+        .get("methodResponses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|responses| responses.first())
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Other("JMAP move returned no method response".into()))?;
+    let method_name = method_response
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let body = method_response.get(1).cloned().unwrap_or_default();
+    if method_name == "error" {
+        let description = body
+            .get("description")
+            .or_else(|| body.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown method error");
+        return Err(Error::Other(format!("JMAP move failed: {}", description)));
+    }
+    if method_name != "Email/set" {
+        return Err(Error::Other(format!(
+            "JMAP move returned unexpected method response '{}'",
+            method_name
+        )));
+    }
+    let updated = body
+        .get("updated")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let not_updated = body
+        .get("notUpdated")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let failures: serde_json::Map<String, serde_json::Value> = not_updated
+        .iter()
+        .filter(|(_, error)| {
+            error.get("type").and_then(serde_json::Value::as_str) != Some("notFound")
+        })
+        .map(|(id, error)| (id.clone(), error.clone()))
+        .collect();
+    if !failures.is_empty() {
+        return Err(Error::Other(format!(
+            "JMAP move rejected {} message(s): {}",
+            failures.len(),
+            serde_json::Value::Object(failures)
+        )));
+    }
+    let unreported: Vec<_> = email_ids
+        .iter()
+        .filter(|email_id| !updated.contains_key(*email_id) && !not_updated.contains_key(*email_id))
+        .collect();
+    if !unreported.is_empty() {
+        return Err(Error::Other(format!(
+            "JMAP move omitted {} message(s) from its response",
+            unreported.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct AddrJson {
     name: Option<String>,
@@ -1149,7 +1215,10 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
 
 #[cfg(test)]
 mod set_flags_tests {
-    use super::{delete_chunks, validate_delete_response, validate_set_flags_response};
+    use super::{
+        delete_chunks, validate_delete_response, validate_move_response,
+        validate_set_flags_response,
+    };
 
     #[test]
     fn accepts_successful_email_set() {
@@ -1219,5 +1288,42 @@ mod set_flags_tests {
             "methodResponses": [["Email/set", {}, "d1"]]
         });
         assert!(validate_delete_response(&omitted, &ids).is_err());
+    }
+
+    #[test]
+    fn move_accepts_updated_and_not_found_messages() {
+        let ids = vec!["id".to_string()];
+        let updated = serde_json::json!({
+            "methodResponses": [["Email/set", { "updated": { "id": null } }, "mv1"]]
+        });
+        assert!(validate_move_response(&updated, &ids).is_ok());
+
+        let not_found = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notUpdated": { "id": { "type": "notFound" } }
+            }, "mv1"]]
+        });
+        assert!(validate_move_response(&not_found, &ids).is_ok());
+    }
+
+    #[test]
+    fn move_rejects_item_method_and_omission_errors() {
+        let ids = vec!["id".to_string()];
+        let forbidden = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notUpdated": { "id": { "type": "forbidden" } }
+            }, "mv1"]]
+        });
+        assert!(validate_move_response(&forbidden, &ids).is_err());
+
+        let method_error = serde_json::json!({
+            "methodResponses": [["error", { "type": "serverFail" }, "mv1"]]
+        });
+        assert!(validate_move_response(&method_error, &ids).is_err());
+
+        let omitted = serde_json::json!({
+            "methodResponses": [["Email/set", {}, "mv1"]]
+        });
+        assert!(validate_move_response(&omitted, &ids).is_err());
     }
 }

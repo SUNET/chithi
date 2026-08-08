@@ -60,155 +60,116 @@ pub async fn move_messages(
         message_ids.len(),
         target_folder
     );
+    if target_folder.is_empty()
+        || target_folder.contains('\0')
+        || target_folder.contains('\n')
+        || target_folder.contains('\r')
+    {
+        return Err(Error::Other(
+            "Invalid target folder for move operation".into(),
+        ));
+    }
 
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    // Gather data needed for the server operation before we modify the DB.
-    // For IMAP we need UIDs grouped by folder; for JMAP/Graph we need the IDs.
-    let imap_by_folder =
-        if account.mail_protocol_str() != "graph" && account.mail_protocol_str() != "jmap" {
-            let conn = state.db.reader();
-            let uid_rows = db::messages::get_message_uids(&conn, &account_id, &message_ids)?;
-            let grouped = group_by_folder(uid_rows);
-            if grouped.is_empty() {
-                log::warn!("No messages found for move operation");
-                return Ok(());
-            }
-            Some(grouped)
-        } else {
-            None
-        };
+    let message_rows = {
+        let conn = state.db.reader();
+        db::messages::get_message_uids(&conn, &account_id, &message_ids)?
+    };
+    let resolved: Vec<(String, BackendMessageRef)> = message_rows
+        .into_iter()
+        .filter(|(_, folder_path, _)| folder_path != &target_folder)
+        .map(|(db_id, folder_path, uid)| {
+            let message_ref = BackendMessageRef::from_db_row(
+                account.mail_protocol_str(),
+                &account_id,
+                &db_id,
+                &folder_path,
+                uid,
+            )
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Invalid {} message id '{}' for folder '{}'",
+                    account.mail_protocol_str(),
+                    db_id,
+                    folder_path
+                ))
+            })?;
+            Ok((db_id, message_ref))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if resolved.is_empty() {
+        log::warn!("No messages found for move operation");
+        return Ok(());
+    }
 
     // --- Optimistic: update local DB and notify UI immediately ---
     {
         let conn = state.db.writer().await;
-        db::messages::delete_messages_by_ids(&conn, &message_ids)?;
-        db::folders::recalculate_folder_counts(&conn, &account_id)?;
+        let transaction = conn.unchecked_transaction().map_err(Error::Database)?;
+        let resolved_ids: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();
+        db::messages::delete_messages_for_account(&transaction, &account_id, &resolved_ids)?;
+        db::folders::recalculate_folder_counts(&transaction, &account_id)?;
+        transaction.commit().map_err(Error::Database)?;
     }
     emit_messages_changed(&app, &account_id);
     emit_folders_changed(&app, &account_id);
 
-    // --- Background: send to worker queue (IMAP) or spawn ad-hoc (JMAP/Graph) ---
-    if account.mail_protocol_str() == "imap" {
-        if let Some(by_folder) = imap_by_folder {
-            let sender = state.get_op_sender(&account_id, &app);
-            if let Err(e) = sender
-                .send(OpEntry {
-                    op: MailOp::MoveMessages {
-                        by_folder,
-                        target_folder: target_folder.clone(),
-                    },
-                    priority: OpPriority::User,
-                })
-                .await
-            {
-                log::error!("Failed to queue move op for account {}: {}", account_id, e);
-                app.emit(
-                    "op-failed",
-                    serde_json::json!({
-                        "account_id": account_id,
-                        "op_type": "move",
-                        "error": format!("Failed to queue operation: {}", e),
-                    }),
-                )
-                .ok();
-            }
-        }
-    } else {
-        // JMAP/Graph: async HTTP, spawn directly
-        let app_bg = app.clone();
-        let account_id_bg = account_id.clone();
-        let message_ids_bg = message_ids.clone();
-        let target_folder_bg = target_folder.clone();
-        let db_bg = state.db.clone();
-
-        tokio::spawn(async move {
-            let result: std::result::Result<(), Error> = async {
-                if account.mail_protocol_str() == "graph" {
-                    let token = crate::mail::graph::get_graph_token(&account_id_bg).await?;
-                    let client = crate::mail::graph::GraphClient::new(&token);
-                    let mut errors: Vec<String> = Vec::new();
-                    for mid in &message_ids_bg {
-                        let graph_id = mid
-                            .strip_prefix(&format!("{}_", account_id_bg))
-                            .unwrap_or(mid);
-                        if let Err(e) = client.move_message(graph_id, &target_folder_bg).await {
-                            log::error!("Graph move failed for {}: {}", graph_id, e);
-                            errors.push(format!("{}: {}", graph_id, e));
-                        }
-                    }
-                    if !errors.is_empty() {
-                        return Err(Error::Other(format!(
-                            "Graph move failed for {} message(s): {}",
-                            errors.len(),
-                            errors.join("; ")
-                        )));
-                    }
-                } else if account.mail_protocol_str() == "jmap" {
-                    let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                    let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
-                    for mid in &message_ids_bg {
-                        let parts: Vec<&str> = mid.splitn(3, '_').collect();
-                        if parts.len() == 3 {
-                            by_folder
-                                .entry(parts[1].to_string())
-                                .or_default()
-                                .push(parts[2].to_string());
-                        }
-                    }
-                    let conn_jmap =
-                        crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-                    for (source_mailbox, jmap_ids) in &by_folder {
-                        conn_jmap
-                            .move_emails(&jmap_config, jmap_ids, source_mailbox, &target_folder_bg)
-                            .await?;
-                    }
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = result {
-                log::error!(
-                    "Background move failed for account {}: {}",
-                    account_id_bg,
-                    e
-                );
-                // Queue to offline outbox for retry on next sync
-                let payload = serde_json::json!({
-                    "protocol": account.mail_protocol,
-                    "message_ids": message_ids_bg,
-                    "target_folder": target_folder_bg,
-                });
-                let conn = db_bg.writer().await;
-                match crate::ops::offline::queue_offline_op(&conn, &account_id_bg, "move", &payload)
-                {
-                    Ok(id) => log::info!(
-                        "Queued failed JMAP/Graph move to outbox (id={}) for account {}",
-                        id,
-                        account_id_bg
-                    ),
-                    Err(db_err) => log::error!(
-                        "Failed to queue offline move op for account {}: {}",
-                        account_id_bg,
-                        db_err
-                    ),
-                }
-                app_bg
-                    .emit(
-                        "op-failed",
-                        serde_json::json!({
-                            "account_id": account_id_bg,
-                            "op_type": "move",
-                            "error": format!("{} (will retry)", e),
-                        }),
-                    )
-                    .ok();
-            }
-        });
+    let message_refs = resolved
+        .into_iter()
+        .map(|(_, message_ref)| message_ref)
+        .collect();
+    let sender = state.get_op_sender(&account_id, &app);
+    if let Err(e) = sender
+        .send(OpEntry {
+            op: MailOp::MoveMessages {
+                message_refs,
+                target_folder: target_folder.clone(),
+            },
+            priority: OpPriority::User,
+        })
+        .await
+    {
+        let queue_error = e.to_string();
+        log::error!(
+            "Failed to queue move op for account {}: {}",
+            account_id,
+            queue_error
+        );
+        let (message_refs, target_folder) = match e.0.op {
+            MailOp::MoveMessages {
+                message_refs,
+                target_folder,
+            } => (message_refs, target_folder),
+            _ => unreachable!("failed operation was constructed as a move"),
+        };
+        let outbox_id = {
+            let conn = state.db.writer().await;
+            crate::ops::offline::queue_failed_move(
+                &conn,
+                &account_id,
+                &message_refs,
+                &target_folder,
+            )?
+        };
+        log::info!(
+            "Persisted unqueued move to outbox (id={}) for account {}",
+            outbox_id,
+            account_id
+        );
+        app.emit(
+            "op-failed",
+            serde_json::json!({
+                "account_id": account_id,
+                "op_type": "move",
+                "error": format!("Failed to queue operation: {} (will retry)", queue_error),
+            }),
+        )
+        .ok();
     }
 
     Ok(())
