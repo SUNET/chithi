@@ -602,6 +602,40 @@ pub(super) struct GraphOpExecutor;
 impl MailOpExecutor for GraphOpExecutor {
     async fn execute(&mut self, _ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
         match op {
+            MailOp::CopyMessages {
+                message_refs,
+                target_folder,
+            } => {
+                let item_ids = message_refs
+                    .into_iter()
+                    .map(|message_ref| {
+                        message_ref.into_graph_item_id().ok_or_else(|| {
+                            Error::Other(
+                                "Graph executor received a non-Graph message reference".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let token = crate::mail::graph::get_graph_token(account_id).await?;
+                let client = crate::mail::graph::GraphClient::new(&token);
+                let outcomes = client
+                    .copy_messages_batch(&item_ids, &target_folder)
+                    .await?;
+                let failures: Vec<String> = item_ids
+                    .iter()
+                    .zip(outcomes)
+                    .filter_map(|(item_id, outcome)| {
+                        outcome.err().map(|error| format!("{}: {}", item_id, error))
+                    })
+                    .collect();
+                if !failures.is_empty() {
+                    return Err(Error::Other(format!(
+                        "Graph copy failed for {} message(s): {}",
+                        failures.len(),
+                        failures.join("; ")
+                    )));
+                }
+            }
             MailOp::MoveMessages {
                 message_refs,
                 target_folder,

@@ -747,9 +747,10 @@ fn execute_imap_op(
             }
         }
         MailOp::CopyMessages {
-            by_folder,
+            message_refs,
             target_folder,
         } => {
+            let by_folder = group_imap_message_refs(message_refs)?;
             for (folder_path, uids) in &by_folder {
                 select_folder_if_needed(conn, selected, folder_path)?;
                 conn.copy_messages(uids, &target_folder)?;
@@ -758,6 +759,21 @@ fn execute_imap_op(
         _ => {}
     }
     Ok(())
+}
+
+fn group_imap_message_refs(
+    message_refs: Vec<crate::mail::compat::BackendMessageRef>,
+) -> Result<std::collections::HashMap<String, Vec<u32>>> {
+    let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+    for message_ref in message_refs {
+        let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref else {
+            return Err(Error::Other(
+                "IMAP executor received a non-IMAP message reference".into(),
+            ));
+        };
+        by_folder.entry(folder_path).or_default().push(uid);
+    }
+    Ok(by_folder)
 }
 
 /// SELECT a folder on the IMAP connection, skipping if already selected.
@@ -771,4 +787,28 @@ fn select_folder_if_needed(
         *selected = Some(folder.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_imap_message_refs;
+    use crate::mail::compat::BackendMessageRef;
+
+    #[test]
+    fn copy_references_are_grouped_by_source_folder() {
+        let grouped = group_imap_message_refs(vec![
+            BackendMessageRef::imap("INBOX", 1),
+            BackendMessageRef::imap("Archive", 2),
+            BackendMessageRef::imap("INBOX", 3),
+        ])
+        .unwrap();
+        assert_eq!(grouped["INBOX"], vec![1, 3]);
+        assert_eq!(grouped["Archive"], vec![2]);
+    }
+
+    #[test]
+    fn copy_rejects_non_imap_references() {
+        let result = group_imap_message_refs(vec![BackendMessageRef::graph("item")]);
+        assert!(result.is_err());
+    }
 }

@@ -5,14 +5,15 @@ use crate::mail::compat::BackendMessageRef;
 use crate::ops::flags::{remove_deleted_refs, subtract_flag_mutation, FlagMutation, FlagTarget};
 use crate::ops::queue::MailOp;
 
-/// Replay order matching Thunderbird's `nsImapOfflineSync`:
-/// flags (0) -> moves (1) -> copies (2) -> deletes (3).
+/// Replay order matching operation dependencies:
+/// flags (0) -> copies (1) -> moves (2) -> deletes (3).
+/// Copies precede moves because moving an IMAP message invalidates its source UID.
 /// `send` is independent of folder state, so it goes last (4).
 fn replay_order(action_type: &str) -> i32 {
     match action_type {
         "set_flags" => 0,
-        "move" => 1,
-        "copy" => 2,
+        "copy" => 1,
+        "move" => 2,
         "delete" => 3,
         "send" => 4,
         _ => 5,
@@ -33,7 +34,7 @@ pub struct OutboxEntry {
 
 /// Write a failed operation to the outbox for later replay.
 ///
-/// Replay order (flags -> moves -> copies -> deletes) is computed at read
+/// Replay order (flags -> copies -> moves -> deletes) is computed at read
 /// time in `get_pending_ops` via `replay_order()`, so no extra column or
 /// workaround is needed here.
 pub fn queue_offline_op(
@@ -65,6 +66,23 @@ pub fn queue_offline_op_with_status(
     .map_err(Error::Database)?;
     let id = conn.last_insert_rowid();
     Ok(id)
+}
+
+/// Preserve an operation for visibility without scheduling automatic replay.
+pub fn queue_dead_op(
+    conn: &Connection,
+    account_id: &str,
+    action_type: &str,
+    payload: &serde_json::Value,
+    error: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outbox (account_id, action_type, payload_json, status, retry_count, error_message)
+         VALUES (?1, ?2, ?3, 'dead', 0, ?4)",
+        rusqlite::params![account_id, action_type, payload.to_string(), error],
+    )
+    .map_err(Error::Database)?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Flip a 'sending' row back to 'pending' so the worker will retry it
@@ -121,7 +139,7 @@ pub fn get_pending_ops(conn: &Connection, account_id: &str) -> Result<Vec<Outbox
         .filter_map(|r| r.ok())
         .collect();
 
-    // Sort by replay order: flags -> moves -> copies -> deletes.
+    // Sort by replay order: flags -> copies -> moves -> deletes.
     // Use stable ordering: break ties by id to preserve insertion order.
     entries.sort_by(|a, b| {
         replay_order(&a.action_type)
@@ -275,12 +293,36 @@ pub fn mail_op_to_outbox(op: &MailOp) -> Option<(&'static str, serde_json::Value
             Some(("set_flags", payload))
         }
         MailOp::CopyMessages {
-            by_folder,
+            message_refs,
+            target_folder,
+        } if message_refs
+            .iter()
+            .all(|message_ref| matches!(message_ref, BackendMessageRef::Imap { .. })) =>
+        {
+            let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
+            for message_ref in message_refs {
+                if let BackendMessageRef::Imap { folder_path, uid } = message_ref {
+                    by_folder.entry(folder_path.clone()).or_default().push(*uid);
+                }
+            }
+            Some((
+                "copy",
+                serde_json::json!({
+                    "by_folder": by_folder,
+                    "target_folder": target_folder,
+                }),
+            ))
+        }
+        MailOp::CopyMessages {
+            message_refs,
             target_folder,
         } => Some((
             "copy",
             serde_json::json!({
-                "by_folder": by_folder,
+                "message_refs": message_refs
+                    .iter()
+                    .map(message_ref_to_json)
+                    .collect::<Vec<_>>(),
                 "target_folder": target_folder,
             }),
         )),
@@ -402,6 +444,21 @@ pub fn queue_failed_move(
     })
     .expect("MoveMessages is serializable");
     queue_offline_op(conn, account_id, "move", &payload)
+}
+
+/// Preserve a copy that could not be sent to the account worker.
+pub fn queue_failed_copy(
+    conn: &Connection,
+    account_id: &str,
+    message_refs: &[BackendMessageRef],
+    target_folder: &str,
+) -> Result<i64> {
+    let (_, payload) = mail_op_to_outbox(&MailOp::CopyMessages {
+        message_refs: message_refs.to_vec(),
+        target_folder: target_folder.to_string(),
+    })
+    .expect("CopyMessages is serializable");
+    queue_offline_op(conn, account_id, "copy", &payload)
 }
 
 fn rewrite_pending_flags_for_delete(
@@ -618,7 +675,7 @@ fn message_ref_from_json(
     }
 }
 
-fn valid_delete_ref(message_ref: &BackendMessageRef) -> bool {
+fn valid_message_ref(message_ref: &BackendMessageRef) -> bool {
     match message_ref {
         BackendMessageRef::Imap { folder_path, uid } => valid_folder_path(folder_path) && *uid > 0,
         BackendMessageRef::Jmap {
@@ -627,6 +684,16 @@ fn valid_delete_ref(message_ref: &BackendMessageRef) -> bool {
         } => !mailbox_id.is_empty() && !email_id.is_empty(),
         BackendMessageRef::Graph { item_id } => !item_id.is_empty(),
     }
+}
+
+fn message_refs_have_one_provider(message_refs: &[BackendMessageRef]) -> bool {
+    let Some(first) = message_refs.first() else {
+        return false;
+    };
+    let provider = std::mem::discriminant(first);
+    message_refs
+        .iter()
+        .all(|message_ref| std::mem::discriminant(message_ref) == provider)
 }
 
 fn legacy_delete_refs(
@@ -705,7 +772,7 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             } else {
                 legacy_move_refs(entry, &payload)?
             };
-            if message_refs.is_empty() || !message_refs.iter().all(valid_delete_ref) {
+            if message_refs.is_empty() || !message_refs.iter().all(valid_message_ref) {
                 log::warn!("outbox_to_mail_op: rejected move op with invalid message reference");
                 return None;
             }
@@ -739,7 +806,7 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             } else {
                 legacy_delete_refs(entry, &payload)?
             };
-            if message_refs.is_empty() || !message_refs.iter().all(valid_delete_ref) {
+            if message_refs.is_empty() || !message_refs.iter().all(valid_message_ref) {
                 log::warn!("outbox_to_mail_op: rejected delete op with invalid message reference");
                 return None;
             }
@@ -758,10 +825,41 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
             Some(MailOp::SetFlags { mutations })
         }
         "copy" => {
-            let by_folder = serde_json::from_value(payload.get("by_folder")?.clone()).ok()?;
+            let message_refs = if let Some(by_folder) = payload.get("by_folder") {
+                let by_folder: std::collections::HashMap<String, Vec<u32>> =
+                    serde_json::from_value(by_folder.clone()).ok()?;
+                if !validate_folder_paths(&by_folder) {
+                    log::warn!("outbox_to_mail_op: rejected copy op with invalid folder path");
+                    return None;
+                }
+                by_folder
+                    .into_iter()
+                    .flat_map(|(folder_path, uids)| {
+                        uids.into_iter()
+                            .map(move |uid| BackendMessageRef::imap(folder_path.clone(), uid))
+                    })
+                    .collect()
+            } else {
+                payload
+                    .get("message_refs")?
+                    .as_array()?
+                    .iter()
+                    .map(message_ref_from_json)
+                    .collect::<Option<Vec<_>>>()?
+            };
+            if !message_refs_have_one_provider(&message_refs)
+                || !message_refs.iter().all(valid_message_ref)
+            {
+                log::warn!("outbox_to_mail_op: rejected copy op with invalid message reference");
+                return None;
+            }
             let target_folder = payload.get("target_folder")?.as_str()?.to_string();
+            if target_folder.is_empty() || !valid_folder_path(&target_folder) {
+                log::warn!("outbox_to_mail_op: rejected copy op with invalid target folder");
+                return None;
+            }
             Some(MailOp::CopyMessages {
-                by_folder,
+                message_refs,
                 target_folder,
             })
         }
@@ -847,6 +945,17 @@ mod tests {
     }
 
     #[test]
+    fn copy_replays_before_move() {
+        let conn = setup_db();
+        queue_offline_op(&conn, "acc1", "move", &serde_json::json!({})).unwrap();
+        queue_offline_op(&conn, "acc1", "copy", &serde_json::json!({})).unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending[0].action_type, "copy");
+        assert_eq!(pending[1].action_type, "move");
+    }
+
+    #[test]
     fn test_mark_completed_removes_entry() {
         let conn = setup_db();
         let id = queue_offline_op(&conn, "acc1", "delete", &serde_json::json!({})).unwrap();
@@ -866,6 +975,28 @@ mod tests {
         assert_eq!(
             dead[0].error_message.as_deref(),
             Some("invalid delete payload")
+        );
+    }
+
+    #[test]
+    fn queue_dead_op_is_visible_but_not_pending() {
+        let conn = setup_db();
+        let id = queue_dead_op(
+            &conn,
+            "acc1",
+            "copy",
+            &serde_json::json!({ "message_refs": [] }),
+            "ambiguous copy outcome",
+        )
+        .unwrap();
+
+        assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
+        let dead = get_dead_ops(&conn, "acc1").unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, id);
+        assert_eq!(
+            dead[0].error_message.as_deref(),
+            Some("ambiguous copy outcome")
         );
     }
 
@@ -998,6 +1129,100 @@ mod tests {
         ] {
             assert!(outbox_to_mail_op(&outbox_entry("move", payload)).is_none());
         }
+    }
+
+    #[test]
+    fn imap_copy_preserves_legacy_payload() {
+        let op = MailOp::CopyMessages {
+            message_refs: vec![
+                BackendMessageRef::imap("INBOX", 1),
+                BackendMessageRef::imap("INBOX", 2),
+            ],
+            target_folder: "Archive".into(),
+        };
+        let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+        assert_eq!(action_type, "copy");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "by_folder": { "INBOX": [1, 2] },
+                "target_folder": "Archive"
+            })
+        );
+        assert_eq!(
+            outbox_to_mail_op(&outbox_entry(action_type, payload)),
+            Some(op)
+        );
+    }
+
+    #[test]
+    fn provider_copy_references_round_trip_without_delimiter_parsing() {
+        for message_ref in [
+            BackendMessageRef::jmap("box_with_under", "email_with_under"),
+            BackendMessageRef::graph("AAMk_with_under"),
+        ] {
+            let op = MailOp::CopyMessages {
+                message_refs: vec![message_ref],
+                target_folder: "target_with_under".into(),
+            };
+            let (action_type, payload) = mail_op_to_outbox(&op).unwrap();
+            assert!(payload.get("message_refs").is_some());
+            assert_eq!(
+                outbox_to_mail_op(&outbox_entry(action_type, payload)),
+                Some(op)
+            );
+        }
+    }
+
+    #[test]
+    fn copy_rejects_invalid_references_and_targets() {
+        for payload in [
+            serde_json::json!({
+                "message_refs": [],
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "by_folder": { "INBOX": [0] },
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "message_refs": [{ "kind": "graph", "item_id": "" }],
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "message_refs": [{ "kind": "jmap", "mailbox_id": "box", "email_id": "" }],
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "message_refs": [
+                    { "kind": "imap", "folder_path": "INBOX", "uid": 1 },
+                    { "kind": "graph", "item_id": "item" }
+                ],
+                "target_folder": "archive"
+            }),
+            serde_json::json!({
+                "by_folder": { "INBOX": [1] },
+                "target_folder": "bad\npath"
+            }),
+        ] {
+            assert!(outbox_to_mail_op(&outbox_entry("copy", payload)).is_none());
+        }
+    }
+
+    #[test]
+    fn queue_failed_copy_persists_provider_references() {
+        let conn = setup_db();
+        let refs = vec![BackendMessageRef::graph("item_with_under")];
+        queue_failed_copy(&conn, "acc1", &refs, "archive").unwrap();
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(
+            outbox_to_mail_op(&pending[0]),
+            Some(MailOp::CopyMessages {
+                message_refs: refs,
+                target_folder: "archive".into(),
+            })
+        );
     }
 
     fn outbox_entry(action_type: &str, payload: serde_json::Value) -> OutboxEntry {

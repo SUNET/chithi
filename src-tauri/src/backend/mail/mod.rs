@@ -4,7 +4,7 @@
 //! (account sync, per-folder sync, body prefetch) plus capability
 //! flags for the command-layer concurrency machinery (IDLE
 //! suspension, background folder sync). Queued user operations
-//! (move/delete/flag/send) go through the ops worker; the
+//! (move/copy/delete/flag/send) go through the ops worker; the
 //! protocol-specific push/idle starters (`start_imap_idle`,
 //! `start_jmap_push`) stay per-provider like meet auth flows.
 

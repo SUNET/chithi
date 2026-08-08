@@ -25,13 +25,14 @@ pub(crate) fn is_item_not_found(error: &Error) -> bool {
 /// out of order.
 ///
 /// A batch can return outer HTTP 200 while individual sub-responses are
-/// throttled (429) or transient (503/504). Those items are NOT written
-/// into `results`; they come back as `(index, retry_after_secs)` so the
-/// caller can retry just the affected sub-requests after the per-item
-/// delay. Everything else is recorded as a final outcome.
+/// throttled (429) or transient (503/504). Retryable items are NOT written
+/// into `results`; they come back as `(index, retry_after_secs)` so the caller
+/// can retry just those sub-requests. Non-idempotent callers can disable
+/// retries for ambiguous 503/504 responses. Everything else is final.
 fn apply_batch_responses(
     resp: &serde_json::Value,
     results: &mut [Result<()>],
+    retry_transient_errors: bool,
 ) -> Vec<(usize, u64)> {
     let mut retryable = Vec::new();
     let Some(responses) = resp["responses"].as_array() else {
@@ -47,7 +48,7 @@ fn apply_batch_responses(
         let status = r["status"].as_u64().unwrap_or(0) as u16;
         if (200..300).contains(&status) {
             results[idx] = Ok(());
-        } else if matches!(status, 429 | 503 | 504) {
+        } else if status == 429 || (retry_transient_errors && matches!(status, 503 | 504)) {
             let delay = batch_item_retry_after(r).unwrap_or(5);
             retryable.push((idx, delay));
         } else {
@@ -71,6 +72,25 @@ fn batch_item_retry_after(r: &serde_json::Value) -> Option<u64> {
         .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
         .and_then(|(_, v)| v.as_str())
         .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn build_copy_batch_requests(
+    message_ids: &[String],
+    dest_folder_id: &str,
+) -> Vec<serde_json::Value> {
+    message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            serde_json::json!({
+                "id": format!("{}", i),
+                "method": "POST",
+                "url": format!("/me/messages/{}/copy", id),
+                "headers": { "Content-Type": "application/json" },
+                "body": { "destinationId": dest_folder_id }
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -895,16 +915,14 @@ impl GraphClient {
         Ok(())
     }
 
-    /// Execute pre-built `$batch` sub-requests (each carrying an `id` set
-    /// to its global index), chunked at [`BATCH_SIZE`]. Sub-responses that
-    /// come back 429/503/504 are retried after their per-item
-    /// `Retry-After` delay, up to 3 rounds; a retried operation that
-    /// already committed server-side resolves to a 404
-    /// `ErrorItemNotFound`, which callers treat as a stale local row —
-    /// so retrying moves/deletes converges instead of duplicating work.
+    /// Execute pre-built `$batch` sub-requests (each carrying an `id` set to
+    /// its global index), chunked at [`BATCH_SIZE`]. A 429 is retried after its
+    /// per-item `Retry-After` delay. Callers may also enable 503/504 retries
+    /// for convergent operations such as move and delete.
     async fn execute_batch_with_retry(
         &self,
         requests: Vec<serde_json::Value>,
+        retry_transient_errors: bool,
     ) -> Result<Vec<Result<()>>> {
         const MAX_ROUNDS: u32 = 3;
         const MAX_RETRY_AFTER_SECS: u64 = 120;
@@ -923,7 +941,11 @@ impl GraphClient {
                 let resp = self
                     .post_json("/$batch", &serde_json::json!({ "requests": chunk }))
                     .await?;
-                retry_indices.extend(apply_batch_responses(&resp, &mut results));
+                retry_indices.extend(apply_batch_responses(
+                    &resp,
+                    &mut results,
+                    retry_transient_errors,
+                ));
             }
 
             if round >= MAX_ROUNDS {
@@ -993,7 +1015,21 @@ impl GraphClient {
                 })
             })
             .collect();
-        self.execute_batch_with_retry(requests).await
+        self.execute_batch_with_retry(requests, true).await
+    }
+
+    /// Copy messages to a destination folder using JSON batching.
+    ///
+    /// Unlike move and delete, copy is not idempotent. Retry definite 429
+    /// throttling responses, but leave ambiguous 503/504 outcomes as errors so
+    /// this call does not immediately create a second copy.
+    pub async fn copy_messages_batch(
+        &self,
+        message_ids: &[String],
+        dest_folder_id: &str,
+    ) -> Result<Vec<Result<()>>> {
+        let requests = build_copy_batch_requests(message_ids, dest_folder_id);
+        self.execute_batch_with_retry(requests, false).await
     }
 
     /// Delete messages using JSON batching. Same contract as
@@ -1010,7 +1046,7 @@ impl GraphClient {
                 })
             })
             .collect();
-        self.execute_batch_with_retry(requests).await
+        self.execute_batch_with_retry(requests, true).await
     }
 
     pub async fn move_message(&self, message_id: &str, dest_folder_id: &str) -> Result<()> {
@@ -1084,7 +1120,7 @@ impl GraphClient {
                 })
             })
             .collect();
-        self.execute_batch_with_retry(requests).await
+        self.execute_batch_with_retry(requests, true).await
     }
 
     /// Mark messages as read or unread.
@@ -1125,7 +1161,7 @@ impl GraphClient {
                 })
             })
             .collect();
-        for outcome in self.execute_batch_with_retry(requests).await? {
+        for outcome in self.execute_batch_with_retry(requests, true).await? {
             outcome.map_err(|error| {
                 Error::Other(format!("Graph set-flags batch item failed: {}", error))
             })?;
@@ -2748,7 +2784,8 @@ async fn get_graph_token_with_scopes(
 #[cfg(test)]
 mod batch_tests {
     use super::{
-        apply_batch_responses, is_delta_resync_required, is_item_not_found, DELTA_RESYNC_MARKER,
+        apply_batch_responses, build_copy_batch_requests, is_delta_resync_required,
+        is_item_not_found, DELTA_RESYNC_MARKER,
     };
     use crate::error::Error;
 
@@ -2767,7 +2804,7 @@ mod batch_tests {
             ]
         });
         let mut results = fresh_results(2);
-        apply_batch_responses(&resp, &mut results);
+        apply_batch_responses(&resp, &mut results, true);
         assert!(results[0].is_ok());
         assert!(results[1].is_ok());
     }
@@ -2785,7 +2822,7 @@ mod batch_tests {
             ]
         });
         let mut results = fresh_results(2);
-        apply_batch_responses(&resp, &mut results);
+        apply_batch_responses(&resp, &mut results, true);
         assert!(results[0].is_ok());
         // The stale-id detection in commands::filters matches on "404" +
         // "ErrorItemNotFound" appearing in the error text.
@@ -2802,7 +2839,7 @@ mod batch_tests {
     fn batch_responses_missing_item_stays_err() {
         let resp = serde_json::json!({ "responses": [ { "id": "0", "status": 200 } ] });
         let mut results = fresh_results(2);
-        apply_batch_responses(&resp, &mut results);
+        apply_batch_responses(&resp, &mut results, true);
         assert!(results[0].is_ok());
         assert!(
             results[1].is_err(),
@@ -2827,12 +2864,37 @@ mod batch_tests {
             ]
         });
         let mut results = fresh_results(3);
-        let retryable = apply_batch_responses(&resp, &mut results);
+        let retryable = apply_batch_responses(&resp, &mut results, true);
         assert!(results[0].is_ok());
         // Throttled items keep their placeholder (not a final outcome yet).
         assert!(results[1].is_err());
         assert!(results[2].is_err());
         assert_eq!(retryable, vec![(1, 17), (2, 3)]);
+    }
+
+    #[test]
+    fn copy_batch_requests_use_copy_endpoint_and_destination() {
+        let requests = build_copy_batch_requests(&["message_1".into()], "archive_1");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "POST");
+        assert_eq!(requests[0]["url"], "/me/messages/message_1/copy");
+        assert_eq!(requests[0]["body"]["destinationId"], "archive_1");
+    }
+
+    #[test]
+    fn copy_batch_does_not_retry_ambiguous_transient_errors() {
+        let resp = serde_json::json!({
+            "responses": [
+                { "id": "0", "status": 429, "headers": { "Retry-After": "2" } },
+                { "id": "1", "status": 503 },
+                { "id": "2", "status": 504 },
+            ]
+        });
+        let mut results = fresh_results(3);
+        let retryable = apply_batch_responses(&resp, &mut results, false);
+        assert_eq!(retryable, vec![(0, 2)]);
+        assert!(results[1].as_ref().unwrap_err().to_string().contains("503"));
+        assert!(results[2].as_ref().unwrap_err().to_string().contains("504"));
     }
 
     /// Regression: delta events must keep server order. An update followed

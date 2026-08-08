@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use tauri::{Emitter, State};
 
 use crate::db;
@@ -575,10 +574,6 @@ pub async fn set_message_flags(
 }
 
 /// Copy messages to a target folder on the server.
-///
-/// Currently only IMAP accounts support server-side copy. For JMAP and Graph
-/// accounts the command logs a warning and returns Ok, since those protocols
-/// would need a different implementation path.
 #[tauri::command]
 pub async fn copy_messages(
     app: tauri::AppHandle,
@@ -593,28 +588,47 @@ pub async fn copy_messages(
         message_ids.len(),
         target_folder
     );
+    if target_folder.is_empty()
+        || target_folder.contains('\0')
+        || target_folder.contains('\n')
+        || target_folder.contains('\r')
+    {
+        return Err(Error::Other(
+            "Invalid target folder for copy operation".into(),
+        ));
+    }
 
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.mail_protocol_str() != "imap" {
-        log::warn!(
-            "Copy not implemented for protocol '{}' (account {}). Skipping.",
-            account.mail_protocol,
-            account_id
-        );
-        return Ok(());
-    }
-
-    let by_folder = {
+    let message_rows = {
         let conn = state.db.reader();
-        let uid_rows = db::messages::get_message_uids(&conn, &account_id, &message_ids)?;
-        group_by_folder(uid_rows)
+        db::messages::get_message_uids(&conn, &account_id, &message_ids)?
     };
+    let message_refs = message_rows
+        .into_iter()
+        .map(|(db_id, folder_path, uid)| {
+            BackendMessageRef::from_db_row(
+                account.mail_protocol_str(),
+                &account_id,
+                &db_id,
+                &folder_path,
+                uid,
+            )
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Invalid {} message id '{}' for folder '{}'",
+                    account.mail_protocol_str(),
+                    db_id,
+                    folder_path
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    if by_folder.is_empty() {
+    if message_refs.is_empty() {
         log::warn!("No messages found for copy operation");
         return Ok(());
     }
@@ -624,20 +638,46 @@ pub async fn copy_messages(
     if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::CopyMessages {
-                by_folder,
+                message_refs,
                 target_folder: target_folder.clone(),
             },
             priority: OpPriority::User,
         })
         .await
     {
-        log::error!("Failed to queue copy op for account {}: {}", account_id, e);
+        let queue_error = e.to_string();
+        log::error!(
+            "Failed to queue copy op for account {}: {}",
+            account_id,
+            queue_error
+        );
+        let (message_refs, target_folder) = match e.0.op {
+            MailOp::CopyMessages {
+                message_refs,
+                target_folder,
+            } => (message_refs, target_folder),
+            _ => unreachable!("failed operation was constructed as a copy"),
+        };
+        let outbox_id = {
+            let conn = state.db.writer().await;
+            crate::ops::offline::queue_failed_copy(
+                &conn,
+                &account_id,
+                &message_refs,
+                &target_folder,
+            )?
+        };
+        log::info!(
+            "Persisted unqueued copy to outbox (id={}) for account {}",
+            outbox_id,
+            account_id
+        );
         app.emit(
             "op-failed",
             serde_json::json!({
                 "account_id": account_id,
                 "op_type": "copy",
-                "error": format!("Failed to queue operation: {}", e),
+                "error": format!("Failed to queue operation: {} (will retry)", queue_error),
             }),
         )
         .ok();
@@ -762,18 +802,6 @@ pub async fn mark_account_read(
     }
 
     Ok(updated as u64)
-}
-
-/// Group message UIDs by their folder path.
-///
-/// Takes (message_id, folder_path, uid) rows and returns a HashMap
-/// of folder_path -> Vec<uid>.
-fn group_by_folder(rows: Vec<(String, String, u32)>) -> HashMap<String, Vec<u32>> {
-    let mut by_folder: HashMap<String, Vec<u32>> = HashMap::new();
-    for (_message_id, folder_path, uid) in rows {
-        by_folder.entry(folder_path).or_default().push(uid);
-    }
-    by_folder
 }
 
 /// Normalize an IMAP flag name (e.g. \Seen -> seen, \Flagged -> flagged).

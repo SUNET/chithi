@@ -646,6 +646,31 @@ impl JmapConnection {
         Ok(())
     }
 
+    /// Add a destination mailbox membership without removing existing ones.
+    pub async fn copy_emails(
+        &self,
+        config: &JmapConfig,
+        email_ids: &[String],
+        to_mailbox: &str,
+    ) -> Result<()> {
+        log::debug!("JMAP copying {} emails to {}", email_ids.len(), to_mailbox);
+        for (index, chunk) in delete_chunks(email_ids, self.max_objects_in_set).enumerate() {
+            let update = copy_updates(chunk, to_mailbox);
+            let request = serde_json::json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [
+                    ["Email/set", {
+                        "accountId": self.account_id,
+                        "update": update
+                    }, format!("cp{}", index + 1)]
+                ]
+            });
+            let response = self.api_request(&request, config).await?;
+            validate_copy_response(&response, chunk)?;
+        }
+        Ok(())
+    }
+
     /// Import a raw RFC822 email into a specific mailbox on this account.
     ///
     /// Uploads the message as a blob, then issues Email/import so the server
@@ -951,6 +976,24 @@ impl JmapConnection {
     }
 }
 
+fn copy_updates(
+    email_ids: &[String],
+    to_mailbox: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mailbox_token = to_mailbox.replace('~', "~0").replace('/', "~1");
+    email_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                serde_json::json!({
+                    format!("mailboxIds/{}", mailbox_token): true,
+                }),
+            )
+        })
+        .collect()
+}
+
 fn delete_chunks(
     email_ids: &[String],
     max_objects_in_set: usize,
@@ -1082,12 +1125,24 @@ fn validate_delete_response(response: &serde_json::Value, email_ids: &[String]) 
 }
 
 fn validate_move_response(response: &serde_json::Value, email_ids: &[String]) -> Result<()> {
+    validate_email_update_response(response, email_ids, "move")
+}
+
+fn validate_copy_response(response: &serde_json::Value, email_ids: &[String]) -> Result<()> {
+    validate_email_update_response(response, email_ids, "copy")
+}
+
+fn validate_email_update_response(
+    response: &serde_json::Value,
+    email_ids: &[String],
+    operation: &str,
+) -> Result<()> {
     let method_response = response
         .get("methodResponses")
         .and_then(serde_json::Value::as_array)
         .and_then(|responses| responses.first())
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| Error::Other("JMAP move returned no method response".into()))?;
+        .ok_or_else(|| Error::Other(format!("JMAP {} returned no method response", operation)))?;
     let method_name = method_response
         .first()
         .and_then(serde_json::Value::as_str)
@@ -1099,12 +1154,15 @@ fn validate_move_response(response: &serde_json::Value, email_ids: &[String]) ->
             .or_else(|| body.get("type"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown method error");
-        return Err(Error::Other(format!("JMAP move failed: {}", description)));
+        return Err(Error::Other(format!(
+            "JMAP {} failed: {}",
+            operation, description
+        )));
     }
     if method_name != "Email/set" {
         return Err(Error::Other(format!(
-            "JMAP move returned unexpected method response '{}'",
-            method_name
+            "JMAP {} returned unexpected method response '{}'",
+            operation, method_name
         )));
     }
     let updated = body
@@ -1126,7 +1184,8 @@ fn validate_move_response(response: &serde_json::Value, email_ids: &[String]) ->
         .collect();
     if !failures.is_empty() {
         return Err(Error::Other(format!(
-            "JMAP move rejected {} message(s): {}",
+            "JMAP {} rejected {} message(s): {}",
+            operation,
             failures.len(),
             serde_json::Value::Object(failures)
         )));
@@ -1137,7 +1196,8 @@ fn validate_move_response(response: &serde_json::Value, email_ids: &[String]) ->
         .collect();
     if !unreported.is_empty() {
         return Err(Error::Other(format!(
-            "JMAP move omitted {} message(s) from its response",
+            "JMAP {} omitted {} message(s) from its response",
+            operation,
             unreported.len()
         )));
     }
@@ -1216,8 +1276,8 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
 #[cfg(test)]
 mod set_flags_tests {
     use super::{
-        delete_chunks, validate_delete_response, validate_move_response,
-        validate_set_flags_response,
+        copy_updates, delete_chunks, validate_copy_response, validate_delete_response,
+        validate_move_response, validate_set_flags_response,
     };
 
     #[test]
@@ -1325,5 +1385,51 @@ mod set_flags_tests {
             "methodResponses": [["Email/set", {}, "mv1"]]
         });
         assert!(validate_move_response(&omitted, &ids).is_err());
+    }
+
+    #[test]
+    fn copy_adds_only_the_destination_mailbox_membership() {
+        let updates = copy_updates(&["email_1".into()], "archive/one~two");
+        assert_eq!(
+            updates["email_1"],
+            serde_json::json!({ "mailboxIds/archive~1one~0two": true })
+        );
+    }
+
+    #[test]
+    fn copy_accepts_updated_and_not_found_messages() {
+        let ids = vec!["id".to_string()];
+        let updated = serde_json::json!({
+            "methodResponses": [["Email/set", { "updated": { "id": null } }, "cp1"]]
+        });
+        assert!(validate_copy_response(&updated, &ids).is_ok());
+
+        let not_found = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notUpdated": { "id": { "type": "notFound" } }
+            }, "cp1"]]
+        });
+        assert!(validate_copy_response(&not_found, &ids).is_ok());
+    }
+
+    #[test]
+    fn copy_rejects_item_method_and_omission_errors() {
+        let ids = vec!["id".to_string()];
+        let forbidden = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "notUpdated": { "id": { "type": "forbidden" } }
+            }, "cp1"]]
+        });
+        assert!(validate_copy_response(&forbidden, &ids).is_err());
+
+        let method_error = serde_json::json!({
+            "methodResponses": [["error", { "type": "serverFail" }, "cp1"]]
+        });
+        assert!(validate_copy_response(&method_error, &ids).is_err());
+
+        let omitted = serde_json::json!({
+            "methodResponses": [["Email/set", {}, "cp1"]]
+        });
+        assert!(validate_copy_response(&omitted, &ids).is_err());
     }
 }
