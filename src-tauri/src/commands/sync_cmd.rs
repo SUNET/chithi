@@ -49,7 +49,10 @@ use crate::auth::build_jmap_config;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
-use crate::state::AppState;
+use crate::state::{AppState, IdleControl, IdleHandle, IdlePhase};
+
+const IDLE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const IDLE_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 fn should_start_imap_idle(_auth_method: &str) -> bool {
     true
@@ -63,39 +66,128 @@ pub(crate) fn should_suspend_idle_for_imap_operation(auth_method: &str) -> bool 
     auth_method == "oauth-microsoft"
 }
 
+pub(crate) struct ImapIdleSuspension {
+    _account_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+fn imap_idle_account_lock(state: &AppState, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    state
+        .idle_account_locks
+        .lock()
+        .unwrap()
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub(crate) async fn suspend_imap_idle_for_account(
     state: &State<'_, AppState>,
     account_id: &str,
-) -> Result<bool> {
-    let handle = {
-        let mut handles = state.idle_handles.lock().unwrap();
-        handles.remove(account_id)
-    };
-
-    let Some(mut idle_handle) = handle else {
-        return Ok(false);
-    };
-
-    idle_handle.stop_flag.store(true, Ordering::Relaxed);
-
-    if let Some(thread) = idle_handle.thread.take() {
-        tokio::task::spawn_blocking(move || {
-            let _ = thread.join();
-        })
-        .await
-        .map_err(|e| Error::Sync(format!("Stopping IDLE panicked: {}", e)))?;
+) -> Result<ImapIdleSuspension> {
+    let account_guard = imap_idle_account_lock(state, account_id).lock_owned().await;
+    if let Some(generation) = request_imap_idle_stop(state, account_id) {
+        wait_for_imap_idle_stop(state, account_id, generation, None).await?;
     }
+    Ok(ImapIdleSuspension {
+        _account_guard: account_guard,
+    })
+}
 
-    Ok(true)
+fn request_imap_idle_stop(state: &AppState, account_id: &str) -> Option<u64> {
+    let (generation, control) = {
+        let mut handles = state.idle_handles.lock().unwrap();
+        let handle = handles.get_mut(account_id)?;
+        if !matches!(handle.phase, IdlePhase::Joining | IdlePhase::StopFailed) {
+            handle.phase = IdlePhase::Stopping;
+        }
+        (handle.generation, handle.control.clone())
+    };
+    control.request_stop();
+    Some(generation)
+}
+
+async fn wait_for_imap_idle_stop(
+    state: &AppState,
+    account_id: &str,
+    generation: u64,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<()> {
+    loop {
+        let finished_thread = {
+            let mut handles = state.idle_handles.lock().unwrap();
+            match handles.get_mut(account_id) {
+                None => return Ok(()),
+                Some(handle) if handle.generation != generation => {
+                    return Err(Error::Sync(format!(
+                        "IDLE generation changed while stopping account {}",
+                        account_id
+                    )));
+                }
+                Some(handle) if handle.phase == IdlePhase::StopFailed => {
+                    return Err(Error::Sync(format!(
+                        "IDLE loop for account {} panicked during stop",
+                        account_id
+                    )));
+                }
+                Some(handle) => {
+                    let finished = handle
+                        .thread
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished);
+                    if finished {
+                        handle.phase = IdlePhase::Joining;
+                        handle.thread.take()
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+
+        if let Some(thread) = finished_thread {
+            let join_succeeded = thread.join().is_ok();
+            let mut handles = state.idle_handles.lock().unwrap();
+            if let Some(handle) = handles
+                .get_mut(account_id)
+                .filter(|handle| handle.generation == generation)
+            {
+                if join_succeeded {
+                    handles.remove(account_id);
+                } else {
+                    handle.phase = IdlePhase::StopFailed;
+                }
+            }
+            return if join_succeeded {
+                Ok(())
+            } else {
+                Err(Error::Sync(format!(
+                    "IDLE loop for account {} panicked during stop",
+                    account_id
+                )))
+            };
+        }
+
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(Error::Sync(format!(
+                "IDLE loop for account {} did not stop within {}s; restart is blocked",
+                account_id,
+                IDLE_STOP_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(IDLE_STOP_POLL_INTERVAL).await;
+    }
 }
 
 pub(crate) async fn resume_imap_idle_for_account(
     app: &AppHandle,
     state: &State<'_, AppState>,
     account: &db::accounts::AccountFull,
-    suspended_idle: bool,
+    suspension: Option<ImapIdleSuspension>,
 ) -> Result<()> {
-    if !suspended_idle || !should_start_imap_idle(&account.auth_method) {
+    let Some(_suspension) = suspension else {
+        return Ok(());
+    };
+    if !should_start_imap_idle(&account.auth_method) {
         return Ok(());
     }
 
@@ -115,7 +207,70 @@ pub(crate) async fn resume_imap_idle_for_account(
         meet_protocol: account.meet_protocol_str().to_string(),
     };
 
-    start_imap_idle(app, state, &account_summary).await
+    start_imap_idle_inner(app, state, &account_summary).await
+}
+
+pub(crate) async fn restart_imap_idle_after_failed_suspend(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account: &db::accounts::AccountFull,
+) -> Result<()> {
+    let _account_guard = imap_idle_account_lock(state, &account.id)
+        .lock_owned()
+        .await;
+    let account_summary = db::accounts::Account {
+        id: account.id.clone(),
+        display_name: account.display_name.clone(),
+        email: account.email.clone(),
+        username: account.username.clone(),
+        provider: account.provider.clone(),
+        mail_protocol: account.mail_protocol.clone(),
+        enabled: account.enabled,
+        mail_sync_interval_seconds: account.mail_sync_interval_seconds,
+        calendar_sync_interval_seconds: account.calendar_sync_interval_seconds,
+        contacts_sync_interval_seconds: account.contacts_sync_interval_seconds,
+        has_calendar_binding: account.calendar_binding().is_some(),
+        has_contacts_binding: account.contacts_binding().is_some(),
+        meet_protocol: account.meet_protocol_str().to_string(),
+    };
+    start_imap_idle_inner(app, state, &account_summary).await
+}
+
+pub(crate) async fn suspend_imap_idle_for_operation(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    account: &db::accounts::AccountFull,
+) -> Result<ImapIdleSuspension> {
+    suspend_imap_idle_with_recovery(
+        &account.id,
+        suspend_imap_idle_for_account(state, &account.id),
+        restart_imap_idle_after_failed_suspend(app, state, account),
+    )
+    .await
+}
+
+async fn suspend_imap_idle_with_recovery<T, S, R>(
+    account_id: &str,
+    suspend: S,
+    restart: R,
+) -> Result<T>
+where
+    S: std::future::Future<Output = Result<T>>,
+    R: std::future::Future<Output = Result<()>>,
+{
+    match suspend.await {
+        Ok(suspension) => Ok(suspension),
+        Err(suspend_error) => {
+            if let Err(restart_error) = restart.await {
+                log::error!(
+                    "Failed to restore IMAP IDLE after suspension error for account {}: {}",
+                    account_id,
+                    restart_error
+                );
+            }
+            Err(suspend_error)
+        }
+    }
 }
 
 fn try_acquire_account_sync_guard(
@@ -200,9 +355,9 @@ async fn run_mail_sync_once(
             "Suspending IMAP IDLE for account {} before sync",
             account_id
         );
-        suspend_imap_idle_for_account(state, account_id).await?
+        Some(suspend_imap_idle_for_operation(app, state, &account).await?)
     } else {
-        false
+        None
     };
     let resume_account = account.clone();
 
@@ -352,9 +507,9 @@ pub async fn sync_folder(
             "Suspending IMAP IDLE for account {} before single-folder sync",
             account_id
         );
-        suspend_imap_idle_for_account(&state, &account_id).await?
+        Some(suspend_imap_idle_for_operation(&app, &state, &account).await?)
     } else {
-        false
+        None
     };
     let resume_account = account.clone();
 
@@ -462,9 +617,9 @@ pub async fn prefetch_bodies(
                 "Suspending IMAP IDLE for account {} before body prefetch",
                 account_id
             );
-            suspend_imap_idle_for_account(&state, &account_id).await?
+            Some(suspend_imap_idle_for_operation(&app, &state, &account).await?)
         } else {
-            false
+            None
         };
         let resume_account = account.clone();
 
@@ -513,6 +668,10 @@ pub async fn prefetch_bodies(
 /// Start IMAP IDLE and JMAP push for all enabled accounts. Call on app startup.
 #[tauri::command]
 pub async fn start_idle(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
+    {
+        let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
+        state.idle_push_enabled.store(true, Ordering::Release);
+    }
     let accounts = {
         let conn = state.db.reader();
         db::accounts::list_accounts(&conn)?
@@ -526,7 +685,15 @@ pub async fn start_idle(app: AppHandle, state: State<'_, AppState>) -> Result<()
         // Account summary still carries mail_protocol directly; dispatch
         // here without going through AccountFull to avoid an extra DB hop.
         if account.mail_protocol == "imap" {
-            start_imap_idle(&app, &state, account).await?;
+            let account_lock = imap_idle_account_lock(&state, &account.id);
+            let Ok(_account_guard) = account_lock.try_lock_owned() else {
+                log::debug!(
+                    "Deferring IDLE start for account {} until its IMAP operation finishes",
+                    account.id
+                );
+                continue;
+            };
+            start_imap_idle_inner(&app, &state, account).await?;
         } else if account.mail_protocol == "jmap" {
             start_jmap_push(&app, &state, account).await?;
         }
@@ -535,27 +702,60 @@ pub async fn start_idle(app: AppHandle, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
-async fn start_imap_idle(
+async fn start_imap_idle_inner(
     app: &AppHandle,
     state: &State<'_, AppState>,
     account: &db::accounts::Account,
 ) -> Result<()> {
-    // Check if already running
-    {
-        let handles = state.idle_handles.lock().unwrap();
-        if handles.contains_key(&account.id) {
-            log::debug!("IDLE already running for account {}", account.id);
-            return Ok(());
+    let reservation = loop {
+        let (reservation, stopping_generation) = {
+            let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
+            if !state.idle_push_enabled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let stopping_generation = state
+                .idle_handles
+                .lock()
+                .unwrap()
+                .get(&account.id)
+                .filter(|handle| matches!(handle.phase, IdlePhase::Stopping | IdlePhase::Joining))
+                .map(|handle| handle.generation);
+            if stopping_generation.is_some() {
+                (None, stopping_generation)
+            } else {
+                (reserve_imap_idle_start(state, &account.id)?, None)
+            }
+        };
+
+        if let Some(generation) = stopping_generation {
+            wait_for_imap_idle_stop(state, &account.id, generation, None).await?;
+            continue;
         }
-    }
+        break reservation;
+    };
+    let Some((generation, control)) = reservation else {
+        log::debug!("IDLE already active for account {}", account.id);
+        return Ok(());
+    };
 
     let full_account = {
         let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account.id)?
+        db::accounts::get_account_full(&conn, &account.id)
     };
-
-    // For O365: get IMAP-scoped OAuth token
-    let (password, use_xoauth2) = crate::auth::get_imap_credentials(&full_account).await?;
+    let full_account = match full_account {
+        Ok(full_account) => full_account,
+        Err(error) => {
+            remove_imap_idle_generation(state, &account.id, generation);
+            return Err(error);
+        }
+    };
+    let (password, use_xoauth2) = match crate::auth::get_imap_credentials(&full_account).await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            remove_imap_idle_generation(state, &account.id, generation);
+            return Err(error);
+        }
+    };
 
     let config = ImapConfig {
         host: full_account.imap_host.clone(),
@@ -566,42 +766,113 @@ async fn start_imap_idle(
         use_xoauth2,
     };
 
-    let account_id = account.id.clone();
-    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_clone = stop_flag.clone();
-    let app_clone = app.clone();
+    let mut handles = state.idle_handles.lock().unwrap();
+    let Some(handle) = handles.get_mut(&account.id) else {
+        return Ok(());
+    };
+    if handle.generation != generation || handle.phase != IdlePhase::Starting {
+        if handle.generation == generation && handle.phase == IdlePhase::Stopping {
+            handles.remove(&account.id);
+        }
+        return Ok(());
+    }
 
+    let account_id = account.id.clone();
+    let thread_control = control.clone();
+    let event_control = control.clone();
+    let app_clone = app.clone();
     let thread = std::thread::spawn(move || {
         crate::mail::idle::run_idle_loop(
             config,
             account_id.clone(),
-            stop_clone,
-            Box::new(move |event| match event {
-                crate::mail::idle::IdleEvent::NewMail(aid) => {
-                    app_clone.emit("idle-new-mail", aid).ok();
-                }
-                crate::mail::idle::IdleEvent::Disconnected(aid) => {
-                    app_clone.emit("idle-disconnected", aid).ok();
-                }
-                crate::mail::idle::IdleEvent::Reconnected(aid) => {
-                    app_clone.emit("idle-reconnected", aid).ok();
-                }
+            thread_control,
+            Box::new(move |event| {
+                event_control.if_running(|| match event {
+                    crate::mail::idle::IdleEvent::NewMail(aid) => {
+                        app_clone.emit("idle-new-mail", aid).ok();
+                    }
+                    crate::mail::idle::IdleEvent::Disconnected(aid) => {
+                        app_clone.emit("idle-disconnected", aid).ok();
+                    }
+                    crate::mail::idle::IdleEvent::Reconnected(aid) => {
+                        app_clone.emit("idle-reconnected", aid).ok();
+                    }
+                });
             }),
         );
     });
 
-    let handle = crate::state::IdleHandle {
-        stop_flag,
-        thread: Some(thread),
-    };
-
-    state
-        .idle_handles
-        .lock()
-        .unwrap()
-        .insert(account.id.clone(), handle);
+    handle.phase = IdlePhase::Running;
+    handle.thread = Some(thread);
     log::info!("Started IDLE loop for account {}", account.id);
     Ok(())
+}
+
+fn reserve_imap_idle_start(
+    state: &AppState,
+    account_id: &str,
+) -> Result<Option<(u64, Arc<IdleControl>)>> {
+    let mut handles = state.idle_handles.lock().unwrap();
+    let finished = handles
+        .get(account_id)
+        .and_then(|handle| handle.thread.as_ref())
+        .is_some_and(std::thread::JoinHandle::is_finished);
+    if finished {
+        let mut finished_handle = handles.remove(account_id).unwrap();
+        if let Some(thread) = finished_handle.thread.take() {
+            thread.join().map_err(|_| {
+                Error::Sync(format!(
+                    "Previous IDLE loop for account {} panicked",
+                    account_id
+                ))
+            })?;
+        }
+    }
+
+    if let Some(handle) = handles.get(account_id) {
+        return match handle.phase {
+            IdlePhase::Starting | IdlePhase::Running => Ok(None),
+            IdlePhase::Stopping | IdlePhase::Joining => Err(Error::Sync(format!(
+                "IDLE loop for account {} is still stopping; restart is blocked",
+                account_id
+            ))),
+            IdlePhase::StopFailed => {
+                handles.remove(account_id);
+                reserve_new_imap_idle_generation(state, account_id, &mut handles)
+            }
+        };
+    }
+
+    reserve_new_imap_idle_generation(state, account_id, &mut handles)
+}
+
+fn reserve_new_imap_idle_generation(
+    state: &AppState,
+    account_id: &str,
+    handles: &mut HashMap<String, IdleHandle>,
+) -> Result<Option<(u64, Arc<IdleControl>)>> {
+    let generation = state.idle_generation.fetch_add(1, Ordering::Relaxed);
+    let control = Arc::new(IdleControl::new());
+    handles.insert(
+        account_id.to_string(),
+        IdleHandle {
+            generation,
+            phase: IdlePhase::Starting,
+            control: control.clone(),
+            thread: None,
+        },
+    );
+    Ok(Some((generation, control)))
+}
+
+fn remove_imap_idle_generation(state: &AppState, account_id: &str, generation: u64) {
+    let mut handles = state.idle_handles.lock().unwrap();
+    if handles
+        .get(account_id)
+        .is_some_and(|handle| handle.generation == generation)
+    {
+        handles.remove(account_id);
+    }
 }
 
 async fn start_jmap_push(
@@ -609,15 +880,6 @@ async fn start_jmap_push(
     state: &State<'_, AppState>,
     account: &db::accounts::Account,
 ) -> Result<()> {
-    // Check if already running
-    {
-        let handles = state.jmap_push_handles.lock().unwrap();
-        if handles.contains_key(&account.id) {
-            log::debug!("JMAP push already running for account {}", account.id);
-            return Ok(());
-        }
-    }
-
     let full_account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account.id)?
@@ -629,6 +891,16 @@ async fn start_jmap_push(
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_clone = stop_flag.clone();
     let app_clone = app.clone();
+
+    let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
+    if !state.idle_push_enabled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut handles = state.jmap_push_handles.lock().unwrap();
+    if handles.contains_key(&account.id) {
+        log::debug!("JMAP push already running for account {}", account.id);
+        return Ok(());
+    }
 
     let task = tokio::spawn(async move {
         crate::mail::jmap_push::run_push_loop(
@@ -652,11 +924,7 @@ async fn start_jmap_push(
 
     let handle = crate::state::JmapPushHandle { stop_flag, task };
 
-    state
-        .jmap_push_handles
-        .lock()
-        .unwrap()
-        .insert(account.id.clone(), handle);
+    handles.insert(account.id.clone(), handle);
     log::info!("Started JMAP push for account {}", account.id);
     Ok(())
 }
@@ -664,29 +932,40 @@ async fn start_jmap_push(
 /// Stop all IMAP IDLE loops and JMAP push tasks.
 #[tauri::command]
 pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
-    let idle_threads = {
-        let mut handles = state.idle_handles.lock().unwrap();
-        let mut threads = Vec::new();
-        for (account_id, mut handle) in handles.drain() {
-            log::info!("Stopping IDLE loop for account {}", account_id);
-            handle.stop_flag.store(true, Ordering::Relaxed);
-            if let Some(thread) = handle.thread.take() {
-                threads.push((account_id, thread));
+    let (idle_generations, jmap_tasks) = {
+        let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
+        state.idle_push_enabled.store(false, Ordering::Release);
+        let idle_generations = {
+            let mut handles = state.idle_handles.lock().unwrap();
+            let mut generations = Vec::new();
+            for (account_id, handle) in handles.iter_mut() {
+                log::info!("Stopping IDLE loop for account {}", account_id);
+                if !matches!(handle.phase, IdlePhase::Joining | IdlePhase::StopFailed) {
+                    handle.phase = IdlePhase::Stopping;
+                }
+                generations.push((
+                    account_id.clone(),
+                    handle.generation,
+                    handle.control.clone(),
+                ));
             }
-        }
-        threads
+            generations
+        };
+        let jmap_tasks = {
+            let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
+            let mut tasks = Vec::new();
+            for (account_id, handle) in jmap_handles.drain() {
+                log::info!("Stopping JMAP push for account {}", account_id);
+                handle.stop_flag.store(true, Ordering::Relaxed);
+                tasks.push((account_id, handle.task));
+            }
+            tasks
+        };
+        (idle_generations, jmap_tasks)
     };
-
-    let jmap_tasks = {
-        let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
-        let mut tasks = Vec::new();
-        for (account_id, handle) in jmap_handles.drain() {
-            log::info!("Stopping JMAP push for account {}", account_id);
-            handle.stop_flag.store(true, Ordering::Relaxed);
-            tasks.push((account_id, handle.task));
-        }
-        tasks
-    };
+    for (_, _, control) in &idle_generations {
+        control.request_stop();
+    }
 
     let mut stop_error: Option<Error> = None;
 
@@ -727,29 +1006,13 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
         }
     }
 
-    for (account_id, thread) in idle_threads {
-        let join_task = tokio::task::spawn_blocking(move || thread.join());
-        match tokio::time::timeout(std::time::Duration::from_secs(5), join_task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(_))) => {
-                let msg = format!("IDLE loop for account {} panicked during stop", account_id);
-                log::error!("{}", msg);
-                stop_error.get_or_insert_with(|| Error::Sync(msg));
-            }
-            Ok(Err(e)) => {
-                let msg = format!(
-                    "Stopping IDLE loop for account {} panicked: {}",
-                    account_id, e
-                );
-                log::error!("{}", msg);
-                stop_error.get_or_insert_with(|| Error::Sync(msg));
-            }
-            Err(_) => {
-                log::warn!(
-                    "IDLE loop for account {} did not stop within 5s; it will exit after IDLE returns",
-                    account_id
-                );
-            }
+    let idle_deadline = tokio::time::Instant::now() + IDLE_STOP_TIMEOUT;
+    for (account_id, generation, _) in idle_generations {
+        if let Err(error) =
+            wait_for_imap_idle_stop(&state, &account_id, generation, Some(idle_deadline)).await
+        {
+            log::error!("{}", error);
+            stop_error.get_or_insert(error);
         }
     }
 
@@ -775,6 +1038,145 @@ mod tests {
             "oauth-google"
         ));
         assert!(!super::should_suspend_idle_for_imap_operation("password"));
+    }
+
+    #[test]
+    fn idle_start_reservation_allows_only_one_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+
+        let first = reserve_imap_idle_start(&state, "account").unwrap();
+        let second = reserve_imap_idle_start(&state, "account").unwrap();
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            state.idle_handles.lock().unwrap()["account"].phase,
+            IdlePhase::Starting
+        );
+    }
+
+    #[test]
+    fn idle_start_is_blocked_while_previous_generation_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        reserve_imap_idle_start(&state, "account").unwrap();
+
+        request_imap_idle_stop(&state, "account").unwrap();
+        let error = match reserve_imap_idle_start(&state, "account") {
+            Err(error) => error,
+            Ok(_) => panic!("stopping generation accepted a replacement"),
+        };
+
+        assert!(error.to_string().contains("restart is blocked"));
+        assert_eq!(
+            state.idle_handles.lock().unwrap()["account"].phase,
+            IdlePhase::Stopping
+        );
+    }
+
+    #[test]
+    fn imap_operation_lock_is_exclusive_per_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        let first = imap_idle_account_lock(&state, "account");
+        let second = imap_idle_account_lock(&state, "account");
+        let _guard = first.try_lock_owned().unwrap();
+
+        assert!(second.try_lock_owned().is_err());
+    }
+
+    #[tokio::test]
+    async fn imap_suspend_failure_attempts_recovery() {
+        let recovered = Arc::new(AtomicBool::new(false));
+        let recovered_in_future = recovered.clone();
+        let result = suspend_imap_idle_with_recovery::<String, _, _>(
+            "account",
+            async { Err(Error::Other("suspend failed".into())) },
+            async move {
+                recovered_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(recovered.load(Ordering::Relaxed));
+        assert_eq!(result.unwrap_err().to_string(), "suspend failed");
+    }
+
+    #[tokio::test]
+    async fn idle_stop_timeout_retains_stopping_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        let (generation, _) = reserve_imap_idle_start(&state, "account").unwrap().unwrap();
+        {
+            let mut handles = state.idle_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = IdlePhase::Running;
+            handle.thread = Some(std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }));
+        }
+
+        request_imap_idle_stop(&state, "account").unwrap();
+        let result = wait_for_imap_idle_stop(
+            &state,
+            "account",
+            generation,
+            Some(tokio::time::Instant::now()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            state.idle_handles.lock().unwrap()["account"].phase,
+            IdlePhase::Stopping
+        );
+
+        wait_for_imap_idle_stop(
+            &state,
+            "account",
+            generation,
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert!(!state.idle_handles.lock().unwrap().contains_key("account"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_idle_stop_waiters_both_observe_thread_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        let (generation, _) = reserve_imap_idle_start(&state, "account").unwrap().unwrap();
+        {
+            let mut handles = state.idle_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = IdlePhase::Running;
+            handle.thread = Some(std::thread::spawn(|| panic!("IDLE test panic")));
+        }
+        while !state.idle_handles.lock().unwrap()["account"]
+            .thread
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        request_imap_idle_stop(&state, "account").unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+
+        let (first, second) = tokio::join!(
+            wait_for_imap_idle_stop(&state, "account", generation, Some(deadline)),
+            wait_for_imap_idle_stop(&state, "account", generation, Some(deadline))
+        );
+
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert_eq!(
+            state.idle_handles.lock().unwrap()["account"].phase,
+            IdlePhase::StopFailed
+        );
     }
 
     /// A second acquire for the same account is rejected while the first

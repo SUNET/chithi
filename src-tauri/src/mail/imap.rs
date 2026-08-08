@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use crate::error::{Error, Result};
 use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
+use crate::state::IdleControl;
 
 fn mailbox_is_selectable(attributes: &[NameAttribute<'_>]) -> bool {
     !attributes.contains(&NameAttribute::NoSelect)
@@ -73,6 +74,7 @@ pub struct EnvelopeData {
 
 pub struct ImapConnection {
     session: Session<TlsStream<TcpStream>>,
+    idle_control: Option<std::sync::Arc<IdleControl>>,
 }
 
 /// Keep comma-separated UID FETCH commands below conservative server argument
@@ -83,6 +85,22 @@ const IMAP_FETCH_UID_CHUNK_SIZE: usize = 100;
 impl ImapConnection {
     /// Connect and authenticate. Must be called from a blocking context.
     pub fn connect(config: &ImapConfig) -> Result<Self> {
+        Self::connect_inner(config, None)
+    }
+
+    /// Connect an IDLE session and expose its socket to the lifecycle owner so
+    /// shutdown can interrupt blocking network operations.
+    pub fn connect_for_idle(
+        config: &ImapConfig,
+        control: std::sync::Arc<IdleControl>,
+    ) -> Result<Self> {
+        Self::connect_inner(config, Some(control))
+    }
+
+    fn connect_inner(
+        config: &ImapConfig,
+        idle_control: Option<std::sync::Arc<IdleControl>>,
+    ) -> Result<Self> {
         log::info!(
             "IMAP connecting to {}:{} (tls={})",
             config.host,
@@ -95,32 +113,43 @@ impl ImapConnection {
             Error::Imap(e.to_string())
         })?;
 
-        // Port 993 = implicit TLS (entire connection wrapped in TLS from start)
-        // Port 143 = STARTTLS (connect plain, send STARTTLS command, upgrade to TLS)
+        let stream = TcpStream::connect((&*config.host, config.port)).map_err(|e| {
+            log::error!(
+                "IMAP connection failed to {}:{}: {}",
+                config.host,
+                config.port,
+                e
+            );
+            Error::Imap(e.to_string())
+        })?;
+        if let Some(control) = &idle_control {
+            control
+                .register_socket(&stream)
+                .map_err(|e| Error::Imap(format!("Failed to register IDLE socket: {}", e)))?;
+        }
+
+        // Port 993 = implicit TLS (entire connection wrapped in TLS from start).
+        // Other ports use STARTTLS, preserving the existing connection policy.
         let client = if config.port == 993 {
             log::debug!("IMAP using implicit TLS");
-            imap::connect((&*config.host, config.port), &config.host, &tls).map_err(|e| {
-                log::error!(
-                    "IMAP TLS connection failed to {}:{}: {}",
-                    config.host,
-                    config.port,
-                    e
-                );
+            let tls_stream = tls.connect(&config.host, stream).map_err(|e| {
+                log::error!("IMAP TLS connection failed for {}: {}", config.host, e);
                 Error::Imap(e.to_string())
-            })?
+            })?;
+            let mut client = imap::Client::new(tls_stream);
+            client
+                .read_greeting()
+                .map_err(|e| Error::Imap(e.to_string()))?;
+            client
         } else {
             log::debug!("IMAP using STARTTLS");
-            imap::connect_starttls((&*config.host, config.port), &config.host, &tls).map_err(
-                |e| {
-                    log::error!(
-                        "IMAP STARTTLS failed for {}:{}: {}",
-                        config.host,
-                        config.port,
-                        e
-                    );
-                    Error::Imap(e.to_string())
-                },
-            )?
+            let mut client = imap::Client::new(stream);
+            client
+                .read_greeting()
+                .map_err(|e| Error::Imap(e.to_string()))?;
+            client
+                .secure(&config.host, &tls)
+                .map_err(|e| Error::Imap(e.to_string()))?
         };
 
         log::debug!("IMAP connected, authenticating as {}", config.username);
@@ -145,7 +174,10 @@ impl ImapConnection {
         };
 
         log::info!("IMAP authenticated as {}", config.username);
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            idle_control,
+        })
     }
 
     pub fn list_folders(&mut self) -> Result<Vec<(String, String)>> {
@@ -756,8 +788,10 @@ impl ImapConnection {
             .idle()
             .map_err(|e| Error::Imap(format!("IDLE setup failed: {}", e)))?;
         idle.set_keepalive(std::time::Duration::from_secs(300)); // 5 min keepalive
-        let result = idle.wait_with_timeout(timeout);
-        let had_notification = result.is_ok();
+        let outcome = idle
+            .wait_with_timeout(timeout)
+            .map_err(|e| Error::Imap(format!("IMAP IDLE wait failed: {}", e)))?;
+        let had_notification = idle_outcome_has_notification(outcome);
         if had_notification {
             log::info!("IMAP IDLE: server notification received");
         } else {
@@ -783,6 +817,21 @@ impl ImapConnection {
     pub fn logout(mut self) {
         log::debug!("IMAP logging out");
         self.session.logout().ok();
+        if let Some(control) = &self.idle_control {
+            control.clear_socket();
+        }
+    }
+}
+
+fn idle_outcome_has_notification(outcome: imap::extensions::idle::WaitOutcome) -> bool {
+    outcome == imap::extensions::idle::WaitOutcome::MailboxChanged
+}
+
+impl Drop for ImapConnection {
+    fn drop(&mut self) {
+        if let Some(control) = &self.idle_control {
+            control.clear_socket();
+        }
     }
 }
 
@@ -1249,6 +1298,16 @@ fn addresses_to_json(addrs: Option<&[imap_proto::types::Address<'_>]>) -> String
 
 #[cfg(test)]
 mod tests {
+    use imap::extensions::idle::WaitOutcome;
+
+    #[test]
+    fn idle_timeout_is_not_a_mailbox_notification() {
+        assert!(!super::idle_outcome_has_notification(WaitOutcome::TimedOut));
+        assert!(super::idle_outcome_has_notification(
+            WaitOutcome::MailboxChanged
+        ));
+    }
+
     #[test]
     fn test_utf7_imap_decode() {
         let decoded = utf7_imap::decode_utf7_imap("Komih&AOU-g".to_string());

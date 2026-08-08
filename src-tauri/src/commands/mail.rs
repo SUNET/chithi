@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::commands::sync_cmd::{
     resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
-    suspend_imap_idle_for_account,
+    suspend_imap_idle_for_operation,
 };
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
@@ -355,14 +355,9 @@ async fn ensure_message_body_on_disk(
 
         let resume_account = account.clone();
         let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
-            suspend_imap_idle_for_body_fetch(
-                account_id,
-                suspend_imap_idle_for_account(state, account_id),
-                resume_imap_idle_for_account(app, state, &resume_account, true),
-            )
-            .await?
+            Some(suspend_imap_idle_for_operation(app, state, &resume_account).await?)
         } else {
-            false
+            None
         };
 
         run_imap_body_fetch_with_resume(
@@ -420,24 +415,6 @@ async fn ensure_message_body_on_disk(
     }
 
     Ok(relative_path)
-}
-
-async fn suspend_imap_idle_for_body_fetch<S, R>(
-    account_id: &str,
-    suspend: S,
-    resume_after_failure: R,
-) -> Result<bool>
-where
-    S: std::future::Future<Output = Result<bool>>,
-    R: std::future::Future<Output = Result<()>>,
-{
-    match suspend.await {
-        Ok(suspended) => Ok(suspended),
-        Err(suspend_error) => {
-            let resume_result = resume_after_failure.await;
-            finish_imap_body_fetch(account_id, Err(suspend_error), resume_result)
-        }
-    }
 }
 
 async fn run_imap_body_fetch_with_resume<T, F, R>(
@@ -1183,10 +1160,7 @@ pub async fn save_message_as_eml(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        finish_imap_body_fetch, run_imap_body_fetch_with_resume, split_folder_path,
-        suspend_imap_idle_for_body_fetch,
-    };
+    use super::{finish_imap_body_fetch, run_imap_body_fetch_with_resume, split_folder_path};
     use crate::error::Error;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1209,24 +1183,6 @@ mod tests {
 
         assert!(resumed.load(Ordering::Relaxed));
         assert_eq!(result.unwrap_err().to_string(), "fetch failed");
-    }
-
-    #[tokio::test]
-    async fn body_fetch_suspend_failure_attempts_restart() {
-        let resumed = Arc::new(AtomicBool::new(false));
-        let resumed_in_future = resumed.clone();
-        let result = suspend_imap_idle_for_body_fetch(
-            "account",
-            async { Err(Error::Other("suspend failed".into())) },
-            async move {
-                resumed_in_future.store(true, Ordering::Relaxed);
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(resumed.load(Ordering::Relaxed));
-        assert_eq!(result.unwrap_err().to_string(), "suspend failed");
     }
 
     #[test]

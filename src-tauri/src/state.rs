@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::RwLock;
 
 use crate::db;
@@ -14,9 +15,73 @@ pub struct SyncHandle {
     pub abort_handle: tokio::task::AbortHandle,
 }
 
-/// Handle for a running IMAP IDLE loop thread.
+/// Shared cancellation state for one generation of an IMAP IDLE loop.
+pub struct IdleControl {
+    stop_flag: AtomicBool,
+    event_gate: Mutex<()>,
+    socket: Mutex<Option<TcpStream>>,
+}
+
+impl IdleControl {
+    pub fn new() -> Self {
+        Self {
+            stop_flag: AtomicBool::new(false),
+            event_gate: Mutex::new(()),
+            socket: Mutex::new(None),
+        }
+    }
+
+    pub fn should_stop(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+    }
+
+    pub fn register_socket(&self, socket: &TcpStream) -> std::io::Result<()> {
+        let clone = socket.try_clone()?;
+        let mut active = self.socket.lock().unwrap();
+        if self.should_stop() {
+            let _ = clone.shutdown(Shutdown::Both);
+        } else {
+            *active = Some(clone);
+        }
+        Ok(())
+    }
+
+    pub fn clear_socket(&self) {
+        self.socket.lock().unwrap().take();
+    }
+
+    pub fn request_stop(&self) {
+        {
+            let _event_gate = self.event_gate.lock().unwrap();
+            self.stop_flag.store(true, Ordering::Release);
+        }
+        if let Some(socket) = self.socket.lock().unwrap().as_ref() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn if_running(&self, action: impl FnOnce()) {
+        let _event_gate = self.event_gate.lock().unwrap();
+        if !self.should_stop() {
+            action();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdlePhase {
+    Starting,
+    Running,
+    Stopping,
+    Joining,
+    StopFailed,
+}
+
+/// Lifecycle record for one generation of an IMAP IDLE loop.
 pub struct IdleHandle {
-    pub stop_flag: Arc<AtomicBool>,
+    pub generation: u64,
+    pub phase: IdlePhase,
+    pub control: Arc<IdleControl>,
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -30,6 +95,10 @@ pub struct AppState {
     pub db: Arc<DbPool>,
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
+    pub idle_generation: AtomicU64,
+    pub idle_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    pub idle_push_enabled: AtomicBool,
+    pub idle_account_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub jmap_push_handles: std::sync::Mutex<HashMap<String, JmapPushHandle>>,
     /// Per-account mail-sync-in-progress flags. If true, a mail sync or
     /// prefetch is running and new mail sync requests for that account are
@@ -140,6 +209,10 @@ impl AppState {
             db: Arc::new(pool),
             sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
+            idle_generation: AtomicU64::new(1),
+            idle_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            idle_push_enabled: AtomicBool::new(false),
+            idle_account_locks: std::sync::Mutex::new(HashMap::new()),
             jmap_push_handles: std::sync::Mutex::new(HashMap::new()),
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             pending_mail_sync: std::sync::Mutex::new(HashMap::new()),
@@ -195,5 +268,60 @@ impl AppState {
         tokio::spawn(worker.run());
         senders.insert(account_id.to_string(), tx.clone());
         tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IdleControl;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn idle_control_interrupts_registered_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        let control = IdleControl::new();
+        control.register_socket(&client).unwrap();
+        control.request_stop();
+
+        let mut client = client;
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_control_closes_socket_registered_after_stop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        let control = IdleControl::new();
+        control.request_stop();
+        control.register_socket(&client).unwrap();
+
+        let mut client = client;
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_control_suppresses_events_after_stop() {
+        let emitted = AtomicBool::new(false);
+        let control = IdleControl::new();
+        control.request_stop();
+
+        control.if_running(|| emitted.store(true, Ordering::Relaxed));
+
+        assert!(!emitted.load(Ordering::Relaxed));
     }
 }

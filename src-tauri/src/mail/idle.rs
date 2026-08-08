@@ -4,11 +4,11 @@
 //! When the server signals new mail, triggers a sync of the inbox folder.
 //! Handles network disconnects with exponential backoff and auto-reconnect.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::state::IdleControl;
 
 /// IDLE timeout — re-enter IDLE every 25 minutes (well under the
 /// 29-minute RFC 2177 limit and typical server timeouts).
@@ -36,7 +36,7 @@ pub enum IdleEvent<'a> {
 pub fn run_idle_loop(
     config: ImapConfig,
     account_id: String,
-    stop: Arc<AtomicBool>,
+    control: Arc<IdleControl>,
     on_event: Box<dyn Fn(IdleEvent<'_>) + Send>,
 ) {
     log::info!("IDLE loop starting for account {}", account_id);
@@ -44,12 +44,12 @@ pub fn run_idle_loop(
     let mut backoff = INITIAL_RECONNECT_DELAY;
     let mut was_disconnected = false;
 
-    while !stop.load(Ordering::Relaxed) {
+    while !control.should_stop() {
         // Connect
-        let mut conn = match ImapConnection::connect(&config) {
+        let mut conn = match ImapConnection::connect_for_idle(&config, control.clone()) {
             Ok(c) => c,
             Err(e) => {
-                if !was_disconnected {
+                if !was_disconnected && !control.should_stop() {
                     log::error!(
                         "IDLE: connection failed for {} ({}): {}",
                         account_id,
@@ -59,7 +59,7 @@ pub fn run_idle_loop(
                     on_event(IdleEvent::Disconnected(&account_id));
                     was_disconnected = true;
                 }
-                if stop.load(Ordering::Relaxed) {
+                if control.should_stop() {
                     break;
                 }
                 // Exponential backoff with jitter
@@ -68,11 +68,15 @@ pub fn run_idle_loop(
                     backoff.as_secs(),
                     account_id
                 );
-                sleep_interruptible(&stop, backoff);
+                sleep_interruptible(&control, backoff);
                 backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
                 continue;
             }
         };
+
+        if control.should_stop() {
+            break;
+        }
 
         // Select INBOX
         if let Err(e) = conn.select_folder("INBOX") {
@@ -82,7 +86,7 @@ pub fn run_idle_loop(
                 config.username,
                 e
             );
-            sleep_interruptible(&stop, backoff);
+            sleep_interruptible(&control, backoff);
             backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
             continue;
         }
@@ -90,7 +94,9 @@ pub fn run_idle_loop(
         // Reset backoff on successful connection
         backoff = INITIAL_RECONNECT_DELAY;
 
-        if was_disconnected {
+        if control.should_stop() {
+            break;
+        } else if was_disconnected {
             log::info!("IDLE: reconnected for account {}", account_id);
             on_event(IdleEvent::Reconnected(&account_id));
             // Trigger sync on reconnect — emails may have arrived while disconnected
@@ -105,19 +111,22 @@ pub fn run_idle_loop(
 
         // IDLE loop — stay on this connection until it breaks
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if control.should_stop() {
                 break;
             }
 
             match conn.idle_wait(IDLE_TIMEOUT) {
                 Ok(had_notification) => {
-                    if had_notification {
+                    if had_notification && !control.should_stop() {
                         log::info!("IDLE: new mail for account {}, triggering sync", account_id);
                         on_event(IdleEvent::NewMail(&account_id));
                     }
                     // If timeout (no notification), just re-enter IDLE
                 }
                 Err(e) => {
+                    if control.should_stop() {
+                        break;
+                    }
                     log::warn!("IDLE: error for {}: {}, reconnecting...", account_id, e);
                     on_event(IdleEvent::Disconnected(&account_id));
                     was_disconnected = true;
@@ -129,8 +138,8 @@ pub fn run_idle_loop(
         // Clean up connection
         conn.logout();
 
-        if !stop.load(Ordering::Relaxed) {
-            sleep_interruptible(&stop, Duration::from_secs(2));
+        if !control.should_stop() {
+            sleep_interruptible(&control, Duration::from_secs(2));
         }
     }
 
@@ -139,10 +148,10 @@ pub fn run_idle_loop(
 
 /// Sleep for `duration` but check `stop` flag every second so we can
 /// exit quickly when the app is shutting down.
-fn sleep_interruptible(stop: &AtomicBool, duration: Duration) {
+fn sleep_interruptible(control: &IdleControl, duration: Duration) {
     let steps = duration.as_secs();
     for _ in 0..steps {
-        if stop.load(Ordering::Relaxed) {
+        if control.should_stop() {
             return;
         }
         std::thread::sleep(Duration::from_secs(1));
