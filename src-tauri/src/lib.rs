@@ -16,6 +16,7 @@ mod meet;
 mod oauth;
 mod ops;
 mod path_validation;
+mod provider;
 mod state;
 
 use std::sync::atomic::{AtomicU8, Ordering};

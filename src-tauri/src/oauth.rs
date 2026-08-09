@@ -460,6 +460,18 @@ pub async fn exchange_code(
     port: u16,
     code_verifier: Option<&str>,
 ) -> Result<OAuthTokens> {
+    let client = reqwest::Client::new();
+    exchange_code_with_client(provider, code, port, code_verifier, &client).await
+}
+
+/// Exchange an authorization code using the provided HTTP client.
+pub async fn exchange_code_with_client(
+    provider: &OAuthProvider,
+    code: &str,
+    port: u16,
+    code_verifier: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens> {
     // Must match exactly what was sent in the auth request, or
     // the token endpoint returns `invalid_grant`. See
     // `get_auth_url` for the matching construction logic.
@@ -505,7 +517,6 @@ pub async fn exchange_code(
         },
     );
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(provider.token_url)
         .form(&params)
@@ -573,6 +584,16 @@ pub async fn refresh_access_token(
     provider: &OAuthProvider,
     refresh_token: &str,
 ) -> Result<OAuthTokens> {
+    let client = reqwest::Client::new();
+    refresh_access_token_with_client(provider, refresh_token, &client).await
+}
+
+/// Refresh an expired access token using the provided HTTP client.
+pub async fn refresh_access_token_with_client(
+    provider: &OAuthProvider,
+    refresh_token: &str,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens> {
     let mut params = HashMap::new();
     params.insert("client_id", provider.client_id.to_string());
     params.insert("refresh_token", refresh_token.to_string());
@@ -595,7 +616,6 @@ pub async fn refresh_access_token(
         },
     );
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(provider.token_url)
         .form(&params)
@@ -666,6 +686,17 @@ pub async fn refresh_with_scopes(
     refresh_token: &str,
     scopes: &str,
 ) -> Result<OAuthTokens> {
+    let client = reqwest::Client::new();
+    refresh_with_scopes_with_client(provider, refresh_token, scopes, &client).await
+}
+
+/// Refresh an access token with specific scopes using the provided HTTP client.
+pub async fn refresh_with_scopes_with_client(
+    provider: &OAuthProvider,
+    refresh_token: &str,
+    scopes: &str,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens> {
     let mut params = HashMap::new();
     params.insert("client_id", provider.client_id.to_string());
     params.insert("refresh_token", refresh_token.to_string());
@@ -676,7 +707,6 @@ pub async fn refresh_with_scopes(
         params.insert("client_secret", provider.client_secret.to_string());
     }
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(provider.token_url)
         .form(&params)
@@ -1093,6 +1123,20 @@ pub async fn refresh_token_dynamic(
     refresh_token: &str,
     client_id: &str,
 ) -> Result<OAuthTokens> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+    refresh_token_dynamic_with_client(token_url, refresh_token, client_id, &client).await
+}
+
+/// Refresh a dynamic token endpoint using the provided HTTP client.
+pub async fn refresh_token_dynamic_with_client(
+    token_url: &str,
+    refresh_token: &str,
+    client_id: &str,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens> {
     let mut params = HashMap::new();
     params.insert("client_id", client_id.to_string());
     params.insert("refresh_token", refresh_token.to_string());
@@ -1105,10 +1149,6 @@ pub async fn refresh_token_dynamic(
         client_id,
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
     let resp = client
         .post(token_url)
         .form(&params)
