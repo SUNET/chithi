@@ -35,6 +35,12 @@ pub enum Error {
     #[error("Re-authentication required: {0}")]
     AuthRequired(String),
 
+    #[error("{protocol} does not support {capability}")]
+    UnsupportedCapability {
+        protocol: &'static str,
+        capability: &'static str,
+    },
+
     #[error("{0}")]
     Other(String),
 }

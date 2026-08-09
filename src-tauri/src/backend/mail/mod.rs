@@ -1,7 +1,7 @@
 //! Mail backends: one implementor per mail protocol.
 //!
-//! Covers the sync entry points the sync commands dispatch on
-//! (account sync, per-folder sync, body prefetch) plus capability
+//! Covers the sync and search entry points commands dispatch on
+//! (account sync, per-folder sync, body prefetch, server search) plus capability
 //! flags for the command-layer concurrency machinery (IDLE
 //! suspension, background folder sync). Queued user operations
 //! (move/copy/delete/flag/send) go through the ops worker; the
@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use crate::db::accounts::AccountFull;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
 
 pub mod graph;
@@ -69,6 +70,13 @@ pub trait MailBackend: Send + Sync {
     async fn prefetch_bodies(&self, _ctx: &MailSyncCtx, _account: &AccountFull) -> Result<u32> {
         Ok(0)
     }
+
+    /// Search messages across the account on the provider server.
+    async fn search_messages(
+        &self,
+        account: &AccountFull,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>>;
 
     /// Create the per-account executor the ops worker drives queued
     /// [`MailOp`]s through. Called once per worker lifetime.

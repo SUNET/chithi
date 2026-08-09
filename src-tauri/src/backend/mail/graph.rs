@@ -8,12 +8,23 @@ use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
+use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct GraphMailBackend;
+
+fn validate_search_query(query: &SearchQuery) -> Result<()> {
+    if query.since_days.is_some_and(|days| days > 0) {
+        return Err(Error::UnsupportedCapability {
+            protocol: "graph",
+            capability: "server-side age filtering",
+        });
+    }
+    Ok(())
+}
 
 /// Max delta pages (of up to 200 messages each) applied per folder per
 /// sync cycle. The initial enumeration of a huge folder resumes on the
@@ -590,6 +601,18 @@ impl MailBackend for GraphMailBackend {
         Ok(fetched)
     }
 
+    async fn search_messages(
+        &self,
+        account: &AccountFull,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>> {
+        validate_search_query(query)?;
+
+        let token = crate::mail::graph::get_graph_token(&account.id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client.search_messages(&account.id, query).await
+    }
+
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {
         Box::new(GraphOpExecutor)
     }
@@ -752,5 +775,26 @@ impl MailOpExecutor for GraphOpExecutor {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_search_query;
+    use crate::mail::search::{SearchFields, SearchQuery};
+
+    #[test]
+    fn age_filtering_is_explicitly_unsupported() {
+        let query = SearchQuery {
+            text: "report".into(),
+            fields: SearchFields::default(),
+            has_attachment: None,
+            since_days: Some(30),
+        };
+        let error = validate_search_query(&query).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "graph does not support server-side age filtering"
+        );
     }
 }
