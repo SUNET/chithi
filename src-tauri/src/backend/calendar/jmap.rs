@@ -9,7 +9,10 @@ use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::mail::jmap::{JmapCalendarEvent, JmapConnection};
 
-use super::{get_unpushed_events, CalendarBackend, PushedEvent};
+use super::{
+    get_unpushed_events, AttendeeResponseUpdate, CalendarBackend, CalendarCapability,
+    InviteReplyDelivery, PushedEvent,
+};
 
 pub struct JmapCalendarBackend;
 
@@ -37,6 +40,10 @@ fn to_jmap_event(event: &CalendarEvent, remote_calendar_id: &str) -> JmapCalenda
 impl CalendarBackend for JmapCalendarBackend {
     fn protocol(&self) -> &'static str {
         "jmap"
+    }
+
+    fn invite_reply_delivery(&self) -> InviteReplyDelivery {
+        InviteReplyDelivery::JmapSubmission
     }
 
     async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
@@ -284,6 +291,50 @@ impl CalendarBackend for JmapCalendarBackend {
         conn_jmap
             .set_calendar_color(&jmap_config, remote_id, color)
             .await
+    }
+
+    async fn push_attendee_responses(
+        &self,
+        account: &AccountFull,
+        updates: &[AttendeeResponseUpdate],
+    ) -> Result<CalendarCapability<()>> {
+        let jmap_config = crate::auth::build_jmap_config(account).await?;
+        let Ok(connection) = JmapConnection::connect(&jmap_config).await else {
+            return Ok(CalendarCapability::Supported(()));
+        };
+        let Ok(events) = connection.fetch_calendar_events(&jmap_config, None).await else {
+            return Ok(CalendarCapability::Supported(()));
+        };
+
+        for update in updates {
+            let Some(event) = events.iter().find(|event| event.id == update.remote_id) else {
+                continue;
+            };
+            let Some(attendees_json) = event.attendees_json.as_deref() else {
+                continue;
+            };
+            let Ok(attendees) = serde_json::from_str::<Vec<serde_json::Value>>(attendees_json)
+            else {
+                continue;
+            };
+            for (index, attendee) in attendees.iter().enumerate() {
+                if attendee["email"].as_str() == Some(&update.attendee_email) {
+                    let participant_key = format!("att{}", index);
+                    connection
+                        .update_participant_status(
+                            &jmap_config,
+                            &update.remote_id,
+                            &participant_key,
+                            &update.response,
+                        )
+                        .await
+                        .ok();
+                    break;
+                }
+            }
+        }
+
+        Ok(CalendarCapability::Supported(()))
     }
 }
 

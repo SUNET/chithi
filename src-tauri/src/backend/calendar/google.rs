@@ -12,7 +12,11 @@ use crate::mail::google::{
     event_patch_to_google_json, event_to_google_json, send_updates_for, EventsPage, GoogleClient,
 };
 
-use super::{CalendarBackend, PushedEvent};
+use super::{
+    BusyPeriod, CalendarBackend, CalendarCapability, ParticipantSchedule,
+    ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
+    RemoteRsvpRequest,
+};
 
 pub struct GoogleCalendarBackend;
 
@@ -329,6 +333,93 @@ impl CalendarBackend for GoogleCalendarBackend {
         "google"
     }
 
+    fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
+        RemoteRsvpPolicy::BestEffortAfterLocal
+    }
+
+    async fn apply_remote_rsvp(
+        &self,
+        account: &AccountFull,
+        request: &RemoteRsvpRequest,
+    ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
+        let token = get_google_token(&account.id).await?;
+        let client = GoogleClient::new(&token);
+        let mut event_id = client
+            .find_event_by_ical_uid("primary", &request.uid)
+            .await
+            .ok()
+            .flatten();
+
+        if event_id.is_none() {
+            let import_event = google_rsvp_import_event(account, request);
+            match client.import_event("primary", &import_event).await {
+                Ok(imported_id) => {
+                    event_id = imported_id;
+                    log::info!("apply_invite_response: imported event to Google Calendar");
+                }
+                Err(error) => log::warn!(
+                    "apply_invite_response: Google Calendar import failed: {}",
+                    error
+                ),
+            }
+        }
+
+        if let Some(remote_id) = event_id.as_deref().filter(|id| !id.is_empty()) {
+            let attendees_patch = serde_json::json!({
+                "attendees": [{
+                    "email": account.email,
+                    "responseStatus": request.response.as_str(),
+                    "self": true,
+                }]
+            });
+            match client
+                .patch_event("primary", remote_id, &attendees_patch, "none")
+                .await
+            {
+                Ok(()) => log::info!(
+                    "apply_invite_response: updated Google Calendar response to {}",
+                    request.response.as_str()
+                ),
+                Err(error) => log::warn!(
+                    "apply_invite_response: Google Calendar PATCH failed: {}",
+                    error
+                ),
+            }
+        }
+
+        Ok(CalendarCapability::Supported(RemoteRsvpOutcome {
+            remote_id: event_id.filter(|id| !id.is_empty()),
+        }))
+    }
+
+    async fn get_participant_schedules(
+        &self,
+        account: &AccountFull,
+        request: &ParticipantScheduleRequest,
+    ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
+        let token = get_google_token(&account.id).await?;
+        let schedules = GoogleClient::new(&token)
+            .get_schedules(&request.emails, &request.start_time, &request.end_time)
+            .await?;
+        Ok(CalendarCapability::Supported(
+            schedules
+                .into_iter()
+                .map(|schedule| ParticipantSchedule {
+                    email: schedule.email,
+                    available: schedule.available,
+                    busy: schedule
+                        .busy
+                        .into_iter()
+                        .map(|period| BusyPeriod {
+                            start: period.start,
+                            end: period.end,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        ))
+    }
+
     /// REST sync with a CalDAV fallback: accounts configured before
     /// OAuth (or with a broken token) keep syncing through their
     /// `caldav_url` instead of failing outright.
@@ -458,9 +549,43 @@ impl CalendarBackend for GoogleCalendarBackend {
     }
 }
 
+fn google_rsvp_import_event(
+    account: &AccountFull,
+    request: &RemoteRsvpRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "iCalUID": request.uid,
+        "summary": request.summary,
+        "start": if request.all_day {
+            serde_json::json!({
+                "date": request.start_time.split('T').next().unwrap_or_default()
+            })
+        } else {
+            serde_json::json!({"dateTime": request.start_time})
+        },
+        "end": if request.all_day {
+            serde_json::json!({
+                "date": request.end_time.split('T').next().unwrap_or_default()
+            })
+        } else {
+            serde_json::json!({"dateTime": request.end_time})
+        },
+        "description": request.description,
+        "location": request.location,
+        "organizer": {"email": request.organizer_email},
+        "attendees": [{
+            "email": account.email,
+            "responseStatus": request.response.as_str(),
+            "self": true,
+        }],
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::readable_foreground;
+    use super::{google_rsvp_import_event, readable_foreground};
+    use crate::backend::calendar::{InviteResponse, RemoteRsvpRequest};
+    use crate::backend::testutil::account;
 
     #[test]
     fn light_background_gets_black_text() {
@@ -477,5 +602,39 @@ mod tests {
     #[test]
     fn malformed_hex_defaults_to_black() {
         assert_eq!(readable_foreground("nope"), "#000000");
+    }
+
+    #[test]
+    fn rsvp_import_payload_preserves_event_and_response_fields() {
+        let account = account("calendar", "google");
+        let request = RemoteRsvpRequest {
+            uid: "event@example.com".into(),
+            response: InviteResponse::Tentative,
+            summary: Some("Planning".into()),
+            start_time: "2026-08-10".into(),
+            end_time: "2026-08-11".into(),
+            all_day: true,
+            description: Some("Agenda".into()),
+            location: Some("Room 1".into()),
+            organizer_email: Some("organizer@example.com".into()),
+        };
+
+        assert_eq!(
+            google_rsvp_import_event(&account, &request),
+            serde_json::json!({
+                "iCalUID": "event@example.com",
+                "summary": "Planning",
+                "start": {"date": "2026-08-10"},
+                "end": {"date": "2026-08-11"},
+                "description": "Agenda",
+                "location": "Room 1",
+                "organizer": {"email": "organizer@example.com"},
+                "attendees": [{
+                    "email": "u@example.com",
+                    "responseStatus": "tentative",
+                    "self": true,
+                }],
+            })
+        );
     }
 }

@@ -1,7 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tauri::State;
 
-use crate::auth::get_google_token;
+use crate::backend::calendar::{
+    AttendeeResponseUpdate, CalendarCapability, InviteReplyDelivery, InviteResponse,
+    ParticipantSchedule, ParticipantScheduleRequest, RemoteRsvpPolicy, RemoteRsvpRequest,
+    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+};
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
@@ -86,32 +90,6 @@ pub struct MeetBindingInput {
     pub protocol: String,
     pub meeting_id: String,
     pub join_url: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RoomSuggestion {
-    pub name: String,
-    pub address: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RoomAvailability {
-    pub state: String,
-    pub busy_start: Option<String>,
-    pub busy_end: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ParticipantSchedule {
-    pub email: String,
-    pub available: bool,
-    pub busy: Vec<BusyPeriod>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BusyPeriod {
-    pub start: String,
-    pub end: String,
 }
 
 /// Defence-in-depth check on a client-supplied meet binding before
@@ -500,25 +478,19 @@ pub async fn list_room_suggestions(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.calendar_protocol_str() != "graph" {
-        log::debug!(
-            "list_room_suggestions: skipping non-graph account {} ({})",
-            account.id,
-            account.calendar_protocol_str()
-        );
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(Vec::new());
+    };
+    match backend.list_room_suggestions(&account).await? {
+        CalendarCapability::Supported(rooms) => Ok(rooms),
+        CalendarCapability::Unsupported => {
+            log::debug!(
+                "list_room_suggestions: {} backend does not support room lookup",
+                backend.protocol()
+            );
+            Ok(Vec::new())
+        }
     }
-
-    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-    let client = crate::mail::graph::GraphClient::new(&token);
-    let rooms = client.list_rooms().await?;
-    Ok(rooms
-        .into_iter()
-        .map(|room| RoomSuggestion {
-            name: room.name,
-            address: room.address,
-        })
-        .collect())
 }
 
 #[tauri::command]
@@ -534,25 +506,26 @@ pub async fn check_room_availability(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.calendar_protocol_str() != "graph" {
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(RoomAvailability {
             state: "unknown".into(),
             busy_start: None,
             busy_end: None,
         });
+    };
+    let request = RoomAvailabilityRequest {
+        room_address,
+        start_time,
+        end_time,
+    };
+    match backend.check_room_availability(&account, &request).await? {
+        CalendarCapability::Supported(availability) => Ok(availability),
+        CalendarCapability::Unsupported => Ok(RoomAvailability {
+            state: "unknown".into(),
+            busy_start: None,
+            busy_end: None,
+        }),
     }
-
-    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-    let client = crate::mail::graph::GraphClient::new(&token);
-    let availability = client
-        .get_room_availability(&room_address, &start_time, &end_time)
-        .await?;
-
-    Ok(RoomAvailability {
-        state: availability.state,
-        busy_start: availability.busy_start,
-        busy_end: availability.busy_end,
-    })
 }
 
 #[tauri::command]
@@ -563,6 +536,29 @@ pub async fn get_participant_schedules(
     start_time: String,
     end_time: String,
 ) -> Result<Vec<ParticipantSchedule>> {
+    let request = build_participant_schedule_request(emails, start_time, end_time)?;
+
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
+        return Ok(Vec::new());
+    };
+    match backend
+        .get_participant_schedules(&account, &request)
+        .await?
+    {
+        CalendarCapability::Supported(schedules) => Ok(schedules),
+        CalendarCapability::Unsupported => Ok(Vec::new()),
+    }
+}
+
+fn build_participant_schedule_request(
+    emails: Vec<String>,
+    start_time: String,
+    end_time: String,
+) -> Result<ParticipantScheduleRequest> {
     let mut emails: Vec<String> = emails
         .into_iter()
         .map(|email| email.trim().to_ascii_lowercase())
@@ -586,55 +582,11 @@ pub async fn get_participant_schedules(
         ));
     }
 
-    let account = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)?
-    };
-    match account.calendar_protocol_str() {
-        "graph" => {
-            let token = crate::mail::graph::get_graph_token(&account.id).await?;
-            let schedules = crate::mail::graph::GraphClient::new(&token)
-                .get_schedules(&emails, &start_time, &end_time)
-                .await?;
-            Ok(schedules
-                .into_iter()
-                .map(|schedule| ParticipantSchedule {
-                    email: schedule.email,
-                    available: schedule.available,
-                    busy: schedule
-                        .busy
-                        .into_iter()
-                        .map(|period| BusyPeriod {
-                            start: period.start,
-                            end: period.end,
-                        })
-                        .collect(),
-                })
-                .collect())
-        }
-        "google" => {
-            let token = get_google_token(&account.id).await?;
-            let schedules = crate::mail::google::GoogleClient::new(&token)
-                .get_schedules(&emails, &start_time, &end_time)
-                .await?;
-            Ok(schedules
-                .into_iter()
-                .map(|schedule| ParticipantSchedule {
-                    email: schedule.email,
-                    available: schedule.available,
-                    busy: schedule
-                        .busy
-                        .into_iter()
-                        .map(|period| BusyPeriod {
-                            start: period.start,
-                            end: period.end,
-                        })
-                        .collect(),
-                })
-                .collect())
-        }
-        _ => Ok(Vec::new()),
-    }
+    Ok(ParticipantScheduleRequest {
+        emails,
+        start_time,
+        end_time,
+    })
 }
 
 /// Push the event title back to the meet provider as the meeting's
@@ -1065,29 +1017,6 @@ pub async fn get_invite_status(
     Ok(event.and_then(|e| e.my_status))
 }
 
-/// How an iTIP REPLY to a meeting invite should be delivered, by calendar
-/// protocol. Graph/O365 accounts have no SMTP host configured — Microsoft
-/// delivers the reply to the organizer itself via the Graph RSVP call
-/// (`sendResponse: true`). Routing them through SMTP fails with an empty
-/// hostname.
-#[derive(Debug, PartialEq, Eq)]
-enum InviteReplyTransport {
-    /// Send the reply email over JMAP submission.
-    Jmap,
-    /// No client-side send — the Graph RSVP call delivers the reply.
-    GraphRsvp,
-    /// Send the reply email over SMTP (IMAP/Gmail accounts).
-    Smtp,
-}
-
-fn invite_reply_transport(calendar_protocol: &str) -> InviteReplyTransport {
-    match calendar_protocol {
-        "jmap" => InviteReplyTransport::Jmap,
-        "graph" => InviteReplyTransport::GraphRsvp,
-        _ => InviteReplyTransport::Smtp,
-    }
-}
-
 #[tauri::command]
 pub async fn respond_to_invite(
     app: tauri::AppHandle,
@@ -1172,8 +1101,23 @@ async fn apply_invite_response(
     response: String,
     source_message_id: Option<String>,
 ) -> Result<()> {
+    let response = InviteResponse::try_from(response.as_str())?;
+    let response_text = response.as_str();
+    let backend = crate::backend::calendar::for_account(&account);
+    let remote_request = RemoteRsvpRequest {
+        uid: invite_uid.clone(),
+        response,
+        summary: invite.summary.clone(),
+        start_time: invite.dtstart.clone(),
+        end_time: invite.dtend.clone(),
+        all_day: invite.all_day,
+        description: invite.description.clone(),
+        location: invite.location.clone(),
+        organizer_email: invite.organizer_email.clone(),
+    };
+
     // Step 2: Generate the iTIP REPLY
-    let reply_ical = ical::generate_reply(invite, &account.email, &response);
+    let reply_ical = ical::generate_reply(invite, &account.email, response_text);
 
     // Step 3: Send the reply to the organizer
     if let Some(ref organizer_email) = invite.organizer_email {
@@ -1185,12 +1129,15 @@ async fn apply_invite_response(
         // Build an email with the iCal reply as a text/calendar attachment
         let body_text = format!(
             "This is a {} response to the calendar invitation \"{}\".",
-            response.to_lowercase(),
+            response_text,
             invite.summary.as_deref().unwrap_or("Calendar Invite")
         );
 
-        match invite_reply_transport(account.calendar_protocol_str()) {
-            InviteReplyTransport::Jmap => {
+        match backend
+            .map(|provider| provider.invite_reply_delivery())
+            .unwrap_or(InviteReplyDelivery::Smtp)
+        {
+            InviteReplyDelivery::JmapSubmission => {
                 log::info!("apply_invite_response: sending reply via JMAP");
                 let jmap_config = crate::auth::build_jmap_config(&account).await?;
 
@@ -1205,7 +1152,7 @@ async fn apply_invite_response(
                 let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
                 jmap_conn.send_email(&jmap_config, &raw_message).await?;
             }
-            InviteReplyTransport::GraphRsvp => {
+            InviteReplyDelivery::Provider => {
                 // O365/Graph accounts have no SMTP host configured. The reply
                 // email to the organizer is sent by Microsoft itself via the
                 // Graph API RSVP call (`sendResponse: true`) in Step 3b below.
@@ -1213,7 +1160,7 @@ async fn apply_invite_response(
                     "apply_invite_response: O365 account — reply delivered via Graph API RSVP (Step 3b)"
                 );
             }
-            InviteReplyTransport::Smtp => {
+            InviteReplyDelivery::Smtp => {
                 log::info!("apply_invite_response: sending reply via SMTP");
                 let raw_message = build_calendar_reply_message(
                     &account.email,
@@ -1224,7 +1171,8 @@ async fn apply_invite_response(
                 )?;
 
                 // For O365: refresh SMTP-scoped OAuth token
-                let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+                let (smtp_password, use_xoauth2) =
+                    crate::auth::get_imap_credentials(&account).await?;
 
                 send_raw_smtp(
                     &account.smtp_host,
@@ -1251,31 +1199,27 @@ async fn apply_invite_response(
     // keeps the operation atomic: a delivery failure returns an error
     // without having marked the invite answered locally — Step 4 (and the
     // remote_id store in Step 6) only run once delivery has succeeded.
-    let graph_event_id: Option<String> = if account.calendar_protocol_str() == "graph" {
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        let event_id = client
-            .find_event_by_ical_uid(&invite_uid)
+    let required_remote_id = if let Some(provider) = backend
+        .filter(|provider| provider.remote_rsvp_policy() == RemoteRsvpPolicy::RequiredBeforeLocal)
+    {
+        match provider
+            .apply_remote_rsvp(&account, &remote_request)
             .await?
-            .ok_or_else(|| {
-                crate::error::Error::Other(
-                    "This invitation isn't on your Outlook calendar yet. \
-                     Sync the calendar and try again."
-                        .into(),
-                )
-            })?;
-        client.rsvp_event(&event_id, &response, "").await?;
-        log::info!(
-            "apply_invite_response: updated O365 Calendar response to {}",
-            response
-        );
-        Some(event_id)
+        {
+            CalendarCapability::Supported(outcome) => outcome.remote_id,
+            CalendarCapability::Unsupported => {
+                return Err(crate::error::Error::UnsupportedCapability {
+                    protocol: provider.protocol(),
+                    capability: "remote calendar RSVP",
+                });
+            }
+        }
     } else {
         None
     };
 
     // Step 4: Create/update event in local calendar
-    let my_status = response.to_lowercase();
+    let my_status = response_text.to_string();
     let conn = state.db.writer().await;
 
     // Find the best calendar for this account: prefer default, then any with
@@ -1333,7 +1277,7 @@ async fn apply_invite_response(
         log::info!(
             "apply_invite_response: updated existing event {} status={}",
             existing.id,
-            response
+            response_text
         );
     } else {
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -1365,7 +1309,7 @@ async fn apply_invite_response(
         log::info!(
             "apply_invite_response: created event {} status={}",
             event_id,
-            response
+            response_text
         );
     }
 
@@ -1374,108 +1318,51 @@ async fn apply_invite_response(
     // Google/Graph steps can re-acquire the writer without deadlocking.
     drop(conn);
 
-    // Step 5: Update Google Calendar if this is a Gmail account with OAuth
-    if account.calendar_protocol_str() == "google" {
-        if let Ok(token) = get_google_token(&account_id).await {
-            let google_status = match response.to_lowercase().as_str() {
-                "accepted" => "accepted",
-                "tentative" => "tentative",
-                "declined" => "declined",
-                _ => "needsAction",
-            };
-            // Find event on Google Calendar by iCalUID, import if not found
-            let client = crate::mail::google::GoogleClient::new(&token);
-            let mut google_event_id_found = client
-                .find_event_by_ical_uid("primary", &invite_uid)
-                .await
-                .ok()
-                .flatten();
-            // If not on Google Calendar yet, import it
-            if google_event_id_found.is_none() {
-                let import_event = serde_json::json!({
-                    "iCalUID": invite_uid,
-                    "summary": invite.summary,
-                    "start": if invite.all_day {
-                        serde_json::json!({"date": invite.dtstart.split('T').next().unwrap_or_default()})
-                    } else {
-                        serde_json::json!({"dateTime": invite.dtstart})
-                    },
-                    "end": if invite.all_day {
-                        serde_json::json!({"date": invite.dtend.split('T').next().unwrap_or_default()})
-                    } else {
-                        serde_json::json!({"dateTime": invite.dtend})
-                    },
-                    "description": invite.description,
-                    "location": invite.location,
-                    "organizer": {"email": invite.organizer_email},
-                    "attendees": [{
-                        "email": account.email,
-                        "responseStatus": google_status,
-                        "self": true,
-                    }],
-                });
-                match client.import_event("primary", &import_event).await {
-                    Ok(imported_id) => {
-                        google_event_id_found = imported_id;
-                        log::info!("apply_invite_response: imported event to Google Calendar");
-                    }
-                    Err(e) => log::warn!(
-                        "apply_invite_response: Google Calendar import failed: {}",
-                        e
-                    ),
-                }
+    // Step 5: Best-effort provider RSVP after local persistence. Google uses
+    // this path; failures must not undo SMTP delivery or the local status.
+    let best_effort_remote_id = if let Some(provider) = backend
+        .filter(|provider| provider.remote_rsvp_policy() == RemoteRsvpPolicy::BestEffortAfterLocal)
+    {
+        match provider.apply_remote_rsvp(&account, &remote_request).await {
+            Ok(CalendarCapability::Supported(outcome)) => outcome.remote_id,
+            Ok(CalendarCapability::Unsupported) => {
+                log::warn!(
+                    "apply_invite_response: {} advertises remote RSVP but returned unsupported",
+                    provider.protocol()
+                );
+                None
             }
-            // PATCH the attendee status on Google
-            if let Some(ref geid) = google_event_id_found {
-                if !geid.is_empty() {
-                    let attendees_patch = serde_json::json!({
-                        "attendees": [{
-                            "email": account.email,
-                            "responseStatus": google_status,
-                            "self": true,
-                        }]
-                    });
-                    match client
-                        .patch_event("primary", geid, &attendees_patch, "none")
-                        .await
-                    {
-                        Ok(()) => log::info!(
-                            "apply_invite_response: updated Google Calendar response to {}",
-                            google_status
-                        ),
-                        Err(e) => {
-                            log::warn!("apply_invite_response: Google Calendar PATCH failed: {}", e)
-                        }
-                    }
-                }
-            }
-            // Store the Google Calendar event ID as remote_id on the local event
-            // so that Google Calendar sync doesn't create a duplicate.
-            if let Some(ref geid) = google_event_id_found {
-                if !geid.is_empty() {
-                    let conn = state.db.writer().await;
-                    conn.execute(
-                        "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3 AND (remote_id IS NULL OR remote_id = '')",
-                        rusqlite::params![geid, invite_uid, account_id],
-                    ).ok();
-                    log::info!(
-                        "apply_invite_response: stored Google Calendar remote_id={}",
-                        geid
-                    );
-                }
+            Err(error) => {
+                log::warn!(
+                    "apply_invite_response: {} remote RSVP failed: {}",
+                    provider.protocol(),
+                    error
+                );
+                None
             }
         }
+    } else {
+        None
+    };
+
+    if let Some(remote_id) = best_effort_remote_id {
+        let conn = state.db.writer().await;
+        conn.execute(
+            "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3 AND (remote_id IS NULL OR remote_id = '')",
+            rusqlite::params![remote_id, invite_uid, account_id],
+        )
+        .ok();
     }
 
     // Step 6: Persist the Graph event id. The RSVP itself was already
     // delivered in Step 3b; this only records remote_id on the now-existing
     // local row so process_invite_reply can locate the event later. It is
     // best-effort (`.ok()`) — a failure here doesn't lose the RSVP.
-    if let Some(graph_event_id) = graph_event_id {
+    if let Some(remote_id) = required_remote_id {
         let conn = state.db.writer().await;
         conn.execute(
             "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3",
-            rusqlite::params![graph_event_id, invite_uid, account_id],
+            rusqlite::params![remote_id, invite_uid, account_id],
         )
         .ok();
     }
@@ -1652,34 +1539,6 @@ fn build_calendar_reply_message(
         })?;
 
     Ok(message.formatted())
-}
-
-/// Get SMTP credentials for an account, refreshing OAuth tokens for O365.
-async fn get_smtp_credentials(account: &db::accounts::AccountFull) -> Result<(String, bool)> {
-    if account.calendar_protocol_str() == "graph" {
-        let tokens = crate::oauth::load_tokens(&account.id)?
-            .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
-        let refresh_token = tokens
-            .refresh_token
-            .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for SMTP".into()))?;
-        let smtp_tokens = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh_token,
-            crate::oauth::MICROSOFT_IMAP_SCOPES, // SMTP.Send is in the same scope set
-        )
-        .await?;
-        crate::oauth::store_tokens(
-            &account.id,
-            &crate::oauth::OAuthTokens {
-                access_token: smtp_tokens.access_token.clone(),
-                refresh_token: smtp_tokens.refresh_token,
-                expires_at: smtp_tokens.expires_at,
-            },
-        )?;
-        Ok((smtp_tokens.access_token, true))
-    } else {
-        Ok((account.password.clone(), false))
-    }
 }
 
 /// Send a pre-built raw message via SMTP, with XOAUTH2 support for O365.
@@ -1867,7 +1726,7 @@ pub async fn send_invites(
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
         } else {
-            let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+            let (smtp_password, use_xoauth2) = crate::auth::get_imap_credentials(&account).await?;
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
@@ -1939,18 +1798,12 @@ pub async fn process_invite_reply(
         return Ok(());
     }
 
-    // Phase 1: update local DB, collect any JMAP push we need to do
-    // afterwards. The writer guard is dropped at the end of this block
-    // so the JMAP network round-trip below doesn't block other writes.
-    struct JmapPush {
-        remote_id: String,
-        attendee_email: String,
-        status: String,
-    }
-    let (account, jmap_pushes) = {
+    // Phase 1: update local DB and collect provider-neutral remote updates.
+    // The writer guard is dropped before backend network activity.
+    let (account, attendee_updates) = {
         let conn = state.db.writer().await;
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let mut jmap_pushes: Vec<JmapPush> = Vec::new();
+        let mut attendee_updates = Vec::new();
 
         for reply in &reply_invites {
             let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
@@ -1986,52 +1839,31 @@ pub async fn process_invite_reply(
                     }
                 }
 
-                if account.calendar_protocol_str() == "jmap" {
-                    if let Some(ref remote_id) = event.remote_id {
-                        jmap_pushes.push(JmapPush {
-                            remote_id: remote_id.clone(),
-                            attendee_email: attendee.email.clone(),
-                            status: status.clone(),
-                        });
-                    }
+                if let Some(ref remote_id) = event.remote_id {
+                    attendee_updates.push(AttendeeResponseUpdate {
+                        remote_id: remote_id.clone(),
+                        attendee_email: attendee.email.clone(),
+                        response: status.clone(),
+                    });
                 }
             }
         }
-        (account, jmap_pushes)
+        (account, attendee_updates)
     };
 
-    // Phase 2: JMAP push without holding the DB writer. Each REPLY component
-    // gets pushed; one fetch_calendar_events round-trip is reused for all.
-    if !jmap_pushes.is_empty() {
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        if let Ok(jmap_conn) = crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
-            if let Ok(events) = jmap_conn.fetch_calendar_events(&jmap_config, None).await {
-                for push in &jmap_pushes {
-                    let Some(ev) = events.iter().find(|e| e.id == push.remote_id) else {
-                        continue;
-                    };
-                    let Some(ref aj) = ev.attendees_json else {
-                        continue;
-                    };
-                    let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) else {
-                        continue;
-                    };
-                    for (i, a) in atts.iter().enumerate() {
-                        if a["email"].as_str() == Some(&push.attendee_email) {
-                            let key = format!("att{}", i);
-                            jmap_conn
-                                .update_participant_status(
-                                    &jmap_config,
-                                    &push.remote_id,
-                                    &key,
-                                    &push.status,
-                                )
-                                .await
-                                .ok();
-                            break;
-                        }
-                    }
-                }
+    // Phase 2: let the provider apply any supported remote participant update
+    // without holding the DB writer. JMAP preserves its fetch-once behavior;
+    // other providers explicitly report this capability as unsupported.
+    if !attendee_updates.is_empty() {
+        if let Some(backend) = crate::backend::calendar::for_account(&account) {
+            if let CalendarCapability::Unsupported = backend
+                .push_attendee_responses(&account, &attendee_updates)
+                .await?
+            {
+                log::debug!(
+                    "process_invite_reply: {} backend does not push attendee responses",
+                    backend.protocol()
+                );
             }
         }
     }
@@ -2350,29 +2182,49 @@ pub fn get_default_timezone() -> String {
 mod tests {
     use super::*;
 
-    // Regression: replying to a meeting invite on an O365/Graph account must
-    // NOT route through SMTP. Graph accounts have no SMTP host configured
-    // (empty string), so SMTP delivery fails. Microsoft delivers the reply
-    // itself via the Graph RSVP call.
     #[test]
-    fn graph_invite_reply_does_not_use_smtp() {
-        assert_eq!(
-            invite_reply_transport("graph"),
-            InviteReplyTransport::GraphRsvp
-        );
+    fn participant_schedule_request_normalizes_addresses() {
+        let request = build_participant_schedule_request(
+            vec![
+                " Bob@Example.com ".into(),
+                "alice@example.com".into(),
+                "bob@example.com".into(),
+                " ".into(),
+            ],
+            "2026-08-10T09:00:00Z".into(),
+            "2026-08-10T10:00:00Z".into(),
+        )
+        .unwrap();
+
+        assert_eq!(request.emails, vec!["alice@example.com", "bob@example.com"]);
     }
 
     #[test]
-    fn jmap_invite_reply_uses_jmap() {
-        assert_eq!(invite_reply_transport("jmap"), InviteReplyTransport::Jmap);
+    fn participant_schedule_request_rejects_too_many_addresses() {
+        let emails = (0..51)
+            .map(|index| format!("person{index}@example.com"))
+            .collect();
+        assert!(build_participant_schedule_request(
+            emails,
+            "2026-08-10T09:00:00Z".into(),
+            "2026-08-10T10:00:00Z".into(),
+        )
+        .is_err());
     }
 
     #[test]
-    fn imap_and_gmail_invite_reply_use_smtp() {
-        // IMAP/CalDAV and Gmail accounts send the iTIP REPLY over SMTP.
-        assert_eq!(invite_reply_transport("caldav"), InviteReplyTransport::Smtp);
-        assert_eq!(invite_reply_transport("google"), InviteReplyTransport::Smtp);
-        // An account with no calendar binding still falls back to SMTP.
-        assert_eq!(invite_reply_transport(""), InviteReplyTransport::Smtp);
+    fn participant_schedule_request_rejects_invalid_ranges() {
+        assert!(build_participant_schedule_request(
+            vec!["person@example.com".into()],
+            "2026-08-10T10:00:00Z".into(),
+            "2026-08-10T09:00:00Z".into(),
+        )
+        .is_err());
+        assert!(build_participant_schedule_request(
+            vec!["person@example.com".into()],
+            "not-a-date".into(),
+            "2026-08-10T09:00:00Z".into(),
+        )
+        .is_err());
     }
 }

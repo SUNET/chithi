@@ -11,7 +11,11 @@ use crate::mail::graph::{
     event_patch_to_graph_json, event_to_graph_json, get_graph_token, GraphClient,
 };
 
-use super::{CalendarBackend, PushedEvent};
+use super::{
+    BusyPeriod, CalendarBackend, CalendarCapability, InviteReplyDelivery, ParticipantSchedule,
+    ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
+    RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+};
 
 pub struct GraphCalendarBackend;
 
@@ -19,6 +23,104 @@ pub struct GraphCalendarBackend;
 impl CalendarBackend for GraphCalendarBackend {
     fn protocol(&self) -> &'static str {
         "graph"
+    }
+
+    fn invite_reply_delivery(&self) -> InviteReplyDelivery {
+        InviteReplyDelivery::Provider
+    }
+
+    fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
+        RemoteRsvpPolicy::RequiredBeforeLocal
+    }
+
+    async fn apply_remote_rsvp(
+        &self,
+        account: &AccountFull,
+        request: &RemoteRsvpRequest,
+    ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
+        let token = get_graph_token(&account.id).await?;
+        let client = GraphClient::new(&token);
+        let event_id = client
+            .find_event_by_ical_uid(&request.uid)
+            .await?
+            .ok_or_else(|| {
+                crate::error::Error::Other(
+                    "This invitation isn't on your Outlook calendar yet. \
+                     Sync the calendar and try again."
+                        .into(),
+                )
+            })?;
+        client
+            .rsvp_event(&event_id, request.response.as_str(), "")
+            .await?;
+        Ok(CalendarCapability::Supported(RemoteRsvpOutcome {
+            remote_id: Some(event_id),
+        }))
+    }
+
+    async fn list_room_suggestions(
+        &self,
+        account: &AccountFull,
+    ) -> Result<CalendarCapability<Vec<RoomSuggestion>>> {
+        let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
+        let rooms = GraphClient::new(&token).list_rooms().await?;
+        Ok(CalendarCapability::Supported(
+            rooms
+                .into_iter()
+                .map(|room| RoomSuggestion {
+                    name: room.name,
+                    address: room.address,
+                })
+                .collect(),
+        ))
+    }
+
+    async fn check_room_availability(
+        &self,
+        account: &AccountFull,
+        request: &RoomAvailabilityRequest,
+    ) -> Result<CalendarCapability<RoomAvailability>> {
+        let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
+        let availability = GraphClient::new(&token)
+            .get_room_availability(
+                &request.room_address,
+                &request.start_time,
+                &request.end_time,
+            )
+            .await?;
+        Ok(CalendarCapability::Supported(RoomAvailability {
+            state: availability.state,
+            busy_start: availability.busy_start,
+            busy_end: availability.busy_end,
+        }))
+    }
+
+    async fn get_participant_schedules(
+        &self,
+        account: &AccountFull,
+        request: &ParticipantScheduleRequest,
+    ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
+        let token = get_graph_token(&account.id).await?;
+        let schedules = GraphClient::new(&token)
+            .get_schedules(&request.emails, &request.start_time, &request.end_time)
+            .await?;
+        Ok(CalendarCapability::Supported(
+            schedules
+                .into_iter()
+                .map(|schedule| ParticipantSchedule {
+                    email: schedule.email,
+                    available: schedule.available,
+                    busy: schedule
+                        .busy
+                        .into_iter()
+                        .map(|period| BusyPeriod {
+                            start: period.start,
+                            end: period.end,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        ))
     }
 
     async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
