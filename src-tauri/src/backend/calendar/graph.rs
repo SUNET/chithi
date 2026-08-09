@@ -13,8 +13,8 @@ use crate::mail::graph::{
 
 use super::{
     BusyPeriod, CalendarBackend, CalendarCapability, InviteReplyDelivery, ParticipantSchedule,
-    ParticipantScheduleRequest, PushedEvent, RoomAvailability, RoomAvailabilityRequest,
-    RoomSuggestion,
+    ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
+    RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 
 pub struct GraphCalendarBackend;
@@ -27,6 +27,35 @@ impl CalendarBackend for GraphCalendarBackend {
 
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
         InviteReplyDelivery::Provider
+    }
+
+    fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
+        RemoteRsvpPolicy::RequiredBeforeLocal
+    }
+
+    async fn apply_remote_rsvp(
+        &self,
+        account: &AccountFull,
+        request: &RemoteRsvpRequest,
+    ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
+        let token = get_graph_token(&account.id).await?;
+        let client = GraphClient::new(&token);
+        let event_id = client
+            .find_event_by_ical_uid(&request.uid)
+            .await?
+            .ok_or_else(|| {
+                crate::error::Error::Other(
+                    "This invitation isn't on your Outlook calendar yet. \
+                     Sync the calendar and try again."
+                        .into(),
+                )
+            })?;
+        client
+            .rsvp_event(&event_id, request.response.as_str(), "")
+            .await?;
+        Ok(CalendarCapability::Supported(RemoteRsvpOutcome {
+            remote_id: Some(event_id),
+        }))
     }
 
     async fn list_room_suggestions(

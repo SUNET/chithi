@@ -393,10 +393,16 @@ mod registry_tests {
     }
 
     #[test]
-    fn remote_rsvp_policy_stays_unsupported_until_provider_methods_exist() {
-        for protocol in ["caldav", "jmap", "google", "graph"] {
+    fn remote_rsvp_policy_matches_callable_provider_methods() {
+        let cases = [
+            ("caldav", RemoteRsvpPolicy::Unsupported),
+            ("jmap", RemoteRsvpPolicy::Unsupported),
+            ("google", RemoteRsvpPolicy::BestEffortAfterLocal),
+            ("graph", RemoteRsvpPolicy::RequiredBeforeLocal),
+        ];
+        for (protocol, expected) in cases {
             let backend = for_account(&account(protocol, "")).unwrap();
-            assert_eq!(backend.remote_rsvp_policy(), RemoteRsvpPolicy::Unsupported);
+            assert_eq!(backend.remote_rsvp_policy(), expected);
         }
     }
 
@@ -564,5 +570,39 @@ mod contract_tests {
             .check_room_availability(&graph, &room_request)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_rsvp_capabilities_match_their_policies() {
+        let graph = account("calendar", "graph");
+        let google = account("calendar", "google");
+        let caldav = account("calendar", "caldav");
+        let request = RemoteRsvpRequest {
+            uid: "event@example.com".into(),
+            response: InviteResponse::Accepted,
+            summary: Some("Planning".into()),
+            start_time: "2026-08-10T09:00:00Z".into(),
+            end_time: "2026-08-10T10:00:00Z".into(),
+            all_day: false,
+            description: None,
+            location: None,
+            organizer_email: Some("organizer@example.com".into()),
+        };
+
+        assert!(graph::GraphCalendarBackend
+            .apply_remote_rsvp(&graph, &request)
+            .await
+            .is_err());
+        assert!(google::GoogleCalendarBackend
+            .apply_remote_rsvp(&google, &request)
+            .await
+            .is_err());
+        assert_eq!(
+            caldav::CalDavCalendarBackend
+                .apply_remote_rsvp(&caldav, &request)
+                .await
+                .unwrap(),
+            CalendarCapability::Unsupported
+        );
     }
 }
