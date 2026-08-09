@@ -1,46 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 
 use crate::db;
 use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::{
+    ApplicationEvent, EventSink, SharedEventSink, SyncComplete, SyncError, SyncProgress,
+    SyncStarted,
+};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::FilterAction;
 use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
 
-#[derive(Clone, serde::Serialize)]
-struct SyncStarted {
-    account_id: String,
-    account_name: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncProgress {
-    account_id: String,
-    folder: String,
-    synced: u32,
-    total_folders: usize,
-    current_folder: usize,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncComplete {
-    account_id: String,
-    total_synced: u32,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncError {
-    account_id: String,
-    error: String,
-}
-
 /// Sync all folders for an account. If `current_folder` is set, sync it first.
 pub async fn sync_account(
-    app: AppHandle,
+    events: SharedEventSink,
     db: Arc<DbPool>,
     data_dir: PathBuf,
     account_id: String,
@@ -48,22 +23,18 @@ pub async fn sync_account(
     imap_config: ImapConfig,
     current_folder: Option<String>,
 ) -> Result<()> {
-    app.emit(
-        "sync-started",
-        SyncStarted {
-            account_id: account_id.clone(),
-            account_name: account_name.clone(),
-        },
-    )
-    .ok();
+    events.publish(ApplicationEvent::SyncStarted(SyncStarted {
+        account_id: account_id.clone(),
+        account_name: account_name.clone(),
+    }));
 
-    let app_clone = app.clone();
+    let blocking_events = events.clone();
     let account_id_clone = account_id.clone();
 
     let current_folder_clone = current_folder;
     let result = tokio::task::spawn_blocking(move || {
         sync_account_blocking(
-            &app_clone,
+            blocking_events.as_ref(),
             db,
             &data_dir,
             &account_id_clone,
@@ -76,26 +47,18 @@ pub async fn sync_account(
 
     match &result {
         Ok(total) => {
-            app.emit(
-                "sync-complete",
-                SyncComplete {
-                    account_id: account_id.clone(),
-                    total_synced: *total,
-                },
-            )
-            .ok();
-            emit_folders_changed(&app, &account_id);
-            emit_messages_changed(&app, &account_id);
+            events.publish(ApplicationEvent::SyncComplete(SyncComplete {
+                account_id: account_id.clone(),
+                total_synced: *total,
+            }));
+            events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
+            events.publish(ApplicationEvent::MessagesChanged(account_id.clone()));
         }
         Err(e) => {
-            app.emit(
-                "sync-error",
-                SyncError {
-                    account_id: account_id.clone(),
-                    error: e.to_string(),
-                },
-            )
-            .ok();
+            events.publish(ApplicationEvent::SyncError(SyncError {
+                account_id: account_id.clone(),
+                error: e.to_string(),
+            }));
         }
     }
 
@@ -106,7 +69,7 @@ pub async fn sync_account(
 const MAX_PARALLEL_CONNECTIONS: usize = 4;
 
 fn sync_account_blocking(
-    app: &AppHandle,
+    events: &dyn EventSink,
     db: Arc<DbPool>,
     data_dir: &Path,
     account_id: &str,
@@ -164,17 +127,13 @@ fn sync_account_blocking(
     // Phase 1: Sync priority folders sequentially on the existing connection
     // (current folder + INBOX first so the UI is usable quickly)
     for (i, folder) in priority.iter().enumerate() {
-        app.emit(
-            "sync-progress",
-            SyncProgress {
-                account_id: account_id.to_string(),
-                folder: folder.clone(),
-                synced: 0,
-                total_folders,
-                current_folder: i + 1,
-            },
-        )
-        .ok();
+        events.publish(ApplicationEvent::SyncProgress(SyncProgress {
+            account_id: account_id.to_string(),
+            folder: folder.clone(),
+            synced: 0,
+            total_folders,
+            current_folder: i + 1,
+        }));
 
         match sync_folder_envelopes(&db, account_id, &mut conn_imap, folder) {
             Ok(count) => {
@@ -182,17 +141,13 @@ fn sync_account_blocking(
                 if count > 0 {
                     log::info!("Synced {} envelopes in {}", count, folder);
                 }
-                app.emit(
-                    "sync-progress",
-                    SyncProgress {
-                        account_id: account_id.to_string(),
-                        folder: folder.clone(),
-                        synced: count,
-                        total_folders,
-                        current_folder: i + 1,
-                    },
-                )
-                .ok();
+                events.publish(ApplicationEvent::SyncProgress(SyncProgress {
+                    account_id: account_id.to_string(),
+                    folder: folder.clone(),
+                    synced: count,
+                    total_folders,
+                    current_folder: i + 1,
+                }));
             }
             Err(e) => log::error!("Error syncing {}: {}", folder, e),
         }
@@ -225,7 +180,6 @@ fn sync_account_blocking(
                     let db = db.clone();
                     let imap_config = imap_config.clone();
                     let account_id = account_id.to_string();
-                    let app = app.clone();
                     let rt = rt_handle.clone();
                     s.spawn(move || {
                         // Enter the Tokio runtime context for db.writer() calls inside sync
@@ -247,17 +201,13 @@ fn sync_account_blocking(
                                 + thread_idx
                                 + (folders.iter().position(|f| f == folder).unwrap_or(0)
                                     * parallel_count);
-                            app.emit(
-                                "sync-progress",
-                                SyncProgress {
-                                    account_id: account_id.clone(),
-                                    folder: folder.clone(),
-                                    synced: 0,
-                                    total_folders,
-                                    current_folder: folder_idx + 1,
-                                },
-                            )
-                            .ok();
+                            events.publish(ApplicationEvent::SyncProgress(SyncProgress {
+                                account_id: account_id.clone(),
+                                folder: folder.clone(),
+                                synced: 0,
+                                total_folders,
+                                current_folder: folder_idx + 1,
+                            }));
                             match sync_folder_envelopes(&db, &account_id, &mut conn, folder) {
                                 Ok(count) => {
                                     thread_total += count;

@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use tauri::Emitter;
 
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
+use crate::event::{ApplicationEvent, SyncStarted};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::mail::search::{SearchHit, SearchQuery};
 use crate::mail::sync as mail_sync;
@@ -322,7 +322,7 @@ impl MailBackend for ImapMailBackend {
         let imap_config = build_imap_config(account).await?;
 
         mail_sync::sync_account(
-            ctx.app.clone(),
+            ctx.events.clone(),
             ctx.db.clone(),
             ctx.data_dir.clone(),
             account.id.clone(),
@@ -341,15 +341,11 @@ impl MailBackend for ImapMailBackend {
     ) -> Result<u32> {
         // sync_folder_envelopes_public is a low-level helper and
         // doesn't emit sync-started itself, so do it here.
-        ctx.app
-            .emit(
-                "sync-started",
-                serde_json::json!({
-                    "account_id": account.id,
-                    "account_name": account.display_name,
-                }),
-            )
-            .ok();
+        ctx.events
+            .publish(ApplicationEvent::SyncStarted(SyncStarted {
+                account_id: account.id.clone(),
+                account_name: account.display_name.clone(),
+            }));
 
         let imap_config = build_imap_config(account).await?;
 
@@ -474,14 +470,14 @@ pub(crate) async fn sync_folder_quiet(
     let imap_config = build_imap_config(account).await?;
     let db = ctx.db.clone();
     let account_id = account.id.clone();
-    let app = ctx.app.clone();
+    let events = ctx.events.clone();
     let folder_path = folder_path.to_string();
     tokio::task::spawn_blocking(move || {
         let mut conn = ImapConnection::connect(&imap_config)?;
         crate::mail::sync::sync_folder_envelopes_public(&db, &account_id, &mut conn, &folder_path)?;
         conn.logout();
-        crate::event::emit_folders_changed(&app, &account_id);
-        crate::event::emit_messages_changed(&app, &account_id);
+        events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
+        events.publish(ApplicationEvent::MessagesChanged(account_id));
         Ok::<_, Error>(())
     })
     .await

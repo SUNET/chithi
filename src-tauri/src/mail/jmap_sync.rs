@@ -1,45 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 
 use crate::db;
 use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::{
+    ApplicationEvent, EventSink, SharedEventSink, SyncComplete, SyncError, SyncProgress,
+    SyncStarted,
+};
 use crate::mail::compat::BackendMessageRef;
 use crate::mail::jmap::{JmapConfig, JmapConnection};
-
-#[derive(Clone, serde::Serialize)]
-struct SyncStarted {
-    account_id: String,
-    account_name: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncProgress {
-    account_id: String,
-    folder: String,
-    synced: u32,
-    total_folders: usize,
-    current_folder: usize,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncComplete {
-    account_id: String,
-    total_synced: u32,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct SyncError {
-    account_id: String,
-    error: String,
-}
 
 /// Sync all folders for a JMAP account. This is the JMAP equivalent of
 /// `mail::sync::sync_account` for IMAP.
 pub async fn sync_jmap_account(
-    app: AppHandle,
+    events: SharedEventSink,
     db: Arc<DbPool>,
     _data_dir: PathBuf,
     account_id: String,
@@ -47,17 +22,13 @@ pub async fn sync_jmap_account(
     jmap_config: JmapConfig,
     current_folder: Option<String>,
 ) -> Result<()> {
-    app.emit(
-        "sync-started",
-        SyncStarted {
-            account_id: account_id.clone(),
-            account_name: account_name.clone(),
-        },
-    )
-    .ok();
+    events.publish(ApplicationEvent::SyncStarted(SyncStarted {
+        account_id: account_id.clone(),
+        account_name: account_name.clone(),
+    }));
 
     let result = sync_jmap_account_inner(
-        &app,
+        events.as_ref(),
         &db,
         &account_id,
         &jmap_config,
@@ -67,26 +38,18 @@ pub async fn sync_jmap_account(
 
     match &result {
         Ok(total) => {
-            app.emit(
-                "sync-complete",
-                SyncComplete {
-                    account_id: account_id.clone(),
-                    total_synced: *total,
-                },
-            )
-            .ok();
-            emit_folders_changed(&app, &account_id);
-            emit_messages_changed(&app, &account_id);
+            events.publish(ApplicationEvent::SyncComplete(SyncComplete {
+                account_id: account_id.clone(),
+                total_synced: *total,
+            }));
+            events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
+            events.publish(ApplicationEvent::MessagesChanged(account_id.clone()));
         }
         Err(e) => {
-            app.emit(
-                "sync-error",
-                SyncError {
-                    account_id: account_id.clone(),
-                    error: e.to_string(),
-                },
-            )
-            .ok();
+            events.publish(ApplicationEvent::SyncError(SyncError {
+                account_id: account_id.clone(),
+                error: e.to_string(),
+            }));
         }
     }
 
@@ -94,7 +57,7 @@ pub async fn sync_jmap_account(
 }
 
 async fn sync_jmap_account_inner(
-    app: &AppHandle,
+    events: &dyn EventSink,
     db: &Arc<DbPool>,
     account_id: &str,
     jmap_config: &JmapConfig,
@@ -140,17 +103,13 @@ async fn sync_jmap_account_inner(
     let mut grand_total = 0u32;
 
     for (i, (folder_name, mailbox_id)) in all_folders.iter().enumerate() {
-        app.emit(
-            "sync-progress",
-            SyncProgress {
-                account_id: account_id.to_string(),
-                folder: folder_name.to_string(),
-                synced: 0,
-                total_folders,
-                current_folder: i + 1,
-            },
-        )
-        .ok();
+        events.publish(ApplicationEvent::SyncProgress(SyncProgress {
+            account_id: account_id.to_string(),
+            folder: folder_name.to_string(),
+            synced: 0,
+            total_folders,
+            current_folder: i + 1,
+        }));
 
         match sync_jmap_folder(
             db,
@@ -166,17 +125,13 @@ async fn sync_jmap_account_inner(
                 grand_total += count;
                 if count > 0 {
                     log::info!("JMAP synced {} emails in {}", count, folder_name);
-                    app.emit(
-                        "sync-progress",
-                        SyncProgress {
-                            account_id: account_id.to_string(),
-                            folder: folder_name.to_string(),
-                            synced: count,
-                            total_folders,
-                            current_folder: i + 1,
-                        },
-                    )
-                    .ok();
+                    events.publish(ApplicationEvent::SyncProgress(SyncProgress {
+                        account_id: account_id.to_string(),
+                        folder: folder_name.to_string(),
+                        synced: count,
+                        total_folders,
+                        current_folder: i + 1,
+                    }));
                 }
             }
             Err(e) => log::error!("JMAP error syncing {}: {}", folder_name, e),
@@ -506,21 +461,17 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
 
 /// Sync a single JMAP folder — public entry point for the `sync_folder` command.
 pub async fn sync_jmap_folder_public(
-    app: AppHandle,
+    events: SharedEventSink,
     db: Arc<DbPool>,
     account_id: String,
     account_name: String,
     mailbox_id: String,
     jmap_config: JmapConfig,
 ) -> Result<u32> {
-    app.emit(
-        "sync-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "account_name": account_name,
-        }),
-    )
-    .ok();
+    events.publish(ApplicationEvent::SyncStarted(SyncStarted {
+        account_id: account_id.clone(),
+        account_name,
+    }));
 
     let conn_jmap = JmapConnection::connect(&jmap_config).await?;
     let folder_name = mailbox_id.clone();
@@ -536,26 +487,18 @@ pub async fn sync_jmap_folder_public(
 
     match &result {
         Ok(count) => {
-            app.emit(
-                "sync-complete",
-                serde_json::json!({
-                    "account_id": account_id,
-                    "total_synced": count,
-                }),
-            )
-            .ok();
-            emit_folders_changed(&app, &account_id);
-            emit_messages_changed(&app, &account_id);
+            events.publish(ApplicationEvent::SyncComplete(SyncComplete {
+                account_id: account_id.clone(),
+                total_synced: *count,
+            }));
+            events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
+            events.publish(ApplicationEvent::MessagesChanged(account_id.clone()));
         }
         Err(e) => {
-            app.emit(
-                "sync-error",
-                serde_json::json!({
-                    "account_id": account_id,
-                    "error": e.to_string(),
-                }),
-            )
-            .ok();
+            events.publish(ApplicationEvent::SyncError(SyncError {
+                account_id: account_id.clone(),
+                error: e.to_string(),
+            }));
         }
     }
 

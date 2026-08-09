@@ -49,7 +49,7 @@ impl MailBackend for JmapMailBackend {
         let jmap_config = crate::auth::build_jmap_config(account).await?;
 
         jmap_sync::sync_jmap_account(
-            ctx.app.clone(),
+            ctx.events.clone(),
             ctx.db.clone(),
             ctx.data_dir.clone(),
             account.id.clone(),
@@ -68,7 +68,7 @@ impl MailBackend for JmapMailBackend {
     ) -> Result<u32> {
         let jmap_config = crate::auth::build_jmap_config(account).await?;
         jmap_sync::sync_jmap_folder_public(
-            ctx.app.clone(),
+            ctx.events.clone(),
             ctx.db.clone(),
             account.id.clone(),
             account.display_name.clone(),

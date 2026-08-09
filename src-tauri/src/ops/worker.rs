@@ -211,7 +211,7 @@ impl AccountWorker {
         self.executor = self.backend.map(|b| b.op_executor());
         let data_dir = self.app.state::<crate::state::AppState>().data_dir.clone();
         self.ctx = Some(MailSyncCtx {
-            app: self.app.clone(),
+            events: crate::event::tauri::shared_sink(self.app.clone()),
             db: self.db.clone(),
             data_dir,
         });

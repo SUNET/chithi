@@ -4,7 +4,7 @@ use crate::commands::sync_cmd::{resume_imap_idle_for_account, suspend_imap_idle_
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::tauri::{emit_folders_changed, emit_messages_changed};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::imap::ImapConfig;
 use crate::mail::parser;
@@ -296,7 +296,7 @@ async fn ensure_message_body_on_disk(
         ))
     })?;
     let ctx = crate::backend::mail::MailSyncCtx {
-        app: app.clone(),
+        events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
     };

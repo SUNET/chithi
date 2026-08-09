@@ -2,7 +2,7 @@ use tauri::{Emitter, State};
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::tauri::{emit_folders_changed, emit_messages_changed};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::imap::{ImapConfig, ImapConnection};
 use crate::ops::flags::{AccountReadScope, FlagMutation, FlagTarget};
