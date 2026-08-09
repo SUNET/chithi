@@ -97,9 +97,75 @@ fn build_copy_batch_requests(
 // Graph client
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEndpoints {
+    pub v1_api_root: String,
+    pub beta_api_root: String,
+}
+
+impl GraphEndpoints {
+    pub fn new(v1_api_root: impl Into<String>, beta_api_root: impl Into<String>) -> Self {
+        Self {
+            v1_api_root: v1_api_root.into(),
+            beta_api_root: beta_api_root.into(),
+        }
+    }
+
+    fn v1_url(&self, path: &str) -> String {
+        join_url(&self.v1_api_root, path)
+    }
+
+    fn beta_url(&self, path: &str) -> String {
+        join_url(&self.beta_api_root, path)
+    }
+}
+
+impl Default for GraphEndpoints {
+    fn default() -> Self {
+        Self::new(GRAPH_BASE, GRAPH_BETA_BASE)
+    }
+}
+
+fn join_url(root: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::GraphEndpoints;
+
+    #[test]
+    fn defaults_to_production_graph_roots() {
+        let endpoints = GraphEndpoints::default();
+
+        assert_eq!(endpoints.v1_api_root, "https://graph.microsoft.com/v1.0");
+        assert_eq!(endpoints.beta_api_root, "https://graph.microsoft.com/beta");
+    }
+
+    #[test]
+    fn joins_roots_and_paths_with_one_separator() {
+        let endpoints =
+            GraphEndpoints::new("http://localhost:8080/v1.0/", "http://localhost:8080/beta/");
+
+        assert_eq!(
+            endpoints.v1_url("/me/messages"),
+            "http://localhost:8080/v1.0/me/messages"
+        );
+        assert_eq!(
+            endpoints.beta_url("me/findRooms"),
+            "http://localhost:8080/beta/me/findRooms"
+        );
+    }
+}
+
 pub struct GraphClient {
     http: reqwest::Client,
     access_token: String,
+    endpoints: GraphEndpoints,
 }
 
 /// Removes an incomplete Graph download even if its async owner is cancelled.
@@ -169,9 +235,22 @@ pub struct GraphBusyPeriod {
 
 impl GraphClient {
     pub fn new(access_token: &str) -> Self {
+        Self::with_client(
+            reqwest::Client::new(),
+            access_token,
+            GraphEndpoints::default(),
+        )
+    }
+
+    pub fn with_client(
+        http: reqwest::Client,
+        access_token: &str,
+        endpoints: GraphEndpoints,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http,
             access_token: access_token.to_string(),
+            endpoints,
         }
     }
 
@@ -229,7 +308,7 @@ impl GraphClient {
     }
 
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = self.endpoints.v1_url(path);
         let resp = self
             .send_with_retry(
                 || {
@@ -259,7 +338,7 @@ impl GraphClient {
     }
 
     async fn get_beta(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
-        let url = format!("{}{}", GRAPH_BETA_BASE, path);
+        let url = self.endpoints.beta_url(path);
         let resp = self
             .send_with_retry(
                 || {
@@ -340,7 +419,7 @@ impl GraphClient {
     async fn stream_to_file(&self, path: &str, dest: &std::path::Path) -> Result<u64> {
         use tokio::io::AsyncWriteExt;
 
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = self.endpoints.v1_url(path);
         let resp = self
             .send_with_retry(
                 || self.http.get(&url).bearer_auth(&self.access_token),
@@ -411,7 +490,7 @@ impl GraphClient {
     }
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = self.endpoints.v1_url(path);
         let resp = self
             .send_with_retry(
                 || {
@@ -447,7 +526,7 @@ impl GraphClient {
     }
 
     async fn patch_json(&self, path: &str, body: &serde_json::Value) -> Result<()> {
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = self.endpoints.v1_url(path);
         let resp = self
             .send_with_retry(
                 || {
@@ -475,7 +554,7 @@ impl GraphClient {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = self.endpoints.v1_url(path);
         let resp = self
             .send_with_retry(
                 || self.http.delete(&url).bearer_auth(&self.access_token),
@@ -739,13 +818,14 @@ impl GraphClient {
                 || {
                     let req = match link {
                         Some(url) => self.http.get(url),
-                        None => self
-                            .http
-                            .get(format!(
-                                "{}/me/mailFolders/{}/messages/delta",
-                                GRAPH_BASE, folder_id
-                            ))
-                            .query(&[("$select", DELTA_SELECT)]),
+                        None => {
+                            self.http
+                                .get(self.endpoints.v1_url(&format!(
+                                    "/me/mailFolders/{}/messages/delta",
+                                    folder_id
+                                )))
+                                .query(&[("$select", DELTA_SELECT)])
+                        }
                     };
                     req.bearer_auth(&self.access_token)
                         .header("Prefer", "odata.maxpagesize=200")
@@ -790,7 +870,7 @@ impl GraphClient {
             None => return Ok(vec![]),
         };
 
-        let url = format!("{}/me/messages", GRAPH_BASE);
+        let url = self.endpoints.v1_url("/me/messages");
         // Graph $search REQUIRES the value to be wrapped in double quotes,
         // exactly once. `build_graph_kql` returns the bare KQL.
         let search_value = format!("\"{}\"", kql);
@@ -1517,11 +1597,10 @@ impl GraphClient {
                         .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
                 }
                 None => {
-                    let url = format!(
-                        "{}/me/calendars/{}/calendarView",
-                        GRAPH_BASE,
+                    let url = self.endpoints.v1_url(&format!(
+                        "/me/calendars/{}/calendarView",
                         urlencoding::encode(calendar_id)
-                    );
+                    ));
                     let resp = self.http
                         .get(&url)
                         .bearer_auth(&self.access_token)
@@ -1594,7 +1673,7 @@ impl GraphClient {
                         .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
                 }
                 None => {
-                    let url = format!("{}/me/calendarView", GRAPH_BASE);
+                    let url = self.endpoints.v1_url("/me/calendarView");
                     let resp = self.http
                         .get(&url)
                         .bearer_auth(&self.access_token)

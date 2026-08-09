@@ -192,6 +192,15 @@ pub fn await_login_token(listener: TcpListener, expected_state: &str) -> Result<
 /// in the account row — that's the authority for subsequent API
 /// calls.
 pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Result<LoginResult> {
+    exchange_login_token_with_client(homeserver_url, login_token, http_client()?).await
+}
+
+/// Exchange an SSO login token using an explicit HTTP client.
+pub async fn exchange_login_token_with_client(
+    homeserver_url: &str,
+    login_token: &str,
+    client: &reqwest::Client,
+) -> Result<LoginResult> {
     let url = format!(
         "{}/_matrix/client/v3/login",
         normalize_base_url(homeserver_url)
@@ -205,7 +214,7 @@ pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Re
         // otherwise show in the Active sessions panel.
         "initial_device_display_name": USER_AGENT,
     });
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .json(&body)
         .send()
@@ -273,6 +282,24 @@ pub async fn create_call(
     room_name: &str,
     element_call_url: Option<&str>,
 ) -> Result<crate::meet::MeetCreateResult> {
+    create_call_with_client(
+        homeserver,
+        access_token,
+        room_name,
+        element_call_url,
+        http_client()?,
+    )
+    .await
+}
+
+/// Create a Matrix room and widget using an explicit HTTP client.
+pub async fn create_call_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_name: &str,
+    element_call_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<crate::meet::MeetCreateResult> {
     let create_url = format!(
         "{}/_matrix/client/v3/createRoom",
         normalize_base_url(homeserver)
@@ -282,7 +309,6 @@ pub async fn create_call(
         "preset": "private_chat",
         "visibility": "private",
     });
-    let client = http_client()?;
     let resp = client
         .post(&create_url)
         .bearer_auth(access_token)
@@ -374,6 +400,17 @@ pub async fn rename_room(
     room_id: &str,
     new_name: &str,
 ) -> Result<()> {
+    rename_room_with_client(homeserver, access_token, room_id, new_name, http_client()?).await
+}
+
+/// Rename a Matrix room using an explicit HTTP client.
+pub async fn rename_room_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_id: &str,
+    new_name: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/state/m.room.name",
         normalize_base_url(homeserver),
@@ -385,7 +422,7 @@ pub async fn rename_room(
         new_name
     };
     let body = serde_json::json!({ "name": name });
-    let resp = http_client()?
+    let resp = client
         .put(&url)
         .bearer_auth(access_token)
         .json(&body)
@@ -410,12 +447,22 @@ pub async fn rename_room(
 /// the closest analogue to "cancelled this call." 403/404 are
 /// treated as already-gone so the local cleanup is idempotent.
 pub async fn leave_room(homeserver: &str, access_token: &str, room_id: &str) -> Result<()> {
+    leave_room_with_client(homeserver, access_token, room_id, http_client()?).await
+}
+
+/// Leave a Matrix room using an explicit HTTP client.
+pub async fn leave_room_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_id: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/leave",
         normalize_base_url(homeserver),
         urlencoding::encode(room_id),
     );
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .bearer_auth(access_token)
         .header("Content-Type", "application/json")

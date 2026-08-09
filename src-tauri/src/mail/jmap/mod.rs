@@ -101,6 +101,22 @@ mod connect_tests {
             msg
         );
     }
+
+    #[tokio::test]
+    async fn configured_url_bypasses_discovery_client() {
+        let mut config = http_config();
+        config.jmap_url = "https://api.example.com/.well-known/jmap/".into();
+        let discovery_http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+
+        let base_url = JmapConnection::resolve_base_url(&config, &discovery_http)
+            .await
+            .unwrap();
+
+        assert_eq!(base_url, "https://api.example.com");
+    }
 }
 
 impl JmapConfig {
@@ -371,6 +387,24 @@ mod session_limit_tests {
 
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
+        let discovery_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let api_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        Self::connect_with_clients(config, discovery_http, api_http).await
+    }
+
+    /// Connect using caller-provided clients for discovery and JMAP API traffic.
+    pub async fn connect_with_clients(
+        config: &JmapConfig,
+        discovery_http: reqwest::Client,
+        api_http: reqwest::Client,
+    ) -> Result<Self> {
         // Fail fast if bearer/OIDC was selected but no access token
         // resolved. Without this guard, apply_auth() would silently fall
         // through to HTTP Basic with an empty password, the server would
@@ -397,42 +431,7 @@ impl JmapConnection {
             )));
         }
 
-        let base_url = if !config.jmap_url.is_empty() {
-            let url = config.jmap_url.trim_end_matches('/').to_string();
-            let url = url.trim_end_matches("/.well-known/jmap").to_string();
-            crate::mail::url_validation::require_https(&url)?;
-            url
-        } else {
-            // Auto-discover
-            let domain = config
-                .email
-                .rsplit_once('@')
-                .map(|(_, d)| d)
-                .ok_or_else(|| {
-                    Error::Other(format!("Cannot extract domain from '{}'", config.email))
-                })?;
-            let candidates = [
-                format!("https://{}", domain),
-                format!("https://mail.{}", domain),
-                format!("https://jmap.{}", domain),
-            ];
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| Error::Other(e.to_string()))?;
-            let mut found = None;
-            for c in &candidates {
-                let url = format!("{}/.well-known/jmap", c);
-                if let Ok(resp) = http.get(&url).send().await {
-                    if resp.status().is_success() || resp.status().as_u16() == 401 {
-                        found = Some(c.clone());
-                        break;
-                    }
-                }
-            }
-            found
-                .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
-        };
+        let base_url = Self::resolve_base_url(config, &discovery_http).await?;
 
         // Diagnostic: enough to tell which auth mode is in play and to
         // spot truncated/empty credentials without leaking any part of
@@ -454,15 +453,10 @@ impl JmapConnection {
             credential_len,
         );
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(e.to_string()))?;
-
         // Fetch session with authentication
         let well_known = format!("{}/.well-known/jmap", base_url);
         let resp = config
-            .apply_auth(http.get(&well_known))
+            .apply_auth(api_http.get(&well_known))
             .send()
             .await
             .map_err(|e| Error::Other(format!("JMAP session fetch failed: {}", e)))?;
@@ -506,7 +500,7 @@ impl JmapConnection {
         );
 
         Ok(Self {
-            http,
+            http: api_http,
             api_url,
             download_url_template: download_url,
             upload_url_template: upload_url,
@@ -514,6 +508,43 @@ impl JmapConnection {
             account_id,
             max_objects_in_set,
         })
+    }
+
+    async fn resolve_base_url(
+        config: &JmapConfig,
+        discovery_http: &reqwest::Client,
+    ) -> Result<String> {
+        if !config.jmap_url.is_empty() {
+            let url = config.jmap_url.trim_end_matches('/').to_string();
+            let url = url.trim_end_matches("/.well-known/jmap").to_string();
+            crate::mail::url_validation::require_https(&url)?;
+            Ok(url)
+        } else {
+            // Auto-discover
+            let domain = config
+                .email
+                .rsplit_once('@')
+                .map(|(_, d)| d)
+                .ok_or_else(|| {
+                    Error::Other(format!("Cannot extract domain from '{}'", config.email))
+                })?;
+            let candidates = [
+                format!("https://{}", domain),
+                format!("https://mail.{}", domain),
+                format!("https://jmap.{}", domain),
+            ];
+            let mut found = None;
+            for c in &candidates {
+                let url = format!("{}/.well-known/jmap", c);
+                if let Ok(resp) = discovery_http.get(&url).send().await {
+                    if resp.status().is_success() || resp.status().as_u16() == 401 {
+                        found = Some(c.clone());
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))
+        }
     }
 
     pub fn account_id(&self) -> &str {

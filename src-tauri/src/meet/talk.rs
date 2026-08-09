@@ -77,8 +77,16 @@ pub struct LoginFlowResult {
 /// (`https://cloud.example.com`) and path-prefixed installs
 /// (`https://example.com/cloud`).
 pub async fn login_flow_v2_start(server_url: &str) -> Result<LoginFlowStart> {
+    login_flow_v2_start_with_client(server_url, http_client()?).await
+}
+
+/// Start Login Flow v2 using an explicit HTTP client.
+pub async fn login_flow_v2_start_with_client(
+    server_url: &str,
+    client: &reqwest::Client,
+) -> Result<LoginFlowStart> {
     let url = format!("{}/index.php/login/v2", normalize_base_url(server_url));
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .send()
         .await
@@ -107,7 +115,16 @@ pub async fn login_flow_v2_poll(
     poll_endpoint: &str,
     poll_token: &str,
 ) -> Result<Option<LoginFlowResult>> {
-    let resp = http_client()?
+    login_flow_v2_poll_with_client(poll_endpoint, poll_token, http_client()?).await
+}
+
+/// Poll Login Flow v2 once using an explicit HTTP client.
+pub async fn login_flow_v2_poll_with_client(
+    poll_endpoint: &str,
+    poll_token: &str,
+    client: &reqwest::Client,
+) -> Result<Option<LoginFlowResult>> {
+    let resp = client
         .post(poll_endpoint)
         .form(&[("token", poll_token)])
         .send()
@@ -140,9 +157,20 @@ pub async fn login_flow_v2_complete(
     flow: &LoginFlowStart,
     timeout_secs: u64,
 ) -> Result<LoginFlowResult> {
+    login_flow_v2_complete_with_client(flow, timeout_secs, http_client()?).await
+}
+
+/// Complete Login Flow v2 using an explicit HTTP client for every poll.
+pub async fn login_flow_v2_complete_with_client(
+    flow: &LoginFlowStart,
+    timeout_secs: u64,
+    client: &reqwest::Client,
+) -> Result<LoginFlowResult> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(30));
     loop {
-        if let Some(result) = login_flow_v2_poll(&flow.poll.endpoint, &flow.poll.token).await? {
+        if let Some(result) =
+            login_flow_v2_poll_with_client(&flow.poll.endpoint, &flow.poll.token, client).await?
+        {
             return Ok(result);
         }
         if std::time::Instant::now() >= deadline {
@@ -166,6 +194,17 @@ pub async fn create_room(
     app_password: &str,
     room_name: &str,
 ) -> Result<crate::meet::MeetCreateResult> {
+    create_room_with_client(server, login_name, app_password, room_name, http_client()?).await
+}
+
+/// Create a Talk room using an explicit HTTP client.
+pub async fn create_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    room_name: &str,
+    client: &reqwest::Client,
+) -> Result<crate::meet::MeetCreateResult> {
     let base = normalize_base_url(server);
     let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room", base);
     let name = if room_name.trim().is_empty() {
@@ -173,7 +212,7 @@ pub async fn create_room(
     } else {
         room_name
     };
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")
@@ -223,6 +262,26 @@ pub async fn rename_room(
     token: &str,
     new_name: &str,
 ) -> Result<()> {
+    rename_room_with_client(
+        server,
+        login_name,
+        app_password,
+        token,
+        new_name,
+        http_client()?,
+    )
+    .await
+}
+
+/// Rename a Talk room using an explicit HTTP client.
+pub async fn rename_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+    new_name: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
     let base = normalize_base_url(server);
     let url = format!(
         "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
@@ -234,7 +293,7 @@ pub async fn rename_room(
     } else {
         new_name
     };
-    let resp = http_client()?
+    let resp = client
         .put(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")
@@ -265,13 +324,24 @@ pub async fn delete_room(
     app_password: &str,
     token: &str,
 ) -> Result<()> {
+    delete_room_with_client(server, login_name, app_password, token, http_client()?).await
+}
+
+/// Delete a Talk room using an explicit HTTP client.
+pub async fn delete_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
     let base = normalize_base_url(server);
     let url = format!(
         "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
         base,
         urlencoding::encode(token),
     );
-    let resp = http_client()?
+    let resp = client
         .delete(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")

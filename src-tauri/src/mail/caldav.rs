@@ -149,8 +149,12 @@ impl CalDavClient {
     /// Create a new CalDAV client. If `caldav_url` is empty, attempt
     /// auto-discovery via `.well-known/caldav`.
     pub async fn connect(config: &CalDavConfig) -> Result<Self> {
-        let http = crate::mail::dav_http::build_client()?;
+        let http = crate::mail::dav_http::build_dav_client()?;
+        Self::connect_with_client(config, http).await
+    }
 
+    /// Create a CalDAV client using the provided HTTP client.
+    pub async fn connect_with_client(config: &CalDavConfig, http: reqwest::Client) -> Result<Self> {
         let auth = DavAuth::Basic {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -175,9 +179,17 @@ impl CalDavClient {
 
     /// Create a CalDAV client with OAuth2 bearer token authentication.
     pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
-        crate::mail::url_validation::require_https(caldav_url)?;
+        let http = crate::mail::dav_http::build_dav_client()?;
+        Self::connect_with_token_and_client(caldav_url, token, http).await
+    }
 
-        let http = crate::mail::dav_http::build_client()?;
+    /// Create an OAuth2 CalDAV client using the provided HTTP client.
+    pub async fn connect_with_token_and_client(
+        caldav_url: &str,
+        token: &str,
+        http: reqwest::Client,
+    ) -> Result<Self> {
+        crate::mail::url_validation::require_https(caldav_url)?;
 
         let auth = DavAuth::Bearer {
             token: token.to_string(),

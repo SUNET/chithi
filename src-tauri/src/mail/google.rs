@@ -21,9 +21,25 @@ pub struct GoogleBusyPeriod {
     pub end: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleEndpoints {
+    pub calendar_api_root: String,
+    pub people_api_root: String,
+}
+
+impl Default for GoogleEndpoints {
+    fn default() -> Self {
+        Self {
+            calendar_api_root: "https://www.googleapis.com/calendar/v3".into(),
+            people_api_root: "https://people.googleapis.com/v1".into(),
+        }
+    }
+}
+
 pub struct GoogleClient {
     http: reqwest::Client,
     token: String,
+    endpoints: GoogleEndpoints,
 }
 
 /// One page of a Calendar events listing.
@@ -37,10 +53,31 @@ pub enum EventsPage {
 
 impl GoogleClient {
     pub fn new(access_token: &str) -> Self {
+        Self::with_client(
+            reqwest::Client::new(),
+            access_token,
+            GoogleEndpoints::default(),
+        )
+    }
+
+    pub fn with_client(
+        http: reqwest::Client,
+        access_token: &str,
+        endpoints: GoogleEndpoints,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http,
             token: access_token.to_string(),
+            endpoints,
         }
+    }
+
+    fn calendar_url(&self, path: &str) -> String {
+        endpoint_url(&self.endpoints.calendar_api_root, path)
+    }
+
+    fn people_url(&self, path: &str) -> String {
+        endpoint_url(&self.endpoints.people_api_root, path)
     }
 
     // -----------------------------------------------------------------------
@@ -52,7 +89,7 @@ impl GoogleClient {
     pub async fn list_calendar_list(&self) -> Result<serde_json::Value> {
         let resp = self
             .http
-            .get("https://www.googleapis.com/calendar/v3/users/me/calendarList")
+            .get(self.calendar_url("users/me/calendarList"))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -82,7 +119,7 @@ impl GoogleClient {
         });
         let resp = self
             .http
-            .post("https://www.googleapis.com/calendar/v3/freeBusy")
+            .post(self.calendar_url("freeBusy"))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -110,10 +147,10 @@ impl GoogleClient {
     ) -> Result<EventsPage> {
         let resp = self
             .http
-            .get(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            .get(self.calendar_url(&format!(
+                "calendars/{}/events",
                 urlencoding::encode(calendar_id)
-            ))
+            )))
             .bearer_auth(&self.token)
             .query(&[("syncToken", sync_token)])
             .send()
@@ -132,10 +169,10 @@ impl GoogleClient {
     ) -> Result<EventsPage> {
         let resp = self
             .http
-            .get(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            .get(self.calendar_url(&format!(
+                "calendars/{}/events",
                 urlencoding::encode(calendar_id)
-            ))
+            )))
             .bearer_auth(&self.token)
             .query(&[
                 ("timeMin", time_min),
@@ -176,11 +213,11 @@ impl GoogleClient {
         event: &serde_json::Value,
         send_updates: &str,
     ) -> Result<(String, Option<String>)> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events?sendUpdates={}",
             urlencoding::encode(calendar_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .post(&url)
@@ -213,12 +250,12 @@ impl GoogleClient {
         patch: &serde_json::Value,
         send_updates: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/{}?sendUpdates={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(event_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -245,12 +282,12 @@ impl GoogleClient {
         event_id: &str,
         send_updates: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/{}?sendUpdates={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(event_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .delete(&url)
@@ -276,11 +313,11 @@ impl GoogleClient {
         calendar_id: &str,
         ical_uid: &str,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events?iCalUID={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events?iCalUID={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(ical_uid)
-        );
+        ));
         let resp = self
             .http
             .get(&url)
@@ -306,10 +343,10 @@ impl GoogleClient {
         calendar_id: &str,
         event: &serde_json::Value,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/import",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/import",
             urlencoding::encode(calendar_id)
-        );
+        ));
         let resp = self
             .http
             .post(&url)
@@ -342,10 +379,10 @@ impl GoogleClient {
         background: &str,
         foreground: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/users/me/calendarList/{}?colorRgbFormat=true",
+        let url = self.calendar_url(&format!(
+            "users/me/calendarList/{}?colorRgbFormat=true",
             urlencoding::encode(calendar_id)
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -371,10 +408,7 @@ impl GoogleClient {
 
     /// Rename a calendar (the underlying calendar resource's summary).
     pub async fn rename_calendar(&self, calendar_id: &str, name: &str) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}",
-            urlencoding::encode(calendar_id)
-        );
+        let url = self.calendar_url(&format!("calendars/{}", urlencoding::encode(calendar_id)));
         let resp = self
             .http
             .patch(&url)
@@ -402,7 +436,7 @@ impl GoogleClient {
     pub async fn create_contact(&self, person: &serde_json::Value) -> Result<String> {
         let resp = self
             .http
-            .post("https://people.googleapis.com/v1/people:createContact")
+            .post(self.people_url("people:createContact"))
             .bearer_auth(&self.token)
             .json(person)
             .send()
@@ -431,10 +465,10 @@ impl GoogleClient {
         resource_name: &str,
         person: &serde_json::Value,
     ) -> Result<()> {
-        let url = format!(
-            "https://people.googleapis.com/v1/{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
+        let url = self.people_url(&format!(
+            "{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
             resource_name
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -455,10 +489,7 @@ impl GoogleClient {
 
     /// Delete a contact by resourceName.
     pub async fn delete_contact(&self, resource_name: &str) -> Result<()> {
-        let url = format!(
-            "https://people.googleapis.com/v1/{}:deleteContact",
-            resource_name
-        );
+        let url = self.people_url(&format!("{}:deleteContact", resource_name));
         let resp = self
             .http
             .delete(&url)
@@ -481,7 +512,7 @@ impl GoogleClient {
     pub async fn list_connections(&self) -> Result<serde_json::Value> {
         let resp = self
             .http
-            .get("https://people.googleapis.com/v1/people/me/connections")
+            .get(self.people_url("people/me/connections"))
             .bearer_auth(&self.token)
             .query(&[
                 (
@@ -507,6 +538,10 @@ impl GoogleClient {
             .await
             .map_err(|e| Error::Other(format!("Google People API parse error: {}", e)))
     }
+}
+
+fn endpoint_url(root: &str, path: &str) -> String {
+    format!("{}/{}", root.trim_end_matches('/'), path)
 }
 
 fn parse_google_schedules(value: &serde_json::Value, requested: &[String]) -> Vec<GoogleSchedule> {

@@ -72,8 +72,18 @@ impl CardDavClient {
         password: &str,
         email: &str,
     ) -> Result<Self> {
-        let http = crate::mail::dav_http::build_client()?;
+        let http = crate::mail::dav_http::build_dav_client()?;
+        Self::connect_with_client(carddav_url, username, password, email, http).await
+    }
 
+    /// Create a CardDAV client using the provided HTTP client.
+    pub async fn connect_with_client(
+        carddav_url: &str,
+        username: &str,
+        password: &str,
+        email: &str,
+        http: reqwest::Client,
+    ) -> Result<Self> {
         let auth = DavAuth::Basic {
             username: username.to_string(),
             password: password.to_string(),
