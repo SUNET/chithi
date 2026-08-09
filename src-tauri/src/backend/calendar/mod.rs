@@ -8,9 +8,9 @@
 //!    (they differ deliberately — see each method's contract).
 //! 3. Add the struct to [`registry`].
 //!
-//! Push methods are best-effort at the command layer: the local DB
-//! write always lands, a failed push is logged. `sync` errors
-//! propagate to the `calendar-sync-error` event.
+//! The command layer owns iTIP composition, local persistence, event emission,
+//! and cross-provider ordering. Provider network operations and their explicit
+//! unsupported outcomes live behind [`CalendarBackend`].
 
 use async_trait::async_trait;
 

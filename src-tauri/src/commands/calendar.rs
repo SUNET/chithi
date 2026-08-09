@@ -1171,7 +1171,8 @@ async fn apply_invite_response(
                 )?;
 
                 // For O365: refresh SMTP-scoped OAuth token
-                let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+                let (smtp_password, use_xoauth2) =
+                    crate::auth::get_imap_credentials(&account).await?;
 
                 send_raw_smtp(
                     &account.smtp_host,
@@ -1540,34 +1541,6 @@ fn build_calendar_reply_message(
     Ok(message.formatted())
 }
 
-/// Get SMTP credentials for an account, refreshing OAuth tokens for O365.
-async fn get_smtp_credentials(account: &db::accounts::AccountFull) -> Result<(String, bool)> {
-    if account.calendar_protocol_str() == "graph" {
-        let tokens = crate::oauth::load_tokens(&account.id)?
-            .ok_or_else(|| crate::error::Error::Other("No O365 tokens for SMTP".into()))?;
-        let refresh_token = tokens
-            .refresh_token
-            .ok_or_else(|| crate::error::Error::Other("No O365 refresh token for SMTP".into()))?;
-        let smtp_tokens = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh_token,
-            crate::oauth::MICROSOFT_IMAP_SCOPES, // SMTP.Send is in the same scope set
-        )
-        .await?;
-        crate::oauth::store_tokens(
-            &account.id,
-            &crate::oauth::OAuthTokens {
-                access_token: smtp_tokens.access_token.clone(),
-                refresh_token: smtp_tokens.refresh_token,
-                expires_at: smtp_tokens.expires_at,
-            },
-        )?;
-        Ok((smtp_tokens.access_token, true))
-    } else {
-        Ok((account.password.clone(), false))
-    }
-}
-
 /// Send a pre-built raw message via SMTP, with XOAUTH2 support for O365.
 async fn send_raw_smtp(
     smtp_host: &str,
@@ -1753,7 +1726,7 @@ pub async fn send_invites(
             let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
         } else {
-            let (smtp_password, use_xoauth2) = get_smtp_credentials(&account).await?;
+            let (smtp_password, use_xoauth2) = crate::auth::get_imap_credentials(&account).await?;
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
