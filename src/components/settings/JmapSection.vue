@@ -1,6 +1,6 @@
 <script setup lang="ts">
-/// Generic JMAP tab: Basic/OIDC auth method selector, JMAP URL, and
-/// the OIDC device-code sign-in block. The device flow itself lives in
+/// Generic JMAP tab: Basic/OIDC auth method selector, Basic-auth login,
+/// JMAP URL, and the OIDC device-code sign-in block. The device flow lives in
 /// the modal (it owns the pending-account id and the form's oauth2:
 /// marker); this section only emits.
 ///
@@ -37,6 +37,16 @@ const emit = defineEmits<{ oidcSignIn: []; reauth: [] }>();
         @click="form.jmap_auth_method = 'oidc'"
       >OIDC</button>
     </div>
+  </div>
+  <div v-if="form.jmap_auth_method === 'basic'" class="form-group">
+    <label>Username</label>
+    <input
+      v-model="form.username"
+      type="text"
+      placeholder="Login name on the JMAP server"
+      data-testid="jmap-username"
+    />
+    <span class="field-hint">Leave blank to use the email address.</span>
   </div>
   <div class="form-group">
     <label>JMAP URL</label>

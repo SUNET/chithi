@@ -75,6 +75,28 @@ describe("OauthSignInSection", () => {
 });
 
 describe("JmapSection", () => {
+  it("binds a distinct username in Basic mode", async () => {
+    const form = makeForm({
+      mail_protocol: "jmap",
+      email: "user@example.org",
+      username: "user",
+    });
+    const wrapper = mount(JmapSection, {
+      props: {
+        form,
+        editing: false,
+        oauthStatus: null,
+        oidcUserCode: null,
+        oauthInProgress: false,
+      },
+    });
+    const username = wrapper.find('[data-testid="jmap-username"]');
+
+    expect((username.element as HTMLInputElement).value).toBe("user");
+    await username.setValue("other-login");
+    expect(form.username).toBe("other-login");
+  });
+
   it("OIDC mode renders the sign-in button and the device code", async () => {
     const form = makeForm({ jmap_auth_method: "oidc", email: "u@x.org" });
     const wrapper = mount(JmapSection, {
@@ -86,6 +108,7 @@ describe("JmapSection", () => {
         oauthInProgress: false,
       },
     });
+    expect(wrapper.find('[data-testid="jmap-username"]').exists()).toBe(false);
     expect(wrapper.text()).toContain("Sign in with OIDC");
     await wrapper.find(".btn-oauth").trigger("click");
     expect(wrapper.emitted("oidcSignIn")).toHaveLength(1);

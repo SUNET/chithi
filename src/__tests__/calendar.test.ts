@@ -596,7 +596,7 @@ describe("Regression: calendar event attendees and organizer", () => {
     // Previously organizer_email was always None when creating events,
     // so the organizer check in EventDetail never matched and notify
     // dialogs appeared for attendees who shouldn't see them.
-    const accountEmail = "kushal@civilized.systems";
+    const accountEmail = "kushal@example.org";
     const event = {
       account_id: "acc1",
       organizer_email: accountEmail,
@@ -631,14 +631,14 @@ describe("Regression: calendar event attendees and organizer", () => {
 
   it("BUG: only organizer should see notify dialog, not attendees", () => {
     const accounts = [
-      { id: "acc1", email: "kushal@civilized.systems" },
+      { id: "acc1", email: "kushal@example.org" },
       { id: "acc2", email: "sdossec@gmail.com" },
     ];
 
     // Event organized by kushal
     const event = {
       account_id: "acc1",
-      organizer_email: "kushal@civilized.systems",
+      organizer_email: "kushal@example.org",
       attendees_json: '[{"email":"sdossec@gmail.com","status":"accepted"}]',
     };
 

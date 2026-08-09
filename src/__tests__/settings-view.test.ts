@@ -149,6 +149,55 @@ describe("SettingsView", () => {
     expect(bodyEl('[data-testid="account-type-readonly"]')!.textContent).toContain("JMAP");
   });
 
+  it("saves distinct JMAP email and username values", async () => {
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    await wrapper.find(".btn-add").trigger("click");
+    bodyEl('[data-testid="picker-jmap"]')!.click();
+    await flushPromises();
+
+    const email = bodyEl('[data-testid="account-email"]') as HTMLInputElement;
+    const username = bodyEl('[data-testid="jmap-username"]') as HTMLInputElement;
+    email.value = "user@example.org";
+    email.dispatchEvent(new Event("input"));
+    username.value = "user";
+    username.dispatchEvent(new Event("input"));
+    const save = Array.from(document.body.querySelectorAll(".modal-footer button"))
+      .find((button) => button.textContent?.includes("Add Account")) as HTMLElement;
+    save.click();
+    await flushPromises();
+
+    expect(api.addAccount).toHaveBeenCalledWith(expect.objectContaining({
+      email: "user@example.org",
+      username: "user",
+    }));
+  });
+
+  it("defaults a blank JMAP username to the email address", async () => {
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    await wrapper.find(".btn-add").trigger("click");
+    bodyEl('[data-testid="picker-jmap"]')!.click();
+    await flushPromises();
+
+    const email = bodyEl('[data-testid="account-email"]') as HTMLInputElement;
+    email.value = "user@example.org";
+    email.dispatchEvent(new Event("input"));
+    const save = Array.from(document.body.querySelectorAll(".modal-footer button"))
+      .find((button) => button.textContent?.includes("Add Account")) as HTMLElement;
+    save.click();
+    await flushPromises();
+
+    expect(api.addAccount).toHaveBeenCalledWith(expect.objectContaining({
+      email: "user@example.org",
+      username: "user@example.org",
+    }));
+  });
+
   it("fastmail save without an API token shows an error and does not save", async () => {
     const wrapper = mount(SettingsView, {
       global: { plugins: [makeRouter()] },
