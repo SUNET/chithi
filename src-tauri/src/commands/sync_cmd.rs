@@ -593,7 +593,7 @@ async fn run_mail_sync_once(
     resume_result?;
 
     if sync_result.is_ok() {
-        let sender = state.get_op_sender(account_id, app);
+        let sender = state.get_op_sender(account_id, app).await;
         if let Err(error) = sender
             .send(OpEntry {
                 op: MailOp::ReplayOffline,

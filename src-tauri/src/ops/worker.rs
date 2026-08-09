@@ -2,13 +2,22 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::backend::mail::{MailBackend, MailOpExecutor, MailSyncCtx};
 use crate::db::pool::DbPool;
 use crate::error::Result;
 
 use super::coalesce::coalesce;
+use super::lifecycle::{SpawnedWorker, WorkerTaskExit};
 use super::queue::{MailOp, OpEntry};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerExit {
+    ChannelClosed,
+    ShutdownRequested,
+    InitializationFailed,
+}
 
 /// Per-account worker that processes mail operations.
 ///
@@ -48,27 +57,105 @@ impl AccountWorker {
         }
     }
 
-    /// Main loop — runs until the channel is closed.
-    pub async fn run(mut self) {
+    /// Spawn the worker behind a monitor that observes panics and cancellation.
+    pub fn spawn_supervised(self, cancellation: CancellationToken) -> SpawnedWorker {
+        let account_id = self.account_id.clone();
+        let app = self.app.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            match tokio::spawn(self.run(cancellation, ready_tx)).await {
+                Ok(exit) => {
+                    log::info!("Worker for account {} exited: {:?}", account_id, exit);
+                    WorkerTaskExit::Completed
+                }
+                Err(error) if error.is_panic() => {
+                    log::error!("Worker for account {} panicked: {}", account_id, error);
+                    emit_op_failed(
+                        &app,
+                        &account_id,
+                        "worker_runtime",
+                        "Worker stopped unexpectedly",
+                    );
+                    WorkerTaskExit::Panicked
+                }
+                Err(error) => {
+                    log::error!("Worker for account {} was cancelled: {}", account_id, error);
+                    emit_op_failed(
+                        &app,
+                        &account_id,
+                        "worker_runtime",
+                        "Worker was cancelled unexpectedly",
+                    );
+                    WorkerTaskExit::Cancelled
+                }
+            }
+        });
+        SpawnedWorker {
+            task,
+            ready: ready_rx,
+        }
+    }
+
+    /// Main loop — runs until shutdown is requested or the channel is closed.
+    pub async fn run(
+        mut self,
+        cancellation: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) -> WorkerExit {
         log::info!("Worker started for account {}", self.account_id);
 
-        // Resolve the backend on first run
-        if let Err(e) = self.init_backend().await {
+        if cancellation.is_cancelled() {
+            let _ = ready.send(Err("worker shutdown was requested".to_string()));
+            return WorkerExit::ShutdownRequested;
+        }
+
+        // Resolve the backend on first run. Shutdown must be able to release a
+        // sender acquisition that is waiting for initialization to complete.
+        let init_result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let _ = ready.send(Err("worker shutdown was requested".to_string()));
+                return WorkerExit::ShutdownRequested;
+            }
+            result = self.init_backend() => result,
+        };
+        if let Err(e) = init_result {
+            let message = e.to_string();
             log::error!(
                 "Worker for account {} failed to init: {}",
                 self.account_id,
-                e
+                message
             );
             emit_op_failed(
                 &self.app,
                 &self.account_id,
                 "worker_init",
-                &format!("Worker failed to initialize: {}", e),
+                &format!("Worker failed to initialize: {}", message),
             );
-            return;
+            let _ = ready.send(Err(message));
+            return WorkerExit::InitializationFailed;
         }
+        let _ = ready.send(Ok(()));
 
-        while let Some(first) = self.rx.recv().await {
+        let mut shutdown_requested = false;
+        loop {
+            let first = if shutdown_requested {
+                self.rx.recv().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        self.rx.close();
+                        shutdown_requested = true;
+                        self.rx.recv().await
+                    }
+                    entry = self.rx.recv() => entry,
+                }
+            };
+            let Some(first) = first else {
+                break;
+            };
+
             // Drain all pending ops and coalesce
             let mut batch = vec![first];
             while let Ok(next) = self.rx.try_recv() {
@@ -108,6 +195,11 @@ impl AccountWorker {
             executor.shutdown().await;
         }
         log::info!("Worker stopped for account {}", self.account_id);
+        if shutdown_requested {
+            WorkerExit::ShutdownRequested
+        } else {
+            WorkerExit::ChannelClosed
+        }
     }
 
     async fn init_backend(&mut self) -> Result<()> {

@@ -122,7 +122,7 @@ pub async fn move_messages(
         .into_iter()
         .map(|(_, message_ref)| message_ref)
         .collect();
-    let sender = state.get_op_sender(&account_id, &app);
+    let sender = state.get_op_sender(&account_id, &app).await;
     if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::MoveMessages {
@@ -244,7 +244,7 @@ pub async fn delete_messages(
         .into_iter()
         .map(|(_, message_ref)| message_ref)
         .collect();
-    let sender = state.get_op_sender(&account_id, &app);
+    let sender = state.get_op_sender(&account_id, &app).await;
     if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::DeleteMessages { message_refs },
@@ -533,7 +533,7 @@ pub async fn set_message_flags(
         .into_iter()
         .map(|(_, message_ref)| message_ref)
         .collect();
-    let sender = state.get_op_sender(&account_id, &app);
+    let sender = state.get_op_sender(&account_id, &app).await;
     if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::SetFlags {
@@ -634,7 +634,7 @@ pub async fn copy_messages(
     }
 
     // Send through worker queue (persistent connection)
-    let sender = state.get_op_sender(&account_id, &app);
+    let sender = state.get_op_sender(&account_id, &app).await;
     if let Err(e) = sender
         .send(OpEntry {
             op: MailOp::CopyMessages {
@@ -770,7 +770,7 @@ pub async fn mark_account_read(
     emit_folders_changed(&app, &account_id);
 
     if !target.is_empty() {
-        let sender = state.get_op_sender(&account_id, &app);
+        let sender = state.get_op_sender(&account_id, &app).await;
         if let Err(e) = sender
             .send(OpEntry {
                 op: MailOp::SetFlags {

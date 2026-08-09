@@ -308,7 +308,7 @@ pub async fn send_message(
     // Capture the worker's op-sender now so the spawn can enqueue a
     // Sent-folder sync after a successful APPEND (#189). `state` is
     // not `'static`, so the sender must be cloned out before the move.
-    let op_sender_bg = state.get_op_sender(&account_id, &app);
+    let op_sender_bg = state.get_op_sender(&account_id, &app).await;
     let recipients: Vec<String> = message
         .to
         .iter()
