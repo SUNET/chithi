@@ -16,9 +16,20 @@ use crate::mail::sync as mail_sync;
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
-use super::{MailBackend, MailOpExecutor, MailSyncCtx};
+use super::{BodyFetchRequest, MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct ImapMailBackend;
+
+fn body_fetch_target(request: &BodyFetchRequest) -> Result<(&str, u32)> {
+    match &request.message_ref {
+        crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } => {
+            Ok((folder_path, *uid))
+        }
+        _ => Err(Error::Other(
+            "IMAP body fetch received a non-IMAP message reference".into(),
+        )),
+    }
+}
 
 fn validate_search_query(query: &SearchQuery) -> Result<()> {
     if query.has_attachment.is_some() {
@@ -359,6 +370,33 @@ impl MailBackend for ImapMailBackend {
 
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
         prefetch_pipeline(ctx, account).await
+    }
+
+    async fn fetch_body_to_disk(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &BodyFetchRequest,
+    ) -> Result<String> {
+        let (folder_path, uid) = body_fetch_target(request)?;
+
+        let imap_config = build_imap_config(account).await?;
+        let data_dir = ctx.data_dir.clone();
+        let account_id = account.id.clone();
+        let folder_path = folder_path.to_string();
+        let flags = request.flags.clone();
+        tokio::task::spawn_blocking(move || {
+            mail_sync::fetch_and_store_body(
+                &imap_config,
+                &data_dir,
+                &account_id,
+                &folder_path,
+                uid,
+                &flags,
+            )
+        })
+        .await
+        .map_err(|e| Error::Other(format!("IMAP body fetch task panicked: {}", e)))?
     }
 
     async fn search_messages(
@@ -827,8 +865,12 @@ fn select_folder_if_needed(
 
 #[cfg(test)]
 mod tests {
-    use super::{group_imap_message_refs, prefetch_connection_limit, validate_search_query};
-    use crate::mail::compat::BackendMessageRef;
+    use super::{
+        body_fetch_target, group_imap_message_refs, prefetch_connection_limit,
+        validate_search_query,
+    };
+    use crate::backend::mail::BodyFetchRequest;
+    use crate::mail::compat::{BackendMessageRef, BodyLocation};
     use crate::mail::search::{SearchFields, SearchQuery};
 
     #[test]
@@ -847,6 +889,18 @@ mod tests {
     fn copy_rejects_non_imap_references() {
         let result = group_imap_message_refs(vec![BackendMessageRef::graph("item")]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn body_fetch_rejects_non_imap_reference() {
+        let request = BodyFetchRequest {
+            message_id: "db-id".into(),
+            message_ref: BackendMessageRef::graph("item"),
+            folder_path: "INBOX".into(),
+            flags: Vec::new(),
+            body_location: BodyLocation::NotFetched,
+        };
+        assert!(body_fetch_target(&request).is_err());
     }
 
     #[test]

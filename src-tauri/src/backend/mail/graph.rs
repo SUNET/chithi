@@ -12,9 +12,44 @@ use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
-use super::{MailBackend, MailOpExecutor, MailSyncCtx};
+use super::{BodyFetchRequest, MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct GraphMailBackend;
+
+fn body_fetch_item_id(request: &BodyFetchRequest) -> Result<String> {
+    let item_id = request.message_ref.graph_item_id().ok_or_else(|| {
+        Error::Other("Graph body fetch received a non-Graph message reference".into())
+    })?;
+    Ok(request
+        .body_location
+        .graph_item_id()
+        .unwrap_or(item_id)
+        .to_string())
+}
+
+async fn fetch_graph_body_to_disk(
+    client: &crate::mail::graph::GraphClient,
+    data_dir: &std::path::Path,
+    account_id: &str,
+    folder_path: &str,
+    graph_msg_id: &str,
+    flags: &[String],
+) -> Result<String> {
+    use crate::mail::sync::{create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name};
+
+    let folder_dir = sanitize_folder_name(folder_path);
+    let maildir_base = data_dir.join(account_id).join(&folder_dir);
+    create_maildir_dirs(&maildir_base)?;
+    let filename = format!("{}:2,{}", graph_msg_id, flags_to_maildir_suffix(flags));
+    let msg_path = maildir_base.join("cur").join(&filename);
+
+    let bytes = client
+        .download_mime_to_file(graph_msg_id, &msg_path)
+        .await?;
+    let relative = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
+    log::debug!("Graph body fetched: {} ({} bytes)", relative, bytes);
+    Ok(relative)
+}
 
 fn validate_search_query(query: &SearchQuery) -> Result<()> {
     if query.since_days.is_some_and(|days| days > 0) {
@@ -532,9 +567,6 @@ impl MailBackend for GraphMailBackend {
     /// same `download_mime_to_file` path the on-demand fetch uses.
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
         use crate::mail::graph::{self, GraphClient};
-        use crate::mail::sync::{
-            create_maildir_dirs, flags_to_maildir_suffix, sanitize_folder_name,
-        };
 
         /// Bodies fetched per prefetch pass; the pass re-runs after every
         /// sync, so the backlog drains across cycles.
@@ -569,24 +601,22 @@ impl MailBackend for GraphMailBackend {
                 });
             let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
 
-            let folder_dir = sanitize_folder_name(folder_path);
-            let maildir_base = ctx.data_dir.join(&account.id).join(&folder_dir);
-            create_maildir_dirs(&maildir_base)?;
-            let filename = format!("{}:2,{}", graph_msg_id, flags_to_maildir_suffix(&flags));
-            let msg_path = maildir_base.join("cur").join(&filename);
-
-            match client.download_mime_to_file(&graph_msg_id, &msg_path).await {
-                Ok(bytes) => {
-                    let relative = format!("{}/{}/cur/{}", account.id, folder_dir, filename);
+            match fetch_graph_body_to_disk(
+                &client,
+                &ctx.data_dir,
+                &account.id,
+                folder_path,
+                &graph_msg_id,
+                &flags,
+            )
+            .await
+            {
+                Ok(relative) => {
                     let conn = ctx.db.writer().await;
                     db::messages::update_maildir_path(&conn, db_id, &relative)?;
-                    log::debug!("Graph prefetch: {} ({} bytes)", relative, bytes);
                     fetched += 1;
                 }
                 Err(e) => {
-                    // Clean up any partial file; the row stays unfetched
-                    // and is retried on a later pass or on demand.
-                    let _ = std::fs::remove_file(&msg_path);
                     log::warn!("Graph prefetch: failed for {}: {}", graph_msg_id, e);
                 }
             }
@@ -599,6 +629,26 @@ impl MailBackend for GraphMailBackend {
             account.id
         );
         Ok(fetched)
+    }
+
+    async fn fetch_body_to_disk(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &BodyFetchRequest,
+    ) -> Result<String> {
+        let graph_msg_id = body_fetch_item_id(request)?;
+        let token = crate::mail::graph::get_graph_token(&account.id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        fetch_graph_body_to_disk(
+            &client,
+            &ctx.data_dir,
+            &account.id,
+            &request.folder_path,
+            &graph_msg_id,
+            &request.flags,
+        )
+        .await
     }
 
     async fn search_messages(
@@ -780,7 +830,9 @@ impl MailOpExecutor for GraphOpExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_search_query;
+    use super::{body_fetch_item_id, validate_search_query};
+    use crate::backend::mail::BodyFetchRequest;
+    use crate::mail::compat::{BackendMessageRef, BodyLocation};
     use crate::mail::search::{SearchFields, SearchQuery};
 
     #[test]
@@ -796,5 +848,29 @@ mod tests {
             error.to_string(),
             "graph does not support server-side age filtering"
         );
+    }
+
+    #[test]
+    fn body_fetch_prefers_persisted_graph_marker() {
+        let request = BodyFetchRequest {
+            message_id: "account_legacy-id".into(),
+            message_ref: BackendMessageRef::graph("legacy-id"),
+            folder_path: "folder".into(),
+            flags: Vec::new(),
+            body_location: BodyLocation::GraphRemote("marker-id".into()),
+        };
+        assert_eq!(body_fetch_item_id(&request).unwrap(), "marker-id");
+    }
+
+    #[test]
+    fn body_fetch_rejects_non_graph_reference() {
+        let request = BodyFetchRequest {
+            message_id: "db-id".into(),
+            message_ref: BackendMessageRef::imap("INBOX", 1),
+            folder_path: "INBOX".into(),
+            flags: Vec::new(),
+            body_location: BodyLocation::GraphRemote("marker-id".into()),
+        };
+        assert!(body_fetch_item_id(&request).is_err());
     }
 }

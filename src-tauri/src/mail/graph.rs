@@ -102,6 +102,45 @@ pub struct GraphClient {
     access_token: String,
 }
 
+/// Removes an incomplete Graph download even if its async owner is cancelled.
+struct PartialFileGuard {
+    path: std::path::PathBuf,
+    committed: bool,
+}
+
+impl PartialFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartialFileGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "Failed to remove partial Graph download {}: {}",
+                        self.path.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphRoom {
     pub name: String,
@@ -321,10 +360,22 @@ impl GraphClient {
             )));
         }
 
-        let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
-            Error::Other(format!("Failed to create file {}: {}", dest.display(), e))
+        let temp_path =
+            dest.with_file_name(format!(".chithi-{}.partial", uuid::Uuid::new_v4().simple()));
+        let mut partial = PartialFileGuard::new(temp_path);
+        // Create synchronously before the first await. Tokio's async create
+        // runs on its blocking pool, so cancellation while it is pending can
+        // otherwise drop the guard before the background open creates the
+        // file, leaving an unowned partial behind.
+        let standard_file = std::fs::File::create(partial.path()).map_err(|e| {
+            Error::Other(format!(
+                "Failed to create temporary file for {}: {}",
+                dest.display(),
+                e
+            ))
         })?;
-        let result = async {
+        let mut file = tokio::fs::File::from_std(standard_file);
+        let result: Result<u64> = async {
             let mut stream = resp.bytes_stream();
             let mut total: u64 = 0;
 
@@ -347,19 +398,16 @@ impl GraphClient {
         .await;
 
         drop(file);
-        if result.is_err() {
-            if let Err(cleanup_err) = tokio::fs::remove_file(dest).await {
-                if cleanup_err.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!(
-                        "Failed to remove partial Graph download {}: {}",
-                        dest.display(),
-                        cleanup_err
-                    );
-                }
-            }
-        }
-
-        result
+        let total = result?;
+        tokio::fs::rename(partial.path(), dest).await.map_err(|e| {
+            Error::Other(format!(
+                "Failed to finalize Graph download {}: {}",
+                dest.display(),
+                e
+            ))
+        })?;
+        partial.commit();
+        Ok(total)
     }
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -3406,5 +3454,30 @@ mod builder_tests {
         assert!(v["emailAddresses"].is_null());
         assert!(v["mobilePhone"].is_null());
         assert!(v["businessPhones"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod partial_file_tests {
+    use super::PartialFileGuard;
+
+    #[test]
+    fn dropped_guard_removes_precreated_partial_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.partial");
+        std::fs::write(&path, b"incomplete").unwrap();
+        drop(PartialFileGuard::new(path.clone()));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn committed_guard_keeps_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.eml");
+        std::fs::write(&path, b"complete").unwrap();
+        let mut guard = PartialFileGuard::new(path.clone());
+        guard.commit();
+        drop(guard);
+        assert!(path.exists());
     }
 }

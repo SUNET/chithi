@@ -1,19 +1,14 @@
 use tauri::{AppHandle, Manager, State};
 
-use crate::commands::sync_cmd::{
-    resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
-    suspend_imap_idle_for_operation,
-};
+use crate::commands::sync_cmd::{resume_imap_idle_for_account, suspend_imap_idle_for_operation};
 use crate::db;
 use crate::db::messages::{MessageSummary, ThreadedPage};
 use crate::error::{Error, Result};
 use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::imap::ImapConfig;
-use crate::mail::jmap_sync;
 use crate::mail::parser;
 use crate::mail::search::{SearchHit, SearchQuery};
-use crate::mail::sync as mail_sync;
 use crate::state::AppState;
 
 /// Check if an IP address is in a private/reserved range (SSRF protection).
@@ -264,8 +259,7 @@ pub async fn import_search_hit(
 
 /// Ensure the raw RFC822 body for `message_id` is on disk and return the
 /// relative maildir path that resolves under `state.data_dir`. If the body
-/// hasn't been downloaded yet (empty or legacy `graph:` prefix), fetches it
-/// on-demand from the appropriate backend (Graph / JMAP / IMAP).
+/// hasn't been downloaded yet, dispatches through the account's mail backend.
 async fn ensure_message_body_on_disk(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -286,124 +280,73 @@ async fn ensure_message_body_on_disk(
         (account, fp, u)
     };
 
-    let flags: Vec<String> = serde_json::from_str(flags_json).unwrap_or_default();
-    let data_dir = state.data_dir.clone();
-
-    let relative_path = if account.mail_protocol_str() == "graph" {
-        log::info!("Body not on disk for {}, streaming from Graph", message_id);
-
-        let graph_msg_id = if let Some(item_id) = body_location.graph_item_id() {
-            item_id.to_string()
-        } else {
-            BackendMessageRef::graph_from_db_id(account_id, message_id)
-                .into_graph_item_id()
-                .expect("Graph parser must return a Graph reference")
-        };
-
-        let token = crate::mail::graph::get_graph_token(account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-
-        let folder_dir = crate::mail::sync::sanitize_folder_name(&folder_path);
-        let maildir_base = data_dir.join(account_id).join(&folder_dir);
-        crate::mail::sync::create_maildir_dirs(&maildir_base)?;
-
-        let filename = format!(
-            "{}:2,{}",
-            graph_msg_id,
-            crate::mail::sync::flags_to_maildir_suffix(&flags)
-        );
-        let msg_path = maildir_base.join("cur").join(&filename);
-
-        let bytes_written = client
-            .download_mime_to_file(&graph_msg_id, &msg_path)
-            .await?;
-        let rp = format!("{}/{}/cur/{}", account_id, folder_dir, filename);
-        log::info!("Graph body streamed: {} ({} bytes)", rp, bytes_written);
-        rp
-    } else if account.mail_protocol_str() == "jmap" {
-        log::info!("Body not on disk for {}, fetching from JMAP", message_id);
-
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-
-        let jmap_email_id =
-            BackendMessageRef::jmap_from_db_id(account_id, &folder_path, message_id)
-                .and_then(BackendMessageRef::into_jmap_email_id)
-                .unwrap_or_else(|| message_id.to_string());
-
-        jmap_sync::fetch_and_store_jmap_body(
-            &jmap_config,
-            &data_dir,
-            account_id,
-            &folder_path,
-            &jmap_email_id,
-            &flags,
-        )
-        .await?
-    } else {
-        log::info!("Body not on disk for {}, fetching from IMAP", message_id);
-
-        let resume_account = account.clone();
-        let suspended_idle = if should_suspend_idle_for_imap_operation(&account.auth_method) {
-            Some(suspend_imap_idle_for_operation(app, state, &resume_account).await?)
-        } else {
-            None
-        };
-
-        run_with_imap_idle_resume(
-            account_id,
-            "body fetch",
-            async {
-                let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-                    let tokens = crate::oauth::load_tokens(account_id)?
-                        .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-                    let refresh = tokens
-                        .refresh_token
-                        .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-                    let new = crate::oauth::refresh_with_scopes(
-                        &crate::oauth::MICROSOFT,
-                        &refresh,
-                        crate::oauth::MICROSOFT_IMAP_SCOPES,
-                    )
-                    .await?;
-                    crate::oauth::store_tokens(account_id, &new)?;
-                    (new.access_token, true)
-                } else {
-                    (account.password, false)
-                };
-
-                let imap_config = ImapConfig {
-                    host: account.imap_host,
-                    port: account.imap_port,
-                    username: account.username,
-                    password,
-                    use_tls: account.use_tls,
-                    use_xoauth2,
-                };
-
-                let account_id_clone = account_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    mail_sync::fetch_and_store_body(
-                        &imap_config,
-                        &data_dir,
-                        &account_id_clone,
-                        &folder_path,
-                        uid,
-                        &flags,
-                    )
-                })
-                .await
-                .map_err(|e| Error::Other(format!("Body fetch panicked: {}", e)))?
-            },
-            resume_imap_idle_for_account(app, state, &resume_account, suspended_idle),
-        )
-        .await?
+    let flags = serde_json::from_str(flags_json).unwrap_or_default();
+    let request = crate::backend::mail::BodyFetchRequest::from_db_row(
+        &account,
+        message_id,
+        &folder_path,
+        uid,
+        flags,
+        body_location,
+    )?;
+    let backend = crate::backend::mail::for_account(&account).ok_or_else(|| {
+        Error::Other(format!(
+            "Account {} has no enabled mail service for body fetch",
+            account_id
+        ))
+    })?;
+    let ctx = crate::backend::mail::MailSyncCtx {
+        app: app.clone(),
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
     };
 
-    {
-        let conn = state.db.writer().await;
-        db::messages::update_maildir_path(&conn, message_id, &relative_path)?;
-    }
+    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+        Some(suspend_imap_idle_for_operation(app, state, &account).await?)
+    } else {
+        None
+    };
 
+    if let Some(suspended_idle) = suspended_idle {
+        let fetch_account = account.clone();
+        let resume_account = account;
+        let resume_app = app.clone();
+        let task = spawn_with_imap_idle_resume(
+            account_id.to_string(),
+            "body fetch",
+            fetch_body_and_record_path(backend, ctx, fetch_account, request),
+            async move {
+                let state = resume_app.state::<AppState>();
+                resume_imap_idle_for_account(
+                    &resume_app,
+                    &state,
+                    &resume_account,
+                    Some(suspended_idle),
+                )
+                .await
+            },
+        );
+        task.await
+            .map_err(|e| Error::Other(format!("Body fetch owner task panicked: {}", e)))?
+    } else {
+        fetch_body_and_record_path(backend, ctx, account, request).await
+    }
+}
+
+async fn fetch_body_and_record_path(
+    backend: &'static dyn crate::backend::mail::MailBackend,
+    ctx: crate::backend::mail::MailSyncCtx,
+    account: db::accounts::AccountFull,
+    request: crate::backend::mail::BodyFetchRequest,
+) -> Result<String> {
+    log::info!(
+        "Body not on disk for {}, fetching via {}",
+        request.message_id,
+        backend.protocol()
+    );
+    let relative_path = backend.fetch_body_to_disk(&ctx, &account, &request).await?;
+    let conn = ctx.db.writer().await;
+    db::messages::update_maildir_path(&conn, &request.message_id, &relative_path)?;
     Ok(relative_path)
 }
 
@@ -1204,6 +1147,53 @@ mod tests {
 
         assert!(resumed.load(Ordering::Relaxed));
         assert_eq!(result.unwrap_err().to_string(), "fetch failed");
+    }
+
+    #[tokio::test]
+    async fn dropped_body_fetch_waiter_cannot_skip_resume() {
+        let (release_fetch, fetch_released) = tokio::sync::oneshot::channel();
+        let (signal_resumed, resumed) = tokio::sync::oneshot::channel();
+        let task = spawn_with_imap_idle_resume(
+            "account".into(),
+            "body fetch",
+            async move {
+                fetch_released.await.unwrap();
+                Ok("path".to_string())
+            },
+            async move {
+                signal_resumed.send(()).unwrap();
+                Ok(())
+            },
+        );
+
+        drop(task);
+        release_fetch.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), resumed)
+            .await
+            .expect("detached body-fetch task did not resume IDLE")
+            .expect("resume signal was dropped");
+    }
+
+    #[tokio::test]
+    async fn panicked_body_fetch_cannot_skip_resume() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let task = spawn_with_imap_idle_resume::<String, _, _>(
+            "account".into(),
+            "body fetch",
+            async move { panic!("body-fetch panic") },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        let result = task.await.expect("body-fetch owner task panicked");
+        assert!(resumed.load(Ordering::Relaxed));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("body fetch task failed"));
     }
 
     #[test]

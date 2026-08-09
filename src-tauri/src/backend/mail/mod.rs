@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use crate::db::accounts::AccountFull;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
 
@@ -27,6 +28,50 @@ pub struct MailSyncCtx {
     pub app: tauri::AppHandle,
     pub db: std::sync::Arc<DbPool>,
     pub data_dir: std::path::PathBuf,
+}
+
+/// Provider-neutral inputs for fetching one raw RFC 822 body into Maildir.
+#[derive(Debug, Clone)]
+pub struct BodyFetchRequest {
+    pub message_id: String,
+    pub message_ref: BackendMessageRef,
+    pub folder_path: String,
+    pub flags: Vec<String>,
+    pub body_location: BodyLocation,
+}
+
+impl BodyFetchRequest {
+    pub fn from_db_row(
+        account: &AccountFull,
+        message_id: &str,
+        folder_path: &str,
+        uid: u32,
+        flags: Vec<String>,
+        body_location: BodyLocation,
+    ) -> Result<Self> {
+        let protocol = account.mail_protocol_str();
+        let message_ref =
+            BackendMessageRef::from_db_row(protocol, &account.id, message_id, folder_path, uid)
+                .or_else(|| {
+                    // Preserve the legacy JMAP body-fetch fallback for rows whose
+                    // synthetic database id does not carry the expected prefix.
+                    (protocol == "jmap").then(|| BackendMessageRef::jmap(folder_path, message_id))
+                })
+                .ok_or_else(|| {
+                    crate::error::Error::Other(format!(
+                        "Cannot recover {} message reference from database id {}",
+                        protocol, message_id
+                    ))
+                })?;
+
+        Ok(Self {
+            message_id: message_id.to_string(),
+            message_ref,
+            folder_path: folder_path.to_string(),
+            flags,
+            body_location,
+        })
+    }
 }
 
 #[async_trait]
@@ -70,6 +115,15 @@ pub trait MailBackend: Send + Sync {
     async fn prefetch_bodies(&self, _ctx: &MailSyncCtx, _account: &AccountFull) -> Result<u32> {
         Ok(0)
     }
+
+    /// Fetch one raw RFC 822 body and persist it under the Maildir root.
+    /// Returns the relative path; the command records it in the database.
+    async fn fetch_body_to_disk(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &BodyFetchRequest,
+    ) -> Result<String>;
 
     /// Search messages across the account on the provider server.
     async fn search_messages(
@@ -131,6 +185,7 @@ pub fn for_account(account: &AccountFull) -> Option<&'static dyn MailBackend> {
 mod registry_tests {
     use super::*;
     use crate::db::service_bindings::ServiceBinding;
+    use crate::mail::compat::BodyLocation;
 
     fn account(mail_protocol: &str, auth_method: &str) -> AccountFull {
         let bindings = if mail_protocol.is_empty() {
@@ -214,5 +269,43 @@ mod registry_tests {
             .unwrap()
             .suspends_idle_for_ops(&imap_plain));
         assert!(!for_account(&graph).unwrap().suspends_idle_for_ops(&graph));
+    }
+
+    #[test]
+    fn body_fetch_request_recovers_provider_references() {
+        let cases = [
+            ("imap", "acc1_INBOX_42", "INBOX", 42),
+            ("jmap", "acc1_mailbox_email_with_underscores", "mailbox", 0),
+            ("graph", "acc1_AAMk_opaque", "folder", 0),
+        ];
+
+        for (protocol, message_id, folder, uid) in cases {
+            let account = account(protocol, "password");
+            let request = BodyFetchRequest::from_db_row(
+                &account,
+                message_id,
+                folder,
+                uid,
+                Vec::new(),
+                BodyLocation::NotFetched,
+            )
+            .unwrap();
+            assert_eq!(request.message_ref.to_db_id("acc1"), message_id);
+        }
+    }
+
+    #[test]
+    fn body_fetch_request_preserves_legacy_jmap_raw_id_fallback() {
+        let account = account("jmap", "password");
+        let request = BodyFetchRequest::from_db_row(
+            &account,
+            "raw_email_id",
+            "mailbox",
+            0,
+            Vec::new(),
+            BodyLocation::NotFetched,
+        )
+        .unwrap();
+        assert_eq!(request.message_ref.jmap_email_id(), Some("raw_email_id"));
     }
 }
