@@ -8,9 +8,9 @@
 //! Handles network disconnects with exponential backoff, matching the
 //! IMAP IDLE reconnect strategy (ADR 0018 / ADR 0019).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::mail::jmap::{JmapConfig, JmapConnection};
 
@@ -39,12 +39,11 @@ pub enum PushEvent {
 }
 
 /// Run the JMAP EventSource push loop for one account.
-/// This function runs indefinitely in an async task — cancel it via
-/// the `stop` flag or by aborting the task.
+/// This function runs indefinitely in an async task until cancelled.
 pub async fn run_push_loop(
     mut config: JmapConfig,
     account_id: String,
-    stop: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     on_event: Arc<dyn Fn(PushEvent) + Send + Sync>,
 ) {
     log::info!("JMAP push loop starting for account {}", account_id);
@@ -52,20 +51,22 @@ pub async fn run_push_loop(
     let mut backoff = INITIAL_RECONNECT_DELAY;
     let mut was_disconnected = false;
 
-    while !stop.load(Ordering::Relaxed) {
+    while !cancellation.is_cancelled() {
         // For OIDC accounts, refresh the access token before each connect attempt
         // so reconnects after token expiry don't keep using a stale token.
         // Bearer-mode accounts (Fastmail API tokens) also have access_token set
         // but have no refresh endpoint — gate on a non-empty endpoint so we
         // don't fire useless refresh attempts for them.
         if config.access_token.is_some() && !config.oidc_token_endpoint.is_empty() {
-            match crate::auth::refresh_jmap_oidc_token(
-                &account_id,
-                &config.oidc_token_endpoint,
-                &config.oidc_client_id,
-            )
-            .await
-            {
+            let refresh = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                result = crate::auth::refresh_jmap_oidc_token(
+                    &account_id,
+                    &config.oidc_token_endpoint,
+                    &config.oidc_client_id,
+                ) => result,
+            };
+            match refresh {
                 Ok(Some(new_token)) => config.access_token = Some(new_token),
                 Ok(None) => {}
                 Err(e) => log::warn!("JMAP push: token refresh failed for {}: {}", account_id, e),
@@ -73,15 +74,26 @@ pub async fn run_push_loop(
         }
 
         // Connect and get the EventSource URL
-        let (event_source_url, http_auth) = match connect_and_get_url(&config).await {
-            Ok(v) => v,
+        let connection = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = connect_and_get_url(&config) => result,
+        };
+        let (event_source_url, http_auth) = match connection {
+            Ok(Some(connection)) => connection,
+            Ok(None) => {
+                log::info!(
+                    "JMAP push: server does not advertise eventSourceUrl for {}; skipping push",
+                    account_id
+                );
+                break;
+            }
             Err(e) => {
                 if !was_disconnected {
                     log::error!("JMAP push: connection failed for {}: {}", account_id, e);
                     on_event(PushEvent::Disconnected(account_id.clone()));
                     was_disconnected = true;
                 }
-                if stop.load(Ordering::Relaxed) {
+                if cancellation.is_cancelled() {
                     break;
                 }
                 log::debug!(
@@ -89,7 +101,9 @@ pub async fn run_push_loop(
                     backoff.as_secs(),
                     account_id
                 );
-                sleep_interruptible(&stop, backoff).await;
+                if !sleep_interruptible(&cancellation, backoff).await {
+                    break;
+                }
                 backoff = (backoff * 2).min(MAX_RECONNECT_DELAY);
                 continue;
             }
@@ -115,7 +129,7 @@ pub async fn run_push_loop(
             &event_source_url,
             &http_auth,
             &account_id,
-            &stop,
+            &cancellation,
             on_event.clone(),
         )
         .await;
@@ -133,8 +147,10 @@ pub async fn run_push_loop(
                 );
                 on_event(PushEvent::Disconnected(account_id.clone()));
                 was_disconnected = true;
-                if !stop.load(Ordering::Relaxed) {
-                    sleep_interruptible(&stop, Duration::from_secs(2)).await;
+                if !cancellation.is_cancelled()
+                    && !sleep_interruptible(&cancellation, Duration::from_secs(2)).await
+                {
+                    break;
                 }
             }
         }
@@ -162,23 +178,23 @@ impl HttpAuth {
 }
 
 /// Connect to the JMAP server, fetch session, and return the EventSource URL.
-async fn connect_and_get_url(config: &JmapConfig) -> Result<(String, HttpAuth), String> {
+async fn connect_and_get_url(config: &JmapConfig) -> Result<Option<(String, HttpAuth)>, String> {
     let conn = JmapConnection::connect(config)
         .await
         .map_err(|e| format!("JMAP connect failed: {}", e))?;
 
-    let url = conn
-        .event_source_url("*", PING_INTERVAL_SECS)
-        .ok_or_else(|| "Server does not advertise eventSourceUrl".to_string())?;
+    let Some(url) = conn.event_source_url("*", PING_INTERVAL_SECS) else {
+        return Ok(None);
+    };
 
-    Ok((
+    Ok(Some((
         url,
         HttpAuth {
             username: config.username.clone(),
             password: config.password.clone(),
             access_token: config.access_token.clone(),
         },
-    ))
+    )))
 }
 
 /// Stream SSE events from the JMAP EventSource endpoint.
@@ -187,7 +203,7 @@ async fn stream_events(
     url: &str,
     auth: &HttpAuth,
     account_id: &str,
-    stop: &Arc<AtomicBool>,
+    cancellation: &CancellationToken,
     on_event: Arc<dyn Fn(PushEvent) + Send + Sync>,
 ) -> Result<(), String> {
     use futures::StreamExt;
@@ -200,15 +216,17 @@ async fn stream_events(
         .build()
         .map_err(|e| format!("HTTP client build error: {}", e))?;
 
-    let response = auth
+    let request = auth
         .apply_auth(client.get(url))
         .header("Accept", "text/event-stream")
         // Prevent reverse proxies (nginx) from buffering SSE responses.
         .header("Cache-Control", "no-cache")
         .header("X-Accel-Buffering", "no")
-        .send()
-        .await
-        .map_err(|e| format!("SSE request failed: {}", e))?;
+        .send();
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(()),
+        result = request => result.map_err(|e| format!("SSE request failed: {}", e))?,
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -229,13 +247,13 @@ async fn stream_events(
     let mut data_lines: Vec<String> = Vec::new();
 
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
         // Wait for next chunk with a timeout.
         // If no data (including pings) in READ_TIMEOUT, connection is dead.
-        let chunk = match tokio::time::timeout(READ_TIMEOUT, stream.next()).await {
+        let next_chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            result = tokio::time::timeout(READ_TIMEOUT, stream.next()) => result,
+        };
+        let chunk = match next_chunk {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(e))) => {
                 return Err(format!("SSE stream error: {}", e));
@@ -320,20 +338,18 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// Async interruptible sleep — checks `stop` flag every second.
-async fn sleep_interruptible(stop: &AtomicBool, duration: Duration) {
-    let steps = duration.as_secs();
-    for _ in 0..steps {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+/// Sleep for a reconnect delay, returning early when cancelled.
+async fn sleep_interruptible(cancellation: &CancellationToken, duration: Duration) -> bool {
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        _ = tokio::time::sleep(duration) => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_truncate() {
@@ -365,5 +381,63 @@ mod tests {
         };
         handle_sse_event("acc1", "state", r#"{"changed":{}}"#, &on_event);
         assert!(*triggered.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_quiet_sse_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (response_sent, response_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            response_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let url = format!("http://{}/events", address);
+        let push = tokio::spawn(async move {
+            stream_events(
+                &url,
+                &HttpAuth {
+                    username: "user".into(),
+                    password: "password".into(),
+                    access_token: None,
+                },
+                "account",
+                &task_cancellation,
+                Arc::new(|_| {}),
+            )
+            .await
+        });
+
+        response_received.await.unwrap();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), push)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.is_ok());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_sleep_is_cancelled_promptly() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let completed = sleep_interruptible(&cancellation, Duration::from_secs(60)).await;
+
+        assert!(!completed);
     }
 }

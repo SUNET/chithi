@@ -1,7 +1,9 @@
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
+use tokio_util::sync::CancellationToken;
 
 use crate::event::{emit_folders_changed, emit_messages_changed};
 use crate::ops::queue::{MailOp, OpEntry, OpPriority};
@@ -49,7 +51,7 @@ use crate::auth::build_jmap_config;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
-use crate::state::{AppState, IdleControl, IdleHandle, IdlePhase};
+use crate::state::{AppState, IdleControl, IdleHandle, IdlePhase, JmapPushHandle, JmapPushPhase};
 
 const IDLE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const IDLE_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
@@ -175,6 +177,215 @@ async fn wait_for_imap_idle_stop(
             )));
         }
         tokio::time::sleep(IDLE_STOP_POLL_INTERVAL).await;
+    }
+}
+
+fn finish_jmap_push_join(
+    state: &AppState,
+    account_id: &str,
+    generation: u64,
+    task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    let join_result = task
+        .now_or_never()
+        .expect("a JMAP task taken for joining must already be finished");
+    let join_succeeded =
+        join_result.is_ok() || join_result.is_err_and(|error| error.is_cancelled());
+    let mut handles = state.jmap_push_handles.lock().unwrap();
+    if let Some(handle) = handles
+        .get_mut(account_id)
+        .filter(|handle| handle.generation == generation)
+    {
+        if join_succeeded {
+            handles.remove(account_id);
+        } else {
+            handle.phase = JmapPushPhase::StopFailed;
+        }
+    }
+    if join_succeeded {
+        Ok(())
+    } else {
+        Err(Error::Sync(format!(
+            "JMAP push task for account {} panicked",
+            account_id
+        )))
+    }
+}
+
+struct JmapPushReservation<'a> {
+    state: &'a AppState,
+    account_id: String,
+    generation: u64,
+    cancellation: CancellationToken,
+    event_gate: Arc<Mutex<()>>,
+    committed: bool,
+}
+
+impl JmapPushReservation<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for JmapPushReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut handles = self.state.jmap_push_handles.lock().unwrap();
+        if handles
+            .get(&self.account_id)
+            .is_some_and(|handle| handle.generation == self.generation && handle.task.is_none())
+        {
+            handles.remove(&self.account_id);
+        }
+    }
+}
+
+fn cancel_jmap_push(cancellation: &CancellationToken, event_gate: &Mutex<()>) {
+    let _event_guard = event_gate.lock().unwrap();
+    cancellation.cancel();
+}
+
+fn if_jmap_push_running(
+    cancellation: &CancellationToken,
+    event_gate: &Mutex<()>,
+    action: impl FnOnce(),
+) {
+    let _event_guard = event_gate.lock().unwrap();
+    if !cancellation.is_cancelled() {
+        action();
+    }
+}
+
+async fn wait_for_jmap_push_stop(
+    state: &AppState,
+    account_id: &str,
+    generation: u64,
+    mut deadline: Option<tokio::time::Instant>,
+) -> Result<()> {
+    loop {
+        let finished_task = {
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            match handles.get_mut(account_id) {
+                None => return Ok(()),
+                Some(handle) if handle.generation > generation => return Ok(()),
+                Some(handle) if handle.generation != generation => {
+                    return Err(Error::Sync(format!(
+                        "JMAP push generation moved backwards while stopping account {}",
+                        account_id
+                    )));
+                }
+                Some(handle) if handle.phase == JmapPushPhase::StopFailed => {
+                    return Err(Error::Sync(format!(
+                        "JMAP push task for account {} panicked during stop",
+                        account_id
+                    )));
+                }
+                Some(handle)
+                    if handle.phase == JmapPushPhase::Stopping && handle.task.is_none() =>
+                {
+                    handles.remove(account_id);
+                    return Ok(());
+                }
+                Some(handle) => {
+                    let finished = handle
+                        .task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished);
+                    if finished {
+                        handle.phase = JmapPushPhase::Joining;
+                        handle.task.take()
+                    } else {
+                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            log::warn!(
+                                "JMAP push task for account {} did not stop gracefully; aborting",
+                                account_id
+                            );
+                            if let Some(task) = handle.task.as_ref() {
+                                task.abort();
+                            }
+                            deadline = None;
+                        }
+                        None
+                    }
+                }
+            }
+        };
+
+        if let Some(task) = finished_task {
+            return finish_jmap_push_join(state, account_id, generation, task);
+        }
+        tokio::time::sleep(IDLE_STOP_POLL_INTERVAL).await;
+    }
+}
+
+async fn reserve_jmap_push_start<'a>(
+    state: &'a AppState,
+    account_id: &str,
+) -> Result<Option<JmapPushReservation<'a>>> {
+    loop {
+        let stopping_generation = {
+            let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
+            if !state.idle_push_enabled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            let finished_task = handles
+                .get_mut(account_id)
+                .filter(|handle| {
+                    handle
+                        .task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                })
+                .map(|handle| {
+                    handle.phase = JmapPushPhase::Joining;
+                    (handle.generation, handle.task.take().unwrap())
+                });
+            if let Some((generation, task)) = finished_task {
+                drop(handles);
+                finish_jmap_push_join(state, account_id, generation, task)?;
+                None
+            } else if let Some(handle) = handles.get(account_id) {
+                match handle.phase {
+                    JmapPushPhase::Starting | JmapPushPhase::Running => return Ok(None),
+                    JmapPushPhase::Stopping | JmapPushPhase::Joining => Some(handle.generation),
+                    JmapPushPhase::StopFailed => {
+                        handles.remove(account_id);
+                        None
+                    }
+                }
+            } else {
+                let generation = state.jmap_push_generation.fetch_add(1, Ordering::Relaxed);
+                let cancellation = CancellationToken::new();
+                let event_gate = Arc::new(Mutex::new(()));
+                handles.insert(
+                    account_id.to_string(),
+                    JmapPushHandle {
+                        generation,
+                        phase: JmapPushPhase::Starting,
+                        cancellation: cancellation.clone(),
+                        event_gate: event_gate.clone(),
+                        task: None,
+                    },
+                );
+                return Ok(Some(JmapPushReservation {
+                    state,
+                    account_id: account_id.to_string(),
+                    generation,
+                    cancellation,
+                    event_gate,
+                    committed: false,
+                }));
+            }
+        };
+
+        if let Some(generation) = stopping_generation {
+            wait_for_jmap_push_stop(state, account_id, generation, None).await?;
+        }
     }
 }
 
@@ -880,25 +1091,40 @@ async fn start_jmap_push(
     state: &State<'_, AppState>,
     account: &db::accounts::Account,
 ) -> Result<()> {
+    let Some(reservation) = reserve_jmap_push_start(state, &account.id).await? else {
+        log::debug!(
+            "JMAP push already active or disabled for account {}",
+            account.id
+        );
+        return Ok(());
+    };
+    let generation = reservation.generation;
+    let cancellation = reservation.cancellation.clone();
+    let event_gate = reservation.event_gate.clone();
+
     let full_account = {
         let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account.id)?
+        db::accounts::get_account_full(&conn, &account.id)
     };
+    let full_account = full_account?;
 
     let jmap_config = build_jmap_config(&full_account).await?;
 
     let account_id = account.id.clone();
-    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_clone = stop_flag.clone();
+    let task_cancellation = cancellation.clone();
+    let event_cancellation = cancellation.clone();
+    let callback_event_gate = event_gate.clone();
     let app_clone = app.clone();
 
     let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
-    if !state.idle_push_enabled.load(Ordering::Acquire) {
+    if !state.idle_push_enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
         return Ok(());
     }
     let mut handles = state.jmap_push_handles.lock().unwrap();
-    if handles.contains_key(&account.id) {
-        log::debug!("JMAP push already running for account {}", account.id);
+    let Some(handle) = handles.get_mut(&account.id) else {
+        return Ok(());
+    };
+    if handle.generation != generation || handle.phase != JmapPushPhase::Starting {
         return Ok(());
     }
 
@@ -906,25 +1132,28 @@ async fn start_jmap_push(
         crate::mail::jmap_push::run_push_loop(
             jmap_config,
             account_id.clone(),
-            stop_clone,
-            std::sync::Arc::new(move |event| match event {
-                crate::mail::jmap_push::PushEvent::StateChange(aid) => {
-                    app_clone.emit("idle-new-mail", &aid).ok();
-                }
-                crate::mail::jmap_push::PushEvent::Disconnected(aid) => {
-                    app_clone.emit("idle-disconnected", &aid).ok();
-                }
-                crate::mail::jmap_push::PushEvent::Reconnected(aid) => {
-                    app_clone.emit("idle-reconnected", &aid).ok();
-                }
+            task_cancellation,
+            std::sync::Arc::new(move |event| {
+                if_jmap_push_running(&event_cancellation, &callback_event_gate, || match event {
+                    crate::mail::jmap_push::PushEvent::StateChange(aid) => {
+                        app_clone.emit("idle-new-mail", &aid).ok();
+                    }
+                    crate::mail::jmap_push::PushEvent::Disconnected(aid) => {
+                        app_clone.emit("idle-disconnected", &aid).ok();
+                    }
+                    crate::mail::jmap_push::PushEvent::Reconnected(aid) => {
+                        app_clone.emit("idle-reconnected", &aid).ok();
+                    }
+                });
             }),
         )
         .await;
     });
 
-    let handle = crate::state::JmapPushHandle { stop_flag, task };
-
-    handles.insert(account.id.clone(), handle);
+    handle.phase = JmapPushPhase::Running;
+    handle.task = Some(task);
+    drop(handles);
+    reservation.commit();
     log::info!("Started JMAP push for account {}", account.id);
     Ok(())
 }
@@ -932,7 +1161,7 @@ async fn start_jmap_push(
 /// Stop all IMAP IDLE loops and JMAP push tasks.
 #[tauri::command]
 pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
-    let (idle_generations, jmap_tasks) = {
+    let (idle_generations, jmap_generations) = {
         let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
         state.idle_push_enabled.store(false, Ordering::Release);
         let idle_generations = {
@@ -951,17 +1180,23 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
             }
             generations
         };
-        let jmap_tasks = {
+        let jmap_generations = {
             let mut jmap_handles = state.jmap_push_handles.lock().unwrap();
-            let mut tasks = Vec::new();
-            for (account_id, handle) in jmap_handles.drain() {
+            let mut generations = Vec::new();
+            for (account_id, handle) in jmap_handles.iter_mut() {
                 log::info!("Stopping JMAP push for account {}", account_id);
-                handle.stop_flag.store(true, Ordering::Relaxed);
-                tasks.push((account_id, handle.task));
+                if !matches!(
+                    handle.phase,
+                    JmapPushPhase::Joining | JmapPushPhase::StopFailed
+                ) {
+                    handle.phase = JmapPushPhase::Stopping;
+                }
+                cancel_jmap_push(&handle.cancellation, &handle.event_gate);
+                generations.push((account_id.clone(), handle.generation));
             }
-            tasks
+            generations
         };
-        (idle_generations, jmap_tasks)
+        (idle_generations, jmap_generations)
     };
     for (_, _, control) in &idle_generations {
         control.request_stop();
@@ -969,40 +1204,13 @@ pub async fn stop_idle(state: State<'_, AppState>) -> Result<()> {
 
     let mut stop_error: Option<Error> = None;
 
-    for (account_id, mut task) in jmap_tasks {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) if e.is_cancelled() => {
-                log::debug!(
-                    "JMAP push task for account {} was already cancelled",
-                    account_id
-                );
-            }
-            Ok(Err(e)) => {
-                let msg = format!(
-                    "JMAP push task for account {} failed during stop: {}",
-                    account_id, e
-                );
-                log::error!("{}", msg);
-                stop_error.get_or_insert_with(|| Error::Sync(msg));
-            }
-            Err(_) => {
-                log::warn!(
-                    "JMAP push task for account {} did not stop gracefully; aborting",
-                    account_id
-                );
-                task.abort();
-                if let Err(e) = task.await {
-                    if !e.is_cancelled() {
-                        let msg = format!(
-                            "JMAP push task for account {} failed after abort: {}",
-                            account_id, e
-                        );
-                        log::error!("{}", msg);
-                        stop_error.get_or_insert_with(|| Error::Sync(msg));
-                    }
-                }
-            }
+    let jmap_deadline = tokio::time::Instant::now() + IDLE_STOP_TIMEOUT;
+    for (account_id, generation) in jmap_generations {
+        if let Err(error) =
+            wait_for_jmap_push_stop(&state, &account_id, generation, Some(jmap_deadline)).await
+        {
+            log::error!("{}", error);
+            stop_error.get_or_insert(error);
         }
     }
 
@@ -1073,6 +1281,199 @@ mod tests {
             state.idle_handles.lock().unwrap()["account"].phase,
             IdlePhase::Stopping
         );
+    }
+
+    #[tokio::test]
+    async fn jmap_start_reservation_allows_only_one_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        state.idle_push_enabled.store(true, Ordering::Release);
+
+        let first = reserve_jmap_push_start(&state, "account").await.unwrap();
+        let second = reserve_jmap_push_start(&state, "account").await.unwrap();
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            state.jmap_push_handles.lock().unwrap()["account"].phase,
+            JmapPushPhase::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn jmap_restart_waits_for_previous_generation_to_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        state.idle_push_enabled.store(true, Ordering::Release);
+        let reservation = reserve_jmap_push_start(&state, "account")
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = reservation.generation;
+        let cancellation = reservation.cancellation.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = release.clone();
+        {
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = JmapPushPhase::Running;
+            handle.task = Some(tokio::spawn(async move {
+                task_release.notified().await;
+            }));
+            handle.phase = JmapPushPhase::Stopping;
+            cancellation.cancel();
+        }
+        reservation.commit();
+
+        let restart = reserve_jmap_push_start(&state, "account");
+        tokio::pin!(restart);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), restart.as_mut())
+                .await
+                .is_err()
+        );
+
+        release.notify_one();
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), restart.as_mut())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(replacement.generation > generation);
+    }
+
+    #[tokio::test]
+    async fn jmap_stop_aborts_and_joins_unresponsive_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        state.idle_push_enabled.store(true, Ordering::Release);
+        let reservation = reserve_jmap_push_start(&state, "account")
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = reservation.generation;
+        {
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = JmapPushPhase::Stopping;
+            handle.task = Some(tokio::spawn(std::future::pending()));
+            handle.cancellation.cancel();
+        }
+        reservation.commit();
+
+        wait_for_jmap_push_stop(
+            &state,
+            "account",
+            generation,
+            Some(tokio::time::Instant::now()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!state
+            .jmap_push_handles
+            .lock()
+            .unwrap()
+            .contains_key("account"));
+    }
+
+    #[tokio::test]
+    async fn dropping_jmap_start_rolls_back_uncommitted_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        state.idle_push_enabled.store(true, Ordering::Release);
+        let reservation = reserve_jmap_push_start(&state, "account")
+            .await
+            .unwrap()
+            .unwrap();
+        drop(reservation);
+
+        assert!(!state
+            .jmap_push_handles
+            .lock()
+            .unwrap()
+            .contains_key("account"));
+    }
+
+    #[tokio::test]
+    async fn jmap_stop_accepts_a_newer_generation_after_old_joined() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).unwrap();
+        state.idle_push_enabled.store(true, Ordering::Release);
+        let old = reserve_jmap_push_start(&state, "account")
+            .await
+            .unwrap()
+            .unwrap();
+        let old_generation = old.generation;
+        {
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = JmapPushPhase::Stopping;
+            handle.task = Some(tokio::spawn(async {}));
+        }
+        old.commit();
+        while !state.jmap_push_handles.lock().unwrap()["account"]
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        let finished_task = {
+            let mut handles = state.jmap_push_handles.lock().unwrap();
+            let handle = handles.get_mut("account").unwrap();
+            handle.phase = JmapPushPhase::Joining;
+            handle.task.take().unwrap()
+        };
+        finish_jmap_push_join(&state, "account", old_generation, finished_task).unwrap();
+
+        let replacement = reserve_jmap_push_start(&state, "account")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replacement.generation > old_generation);
+        wait_for_jmap_push_stop(&state, "account", old_generation, None)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn jmap_cancellation_is_linearized_with_event_delivery() {
+        let cancellation = CancellationToken::new();
+        let event_gate = Arc::new(Mutex::new(()));
+        let (event_started_tx, event_started_rx) = std::sync::mpsc::channel();
+        let (release_event_tx, release_event_rx) = std::sync::mpsc::channel();
+        let event_cancellation = cancellation.clone();
+        let callback_gate = event_gate.clone();
+        let event = std::thread::spawn(move || {
+            if_jmap_push_running(&event_cancellation, &callback_gate, || {
+                event_started_tx.send(()).unwrap();
+                release_event_rx.recv().unwrap();
+            });
+        });
+        event_started_rx.recv().unwrap();
+
+        let stop_cancellation = cancellation.clone();
+        let stop_gate = event_gate.clone();
+        let (stop_started_tx, stop_started_rx) = std::sync::mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            stop_started_tx.send(()).unwrap();
+            cancel_jmap_push(&stop_cancellation, &stop_gate);
+        });
+        stop_started_rx.recv().unwrap();
+        assert!(!cancellation.is_cancelled());
+
+        release_event_tx.send(()).unwrap();
+        event.join().unwrap();
+        stop.join().unwrap();
+        let emitted_after_stop = AtomicBool::new(false);
+        if_jmap_push_running(&cancellation, &event_gate, || {
+            emitted_after_stop.store(true, Ordering::Relaxed);
+        });
+
+        assert!(cancellation.is_cancelled());
+        assert!(!emitted_after_stop.load(Ordering::Relaxed));
     }
 
     #[test]

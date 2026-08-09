@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::db;
 use crate::db::pool::DbPool;
@@ -85,10 +86,22 @@ pub struct IdleHandle {
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Handle for a running JMAP EventSource push task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JmapPushPhase {
+    Starting,
+    Running,
+    Stopping,
+    Joining,
+    StopFailed,
+}
+
+/// Lifecycle record for one generation of a JMAP EventSource push task.
 pub struct JmapPushHandle {
-    pub stop_flag: Arc<AtomicBool>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub generation: u64,
+    pub phase: JmapPushPhase,
+    pub cancellation: CancellationToken,
+    pub event_gate: Arc<Mutex<()>>,
+    pub task: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct AppState {
@@ -99,6 +112,7 @@ pub struct AppState {
     pub idle_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub idle_push_enabled: AtomicBool,
     pub idle_account_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub jmap_push_generation: AtomicU64,
     pub jmap_push_handles: std::sync::Mutex<HashMap<String, JmapPushHandle>>,
     /// Per-account mail-sync-in-progress flags. If true, a mail sync or
     /// prefetch is running and new mail sync requests for that account are
@@ -213,6 +227,7 @@ impl AppState {
             idle_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             idle_push_enabled: AtomicBool::new(false),
             idle_account_locks: std::sync::Mutex::new(HashMap::new()),
+            jmap_push_generation: AtomicU64::new(1),
             jmap_push_handles: std::sync::Mutex::new(HashMap::new()),
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             pending_mail_sync: std::sync::Mutex::new(HashMap::new()),
