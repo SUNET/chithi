@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::db;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::ops::lifecycle::WorkerRegistry;
 use crate::ops::queue::OpEntry;
 use crate::ops::worker::AccountWorker;
 
@@ -129,9 +130,9 @@ pub struct AppState {
     /// menu) don't race on DB writes and emit out-of-order
     /// `calendar-sync-*` events for the same account.
     pub calendar_sync_in_progress: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// Per-account operation queue senders. Workers are spawned lazily on
-    /// first use and hold persistent connections for their protocol.
-    pub op_senders: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<OpEntry>>>,
+    /// Per-account operation workers, including their shutdown controls and
+    /// join handles. Workers are spawned lazily on first use.
+    op_workers: WorkerRegistry<OpEntry>,
     pub data_dir: PathBuf,
     /// Token -> canonical file path for attachments picked via the native
     /// dialog. The renderer only ever sees the token, so a compromised
@@ -232,7 +233,7 @@ impl AppState {
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             pending_mail_sync: std::sync::Mutex::new(HashMap::new()),
             calendar_sync_in_progress: std::sync::Mutex::new(HashMap::new()),
-            op_senders: std::sync::Mutex::new(HashMap::new()),
+            op_workers: WorkerRegistry::new(256),
             data_dir,
             attachments: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
@@ -264,25 +265,67 @@ impl AppState {
 
     /// Get or create an operation queue sender for the given account.
     /// Spawns a worker task lazily on first use.
-    pub fn get_op_sender(
+    pub async fn get_op_sender(
         &self,
         account_id: &str,
         app: &tauri::AppHandle,
     ) -> tokio::sync::mpsc::Sender<OpEntry> {
-        let mut senders = self.op_senders.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(sender) = senders.get(account_id) {
-            if !sender.is_closed() {
-                return sender.clone();
+        let worker_account_id = account_id.to_string();
+        let db = self.db.clone();
+        let app = app.clone();
+        match self
+            .op_workers
+            .get_or_spawn(account_id, move |receiver, cancellation| {
+                AccountWorker::new(worker_account_id, receiver, db, app)
+                    .spawn_supervised(cancellation)
+            })
+            .await
+        {
+            Ok(sender) => sender,
+            Err(message) => {
+                log::warn!(
+                    "Operation worker unavailable for account {}: {}",
+                    account_id,
+                    message
+                );
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                drop(receiver);
+                sender
             }
-            // Channel closed (worker died) — remove and recreate
-            senders.remove(account_id);
         }
+    }
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<OpEntry>(256);
-        let worker = AccountWorker::new(account_id.to_string(), rx, self.db.clone(), app.clone());
-        tokio::spawn(worker.run());
-        senders.insert(account_id.to_string(), tx.clone());
-        tx
+    /// Gracefully stop and join an account's operation worker, if present.
+    pub async fn stop_op_worker(&self, account_id: &str) {
+        if let Some(outcome) = self.op_workers.stop_account(account_id).await {
+            log::info!(
+                "Stopped operation worker for account {}: {:?}",
+                account_id,
+                outcome
+            );
+        }
+    }
+
+    /// Keep replacement workers excluded while mutating account state.
+    pub async fn with_op_worker_stopped<R, F, Fut>(&self, account_id: &str, action: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        self.op_workers
+            .with_account_stopped(account_id, action)
+            .await
+    }
+
+    /// Stop accepting operation work and join every account worker.
+    pub async fn stop_all_op_workers(&self) {
+        for (account_id, outcome) in self.op_workers.stop_all().await {
+            log::info!(
+                "Stopped operation worker for account {} during shutdown: {:?}",
+                account_id,
+                outcome
+            );
+        }
     }
 }
 

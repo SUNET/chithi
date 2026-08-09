@@ -259,22 +259,32 @@ pub async fn update_account(
     config: db::accounts::AccountConfig,
 ) -> Result<()> {
     log::info!("Updating account {} ({})", account_id, config.email);
-    let conn = state.db.writer().await;
-    db::accounts::update_account(&conn, &account_id, &config)?;
-    Ok(())
+    state
+        .with_op_worker_stopped(&account_id, || async {
+            let conn = state.db.writer().await;
+            db::accounts::update_account(&conn, &account_id, &config)
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn delete_account(state: State<'_, AppState>, account_id: String) -> Result<()> {
     log::info!("Deleting account {}", account_id);
-    let conn = state.db.writer().await;
-    db::accounts::delete_account(&conn, &account_id)?;
-    // Also remove Maildir
-    let maildir_path = state.data_dir.join(&account_id);
-    if maildir_path.exists() {
-        log::info!("Removing maildir at {}", maildir_path.display());
-        std::fs::remove_dir_all(&maildir_path).ok();
-    }
+    state
+        .with_op_worker_stopped(&account_id, || async {
+            {
+                let conn = state.db.writer().await;
+                db::accounts::delete_account(&conn, &account_id)?;
+            }
+            // Also remove Maildir
+            let maildir_path = state.data_dir.join(&account_id);
+            if maildir_path.exists() {
+                log::info!("Removing maildir at {}", maildir_path.display());
+                std::fs::remove_dir_all(&maildir_path).ok();
+            }
+            Result::<()>::Ok(())
+        })
+        .await?;
     log::info!("Account {} deleted", account_id);
     Ok(())
 }

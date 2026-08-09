@@ -18,12 +18,19 @@ mod ops;
 mod path_validation;
 mod state;
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use state::AppState;
 use tauri::Manager;
 
+const EXIT_RUNNING: u8 = 0;
+const EXIT_CLEANING: u8 = 1;
+const EXIT_ALLOWED: u8 = 2;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -158,8 +165,42 @@ pub fn run() {
             commands::pgp::pgp_decrypt_message,
             commands::pgp::pgp_verify_message,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    let exit_phase = Arc::new(AtomicU8::new(EXIT_RUNNING));
+    app.run(move |app, event| {
+        let tauri::RunEvent::ExitRequested { code, api, .. } = event else {
+            return;
+        };
+
+        match exit_phase.compare_exchange(
+            EXIT_RUNNING,
+            EXIT_CLEANING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                api.prevent_exit();
+                let app = app.clone();
+                let exit_phase = Arc::clone(&exit_phase);
+                tauri::async_runtime::spawn(async move {
+                    log::info!("Stopping account workers before application exit");
+                    {
+                        let state = app.state::<AppState>();
+                        state.stop_all_op_workers().await;
+                    }
+                    exit_phase.store(EXIT_ALLOWED, Ordering::Release);
+                    app.exit(code.unwrap_or(0));
+                });
+            }
+            Err(EXIT_CLEANING) => {
+                log::warn!("Second exit request received; forcing application exit");
+            }
+            Err(EXIT_ALLOWED) => {}
+            Err(_) => unreachable!("invalid application exit phase"),
+        }
+    });
 }
 
 fn resolve_data_dir(
