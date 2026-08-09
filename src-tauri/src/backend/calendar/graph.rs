@@ -11,7 +11,7 @@ use crate::mail::graph::{
     event_patch_to_graph_json, event_to_graph_json, get_graph_token, GraphClient,
 };
 
-use super::{CalendarBackend, PushedEvent};
+use super::{CalendarBackend, InviteReplyDelivery, PushedEvent};
 
 pub struct GraphCalendarBackend;
 
@@ -19,6 +19,10 @@ pub struct GraphCalendarBackend;
 impl CalendarBackend for GraphCalendarBackend {
     fn protocol(&self) -> &'static str {
         "graph"
+    }
+
+    fn invite_reply_delivery(&self) -> InviteReplyDelivery {
+        InviteReplyDelivery::Provider
     }
 
     async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {

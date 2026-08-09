@@ -9,7 +9,7 @@ use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::mail::jmap::{JmapCalendarEvent, JmapConnection};
 
-use super::{get_unpushed_events, CalendarBackend, PushedEvent};
+use super::{get_unpushed_events, CalendarBackend, InviteReplyDelivery, PushedEvent};
 
 pub struct JmapCalendarBackend;
 
@@ -37,6 +37,10 @@ fn to_jmap_event(event: &CalendarEvent, remote_calendar_id: &str) -> JmapCalenda
 impl CalendarBackend for JmapCalendarBackend {
     fn protocol(&self) -> &'static str {
         "jmap"
+    }
+
+    fn invite_reply_delivery(&self) -> InviteReplyDelivery {
+        InviteReplyDelivery::JmapSubmission
     }
 
     async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {

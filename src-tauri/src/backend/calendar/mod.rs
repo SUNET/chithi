@@ -34,11 +34,144 @@ pub struct PushedEvent {
     pub canonical_uid: Option<String>,
 }
 
+/// Explicit result for optional provider capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarCapability<T> {
+    Supported(T),
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoomSuggestion {
+    pub name: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoomAvailability {
+    pub state: String,
+    pub busy_start: Option<String>,
+    pub busy_end: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ParticipantSchedule {
+    pub email: String,
+    pub available: bool,
+    pub busy: Vec<BusyPeriod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BusyPeriod {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAvailabilityRequest {
+    pub room_address: String,
+    pub start_time: String,
+    pub end_time: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantScheduleRequest {
+    pub emails: Vec<String>,
+    pub start_time: String,
+    pub end_time: String,
+}
+
+/// Valid responses accepted from the calendar RSVP IPC boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteResponse {
+    Accepted,
+    Tentative,
+    Declined,
+}
+
+impl InviteResponse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Tentative => "tentative",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+impl TryFrom<&str> for InviteResponse {
+    type Error = crate::error::Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "accepted" => Ok(Self::Accepted),
+            "tentative" => Ok(Self::Tentative),
+            "declined" => Ok(Self::Declined),
+            _ => Err(crate::error::Error::Other(format!(
+                "Unsupported invite response: {}",
+                value
+            ))),
+        }
+    }
+}
+
+/// Provider-neutral event data needed by remote RSVP implementations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRsvpRequest {
+    pub uid: String,
+    pub response: InviteResponse,
+    pub summary: Option<String>,
+    pub start_time: String,
+    pub end_time: String,
+    pub all_day: bool,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub organizer_email: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRsvpOutcome {
+    pub remote_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendeeResponseUpdate {
+    pub remote_id: String,
+    pub attendee_email: String,
+    pub response: String,
+}
+
+/// How command-owned iTIP replies are delivered for this provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteReplyDelivery {
+    Smtp,
+    JmapSubmission,
+    Provider,
+}
+
+/// Where a provider's remote RSVP belongs in command-owned orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRsvpPolicy {
+    Unsupported,
+    RequiredBeforeLocal,
+    BestEffortAfterLocal,
+}
+
 #[async_trait]
 pub trait CalendarBackend: Send + Sync {
     /// Protocol discriminator stored on the calendar service binding
     /// (`service_bindings.protocol`).
     fn protocol(&self) -> &'static str;
+
+    /// How the command should deliver the generated iTIP reply.
+    fn invite_reply_delivery(&self) -> InviteReplyDelivery {
+        InviteReplyDelivery::Smtp
+    }
+
+    /// When the command should invoke this provider's remote RSVP call.
+    fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
+        RemoteRsvpPolicy::Unsupported
+    }
 
     /// Full account calendar sync: fetch remote calendars/events and
     /// reconcile the local DB. Interleaves provider I/O with DB writes
@@ -97,6 +230,45 @@ pub trait CalendarBackend: Send + Sync {
         remote_id: &str,
         color: &str,
     ) -> Result<()>;
+
+    async fn list_room_suggestions(
+        &self,
+        _account: &AccountFull,
+    ) -> Result<CalendarCapability<Vec<RoomSuggestion>>> {
+        Ok(CalendarCapability::Unsupported)
+    }
+
+    async fn check_room_availability(
+        &self,
+        _account: &AccountFull,
+        _request: &RoomAvailabilityRequest,
+    ) -> Result<CalendarCapability<RoomAvailability>> {
+        Ok(CalendarCapability::Unsupported)
+    }
+
+    async fn get_participant_schedules(
+        &self,
+        _account: &AccountFull,
+        _request: &ParticipantScheduleRequest,
+    ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
+        Ok(CalendarCapability::Unsupported)
+    }
+
+    async fn apply_remote_rsvp(
+        &self,
+        _account: &AccountFull,
+        _request: &RemoteRsvpRequest,
+    ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
+        Ok(CalendarCapability::Unsupported)
+    }
+
+    async fn push_attendee_responses(
+        &self,
+        _account: &AccountFull,
+        _updates: &[AttendeeResponseUpdate],
+    ) -> Result<CalendarCapability<()>> {
+        Ok(CalendarCapability::Unsupported)
+    }
 }
 
 /// Static set of calendar backends compiled into this build. Adding a
@@ -203,6 +375,46 @@ mod registry_tests {
     #[test]
     fn no_binding_no_caldav_url_is_none() {
         assert!(for_account(&account("", "")).is_none());
+    }
+
+    #[test]
+    fn invite_reply_delivery_matches_provider_semantics() {
+        let cases = [
+            ("caldav", InviteReplyDelivery::Smtp),
+            ("google", InviteReplyDelivery::Smtp),
+            ("jmap", InviteReplyDelivery::JmapSubmission),
+            ("graph", InviteReplyDelivery::Provider),
+        ];
+
+        for (protocol, expected) in cases {
+            let backend = for_account(&account(protocol, "")).unwrap();
+            assert_eq!(backend.invite_reply_delivery(), expected);
+        }
+    }
+
+    #[test]
+    fn remote_rsvp_policy_stays_unsupported_until_provider_methods_exist() {
+        for protocol in ["caldav", "jmap", "google", "graph"] {
+            let backend = for_account(&account(protocol, "")).unwrap();
+            assert_eq!(backend.remote_rsvp_policy(), RemoteRsvpPolicy::Unsupported);
+        }
+    }
+
+    #[test]
+    fn invite_response_parsing_is_case_insensitive_and_rejects_unknown_values() {
+        assert_eq!(
+            InviteResponse::try_from(" ACCEPTED ").unwrap(),
+            InviteResponse::Accepted
+        );
+        assert_eq!(
+            InviteResponse::try_from("Tentative").unwrap(),
+            InviteResponse::Tentative
+        );
+        assert_eq!(
+            InviteResponse::try_from("declined").unwrap(),
+            InviteResponse::Declined
+        );
+        assert!(InviteResponse::try_from("maybe").is_err());
     }
 }
 
