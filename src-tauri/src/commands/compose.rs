@@ -107,7 +107,6 @@ pub async fn send_message(
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
-
     // --- Synchronous part: validate, read attachments, build message ---
     // This is fast (local I/O only) so the compose window waits for it.
     // We *peek* tokens for the build so a failure here (e.g. file
@@ -527,6 +526,8 @@ pub async fn save_draft(
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
+    let backend = crate::backend::mail::for_account(&account)
+        .ok_or_else(|| Error::Other("Account has no enabled mail binding".into()))?;
 
     // Drafts peek rather than consume tokens: the user may save a draft
     // and keep editing, so we must keep the token → path mapping alive.
@@ -576,8 +577,8 @@ pub async fn save_draft(
     // encrypted-to-self with the sender's PUBLIC key — no signing, no
     // passphrase / card PIN prompt, so a card that isn't plugged in at
     // draft time is irrelevant (the user re-attaches it to decrypt on
-    // resume). Graph accounts short-circuit: the Graph draft path posts
-    // structured JSON to /me/messages and has no raw-MIME endpoint wired
+    // resume). Structured-text backends short-circuit because they have no
+    // raw-MIME endpoint wired
     // up, so an encrypted MIME blob can't round-trip — we log and save
     // plaintext, same fail-open posture as a missing key. JMAP and IMAP
     // both upload `raw_message` verbatim, so the encrypted form flows
@@ -586,7 +587,9 @@ pub async fn save_draft(
     // could not be applied — reported back to the renderer for LOW-3.
     let mut plaintext_fallback = false;
     let raw_message = if account.pgp_encrypt_drafts {
-        if account.mail_protocol_str() == "graph" {
+        if backend.draft_storage_format()
+            == crate::backend::mail::DraftStorageFormat::StructuredText
+        {
             log::warn!(
                 "Encrypted drafts not yet supported on Graph accounts ({}); \
                  saving plaintext draft",
@@ -609,90 +612,21 @@ pub async fn save_draft(
         raw_message
     };
 
-    if account.mail_protocol_str() == "graph" {
-        // Save draft via Graph API: POST /me/messages creates a draft
-        // without sending. Known limitation: this JSON path stores only
-        // `body_text` as a single `contentType: Text` body, so it drops
-        // the `multipart/alternative` we built in `raw_message` — a
-        // Markdown draft's rendered-HTML alternative is not persisted, and
-        // on resume Markdown mode can't be re-armed (the user re-toggles
-        // before sending; the send itself is unaffected). Same root cause
-        // as the encrypted-drafts-on-Graph fallback above. Fixing this
-        // means saving the draft as MIME (`Content-Type: text/plain`,
-        // base64 `raw_message`) — tracked in #215.
-        log::info!(
-            "Saving draft via Microsoft Graph for account {}",
-            account.email
-        );
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        client
-            .save_draft(&crate::mail::graph::GraphSendMessage {
-                to: message.to.clone(),
-                cc: message.cc.clone(),
-                bcc: message.bcc.clone(),
-                subject: message.subject.clone(),
-                body_text: message.body_text.clone(),
-            })
-            .await?;
-    } else if account.mail_protocol_str() == "jmap" {
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
-        conn_jmap.save_draft(&jmap_config, &raw_message).await?;
-    } else {
-        // IMAP: append to Drafts folder (O365 uses XOAUTH2)
-        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account.id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
-            .await?;
-            crate::oauth::store_tokens(&account.id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password.clone(), false)
-        };
-        tokio::task::spawn_blocking(move || {
-            let imap_config = crate::mail::imap::ImapConfig {
-                host: account.imap_host,
-                port: account.imap_port,
-                username: account.username,
-                password: imap_password,
-                use_tls: account.use_tls,
-                use_xoauth2: imap_xoauth2,
-            };
-            let mut conn = crate::mail::imap::ImapConnection::connect(&imap_config)?;
-            // Try common Drafts folder names
-            let draft_folders = ["Drafts", "INBOX.Drafts", "[Gmail]/Drafts"];
-            let mut saved = false;
-            for folder in &draft_folders {
-                match conn.append_message(folder, &raw_message) {
-                    Ok(()) => {
-                        saved = true;
-                        break;
-                    }
-                    Err(e) => {
-                        log::debug!("Draft folder '{}' failed: {}", folder, e);
-                    }
-                }
-            }
-            if !saved {
-                return Err(crate::error::Error::Other(
-                    "Could not find Drafts folder".into(),
-                ));
-            }
-            conn.logout();
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::error::Error::Other(format!("Draft save task failed: {}", e)))??;
-    }
+    // Graph currently persists only these structured fields, while IMAP and
+    // JMAP consume `raw_message` verbatim. The backend owns that distinction.
+    backend
+        .save_draft(
+            &account,
+            &crate::backend::mail::DraftSaveRequest {
+                raw_message,
+                to: message.to,
+                cc: message.cc,
+                bcc: message.bcc,
+                subject: message.subject,
+                body_text: message.body_text,
+            },
+        )
+        .await?;
 
     log::info!("Draft saved successfully for account {}", account_id);
     Ok(DraftSaveOutcome { plaintext_fallback })
