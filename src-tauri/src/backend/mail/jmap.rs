@@ -11,7 +11,10 @@ use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
-use super::{BodyFetchRequest, MailBackend, MailOpExecutor, MailSyncCtx};
+use super::{
+    BodyFetchRequest, DraftSaveRequest, DraftStorageFormat, MailBackend, MailOpExecutor,
+    MailSyncCtx,
+};
 
 pub struct JmapMailBackend;
 
@@ -103,6 +106,16 @@ impl MailBackend for JmapMailBackend {
         let config = crate::auth::build_jmap_config(account).await?;
         let connection = crate::mail::jmap::JmapConnection::connect(&config).await?;
         connection.search_account(&config, &account.id, query).await
+    }
+
+    fn draft_storage_format(&self) -> DraftStorageFormat {
+        DraftStorageFormat::RawMime
+    }
+
+    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()> {
+        let config = crate::auth::build_jmap_config(account).await?;
+        let connection = crate::mail::jmap::JmapConnection::connect(&config).await?;
+        connection.save_draft(&config, &request.raw_message).await
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {

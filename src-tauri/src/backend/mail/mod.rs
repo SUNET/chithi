@@ -1,7 +1,7 @@
 //! Mail backends: one implementor per mail protocol.
 //!
-//! Covers the sync and search entry points commands dispatch on
-//! (account sync, per-folder sync, body prefetch, server search) plus capability
+//! Covers the provider entry points commands dispatch on (account sync,
+//! per-folder sync, body prefetch, server search, draft save) plus capability
 //! flags for the command-layer concurrency machinery (IDLE
 //! suspension, background folder sync). Queued user operations
 //! (move/copy/delete/flag/send) go through the ops worker; the
@@ -38,6 +38,29 @@ pub struct BodyFetchRequest {
     pub folder_path: String,
     pub flags: Vec<String>,
     pub body_location: BodyLocation,
+}
+
+/// Representation a provider accepts when creating a server-side draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftStorageFormat {
+    /// The provider stores the complete RFC 5322 message verbatim.
+    RawMime,
+    /// The provider accepts separate envelope and plaintext-body fields.
+    StructuredText,
+}
+
+/// Provider-neutral inputs for creating a server-side draft.
+///
+/// IMAP and JMAP consume `raw_message`. Graph consumes the structured fields
+/// until its raw-MIME draft endpoint is implemented.
+#[derive(Debug, Clone)]
+pub struct DraftSaveRequest {
+    pub raw_message: Vec<u8>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
 }
 
 impl BodyFetchRequest {
@@ -131,6 +154,12 @@ pub trait MailBackend: Send + Sync {
         account: &AccountFull,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>>;
+
+    /// Describe the draft representation this provider can persist.
+    fn draft_storage_format(&self) -> DraftStorageFormat;
+
+    /// Create a server-side draft.
+    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()>;
 
     /// Create the per-account executor the ops worker drives queued
     /// [`MailOp`]s through. Called once per worker lifetime.
@@ -243,6 +272,20 @@ mod registry_tests {
         for proto in ["imap", "jmap", "graph"] {
             let b = for_account(&account(proto, "password")).expect(proto);
             assert_eq!(b.protocol(), proto);
+        }
+    }
+
+    #[test]
+    fn backends_report_their_draft_storage_format() {
+        let cases = [
+            ("imap", DraftStorageFormat::RawMime),
+            ("jmap", DraftStorageFormat::RawMime),
+            ("graph", DraftStorageFormat::StructuredText),
+        ];
+
+        for (protocol, expected) in cases {
+            let backend = for_account(&account(protocol, "password")).unwrap();
+            assert_eq!(backend.draft_storage_format(), expected);
         }
     }
 

@@ -914,22 +914,7 @@ impl GraphClient {
     }
 
     pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {
-        let body = serde_json::json!({
-            "subject": message.subject,
-            "body": {
-                "contentType": "Text",
-                "content": message.body_text
-            },
-            "toRecipients": message.to.iter().map(|e| {
-                serde_json::json!({ "emailAddress": { "address": e } })
-            }).collect::<Vec<_>>(),
-            "ccRecipients": message.cc.iter().map(|e| {
-                serde_json::json!({ "emailAddress": { "address": e } })
-            }).collect::<Vec<_>>(),
-            "bccRecipients": message.bcc.iter().map(|e| {
-                serde_json::json!({ "emailAddress": { "address": e } })
-            }).collect::<Vec<_>>(),
-        });
+        let body = graph_draft_json(message);
 
         self.post_json("/me/messages", &body).await?;
         log::info!("Graph: draft saved successfully");
@@ -1786,6 +1771,61 @@ impl GraphClient {
     /// Delete a contact.
     pub async fn delete_contact(&self, contact_id: &str) -> Result<()> {
         self.delete(&format!("/me/contacts/{}", contact_id)).await
+    }
+}
+
+fn graph_draft_json(message: &GraphSendMessage) -> serde_json::Value {
+    serde_json::json!({
+        "subject": message.subject,
+        "body": {
+            "contentType": "Text",
+            "content": message.body_text
+        },
+        "toRecipients": message.to.iter().map(|e| {
+            serde_json::json!({ "emailAddress": { "address": e } })
+        }).collect::<Vec<_>>(),
+        "ccRecipients": message.cc.iter().map(|e| {
+            serde_json::json!({ "emailAddress": { "address": e } })
+        }).collect::<Vec<_>>(),
+        "bccRecipients": message.bcc.iter().map(|e| {
+            serde_json::json!({ "emailAddress": { "address": e } })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::{graph_draft_json, GraphSendMessage};
+
+    #[test]
+    fn structured_draft_preserves_all_fields() {
+        let message = GraphSendMessage {
+            to: vec!["to@example.com".into()],
+            cc: vec!["cc@example.com".into()],
+            bcc: vec!["bcc@example.com".into()],
+            subject: "Draft subject".into(),
+            body_text: "Draft body".into(),
+        };
+
+        assert_eq!(
+            graph_draft_json(&message),
+            serde_json::json!({
+                "subject": "Draft subject",
+                "body": {
+                    "contentType": "Text",
+                    "content": "Draft body"
+                },
+                "toRecipients": [{
+                    "emailAddress": { "address": "to@example.com" }
+                }],
+                "ccRecipients": [{
+                    "emailAddress": { "address": "cc@example.com" }
+                }],
+                "bccRecipients": [{
+                    "emailAddress": { "address": "bcc@example.com" }
+                }]
+            })
+        );
     }
 }
 

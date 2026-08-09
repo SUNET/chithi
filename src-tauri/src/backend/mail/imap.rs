@@ -16,9 +16,14 @@ use crate::mail::sync as mail_sync;
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
-use super::{BodyFetchRequest, MailBackend, MailOpExecutor, MailSyncCtx};
+use super::{
+    BodyFetchRequest, DraftSaveRequest, DraftStorageFormat, MailBackend, MailOpExecutor,
+    MailSyncCtx,
+};
 
 pub struct ImapMailBackend;
+
+const DRAFT_FOLDERS: [&str; 3] = ["Drafts", "INBOX.Drafts", "[Gmail]/Drafts"];
 
 fn body_fetch_target(request: &BodyFetchRequest) -> Result<(&str, u32)> {
     match &request.message_ref {
@@ -414,6 +419,37 @@ impl MailBackend for ImapMailBackend {
         })
         .await
         .map_err(|e| Error::Other(format!("IMAP search task panicked: {}", e)))?
+    }
+
+    fn draft_storage_format(&self) -> DraftStorageFormat {
+        DraftStorageFormat::RawMime
+    }
+
+    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()> {
+        let imap_config = build_imap_config(account).await?;
+        let raw_message = request.raw_message.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = ImapConnection::connect(&imap_config)?;
+            let mut saved = false;
+            for folder in DRAFT_FOLDERS {
+                match connection.append_message(folder, &raw_message) {
+                    Ok(()) => {
+                        saved = true;
+                        break;
+                    }
+                    Err(error) => {
+                        log::debug!("Draft folder '{}' failed: {}", folder, error);
+                    }
+                }
+            }
+            if !saved {
+                return Err(Error::Other("Could not find Drafts folder".into()));
+            }
+            connection.logout();
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("Draft save task failed: {}", e)))?
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {

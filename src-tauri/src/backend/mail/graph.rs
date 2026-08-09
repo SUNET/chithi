@@ -663,6 +663,28 @@ impl MailBackend for GraphMailBackend {
         client.search_messages(&account.id, query).await
     }
 
+    fn draft_storage_format(&self) -> super::DraftStorageFormat {
+        super::DraftStorageFormat::StructuredText
+    }
+
+    async fn save_draft(
+        &self,
+        account: &AccountFull,
+        request: &super::DraftSaveRequest,
+    ) -> Result<()> {
+        let token = crate::mail::graph::get_graph_token(&account.id).await?;
+        let client = crate::mail::graph::GraphClient::new(&token);
+        client
+            .save_draft(&crate::mail::graph::GraphSendMessage {
+                to: request.to.clone(),
+                cc: request.cc.clone(),
+                bcc: request.bcc.clone(),
+                subject: request.subject.clone(),
+                body_text: request.body_text.clone(),
+            })
+            .await
+    }
+
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {
         Box::new(GraphOpExecutor)
     }
