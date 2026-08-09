@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use crate::db::accounts::AccountFull;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::event::SharedEventSink;
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
@@ -21,11 +22,10 @@ pub mod graph;
 pub mod imap;
 pub mod jmap;
 
-/// Everything a mail sync needs besides the account: the app handle
-/// (sync progress events are emitted deep inside the sync loops), the
-/// DB pool, and the Maildir root.
+/// Everything a mail sync needs besides the account: application event
+/// delivery, the DB pool, and the Maildir root.
 pub struct MailSyncCtx {
-    pub app: tauri::AppHandle,
+    pub events: SharedEventSink,
     pub db: std::sync::Arc<DbPool>,
     pub data_dir: std::path::PathBuf,
 }

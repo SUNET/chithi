@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::tauri::{emit_folders_changed, emit_messages_changed};
 use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 
 /// RAII guard that clears the sync-in-progress flag on drop.
@@ -573,7 +573,7 @@ async fn run_mail_sync_once(
     let resume_account = account.clone();
 
     let ctx = crate::backend::mail::MailSyncCtx {
-        app: app.clone(),
+        events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
     };
@@ -725,7 +725,7 @@ pub async fn sync_folder(
     let resume_account = account.clone();
 
     let ctx = crate::backend::mail::MailSyncCtx {
-        app: app.clone(),
+        events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
     };
@@ -836,7 +836,7 @@ pub async fn prefetch_bodies(
 
         // For O365: get IMAP-scoped OAuth token
         let ctx = crate::backend::mail::MailSyncCtx {
-            app: app.clone(),
+            events: crate::event::tauri::shared_sink(app.clone()),
             db: state.db.clone(),
             data_dir: state.data_dir.clone(),
         };

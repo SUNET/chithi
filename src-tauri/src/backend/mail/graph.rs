@@ -1,12 +1,11 @@
 //! Microsoft Graph mail backend (O365 / Exchange Online).
 
 use async_trait::async_trait;
-use tauri::Emitter;
 
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
-use crate::event::{emit_folders_changed, emit_messages_changed};
+use crate::event::{ApplicationEvent, SyncComplete, SyncStarted};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
@@ -84,7 +83,6 @@ async fn sync_graph_account(
 ) -> Result<()> {
     use crate::mail::graph::{self, GraphClient};
 
-    let app = &ctx.app;
     let db_arc = &ctx.db;
 
     // Mirror sync_account / sync_jmap_account: emit sync-started so the
@@ -96,14 +94,11 @@ async fn sync_graph_account(
             .map(|a| a.display_name)
             .unwrap_or_else(|_| account_id.to_string())
     };
-    app.emit(
-        "sync-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "account_name": account_name,
-        }),
-    )
-    .ok();
+    ctx.events
+        .publish(ApplicationEvent::SyncStarted(SyncStarted {
+            account_id: account_id.to_string(),
+            account_name,
+        }));
 
     let token = graph::get_graph_token(account_id).await?;
     let client = GraphClient::new(&token);
@@ -164,16 +159,15 @@ async fn sync_graph_account(
         }
     }
 
-    app.emit(
-        "sync-complete",
-        serde_json::json!({
-            "account_id": account_id,
-            "total_synced": grand_total,
-        }),
-    )
-    .ok();
-    emit_folders_changed(app, account_id);
-    emit_messages_changed(app, account_id);
+    ctx.events
+        .publish(ApplicationEvent::SyncComplete(SyncComplete {
+            account_id: account_id.to_string(),
+            total_synced: grand_total,
+        }));
+    ctx.events
+        .publish(ApplicationEvent::FoldersChanged(account_id.to_string()));
+    ctx.events
+        .publish(ApplicationEvent::MessagesChanged(account_id.to_string()));
 
     log::info!(
         "Graph sync: completed for account {}, {} new messages",
@@ -522,15 +516,11 @@ impl MailBackend for GraphMailBackend {
     ) -> Result<u32> {
         use crate::mail::graph::{self, GraphClient};
 
-        ctx.app
-            .emit(
-                "sync-started",
-                serde_json::json!({
-                    "account_id": account.id,
-                    "account_name": account.display_name,
-                }),
-            )
-            .ok();
+        ctx.events
+            .publish(ApplicationEvent::SyncStarted(SyncStarted {
+                account_id: account.id.clone(),
+                account_name: account.display_name.clone(),
+            }));
 
         let token = graph::get_graph_token(&account.id).await?;
         let client = GraphClient::new(&token);
