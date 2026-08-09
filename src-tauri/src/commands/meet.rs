@@ -81,6 +81,7 @@ pub async fn meet_talk_login_complete(
         &state.providers.transports.talk_http,
     )
     .await?;
+    validate_returned_server_url(&creds.server)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -222,6 +223,7 @@ pub async fn meet_matrix_login_complete(
         &state.providers.transports.matrix_http,
     )
     .await?;
+    validate_returned_server_url(&result.homeserver)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -531,4 +533,36 @@ fn short_host(url: &str) -> String {
         .next()
         .unwrap_or(url)
         .to_string()
+}
+
+fn validate_returned_server_url(url: &str) -> Result<()> {
+    crate::mail::url_validation::require_https(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_returned_server_url;
+
+    #[test]
+    fn returned_server_url_accepts_https_and_debug_loopback_http() {
+        assert!(validate_returned_server_url("https://meet.example.com").is_ok());
+        let loopback_urls = [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ];
+        for url in loopback_urls {
+            assert_eq!(
+                validate_returned_server_url(url).is_ok(),
+                cfg!(debug_assertions)
+            );
+        }
+    }
+
+    #[test]
+    fn returned_server_url_rejects_malformed_and_public_cleartext_urls() {
+        assert!(validate_returned_server_url("not a URL").is_err());
+        assert!(validate_returned_server_url("http://meet.example.com").is_err());
+        assert!(validate_returned_server_url("http://192.0.2.1").is_err());
+    }
 }

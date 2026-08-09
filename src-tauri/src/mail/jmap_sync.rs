@@ -14,45 +14,46 @@ use crate::provider::ProviderServices;
 
 /// Sync all folders for a JMAP account. This is the JMAP equivalent of
 /// `mail::sync::sync_account` for IMAP.
-pub async fn sync_jmap_account(
+pub(crate) async fn sync_jmap_account(
     events: SharedEventSink,
     db: Arc<DbPool>,
     _data_dir: PathBuf,
-    account_id: String,
-    account_name: String,
+    account: &crate::db::accounts::AccountFull,
     providers: Arc<ProviderServices>,
-    jmap_config: JmapConfig,
-    conn_jmap: JmapConnection,
     current_folder: Option<String>,
 ) -> Result<()> {
     events.publish(ApplicationEvent::SyncStarted(SyncStarted {
-        account_id: account_id.clone(),
-        account_name: account_name.clone(),
+        account_id: account.id.clone(),
+        account_name: account.display_name.clone(),
     }));
 
-    let result = sync_jmap_account_inner(
-        events.as_ref(),
-        &db,
-        providers.as_ref(),
-        &account_id,
-        &jmap_config,
-        &conn_jmap,
-        current_folder.as_deref(),
-    )
+    let result = async {
+        let (jmap_config, conn_jmap) = providers.jmap_client(account).await?;
+        sync_jmap_account_inner(
+            events.as_ref(),
+            &db,
+            providers.as_ref(),
+            &account.id,
+            &jmap_config,
+            &conn_jmap,
+            current_folder.as_deref(),
+        )
+        .await
+    }
     .await;
 
     match &result {
         Ok(total) => {
             events.publish(ApplicationEvent::SyncComplete(SyncComplete {
-                account_id: account_id.clone(),
+                account_id: account.id.clone(),
                 total_synced: *total,
             }));
-            events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
-            events.publish(ApplicationEvent::MessagesChanged(account_id.clone()));
+            events.publish(ApplicationEvent::FoldersChanged(account.id.clone()));
+            events.publish(ApplicationEvent::MessagesChanged(account.id.clone()));
         }
         Err(e) => {
             events.publish(ApplicationEvent::SyncError(SyncError {
-                account_id: account_id.clone(),
+                account_id: account.id.clone(),
                 error: e.to_string(),
             }));
         }
@@ -467,45 +468,46 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
 }
 
 /// Sync a single JMAP folder — public entry point for the `sync_folder` command.
-pub async fn sync_jmap_folder_public(
+pub(crate) async fn sync_jmap_folder_public(
     events: SharedEventSink,
     db: Arc<DbPool>,
-    account_id: String,
-    account_name: String,
+    account: &crate::db::accounts::AccountFull,
     mailbox_id: String,
     providers: Arc<ProviderServices>,
-    jmap_config: JmapConfig,
-    conn_jmap: JmapConnection,
 ) -> Result<u32> {
     events.publish(ApplicationEvent::SyncStarted(SyncStarted {
-        account_id: account_id.clone(),
-        account_name,
+        account_id: account.id.clone(),
+        account_name: account.display_name.clone(),
     }));
 
     let folder_name = mailbox_id.clone();
-    let result = sync_jmap_folder(
-        &db,
-        providers.as_ref(),
-        &account_id,
-        &conn_jmap,
-        &jmap_config,
-        &mailbox_id,
-        &folder_name,
-    )
+    let result = async {
+        let (jmap_config, conn_jmap) = providers.jmap_client(account).await?;
+        sync_jmap_folder(
+            &db,
+            providers.as_ref(),
+            &account.id,
+            &conn_jmap,
+            &jmap_config,
+            &mailbox_id,
+            &folder_name,
+        )
+        .await
+    }
     .await;
 
     match &result {
         Ok(count) => {
             events.publish(ApplicationEvent::SyncComplete(SyncComplete {
-                account_id: account_id.clone(),
+                account_id: account.id.clone(),
                 total_synced: *count,
             }));
-            events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
-            events.publish(ApplicationEvent::MessagesChanged(account_id.clone()));
+            events.publish(ApplicationEvent::FoldersChanged(account.id.clone()));
+            events.publish(ApplicationEvent::MessagesChanged(account.id.clone()));
         }
         Err(e) => {
             events.publish(ApplicationEvent::SyncError(SyncError {
-                account_id: account_id.clone(),
+                account_id: account.id.clone(),
                 error: e.to_string(),
             }));
         }
@@ -606,7 +608,93 @@ pub async fn fetch_and_store_jmap_body(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingEvents(Mutex<Vec<ApplicationEvent>>);
+
+    impl EventSink for RecordingEvents {
+        fn publish(&self, event: ApplicationEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn jmap_account(jmap_url: &str) -> crate::db::accounts::AccountFull {
+        crate::db::accounts::AccountFull {
+            id: "account-1".into(),
+            display_name: "JMAP account".into(),
+            email: "user@example.com".into(),
+            provider: "generic".into(),
+            mail_protocol: "jmap".into(),
+            imap_host: String::new(),
+            imap_port: 0,
+            smtp_host: String::new(),
+            smtp_port: 0,
+            jmap_url: jmap_url.into(),
+            caldav_url: String::new(),
+            meet_url: String::new(),
+            meet_protocol: String::new(),
+            username: "user@example.com".into(),
+            password: "password".into(),
+            use_tls: true,
+            enabled: true,
+            signature: String::new(),
+            jmap_auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            calendar_sync_enabled: false,
+            auth_method: "password".into(),
+            bindings: Vec::new(),
+            mail_sync_enabled: true,
+            contacts_sync_enabled: false,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
+            pgp_attach_pubkey_on_sign: false,
+            pgp_autocrypt_header: false,
+            pgp_encrypt_subject: false,
+            pgp_encrypt_drafts: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_failures_emit_started_then_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DbPool::new(&temp.path().join("test.db"), 1).unwrap());
+        let recording = Arc::new(RecordingEvents::default());
+        let events: SharedEventSink = recording.clone();
+        let account = jmap_account("http://mail.example.com");
+
+        let result = sync_jmap_account(
+            events,
+            db,
+            temp.path().to_path_buf(),
+            &account,
+            Arc::new(ProviderServices::production().unwrap()),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let result = sync_jmap_folder_public(
+            recording.clone(),
+            Arc::new(DbPool::new(&temp.path().join("folder.db"), 1).unwrap()),
+            &account,
+            "inbox".into(),
+            Arc::new(ProviderServices::production().unwrap()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let events = recording.0.lock().unwrap();
+        assert!(matches!(events[0], ApplicationEvent::SyncStarted(_)));
+        assert!(matches!(events[1], ApplicationEvent::SyncError(_)));
+        assert!(matches!(events[2], ApplicationEvent::SyncStarted(_)));
+        assert!(matches!(events[3], ApplicationEvent::SyncError(_)));
+        assert_eq!(events.len(), 4);
+    }
 
     #[test]
     fn accepts_rfc8620_ids() {

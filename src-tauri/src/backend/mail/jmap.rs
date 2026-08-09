@@ -63,17 +63,12 @@ impl MailBackend for JmapMailBackend {
             account.jmap_url
         );
 
-        let (jmap_config, connection) = connect(ctx, account).await?;
-
         jmap_sync::sync_jmap_account(
             ctx.events.clone(),
             ctx.db.clone(),
             ctx.data_dir.clone(),
-            account.id.clone(),
-            account.display_name.clone(),
+            account,
             ctx.providers.clone(),
-            jmap_config,
-            connection,
             current_folder,
         )
         .await
@@ -85,16 +80,12 @@ impl MailBackend for JmapMailBackend {
         account: &AccountFull,
         folder_path: &str,
     ) -> Result<u32> {
-        let (jmap_config, connection) = connect(ctx, account).await?;
         jmap_sync::sync_jmap_folder_public(
             ctx.events.clone(),
             ctx.db.clone(),
-            account.id.clone(),
-            account.display_name.clone(),
+            account,
             folder_path.to_string(),
             ctx.providers.clone(),
-            jmap_config,
-            connection,
         )
         .await
     }

@@ -801,6 +801,18 @@ mod connect_tests {
             "https://example.com:8443/dav/addressbooks/u/default/"
         );
     }
+
+    #[test]
+    fn resolve_url_preserves_path_prefix_without_trailing_slash() {
+        let client = client_with_base("https://example.com:8443/dav");
+        let resolved = client
+            .resolve_url("addressbooks/u/default/")
+            .expect("expected Ok");
+        assert_eq!(
+            resolved,
+            "https://example.com:8443/dav/addressbooks/u/default/"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -138,6 +138,28 @@ mod connect_tests {
         );
     }
 
+    #[test]
+    fn resolve_url_preserves_path_prefix_without_trailing_slash() {
+        let client = client_with_base("https://example.com:8443/dav");
+        assert_eq!(
+            ok_str(client.resolve_url("calendars/user/default/")),
+            "https://example.com:8443/dav/calendars/user/default/"
+        );
+    }
+
+    #[test]
+    fn resolve_url_preserves_query_and_fragment_reference_semantics() {
+        let client = client_with_base("https://example.com:8443/dav");
+        assert_eq!(
+            ok_str(client.resolve_url("?view=all")),
+            "https://example.com:8443/dav?view=all"
+        );
+        assert_eq!(
+            ok_str(client.resolve_url("#calendar")),
+            "https://example.com:8443/dav#calendar"
+        );
+    }
+
     #[tokio::test]
     async fn connect_rejects_http_url() {
         let cfg = CalDavConfig {
@@ -751,7 +773,16 @@ impl CalDavClient {
 pub(crate) fn resolve_dav_url(base_url: &str, href: &str, protocol: &str) -> Result<String> {
     let base = url::Url::parse(base_url)
         .map_err(|e| Error::Other(format!("{}: invalid base URL: {}", protocol, e)))?;
-    let resolved = base
+    let mut join_base = base.clone();
+    let is_path_relative = !href.is_empty()
+        && !href.starts_with('/')
+        && !href.starts_with('?')
+        && !href.starts_with('#');
+    if is_path_relative && url::Url::parse(href).is_err() && !join_base.path().ends_with('/') {
+        let collection_path = format!("{}/", join_base.path());
+        join_base.set_path(&collection_path);
+    }
+    let resolved = join_base
         .join(href)
         .map_err(|e| Error::Other(format!("{}: invalid href: {}", protocol, e)))?;
 
