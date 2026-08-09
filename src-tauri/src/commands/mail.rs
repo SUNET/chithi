@@ -434,7 +434,15 @@ where
     R: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
-        run_with_imap_idle_resume(&account_id, operation, operation_future, resume).await
+        let operation_result = match tokio::spawn(operation_future).await {
+            Ok(result) => result,
+            Err(error) => Err(Error::Other(format!(
+                "{} task failed: {}",
+                operation, error
+            ))),
+        };
+        let resume_result = resume.await;
+        finish_with_imap_idle_resume(&account_id, operation, operation_result, resume_result)
     })
 }
 
@@ -1279,6 +1287,28 @@ mod tests {
             .await
             .expect("detached search task did not resume IDLE")
             .expect("resume signal was dropped");
+    }
+
+    #[tokio::test]
+    async fn panicked_search_cannot_skip_resume() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let task = spawn_with_imap_idle_resume::<Vec<String>, _, _>(
+            "account".into(),
+            "server search",
+            async move { panic!("search panic") },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        let result = task.await.expect("search owner task panicked");
+        assert!(resumed.load(Ordering::Relaxed));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("server search task failed"));
     }
 
     // A bare name with no slash is a top-level folder.
