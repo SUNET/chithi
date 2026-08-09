@@ -18,11 +18,17 @@ use crate::db::accounts::AccountFull;
 use crate::db::calendar::CalendarEvent;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::provider::ProviderServices;
 
 pub mod caldav;
 pub mod google;
 pub mod graph;
 pub mod jmap;
+
+pub struct CalendarBackendCtx<'a> {
+    pub db: &'a DbPool,
+    pub services: &'a ProviderServices,
+}
 
 /// Server identifiers returned by a successful event push.
 pub struct PushedEvent {
@@ -177,7 +183,7 @@ pub trait CalendarBackend: Send + Sync {
     /// reconcile the local DB. Interleaves provider I/O with DB writes
     /// (calendar/event upserts, deletion reconciliation, pushing
     /// locally created events), so it takes the pool.
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()>;
+    async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()>;
 
     /// Push a newly created local event. `Ok(None)` means the provider
     /// defers the push (CalDAV events go out with the next sync's
@@ -186,6 +192,7 @@ pub trait CalendarBackend: Send + Sync {
     /// default calendar ignore it.
     async fn push_created_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
         remote_calendar_id: &str,
@@ -196,6 +203,7 @@ pub trait CalendarBackend: Send + Sync {
     /// deliberate; their updates reach the server via other paths.
     async fn push_updated_event(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _remote_id: &str,
         _event: &CalendarEvent,
@@ -206,6 +214,7 @@ pub trait CalendarBackend: Send + Sync {
     /// Delete an event on the server.
     async fn push_deleted_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         remote_calendar_id: &str,
@@ -215,6 +224,7 @@ pub trait CalendarBackend: Send + Sync {
     /// the local DB unchanged on remote failure.
     async fn push_calendar_rename(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         name: &str,
@@ -226,6 +236,7 @@ pub trait CalendarBackend: Send + Sync {
     /// the local pick should stick regardless).
     async fn push_calendar_color(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         color: &str,
@@ -233,6 +244,7 @@ pub trait CalendarBackend: Send + Sync {
 
     async fn list_room_suggestions(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
     ) -> Result<CalendarCapability<Vec<RoomSuggestion>>> {
         Ok(CalendarCapability::Unsupported)
@@ -240,6 +252,7 @@ pub trait CalendarBackend: Send + Sync {
 
     async fn check_room_availability(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _request: &RoomAvailabilityRequest,
     ) -> Result<CalendarCapability<RoomAvailability>> {
@@ -248,6 +261,7 @@ pub trait CalendarBackend: Send + Sync {
 
     async fn get_participant_schedules(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _request: &ParticipantScheduleRequest,
     ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
@@ -256,6 +270,7 @@ pub trait CalendarBackend: Send + Sync {
 
     async fn apply_remote_rsvp(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _request: &RemoteRsvpRequest,
     ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
@@ -264,6 +279,7 @@ pub trait CalendarBackend: Send + Sync {
 
     async fn push_attendee_responses(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _updates: &[AttendeeResponseUpdate],
     ) -> Result<CalendarCapability<()>> {
@@ -434,12 +450,30 @@ mod contract_tests {
     use super::*;
     use crate::backend::testutil::{account, event, temp_pool};
 
+    fn services() -> &'static ProviderServices {
+        static SERVICES: std::sync::OnceLock<ProviderServices> = std::sync::OnceLock::new();
+        SERVICES.get_or_init(|| ProviderServices::production().unwrap())
+    }
+
+    fn ctx(db: &DbPool) -> CalendarBackendCtx<'_> {
+        CalendarBackendCtx {
+            db,
+            services: services(),
+        }
+    }
+
     /// CalDAV never pushes at create time — events go out with the
     /// next sync's unpushed-rows pass.
     #[tokio::test]
     async fn caldav_defers_event_creation_to_sync() {
+        let (_dir, db) = temp_pool();
         let pushed = caldav::CalDavCalendarBackend
-            .push_created_event(&account("calendar", "caldav"), &event(), "cal-href")
+            .push_created_event(
+                &ctx(&db),
+                &account("calendar", "caldav"),
+                &event(),
+                "cal-href",
+            )
             .await
             .unwrap();
         assert!(pushed.is_none());
@@ -450,12 +484,13 @@ mod contract_tests {
     /// server config and fail this test.
     #[tokio::test]
     async fn jmap_and_caldav_do_not_push_event_updates() {
+        let (_dir, db) = temp_pool();
         jmap::JmapCalendarBackend
-            .push_updated_event(&account("calendar", "jmap"), "r1", &event())
+            .push_updated_event(&ctx(&db), &account("calendar", "jmap"), "r1", &event())
             .await
             .unwrap();
         caldav::CalDavCalendarBackend
-            .push_updated_event(&account("calendar", "caldav"), "r1", &event())
+            .push_updated_event(&ctx(&db), &account("calendar", "caldav"), "r1", &event())
             .await
             .unwrap();
     }
@@ -464,8 +499,9 @@ mod contract_tests {
     /// pick sticks.
     #[tokio::test]
     async fn google_color_push_swallows_missing_token() {
+        let (_dir, db) = temp_pool();
         google::GoogleCalendarBackend
-            .push_calendar_color(&account("calendar", "google"), "r1", "#a1b2c3")
+            .push_calendar_color(&ctx(&db), &account("calendar", "google"), "r1", "#a1b2c3")
             .await
             .unwrap();
     }
@@ -474,8 +510,9 @@ mod contract_tests {
     /// token propagates (pre-trait behaviour, kept verbatim).
     #[tokio::test]
     async fn graph_color_push_propagates_missing_token() {
+        let (_dir, db) = temp_pool();
         let result = graph::GraphCalendarBackend
-            .push_calendar_color(&account("calendar", "graph"), "r1", "#a1b2c3")
+            .push_calendar_color(&ctx(&db), &account("calendar", "graph"), "r1", "#a1b2c3")
             .await;
         assert!(result.is_err());
     }
@@ -486,7 +523,7 @@ mod contract_tests {
     async fn google_sync_without_caldav_fallback_propagates() {
         let (_dir, db) = temp_pool();
         let result = google::GoogleCalendarBackend
-            .sync(&db, &account("calendar", "google"))
+            .sync(&ctx(&db), &account("calendar", "google"))
             .await;
         assert!(result.is_err());
     }
@@ -496,13 +533,14 @@ mod contract_tests {
     async fn graph_sync_propagates_missing_token() {
         let (_dir, db) = temp_pool();
         let result = graph::GraphCalendarBackend
-            .sync(&db, &account("calendar", "graph"))
+            .sync(&ctx(&db), &account("calendar", "graph"))
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn unsupported_scheduling_capabilities_do_not_attempt_io() {
+        let (_dir, db) = temp_pool();
         let caldav = account("calendar", "caldav");
         let jmap = account("calendar", "jmap");
         let room_request = RoomAvailabilityRequest {
@@ -518,21 +556,21 @@ mod contract_tests {
 
         assert_eq!(
             caldav::CalDavCalendarBackend
-                .list_room_suggestions(&caldav)
+                .list_room_suggestions(&ctx(&db), &caldav)
                 .await
                 .unwrap(),
             CalendarCapability::Unsupported
         );
         assert_eq!(
             jmap::JmapCalendarBackend
-                .check_room_availability(&jmap, &room_request)
+                .check_room_availability(&ctx(&db), &jmap, &room_request)
                 .await
                 .unwrap(),
             CalendarCapability::Unsupported
         );
         assert_eq!(
             jmap::JmapCalendarBackend
-                .get_participant_schedules(&jmap, &schedule_request)
+                .get_participant_schedules(&ctx(&db), &jmap, &schedule_request)
                 .await
                 .unwrap(),
             CalendarCapability::Unsupported
@@ -541,6 +579,7 @@ mod contract_tests {
 
     #[tokio::test]
     async fn supported_scheduling_capabilities_attempt_provider_auth() {
+        let (_dir, db) = temp_pool();
         let graph = account("calendar", "graph");
         let google = account("calendar", "google");
         let request = ParticipantScheduleRequest {
@@ -550,15 +589,15 @@ mod contract_tests {
         };
 
         assert!(graph::GraphCalendarBackend
-            .get_participant_schedules(&graph, &request)
+            .get_participant_schedules(&ctx(&db), &graph, &request)
             .await
             .is_err());
         assert!(google::GoogleCalendarBackend
-            .get_participant_schedules(&google, &request)
+            .get_participant_schedules(&ctx(&db), &google, &request)
             .await
             .is_err());
         assert!(graph::GraphCalendarBackend
-            .list_room_suggestions(&graph)
+            .list_room_suggestions(&ctx(&db), &graph)
             .await
             .is_err());
         let room_request = RoomAvailabilityRequest {
@@ -567,13 +606,14 @@ mod contract_tests {
             end_time: request.end_time.clone(),
         };
         assert!(graph::GraphCalendarBackend
-            .check_room_availability(&graph, &room_request)
+            .check_room_availability(&ctx(&db), &graph, &room_request)
             .await
             .is_err());
     }
 
     #[tokio::test]
     async fn remote_rsvp_capabilities_match_their_policies() {
+        let (_dir, db) = temp_pool();
         let graph = account("calendar", "graph");
         let google = account("calendar", "google");
         let caldav = account("calendar", "caldav");
@@ -590,16 +630,16 @@ mod contract_tests {
         };
 
         assert!(graph::GraphCalendarBackend
-            .apply_remote_rsvp(&graph, &request)
+            .apply_remote_rsvp(&ctx(&db), &graph, &request)
             .await
             .is_err());
         assert!(google::GoogleCalendarBackend
-            .apply_remote_rsvp(&google, &request)
+            .apply_remote_rsvp(&ctx(&db), &google, &request)
             .await
             .is_err());
         assert_eq!(
             caldav::CalDavCalendarBackend
-                .apply_remote_rsvp(&caldav, &request)
+                .apply_remote_rsvp(&ctx(&db), &caldav, &request)
                 .await
                 .unwrap(),
             CalendarCapability::Unsupported
@@ -608,6 +648,7 @@ mod contract_tests {
 
     #[tokio::test]
     async fn only_jmap_handles_remote_attendee_responses() {
+        let (_dir, db) = temp_pool();
         let update = AttendeeResponseUpdate {
             remote_id: "event-1".into(),
             attendee_email: "person@example.com".into(),
@@ -618,14 +659,14 @@ mod contract_tests {
 
         assert_eq!(
             jmap::JmapCalendarBackend
-                .push_attendee_responses(&jmap, std::slice::from_ref(&update))
+                .push_attendee_responses(&ctx(&db), &jmap, std::slice::from_ref(&update))
                 .await
                 .unwrap(),
             CalendarCapability::Supported(())
         );
         assert_eq!(
             graph::GraphCalendarBackend
-                .push_attendee_responses(&graph, &[update])
+                .push_attendee_responses(&ctx(&db), &graph, &[update])
                 .await
                 .unwrap(),
             CalendarCapability::Unsupported

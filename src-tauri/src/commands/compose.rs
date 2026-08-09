@@ -512,6 +512,7 @@ pub struct DraftSaveOutcome {
 
 #[tauri::command]
 pub async fn save_draft(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     message: ComposeMessage,
@@ -614,8 +615,15 @@ pub async fn save_draft(
 
     // Graph currently persists only these structured fields, while IMAP and
     // JMAP consume `raw_message` verbatim. The backend owns that distinction.
+    let ctx = crate::backend::mail::MailSyncCtx {
+        events: crate::event::tauri::shared_sink(app),
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+        providers: state.providers.clone(),
+    };
     backend
         .save_draft(
+            &ctx,
             &account,
             &crate::backend::mail::DraftSaveRequest {
                 raw_message,

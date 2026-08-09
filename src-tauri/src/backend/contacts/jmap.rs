@@ -4,11 +4,9 @@ use async_trait::async_trait;
 
 use crate::db::accounts::AccountFull;
 use crate::db::contacts::Contact;
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::jmap::JmapConnection;
 
-use super::{BookRef, ContactBackend, PushedContact};
+use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};
 
 pub struct JmapContactBackend;
 
@@ -18,11 +16,9 @@ impl ContactBackend for JmapContactBackend {
         "jmap"
     }
 
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &ContactBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let account_id = account.id.as_str();
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-
-        let jmap_conn = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, jmap_conn) = ctx.providers.jmap_client(account).await?;
 
         // Step 1: Fetch address books
         let address_books = jmap_conn.list_address_books(&jmap_config).await?;
@@ -35,7 +31,7 @@ impl ContactBackend for JmapContactBackend {
             std::collections::HashMap::new();
 
         {
-            let conn = db.writer().await;
+            let conn = ctx.db.writer().await;
             for ab in &address_books {
                 // Upsert contact book
                 let existing: Option<String> = conn
@@ -85,7 +81,7 @@ impl ContactBackend for JmapContactBackend {
             );
 
             let local_book_id = remote_to_local.get(&ab.id).cloned().unwrap_or_default();
-            let conn = db.writer().await;
+            let conn = ctx.db.writer().await;
 
             for jc in &jmap_contacts {
                 // Upsert by remote_id
@@ -204,7 +200,7 @@ impl ContactBackend for JmapContactBackend {
                                 name,
                                 remote_id
                             );
-                            let conn = db.writer().await;
+                            let conn = ctx.db.writer().await;
                             conn.execute(
                                 "UPDATE contacts SET remote_id = ?1 WHERE id = ?2",
                                 rusqlite::params![remote_id, local_id],
@@ -226,6 +222,7 @@ impl ContactBackend for JmapContactBackend {
     /// unpushed-rows pass (see `sync`), not pushed at create time.
     async fn push_created_contact(
         &self,
+        _ctx: &ContactBackendCtx<'_>,
         _account: &AccountFull,
         _book: &BookRef<'_>,
         _contact: &Contact,
@@ -235,13 +232,13 @@ impl ContactBackend for JmapContactBackend {
 
     async fn push_updated_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         _book: &BookRef<'_>,
         contact: &Contact,
         remote_id: &str,
     ) -> Result<Option<PushedContact>> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, conn_jmap) = ctx.providers.jmap_client(account).await?;
         conn_jmap
             .update_contact_card(
                 &jmap_config,
@@ -257,9 +254,13 @@ impl ContactBackend for JmapContactBackend {
         Ok(None)
     }
 
-    async fn push_deleted_contact(&self, account: &AccountFull, remote_id: &str) -> Result<()> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+    async fn push_deleted_contact(
+        &self,
+        ctx: &ContactBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+    ) -> Result<()> {
+        let (jmap_config, conn_jmap) = ctx.providers.jmap_client(account).await?;
         conn_jmap.delete_contact_card(&jmap_config, remote_id).await
     }
 }

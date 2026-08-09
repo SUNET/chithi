@@ -370,7 +370,7 @@ fn normalize_base_url(server: &str) -> String {
 
 /// `MeetProvider` implementor for Nextcloud Talk. Stateless — each
 /// `create_url` call reads the account's URL from its meet binding
-/// and the app password from the keyring.
+/// and the app password from the injected provider services.
 pub struct TalkProvider;
 
 #[async_trait::async_trait]
@@ -383,6 +383,7 @@ impl crate::meet::MeetProvider for TalkProvider {
     }
     async fn create_url(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         name: &str,
         _start_time: Option<&str>,
@@ -396,12 +397,24 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        create_room(url, &account.username, &app_password, name).await
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        create_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            name,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 
     async fn delete_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
     ) -> Result<()> {
@@ -411,12 +424,24 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        delete_room(url, &account.username, &app_password, meeting_id).await
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        delete_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            meeting_id,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 
     async fn update_topic(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         topic: &str,
@@ -427,19 +452,20 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        rename_room(url, &account.username, &app_password, meeting_id, topic).await
-    }
-}
-
-/// Shared keyring read so create / delete share one error path
-/// and one not-signed-in message.
-fn load_app_password(account: &crate::db::accounts::AccountFull) -> Result<String> {
-    match crate::oauth::load_tokens(&account.id)? {
-        Some(t) => Ok(t.access_token),
-        None => Err(Error::Other(
-            "Nextcloud Talk: no app password in keyring; sign in again".into(),
-        )),
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        rename_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            meeting_id,
+            topic,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 }
 

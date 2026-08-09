@@ -81,7 +81,8 @@ async fn sync_graph_account(
     account_id: &str,
     current_folder: Option<&str>,
 ) -> Result<()> {
-    use crate::mail::graph::{self, GraphClient};
+    use crate::mail::graph;
+    use crate::provider::GraphTokenPurpose;
 
     let db_arc = &ctx.db;
 
@@ -100,8 +101,10 @@ async fn sync_graph_account(
             account_name,
         }));
 
-    let token = graph::get_graph_token(account_id).await?;
-    let client = GraphClient::new(&token);
+    let client = ctx
+        .providers
+        .graph_client(account_id, GraphTokenPurpose::Baseline)
+        .await?;
 
     // Sync mail folders
     let graph_folders = client.list_mail_folders().await?;
@@ -514,7 +517,8 @@ impl MailBackend for GraphMailBackend {
         account: &AccountFull,
         folder_path: &str,
     ) -> Result<u32> {
-        use crate::mail::graph::{self, GraphClient};
+        use crate::mail::graph;
+        use crate::provider::GraphTokenPurpose;
 
         ctx.events
             .publish(ApplicationEvent::SyncStarted(SyncStarted {
@@ -522,8 +526,10 @@ impl MailBackend for GraphMailBackend {
                 account_name: account.display_name.clone(),
             }));
 
-        let token = graph::get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
 
         let gf = client.get_mail_folder(folder_path).await?;
         {
@@ -556,7 +562,7 @@ impl MailBackend for GraphMailBackend {
     /// Instead, stream full MIME for the newest unfetched rows via the
     /// same `download_mime_to_file` path the on-demand fetch uses.
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
-        use crate::mail::graph::{self, GraphClient};
+        use crate::provider::GraphTokenPurpose;
 
         /// Bodies fetched per prefetch pass; the pass re-runs after every
         /// sync, so the backlog drains across cycles.
@@ -575,8 +581,10 @@ impl MailBackend for GraphMailBackend {
             account.id
         );
 
-        let token = graph::get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
 
         let mut fetched = 0u32;
         for (db_id, folder_path, maildir_path, flags_json) in &unfetched {
@@ -628,8 +636,10 @@ impl MailBackend for GraphMailBackend {
         request: &BodyFetchRequest,
     ) -> Result<String> {
         let graph_msg_id = body_fetch_item_id(request)?;
-        let token = crate::mail::graph::get_graph_token(&account.id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, crate::provider::GraphTokenPurpose::Baseline)
+            .await?;
         fetch_graph_body_to_disk(
             &client,
             &ctx.data_dir,
@@ -643,13 +653,16 @@ impl MailBackend for GraphMailBackend {
 
     async fn search_messages(
         &self,
+        ctx: &MailSyncCtx,
         account: &AccountFull,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>> {
         validate_search_query(query)?;
 
-        let token = crate::mail::graph::get_graph_token(&account.id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, crate::provider::GraphTokenPurpose::Baseline)
+            .await?;
         client.search_messages(&account.id, query).await
     }
 
@@ -659,11 +672,14 @@ impl MailBackend for GraphMailBackend {
 
     async fn save_draft(
         &self,
+        ctx: &MailSyncCtx,
         account: &AccountFull,
         request: &super::DraftSaveRequest,
     ) -> Result<()> {
-        let token = crate::mail::graph::get_graph_token(&account.id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, crate::provider::GraphTokenPurpose::Baseline)
+            .await?;
         client
             .save_draft(&crate::mail::graph::GraphSendMessage {
                 to: request.to.clone(),
@@ -685,7 +701,7 @@ pub(super) struct GraphOpExecutor;
 
 #[async_trait]
 impl MailOpExecutor for GraphOpExecutor {
-    async fn execute(&mut self, _ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
+    async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()> {
         match op {
             MailOp::CopyMessages {
                 message_refs,
@@ -701,8 +717,10 @@ impl MailOpExecutor for GraphOpExecutor {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let token = crate::mail::graph::get_graph_token(account_id).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
+                let client = ctx
+                    .providers
+                    .graph_client(account_id, crate::provider::GraphTokenPurpose::Baseline)
+                    .await?;
                 let outcomes = client
                     .copy_messages_batch(&item_ids, &target_folder)
                     .await?;
@@ -735,8 +753,10 @@ impl MailOpExecutor for GraphOpExecutor {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let token = crate::mail::graph::get_graph_token(account_id).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
+                let client = ctx
+                    .providers
+                    .graph_client(account_id, crate::provider::GraphTokenPurpose::Baseline)
+                    .await?;
                 let outcomes = client
                     .move_messages_batch(&item_ids, &target_folder)
                     .await?;
@@ -771,8 +791,10 @@ impl MailOpExecutor for GraphOpExecutor {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let token = crate::mail::graph::get_graph_token(account_id).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
+                let client = ctx
+                    .providers
+                    .graph_client(account_id, crate::provider::GraphTokenPurpose::Baseline)
+                    .await?;
                 let outcomes = client.delete_messages_batch(&item_ids).await?;
                 let failures: Vec<String> = item_ids
                     .iter()
@@ -817,8 +839,10 @@ impl MailOpExecutor for GraphOpExecutor {
                         Ok((item_ids, mutation.flags, mutation.add))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let token = crate::mail::graph::get_graph_token(account_id).await?;
-                let client = crate::mail::graph::GraphClient::new(&token);
+                let client = ctx
+                    .providers
+                    .graph_client(account_id, crate::provider::GraphTokenPurpose::Baseline)
+                    .await?;
                 for (item_ids, flags, add) in prepared {
                     client.set_flags(&item_ids, &flags, add).await?;
                 }

@@ -20,6 +20,7 @@ pub async fn sync_jmap_account(
     account_id: String,
     account_name: String,
     jmap_config: JmapConfig,
+    conn_jmap: JmapConnection,
     current_folder: Option<String>,
 ) -> Result<()> {
     events.publish(ApplicationEvent::SyncStarted(SyncStarted {
@@ -32,6 +33,7 @@ pub async fn sync_jmap_account(
         &db,
         &account_id,
         &jmap_config,
+        &conn_jmap,
         current_folder.as_deref(),
     )
     .await;
@@ -61,10 +63,9 @@ async fn sync_jmap_account_inner(
     db: &Arc<DbPool>,
     account_id: &str,
     jmap_config: &JmapConfig,
+    conn_jmap: &JmapConnection,
     current_folder: Option<&str>,
 ) -> Result<u32> {
-    let conn_jmap = JmapConnection::connect(jmap_config).await?;
-
     // List and update mailboxes in DB
     let jmap_folders = conn_jmap.list_folders(jmap_config).await?;
     {
@@ -114,7 +115,7 @@ async fn sync_jmap_account_inner(
         match sync_jmap_folder(
             db,
             account_id,
-            &conn_jmap,
+            conn_jmap,
             jmap_config,
             mailbox_id,
             folder_name,
@@ -467,13 +468,13 @@ pub async fn sync_jmap_folder_public(
     account_name: String,
     mailbox_id: String,
     jmap_config: JmapConfig,
+    conn_jmap: JmapConnection,
 ) -> Result<u32> {
     events.publish(ApplicationEvent::SyncStarted(SyncStarted {
         account_id: account_id.clone(),
         account_name,
     }));
 
-    let conn_jmap = JmapConnection::connect(&jmap_config).await?;
     let folder_name = mailbox_id.clone();
     let result = sync_jmap_folder(
         &db,
@@ -530,6 +531,7 @@ fn validate_jmap_email_id(id: &str) -> Result<()> {
 /// Called when the user opens a message whose body hasn't been downloaded yet.
 pub async fn fetch_and_store_jmap_body(
     jmap_config: &JmapConfig,
+    conn_jmap: &JmapConnection,
     data_dir: &std::path::Path,
     account_id: &str,
     folder_path: &str,
@@ -547,7 +549,6 @@ pub async fn fetch_and_store_jmap_body(
         jmap_email_id
     );
 
-    let conn_jmap = JmapConnection::connect(jmap_config).await?;
     let body = conn_jmap
         .fetch_email_body(jmap_config, jmap_email_id)
         .await?

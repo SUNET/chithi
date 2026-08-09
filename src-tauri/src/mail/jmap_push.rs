@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::mail::jmap::{JmapConfig, JmapConnection};
+use crate::provider::ProviderServices;
 
 /// Initial delay before reconnecting after an error.
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -44,6 +45,7 @@ pub async fn run_push_loop(
     mut config: JmapConfig,
     account_id: String,
     cancellation: CancellationToken,
+    providers: Arc<ProviderServices>,
     on_event: Arc<dyn Fn(PushEvent) + Send + Sync>,
 ) {
     log::info!("JMAP push loop starting for account {}", account_id);
@@ -60,7 +62,7 @@ pub async fn run_push_loop(
         if config.access_token.is_some() && !config.oidc_token_endpoint.is_empty() {
             let refresh = tokio::select! {
                 _ = cancellation.cancelled() => break,
-                result = crate::auth::refresh_jmap_oidc_token(
+                result = providers.credentials().jmap_push_access_token(
                     &account_id,
                     &config.oidc_token_endpoint,
                     &config.oidc_client_id,
@@ -76,7 +78,7 @@ pub async fn run_push_loop(
         // Connect and get the EventSource URL
         let connection = tokio::select! {
             _ = cancellation.cancelled() => break,
-            result = connect_and_get_url(&config) => result,
+            result = connect_and_get_url(&config, &providers) => result,
         };
         let (event_source_url, http_auth) = match connection {
             Ok(Some(connection)) => connection,
@@ -126,6 +128,7 @@ pub async fn run_push_loop(
 
         // Stream SSE events
         let result = stream_events(
+            &providers.transports.jmap_sse_http,
             &event_source_url,
             &http_auth,
             &account_id,
@@ -178,10 +181,17 @@ impl HttpAuth {
 }
 
 /// Connect to the JMAP server, fetch session, and return the EventSource URL.
-async fn connect_and_get_url(config: &JmapConfig) -> Result<Option<(String, HttpAuth)>, String> {
-    let conn = JmapConnection::connect(config)
-        .await
-        .map_err(|e| format!("JMAP connect failed: {}", e))?;
+async fn connect_and_get_url(
+    config: &JmapConfig,
+    providers: &ProviderServices,
+) -> Result<Option<(String, HttpAuth)>, String> {
+    let conn = JmapConnection::connect_with_clients(
+        config,
+        providers.transports.jmap_discovery_http.clone(),
+        providers.transports.jmap_api_http.clone(),
+    )
+    .await
+    .map_err(|e| format!("JMAP connect failed: {}", e))?;
 
     let Some(url) = conn.event_source_url("*", PING_INTERVAL_SECS) else {
         return Ok(None);
@@ -200,6 +210,7 @@ async fn connect_and_get_url(config: &JmapConfig) -> Result<Option<(String, Http
 /// Stream SSE events from the JMAP EventSource endpoint.
 /// Returns Ok(()) if the stop flag was set, Err on connection/parse errors.
 async fn stream_events(
+    client: &reqwest::Client,
     url: &str,
     auth: &HttpAuth,
     account_id: &str,
@@ -209,12 +220,6 @@ async fn stream_events(
     use futures::StreamExt;
 
     log::debug!("JMAP push: opening SSE stream at {}", url);
-
-    // No overall timeout — SSE is a long-lived connection.
-    // We use READ_TIMEOUT per-chunk to detect dead connections.
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| format!("HTTP client build error: {}", e))?;
 
     let request = auth
         .apply_auth(client.get(url))
@@ -405,8 +410,10 @@ mod tests {
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let url = format!("http://{}/events", address);
+        let client = reqwest::Client::new();
         let push = tokio::spawn(async move {
             stream_events(
+                &client,
                 &url,
                 &HttpAuth {
                     username: "user".into(),

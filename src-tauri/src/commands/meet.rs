@@ -27,8 +27,15 @@ pub struct TalkLoginStart {
 }
 
 #[tauri::command]
-pub async fn meet_talk_login_start(server_url: String) -> Result<TalkLoginStart> {
-    let flow = meet::talk::login_flow_v2_start(&server_url).await?;
+pub async fn meet_talk_login_start(
+    state: State<'_, AppState>,
+    server_url: String,
+) -> Result<TalkLoginStart> {
+    let flow = meet::talk::login_flow_v2_start_with_client(
+        &server_url,
+        &state.providers.transports.talk_http,
+    )
+    .await?;
     Ok(TalkLoginStart {
         login_url: flow.login,
         poll_endpoint: flow.poll.endpoint,
@@ -53,7 +60,12 @@ pub async fn meet_talk_login_complete(
             endpoint: poll_endpoint,
         },
     };
-    let creds = meet::talk::login_flow_v2_complete(&flow, 300).await?;
+    let creds = meet::talk::login_flow_v2_complete_with_client(
+        &flow,
+        300,
+        &state.providers.transports.talk_http,
+    )
+    .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -188,7 +200,12 @@ pub async fn meet_matrix_login_complete(
     })
     .await
     .map_err(|e| Error::Other(format!("matrix sso join: {}", e)))??;
-    let result = meet::matrix::exchange_login_token(&homeserver_url, &token).await?;
+    let result = meet::matrix::exchange_login_token_with_client(
+        &homeserver_url,
+        &token,
+        &state.providers.transports.matrix_http,
+    )
+    .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -376,11 +393,12 @@ pub async fn meet_zoom_login_complete(
         }
     }
 
-    let tokens = crate::oauth::exchange_code(
+    let tokens = crate::oauth::exchange_code_with_client(
         &crate::oauth::ZOOM,
         &callback.code,
         port,
         verifier.as_deref(),
+        &state.providers.transports.zoom_http,
     )
     .await?;
 
@@ -465,8 +483,17 @@ pub async fn meet_create_url(
         Error::Other(format!("account {} has no usable meet binding", account_id))
     })?;
     let protocol = provider.protocol().to_string();
+    let ctx = meet::MeetProviderCtx {
+        services: &state.providers,
+    };
     let res = provider
-        .create_url(&account, &name, start_time.as_deref(), duration_minutes)
+        .create_url(
+            &ctx,
+            &account,
+            &name,
+            start_time.as_deref(),
+            duration_minutes,
+        )
         .await?;
     Ok(MeetCreateResponse {
         account_id: account.id,

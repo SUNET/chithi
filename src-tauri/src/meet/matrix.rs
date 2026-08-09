@@ -501,7 +501,7 @@ fn normalize_base_url(server: &str) -> String {
 
 /// `MeetProvider` implementor for Matrix / Element Call. Stateless;
 /// each `create_url` reads the homeserver from the account's meet
-/// binding and the access token from the keyring.
+/// binding and the access token from the injected provider services.
 pub struct MatrixProvider;
 
 #[async_trait::async_trait]
@@ -514,6 +514,7 @@ impl crate::meet::MeetProvider for MatrixProvider {
     }
     async fn create_url(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         name: &str,
         _start_time: Option<&str>,
@@ -527,12 +528,24 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        create_call(homeserver, &access_token, name, None).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        create_call_with_client(
+            homeserver,
+            &access_token,
+            name,
+            None,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 
     async fn delete_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
     ) -> Result<()> {
@@ -542,12 +555,23 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        leave_room(homeserver, &access_token, meeting_id).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        leave_room_with_client(
+            homeserver,
+            &access_token,
+            meeting_id,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 
     async fn update_topic(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         topic: &str,
@@ -558,17 +582,19 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        rename_room(homeserver, &access_token, meeting_id, topic).await
-    }
-}
-
-fn load_access_token(account: &crate::db::accounts::AccountFull) -> Result<String> {
-    match crate::oauth::load_tokens(&account.id)? {
-        Some(t) => Ok(t.access_token),
-        None => Err(Error::Other(
-            "Matrix: no access token in keyring; sign in again".into(),
-        )),
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        rename_room_with_client(
+            homeserver,
+            &access_token,
+            meeting_id,
+            topic,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 }
 

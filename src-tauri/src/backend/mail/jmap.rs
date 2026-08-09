@@ -18,6 +18,23 @@ use super::{
 
 pub struct JmapMailBackend;
 
+async fn connect(
+    ctx: &MailSyncCtx,
+    account: &AccountFull,
+) -> Result<(
+    crate::mail::jmap::JmapConfig,
+    crate::mail::jmap::JmapConnection,
+)> {
+    let config = ctx.providers.credentials().jmap_config(account).await?;
+    let connection = crate::mail::jmap::JmapConnection::connect_with_clients(
+        &config,
+        ctx.providers.transports.jmap_discovery_http.clone(),
+        ctx.providers.transports.jmap_api_http.clone(),
+    )
+    .await?;
+    Ok((config, connection))
+}
+
 fn body_fetch_email_id(request: &BodyFetchRequest) -> Result<&str> {
     match &request.message_ref {
         crate::mail::compat::BackendMessageRef::Jmap { email_id, .. } => Ok(email_id),
@@ -46,7 +63,7 @@ impl MailBackend for JmapMailBackend {
             account.jmap_url
         );
 
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
+        let (jmap_config, connection) = connect(ctx, account).await?;
 
         jmap_sync::sync_jmap_account(
             ctx.events.clone(),
@@ -55,6 +72,7 @@ impl MailBackend for JmapMailBackend {
             account.id.clone(),
             account.display_name.clone(),
             jmap_config,
+            connection,
             current_folder,
         )
         .await
@@ -66,7 +84,7 @@ impl MailBackend for JmapMailBackend {
         account: &AccountFull,
         folder_path: &str,
     ) -> Result<u32> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
+        let (jmap_config, connection) = connect(ctx, account).await?;
         jmap_sync::sync_jmap_folder_public(
             ctx.events.clone(),
             ctx.db.clone(),
@@ -74,6 +92,7 @@ impl MailBackend for JmapMailBackend {
             account.display_name.clone(),
             folder_path.to_string(),
             jmap_config,
+            connection,
         )
         .await
     }
@@ -86,9 +105,10 @@ impl MailBackend for JmapMailBackend {
     ) -> Result<String> {
         let email_id = body_fetch_email_id(request)?;
 
-        let config = crate::auth::build_jmap_config(account).await?;
+        let (config, connection) = connect(ctx, account).await?;
         jmap_sync::fetch_and_store_jmap_body(
             &config,
+            &connection,
             &ctx.data_dir,
             &account.id,
             &request.folder_path,
@@ -100,11 +120,11 @@ impl MailBackend for JmapMailBackend {
 
     async fn search_messages(
         &self,
+        ctx: &MailSyncCtx,
         account: &AccountFull,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>> {
-        let config = crate::auth::build_jmap_config(account).await?;
-        let connection = crate::mail::jmap::JmapConnection::connect(&config).await?;
+        let (config, connection) = connect(ctx, account).await?;
         connection.search_account(&config, &account.id, query).await
     }
 
@@ -112,9 +132,13 @@ impl MailBackend for JmapMailBackend {
         DraftStorageFormat::RawMime
     }
 
-    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()> {
-        let config = crate::auth::build_jmap_config(account).await?;
-        let connection = crate::mail::jmap::JmapConnection::connect(&config).await?;
+    async fn save_draft(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &DraftSaveRequest,
+    ) -> Result<()> {
+        let (config, connection) = connect(ctx, account).await?;
         connection.save_draft(&config, &request.raw_message).await
     }
 
@@ -154,8 +178,7 @@ impl MailOpExecutor for JmapOpExecutor {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 };
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
                 conn_jmap
                     .copy_emails(&jmap_config, &email_ids, &target_folder)
                     .await?;
@@ -184,8 +207,7 @@ impl MailOpExecutor for JmapOpExecutor {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 };
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
                 for (source_mailbox, email_ids) in by_mailbox {
                     conn_jmap
                         .move_emails(&jmap_config, &email_ids, &source_mailbox, &target_folder)
@@ -213,8 +235,7 @@ impl MailOpExecutor for JmapOpExecutor {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 };
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
                 conn_jmap.delete_emails(&jmap_config, &email_ids).await?;
             }
             MailOp::SetFlags { mutations } => {
@@ -244,8 +265,7 @@ impl MailOpExecutor for JmapOpExecutor {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 };
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
                 for (email_ids, flags, add) in prepared {
                     let flag_strs: Vec<&str> = flags.iter().map(String::as_str).collect();
                     conn_jmap
@@ -258,8 +278,7 @@ impl MailOpExecutor for JmapOpExecutor {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 };
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+                let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
                 conn_jmap.send_email(&jmap_config, &raw_message).await?;
             }
             _ => {}

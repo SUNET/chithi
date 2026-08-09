@@ -320,8 +320,8 @@ fn zoom_api_url(api_root: &str, path: &str) -> String {
     )
 }
 
-/// `MeetProvider` implementor for Zoom. Stateless — each call
-/// reads tokens from the keyring under the account id.
+/// `MeetProvider` implementor for Zoom. Stateless; each call obtains
+/// credentials and transport settings from the injected provider services.
 pub struct ZoomProvider;
 
 #[async_trait::async_trait]
@@ -334,43 +334,92 @@ impl crate::meet::MeetProvider for ZoomProvider {
     }
     async fn create_url(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         name: &str,
         start_time: Option<&str>,
         duration_minutes: Option<u32>,
     ) -> Result<crate::meet::MeetCreateResult> {
-        let access_token = get_access_token(&account.id).await?;
-        create_meeting(&access_token, name, start_time, duration_minutes).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .zoom_access_token(&account.id)
+            .await?;
+        create_meeting_with_client(
+            &access_token,
+            name,
+            start_time,
+            duration_minutes,
+            &ctx.services.transports.zoom_http,
+            &ctx.services.transports.zoom_api_root,
+        )
+        .await
     }
 
     async fn delete_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
     ) -> Result<()> {
-        let access_token = get_access_token(&account.id).await?;
-        api_delete_meeting(&access_token, meeting_id).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .zoom_access_token(&account.id)
+            .await?;
+        api_delete_meeting_with_client(
+            &access_token,
+            meeting_id,
+            &ctx.services.transports.zoom_http,
+            &ctx.services.transports.zoom_api_root,
+        )
+        .await
     }
 
     async fn reschedule_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         start_time: &str,
         duration_minutes: u32,
     ) -> Result<()> {
-        let access_token = get_access_token(&account.id).await?;
-        api_update_meeting_schedule(&access_token, meeting_id, start_time, duration_minutes).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .zoom_access_token(&account.id)
+            .await?;
+        api_update_meeting_schedule_with_client(
+            &access_token,
+            meeting_id,
+            start_time,
+            duration_minutes,
+            &ctx.services.transports.zoom_http,
+            &ctx.services.transports.zoom_api_root,
+        )
+        .await
     }
 
     async fn update_topic(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         topic: &str,
     ) -> Result<()> {
-        let access_token = get_access_token(&account.id).await?;
-        api_update_meeting_topic(&access_token, meeting_id, topic).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .zoom_access_token(&account.id)
+            .await?;
+        api_update_meeting_topic_with_client(
+            &access_token,
+            meeting_id,
+            topic,
+            &ctx.services.transports.zoom_http,
+            &ctx.services.transports.zoom_api_root,
+        )
+        .await
     }
 }
 

@@ -9,6 +9,9 @@ use crate::error::{Error, Result};
 use crate::mail::jmap::JmapConfig;
 use crate::oauth::{OAuthProvider, OAuthTokens};
 
+const PROVIDER_HTTP_TIMEOUT_SECS: u64 = 30;
+const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
+
 /// Microsoft Graph token families have deliberately different consent policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphTokenPurpose {
@@ -178,6 +181,166 @@ pub trait ProviderCredentials: Send + Sync {
 pub struct ProviderCredentialService {
     tokens: Arc<dyn OAuthTokenStore>,
     endpoint: Arc<dyn TokenEndpointClient>,
+}
+
+/// Shared HTTP transports and test-overridable provider API endpoints.
+/// Cloning a `reqwest::Client` retains its connection pool.
+pub struct ProviderTransports {
+    pub graph_http: reqwest::Client,
+    pub graph_endpoints: crate::mail::graph::GraphEndpoints,
+    pub google_http: reqwest::Client,
+    pub google_endpoints: crate::mail::google::GoogleEndpoints,
+    pub jmap_discovery_http: reqwest::Client,
+    pub jmap_api_http: reqwest::Client,
+    pub jmap_sse_http: reqwest::Client,
+    pub dav_http: reqwest::Client,
+    pub zoom_http: reqwest::Client,
+    pub zoom_api_root: String,
+    pub matrix_http: reqwest::Client,
+    pub talk_http: reqwest::Client,
+}
+
+impl ProviderTransports {
+    pub fn production() -> Result<Self> {
+        let jmap_discovery_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let jmap_api_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| Error::Other(error.to_string()))?;
+
+        Ok(Self {
+            graph_http: reqwest::Client::new(),
+            graph_endpoints: crate::mail::graph::GraphEndpoints::default(),
+            google_http: reqwest::Client::new(),
+            google_endpoints: crate::mail::google::GoogleEndpoints::default(),
+            jmap_discovery_http,
+            jmap_api_http,
+            // No overall timeout: EventSource responses are long-lived and
+            // enforce a per-chunk read timeout in the push loop.
+            jmap_sse_http: reqwest::Client::builder()
+                .build()
+                .map_err(|error| Error::Other(error.to_string()))?,
+            dav_http: crate::mail::dav_http::build_dav_client()?,
+            zoom_http: build_meet_http_client("zoom")?,
+            zoom_api_root: "https://api.zoom.us/v2".into(),
+            matrix_http: build_meet_http_client("matrix")?,
+            talk_http: build_meet_http_client("talk")?,
+        })
+    }
+}
+
+fn build_meet_http_client(provider: &str) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(PROVIDER_HTTP_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|error| Error::Other(format!("{} http client: {}", provider, error)))
+}
+
+/// Focused provider dependencies shared by backend and meet contexts.
+pub struct ProviderServices {
+    credentials: Arc<dyn ProviderCredentials>,
+    pub transports: ProviderTransports,
+}
+
+impl ProviderServices {
+    pub fn new(credentials: Arc<dyn ProviderCredentials>, transports: ProviderTransports) -> Self {
+        Self {
+            credentials,
+            transports,
+        }
+    }
+
+    pub fn production() -> Result<Self> {
+        Ok(Self::new(
+            Arc::new(ProviderCredentialService::production()?),
+            ProviderTransports::production()?,
+        ))
+    }
+
+    pub fn credentials(&self) -> &dyn ProviderCredentials {
+        self.credentials.as_ref()
+    }
+
+    pub async fn graph_client(
+        &self,
+        account_id: &str,
+        purpose: GraphTokenPurpose,
+    ) -> Result<crate::mail::graph::GraphClient> {
+        let token = self
+            .credentials
+            .graph_access_token(account_id, purpose)
+            .await?;
+        Ok(crate::mail::graph::GraphClient::with_client(
+            self.transports.graph_http.clone(),
+            &token,
+            self.transports.graph_endpoints.clone(),
+        ))
+    }
+
+    pub async fn google_client(
+        &self,
+        account_id: &str,
+    ) -> Result<crate::mail::google::GoogleClient> {
+        let token = self.credentials.google_access_token(account_id).await?;
+        Ok(crate::mail::google::GoogleClient::with_client(
+            self.transports.google_http.clone(),
+            &token,
+            self.transports.google_endpoints.clone(),
+        ))
+    }
+
+    pub async fn jmap_connection(
+        &self,
+        account: &AccountFull,
+    ) -> Result<crate::mail::jmap::JmapConnection> {
+        Ok(self.jmap_client(account).await?.1)
+    }
+
+    pub async fn jmap_client(
+        &self,
+        account: &AccountFull,
+    ) -> Result<(JmapConfig, crate::mail::jmap::JmapConnection)> {
+        let config = self.credentials.jmap_config(account).await?;
+        let connection = crate::mail::jmap::JmapConnection::connect_with_clients(
+            &config,
+            self.transports.jmap_discovery_http.clone(),
+            self.transports.jmap_api_http.clone(),
+        )
+        .await?;
+        Ok((config, connection))
+    }
+
+    pub async fn caldav_client(
+        &self,
+        config: &crate::mail::caldav::CalDavConfig,
+    ) -> Result<crate::mail::caldav::CalDavClient> {
+        crate::mail::caldav::CalDavClient::connect_with_client(
+            config,
+            self.transports.dav_http.clone(),
+        )
+        .await
+    }
+
+    pub async fn carddav_client(
+        &self,
+        carddav_url: &str,
+        username: &str,
+        password: &str,
+        email: &str,
+    ) -> Result<crate::mail::carddav::CardDavClient> {
+        crate::mail::carddav::CardDavClient::connect_with_client(
+            carddav_url,
+            username,
+            password,
+            email,
+            self.transports.dav_http.clone(),
+        )
+        .await
+    }
 }
 
 impl ProviderCredentialService {

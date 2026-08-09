@@ -5,25 +5,28 @@ use async_trait::async_trait;
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::contacts::Contact;
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::carddav::{contact_to_vcard, parse_vcard, CardDavClient};
+use crate::mail::carddav::{contact_to_vcard, parse_vcard};
 
-use super::{BookRef, ContactBackend, PushedContact};
+use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};
 
 pub struct CardDavContactBackend;
 
 /// Connect with the account's DAV coordinates. Uses `caldav_url` for
 /// CardDAV too (the same server usually hosts both); if empty,
 /// auto-discovery tries `.well-known/carddav`.
-async fn connect(account: &AccountFull) -> Result<CardDavClient> {
-    CardDavClient::connect(
-        &account.caldav_url,
-        &account.username,
-        &account.password,
-        &account.email,
-    )
-    .await
+async fn connect(
+    ctx: &ContactBackendCtx<'_>,
+    account: &AccountFull,
+) -> Result<crate::mail::carddav::CardDavClient> {
+    ctx.providers
+        .carddav_client(
+            &account.caldav_url,
+            &account.username,
+            &account.password,
+            &account.email,
+        )
+        .await
 }
 
 #[async_trait]
@@ -35,12 +38,12 @@ impl ContactBackend for CardDavContactBackend {
     /// CardDAV sync. Failures are swallowed with a warning — DAV
     /// servers without an addressbook collection would otherwise fail
     /// the whole contacts sync for the account.
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &ContactBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let account_id = account.id.as_str();
         let result: Result<()> = async {
             log::info!("sync_contacts_carddav: starting for account {}", account_id);
 
-            let client = connect(account).await?;
+            let client = connect(ctx, account).await?;
 
             let address_books = client.list_addressbooks().await?;
             log::info!(
@@ -51,7 +54,7 @@ impl ContactBackend for CardDavContactBackend {
             for ab in &address_books {
                 // Upsert contact book in DB
                 let book_id = {
-                    let conn = db.writer().await;
+                    let conn = ctx.db.writer().await;
                     let book = db::contacts::ContactBook {
                         id: uuid::Uuid::new_v4().to_string(),
                         account_id: account_id.to_string(),
@@ -92,7 +95,7 @@ impl ContactBackend for CardDavContactBackend {
                     ab.name
                 );
 
-                let conn = db.writer().await;
+                let conn = ctx.db.writer().await;
 
                 // Get existing local contacts for this book
                 let local_contacts = db::contacts::list_contacts(&conn, &book_id)?;
@@ -184,6 +187,7 @@ impl ContactBackend for CardDavContactBackend {
     /// book has no collection href (nothing to push to).
     async fn push_created_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         book: &BookRef<'_>,
         contact: &Contact,
@@ -191,7 +195,7 @@ impl ContactBackend for CardDavContactBackend {
         let Some(href) = book.remote_id else {
             return Ok(None);
         };
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
         let uid = contact.uid.as_deref().unwrap_or(&contact.id);
         let vcard = contact_to_vcard(uid, contact);
         let etag = client.put_contact(href, uid, &vcard).await?;
@@ -205,12 +209,13 @@ impl ContactBackend for CardDavContactBackend {
 
     async fn push_updated_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         book: &BookRef<'_>,
         contact: &Contact,
         _remote_id: &str,
     ) -> Result<Option<PushedContact>> {
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
         let uid = contact.uid.as_deref().unwrap_or(&contact.id);
         let book_href = book.remote_id.unwrap_or_default();
         let vcard = contact_to_vcard(uid, contact);
@@ -222,8 +227,13 @@ impl ContactBackend for CardDavContactBackend {
         }))
     }
 
-    async fn push_deleted_contact(&self, account: &AccountFull, remote_id: &str) -> Result<()> {
-        let client = connect(account).await?;
+    async fn push_deleted_contact(
+        &self,
+        ctx: &ContactBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+    ) -> Result<()> {
+        let client = connect(ctx, account).await?;
         client.delete_contact(remote_id).await
     }
 }

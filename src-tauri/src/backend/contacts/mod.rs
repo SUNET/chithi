@@ -18,11 +18,17 @@ use crate::db::accounts::AccountFull;
 use crate::db::contacts::Contact;
 use crate::db::pool::DbPool;
 use crate::error::Result;
+use crate::provider::ProviderServices;
 
 pub mod carddav;
 pub mod google;
 pub mod graph;
 pub mod jmap;
+
+pub struct ContactBackendCtx<'a> {
+    pub db: &'a DbPool,
+    pub providers: &'a ProviderServices,
+}
 
 /// The book coordinates a push needs: the local book id plus the
 /// book's remote handle (CardDAV collection href / JMAP address-book
@@ -50,7 +56,7 @@ pub trait ContactBackend: Send + Sync {
     /// Full account contact sync: fetch remote books/contacts and
     /// reconcile the local DB (including pushing local unpushed rows
     /// where the provider does that during sync).
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()>;
+    async fn sync(&self, ctx: &ContactBackendCtx<'_>, account: &AccountFull) -> Result<()>;
 
     /// Push a new local contact. `Ok(None)` means the provider defers
     /// the push (JMAP creates go out with the next sync's
@@ -58,6 +64,7 @@ pub trait ContactBackend: Send + Sync {
     /// without a collection href).
     async fn push_created_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         book: &BookRef<'_>,
         contact: &Contact,
@@ -66,6 +73,7 @@ pub trait ContactBackend: Send + Sync {
     /// Push field updates for a contact that already has a remote_id.
     async fn push_updated_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         book: &BookRef<'_>,
         contact: &Contact,
@@ -73,7 +81,12 @@ pub trait ContactBackend: Send + Sync {
     ) -> Result<Option<PushedContact>>;
 
     /// Delete a contact on the server.
-    async fn push_deleted_contact(&self, account: &AccountFull, remote_id: &str) -> Result<()>;
+    async fn push_deleted_contact(
+        &self,
+        ctx: &ContactBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+    ) -> Result<()>;
 }
 
 /// Static set of contact backends compiled into this build.
@@ -146,6 +159,10 @@ mod contract_tests {
     use super::*;
     use crate::backend::testutil::{account, contact, temp_pool};
 
+    fn providers() -> ProviderServices {
+        ProviderServices::production().unwrap()
+    }
+
     /// JMAP contact creation is deferred to the next sync's
     /// unpushed-rows pass — never pushed at create time.
     #[tokio::test]
@@ -154,8 +171,14 @@ mod contract_tests {
             book_id: "b1",
             remote_id: Some("ab1"),
         };
+        let (_dir, db) = temp_pool();
+        let providers = providers();
+        let ctx = ContactBackendCtx {
+            db: &db,
+            providers: &providers,
+        };
         let pushed = jmap::JmapContactBackend
-            .push_created_contact(&account("contacts", "jmap"), &book, &contact())
+            .push_created_contact(&ctx, &account("contacts", "jmap"), &book, &contact())
             .await
             .unwrap();
         assert!(pushed.is_none());
@@ -169,8 +192,14 @@ mod contract_tests {
             book_id: "b1",
             remote_id: None,
         };
+        let (_dir, db) = temp_pool();
+        let providers = providers();
+        let ctx = ContactBackendCtx {
+            db: &db,
+            providers: &providers,
+        };
         let pushed = carddav::CardDavContactBackend
-            .push_created_contact(&account("contacts", "carddav"), &book, &contact())
+            .push_created_contact(&ctx, &account("contacts", "carddav"), &book, &contact())
             .await
             .unwrap();
         assert!(pushed.is_none());
@@ -181,8 +210,13 @@ mod contract_tests {
     #[tokio::test]
     async fn google_and_carddav_sync_swallow_failures() {
         let (_dir, db) = temp_pool();
+        let providers = providers();
+        let ctx = ContactBackendCtx {
+            db: &db,
+            providers: &providers,
+        };
         google::GoogleContactBackend
-            .sync(&db, &account("contacts", "google"))
+            .sync(&ctx, &account("contacts", "google"))
             .await
             .unwrap();
         let mut acc = account("contacts", "carddav");
@@ -190,7 +224,7 @@ mod contract_tests {
         // live `.well-known` auto-discovery.
         acc.caldav_url = "not a url".into();
         carddav::CardDavContactBackend
-            .sync(&db, &acc)
+            .sync(&ctx, &acc)
             .await
             .unwrap();
     }
@@ -199,11 +233,16 @@ mod contract_tests {
     #[tokio::test]
     async fn jmap_and_graph_sync_propagate_failures() {
         let (_dir, db) = temp_pool();
+        let providers = providers();
+        let ctx = ContactBackendCtx {
+            db: &db,
+            providers: &providers,
+        };
         let mut acc = account("contacts", "jmap");
         acc.jmap_url = "not a url".into();
-        assert!(jmap::JmapContactBackend.sync(&db, &acc).await.is_err());
+        assert!(jmap::JmapContactBackend.sync(&ctx, &acc).await.is_err());
         assert!(graph::GraphContactBackend
-            .sync(&db, &account("contacts", "graph"))
+            .sync(&ctx, &account("contacts", "graph"))
             .await
             .is_err());
     }

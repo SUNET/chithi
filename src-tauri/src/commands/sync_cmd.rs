@@ -47,7 +47,6 @@ pub(crate) fn try_acquire_sync_guard(
     Some(SyncGuard(flag))
 }
 
-use crate::auth::build_jmap_config;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::mail::imap::ImapConfig;
@@ -576,6 +575,7 @@ async fn run_mail_sync_once(
         events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        providers: state.providers.clone(),
     };
     // Calendar sync is independent — triggered by its own interval,
     // not chained to mail sync. See CalendarView.vue / calendar.ts.
@@ -728,6 +728,7 @@ pub async fn sync_folder(
         events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        providers: state.providers.clone(),
     };
 
     // Every backend syncs exactly the requested folder synchronously —
@@ -839,6 +840,7 @@ pub async fn prefetch_bodies(
             events: crate::event::tauri::shared_sink(app.clone()),
             db: state.db.clone(),
             data_dir: state.data_dir.clone(),
+            providers: state.providers.clone(),
         };
         let prefetch_result = backend.prefetch_bodies(&ctx, &account).await;
         let resume_result =
@@ -960,7 +962,12 @@ async fn start_imap_idle_inner(
             return Err(error);
         }
     };
-    let (password, use_xoauth2) = match crate::auth::get_imap_credentials(&full_account).await {
+    let credentials = match state
+        .providers
+        .credentials()
+        .mail_credentials(&full_account)
+        .await
+    {
         Ok(credentials) => credentials,
         Err(error) => {
             remove_imap_idle_generation(state, &account.id, generation);
@@ -972,9 +979,9 @@ async fn start_imap_idle_inner(
         host: full_account.imap_host.clone(),
         port: full_account.imap_port,
         username: full_account.username.clone(),
-        password,
+        password: credentials.secret,
         use_tls: full_account.use_tls,
-        use_xoauth2,
+        use_xoauth2: credentials.use_xoauth2,
     };
 
     let mut handles = state.idle_handles.lock().unwrap();
@@ -1108,13 +1115,18 @@ async fn start_jmap_push(
     };
     let full_account = full_account?;
 
-    let jmap_config = build_jmap_config(&full_account).await?;
+    let jmap_config = state
+        .providers
+        .credentials()
+        .jmap_config(&full_account)
+        .await?;
 
     let account_id = account.id.clone();
     let task_cancellation = cancellation.clone();
     let event_cancellation = cancellation.clone();
     let callback_event_gate = event_gate.clone();
     let app_clone = app.clone();
+    let providers = state.providers.clone();
 
     let _lifecycle_guard = state.idle_lifecycle_lock.lock().await;
     if !state.idle_push_enabled.load(Ordering::Acquire) || cancellation.is_cancelled() {
@@ -1133,6 +1145,7 @@ async fn start_jmap_push(
             jmap_config,
             account_id.clone(),
             task_cancellation,
+            providers,
             std::sync::Arc::new(move |event| {
                 if_jmap_push_running(&event_cancellation, &callback_event_gate, || match event {
                     crate::mail::jmap_push::PushEvent::StateChange(aid) => {

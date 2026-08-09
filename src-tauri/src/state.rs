@@ -107,6 +107,7 @@ pub struct JmapPushHandle {
 
 pub struct AppState {
     pub db: Arc<DbPool>,
+    pub providers: Arc<crate::provider::ProviderServices>,
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub idle_generation: AtomicU64,
@@ -222,6 +223,7 @@ impl AppState {
 
         Ok(Self {
             db: Arc::new(pool),
+            providers: Arc::new(crate::provider::ProviderServices::production()?),
             sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
             idle_generation: AtomicU64::new(1),

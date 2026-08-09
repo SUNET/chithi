@@ -2,18 +2,16 @@
 
 use async_trait::async_trait;
 
-use crate::auth::get_google_token;
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::CalendarEvent;
-use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::mail::google::{
-    event_patch_to_google_json, event_to_google_json, send_updates_for, EventsPage, GoogleClient,
+    event_patch_to_google_json, event_to_google_json, send_updates_for, EventsPage,
 };
 
 use super::{
-    BusyPeriod, CalendarBackend, CalendarCapability, ParticipantSchedule,
+    BusyPeriod, CalendarBackend, CalendarBackendCtx, CalendarCapability, ParticipantSchedule,
     ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
     RemoteRsvpRequest,
 };
@@ -49,10 +47,10 @@ fn readable_foreground(bg_hex: &str) -> &'static str {
 
 /// The account-level sync body. Split out so `sync` can wrap it with
 /// the CalDAV fallback without recursing through the trait object.
-async fn sync_google(db: &DbPool, account: &AccountFull) -> Result<()> {
+async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
+    let db = ctx.db;
     let account_id = account.id.as_str();
-    let access_token = get_google_token(account_id).await?;
-    let client = GoogleClient::new(&access_token);
+    let client = ctx.services.google_client(account_id).await?;
 
     // Step 1: List calendars via Google Calendar API
     let data = client.list_calendar_list().await?;
@@ -339,11 +337,11 @@ impl CalendarBackend for GoogleCalendarBackend {
 
     async fn apply_remote_rsvp(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         request: &RemoteRsvpRequest,
     ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.services.google_client(&account.id).await?;
         let mut event_id = client
             .find_event_by_ical_uid("primary", &request.uid)
             .await
@@ -394,11 +392,14 @@ impl CalendarBackend for GoogleCalendarBackend {
 
     async fn get_participant_schedules(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         request: &ParticipantScheduleRequest,
     ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
-        let token = get_google_token(&account.id).await?;
-        let schedules = GoogleClient::new(&token)
+        let schedules = ctx
+            .services
+            .google_client(&account.id)
+            .await?
             .get_schedules(&request.emails, &request.start_time, &request.end_time)
             .await?;
         Ok(CalendarCapability::Supported(
@@ -423,8 +424,8 @@ impl CalendarBackend for GoogleCalendarBackend {
     /// REST sync with a CalDAV fallback: accounts configured before
     /// OAuth (or with a broken token) keep syncing through their
     /// `caldav_url` instead of failing outright.
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
-        match sync_google(db, account).await {
+    async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
+        match sync_google(ctx, account).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 log::warn!(
@@ -432,7 +433,9 @@ impl CalendarBackend for GoogleCalendarBackend {
                     e
                 );
                 if !account.caldav_url.is_empty() {
-                    super::caldav::CalDavCalendarBackend.sync(db, account).await
+                    super::caldav::CalDavCalendarBackend
+                        .sync(ctx, account)
+                        .await
                 } else {
                     Err(e)
                 }
@@ -444,12 +447,12 @@ impl CalendarBackend for GoogleCalendarBackend {
     /// pre-trait behaviour); `remote_calendar_id` is ignored.
     async fn push_created_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
         _remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.services.google_client(&account.id).await?;
         let google_event = event_to_google_json(event);
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         let (remote_id, canonical_uid) = client
@@ -463,12 +466,12 @@ impl CalendarBackend for GoogleCalendarBackend {
 
     async fn push_updated_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<()> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.services.google_client(&account.id).await?;
         let patch = event_patch_to_google_json(event);
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         client
@@ -478,12 +481,12 @@ impl CalendarBackend for GoogleCalendarBackend {
 
     async fn push_deleted_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         remote_calendar_id: &str,
     ) -> Result<()> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.services.google_client(&account.id).await?;
         client
             .delete_event(remote_calendar_id, remote_id, "all")
             .await
@@ -494,12 +497,12 @@ impl CalendarBackend for GoogleCalendarBackend {
     /// actually a CalDAV href).
     async fn push_calendar_rename(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         name: &str,
     ) -> Result<()> {
-        if let Ok(token) = get_google_token(&account.id).await {
-            let client = GoogleClient::new(&token);
+        if let Ok(client) = ctx.services.google_client(&account.id).await {
             match client.rename_calendar(remote_id, name).await {
                 Ok(()) => return Ok(()),
                 Err(e) => log::warn!(
@@ -510,7 +513,7 @@ impl CalendarBackend for GoogleCalendarBackend {
         }
         if !account.caldav_url.is_empty() {
             return super::caldav::CalDavCalendarBackend
-                .push_calendar_rename(account, remote_id, name)
+                .push_calendar_rename(ctx, account, remote_id, name)
                 .await;
         }
         Err(Error::Other(format!(
@@ -525,14 +528,14 @@ impl CalendarBackend for GoogleCalendarBackend {
     /// OAuth token) are swallowed — the local color pick sticks.
     async fn push_calendar_color(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         color: &str,
     ) -> Result<()> {
-        match get_google_token(&account.id).await {
-            Ok(token) => {
+        match ctx.services.google_client(&account.id).await {
+            Ok(client) => {
                 let fg = readable_foreground(color);
-                let client = GoogleClient::new(&token);
                 if let Err(e) = client.set_calendar_color(remote_id, color, fg).await {
                     log::warn!(
                         "update_calendar: Google color push failed (keeping local-only): {}",

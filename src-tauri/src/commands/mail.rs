@@ -132,6 +132,12 @@ pub async fn search_messages_server(
             account_id
         ))
     })?;
+    let ctx = crate::backend::mail::MailSyncCtx {
+        events: crate::event::tauri::shared_sink(app.clone()),
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+        providers: state.providers.clone(),
+    };
 
     let suspended_idle = if backend.suspends_idle_for_ops(&account) {
         Some(suspend_imap_idle_for_operation(&app, &state, &account).await?)
@@ -146,7 +152,7 @@ pub async fn search_messages_server(
         let task = spawn_with_imap_idle_resume(
             account_id.clone(),
             "server search",
-            async move { backend.search_messages(&search_account, &query).await },
+            async move { backend.search_messages(&ctx, &search_account, &query).await },
             async move {
                 let state = resume_app.state::<AppState>();
                 resume_imap_idle_for_account(
@@ -161,7 +167,7 @@ pub async fn search_messages_server(
         task.await
             .map_err(|e| Error::Other(format!("Server search task panicked: {}", e)))??
     } else {
-        backend.search_messages(&account, &query).await?
+        backend.search_messages(&ctx, &account, &query).await?
     };
 
     log::info!("Server search returned {} hits", hits.len());
@@ -299,6 +305,7 @@ async fn ensure_message_body_on_disk(
         events: crate::event::tauri::shared_sink(app.clone()),
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        providers: state.providers.clone(),
     };
 
     let suspended_idle = if backend.suspends_idle_for_ops(&account) {
@@ -691,8 +698,10 @@ pub async fn create_folder(
         // folder_path is "parentFolderId/name" (built by the frontend); the
         // parent component is the parent's Graph folder ID.
         let (parent_id, folder_name) = split_folder_path(&folder_path);
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
+        let client = state
+            .providers
+            .graph_client(&account_id, crate::provider::GraphTokenPurpose::Baseline)
+            .await?;
         client
             .create_mail_folder(folder_name, parent_id)
             .await
@@ -707,8 +716,13 @@ pub async fn create_folder(
             })?;
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set create
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        let jmap_config = state.providers.credentials().jmap_config(&account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect_with_clients(
+            &jmap_config,
+            state.providers.transports.jmap_discovery_http.clone(),
+            state.providers.transports.jmap_api_http.clone(),
+        )
+        .await?;
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
         // Split to get the parent mailbox ID and the new folder name.
         let (parent_id, mailbox_name) = split_folder_path(&folder_path);
@@ -717,30 +731,18 @@ pub async fn create_folder(
             .await?;
     } else {
         // IMAP: CREATE (O365 uses XOAUTH2)
-        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account_id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
+        let credentials = state
+            .providers
+            .credentials()
+            .mail_credentials(&account)
             .await?;
-            crate::oauth::store_tokens(&account_id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password, false)
-        };
         let imap_config = ImapConfig {
             host: account.imap_host,
             port: account.imap_port,
             username: account.username,
-            password: imap_password,
+            password: credentials.secret,
             use_tls: account.use_tls,
-            use_xoauth2: imap_xoauth2,
+            use_xoauth2: credentials.use_xoauth2,
         };
         let folder_for_imap = folder_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -820,8 +822,10 @@ pub async fn delete_folder(
     };
 
     if account.mail_protocol_str() == "graph" {
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
+        let client = state
+            .providers
+            .graph_client(&account_id, crate::provider::GraphTokenPurpose::Baseline)
+            .await?;
         client.delete_mail_folder(&folder_path).await.map_err(|e| {
             log::error!(
                 "Failed to delete Graph folder '{}' for account {}: {}",
@@ -833,8 +837,13 @@ pub async fn delete_folder(
         })?;
     } else if account.mail_protocol_str() == "jmap" {
         // JMAP: Mailbox/set destroy — folder_path is the mailbox ID
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+        let jmap_config = state.providers.credentials().jmap_config(&account).await?;
+        let conn_jmap = crate::mail::jmap::JmapConnection::connect_with_clients(
+            &jmap_config,
+            state.providers.transports.jmap_discovery_http.clone(),
+            state.providers.transports.jmap_api_http.clone(),
+        )
+        .await?;
         conn_jmap
             .destroy_mailbox(&jmap_config, &folder_path, true)
             .await
@@ -849,30 +858,18 @@ pub async fn delete_folder(
             })?;
     } else {
         // IMAP: DELETE
-        let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account_id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
+        let credentials = state
+            .providers
+            .credentials()
+            .mail_credentials(&account)
             .await?;
-            crate::oauth::store_tokens(&account_id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password, false)
-        };
         let imap_config = ImapConfig {
             host: account.imap_host,
             port: account.imap_port,
             username: account.username,
-            password: imap_password,
+            password: credentials.secret,
             use_tls: account.use_tls,
-            use_xoauth2: imap_xoauth2,
+            use_xoauth2: credentials.use_xoauth2,
         };
         let folder_for_imap = folder_path.clone();
         tokio::task::spawn_blocking(move || {
