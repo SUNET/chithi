@@ -363,13 +363,18 @@ impl GraphClient {
         let temp_path =
             dest.with_file_name(format!(".chithi-{}.partial", uuid::Uuid::new_v4().simple()));
         let mut partial = PartialFileGuard::new(temp_path);
-        let mut file = tokio::fs::File::create(partial.path()).await.map_err(|e| {
+        // Create synchronously before the first await. Tokio's async create
+        // runs on its blocking pool, so cancellation while it is pending can
+        // otherwise drop the guard before the background open creates the
+        // file, leaving an unowned partial behind.
+        let standard_file = std::fs::File::create(partial.path()).map_err(|e| {
             Error::Other(format!(
                 "Failed to create temporary file for {}: {}",
                 dest.display(),
                 e
             ))
         })?;
+        let mut file = tokio::fs::File::from_std(standard_file);
         let result: Result<u64> = async {
             let mut stream = resp.bytes_stream();
             let mut total: u64 = 0;
@@ -3457,7 +3462,7 @@ mod partial_file_tests {
     use super::PartialFileGuard;
 
     #[test]
-    fn dropped_guard_removes_partial_download() {
+    fn dropped_guard_removes_precreated_partial_download() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("body.partial");
         std::fs::write(&path, b"incomplete").unwrap();
