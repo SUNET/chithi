@@ -1238,14 +1238,14 @@ END:VCALENDAR\r\n";
             "2026-04-07T18:00:00Z",
             None,
             None,
-            "kushal@civilized.systems",
+            "kushal@example.org",
             None, // No organizer name
             &[],
             None,
             None,
         );
         assert!(
-            ical.contains("ORGANIZER:mailto:kushal@civilized.systems"),
+            ical.contains("ORGANIZER:mailto:kushal@example.org"),
             "Should have ORGANIZER without CN, got: {}",
             ical
         );
@@ -1261,13 +1261,13 @@ END:VCALENDAR\r\n";
             "2026-04-07T18:00:00Z",
             None,
             None,
-            "kushal@civilized.systems",
+            "kushal@example.org",
             Some("Kushal Das"),
             &[],
             None,
             None,
         );
-        assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@civilized.systems"));
+        assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@example.org"));
     }
 
     #[test]
