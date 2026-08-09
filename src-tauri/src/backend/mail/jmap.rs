@@ -11,9 +11,18 @@ use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
-use super::{MailBackend, MailOpExecutor, MailSyncCtx};
+use super::{BodyFetchRequest, MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct JmapMailBackend;
+
+fn body_fetch_email_id(request: &BodyFetchRequest) -> Result<&str> {
+    match &request.message_ref {
+        crate::mail::compat::BackendMessageRef::Jmap { email_id, .. } => Ok(email_id),
+        _ => Err(Error::Other(
+            "JMAP body fetch received a non-JMAP message reference".into(),
+        )),
+    }
+}
 
 #[async_trait]
 impl MailBackend for JmapMailBackend {
@@ -62,6 +71,26 @@ impl MailBackend for JmapMailBackend {
             account.display_name.clone(),
             folder_path.to_string(),
             jmap_config,
+        )
+        .await
+    }
+
+    async fn fetch_body_to_disk(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &BodyFetchRequest,
+    ) -> Result<String> {
+        let email_id = body_fetch_email_id(request)?;
+
+        let config = crate::auth::build_jmap_config(account).await?;
+        jmap_sync::fetch_and_store_jmap_body(
+            &config,
+            &ctx.data_dir,
+            &account.id,
+            &request.folder_path,
+            email_id,
+            &request.flags,
         )
         .await
     }
@@ -223,5 +252,36 @@ impl MailOpExecutor for JmapOpExecutor {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_fetch_email_id;
+    use crate::backend::mail::BodyFetchRequest;
+    use crate::mail::compat::{BackendMessageRef, BodyLocation};
+
+    #[test]
+    fn body_fetch_accepts_opaque_email_id_with_underscores() {
+        let request = BodyFetchRequest {
+            message_id: "db-id".into(),
+            message_ref: BackendMessageRef::jmap("mailbox", "opaque_id_value"),
+            folder_path: "mailbox".into(),
+            flags: Vec::new(),
+            body_location: BodyLocation::NotFetched,
+        };
+        assert_eq!(body_fetch_email_id(&request).unwrap(), "opaque_id_value");
+    }
+
+    #[test]
+    fn body_fetch_rejects_non_jmap_reference() {
+        let request = BodyFetchRequest {
+            message_id: "db-id".into(),
+            message_ref: BackendMessageRef::imap("INBOX", 1),
+            folder_path: "INBOX".into(),
+            flags: Vec::new(),
+            body_location: BodyLocation::NotFetched,
+        };
+        assert!(body_fetch_email_id(&request).is_err());
     }
 }
