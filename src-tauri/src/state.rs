@@ -107,6 +107,7 @@ pub struct JmapPushHandle {
 
 pub struct AppState {
     pub db: Arc<DbPool>,
+    pub providers: Arc<crate::provider::ProviderServices>,
     pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub idle_generation: AtomicU64,
@@ -138,6 +139,9 @@ pub struct AppState {
     /// dialog. The renderer only ever sees the token, so a compromised
     /// renderer cannot ask the backend to read arbitrary files.
     pub attachments: std::sync::Mutex<HashMap<String, PathBuf>>,
+    /// In-flight Nextcloud Talk Login Flow v2 sessions. Poll endpoints and
+    /// tokens remain backend-only; the renderer receives only the map key.
+    pub talk_login_sessions: std::sync::Mutex<HashMap<String, TalkLoginSession>>,
     /// In-flight Matrix SSO sessions, keyed by the local-port the
     /// frontend will pass back to `meet_matrix_login_complete`.
     /// Each entry carries the bound `TcpListener`, a creation
@@ -183,8 +187,14 @@ pub struct PendingSecret {
 /// `_complete` Tauri commands.
 pub struct MatrixSsoSession {
     pub created: std::time::Instant,
+    pub homeserver: String,
     pub listener: std::net::TcpListener,
     pub state: String,
+}
+
+pub struct TalkLoginSession {
+    pub created: std::time::Instant,
+    pub flow: crate::meet::talk::LoginFlowStart,
 }
 
 /// One in-flight Zoom OAuth login. Same shape as the Matrix
@@ -222,6 +232,7 @@ impl AppState {
 
         Ok(Self {
             db: Arc::new(pool),
+            providers: Arc::new(crate::provider::ProviderServices::production()?),
             sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
             idle_generation: AtomicU64::new(1),
@@ -236,6 +247,7 @@ impl AppState {
             op_workers: WorkerRegistry::new(256),
             data_dir,
             attachments: std::sync::Mutex::new(HashMap::new()),
+            talk_login_sessions: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
             zoom_oauth_sessions: std::sync::Mutex::new(HashMap::new()),
             pgp_store: OnceLock::new(),

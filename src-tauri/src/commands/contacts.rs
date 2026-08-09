@@ -6,6 +6,13 @@ use crate::db::contacts::{CollectedContact, Contact, ContactBook};
 use crate::error::Result;
 use crate::state::AppState;
 
+fn backend_ctx(state: &AppState) -> crate::backend::contacts::ContactBackendCtx<'_> {
+    crate::backend::contacts::ContactBackendCtx {
+        db: &state.db,
+        providers: &state.providers,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Contact Books
 // ---------------------------------------------------------------------------
@@ -100,7 +107,10 @@ pub async fn create_contact(
                 book_id: &c.book_id,
                 remote_id: book_remote_id.as_deref(),
             };
-            match backend.push_created_contact(&account, &book_ref, &c).await {
+            match backend
+                .push_created_contact(&backend_ctx(&state), &account, &book_ref, &c)
+                .await
+            {
                 Ok(Some(pushed)) => {
                     let conn = state.db.writer().await;
                     conn.execute(
@@ -162,7 +172,13 @@ pub async fn update_contact(state: State<'_, AppState>, contact: Contact) -> Res
                         remote_id: book_remote_id.as_deref(),
                     };
                     match backend
-                        .push_updated_contact(&account, &book_ref, &contact, remote_id)
+                        .push_updated_contact(
+                            &backend_ctx(&state),
+                            &account,
+                            &book_ref,
+                            &contact,
+                            remote_id,
+                        )
                         .await
                     {
                         Ok(pushed) => {
@@ -223,7 +239,10 @@ pub async fn delete_contact(state: State<'_, AppState>, contact_id: String) -> R
                     let conn = state.db.reader();
                     db::accounts::get_account_full(&conn, &account_id)?
                 };
-                match backend.push_deleted_contact(&account, &remote_id).await {
+                match backend
+                    .push_deleted_contact(&backend_ctx(&state), &account, &remote_id)
+                    .await
+                {
                     Ok(()) => log::info!(
                         "delete_contact: deleted from {}: {}",
                         backend.protocol(),
@@ -262,7 +281,7 @@ pub async fn sync_contacts(
     // Per-provider sync lives in the backend impls; Google and CardDAV
     // swallow their own errors there (see backend/contacts/).
     match crate::backend::contacts::for_account(&account) {
-        Some(backend) => backend.sync(&state.db, &account).await?,
+        Some(backend) => backend.sync(&backend_ctx(&state), &account).await?,
         None => {
             log::debug!(
                 "sync_contacts: skipping account {} (no contacts binding)",

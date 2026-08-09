@@ -5,16 +5,14 @@ use async_trait::async_trait;
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::{CalendarEvent, NewCalendar};
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::graph::{
-    event_patch_to_graph_json, event_to_graph_json, get_graph_token, GraphClient,
-};
+use crate::mail::graph::{event_patch_to_graph_json, event_to_graph_json};
+use crate::provider::GraphTokenPurpose;
 
 use super::{
-    BusyPeriod, CalendarBackend, CalendarCapability, InviteReplyDelivery, ParticipantSchedule,
-    ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
-    RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+    BusyPeriod, CalendarBackend, CalendarBackendCtx, CalendarCapability, InviteReplyDelivery,
+    ParticipantSchedule, ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome,
+    RemoteRsvpPolicy, RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 
 pub struct GraphCalendarBackend;
@@ -35,11 +33,14 @@ impl CalendarBackend for GraphCalendarBackend {
 
     async fn apply_remote_rsvp(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         request: &RemoteRsvpRequest,
     ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         let event_id = client
             .find_event_by_ical_uid(&request.uid)
             .await?
@@ -60,10 +61,24 @@ impl CalendarBackend for GraphCalendarBackend {
 
     async fn list_room_suggestions(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
     ) -> Result<CalendarCapability<Vec<RoomSuggestion>>> {
-        let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-        let rooms = GraphClient::new(&token).list_rooms().await?;
+        let client = match ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Rooms)
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!(
+                    "list_room_suggestions: room credentials unavailable, allowing free text: {}",
+                    error
+                );
+                return Ok(CalendarCapability::Supported(Vec::new()));
+            }
+        };
+        let rooms = client.list_rooms().await?;
         Ok(CalendarCapability::Supported(
             rooms
                 .into_iter()
@@ -77,11 +92,29 @@ impl CalendarBackend for GraphCalendarBackend {
 
     async fn check_room_availability(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         request: &RoomAvailabilityRequest,
     ) -> Result<CalendarCapability<RoomAvailability>> {
-        let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-        let availability = GraphClient::new(&token)
+        let client = match ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Rooms)
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!(
+                    "check_room_availability: room credentials unavailable: {}",
+                    error
+                );
+                return Ok(CalendarCapability::Supported(RoomAvailability {
+                    state: "unknown".into(),
+                    busy_start: None,
+                    busy_end: None,
+                }));
+            }
+        };
+        let availability = client
             .get_room_availability(
                 &request.room_address,
                 &request.start_time,
@@ -97,11 +130,14 @@ impl CalendarBackend for GraphCalendarBackend {
 
     async fn get_participant_schedules(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         request: &ParticipantScheduleRequest,
     ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
-        let token = get_graph_token(&account.id).await?;
-        let schedules = GraphClient::new(&token)
+        let schedules = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
             .get_schedules(&request.emails, &request.start_time, &request.end_time)
             .await?;
         Ok(CalendarCapability::Supported(
@@ -123,19 +159,22 @@ impl CalendarBackend for GraphCalendarBackend {
         ))
     }
 
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
+        let db = ctx.db;
         let account_id = account.id.as_str();
         log::info!("sync_calendars_graph: starting for account {}", account_id);
 
-        let token = match get_graph_token(account_id).await {
-            Ok(t) => t,
+        let client = match ctx
+            .services
+            .graph_client(account_id, GraphTokenPurpose::Baseline)
+            .await
+        {
+            Ok(client) => client,
             Err(e) => {
                 log::error!("sync_calendars_graph: failed to get token: {}", e);
                 return Err(e);
             }
         };
-        let client = GraphClient::new(&token);
-
         // 1. List Graph calendars and upsert each into the local table.
         // Multi-calendar support (#47): we keep a remote_id -> (local_id,
         // is_subscribed) map so the per-calendar event sync below can map
@@ -355,12 +394,15 @@ impl CalendarBackend for GraphCalendarBackend {
     /// automatically when attendees are present.
     async fn push_created_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
         _remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         let graph_event = event_to_graph_json(event);
         if let Some(atts) = graph_event["attendees"].as_array() {
             log::info!("create_event: O365 event with {} attendees", atts.len());
@@ -378,35 +420,44 @@ impl CalendarBackend for GraphCalendarBackend {
 
     async fn push_updated_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<()> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         let patch = event_patch_to_graph_json(event);
         client.update_event(remote_id, &patch).await
     }
 
     async fn push_deleted_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         _remote_calendar_id: &str,
     ) -> Result<()> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         client.delete_event(remote_id).await
     }
 
     async fn push_calendar_rename(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         name: &str,
     ) -> Result<()> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         client.rename_calendar(remote_id, name).await
     }
 
@@ -421,12 +472,15 @@ impl CalendarBackend for GraphCalendarBackend {
     /// so the sidebar shows what they picked.
     async fn push_calendar_color(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         color: &str,
     ) -> Result<()> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         if let Err(e) = client.set_calendar_color(remote_id, color).await {
             log::warn!(
                 "update_calendar: Graph color push failed (calendar may be read-only or shared), keeping local-only: {}",

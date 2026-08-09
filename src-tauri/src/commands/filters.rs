@@ -62,5 +62,11 @@ pub async fn apply_filters_to_folder(
         folder_path
     );
 
-    crate::filters::service::apply_filters_to_folder(&state.db, &account_id, &folder_path).await
+    crate::filters::service::apply_filters_to_folder(
+        &state.db,
+        state.providers.as_ref(),
+        &account_id,
+        &folder_path,
+    )
+    .await
 }

@@ -49,6 +49,92 @@ pub struct JmapConfig {
 #[cfg(test)]
 mod connect_tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    async fn session_server() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let body = serde_json::json!({
+            "apiUrl": "http://127.0.0.1:9/jmap/api",
+            "downloadUrl": "http://127.0.0.1:9/jmap/download/{blobId}",
+            "uploadUrl": "http://127.0.0.1:9/jmap/upload/{accountId}",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "account-1" }
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    async fn connect_to_mock(access_token: Option<&str>) -> (JmapConnection, String) {
+        let (base_url, request_rx) = session_server().await;
+        let config = JmapConfig {
+            jmap_url: format!("{}/.well-known/jmap/", base_url),
+            email: "user@example.com".into(),
+            username: "user".into(),
+            password: "pass".into(),
+            access_token: access_token.map(str::to_string),
+            auth_method: if access_token.is_some() {
+                "bearer".into()
+            } else {
+                "basic".into()
+            },
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let discovery_http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-injected-client", HeaderValue::from_static("jmap-test"));
+        let api_http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+
+        let connection = JmapConnection::connect_with_clients(&config, discovery_http, api_http)
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+        assert_eq!(connection.account_id(), "account-1");
+        assert_eq!(connection.api_url, format!("{}/jmap/api", base_url));
+        assert!(request.starts_with("GET /.well-known/jmap HTTP/1.1\r\n"));
+        assert_eq!(header(&request, "x-injected-client"), Some("jmap-test"));
+        (connection, request)
+    }
 
     fn http_config() -> JmapConfig {
         JmapConfig {
@@ -100,6 +186,37 @@ mod connect_tests {
             "expected bearer/token error, got: {}",
             msg
         );
+    }
+
+    #[tokio::test]
+    async fn configured_url_bypasses_discovery_client() {
+        let mut config = http_config();
+        config.jmap_url = "https://api.example.com/.well-known/jmap/".into();
+        let discovery_http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+
+        let base_url = JmapConnection::resolve_base_url(&config, &discovery_http)
+            .await
+            .unwrap();
+
+        assert_eq!(base_url, "https://api.example.com");
+    }
+
+    #[tokio::test]
+    async fn configured_session_uses_injected_client_and_basic_auth() {
+        let (_, request) = connect_to_mock(None).await;
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Basic dXNlcjpwYXNz")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_session_uses_injected_client_and_bearer_auth() {
+        let (_, request) = connect_to_mock(Some("token-1")).await;
+        assert_eq!(header(&request, "authorization"), Some("Bearer token-1"));
     }
 }
 
@@ -371,6 +488,24 @@ mod session_limit_tests {
 
 impl JmapConnection {
     pub async fn connect(config: &JmapConfig) -> Result<Self> {
+        let discovery_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let api_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        Self::connect_with_clients(config, discovery_http, api_http).await
+    }
+
+    /// Connect using caller-provided clients for discovery and JMAP API traffic.
+    pub async fn connect_with_clients(
+        config: &JmapConfig,
+        discovery_http: reqwest::Client,
+        api_http: reqwest::Client,
+    ) -> Result<Self> {
         // Fail fast if bearer/OIDC was selected but no access token
         // resolved. Without this guard, apply_auth() would silently fall
         // through to HTTP Basic with an empty password, the server would
@@ -397,42 +532,7 @@ impl JmapConnection {
             )));
         }
 
-        let base_url = if !config.jmap_url.is_empty() {
-            let url = config.jmap_url.trim_end_matches('/').to_string();
-            let url = url.trim_end_matches("/.well-known/jmap").to_string();
-            crate::mail::url_validation::require_https(&url)?;
-            url
-        } else {
-            // Auto-discover
-            let domain = config
-                .email
-                .rsplit_once('@')
-                .map(|(_, d)| d)
-                .ok_or_else(|| {
-                    Error::Other(format!("Cannot extract domain from '{}'", config.email))
-                })?;
-            let candidates = [
-                format!("https://{}", domain),
-                format!("https://mail.{}", domain),
-                format!("https://jmap.{}", domain),
-            ];
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| Error::Other(e.to_string()))?;
-            let mut found = None;
-            for c in &candidates {
-                let url = format!("{}/.well-known/jmap", c);
-                if let Ok(resp) = http.get(&url).send().await {
-                    if resp.status().is_success() || resp.status().as_u16() == 401 {
-                        found = Some(c.clone());
-                        break;
-                    }
-                }
-            }
-            found
-                .ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))?
-        };
+        let base_url = Self::resolve_base_url(config, &discovery_http).await?;
 
         // Diagnostic: enough to tell which auth mode is in play and to
         // spot truncated/empty credentials without leaking any part of
@@ -454,15 +554,10 @@ impl JmapConnection {
             credential_len,
         );
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(e.to_string()))?;
-
         // Fetch session with authentication
         let well_known = format!("{}/.well-known/jmap", base_url);
         let resp = config
-            .apply_auth(http.get(&well_known))
+            .apply_auth(api_http.get(&well_known))
             .send()
             .await
             .map_err(|e| Error::Other(format!("JMAP session fetch failed: {}", e)))?;
@@ -506,7 +601,7 @@ impl JmapConnection {
         );
 
         Ok(Self {
-            http,
+            http: api_http,
             api_url,
             download_url_template: download_url,
             upload_url_template: upload_url,
@@ -514,6 +609,43 @@ impl JmapConnection {
             account_id,
             max_objects_in_set,
         })
+    }
+
+    async fn resolve_base_url(
+        config: &JmapConfig,
+        discovery_http: &reqwest::Client,
+    ) -> Result<String> {
+        if !config.jmap_url.is_empty() {
+            let url = config.jmap_url.trim_end_matches('/').to_string();
+            let url = url.trim_end_matches("/.well-known/jmap").to_string();
+            crate::mail::url_validation::require_https(&url)?;
+            Ok(url)
+        } else {
+            // Auto-discover
+            let domain = config
+                .email
+                .rsplit_once('@')
+                .map(|(_, d)| d)
+                .ok_or_else(|| {
+                    Error::Other(format!("Cannot extract domain from '{}'", config.email))
+                })?;
+            let candidates = [
+                format!("https://{}", domain),
+                format!("https://mail.{}", domain),
+                format!("https://jmap.{}", domain),
+            ];
+            let mut found = None;
+            for c in &candidates {
+                let url = format!("{}/.well-known/jmap", c);
+                if let Ok(resp) = discovery_http.get(&url).send().await {
+                    if resp.status().is_success() || resp.status().as_u16() == 401 {
+                        found = Some(c.clone());
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))
+        }
     }
 
     pub fn account_id(&self) -> &str {

@@ -2,8 +2,8 @@
 //!
 //! Owns the wire payloads for the Google side of calendar/contact sync
 //! and push (ADR 0016, ADR 0050). Token acquisition lives in
-//! `crate::auth::get_google_token`; this client just sends requests
-//! with a ready token, mirroring `GraphClient`.
+//! `ProviderCredentials`; this client just sends requests with a ready token,
+//! mirroring `GraphClient`.
 
 use crate::db::calendar::CalendarEvent;
 use crate::error::{Error, Result};
@@ -21,9 +21,25 @@ pub struct GoogleBusyPeriod {
     pub end: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleEndpoints {
+    pub calendar_api_root: String,
+    pub people_api_root: String,
+}
+
+impl Default for GoogleEndpoints {
+    fn default() -> Self {
+        Self {
+            calendar_api_root: "https://www.googleapis.com/calendar/v3".into(),
+            people_api_root: "https://people.googleapis.com/v1".into(),
+        }
+    }
+}
+
 pub struct GoogleClient {
     http: reqwest::Client,
     token: String,
+    endpoints: GoogleEndpoints,
 }
 
 /// One page of a Calendar events listing.
@@ -37,10 +53,31 @@ pub enum EventsPage {
 
 impl GoogleClient {
     pub fn new(access_token: &str) -> Self {
+        Self::with_client(
+            reqwest::Client::new(),
+            access_token,
+            GoogleEndpoints::default(),
+        )
+    }
+
+    pub fn with_client(
+        http: reqwest::Client,
+        access_token: &str,
+        endpoints: GoogleEndpoints,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http,
             token: access_token.to_string(),
+            endpoints,
         }
+    }
+
+    fn calendar_url(&self, path: &str) -> String {
+        endpoint_url(&self.endpoints.calendar_api_root, path)
+    }
+
+    fn people_url(&self, path: &str) -> String {
+        endpoint_url(&self.endpoints.people_api_root, path)
     }
 
     // -----------------------------------------------------------------------
@@ -52,7 +89,7 @@ impl GoogleClient {
     pub async fn list_calendar_list(&self) -> Result<serde_json::Value> {
         let resp = self
             .http
-            .get("https://www.googleapis.com/calendar/v3/users/me/calendarList")
+            .get(self.calendar_url("users/me/calendarList"))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -82,7 +119,7 @@ impl GoogleClient {
         });
         let resp = self
             .http
-            .post("https://www.googleapis.com/calendar/v3/freeBusy")
+            .post(self.calendar_url("freeBusy"))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -110,10 +147,10 @@ impl GoogleClient {
     ) -> Result<EventsPage> {
         let resp = self
             .http
-            .get(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            .get(self.calendar_url(&format!(
+                "calendars/{}/events",
                 urlencoding::encode(calendar_id)
-            ))
+            )))
             .bearer_auth(&self.token)
             .query(&[("syncToken", sync_token)])
             .send()
@@ -132,10 +169,10 @@ impl GoogleClient {
     ) -> Result<EventsPage> {
         let resp = self
             .http
-            .get(format!(
-                "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            .get(self.calendar_url(&format!(
+                "calendars/{}/events",
                 urlencoding::encode(calendar_id)
-            ))
+            )))
             .bearer_auth(&self.token)
             .query(&[
                 ("timeMin", time_min),
@@ -176,11 +213,11 @@ impl GoogleClient {
         event: &serde_json::Value,
         send_updates: &str,
     ) -> Result<(String, Option<String>)> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events?sendUpdates={}",
             urlencoding::encode(calendar_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .post(&url)
@@ -213,12 +250,12 @@ impl GoogleClient {
         patch: &serde_json::Value,
         send_updates: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/{}?sendUpdates={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(event_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -245,12 +282,12 @@ impl GoogleClient {
         event_id: &str,
         send_updates: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/{}?sendUpdates={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/{}?sendUpdates={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(event_id),
             send_updates
-        );
+        ));
         let resp = self
             .http
             .delete(&url)
@@ -276,11 +313,11 @@ impl GoogleClient {
         calendar_id: &str,
         ical_uid: &str,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events?iCalUID={}",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events?iCalUID={}",
             urlencoding::encode(calendar_id),
             urlencoding::encode(ical_uid)
-        );
+        ));
         let resp = self
             .http
             .get(&url)
@@ -306,10 +343,10 @@ impl GoogleClient {
         calendar_id: &str,
         event: &serde_json::Value,
     ) -> Result<Option<String>> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events/import",
+        let url = self.calendar_url(&format!(
+            "calendars/{}/events/import",
             urlencoding::encode(calendar_id)
-        );
+        ));
         let resp = self
             .http
             .post(&url)
@@ -342,10 +379,10 @@ impl GoogleClient {
         background: &str,
         foreground: &str,
     ) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/users/me/calendarList/{}?colorRgbFormat=true",
+        let url = self.calendar_url(&format!(
+            "users/me/calendarList/{}?colorRgbFormat=true",
             urlencoding::encode(calendar_id)
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -371,10 +408,7 @@ impl GoogleClient {
 
     /// Rename a calendar (the underlying calendar resource's summary).
     pub async fn rename_calendar(&self, calendar_id: &str, name: &str) -> Result<()> {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}",
-            urlencoding::encode(calendar_id)
-        );
+        let url = self.calendar_url(&format!("calendars/{}", urlencoding::encode(calendar_id)));
         let resp = self
             .http
             .patch(&url)
@@ -402,7 +436,7 @@ impl GoogleClient {
     pub async fn create_contact(&self, person: &serde_json::Value) -> Result<String> {
         let resp = self
             .http
-            .post("https://people.googleapis.com/v1/people:createContact")
+            .post(self.people_url("people:createContact"))
             .bearer_auth(&self.token)
             .json(person)
             .send()
@@ -431,10 +465,10 @@ impl GoogleClient {
         resource_name: &str,
         person: &serde_json::Value,
     ) -> Result<()> {
-        let url = format!(
-            "https://people.googleapis.com/v1/{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
+        let url = self.people_url(&format!(
+            "{}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers",
             resource_name
-        );
+        ));
         let resp = self
             .http
             .patch(&url)
@@ -455,10 +489,7 @@ impl GoogleClient {
 
     /// Delete a contact by resourceName.
     pub async fn delete_contact(&self, resource_name: &str) -> Result<()> {
-        let url = format!(
-            "https://people.googleapis.com/v1/{}:deleteContact",
-            resource_name
-        );
+        let url = self.people_url(&format!("{}:deleteContact", resource_name));
         let resp = self
             .http
             .delete(&url)
@@ -481,7 +512,7 @@ impl GoogleClient {
     pub async fn list_connections(&self) -> Result<serde_json::Value> {
         let resp = self
             .http
-            .get("https://people.googleapis.com/v1/people/me/connections")
+            .get(self.people_url("people/me/connections"))
             .bearer_auth(&self.token)
             .query(&[
                 (
@@ -507,6 +538,10 @@ impl GoogleClient {
             .await
             .map_err(|e| Error::Other(format!("Google People API parse error: {}", e)))
     }
+}
+
+fn endpoint_url(root: &str, path: &str) -> String {
+    format!("{}/{}", root.trim_end_matches('/'), path)
 }
 
 fn parse_google_schedules(value: &serde_json::Value, requested: &[String]) -> Vec<GoogleSchedule> {
@@ -536,6 +571,109 @@ fn parse_google_schedules(value: &serde_json::Value, requested: &[String]) -> Ve
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(response_body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!(
+            "http://{}/injected-calendar",
+            listener.local_addr().unwrap()
+        );
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut expected_length = None;
+            loop {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let body_start = header_end + 4;
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = expected_length.get_or_insert_with(|| {
+                        headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0)
+                    });
+                    if bytes.len() >= body_start + *content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        (root, request)
+    }
+
+    #[tokio::test]
+    async fn create_event_uses_injected_root_client_and_google_wire_format() {
+        let (calendar_root, captured) =
+            serve_once(r#"{"id":"remote-event","iCalUID":"uid@example.org"}"#).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-injected-client", HeaderValue::from_static("google-test"));
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let client = GoogleClient::with_client(
+            http,
+            "test-access-token",
+            GoogleEndpoints {
+                calendar_api_root: calendar_root,
+                people_api_root: "http://127.0.0.1:1/unused-people".into(),
+            },
+        );
+        let event = serde_json::json!({
+            "summary": "Wire test",
+            "start": { "dateTime": "2026-08-09T09:00:00Z" },
+            "end": { "dateTime": "2026-08-09T10:00:00Z" },
+        });
+
+        let result = client
+            .create_event("team@example.org", &event, "all")
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ("remote-event".into(), Some("uid@example.org".into()))
+        );
+
+        let request = captured.await.unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line,
+            "POST /injected-calendar/calendars/team%40example.org/events?sendUpdates=all HTTP/1.1"
+        );
+        let headers = format!("{head}\r\n").to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-access-token\r\n"));
+        assert!(headers.contains("x-injected-client: google-test\r\n"));
+        assert!(headers.contains("content-type: application/json\r\n"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            event
+        );
+    }
 }
 
 #[cfg(test)]

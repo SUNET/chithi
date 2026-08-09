@@ -40,10 +40,15 @@ use serde::Serialize;
 
 use crate::db::accounts::AccountFull;
 use crate::error::Result;
+use crate::provider::ProviderServices;
 
 pub mod matrix;
 pub mod talk;
 pub mod zoom;
+
+pub struct MeetProviderCtx<'a> {
+    pub services: &'a ProviderServices,
+}
 
 /// What `create_url` hands back. The join URL is what goes on the
 /// calendar event; `meeting_id` is the provider-specific handle the
@@ -80,6 +85,7 @@ pub trait MeetProvider: Send + Sync {
     /// the meeting lands on the correct slot in the host's schedule.
     async fn create_url(
         &self,
+        ctx: &MeetProviderCtx<'_>,
         account: &AccountFull,
         name: &str,
         start_time: Option<&str>,
@@ -91,7 +97,12 @@ pub trait MeetProvider: Send + Sync {
     /// surface to the caller; the caller logs and proceeds with the
     /// local cleanup either way so a transient provider failure
     /// doesn't strand the event in an undeletable state.
-    async fn delete_meeting(&self, account: &AccountFull, meeting_id: &str) -> Result<()>;
+    async fn delete_meeting(
+        &self,
+        ctx: &MeetProviderCtx<'_>,
+        account: &AccountFull,
+        meeting_id: &str,
+    ) -> Result<()>;
 
     /// Rename the remote meeting's title / topic. Called after
     /// create_event / update_event because the user typically
@@ -101,6 +112,7 @@ pub trait MeetProvider: Send + Sync {
     /// remote room's name in sync with the calendar event.
     async fn update_topic(
         &self,
+        ctx: &MeetProviderCtx<'_>,
         account: &AccountFull,
         meeting_id: &str,
         topic: &str,
@@ -113,6 +125,7 @@ pub trait MeetProvider: Send + Sync {
     /// doesn't require touching the provider.
     async fn reschedule_meeting(
         &self,
+        _ctx: &MeetProviderCtx<'_>,
         _account: &AccountFull,
         _meeting_id: &str,
         _start_time: &str,

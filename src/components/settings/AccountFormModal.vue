@@ -695,8 +695,7 @@ async function signInWithTalk() {
     const start = await api.meetTalkLoginStart(form.value.meet_url.trim());
     await openUrl(start.login_url);
     const accountId = await api.meetTalkLoginComplete(
-      start.poll_endpoint,
-      start.poll_token,
+      start.session_id,
       form.value.display_name || undefined,
     );
     await accountsStore.fetchAccounts();
@@ -729,7 +728,6 @@ async function signInWithMatrix() {
     const start = await api.meetMatrixLoginStart(homeserver);
     await openUrl(start.login_url);
     const accountId = await api.meetMatrixLoginComplete(
-      homeserver,
       start.port,
       form.value.display_name || undefined,
     );

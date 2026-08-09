@@ -2,9 +2,9 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::backend::calendar::{
-    AttendeeResponseUpdate, CalendarCapability, InviteReplyDelivery, InviteResponse,
-    ParticipantSchedule, ParticipantScheduleRequest, RemoteRsvpPolicy, RemoteRsvpRequest,
-    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+    AttendeeResponseUpdate, CalendarBackendCtx, CalendarCapability, InviteReplyDelivery,
+    InviteResponse, ParticipantSchedule, ParticipantScheduleRequest, RemoteRsvpPolicy,
+    RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
@@ -14,6 +14,19 @@ use crate::error::Result;
 use crate::mail::compat::BodyLocation;
 use crate::meet;
 use crate::state::AppState;
+
+fn calendar_backend_ctx(state: &AppState) -> CalendarBackendCtx<'_> {
+    CalendarBackendCtx {
+        db: &state.db,
+        services: &state.providers,
+    }
+}
+
+fn meet_provider_ctx(state: &AppState) -> meet::MeetProviderCtx<'_> {
+    meet::MeetProviderCtx {
+        services: &state.providers,
+    }
+}
 
 /// Compute the duration in whole minutes between two ISO-8601
 /// timestamps. Returns 60 (Zoom's API default) when either input
@@ -184,7 +197,7 @@ pub async fn update_calendar(
     let remote_id = existing.remote_id.clone().filter(|r| !r.is_empty());
     if name_changed {
         if let Some(ref rid) = remote_id {
-            push_calendar_rename(&account, rid, &name).await?;
+            push_calendar_rename(&state, &account, rid, &name).await?;
         } else {
             log::info!(
                 "update_calendar: skipping remote rename (no remote_id, local-only calendar)"
@@ -201,7 +214,7 @@ pub async fn update_calendar(
             // refusing to apply *any* local color change for those
             // accounts would be worse than letting the local pick
             // stick.
-            push_calendar_color(&account, rid, &color).await?;
+            push_calendar_color(&state, &account, rid, &color).await?;
         } else {
             log::info!(
                 "update_calendar: skipping remote color push (no remote_id, local-only calendar)"
@@ -220,14 +233,16 @@ pub async fn update_calendar(
 /// calendars (no `remote_id`) never reach this function — caller
 /// short-circuits.
 async fn push_calendar_color(
+    state: &AppState,
     account: &db::accounts::AccountFull,
     remote_id: &str,
     new_color: &str,
 ) -> Result<()> {
     match crate::backend::calendar::for_account(account) {
         Some(backend) => {
+            let ctx = calendar_backend_ctx(state);
             backend
-                .push_calendar_color(account, remote_id, new_color)
+                .push_calendar_color(&ctx, account, remote_id, new_color)
                 .await
         }
         None => {
@@ -245,14 +260,16 @@ async fn push_calendar_color(
 /// must propagate so the command leaves the local DB unchanged on
 /// remote failure.
 async fn push_calendar_rename(
+    state: &AppState,
     account: &db::accounts::AccountFull,
     remote_id: &str,
     new_name: &str,
 ) -> Result<()> {
     match crate::backend::calendar::for_account(account) {
         Some(backend) => {
+            let ctx = calendar_backend_ctx(state);
             backend
-                .push_calendar_rename(account, remote_id, new_name)
+                .push_calendar_rename(&ctx, account, remote_id, new_name)
                 .await
         }
         None => Err(crate::error::Error::Other(format!(
@@ -419,8 +436,9 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
             }
             // Best-effort: the local insert above always stands; a failed
             // push is logged and the event goes out with a later sync.
+            let ctx = calendar_backend_ctx(&state);
             match backend
-                .push_created_event(&account, &cal_event, &remote_cal_id)
+                .push_created_event(&ctx, &account, &cal_event, &remote_cal_id)
                 .await
             {
                 Ok(Some(pushed)) => {
@@ -481,7 +499,8 @@ pub async fn list_room_suggestions(
     let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(Vec::new());
     };
-    match backend.list_room_suggestions(&account).await? {
+    let ctx = calendar_backend_ctx(&state);
+    match backend.list_room_suggestions(&ctx, &account).await? {
         CalendarCapability::Supported(rooms) => Ok(rooms),
         CalendarCapability::Unsupported => {
             log::debug!(
@@ -518,7 +537,11 @@ pub async fn check_room_availability(
         start_time,
         end_time,
     };
-    match backend.check_room_availability(&account, &request).await? {
+    let ctx = calendar_backend_ctx(&state);
+    match backend
+        .check_room_availability(&ctx, &account, &request)
+        .await?
+    {
         CalendarCapability::Supported(availability) => Ok(availability),
         CalendarCapability::Unsupported => Ok(RoomAvailability {
             state: "unknown".into(),
@@ -545,8 +568,9 @@ pub async fn get_participant_schedules(
     let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(Vec::new());
     };
+    let ctx = calendar_backend_ctx(&state);
     match backend
-        .get_participant_schedules(&account, &request)
+        .get_participant_schedules(&ctx, &account, &request)
         .await?
     {
         CalendarCapability::Supported(schedules) => Ok(schedules),
@@ -611,7 +635,7 @@ async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &s
         title,
     );
     if let Err(e) = provider
-        .update_topic(&acc, &binding.meeting_id, title)
+        .update_topic(&meet_provider_ctx(state), &acc, &binding.meeting_id, title)
         .await
     {
         log::warn!("sync_meet_topic: provider update_topic failed: {}", e);
@@ -719,6 +743,7 @@ pub async fn update_event(
             );
             if let Err(e) = provider
                 .reschedule_meeting(
+                    &meet_provider_ctx(&state),
                     &meet_account,
                     &binding.meeting_id,
                     &existing.start_time,
@@ -737,7 +762,12 @@ pub async fn update_event(
     if let Some(remote_id) = existing.remote_id.as_ref().filter(|r| !r.is_empty()) {
         if let Some(backend) = crate::backend::calendar::for_account(&account) {
             match backend
-                .push_updated_event(&account, remote_id, &existing)
+                .push_updated_event(
+                    &calendar_backend_ctx(&state),
+                    &account,
+                    remote_id,
+                    &existing,
+                )
                 .await
             {
                 Ok(()) => log::info!("update_event: pushed via {}", backend.protocol()),
@@ -807,7 +837,11 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
                 binding.meeting_id,
             );
             if let Err(e) = provider
-                .delete_meeting(&meet_account, &binding.meeting_id)
+                .delete_meeting(
+                    &meet_provider_ctx(&state),
+                    &meet_account,
+                    &binding.meeting_id,
+                )
                 .await
             {
                 log::warn!("delete_event: meet provider delete failed: {}", e);
@@ -822,7 +856,12 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
         if !remote_id.is_empty() {
             if let Some(backend) = crate::backend::calendar::for_account(&account) {
                 match backend
-                    .push_deleted_event(&account, remote_id, &cal_remote_id)
+                    .push_deleted_event(
+                        &calendar_backend_ctx(&state),
+                        &account,
+                        remote_id,
+                        &cal_remote_id,
+                    )
                     .await
                 {
                     Ok(()) => log::info!(
@@ -918,7 +957,7 @@ pub async fn sync_calendars(
     // Per-provider sync (incl. Google's internal CalDAV fallback) lives
     // in the backend impls; see backend/calendar/.
     let sync_result: Result<()> = match crate::backend::calendar::for_account(&account) {
-        Some(backend) => backend.sync(&state.db, &account).await,
+        Some(backend) => backend.sync(&calendar_backend_ctx(&state), &account).await,
         None => {
             log::debug!(
                 "sync_calendars: skipping account {} (no calendar backend configured)",
@@ -1139,7 +1178,7 @@ async fn apply_invite_response(
         {
             InviteReplyDelivery::JmapSubmission => {
                 log::info!("apply_invite_response: sending reply via JMAP");
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
+                let (jmap_config, jmap_conn) = state.providers.jmap_client(&account).await?;
 
                 let raw_message = build_calendar_reply_message(
                     &account.email,
@@ -1149,7 +1188,6 @@ async fn apply_invite_response(
                     &reply_ical,
                 )?;
 
-                let jmap_conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
                 jmap_conn.send_email(&jmap_config, &raw_message).await?;
             }
             InviteReplyDelivery::Provider => {
@@ -1171,16 +1209,19 @@ async fn apply_invite_response(
                 )?;
 
                 // For O365: refresh SMTP-scoped OAuth token
-                let (smtp_password, use_xoauth2) =
-                    crate::auth::get_imap_credentials(&account).await?;
+                let credentials = state
+                    .providers
+                    .credentials()
+                    .mail_credentials(&account)
+                    .await?;
 
                 send_raw_smtp(
                     &account.smtp_host,
                     account.smtp_port,
                     &account.username,
-                    &smtp_password,
+                    &credentials.secret,
                     account.use_tls,
-                    use_xoauth2,
+                    credentials.use_xoauth2,
                     &account.email,
                     organizer_email,
                     &raw_message,
@@ -1203,7 +1244,7 @@ async fn apply_invite_response(
         .filter(|provider| provider.remote_rsvp_policy() == RemoteRsvpPolicy::RequiredBeforeLocal)
     {
         match provider
-            .apply_remote_rsvp(&account, &remote_request)
+            .apply_remote_rsvp(&calendar_backend_ctx(state), &account, &remote_request)
             .await?
         {
             CalendarCapability::Supported(outcome) => outcome.remote_id,
@@ -1323,7 +1364,10 @@ async fn apply_invite_response(
     let best_effort_remote_id = if let Some(provider) = backend
         .filter(|provider| provider.remote_rsvp_policy() == RemoteRsvpPolicy::BestEffortAfterLocal)
     {
-        match provider.apply_remote_rsvp(&account, &remote_request).await {
+        match provider
+            .apply_remote_rsvp(&calendar_backend_ctx(state), &account, &remote_request)
+            .await
+        {
             Ok(CalendarCapability::Supported(outcome)) => outcome.remote_id,
             Ok(CalendarCapability::Unsupported) => {
                 log::warn!(
@@ -1722,18 +1766,21 @@ pub async fn send_invites(
         }
 
         if account.calendar_protocol_str() == "jmap" {
-            let jmap_config = crate::auth::build_jmap_config(&account).await?;
-            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            let (jmap_config, conn_jmap) = state.providers.jmap_client(&account).await?;
             conn_jmap.send_email(&jmap_config, &raw).await?;
         } else {
-            let (smtp_password, use_xoauth2) = crate::auth::get_imap_credentials(&account).await?;
+            let credentials = state
+                .providers
+                .credentials()
+                .mail_credentials(&account)
+                .await?;
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
                 &account.username,
-                &smtp_password,
+                &credentials.secret,
                 account.use_tls,
-                use_xoauth2,
+                credentials.use_xoauth2,
                 &account.email,
                 attendee_email,
                 &raw,
@@ -1857,7 +1904,7 @@ pub async fn process_invite_reply(
     if !attendee_updates.is_empty() {
         if let Some(backend) = crate::backend::calendar::for_account(&account) {
             if let CalendarCapability::Unsupported = backend
-                .push_attendee_responses(&account, &attendee_updates)
+                .push_attendee_responses(&calendar_backend_ctx(&state), &account, &attendee_updates)
                 .await?
             {
                 log::debug!(

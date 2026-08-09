@@ -59,15 +59,19 @@ fn prefetch_connection_limit(auth_method: &str, folder_count: usize) -> usize {
 
 /// Build the connection config, refreshing the O365 IMAP-scoped token
 /// when needed.
-async fn build_imap_config(account: &AccountFull) -> Result<ImapConfig> {
-    let (password, use_xoauth2) = crate::auth::get_imap_credentials(account).await?;
+async fn build_imap_config(ctx: &MailSyncCtx, account: &AccountFull) -> Result<ImapConfig> {
+    let credentials = ctx
+        .providers
+        .credentials()
+        .mail_credentials(account)
+        .await?;
     Ok(ImapConfig {
         host: account.imap_host.clone(),
         port: account.imap_port,
         username: account.username.clone(),
-        password,
+        password: credentials.secret,
         use_tls: account.use_tls,
-        use_xoauth2,
+        use_xoauth2: credentials.use_xoauth2,
     })
 }
 
@@ -89,7 +93,7 @@ pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) 
     }
 
     let account_id = account.id.clone();
-    let imap_config = build_imap_config(account).await?;
+    let imap_config = build_imap_config(ctx, account).await?;
     let data_dir = ctx.data_dir.clone();
 
     // Fetch the list of unfetched messages (up to 1000 per cycle)
@@ -319,7 +323,7 @@ impl MailBackend for ImapMailBackend {
             account.imap_port
         );
 
-        let imap_config = build_imap_config(account).await?;
+        let imap_config = build_imap_config(ctx, account).await?;
 
         mail_sync::sync_account(
             ctx.events.clone(),
@@ -347,7 +351,7 @@ impl MailBackend for ImapMailBackend {
                 account_name: account.display_name.clone(),
             }));
 
-        let imap_config = build_imap_config(account).await?;
+        let imap_config = build_imap_config(ctx, account).await?;
 
         let db = ctx.db.clone();
         let account_id = account.id.clone();
@@ -381,7 +385,7 @@ impl MailBackend for ImapMailBackend {
     ) -> Result<String> {
         let (folder_path, uid) = body_fetch_target(request)?;
 
-        let imap_config = build_imap_config(account).await?;
+        let imap_config = build_imap_config(ctx, account).await?;
         let data_dir = ctx.data_dir.clone();
         let account_id = account.id.clone();
         let folder_path = folder_path.to_string();
@@ -402,12 +406,13 @@ impl MailBackend for ImapMailBackend {
 
     async fn search_messages(
         &self,
+        ctx: &MailSyncCtx,
         account: &AccountFull,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>> {
         validate_search_query(query)?;
 
-        let imap_config = build_imap_config(account).await?;
+        let imap_config = build_imap_config(ctx, account).await?;
         let account_id = account.id.clone();
         let query = query.clone();
         tokio::task::spawn_blocking(move || {
@@ -421,8 +426,13 @@ impl MailBackend for ImapMailBackend {
         DraftStorageFormat::RawMime
     }
 
-    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()> {
-        let imap_config = build_imap_config(account).await?;
+    async fn save_draft(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &DraftSaveRequest,
+    ) -> Result<()> {
+        let imap_config = build_imap_config(ctx, account).await?;
         let raw_message = request.raw_message.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = ImapConnection::connect(&imap_config)?;
@@ -467,7 +477,7 @@ pub(crate) async fn sync_folder_quiet(
     account: &AccountFull,
     folder_path: &str,
 ) -> Result<()> {
-    let imap_config = build_imap_config(account).await?;
+    let imap_config = build_imap_config(ctx, account).await?;
     let db = ctx.db.clone();
     let account_id = account.id.clone();
     let events = ctx.events.clone();
@@ -556,7 +566,7 @@ impl ImapOpExecutor {
                 let conn = ctx.db.reader();
                 crate::db::accounts::get_account_full(&conn, account_id)?
             };
-            let config = build_imap_config(&account).await?;
+            let config = build_imap_config(ctx, &account).await?;
 
             let conn = tokio::task::spawn_blocking(move || ImapConnection::connect(&config))
                 .await
@@ -609,7 +619,13 @@ impl ImapOpExecutor {
         // the IMAP scope set). For password accounts, just use the
         // stored password.
         let smtp_username = account.username.clone();
-        let (smtp_password, use_xoauth2) = crate::auth::get_imap_credentials(&account).await?;
+        let credentials = ctx
+            .providers
+            .credentials()
+            .mail_credentials(&account)
+            .await?;
+        let smtp_password = credentials.secret;
+        let use_xoauth2 = credentials.use_xoauth2;
 
         crate::mail::smtp::send_raw(
             &account.smtp_host,

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
-mod auth;
 mod backend;
 mod calendar;
 mod commands;
@@ -16,6 +15,7 @@ mod meet;
 mod oauth;
 mod ops;
 mod path_validation;
+mod provider;
 mod state;
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -107,7 +107,6 @@ pub fn run() {
             commands::sync_cmd::stop_idle,
             commands::oauth::oauth_start,
             commands::oauth::oauth_complete,
-            commands::oauth::oauth_get_token,
             commands::oauth::oauth_has_tokens,
             commands::oauth::oauth_get_ms_profile,
             commands::oauth::jmap_oidc_start,

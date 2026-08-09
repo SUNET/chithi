@@ -7,11 +7,11 @@ use async_trait::async_trait;
 
 use crate::db::accounts::AccountFull;
 use crate::db::contacts::Contact;
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::graph::{contact_to_graph_json, get_graph_token, GraphClient};
+use crate::mail::graph::contact_to_graph_json;
+use crate::provider::GraphTokenPurpose;
 
-use super::{BookRef, ContactBackend, PushedContact};
+use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};
 
 pub struct GraphContactBackend;
 
@@ -21,22 +21,25 @@ impl ContactBackend for GraphContactBackend {
         "graph"
     }
 
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &ContactBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let account_id = account.id.as_str();
         log::info!("sync_contacts_graph: starting for account {}", account_id);
 
-        let token = match get_graph_token(account_id).await {
-            Ok(t) => t,
+        let client = match ctx
+            .providers
+            .graph_client(account_id, GraphTokenPurpose::Baseline)
+            .await
+        {
+            Ok(client) => client,
             Err(e) => {
                 log::error!("sync_contacts_graph: failed to get token: {}", e);
                 return Err(e);
             }
         };
-        let client = GraphClient::new(&token);
 
         // 1. Ensure contact book exists
         let book_id = {
-            let conn = db.writer().await;
+            let conn = ctx.db.writer().await;
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
@@ -72,7 +75,7 @@ impl ContactBackend for GraphContactBackend {
             graph_contacts.len()
         );
 
-        let conn = db.writer().await;
+        let conn = ctx.db.writer().await;
 
         // Build set of server IDs for reconciliation
         let server_ids: std::collections::HashSet<String> =
@@ -162,12 +165,15 @@ impl ContactBackend for GraphContactBackend {
 
     async fn push_created_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         _book: &BookRef<'_>,
         contact: &Contact,
     ) -> Result<Option<PushedContact>> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         let gc = contact_to_graph_json(
             &contact.display_name,
             &contact.emails_json,
@@ -185,13 +191,16 @@ impl ContactBackend for GraphContactBackend {
 
     async fn push_updated_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         _book: &BookRef<'_>,
         contact: &Contact,
         remote_id: &str,
     ) -> Result<Option<PushedContact>> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+        let client = ctx
+            .providers
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         let gc = contact_to_graph_json(
             &contact.display_name,
             &contact.emails_json,
@@ -203,9 +212,16 @@ impl ContactBackend for GraphContactBackend {
         Ok(None)
     }
 
-    async fn push_deleted_contact(&self, account: &AccountFull, remote_id: &str) -> Result<()> {
-        let token = get_graph_token(&account.id).await?;
-        let client = GraphClient::new(&token);
+    async fn push_deleted_contact(
+        &self,
+        ctx: &ContactBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+    ) -> Result<()> {
+        let client = ctx
+            .providers
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
         client.delete_contact(remote_id).await
     }
 }

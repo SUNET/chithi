@@ -6,23 +6,25 @@ use crate::calendar::ical;
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::CalendarEvent;
-use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::mail::caldav::{CalDavClient, CalDavConfig};
 
-use super::{get_unpushed_events, CalendarBackend, PushedEvent};
+use super::{get_unpushed_events, CalendarBackend, CalendarBackendCtx, PushedEvent};
 
 pub struct CalDavCalendarBackend;
 
 /// Connect with the account's DAV coordinates.
-pub(super) async fn connect(account: &AccountFull) -> Result<CalDavClient> {
+pub(super) async fn connect(
+    ctx: &CalendarBackendCtx<'_>,
+    account: &AccountFull,
+) -> Result<CalDavClient> {
     let caldav_config = CalDavConfig {
         caldav_url: account.caldav_url.clone(),
         username: account.username.clone(),
         password: account.password.clone(),
         email: account.email.clone(),
     };
-    CalDavClient::connect(&caldav_config).await
+    ctx.services.caldav_client(&caldav_config).await
 }
 
 #[async_trait]
@@ -31,9 +33,10 @@ impl CalendarBackend for CalDavCalendarBackend {
         "caldav"
     }
 
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
+        let db = ctx.db;
         let account_id = account.id.as_str();
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
 
         // Step 1: List calendars from server
         let caldav_calendars = client.list_calendars().await?;
@@ -280,6 +283,7 @@ impl CalendarBackend for CalDavCalendarBackend {
     /// unpushed-rows pass PUTs them (see `sync` step 3).
     async fn push_created_event(
         &self,
+        _ctx: &CalendarBackendCtx<'_>,
         _account: &AccountFull,
         _event: &CalendarEvent,
         _remote_calendar_id: &str,
@@ -289,31 +293,34 @@ impl CalendarBackend for CalDavCalendarBackend {
 
     async fn push_deleted_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         _remote_calendar_id: &str,
     ) -> Result<()> {
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
         client.delete_event(remote_id).await
     }
 
     async fn push_calendar_rename(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         name: &str,
     ) -> Result<()> {
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
         client.rename_calendar(remote_id, name).await
     }
 
     async fn push_calendar_color(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         color: &str,
     ) -> Result<()> {
-        let client = connect(account).await?;
+        let client = connect(ctx, account).await?;
         client.set_calendar_color(remote_id, color).await
     }
 }

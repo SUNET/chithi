@@ -76,6 +76,7 @@ pub struct LoginResult {
 /// the listener registration) and the legitimate redirect is
 /// what we're actually defending against.
 pub fn sso_login_start(homeserver_url: &str) -> Result<(String, TcpListener, String)> {
+    crate::mail::url_validation::require_https(homeserver_url)?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| Error::Other(format!("matrix sso bind: {}", e)))?;
     let port = listener
@@ -192,6 +193,16 @@ pub fn await_login_token(listener: TcpListener, expected_state: &str) -> Result<
 /// in the account row — that's the authority for subsequent API
 /// calls.
 pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Result<LoginResult> {
+    exchange_login_token_with_client(homeserver_url, login_token, http_client()?).await
+}
+
+/// Exchange an SSO login token using an explicit HTTP client.
+pub async fn exchange_login_token_with_client(
+    homeserver_url: &str,
+    login_token: &str,
+    client: &reqwest::Client,
+) -> Result<LoginResult> {
+    crate::mail::url_validation::require_https(homeserver_url)?;
     let url = format!(
         "{}/_matrix/client/v3/login",
         normalize_base_url(homeserver_url)
@@ -205,7 +216,7 @@ pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Re
         // otherwise show in the Active sessions panel.
         "initial_device_display_name": USER_AGENT,
     });
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .json(&body)
         .send()
@@ -273,6 +284,25 @@ pub async fn create_call(
     room_name: &str,
     element_call_url: Option<&str>,
 ) -> Result<crate::meet::MeetCreateResult> {
+    create_call_with_client(
+        homeserver,
+        access_token,
+        room_name,
+        element_call_url,
+        http_client()?,
+    )
+    .await
+}
+
+/// Create a Matrix room and widget using an explicit HTTP client.
+pub async fn create_call_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_name: &str,
+    element_call_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<crate::meet::MeetCreateResult> {
+    crate::mail::url_validation::require_https(homeserver)?;
     let create_url = format!(
         "{}/_matrix/client/v3/createRoom",
         normalize_base_url(homeserver)
@@ -282,7 +312,6 @@ pub async fn create_call(
         "preset": "private_chat",
         "visibility": "private",
     });
-    let client = http_client()?;
     let resp = client
         .post(&create_url)
         .bearer_auth(access_token)
@@ -374,6 +403,18 @@ pub async fn rename_room(
     room_id: &str,
     new_name: &str,
 ) -> Result<()> {
+    rename_room_with_client(homeserver, access_token, room_id, new_name, http_client()?).await
+}
+
+/// Rename a Matrix room using an explicit HTTP client.
+pub async fn rename_room_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_id: &str,
+    new_name: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    crate::mail::url_validation::require_https(homeserver)?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/state/m.room.name",
         normalize_base_url(homeserver),
@@ -385,7 +426,7 @@ pub async fn rename_room(
         new_name
     };
     let body = serde_json::json!({ "name": name });
-    let resp = http_client()?
+    let resp = client
         .put(&url)
         .bearer_auth(access_token)
         .json(&body)
@@ -410,12 +451,23 @@ pub async fn rename_room(
 /// the closest analogue to "cancelled this call." 403/404 are
 /// treated as already-gone so the local cleanup is idempotent.
 pub async fn leave_room(homeserver: &str, access_token: &str, room_id: &str) -> Result<()> {
+    leave_room_with_client(homeserver, access_token, room_id, http_client()?).await
+}
+
+/// Leave a Matrix room using an explicit HTTP client.
+pub async fn leave_room_with_client(
+    homeserver: &str,
+    access_token: &str,
+    room_id: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    crate::mail::url_validation::require_https(homeserver)?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/leave",
         normalize_base_url(homeserver),
         urlencoding::encode(room_id),
     );
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .bearer_auth(access_token)
         .header("Content-Type", "application/json")
@@ -454,7 +506,7 @@ fn normalize_base_url(server: &str) -> String {
 
 /// `MeetProvider` implementor for Matrix / Element Call. Stateless;
 /// each `create_url` reads the homeserver from the account's meet
-/// binding and the access token from the keyring.
+/// binding and the access token from the injected provider services.
 pub struct MatrixProvider;
 
 #[async_trait::async_trait]
@@ -467,6 +519,7 @@ impl crate::meet::MeetProvider for MatrixProvider {
     }
     async fn create_url(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         name: &str,
         _start_time: Option<&str>,
@@ -480,12 +533,24 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        create_call(homeserver, &access_token, name, None).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        create_call_with_client(
+            homeserver,
+            &access_token,
+            name,
+            None,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 
     async fn delete_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
     ) -> Result<()> {
@@ -495,12 +560,23 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        leave_room(homeserver, &access_token, meeting_id).await
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        leave_room_with_client(
+            homeserver,
+            &access_token,
+            meeting_id,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 
     async fn update_topic(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         topic: &str,
@@ -511,23 +587,79 @@ impl crate::meet::MeetProvider for MatrixProvider {
                 "Matrix: account has no homeserver URL configured".into(),
             ));
         }
-        let access_token = load_access_token(account)?;
-        rename_room(homeserver, &access_token, meeting_id, topic).await
-    }
-}
-
-fn load_access_token(account: &crate::db::accounts::AccountFull) -> Result<String> {
-    match crate::oauth::load_tokens(&account.id)? {
-        Some(t) => Ok(t.access_token),
-        None => Err(Error::Other(
-            "Matrix: no access token in keyring; sign in again".into(),
-        )),
+        let access_token = ctx
+            .services
+            .credentials()
+            .matrix_access_token(&account.id)
+            .await?;
+        rename_room_with_client(
+            homeserver,
+            &access_token,
+            meeting_id,
+            topic,
+            &ctx.services.transports.matrix_http,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn mock_server(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|(status, body)| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_request(&mut stream);
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .unwrap();
+                    request
+                })
+                .collect()
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[test]
     fn host_only_strips_scheme_and_path() {
@@ -552,5 +684,108 @@ mod tests {
             normalize_base_url("https://m.example.com///"),
             "https://m.example.com"
         );
+    }
+
+    #[test]
+    fn sso_login_rejects_public_http_homeserver() {
+        let error = sso_login_start("http://matrix.example").unwrap_err();
+        assert!(error.to_string().contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn secret_requests_reject_public_http_homeserver() {
+        let client = reqwest::Client::new();
+
+        assert!(
+            exchange_login_token_with_client("http://matrix.example", "sso-token", &client,)
+                .await
+                .is_err()
+        );
+        assert!(create_call_with_client(
+            "http://matrix.example",
+            "matrix-token",
+            "Meeting",
+            None,
+            &client,
+        )
+        .await
+        .is_err());
+        assert!(rename_room_with_client(
+            "http://matrix.example",
+            "matrix-token",
+            "!room:matrix.example",
+            "Renamed",
+            &client,
+        )
+        .await
+        .is_err());
+        assert!(leave_room_with_client(
+            "http://matrix.example",
+            "matrix-token",
+            "!room:matrix.example",
+            &client,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_login_token_uses_injected_homeserver_path_and_payload() {
+        let (root, server) = mock_server(vec![(
+            "200 OK",
+            r#"{"access_token":"matrix-token","user_id":"@alice:matrix.example","device_id":"DEVICE","well_known":{"m.homeserver":{"base_url":"https://canonical.example/"}}}"#,
+        )]);
+        let homeserver = format!("{root}/tenant/");
+
+        let result =
+            exchange_login_token_with_client(&homeserver, "sso-token", &reqwest::Client::new())
+                .await
+                .unwrap();
+        let requests = server.join().unwrap();
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert!(headers.starts_with("POST /tenant/_matrix/client/v3/login HTTP/1.1\r\n"));
+        assert_eq!(payload["type"], "m.login.token");
+        assert_eq!(payload["token"], "sso-token");
+        assert_eq!(payload["initial_device_display_name"], USER_AGENT);
+        assert_eq!(result.access_token, "matrix-token");
+        assert_eq!(result.homeserver, "https://canonical.example");
+    }
+
+    #[tokio::test]
+    async fn create_call_sends_bearer_auth_and_room_payload() {
+        let (root, server) = mock_server(vec![
+            ("200 OK", r#"{"room_id":"!room:matrix.example"}"#),
+            ("200 OK", "{}"),
+        ]);
+
+        let result = create_call_with_client(
+            &root,
+            "matrix-token",
+            "Weekly sync",
+            Some("https://call.example/"),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let requests = server.join().unwrap();
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert!(headers.starts_with("POST /_matrix/client/v3/createRoom HTTP/1.1\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer matrix-token"));
+        assert_eq!(payload["name"], "Weekly sync");
+        assert_eq!(payload["preset"], "private_chat");
+        assert_eq!(payload["visibility"], "private");
+        assert!(
+            requests[1].starts_with("PUT /_matrix/client/v3/rooms/%21room%3Amatrix.example/state/")
+        );
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer matrix-token"));
+        assert_eq!(result.meeting_id, "!room:matrix.example");
     }
 }

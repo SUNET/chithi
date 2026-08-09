@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::mail::caldav::{
-    find_elements, find_text_in, has_descendant, parse_href_from_xml, DavAuth,
+    find_elements, find_text_in, has_descendant, parse_href_from_xml, resolve_dav_url, DavAuth,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,8 +72,18 @@ impl CardDavClient {
         password: &str,
         email: &str,
     ) -> Result<Self> {
-        let http = crate::mail::dav_http::build_client()?;
+        let http = crate::mail::dav_http::build_dav_client()?;
+        Self::connect_with_client(carddav_url, username, password, email, http).await
+    }
 
+    /// Create a CardDAV client using the provided HTTP client.
+    pub async fn connect_with_client(
+        carddav_url: &str,
+        username: &str,
+        password: &str,
+        email: &str,
+        http: reqwest::Client,
+    ) -> Result<Self> {
         let auth = DavAuth::Basic {
             username: username.to_string(),
             password: password.to_string(),
@@ -133,26 +143,9 @@ impl CardDavClient {
         Ok(text)
     }
 
-    /// Resolve a potentially relative URL against the base URL. Rejects
-    /// cleartext schemes via `require_https` so a server can't downgrade
-    /// subsequent auth-bearing requests by returning absolute `http://` hrefs.
+    /// Resolve a potentially relative URL against the base URL.
     fn resolve_url(&self, href: &str) -> Result<String> {
-        let resolved = if href.starts_with("http://") || href.starts_with("https://") {
-            href.to_string()
-        } else if let Ok(base) = url::Url::parse(&self.base_url) {
-            let port_str = base.port().map(|p| format!(":{}", p)).unwrap_or_default();
-            format!(
-                "{}://{}{}{}",
-                base.scheme(),
-                base.host_str().unwrap_or(""),
-                port_str,
-                href
-            )
-        } else {
-            format!("{}{}", self.base_url.trim_end_matches('/'), href)
-        };
-        crate::mail::url_validation::require_https(&resolved)?;
-        Ok(resolved)
+        resolve_dav_url(&self.base_url, href, "CardDAV")
     }
 
     /// Discover the current user's principal URL.
@@ -669,6 +662,46 @@ pub fn contact_to_vcard(uid: &str, contact: &crate::db::contacts::Contact) -> St
 #[cfg(test)]
 mod connect_tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    async fn dav_server() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let body = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/principals/u/</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>"#;
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+        });
+        (format!("http://{}/dav/", addr), request_rx)
+    }
+
+    fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
 
     #[tokio::test]
     async fn connect_rejects_http_url() {
@@ -679,6 +712,38 @@ mod connect_tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn injected_client_sends_basic_propfind_to_loopback() {
+        let (url, request_rx) = dav_server().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-injected-client",
+            HeaderValue::from_static("carddav-test"),
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let client =
+            CardDavClient::connect_with_client(&url, "user", "pass", "user@example.com", http)
+                .await
+                .unwrap();
+
+        assert!(client
+            .discover_principal()
+            .await
+            .unwrap()
+            .ends_with("/principals/u/"));
+        let request = request_rx.await.unwrap();
+        assert!(request.starts_with("PROPFIND /dav/ HTTP/1.1\r\n"));
+        assert_eq!(header(&request, "depth"), Some("0"));
+        assert_eq!(header(&request, "x-injected-client"), Some("carddav-test"));
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Basic dXNlcjpwYXNz")
+        );
     }
 
     fn client_with_base(base: &str) -> CardDavClient {
@@ -703,12 +768,50 @@ mod connect_tests {
     }
 
     #[test]
-    fn resolve_url_resolves_relative_href_with_port() {
+    fn resolve_url_accepts_absolute_same_origin_https_href() {
         let client = client_with_base("https://example.com:8443/dav/");
         let resolved = client
-            .resolve_url("/addressbooks/u/default/")
+            .resolve_url("https://example.com:8443/addressbooks/u/")
             .expect("expected Ok");
-        assert_eq!(resolved, "https://example.com:8443/addressbooks/u/default/");
+        assert_eq!(resolved, "https://example.com:8443/addressbooks/u/");
+    }
+
+    #[test]
+    fn resolve_url_rejects_absolute_cross_origin_https_href() {
+        let client = client_with_base("https://example.com:8443/dav/");
+        let msg = match client.resolve_url("https://example.com:9443/addressbooks/u/") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("origin"),
+            "expected origin error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn resolve_url_resolves_relative_href_with_port_and_path_prefix() {
+        let client = client_with_base("https://example.com:8443/dav/");
+        let resolved = client
+            .resolve_url("addressbooks/u/default/")
+            .expect("expected Ok");
+        assert_eq!(
+            resolved,
+            "https://example.com:8443/dav/addressbooks/u/default/"
+        );
+    }
+
+    #[test]
+    fn resolve_url_preserves_path_prefix_without_trailing_slash() {
+        let client = client_with_base("https://example.com:8443/dav");
+        let resolved = client
+            .resolve_url("addressbooks/u/default/")
+            .expect("expected Ok");
+        assert_eq!(
+            resolved,
+            "https://example.com:8443/dav/addressbooks/u/default/"
+        );
     }
 }
 

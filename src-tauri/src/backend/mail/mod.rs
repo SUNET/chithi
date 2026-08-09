@@ -17,17 +17,20 @@ use crate::event::SharedEventSink;
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
+use crate::provider::ProviderServices;
 
 pub mod graph;
 pub mod imap;
 pub mod jmap;
 
-/// Everything a mail sync needs besides the account: application event
-/// delivery, the DB pool, and the Maildir root.
+/// Everything a mail operation needs besides the account: application event
+/// delivery, the DB pool, the Maildir root, and shared provider services.
+#[derive(Clone)]
 pub struct MailSyncCtx {
     pub events: SharedEventSink,
     pub db: std::sync::Arc<DbPool>,
     pub data_dir: std::path::PathBuf,
+    pub providers: std::sync::Arc<ProviderServices>,
 }
 
 /// Provider-neutral inputs for fetching one raw RFC 822 body into Maildir.
@@ -151,6 +154,7 @@ pub trait MailBackend: Send + Sync {
     /// Search messages across the account on the provider server.
     async fn search_messages(
         &self,
+        ctx: &MailSyncCtx,
         account: &AccountFull,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>>;
@@ -159,7 +163,12 @@ pub trait MailBackend: Send + Sync {
     fn draft_storage_format(&self) -> DraftStorageFormat;
 
     /// Create a server-side draft.
-    async fn save_draft(&self, account: &AccountFull, request: &DraftSaveRequest) -> Result<()>;
+    async fn save_draft(
+        &self,
+        ctx: &MailSyncCtx,
+        account: &AccountFull,
+        request: &DraftSaveRequest,
+    ) -> Result<()>;
 
     /// Create the per-account executor the ops worker drives queued
     /// [`MailOp`]s through. Called once per worker lifetime.

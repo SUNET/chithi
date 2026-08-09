@@ -5,16 +5,23 @@ use async_trait::async_trait;
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::CalendarEvent;
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::jmap::{JmapCalendarEvent, JmapConnection};
+use crate::mail::jmap::{JmapCalendarEvent, JmapConfig, JmapConnection};
 
 use super::{
-    get_unpushed_events, AttendeeResponseUpdate, CalendarBackend, CalendarCapability,
-    InviteReplyDelivery, PushedEvent,
+    get_unpushed_events, AttendeeResponseUpdate, CalendarBackend, CalendarBackendCtx,
+    CalendarCapability, InviteReplyDelivery, PushedEvent,
 };
 
 pub struct JmapCalendarBackend;
+
+async fn connect(
+    ctx: &CalendarBackendCtx<'_>,
+    account: &AccountFull,
+) -> Result<(JmapConfig, JmapConnection)> {
+    let (config, connection) = ctx.services.jmap_client(account).await?;
+    Ok((config, connection))
+}
 
 /// Build the wire event from a local row. `id` is empty for creates —
 /// the server assigns one.
@@ -46,11 +53,10 @@ impl CalendarBackend for JmapCalendarBackend {
         InviteReplyDelivery::JmapSubmission
     }
 
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
+        let db = ctx.db;
         let account_id = account.id.as_str();
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-
-        let jmap_conn = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, jmap_conn) = connect(ctx, account).await?;
 
         // Step 1: Fetch and upsert calendars
         let jmap_calendars = jmap_conn.list_jmap_calendars(&jmap_config).await?;
@@ -238,12 +244,12 @@ impl CalendarBackend for JmapCalendarBackend {
 
     async fn push_created_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
         remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         let jmap_event = to_jmap_event(event, remote_calendar_id);
         let remote_id = conn_jmap
             .create_calendar_event(&jmap_config, &jmap_event)
@@ -256,12 +262,12 @@ impl CalendarBackend for JmapCalendarBackend {
 
     async fn push_deleted_event(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         _remote_calendar_id: &str,
     ) -> Result<()> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         conn_jmap
             .delete_calendar_event(&jmap_config, remote_id)
             .await
@@ -269,12 +275,12 @@ impl CalendarBackend for JmapCalendarBackend {
 
     async fn push_calendar_rename(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         name: &str,
     ) -> Result<()> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         conn_jmap
             .rename_calendar(&jmap_config, remote_id, name)
             .await
@@ -282,12 +288,12 @@ impl CalendarBackend for JmapCalendarBackend {
 
     async fn push_calendar_color(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
         color: &str,
     ) -> Result<()> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let conn_jmap = JmapConnection::connect(&jmap_config).await?;
+        let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         conn_jmap
             .set_calendar_color(&jmap_config, remote_id, color)
             .await
@@ -295,11 +301,11 @@ impl CalendarBackend for JmapCalendarBackend {
 
     async fn push_attendee_responses(
         &self,
+        ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         updates: &[AttendeeResponseUpdate],
     ) -> Result<CalendarCapability<()>> {
-        let jmap_config = crate::auth::build_jmap_config(account).await?;
-        let Ok(connection) = JmapConnection::connect(&jmap_config).await else {
+        let Ok((jmap_config, connection)) = connect(ctx, account).await else {
             return Ok(CalendarCapability::Supported(()));
         };
         let Ok(events) = connection.fetch_calendar_events(&jmap_config, None).await else {

@@ -8,6 +8,7 @@ use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::{FilterAction, FilterRule};
 use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::provider::{GraphTokenPurpose, ProviderServices};
 
 /// Detect Graph "item not found" errors — i.e. the local id is stale because
 /// the message was moved or deleted server-side. Matches both the HTTP 404
@@ -22,6 +23,7 @@ fn is_graph_item_not_found(err: &Error) -> bool {
 /// Returns the number of messages that had at least one action applied.
 pub(crate) async fn apply_filters_to_folder(
     db: &Arc<DbPool>,
+    providers: &ProviderServices,
     account_id: &str,
     folder_path: &str,
 ) -> Result<u32> {
@@ -78,10 +80,12 @@ pub(crate) async fn apply_filters_to_folder(
     //    Graph path tolerates per-message failures so one stale id can't
     //    block the rest of the batch.
     let result = match account.mail_protocol_str() {
-        "graph" => execute_graph_filter_actions(account_id, &action_plan).await?,
-        "jmap" => execute_jmap_filter_actions(&account, folder_path, &action_plan).await?,
+        "graph" => execute_graph_filter_actions(providers, account_id, &action_plan).await?,
+        "jmap" => {
+            execute_jmap_filter_actions(providers, &account, folder_path, &action_plan).await?
+        }
         "imap" => {
-            execute_imap_filter_actions(account_id, &account, folder_path, &action_plan).await?
+            execute_imap_filter_actions(providers, &account, folder_path, &action_plan).await?
         }
         "" => {
             // Mail binding disabled (DAV-only account, etc.). There should be
@@ -315,6 +319,7 @@ pub(crate) struct FilterPassOutcome {
 /// on the next cycle (Graph) or via the manual "Apply Filters" button.
 pub(crate) async fn apply_filters_to_new_messages(
     db: &Arc<DbPool>,
+    providers: &ProviderServices,
     account_id: &str,
     folder_path: &str,
     new_ids: &[String],
@@ -357,7 +362,9 @@ pub(crate) async fn apply_filters_to_new_messages(
     // (which reuses the open Session); anything we don't know how to dispatch
     // is a silent no-op so a misconfigured account never blocks sync.
     let result = match account.mail_protocol_str() {
-        "jmap" => match execute_jmap_filter_actions(&account, folder_path, &action_plan).await {
+        "jmap" => match execute_jmap_filter_actions(providers, &account, folder_path, &action_plan)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 log::warn!(
@@ -371,7 +378,7 @@ pub(crate) async fn apply_filters_to_new_messages(
                 });
             }
         },
-        "graph" => match execute_graph_filter_actions(account_id, &action_plan).await {
+        "graph" => match execute_graph_filter_actions(providers, account_id, &action_plan).await {
             Ok(r) => r,
             Err(e) => {
                 log::warn!(
@@ -445,36 +452,19 @@ struct ExecutionResult {
 /// represented here — either the whole batch op succeeds or the function
 /// returns Err.
 async fn execute_imap_filter_actions(
-    account_id: &str,
+    providers: &ProviderServices,
     account: &db::accounts::AccountFull,
     folder_path: &str,
     action_plan: &[(MessageData, Vec<FilterAction>)],
 ) -> Result<ExecutionResult> {
-    // Build IMAP config — O365 needs XOAUTH2 token refresh
-    let (imap_password, imap_xoauth2) = if account.auth_method == "oauth-microsoft" {
-        let tokens = crate::oauth::load_tokens(account_id)?
-            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens
-            .refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-        let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh,
-            crate::oauth::MICROSOFT_IMAP_SCOPES,
-        )
-        .await?;
-        crate::oauth::store_tokens(account_id, &new)?;
-        (new.access_token, true)
-    } else {
-        (account.password.clone(), false)
-    };
+    let credentials = providers.credentials().mail_credentials(account).await?;
     let imap_config = ImapConfig {
         host: account.imap_host.clone(),
         port: account.imap_port,
         username: account.username.clone(),
-        password: imap_password,
+        password: credentials.secret,
         use_tls: account.use_tls,
-        use_xoauth2: imap_xoauth2,
+        use_xoauth2: credentials.use_xoauth2,
     };
 
     let mut move_targets: HashMap<String, Vec<u32>> = HashMap::new();
@@ -592,11 +582,13 @@ async fn execute_imap_filter_actions(
 /// `ErrorItemNotFound`) are logged and skipped so one bad id does not block
 /// the rest of the batch. Copy and non-Seen flag changes are unsupported.
 async fn execute_graph_filter_actions(
+    providers: &ProviderServices,
     account_id: &str,
     action_plan: &[(MessageData, Vec<FilterAction>)],
 ) -> Result<ExecutionResult> {
-    let token = crate::mail::graph::get_graph_token(account_id).await?;
-    let client = crate::mail::graph::GraphClient::new(&token);
+    let client = providers
+        .graph_client(account_id, GraphTokenPurpose::Baseline)
+        .await?;
 
     // Pair every operation with its DB id so we can report which messages
     // really changed server-side — and, on failure, WHICH messages still
@@ -816,12 +808,12 @@ async fn execute_graph_filter_actions(
 /// either a batch succeeds and every planned id in it is taken to have
 /// applied, or the function returns Err. Copy is unsupported.
 async fn execute_jmap_filter_actions(
+    providers: &ProviderServices,
     account: &db::accounts::AccountFull,
     folder_path: &str,
     action_plan: &[(MessageData, Vec<FilterAction>)],
 ) -> Result<ExecutionResult> {
-    let jmap_config = crate::auth::build_jmap_config(account).await?;
-    let conn = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+    let (jmap_config, conn) = providers.jmap_client(account).await?;
 
     // (db_id, jmap_id, target) for moves; (db_id, jmap_id) for deletes
     let mut moves: HashMap<String, Vec<(String, String)>> = HashMap::new();

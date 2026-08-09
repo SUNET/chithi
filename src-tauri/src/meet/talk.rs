@@ -77,8 +77,17 @@ pub struct LoginFlowResult {
 /// (`https://cloud.example.com`) and path-prefixed installs
 /// (`https://example.com/cloud`).
 pub async fn login_flow_v2_start(server_url: &str) -> Result<LoginFlowStart> {
+    login_flow_v2_start_with_client(server_url, http_client()?).await
+}
+
+/// Start Login Flow v2 using an explicit HTTP client.
+pub async fn login_flow_v2_start_with_client(
+    server_url: &str,
+    client: &reqwest::Client,
+) -> Result<LoginFlowStart> {
+    crate::mail::url_validation::require_https(server_url)?;
     let url = format!("{}/index.php/login/v2", normalize_base_url(server_url));
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .send()
         .await
@@ -92,9 +101,12 @@ pub async fn login_flow_v2_start(server_url: &str) -> Result<LoginFlowStart> {
             body.chars().take(200).collect::<String>(),
         )));
     }
-    resp.json::<LoginFlowStart>()
+    let flow = resp
+        .json::<LoginFlowStart>()
         .await
-        .map_err(|e| Error::Other(format!("talk login_flow_v2_start parse: {}", e)))
+        .map_err(|e| Error::Other(format!("talk login_flow_v2_start parse: {}", e)))?;
+    validate_poll_endpoint(server_url, &flow.poll.endpoint)?;
+    Ok(flow)
 }
 
 /// Poll the login-flow endpoint once. Returns:
@@ -107,7 +119,17 @@ pub async fn login_flow_v2_poll(
     poll_endpoint: &str,
     poll_token: &str,
 ) -> Result<Option<LoginFlowResult>> {
-    let resp = http_client()?
+    login_flow_v2_poll_with_client(poll_endpoint, poll_token, http_client()?).await
+}
+
+/// Poll Login Flow v2 once using an explicit HTTP client.
+pub async fn login_flow_v2_poll_with_client(
+    poll_endpoint: &str,
+    poll_token: &str,
+    client: &reqwest::Client,
+) -> Result<Option<LoginFlowResult>> {
+    crate::mail::url_validation::require_https(poll_endpoint)?;
+    let resp = client
         .post(poll_endpoint)
         .form(&[("token", poll_token)])
         .send()
@@ -140,9 +162,20 @@ pub async fn login_flow_v2_complete(
     flow: &LoginFlowStart,
     timeout_secs: u64,
 ) -> Result<LoginFlowResult> {
+    login_flow_v2_complete_with_client(flow, timeout_secs, http_client()?).await
+}
+
+/// Complete Login Flow v2 using an explicit HTTP client for every poll.
+pub async fn login_flow_v2_complete_with_client(
+    flow: &LoginFlowStart,
+    timeout_secs: u64,
+    client: &reqwest::Client,
+) -> Result<LoginFlowResult> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(30));
     loop {
-        if let Some(result) = login_flow_v2_poll(&flow.poll.endpoint, &flow.poll.token).await? {
+        if let Some(result) =
+            login_flow_v2_poll_with_client(&flow.poll.endpoint, &flow.poll.token, client).await?
+        {
             return Ok(result);
         }
         if std::time::Instant::now() >= deadline {
@@ -166,6 +199,18 @@ pub async fn create_room(
     app_password: &str,
     room_name: &str,
 ) -> Result<crate::meet::MeetCreateResult> {
+    create_room_with_client(server, login_name, app_password, room_name, http_client()?).await
+}
+
+/// Create a Talk room using an explicit HTTP client.
+pub async fn create_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    room_name: &str,
+    client: &reqwest::Client,
+) -> Result<crate::meet::MeetCreateResult> {
+    crate::mail::url_validation::require_https(server)?;
     let base = normalize_base_url(server);
     let url = format!("{}/ocs/v2.php/apps/spreed/api/v4/room", base);
     let name = if room_name.trim().is_empty() {
@@ -173,7 +218,7 @@ pub async fn create_room(
     } else {
         room_name
     };
-    let resp = http_client()?
+    let resp = client
         .post(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")
@@ -223,6 +268,27 @@ pub async fn rename_room(
     token: &str,
     new_name: &str,
 ) -> Result<()> {
+    rename_room_with_client(
+        server,
+        login_name,
+        app_password,
+        token,
+        new_name,
+        http_client()?,
+    )
+    .await
+}
+
+/// Rename a Talk room using an explicit HTTP client.
+pub async fn rename_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+    new_name: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    crate::mail::url_validation::require_https(server)?;
     let base = normalize_base_url(server);
     let url = format!(
         "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
@@ -234,7 +300,7 @@ pub async fn rename_room(
     } else {
         new_name
     };
-    let resp = http_client()?
+    let resp = client
         .put(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")
@@ -265,13 +331,25 @@ pub async fn delete_room(
     app_password: &str,
     token: &str,
 ) -> Result<()> {
+    delete_room_with_client(server, login_name, app_password, token, http_client()?).await
+}
+
+/// Delete a Talk room using an explicit HTTP client.
+pub async fn delete_room_with_client(
+    server: &str,
+    login_name: &str,
+    app_password: &str,
+    token: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    crate::mail::url_validation::require_https(server)?;
     let base = normalize_base_url(server);
     let url = format!(
         "{}/ocs/v2.php/apps/spreed/api/v4/room/{}",
         base,
         urlencoding::encode(token),
     );
-    let resp = http_client()?
+    let resp = client
         .delete(&url)
         .basic_auth(login_name, Some(app_password))
         .header("OCS-APIRequest", "true")
@@ -298,9 +376,23 @@ fn normalize_base_url(server: &str) -> String {
     server.trim_end_matches('/').to_string()
 }
 
+fn validate_poll_endpoint(server: &str, endpoint: &str) -> Result<()> {
+    crate::mail::url_validation::require_https(endpoint)?;
+    let server = url::Url::parse(server)
+        .map_err(|e| Error::Other(format!("Invalid Nextcloud server URL: {}", e)))?;
+    let endpoint = url::Url::parse(endpoint)
+        .map_err(|e| Error::Other(format!("Invalid Nextcloud poll URL: {}", e)))?;
+    if server.origin() != endpoint.origin() {
+        return Err(Error::Other(
+            "Nextcloud login poll endpoint must use the server origin".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `MeetProvider` implementor for Nextcloud Talk. Stateless — each
 /// `create_url` call reads the account's URL from its meet binding
-/// and the app password from the keyring.
+/// and the app password from the injected provider services.
 pub struct TalkProvider;
 
 #[async_trait::async_trait]
@@ -313,6 +405,7 @@ impl crate::meet::MeetProvider for TalkProvider {
     }
     async fn create_url(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         name: &str,
         _start_time: Option<&str>,
@@ -326,12 +419,24 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        create_room(url, &account.username, &app_password, name).await
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        create_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            name,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 
     async fn delete_meeting(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
     ) -> Result<()> {
@@ -341,12 +446,24 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        delete_room(url, &account.username, &app_password, meeting_id).await
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        delete_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            meeting_id,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 
     async fn update_topic(
         &self,
+        ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
         topic: &str,
@@ -357,25 +474,71 @@ impl crate::meet::MeetProvider for TalkProvider {
                 "Nextcloud Talk: account has no server URL configured".into(),
             ));
         }
-        let app_password = load_app_password(account)?;
-        rename_room(url, &account.username, &app_password, meeting_id, topic).await
-    }
-}
-
-/// Shared keyring read so create / delete share one error path
-/// and one not-signed-in message.
-fn load_app_password(account: &crate::db::accounts::AccountFull) -> Result<String> {
-    match crate::oauth::load_tokens(&account.id)? {
-        Some(t) => Ok(t.access_token),
-        None => Err(Error::Other(
-            "Nextcloud Talk: no app password in keyring; sign in again".into(),
-        )),
+        let app_password = ctx
+            .services
+            .credentials()
+            .talk_app_password(&account.id)
+            .await?;
+        rename_room_with_client(
+            url,
+            &account.username,
+            &app_password,
+            meeting_id,
+            topic,
+            &ctx.services.transports.talk_http,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn mock_server(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[test]
     fn normalizes_trailing_slashes() {
@@ -383,5 +546,160 @@ mod tests {
         assert_eq!(normalize_base_url("https://x///"), "https://x");
         assert_eq!(normalize_base_url("https://x"), "https://x");
         assert_eq!(normalize_base_url(""), "");
+    }
+
+    #[tokio::test]
+    async fn login_flow_start_uses_injected_server_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = format!("http://{address}");
+        let body = format!(
+            r#"{{"login":"{root}/cloud/login","poll":{{"token":"poll-token","endpoint":"{root}/cloud/index.php/login/v2/poll"}}}}"#,
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let server_url = format!("{root}/cloud/");
+
+        let result = login_flow_v2_start_with_client(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("POST /cloud/index.php/login/v2 HTTP/1.1\r\n"));
+        assert_eq!(result.poll.token, "poll-token");
+        assert_eq!(
+            result.poll.endpoint,
+            format!("{root}/cloud/index.php/login/v2/poll")
+        );
+    }
+
+    #[tokio::test]
+    async fn login_flow_start_rejects_cross_origin_poll_endpoint() {
+        let (root, server) = mock_server(
+            "200 OK",
+            r#"{"login":"https://cloud.example/login","poll":{"token":"poll-token","endpoint":"https://evil.example/poll"}}"#,
+        );
+
+        let error = login_flow_v2_start_with_client(&root, &reqwest::Client::new())
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("server origin"));
+    }
+
+    #[tokio::test]
+    async fn secret_requests_reject_public_http_urls() {
+        let client = reqwest::Client::new();
+
+        assert!(
+            login_flow_v2_start_with_client("http://cloud.example", &client,)
+                .await
+                .is_err()
+        );
+        assert!(
+            login_flow_v2_poll_with_client("http://cloud.example/poll", "poll-token", &client,)
+                .await
+                .is_err()
+        );
+        assert!(create_room_with_client(
+            "http://cloud.example",
+            "alice",
+            "app-secret",
+            "Meeting",
+            &client,
+        )
+        .await
+        .is_err());
+        assert!(rename_room_with_client(
+            "http://cloud.example",
+            "alice",
+            "app-secret",
+            "room-token",
+            "Renamed",
+            &client,
+        )
+        .await
+        .is_err());
+        assert!(delete_room_with_client(
+            "http://cloud.example",
+            "alice",
+            "app-secret",
+            "room-token",
+            &client,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn login_flow_poll_posts_token_and_treats_404_as_pending() {
+        let (root, server) = mock_server("404 Not Found", "");
+        let endpoint = format!("{root}/index.php/login/v2/poll");
+
+        let result =
+            login_flow_v2_poll_with_client(&endpoint, "pending-token", &reqwest::Client::new())
+                .await
+                .unwrap();
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+
+        assert!(headers.starts_with("POST /index.php/login/v2/poll HTTP/1.1\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("content-type: application/x-www-form-urlencoded"));
+        assert_eq!(body, "token=pending-token");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_room_sends_basic_auth_and_ocs_semantics() {
+        let (root, server) = mock_server(
+            "200 OK",
+            r#"{"ocs":{"meta":{"status":"ok"},"data":{"token":"room-token"}}}"#,
+        );
+        let server_url = format!("{root}/cloud/");
+
+        let result = create_room_with_client(
+            &server_url,
+            "alice",
+            "app-secret",
+            "Team sync",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+
+        assert!(headers.starts_with("post /cloud/ocs/v2.php/apps/spreed/api/v4/room http/1.1\r\n"));
+        assert!(headers.contains("authorization: basic ywxpy2u6yxbwlxnly3jlda=="));
+        assert!(headers.contains("ocs-apirequest: true"));
+        assert!(headers.contains("accept: application/json"));
+        assert!(headers.contains("content-type: application/x-www-form-urlencoded"));
+        assert_eq!(body, "roomType=2&roomName=Team+sync");
+        assert_eq!(result.meeting_id, "room-token");
+        assert_eq!(result.join_url, format!("{root}/cloud/call/room-token"));
     }
 }

@@ -24,7 +24,7 @@ pub const DAV_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// send `Content-Encoding: gzip` on PROPFIND/REPORT responses; without
 /// decompression `resp.text()` fails with "error decoding response body"
 /// (see #56).
-pub fn build_client() -> Result<Client> {
+pub fn build_dav_client() -> Result<Client> {
     Client::builder()
         .redirect(redirect::Policy::limited(10))
         .connect_timeout(DAV_CONNECT_TIMEOUT)

@@ -2,14 +2,12 @@
 
 use async_trait::async_trait;
 
-use crate::auth::get_google_token;
 use crate::db::accounts::AccountFull;
 use crate::db::contacts::Contact;
-use crate::db::pool::DbPool;
 use crate::error::Result;
-use crate::mail::google::{contact_to_person_json, GoogleClient};
+use crate::mail::google::contact_to_person_json;
 
-use super::{BookRef, ContactBackend, PushedContact};
+use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};
 
 pub struct GoogleContactBackend;
 
@@ -22,13 +20,12 @@ impl ContactBackend for GoogleContactBackend {
     /// People API sync. Failures are swallowed with a warning — Gmail
     /// accounts without calendar/contacts OAuth consent would
     /// otherwise fail every contacts sync outright.
-    async fn sync(&self, db: &DbPool, account: &AccountFull) -> Result<()> {
+    async fn sync(&self, ctx: &ContactBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let account_id = account.id.as_str();
         let result: Result<()> = async {
-            // Get a valid OAuth2 access token
-            let access_token = get_google_token(account_id).await?;
+            let client = ctx.providers.google_client(account_id).await?;
 
-            let conn = db.writer().await;
+            let conn = ctx.db.writer().await;
             let book_id = {
                 let existing: Option<String> = conn
                     .query_row(
@@ -52,13 +49,12 @@ impl ContactBackend for GoogleContactBackend {
             drop(conn);
 
             // Fetch contacts using Google People API (more reliable than CardDAV for Google)
-            let client = GoogleClient::new(&access_token);
             let data = client.list_connections().await?;
             let connections = data["connections"].as_array();
             let count = connections.map(|c| c.len()).unwrap_or(0);
             log::info!("sync_contacts_google: fetched {} contacts", count);
 
-            let conn = db.writer().await;
+            let conn = ctx.db.writer().await;
 
             if let Some(people) = connections {
                 for person in people {
@@ -154,12 +150,12 @@ impl ContactBackend for GoogleContactBackend {
 
     async fn push_created_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         _book: &BookRef<'_>,
         contact: &Contact,
     ) -> Result<Option<PushedContact>> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.providers.google_client(&account.id).await?;
         let person = contact_to_person_json(
             &contact.display_name,
             &contact.emails_json,
@@ -175,13 +171,13 @@ impl ContactBackend for GoogleContactBackend {
 
     async fn push_updated_contact(
         &self,
+        ctx: &ContactBackendCtx<'_>,
         account: &AccountFull,
         _book: &BookRef<'_>,
         contact: &Contact,
         remote_id: &str,
     ) -> Result<Option<PushedContact>> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+        let client = ctx.providers.google_client(&account.id).await?;
         let person = contact_to_person_json(
             &contact.display_name,
             &contact.emails_json,
@@ -191,9 +187,13 @@ impl ContactBackend for GoogleContactBackend {
         Ok(None)
     }
 
-    async fn push_deleted_contact(&self, account: &AccountFull, remote_id: &str) -> Result<()> {
-        let token = get_google_token(&account.id).await?;
-        let client = GoogleClient::new(&token);
+    async fn push_deleted_contact(
+        &self,
+        ctx: &ContactBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+    ) -> Result<()> {
+        let client = ctx.providers.google_client(&account.id).await?;
         client.delete_contact(remote_id).await
     }
 }

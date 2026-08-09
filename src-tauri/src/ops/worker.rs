@@ -210,10 +210,12 @@ impl AccountWorker {
         self.backend = crate::backend::mail::for_account(&account);
         self.executor = self.backend.map(|b| b.op_executor());
         let data_dir = self.app.state::<crate::state::AppState>().data_dir.clone();
+        let providers = self.app.state::<crate::state::AppState>().providers.clone();
         self.ctx = Some(MailSyncCtx {
             events: crate::event::tauri::shared_sink(self.app.clone()),
             db: self.db.clone(),
             data_dir,
+            providers,
         });
         Ok(())
     }

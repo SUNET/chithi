@@ -155,9 +155,9 @@ pub async fn add_account(
     // During OAuth flow, tokens are stored under a temp ID like "o365-pending-123"
     // or "gmail-pending-123", referenced via password field "oauth2:{temp_id}".
     if let Some(temp_id) = config.password.strip_prefix("oauth2:") {
-        if let Ok(Some(tokens)) = crate::oauth::load_tokens(temp_id) {
-            crate::oauth::store_tokens(&id, &tokens)?;
-            crate::oauth::delete_tokens(temp_id).ok();
+        if let Ok(Some(tokens)) = state.providers.token_store().load(temp_id) {
+            state.providers.token_store().store(&id, &tokens)?;
+            state.providers.token_store().delete(temp_id).ok();
             log::info!("Migrated OAuth tokens from {} to {}", temp_id, id);
         }
     }
