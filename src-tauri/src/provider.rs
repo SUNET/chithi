@@ -159,6 +159,12 @@ impl TokenEndpointClient for ReqwestTokenEndpointClient {
 /// than supplying arbitrary OAuth scopes.
 #[async_trait]
 pub trait ProviderCredentials: Send + Sync {
+    /// Coordinator used for per-account token refresh, when the implementation
+    /// participates in token lifecycle serialization.
+    fn account_coordinator(&self) -> Option<Arc<ProviderAccountCoordinator>> {
+        None
+    }
+
     async fn google_access_token(&self, account_id: &str) -> Result<String>;
     async fn graph_access_token(
         &self,
@@ -181,7 +187,139 @@ pub trait ProviderCredentials: Send + Sync {
 pub struct ProviderCredentialService {
     tokens: Arc<dyn OAuthTokenStore>,
     endpoint: Arc<dyn TokenEndpointClient>,
-    account_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    account_locks: Arc<ProviderAccountCoordinator>,
+}
+
+#[derive(Default)]
+pub struct ProviderAccountCoordinator {
+    locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ProviderAccountCoordinator {
+    pub async fn lock_account(&self, account_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let account_lock = self
+            .locks
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        account_lock.lock_owned().await
+    }
+}
+
+struct OAuthTokenLifecycle {
+    tokens: Arc<dyn OAuthTokenStore>,
+    account_locks: Arc<ProviderAccountCoordinator>,
+}
+
+impl OAuthTokenLifecycle {
+    fn store_zoom_and_commit<F>(
+        &self,
+        account_id: &str,
+        tokens: &OAuthTokens,
+        commit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        if let Err(error) = self.tokens.store(account_id, tokens) {
+            return match self.tokens.delete(account_id) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(compensation_error(
+                    "storing Zoom tokens",
+                    error,
+                    "removing a partial token write",
+                    cleanup_error,
+                )),
+            };
+        }
+
+        if let Err(error) = commit() {
+            return match self.tokens.delete(account_id) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(compensation_error(
+                    "committing the Zoom account",
+                    error,
+                    "removing its tokens",
+                    cleanup_error,
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    fn delete_zoom_and_commit<F>(&self, account_id: &str, commit: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let previous = self.tokens.load(account_id)?;
+        if let Err(error) = self.tokens.delete(account_id) {
+            return match previous {
+                Some(tokens) => match self.tokens.store(account_id, &tokens) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(compensation_error(
+                        "deleting Zoom tokens",
+                        error,
+                        "restoring the token snapshot",
+                        restore_error,
+                    )),
+                },
+                None => Err(error),
+            };
+        }
+
+        if let Err(error) = commit() {
+            return match previous {
+                Some(tokens) => match self.tokens.store(account_id, &tokens) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(compensation_error(
+                        "committing Zoom account deletion",
+                        error,
+                        "restoring its tokens",
+                        restore_error,
+                    )),
+                },
+                None => Err(error),
+            };
+        }
+        Ok(())
+    }
+}
+
+pub struct ZoomTokenLifecycleGuard<'a> {
+    lifecycle: &'a OAuthTokenLifecycle,
+    account_id: &'a str,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ZoomTokenLifecycleGuard<'_> {
+    pub fn store_and_commit<F>(&self, tokens: &OAuthTokens, commit: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.lifecycle
+            .store_zoom_and_commit(self.account_id, tokens, commit)
+    }
+
+    pub fn delete_and_commit<F>(&self, commit: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.lifecycle
+            .delete_zoom_and_commit(self.account_id, commit)
+    }
+}
+
+fn compensation_error(
+    operation: &str,
+    error: Error,
+    compensation: &str,
+    compensation_error: Error,
+) -> Error {
+    Error::Other(format!(
+        "failed while {operation}: {error}; also failed while {compensation}: {compensation_error}"
+    ))
 }
 
 /// Shared HTTP transports and test-overridable provider API endpoints.
@@ -256,6 +394,7 @@ pub struct ProviderServices {
     credentials: Arc<dyn ProviderCredentials>,
     token_store: Arc<dyn OAuthTokenStore>,
     token_endpoint: Arc<dyn TokenEndpointClient>,
+    token_lifecycle: OAuthTokenLifecycle,
     pub transports: ProviderTransports,
 }
 
@@ -266,10 +405,17 @@ impl ProviderServices {
         token_endpoint: Arc<dyn TokenEndpointClient>,
         transports: ProviderTransports,
     ) -> Self {
+        let account_locks = credentials
+            .account_coordinator()
+            .unwrap_or_else(|| Arc::new(ProviderAccountCoordinator::default()));
         Self {
             credentials,
-            token_store,
+            token_store: token_store.clone(),
             token_endpoint,
+            token_lifecycle: OAuthTokenLifecycle {
+                tokens: token_store,
+                account_locks,
+            },
             transports,
         }
     }
@@ -278,11 +424,12 @@ impl ProviderServices {
         let token_endpoint: Arc<dyn TokenEndpointClient> =
             Arc::new(ReqwestTokenEndpointClient::production()?);
         let token_store: Arc<dyn OAuthTokenStore> = Arc::new(SystemOAuthTokenStore);
+        let credentials = Arc::new(ProviderCredentialService::new(
+            token_store.clone(),
+            token_endpoint.clone(),
+        ));
         Ok(Self::new(
-            Arc::new(ProviderCredentialService::new(
-                token_store.clone(),
-                token_endpoint.clone(),
-            )),
+            credentials,
             token_store,
             token_endpoint,
             ProviderTransports::production()?,
@@ -299,6 +446,21 @@ impl ProviderServices {
 
     pub fn token_store(&self) -> &dyn OAuthTokenStore {
         self.token_store.as_ref()
+    }
+
+    pub async fn lock_zoom_tokens<'a>(
+        &'a self,
+        account_id: &'a str,
+    ) -> ZoomTokenLifecycleGuard<'a> {
+        ZoomTokenLifecycleGuard {
+            lifecycle: &self.token_lifecycle,
+            account_id,
+            _guard: self
+                .token_lifecycle
+                .account_locks
+                .lock_account(account_id)
+                .await,
+        }
     }
 
     pub async fn graph_client(
@@ -384,7 +546,7 @@ impl ProviderCredentialService {
         Self {
             tokens,
             endpoint,
-            account_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
         }
     }
 
@@ -401,22 +563,12 @@ impl ProviderCredentialService {
             .ok_or_else(|| Error::Other(missing_message.into()))
     }
 
-    fn account_lock(&self, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.account_locks
-            .lock()
-            .unwrap()
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     async fn jmap_oidc_access_token(&self, account: &AccountFull) -> Result<Option<String>> {
         if account.jmap_auth_method != "oidc" {
             return Ok(None);
         }
 
-        let account_lock = self.account_lock(&account.id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(&account.id).await;
         let tokens =
             self.required_tokens(&account.id, "No OIDC tokens found. Please sign in again.")?;
         if !tokens.is_expired() {
@@ -452,9 +604,12 @@ impl ProviderCredentialService {
 
 #[async_trait]
 impl ProviderCredentials for ProviderCredentialService {
+    fn account_coordinator(&self) -> Option<Arc<ProviderAccountCoordinator>> {
+        Some(self.account_locks.clone())
+    }
+
     async fn google_access_token(&self, account_id: &str) -> Result<String> {
-        let account_lock = self.account_lock(account_id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(account_id).await;
         let tokens = self.required_tokens(
             account_id,
             "No Google OAuth tokens. Please sign in with Google in Settings.",
@@ -479,8 +634,7 @@ impl ProviderCredentials for ProviderCredentialService {
         account_id: &str,
         purpose: GraphTokenPurpose,
     ) -> Result<String> {
-        let account_lock = self.account_lock(account_id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(account_id).await;
         crate::oauth::ensure_not_reauth_required(account_id)?;
         let tokens = self.required_tokens(
             account_id,
@@ -526,8 +680,7 @@ impl ProviderCredentials for ProviderCredentialService {
             });
         }
 
-        let account_lock = self.account_lock(&account.id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(&account.id).await;
         crate::oauth::ensure_not_reauth_required(&account.id)?;
         let tokens = self.required_tokens(
             &account.id,
@@ -566,8 +719,7 @@ impl ProviderCredentials for ProviderCredentialService {
         token_endpoint: &str,
         client_id: &str,
     ) -> Result<Option<String>> {
-        let account_lock = self.account_lock(account_id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(account_id).await;
         let Some(tokens) = self.tokens.load(account_id)? else {
             return Ok(None);
         };
@@ -589,8 +741,7 @@ impl ProviderCredentials for ProviderCredentialService {
     }
 
     async fn zoom_access_token(&self, account_id: &str) -> Result<String> {
-        let account_lock = self.account_lock(account_id);
-        let _guard = account_lock.lock().await;
+        let _guard = self.account_locks.lock_account(account_id).await;
         let tokens =
             self.required_tokens(account_id, "Zoom: no tokens in keyring; sign in again")?;
         if !tokens.is_expired() {
@@ -660,6 +811,70 @@ mod tests {
     struct FakeTokenEndpoint {
         refreshed: OAuthTokens,
         scopes: Mutex<Vec<String>>,
+    }
+
+    struct CoordinatedBlockingCredentials {
+        coordinator: Arc<ProviderAccountCoordinator>,
+        tokens: Arc<MemoryTokenStore>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ProviderCredentials for CoordinatedBlockingCredentials {
+        fn account_coordinator(&self) -> Option<Arc<ProviderAccountCoordinator>> {
+            Some(self.coordinator.clone())
+        }
+
+        async fn google_access_token(&self, _account_id: &str) -> Result<String> {
+            unreachable!()
+        }
+
+        async fn graph_access_token(
+            &self,
+            _account_id: &str,
+            _purpose: GraphTokenPurpose,
+        ) -> Result<String> {
+            unreachable!()
+        }
+
+        async fn mail_credentials(&self, _account: &AccountFull) -> Result<MailCredentials> {
+            unreachable!()
+        }
+
+        async fn jmap_config(&self, _account: &AccountFull) -> Result<JmapConfig> {
+            unreachable!()
+        }
+
+        async fn jmap_push_access_token(
+            &self,
+            _account_id: &str,
+            _token_endpoint: &str,
+            _client_id: &str,
+        ) -> Result<Option<String>> {
+            unreachable!()
+        }
+
+        async fn zoom_access_token(&self, account_id: &str) -> Result<String> {
+            let _guard = self.coordinator.lock_account(account_id).await;
+            self.entered.notify_one();
+            self.release.notified().await;
+            let refreshed = OAuthTokens {
+                access_token: "custom-refreshed-access".into(),
+                refresh_token: Some("custom-refreshed-refresh".into()),
+                expires_at: Some(i64::MAX),
+            };
+            self.tokens.store(account_id, &refreshed)?;
+            Ok(refreshed.access_token)
+        }
+
+        async fn matrix_access_token(&self, _account_id: &str) -> Result<String> {
+            unreachable!()
+        }
+
+        async fn talk_app_password(&self, _account_id: &str) -> Result<String> {
+            unreachable!()
+        }
     }
 
     #[derive(Default)]
@@ -923,6 +1138,128 @@ mod tests {
 
         assert_eq!(other.unwrap().unwrap(), "other-access");
         assert_eq!(blocked.await.unwrap().unwrap(), "first-access");
+    }
+
+    #[tokio::test]
+    async fn zoom_creation_commit_failure_removes_stored_tokens() {
+        let store = Arc::new(MemoryTokenStore::default());
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account("zoom").await;
+
+        let result = lifecycle.store_zoom_and_commit("zoom", &refreshed_tokens(), || {
+            Err(Error::Other("injected commit failure".into()))
+        });
+
+        assert!(result.is_err());
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn zoom_deletion_commit_failure_restores_previous_tokens() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("zoom", &refreshed_tokens()).unwrap();
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account("zoom").await;
+
+        let result = lifecycle.delete_zoom_and_commit("zoom", || {
+            Err(Error::Other("injected commit failure".into()))
+        });
+
+        assert!(result.is_err());
+        let restored = store.load("zoom").unwrap().unwrap();
+        assert_eq!(restored.access_token, "fresh-access");
+        assert_eq!(restored.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(restored.expires_at, Some(i64::MAX));
+    }
+
+    #[tokio::test]
+    async fn zoom_deletion_waits_for_refresh_then_removes_refreshed_tokens() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("zoom", &expired_tokens()).unwrap();
+        let endpoint = Arc::new(BlockingRotatingEndpoint::default());
+        let token_endpoint: Arc<dyn TokenEndpointClient> = endpoint.clone();
+        let credentials = Arc::new(ProviderCredentialService::new(
+            store.clone(),
+            token_endpoint.clone(),
+        ));
+        let providers = Arc::new(ProviderServices::new(
+            credentials,
+            store.clone(),
+            token_endpoint,
+            ProviderTransports::production().unwrap(),
+        ));
+
+        let refresh_providers = providers.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_providers
+                .credentials()
+                .zoom_access_token("zoom")
+                .await
+        });
+        endpoint.first_entered.notified().await;
+
+        let delete_providers = providers.clone();
+        let delete = tokio::spawn(async move {
+            let token_guard = delete_providers.lock_zoom_tokens("zoom").await;
+            token_guard.delete_and_commit(|| Ok(()))
+        });
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished());
+
+        endpoint.release_first.notify_one();
+        assert_eq!(refresh.await.unwrap().unwrap(), "first-access");
+        delete.await.unwrap().unwrap();
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn injected_coordinated_credentials_serialize_with_lifecycle_deletion() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("zoom", &expired_tokens()).unwrap();
+        let credentials = Arc::new(CoordinatedBlockingCredentials {
+            coordinator: Arc::new(ProviderAccountCoordinator::default()),
+            tokens: store.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let endpoint: Arc<dyn TokenEndpointClient> = Arc::new(FakeTokenEndpoint {
+            refreshed: refreshed_tokens(),
+            scopes: Mutex::new(Vec::new()),
+        });
+        let providers = Arc::new(ProviderServices::new(
+            credentials.clone(),
+            store.clone(),
+            endpoint,
+            ProviderTransports::production().unwrap(),
+        ));
+
+        let refresh_providers = providers.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_providers
+                .credentials()
+                .zoom_access_token("zoom")
+                .await
+        });
+        credentials.entered.notified().await;
+
+        let delete_providers = providers.clone();
+        let delete = tokio::spawn(async move {
+            let token_guard = delete_providers.lock_zoom_tokens("zoom").await;
+            token_guard.delete_and_commit(|| Ok(()))
+        });
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished());
+
+        credentials.release.notify_one();
+        assert_eq!(refresh.await.unwrap().unwrap(), "custom-refreshed-access");
+        delete.await.unwrap().unwrap();
+        assert!(store.load("zoom").unwrap().is_none());
     }
 
     #[tokio::test]

@@ -463,11 +463,9 @@ pub async fn meet_zoom_login_complete(
         pgp_encrypt_subject: true,
         pgp_encrypt_drafts: true,
     };
+    let token_guard = state.providers.lock_zoom_tokens(&id).await;
     let conn = state.db.writer().await;
-    db::accounts::insert_account(&conn, &id, &config)?;
-    drop(conn);
-
-    state.providers.token_store().store(&id, &tokens)?;
+    crate::commands::accounts::insert_zoom_account(&conn, &id, &config, &tokens, &token_guard)?;
     Ok(id)
 }
 
