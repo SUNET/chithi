@@ -11,6 +11,7 @@ use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::mail::search::{SearchHit, SearchQuery};
 use crate::mail::sync as mail_sync;
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
@@ -18,6 +19,16 @@ use crate::ops::queue::MailOp;
 use super::{MailBackend, MailOpExecutor, MailSyncCtx};
 
 pub struct ImapMailBackend;
+
+fn validate_search_query(query: &SearchQuery) -> Result<()> {
+    if query.has_attachment.is_some() {
+        return Err(Error::UnsupportedCapability {
+            protocol: "imap",
+            capability: "server-side attachment filtering",
+        });
+    }
+    Ok(())
+}
 
 /// (message_id, uid, flags_json) tuple for prefetch grouping.
 type PrefetchMsg = (String, u32, String);
@@ -348,6 +359,23 @@ impl MailBackend for ImapMailBackend {
 
     async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
         prefetch_pipeline(ctx, account).await
+    }
+
+    async fn search_messages(
+        &self,
+        account: &AccountFull,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>> {
+        validate_search_query(query)?;
+
+        let imap_config = build_imap_config(account).await?;
+        let account_id = account.id.clone();
+        let query = query.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::mail::imap::search_account_blocking(&imap_config, &account_id, &query)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("IMAP search task panicked: {}", e)))?
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {
@@ -799,8 +827,9 @@ fn select_folder_if_needed(
 
 #[cfg(test)]
 mod tests {
-    use super::{group_imap_message_refs, prefetch_connection_limit};
+    use super::{group_imap_message_refs, prefetch_connection_limit, validate_search_query};
     use crate::mail::compat::BackendMessageRef;
+    use crate::mail::search::{SearchFields, SearchQuery};
 
     #[test]
     fn copy_references_are_grouped_by_source_folder() {
@@ -824,5 +853,22 @@ mod tests {
     fn o365_prefetch_uses_one_connection() {
         assert_eq!(prefetch_connection_limit("oauth-microsoft", 3), 1);
         assert_eq!(prefetch_connection_limit("password", 3), 3);
+    }
+
+    #[test]
+    fn attachment_filtering_is_explicitly_unsupported() {
+        for has_attachment in [true, false] {
+            let query = SearchQuery {
+                text: "report".into(),
+                fields: SearchFields::default(),
+                has_attachment: Some(has_attachment),
+                since_days: None,
+            };
+            let error = validate_search_query(&query).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "imap does not support server-side attachment filtering"
+            );
+        }
     }
 }

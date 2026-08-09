@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::jmap_sync;
+use crate::mail::search::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
@@ -63,6 +64,16 @@ impl MailBackend for JmapMailBackend {
             jmap_config,
         )
         .await
+    }
+
+    async fn search_messages(
+        &self,
+        account: &AccountFull,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchHit>> {
+        let config = crate::auth::build_jmap_config(account).await?;
+        let connection = crate::mail::jmap::JmapConnection::connect(&config).await?;
+        connection.search_account(&config, &account.id, query).await
     }
 
     fn op_executor(&self) -> Box<dyn MailOpExecutor> {

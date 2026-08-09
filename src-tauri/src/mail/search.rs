@@ -156,8 +156,8 @@ pub fn build_jmap_filter(query: &SearchQuery) -> Option<serde_json::Value> {
         }
     }
 
-    if let Some(true) = query.has_attachment {
-        conditions.push(serde_json::json!({ "hasAttachment": true }));
+    if let Some(has_attachment) = query.has_attachment {
+        conditions.push(serde_json::json!({ "hasAttachment": has_attachment }));
     }
     if let Some(days) = query.since_days {
         if days > 0 {
@@ -225,8 +225,8 @@ pub fn build_graph_kql(query: &SearchQuery) -> Option<String> {
     };
 
     let mut kql = core;
-    if let Some(true) = query.has_attachment {
-        kql = format!("({}) AND hasAttachments:true", kql);
+    if let Some(has_attachment) = query.has_attachment {
+        kql = format!("({}) AND hasAttachments:{}", kql, has_attachment);
     }
     Some(kql)
 }
@@ -345,6 +345,14 @@ mod tests {
     }
 
     #[test]
+    fn jmap_without_attachment_filter_is_preserved() {
+        let mut query = q("foo");
+        query.has_attachment = Some(false);
+        let f = build_jmap_filter(&query).unwrap();
+        assert_eq!(f["conditions"][1]["hasAttachment"], false);
+    }
+
+    #[test]
     fn graph_all_fields_bare() {
         let s = build_graph_kql(&q("foo")).unwrap();
         assert_eq!(s, "foo");
@@ -392,5 +400,13 @@ mod tests {
         query.has_attachment = Some(true);
         let s = build_graph_kql(&query).unwrap();
         assert_eq!(s, "(foo) AND hasAttachments:true");
+    }
+
+    #[test]
+    fn graph_without_attachment_filter_is_preserved() {
+        let mut query = q("foo");
+        query.has_attachment = Some(false);
+        let s = build_graph_kql(&query).unwrap();
+        assert_eq!(s, "(foo) AND hasAttachments:false");
     }
 }

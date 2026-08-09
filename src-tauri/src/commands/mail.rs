@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::sync_cmd::{
     resume_imap_idle_for_account, should_suspend_idle_for_imap_operation,
@@ -111,9 +111,10 @@ pub async fn get_messages(
 }
 
 /// Run a server-side search across all folders of an account.
-/// Dispatches to the IMAP, JMAP, or Graph backend based on `mail_protocol`.
+/// Provider credentials and wire behavior stay behind [`MailBackend`].
 #[tauri::command]
 pub async fn search_messages_server(
+    app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     query: SearchQuery,
@@ -130,54 +131,42 @@ pub async fn search_messages_server(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    let hits = if account.mail_protocol_str() == "graph" {
-        let token = crate::mail::graph::get_graph_token(&account_id).await?;
-        let client = crate::mail::graph::GraphClient::new(&token);
-        client.search_messages(&account_id, &query).await?
-    } else if account.mail_protocol_str() == "jmap" {
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
-        conn_jmap
-            .search_account(&jmap_config, &account_id, &query)
-            .await?
-    } else {
-        let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account_id)?
-                .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-            let refresh = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-            let new = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
-            .await?;
-            crate::oauth::store_tokens(&account_id, &new)?;
-            (new.access_token, true)
-        } else {
-            (account.password.clone(), false)
-        };
-        let imap_config = ImapConfig {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: account.username.clone(),
-            password,
-            use_tls: account.use_tls,
-            use_xoauth2,
-        };
+    let backend = crate::backend::mail::for_account(&account).ok_or_else(|| {
+        Error::Other(format!(
+            "Account {} has no enabled mail service for server search",
+            account_id
+        ))
+    })?;
 
-        let account_id_for_blocking = account_id.clone();
-        let query_for_blocking = query.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::mail::imap::search_account_blocking(
-                &imap_config,
-                &account_id_for_blocking,
-                &query_for_blocking,
-            )
-        })
-        .await
-        .map_err(|e| Error::Other(format!("IMAP search task panicked: {}", e)))??
+    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+        Some(suspend_imap_idle_for_operation(&app, &state, &account).await?)
+    } else {
+        None
+    };
+
+    let hits = if let Some(suspended_idle) = suspended_idle {
+        let search_account = account.clone();
+        let resume_account = account.clone();
+        let resume_app = app.clone();
+        let task = spawn_with_imap_idle_resume(
+            account_id.clone(),
+            "server search",
+            async move { backend.search_messages(&search_account, &query).await },
+            async move {
+                let state = resume_app.state::<AppState>();
+                resume_imap_idle_for_account(
+                    &resume_app,
+                    &state,
+                    &resume_account,
+                    Some(suspended_idle),
+                )
+                .await
+            },
+        );
+        task.await
+            .map_err(|e| Error::Other(format!("Server search task panicked: {}", e)))??
+    } else {
+        backend.search_messages(&account, &query).await?
     };
 
     log::info!("Server search returned {} hits", hits.len());
@@ -360,8 +349,9 @@ async fn ensure_message_body_on_disk(
             None
         };
 
-        run_imap_body_fetch_with_resume(
+        run_with_imap_idle_resume(
             account_id,
+            "body fetch",
             async {
                 let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
                     let tokens = crate::oauth::load_tokens(account_id)?
@@ -417,36 +407,63 @@ async fn ensure_message_body_on_disk(
     Ok(relative_path)
 }
 
-async fn run_imap_body_fetch_with_resume<T, F, R>(
+async fn run_with_imap_idle_resume<T, F, R>(
     account_id: &str,
-    fetch: F,
+    operation: &'static str,
+    operation_future: F,
     resume: R,
 ) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
     R: std::future::Future<Output = Result<()>>,
 {
-    let fetch_result = fetch.await;
+    let operation_result = operation_future.await;
     let resume_result = resume.await;
-    finish_imap_body_fetch(account_id, fetch_result, resume_result)
+    finish_with_imap_idle_resume(account_id, operation, operation_result, resume_result)
 }
 
-fn finish_imap_body_fetch<T>(
+fn spawn_with_imap_idle_resume<T, F, R>(
+    account_id: String,
+    operation: &'static str,
+    operation_future: F,
+    resume: R,
+) -> tokio::task::JoinHandle<Result<T>>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    R: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let operation_result = match tokio::spawn(operation_future).await {
+            Ok(result) => result,
+            Err(error) => Err(Error::Other(format!(
+                "{} task failed: {}",
+                operation, error
+            ))),
+        };
+        let resume_result = resume.await;
+        finish_with_imap_idle_resume(&account_id, operation, operation_result, resume_result)
+    })
+}
+
+fn finish_with_imap_idle_resume<T>(
     account_id: &str,
-    fetch_result: Result<T>,
+    operation: &str,
+    operation_result: Result<T>,
     resume_result: Result<()>,
 ) -> Result<T> {
-    match (fetch_result, resume_result) {
+    match (operation_result, resume_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(resume_error)) => Err(resume_error),
-        (Err(fetch_error), Ok(())) => Err(fetch_error),
-        (Err(fetch_error), Err(resume_error)) => {
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(resume_error)) => {
             log::error!(
-                "Failed to resume IMAP IDLE after body fetch error for account {}: {}",
+                "Failed to resume IMAP IDLE after {} error for account {}: {}",
+                operation,
                 account_id,
                 resume_error
             );
-            Err(fetch_error)
+            Err(operation_error)
         }
     }
 }
@@ -1160,7 +1177,10 @@ pub async fn save_message_as_eml(
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_imap_body_fetch, run_imap_body_fetch_with_resume, split_folder_path};
+    use super::{
+        finish_with_imap_idle_resume, run_with_imap_idle_resume, spawn_with_imap_idle_resume,
+        split_folder_path,
+    };
     use crate::error::Error;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1171,8 +1191,9 @@ mod tests {
     async fn body_fetch_failure_still_runs_resume() {
         let resumed = Arc::new(AtomicBool::new(false));
         let resumed_in_future = resumed.clone();
-        let result = run_imap_body_fetch_with_resume::<String, _, _>(
+        let result = run_with_imap_idle_resume::<String, _, _>(
             "account",
+            "body fetch",
             async { Err(Error::Other("fetch failed".into())) },
             async move {
                 resumed_in_future.store(true, Ordering::Relaxed);
@@ -1187,8 +1208,9 @@ mod tests {
 
     #[test]
     fn body_fetch_result_preserves_fetch_error_when_resume_also_fails() {
-        let result = finish_imap_body_fetch::<String>(
+        let result = finish_with_imap_idle_resume::<String>(
             "account",
+            "body fetch",
             Err(Error::Other("fetch failed".into())),
             Err(Error::Other("resume failed".into())),
         );
@@ -1197,8 +1219,9 @@ mod tests {
 
     #[test]
     fn body_fetch_result_returns_resume_error_after_successful_fetch() {
-        let result = finish_imap_body_fetch(
+        let result = finish_with_imap_idle_resume(
             "account",
+            "body fetch",
             Ok("path".to_string()),
             Err(Error::Other("resume failed".into())),
         );
@@ -1207,8 +1230,9 @@ mod tests {
 
     #[test]
     fn body_fetch_result_returns_fetch_error_after_successful_resume() {
-        let result = finish_imap_body_fetch::<String>(
+        let result = finish_with_imap_idle_resume::<String>(
             "account",
+            "body fetch",
             Err(Error::Other("fetch failed".into())),
             Ok(()),
         );
@@ -1217,8 +1241,74 @@ mod tests {
 
     #[test]
     fn body_fetch_result_returns_value_when_fetch_and_resume_succeed() {
-        let result = finish_imap_body_fetch("account", Ok("path"), Ok(()));
+        let result = finish_with_imap_idle_resume("account", "body fetch", Ok("path"), Ok(()));
         assert_eq!(result.unwrap(), "path");
+    }
+
+    #[tokio::test]
+    async fn server_search_failure_still_runs_resume() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let result = run_with_imap_idle_resume::<Vec<String>, _, _>(
+            "account",
+            "server search",
+            async { Err(Error::Other("search failed".into())) },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(resumed.load(Ordering::Relaxed));
+        assert_eq!(result.unwrap_err().to_string(), "search failed");
+    }
+
+    #[tokio::test]
+    async fn dropped_search_waiter_cannot_skip_resume() {
+        let (release_search, search_released) = tokio::sync::oneshot::channel();
+        let (signal_resumed, resumed) = tokio::sync::oneshot::channel();
+        let task = spawn_with_imap_idle_resume(
+            "account".into(),
+            "server search",
+            async move {
+                search_released.await.unwrap();
+                Ok(Vec::<String>::new())
+            },
+            async move {
+                signal_resumed.send(()).unwrap();
+                Ok(())
+            },
+        );
+
+        drop(task);
+        release_search.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), resumed)
+            .await
+            .expect("detached search task did not resume IDLE")
+            .expect("resume signal was dropped");
+    }
+
+    #[tokio::test]
+    async fn panicked_search_cannot_skip_resume() {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed_in_future = resumed.clone();
+        let task = spawn_with_imap_idle_resume::<Vec<String>, _, _>(
+            "account".into(),
+            "server search",
+            async move { panic!("search panic") },
+            async move {
+                resumed_in_future.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        let result = task.await.expect("search owner task panicked");
+        assert!(resumed.load(Ordering::Relaxed));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("server search task failed"));
     }
 
     // A bare name with no slash is a top-level folder.
