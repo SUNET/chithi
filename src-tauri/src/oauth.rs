@@ -764,16 +764,23 @@ pub struct OidcEndpoints {
 /// Discover OIDC endpoints from a JMAP server's .well-known/openid-configuration.
 /// `base_url` should be like "https://mail.example.com".
 pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client build error: {}", e)))?;
+    discover_oidc_with_client(base_url, &client).await
+}
+
+/// Discover OIDC endpoints using the provided HTTP client.
+pub async fn discover_oidc_with_client(
+    base_url: &str,
+    client: &reqwest::Client,
+) -> Result<OidcEndpoints> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         base_url.trim_end_matches('/')
     );
     log::info!("OIDC: discovering endpoints from {}", url);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client build error: {}", e)))?;
 
     let resp = client
         .get(&url)
@@ -849,6 +856,18 @@ pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
 /// Register a client dynamically via RFC 7591.
 /// Returns the assigned `client_id`.
 pub async fn register_oidc_client(registration_endpoint: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+    register_oidc_client_with_client(registration_endpoint, &client).await
+}
+
+/// Register an OIDC client using the provided HTTP client.
+pub async fn register_oidc_client_with_client(
+    registration_endpoint: &str,
+    client: &reqwest::Client,
+) -> Result<String> {
     let body = serde_json::json!({
         "client_name": "Chithi Mail",
         "redirect_uris": [],
@@ -858,11 +877,6 @@ pub async fn register_oidc_client(registration_endpoint: &str) -> Result<String>
     });
 
     log::info!("OIDC: registering client at {}", registration_endpoint);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
 
     let resp = client
         .post(registration_endpoint)
@@ -928,6 +942,19 @@ pub async fn device_auth_start(
     device_auth_endpoint: &str,
     client_id: &str,
 ) -> Result<DeviceAuthResponse> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+    device_auth_start_with_client(device_auth_endpoint, client_id, &client).await
+}
+
+/// Start device authorization using the provided HTTP client.
+pub async fn device_auth_start_with_client(
+    device_auth_endpoint: &str,
+    client_id: &str,
+    client: &reqwest::Client,
+) -> Result<DeviceAuthResponse> {
     if client_id.trim().is_empty() {
         return Err(Error::Other(
             "Device authorization requires a client_id".into(),
@@ -941,11 +968,6 @@ pub async fn device_auth_start(
 
     let mut params = HashMap::new();
     params.insert("client_id", client_id.to_string());
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
 
     let resp = client
         .post(device_auth_endpoint)
@@ -998,7 +1020,26 @@ pub async fn device_auth_poll(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
+    device_auth_poll_with_client(
+        token_endpoint,
+        device_code,
+        interval,
+        expires_in,
+        client_id,
+        &client,
+    )
+    .await
+}
 
+/// Poll for device authorization using the provided HTTP client.
+pub async fn device_auth_poll_with_client(
+    token_endpoint: &str,
+    device_code: &str,
+    interval: u64,
+    expires_in: u64,
+    client_id: &str,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
     let mut current_interval = std::time::Duration::from_secs(interval);
     let mut first_poll = true;
@@ -1496,6 +1537,87 @@ pub fn delete_tokens(account_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::thread::JoinHandle;
+
+    struct TokenRequest {
+        request_line: String,
+        form: Vec<(String, String)>,
+    }
+
+    fn token_server(response_body: &'static str) -> (String, JoinHandle<TokenRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+
+            let mut content_length = None;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header
+                    .strip_prefix("Content-Length:")
+                    .or_else(|| header.strip_prefix("content-length:"))
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+
+            let mut body = vec![0; content_length.expect("request must have Content-Length")];
+            reader.read_exact(&mut body).unwrap();
+            let mut form: Vec<_> = url::form_urlencoded::parse(&body).into_owned().collect();
+            form.sort();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+
+            TokenRequest {
+                request_line: request_line.trim_end().to_string(),
+                form,
+            }
+        });
+        (format!("http://{address}/token"), handle)
+    }
+
+    fn provider_at(
+        provider: &OAuthProvider,
+        token_url: String,
+        client_id: &'static str,
+        client_secret: &'static str,
+    ) -> OAuthProvider {
+        OAuthProvider {
+            name: provider.name,
+            client_id,
+            client_secret,
+            auth_url: provider.auth_url,
+            token_url: Box::leak(token_url.into_boxed_str()),
+            scopes: provider.scopes,
+            token_exchange_scope: provider.token_exchange_scope,
+            use_pkce: provider.use_pkce,
+            redirect_host: provider.redirect_host,
+            redirect_fixed_port: provider.redirect_fixed_port,
+            redirect_url_override: provider.redirect_url_override,
+        }
+    }
+
+    fn sorted_form(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut form: Vec<_> = entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        form.sort();
+        form
+    }
 
     fn is_flagged(account_id: &str) -> bool {
         reauth_registry()
@@ -1696,6 +1818,131 @@ mod tests {
     fn test_non_microsoft_providers_omit_token_exchange_scope() {
         assert!(GOOGLE.token_exchange_scope.is_none());
         assert!(ZOOM.token_exchange_scope.is_none());
+    }
+
+    #[tokio::test]
+    async fn google_code_exchange_sends_exact_form_without_scope() {
+        let (token_url, request) = token_server(
+            r#"{"access_token":"test-access","refresh_token":"test-refresh","expires_in":3600}"#,
+        );
+        let provider = provider_at(
+            &GOOGLE,
+            token_url,
+            "test-google-client",
+            "test-google-secret",
+        );
+        let client = reqwest::Client::new();
+
+        let tokens =
+            exchange_code_with_client(&provider, "test-code", 4567, Some("test-verifier"), &client)
+                .await
+                .unwrap();
+
+        assert_eq!(tokens.refresh_token.as_deref(), Some("test-refresh"));
+        let request = request.join().unwrap();
+        assert_eq!(request.request_line, "POST /token HTTP/1.1");
+        assert_eq!(
+            request.form,
+            sorted_form(&[
+                ("client_id", "test-google-client"),
+                ("client_secret", "test-google-secret"),
+                ("code", "test-code"),
+                ("code_verifier", "test-verifier"),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", "http://localhost:4567"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn microsoft_code_exchange_sends_graph_scope_without_secret() {
+        let (token_url, request) = token_server(r#"{"access_token":"test-access"}"#);
+        let provider = provider_at(&MICROSOFT, token_url, "test-ms-client", "");
+        let client = reqwest::Client::new();
+
+        exchange_code_with_client(&provider, "test-code", 7654, Some("test-verifier"), &client)
+            .await
+            .unwrap();
+
+        let request = request.join().unwrap();
+        assert_eq!(request.request_line, "POST /token HTTP/1.1");
+        assert_eq!(
+            request.form,
+            sorted_form(&[
+                ("client_id", "test-ms-client"),
+                ("code", "test-code"),
+                ("code_verifier", "test-verifier"),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", "http://localhost:7654"),
+                ("scope", MICROSOFT_GRAPH_SCOPES),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_outlook_refresh_preserves_refresh_token() {
+        let (token_url, request) = token_server(r#"{"access_token":"test-access"}"#);
+        let provider = provider_at(&MICROSOFT, token_url, "test-ms-client", "");
+        let client = reqwest::Client::new();
+
+        let tokens = refresh_with_scopes_with_client(
+            &provider,
+            "test-original-refresh",
+            MICROSOFT_IMAP_SCOPES,
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tokens.refresh_token.as_deref(),
+            Some("test-original-refresh")
+        );
+        let request = request.join().unwrap();
+        assert_eq!(request.request_line, "POST /token HTTP/1.1");
+        assert_eq!(
+            request.form,
+            sorted_form(&[
+                ("client_id", "test-ms-client"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "test-original-refresh"),
+                ("scope", MICROSOFT_IMAP_SCOPES),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_graph_refresh_uses_rotated_refresh_token() {
+        let (token_url, request) = token_server(
+            r#"{"access_token":"test-access","refresh_token":"test-rotated-refresh"}"#,
+        );
+        let provider = provider_at(&MICROSOFT, token_url, "test-ms-client", "");
+        let client = reqwest::Client::new();
+
+        let tokens = refresh_with_scopes_with_client(
+            &provider,
+            "test-original-refresh",
+            MICROSOFT_GRAPH_SCOPES,
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tokens.refresh_token.as_deref(),
+            Some("test-rotated-refresh")
+        );
+        let request = request.join().unwrap();
+        assert_eq!(request.request_line, "POST /token HTTP/1.1");
+        assert_eq!(
+            request.form,
+            sorted_form(&[
+                ("client_id", "test-ms-client"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "test-original-refresh"),
+                ("scope", MICROSOFT_GRAPH_SCOPES),
+            ])
+        );
     }
 
     #[test]

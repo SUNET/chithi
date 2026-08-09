@@ -8,12 +8,8 @@
 //! storing the resulting tokens in the keyring under the new
 //! account id.
 //!
-//! Refresh: Zoom access tokens expire after 60 minutes. Each
-//! `create_url` call inspects the cached `expires_at` and runs
-//! `oauth::refresh_access_token(&oauth::ZOOM, refresh_token)`
-//! when the access token is within a minute of expiry. The
-//! refreshed pair is written back to the keyring so the next
-//! call picks them up.
+//! Refresh: Zoom access tokens expire after 60 minutes. The injected
+//! provider credential service serializes refresh and persistence per account.
 //!
 //! [create-meeting]: https://developers.zoom.us/docs/api/meetings/methods/#tag/meetings/POST/users/{userId}/meetings
 
@@ -284,34 +280,6 @@ async fn api_update_meeting_schedule_with_client(
     )))
 }
 
-/// Get a fresh Zoom access token for `account_id`, refreshing
-/// against `oauth::ZOOM.token_url` when the cached one is
-/// expired (or about to be — `is_expired` carries a 60-second
-/// safety margin). Persists the new pair to the keyring.
-pub async fn get_access_token(account_id: &str) -> Result<String> {
-    get_access_token_with_client(account_id, http_client()?).await
-}
-
-/// Load or refresh a Zoom token using an explicit HTTP client.
-pub async fn get_access_token_with_client(
-    account_id: &str,
-    client: &reqwest::Client,
-) -> Result<String> {
-    let tokens = crate::oauth::load_tokens(account_id)?
-        .ok_or_else(|| Error::Other("Zoom: no tokens in keyring; sign in again".into()))?;
-    if !tokens.is_expired() {
-        return Ok(tokens.access_token);
-    }
-    let refresh_token = tokens.refresh_token.ok_or_else(|| {
-        Error::Other("Zoom: access token expired and no refresh token; sign in again".into())
-    })?;
-    let new_tokens =
-        crate::oauth::refresh_access_token_with_client(&crate::oauth::ZOOM, &refresh_token, client)
-            .await?;
-    crate::oauth::store_tokens(account_id, &new_tokens)?;
-    Ok(new_tokens.access_token)
-}
-
 fn zoom_api_url(api_root: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -426,6 +394,51 @@ impl crate::meet::MeetProvider for ZoomProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn mock_server(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[test]
     fn zoom_api_url_normalizes_boundary_slashes() {
@@ -433,5 +446,42 @@ mod tests {
             zoom_api_url("http://localhost:1234/v2/", "/users/me/meetings"),
             "http://localhost:1234/v2/users/me/meetings"
         );
+    }
+
+    #[tokio::test]
+    async fn create_meeting_uses_injected_root_and_bearer_auth() {
+        let (root, server) = mock_server(
+            "201 Created",
+            r#"{"id":123456,"join_url":"https://zoom.example/j/123456"}"#,
+        );
+        let api_root = format!("{root}/injected/v2/");
+
+        let result = create_meeting_with_client(
+            "zoom-token",
+            "Planning",
+            Some("2026-08-10T09:00:00Z"),
+            Some(45),
+            &reqwest::Client::new(),
+            &api_root,
+        )
+        .await
+        .unwrap();
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert!(headers.starts_with("POST /injected/v2/users/me/meetings HTTP/1.1\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer zoom-token"));
+        assert_eq!(payload["topic"], "Planning");
+        assert_eq!(payload["type"], 2);
+        assert_eq!(payload["start_time"], "2026-08-10T09:00:00Z");
+        assert_eq!(payload["timezone"], "UTC");
+        assert_eq!(payload["duration"], 45);
+        assert_eq!(payload["settings"]["join_before_host"], true);
+        assert_eq!(payload["settings"]["waiting_room"], false);
+        assert_eq!(result.meeting_id, "123456");
+        assert_eq!(result.join_url, "https://zoom.example/j/123456");
     }
 }

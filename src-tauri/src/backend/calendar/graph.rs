@@ -64,12 +64,21 @@ impl CalendarBackend for GraphCalendarBackend {
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
     ) -> Result<CalendarCapability<Vec<RoomSuggestion>>> {
-        let rooms = ctx
+        let client = match ctx
             .services
             .graph_client(&account.id, GraphTokenPurpose::Rooms)
-            .await?
-            .list_rooms()
-            .await?;
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!(
+                    "list_room_suggestions: room credentials unavailable, allowing free text: {}",
+                    error
+                );
+                return Ok(CalendarCapability::Supported(Vec::new()));
+            }
+        };
+        let rooms = client.list_rooms().await?;
         Ok(CalendarCapability::Supported(
             rooms
                 .into_iter()
@@ -87,10 +96,25 @@ impl CalendarBackend for GraphCalendarBackend {
         account: &AccountFull,
         request: &RoomAvailabilityRequest,
     ) -> Result<CalendarCapability<RoomAvailability>> {
-        let availability = ctx
+        let client = match ctx
             .services
             .graph_client(&account.id, GraphTokenPurpose::Rooms)
-            .await?
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!(
+                    "check_room_availability: room credentials unavailable: {}",
+                    error
+                );
+                return Ok(CalendarCapability::Supported(RoomAvailability {
+                    state: "unknown".into(),
+                    busy_start: None,
+                    busy_end: None,
+                }));
+            }
+        };
+        let availability = client
             .get_room_availability(
                 &request.room_address,
                 &request.start_time,

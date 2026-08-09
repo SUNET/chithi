@@ -136,7 +136,37 @@ fn join_url(root: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod endpoint_tests {
-    use super::GraphEndpoints;
+    use super::{GraphClient, GraphEndpoints};
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(response_body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/injected", listener.local_addr().unwrap());
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        (root, request)
+    }
 
     #[test]
     fn defaults_to_production_graph_roots() {
@@ -159,6 +189,55 @@ mod endpoint_tests {
             endpoints.beta_url("me/findRooms"),
             "http://localhost:8080/beta/me/findRooms"
         );
+    }
+
+    #[tokio::test]
+    async fn calendar_request_uses_injected_root_client_and_graph_wire_format() {
+        let (root, captured) = serve_once(r#"{"value":[]}"#).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-injected-client", HeaderValue::from_static("graph-test"));
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let client = GraphClient::with_client(
+            http,
+            "test-access-token",
+            GraphEndpoints::new(&root, "http://127.0.0.1:1/unused-beta"),
+        );
+
+        let events = client
+            .list_events_for_calendar(
+                "team@example.org",
+                "2026-08-09T00:00:00Z",
+                "2026-08-10T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+
+        let request = captured.await.unwrap();
+        let mut lines = request.lines();
+        let request_line = lines.next().unwrap();
+        let target = request_line.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+
+        assert_eq!(request_line.split_whitespace().next(), Some("GET"));
+        assert_eq!(
+            url.path(),
+            "/injected/me/calendars/team%40example.org/calendarView"
+        );
+        assert_eq!(query.get("startDateTime").unwrap(), "2026-08-09T00:00:00Z");
+        assert_eq!(query.get("endDateTime").unwrap(), "2026-08-10T00:00:00Z");
+        assert_eq!(query.get("$top").unwrap(), "100");
+        assert_eq!(query.get("$orderby").unwrap(), "start/dateTime");
+        assert!(query.get("$select").unwrap().contains("responseStatus"));
+
+        let headers = request.to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-access-token\r\n"));
+        assert!(headers.contains("x-injected-client: graph-test\r\n"));
+        assert!(headers.contains("prefer: outlook.timezone=\"utc\"\r\n"));
     }
 }
 
@@ -2882,70 +2961,6 @@ pub fn contact_to_graph_json(
         gc["jobTitle"] = serde_json::json!(t);
     }
     gc
-}
-
-/// Get a valid Graph API access token for an O365 account.
-/// Always refreshes with Graph-specific scopes because the stored token
-/// may be IMAP-scoped (both share the same keyring entry and refresh token).
-pub async fn get_graph_token(account_id: &str) -> Result<String> {
-    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_SCOPES, true).await
-}
-
-/// Like [`get_graph_token`] but requests the room scopes (`Place.Read.All`).
-///
-/// Accounts that signed in before room support existed never consented to
-/// `Place.Read.All`, so this refresh fails them with consent_required. That
-/// is expected: callers (room suggestion/availability commands) treat the
-/// error as "rooms unavailable" and never let it disrupt baseline Graph
-/// operations, which keep using the consent-safe [`get_graph_token`].
-/// Because this whole scope set is optional, failures here never latch the
-/// re-auth flag — a room lookup must not be able to take down mail sync.
-pub async fn get_graph_token_for_rooms(account_id: &str) -> Result<String> {
-    get_graph_token_with_scopes(account_id, crate::oauth::MICROSOFT_GRAPH_ROOM_SCOPES, false).await
-}
-
-async fn get_graph_token_with_scopes(
-    account_id: &str,
-    scopes: &str,
-    latch_reauth: bool,
-) -> Result<String> {
-    // Dead refresh token (invalid_grant)? Fail fast without a network call
-    // until the user signs in again — see oauth::auth_required_on_invalid_grant.
-    crate::oauth::ensure_not_reauth_required(account_id)?;
-
-    let tokens = crate::oauth::load_tokens(account_id)?.ok_or_else(|| {
-        Error::Other("No O365 OAuth tokens. Please sign in with Microsoft.".into())
-    })?;
-
-    let refresh_token = tokens
-        .refresh_token
-        .ok_or_else(|| Error::Other("No refresh token for O365. Please sign in again.".into()))?;
-
-    // Always refresh with Graph scopes — the cached token is likely IMAP-scoped
-    let new_tokens =
-        crate::oauth::refresh_with_scopes(&crate::oauth::MICROSOFT, &refresh_token, scopes)
-            .await
-            .map_err(|e| {
-                if latch_reauth {
-                    crate::oauth::auth_required_on_invalid_grant(account_id, e)
-                } else {
-                    e
-                }
-            })?;
-    // Don't overwrite the stored tokens — IMAP sync needs the IMAP-scoped token.
-    // The refresh_token may rotate, so save that part only.
-    if new_tokens.refresh_token.is_some() {
-        crate::oauth::store_tokens(
-            account_id,
-            &crate::oauth::OAuthTokens {
-                access_token: tokens.access_token, // Keep the IMAP token as stored
-                refresh_token: new_tokens.refresh_token,
-                expires_at: tokens.expires_at,
-            },
-        )?;
-    }
-
-    Ok(new_tokens.access_token)
 }
 
 #[cfg(test)]

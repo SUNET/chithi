@@ -3,7 +3,6 @@ use tauri::{Emitter, State};
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::mail::jmap::JmapConnection;
 use crate::mail::msgid::normalize_message_id;
 use crate::mail::smtp;
 use crate::state::AppState;
@@ -217,32 +216,18 @@ pub async fn send_message(
     // the inlined attachment bytes (potentially many MB).
     let raw_message: std::sync::Arc<[u8]> = raw_message.into();
 
-    // For O365 SMTP: refresh OAuth token now (needs keyring access)
-    let smtp_creds =
-        if account.mail_protocol_str() != "jmap" && account.auth_method == "oauth-microsoft" {
-            let tokens = crate::oauth::load_tokens(&account_id)?
-                .ok_or_else(|| Error::Other("No O365 tokens for SMTP".into()))?;
-            let refresh_token = tokens
-                .refresh_token
-                .ok_or_else(|| Error::Other("No O365 refresh token for SMTP".into()))?;
-            let smtp_tokens = crate::oauth::refresh_with_scopes(
-                &crate::oauth::MICROSOFT,
-                &refresh_token,
-                crate::oauth::MICROSOFT_IMAP_SCOPES,
-            )
-            .await?;
-            crate::oauth::store_tokens(
-                &account_id,
-                &crate::oauth::OAuthTokens {
-                    access_token: smtp_tokens.access_token.clone(),
-                    refresh_token: smtp_tokens.refresh_token,
-                    expires_at: smtp_tokens.expires_at,
-                },
-            )?;
-            Some((account.username.clone(), smtp_tokens.access_token, true))
-        } else {
-            None
-        };
+    // Resolve SMTP credentials now because OAuth refresh needs keyring access.
+    let smtp_creds = if account.mail_protocol_str() != "jmap" {
+        Some(
+            state
+                .providers
+                .credentials()
+                .mail_credentials(&account)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     // Notify main window that send is starting
     let subject_display = if message.subject.is_empty() {
@@ -304,6 +289,7 @@ pub async fn send_message(
     let account_id_bg = account_id.clone();
     let subject_bg = subject_display.clone();
     let db_bg = state.db.clone();
+    let providers_bg = state.providers.clone();
     // Capture the worker's op-sender now so the spawn can enqueue a
     // Sent-folder sync after a successful APPEND (#189). `state` is
     // not `'static`, so the sender must be cloned out before the move.
@@ -317,14 +303,8 @@ pub async fn send_message(
 
     tokio::spawn(async move {
         let result: std::result::Result<(), Error> = async {
-            if account.mail_protocol_str() == "jmap" {
-                log::info!("Sending via JMAP for account {}", account.email);
-                let jmap_config = crate::auth::build_jmap_config(&account).await?;
-                let conn_jmap = JmapConnection::connect(&jmap_config).await?;
-                conn_jmap.send_email(&jmap_config, &raw_message).await?;
-            } else {
-                let (smtp_username, smtp_password, use_xoauth2) = smtp_creds
-                    .unwrap_or_else(|| (account.username.clone(), account.password.clone(), false));
+            if let Some(smtp_creds) = smtp_creds {
+                let smtp_username = account.username.clone();
 
                 log::info!(
                     "Sending via SMTP {}:{} as {}",
@@ -341,9 +321,9 @@ pub async fn send_message(
                     &account.smtp_host,
                     account.smtp_port,
                     &smtp_username,
-                    &smtp_password,
+                    &smtp_creds.secret,
                     account.use_tls,
-                    use_xoauth2,
+                    smtp_creds.use_xoauth2,
                     &account.email,
                     &message.to,
                     &message.cc,
@@ -371,9 +351,9 @@ pub async fn send_message(
                     host: account.imap_host.clone(),
                     port: account.imap_port,
                     username: smtp_username.clone(),
-                    password: smtp_password.clone(),
+                    password: smtp_creds.secret.clone(),
                     use_tls: account.use_tls,
-                    use_xoauth2,
+                    use_xoauth2: smtp_creds.use_xoauth2,
                 };
                 // `Arc::clone` of `Arc<[u8]>` is a refcount bump — does
                 // not duplicate the inlined-attachment bytes (which can
@@ -435,6 +415,10 @@ pub async fn send_message(
                         );
                     }
                 }
+            } else {
+                log::info!("Sending via JMAP for account {}", account.email);
+                let (jmap_config, conn_jmap) = providers_bg.jmap_client(&account).await?;
+                conn_jmap.send_email(&jmap_config, &raw_message).await?;
             }
             Ok(())
         }

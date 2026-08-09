@@ -442,7 +442,11 @@ async fn sync_graph_folder_delta(
     // the next cycle.
     if !new_ids.is_empty() {
         match crate::filters::service::apply_filters_to_new_messages(
-            db_arc, account_id, &gf.id, &new_ids,
+            db_arc,
+            ctx.providers.as_ref(),
+            account_id,
+            &gf.id,
+            &new_ids,
         )
         .await
         {

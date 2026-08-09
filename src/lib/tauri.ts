@@ -600,8 +600,7 @@ export async function syncContacts(accountId: string): Promise<void> {
 
 export interface TalkLoginStart {
   login_url: string;
-  poll_endpoint: string;
-  poll_token: string;
+  session_id: string;
 }
 
 export async function meetTalkLoginStart(
@@ -611,13 +610,11 @@ export async function meetTalkLoginStart(
 }
 
 export async function meetTalkLoginComplete(
-  pollEndpoint: string,
-  pollToken: string,
+  sessionId: string,
   displayName?: string,
 ): Promise<string> {
   return invoke("meet_talk_login_complete", {
-    pollEndpoint,
-    pollToken,
+    sessionId,
     displayName: displayName ?? null,
   });
 }
@@ -634,12 +631,10 @@ export async function meetMatrixLoginStart(
 }
 
 export async function meetMatrixLoginComplete(
-  homeserverUrl: string,
   port: number,
   displayName?: string,
 ): Promise<string> {
   return invoke("meet_matrix_login_complete", {
-    homeserverUrl,
     port,
     displayName: displayName ?? null,
   });
@@ -714,13 +709,6 @@ export async function oauthComplete(
   accountId: string,
 ): Promise<void> {
   return invoke("oauth_complete", { provider, port, accountId });
-}
-
-export async function oauthGetToken(
-  provider: string,
-  accountId: string,
-): Promise<string> {
-  return invoke("oauth_get_token", { provider, accountId });
 }
 
 export async function oauthHasTokens(

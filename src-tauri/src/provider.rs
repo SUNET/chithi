@@ -181,6 +181,7 @@ pub trait ProviderCredentials: Send + Sync {
 pub struct ProviderCredentialService {
     tokens: Arc<dyn OAuthTokenStore>,
     endpoint: Arc<dyn TokenEndpointClient>,
+    account_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Shared HTTP transports and test-overridable provider API endpoints.
@@ -193,6 +194,8 @@ pub struct ProviderTransports {
     pub jmap_discovery_http: reqwest::Client,
     pub jmap_api_http: reqwest::Client,
     pub jmap_sse_http: reqwest::Client,
+    pub oidc_http: reqwest::Client,
+    pub oidc_poll_http: reqwest::Client,
     pub dav_http: reqwest::Client,
     pub zoom_http: reqwest::Client,
     pub zoom_api_root: String,
@@ -223,6 +226,14 @@ impl ProviderTransports {
             jmap_sse_http: reqwest::Client::builder()
                 .build()
                 .map_err(|error| Error::Other(error.to_string()))?,
+            oidc_http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|error| Error::Other(format!("HTTP client build error: {}", error)))?,
+            oidc_poll_http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|error| Error::Other(format!("HTTP client build error: {}", error)))?,
             dav_http: crate::mail::dav_http::build_dav_client()?,
             zoom_http: build_meet_http_client("zoom")?,
             zoom_api_root: "https://api.zoom.us/v2".into(),
@@ -243,26 +254,51 @@ fn build_meet_http_client(provider: &str) -> Result<reqwest::Client> {
 /// Focused provider dependencies shared by backend and meet contexts.
 pub struct ProviderServices {
     credentials: Arc<dyn ProviderCredentials>,
+    token_store: Arc<dyn OAuthTokenStore>,
+    token_endpoint: Arc<dyn TokenEndpointClient>,
     pub transports: ProviderTransports,
 }
 
 impl ProviderServices {
-    pub fn new(credentials: Arc<dyn ProviderCredentials>, transports: ProviderTransports) -> Self {
+    pub fn new(
+        credentials: Arc<dyn ProviderCredentials>,
+        token_store: Arc<dyn OAuthTokenStore>,
+        token_endpoint: Arc<dyn TokenEndpointClient>,
+        transports: ProviderTransports,
+    ) -> Self {
         Self {
             credentials,
+            token_store,
+            token_endpoint,
             transports,
         }
     }
 
     pub fn production() -> Result<Self> {
+        let token_endpoint: Arc<dyn TokenEndpointClient> =
+            Arc::new(ReqwestTokenEndpointClient::production()?);
+        let token_store: Arc<dyn OAuthTokenStore> = Arc::new(SystemOAuthTokenStore);
         Ok(Self::new(
-            Arc::new(ProviderCredentialService::production()?),
+            Arc::new(ProviderCredentialService::new(
+                token_store.clone(),
+                token_endpoint.clone(),
+            )),
+            token_store,
+            token_endpoint,
             ProviderTransports::production()?,
         ))
     }
 
     pub fn credentials(&self) -> &dyn ProviderCredentials {
         self.credentials.as_ref()
+    }
+
+    pub fn token_endpoint(&self) -> &dyn TokenEndpointClient {
+        self.token_endpoint.as_ref()
+    }
+
+    pub fn token_store(&self) -> &dyn OAuthTokenStore {
+        self.token_store.as_ref()
     }
 
     pub async fn graph_client(
@@ -345,7 +381,11 @@ impl ProviderServices {
 
 impl ProviderCredentialService {
     pub fn new(tokens: Arc<dyn OAuthTokenStore>, endpoint: Arc<dyn TokenEndpointClient>) -> Self {
-        Self { tokens, endpoint }
+        Self {
+            tokens,
+            endpoint,
+            account_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn production() -> Result<Self> {
@@ -361,11 +401,22 @@ impl ProviderCredentialService {
             .ok_or_else(|| Error::Other(missing_message.into()))
     }
 
+    fn account_lock(&self, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.account_locks
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     async fn jmap_oidc_access_token(&self, account: &AccountFull) -> Result<Option<String>> {
         if account.jmap_auth_method != "oidc" {
             return Ok(None);
         }
 
+        let account_lock = self.account_lock(&account.id);
+        let _guard = account_lock.lock().await;
         let tokens =
             self.required_tokens(&account.id, "No OIDC tokens found. Please sign in again.")?;
         if !tokens.is_expired() {
@@ -402,6 +453,8 @@ impl ProviderCredentialService {
 #[async_trait]
 impl ProviderCredentials for ProviderCredentialService {
     async fn google_access_token(&self, account_id: &str) -> Result<String> {
+        let account_lock = self.account_lock(account_id);
+        let _guard = account_lock.lock().await;
         let tokens = self.required_tokens(
             account_id,
             "No Google OAuth tokens. Please sign in with Google in Settings.",
@@ -426,6 +479,8 @@ impl ProviderCredentials for ProviderCredentialService {
         account_id: &str,
         purpose: GraphTokenPurpose,
     ) -> Result<String> {
+        let account_lock = self.account_lock(account_id);
+        let _guard = account_lock.lock().await;
         crate::oauth::ensure_not_reauth_required(account_id)?;
         let tokens = self.required_tokens(
             account_id,
@@ -471,6 +526,8 @@ impl ProviderCredentials for ProviderCredentialService {
             });
         }
 
+        let account_lock = self.account_lock(&account.id);
+        let _guard = account_lock.lock().await;
         crate::oauth::ensure_not_reauth_required(&account.id)?;
         let tokens = self.required_tokens(
             &account.id,
@@ -509,6 +566,8 @@ impl ProviderCredentials for ProviderCredentialService {
         token_endpoint: &str,
         client_id: &str,
     ) -> Result<Option<String>> {
+        let account_lock = self.account_lock(account_id);
+        let _guard = account_lock.lock().await;
         let Some(tokens) = self.tokens.load(account_id)? else {
             return Ok(None);
         };
@@ -530,6 +589,8 @@ impl ProviderCredentials for ProviderCredentialService {
     }
 
     async fn zoom_access_token(&self, account_id: &str) -> Result<String> {
+        let account_lock = self.account_lock(account_id);
+        let _guard = account_lock.lock().await;
         let tokens =
             self.required_tokens(account_id, "Zoom: no tokens in keyring; sign in again")?;
         if !tokens.is_expired() {
@@ -599,6 +660,84 @@ mod tests {
     struct FakeTokenEndpoint {
         refreshed: OAuthTokens,
         scopes: Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
+    struct BlockingRotatingEndpoint {
+        refresh_tokens: Mutex<Vec<String>>,
+        first_entered: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+    }
+
+    impl BlockingRotatingEndpoint {
+        fn refreshed_tokens(refresh_token: &str) -> OAuthTokens {
+            match refresh_token {
+                "stored-refresh" => OAuthTokens {
+                    access_token: "first-access".into(),
+                    refresh_token: Some("rotated-refresh".into()),
+                    expires_at: Some(0),
+                },
+                "rotated-refresh" => OAuthTokens {
+                    access_token: "second-access".into(),
+                    refresh_token: Some("rotated-refresh-again".into()),
+                    expires_at: Some(i64::MAX),
+                },
+                "other-refresh" => OAuthTokens {
+                    access_token: "other-access".into(),
+                    refresh_token: Some("other-rotated-refresh".into()),
+                    expires_at: Some(i64::MAX),
+                },
+                other => panic!("unexpected refresh token: {other}"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TokenEndpointClient for BlockingRotatingEndpoint {
+        async fn exchange_code(
+            &self,
+            _provider: &OAuthProvider,
+            _code: &str,
+            _port: u16,
+            _code_verifier: Option<&str>,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &OAuthProvider,
+            refresh_token: &str,
+        ) -> Result<OAuthTokens> {
+            let is_first = {
+                let mut refresh_tokens = self.refresh_tokens.lock().unwrap();
+                refresh_tokens.push(refresh_token.to_string());
+                refresh_tokens.len() == 1
+            };
+            if is_first {
+                self.first_entered.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok(Self::refreshed_tokens(refresh_token))
+        }
+
+        async fn refresh_scoped(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+            _scopes: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh_dynamic(
+            &self,
+            _token_url: &str,
+            _refresh_token: &str,
+            _client_id: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
     }
 
     #[async_trait]
@@ -705,6 +844,85 @@ mod tests {
         assert_eq!(stored.access_token, "stored-access");
         assert_eq!(stored.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(stored.expires_at, Some(0));
+    }
+
+    #[tokio::test]
+    async fn same_account_refreshes_serialize_and_observe_rotation() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("account", &expired_tokens()).unwrap();
+        let endpoint = Arc::new(BlockingRotatingEndpoint::default());
+        let credentials = Arc::new(ProviderCredentialService::new(
+            store.clone(),
+            endpoint.clone(),
+        ));
+
+        let first_credentials = credentials.clone();
+        let first =
+            tokio::spawn(async move { first_credentials.google_access_token("account").await });
+        endpoint.first_entered.notified().await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let second_credentials = credentials.clone();
+        let second = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            second_credentials.google_access_token("account").await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *endpoint.refresh_tokens.lock().unwrap(),
+            vec!["stored-refresh"]
+        );
+
+        endpoint.release_first.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), "first-access");
+        assert_eq!(second.await.unwrap().unwrap(), "second-access");
+        assert_eq!(
+            *endpoint.refresh_tokens.lock().unwrap(),
+            vec!["stored-refresh", "rotated-refresh"]
+        );
+        assert_eq!(
+            store
+                .load("account")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("rotated-refresh-again")
+        );
+    }
+
+    #[tokio::test]
+    async fn different_account_refresh_locks_are_independent() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("blocked", &expired_tokens()).unwrap();
+        store
+            .store(
+                "other",
+                &OAuthTokens {
+                    access_token: "other-stored-access".into(),
+                    refresh_token: Some("other-refresh".into()),
+                    expires_at: Some(0),
+                },
+            )
+            .unwrap();
+        let endpoint = Arc::new(BlockingRotatingEndpoint::default());
+        let credentials = Arc::new(ProviderCredentialService::new(store, endpoint.clone()));
+
+        let blocked_credentials = credentials.clone();
+        let blocked =
+            tokio::spawn(async move { blocked_credentials.google_access_token("blocked").await });
+        endpoint.first_entered.notified().await;
+
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            credentials.google_access_token("other"),
+        )
+        .await;
+        endpoint.release_first.notify_one();
+
+        assert_eq!(other.unwrap().unwrap(), "other-access");
+        assert_eq!(blocked.await.unwrap().unwrap(), "first-access");
     }
 
     #[tokio::test]

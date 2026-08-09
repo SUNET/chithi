@@ -9,36 +9,6 @@ use crate::ops::flags::{AccountReadScope, FlagMutation, FlagTarget};
 use crate::ops::queue::{MailOp, OpEntry, OpPriority};
 use crate::state::AppState;
 
-/// Build an ImapConfig for an account, handling O365 XOAUTH2 token refresh.
-async fn build_imap_config(account: &db::accounts::AccountFull) -> Result<ImapConfig> {
-    let (password, use_xoauth2) = if account.auth_method == "oauth-microsoft" {
-        let tokens = crate::oauth::load_tokens(&account.id)?
-            .ok_or_else(|| Error::Other("No O365 tokens".into()))?;
-        let refresh = tokens
-            .refresh_token
-            .ok_or_else(|| Error::Other("No O365 refresh token".into()))?;
-        let new = crate::oauth::refresh_with_scopes(
-            &crate::oauth::MICROSOFT,
-            &refresh,
-            crate::oauth::MICROSOFT_IMAP_SCOPES,
-        )
-        .await?;
-        crate::oauth::store_tokens(&account.id, &new)?;
-        (new.access_token, true)
-    } else {
-        (account.password.clone(), false)
-    };
-    let imap = account.mail_imap_config().unwrap_or_default();
-    Ok(ImapConfig {
-        host: imap.imap_host,
-        port: imap.imap_port,
-        username: account.username.clone(),
-        password,
-        use_tls: imap.use_tls,
-        use_xoauth2,
-    })
-}
-
 /// Move messages to a target folder on the IMAP/JMAP server and update local DB.
 ///
 /// Uses optimistic UI: the local DB is updated and events emitted immediately
@@ -370,7 +340,20 @@ pub async fn move_messages_cross_account(
     match target_account.mail_protocol.as_str() {
         "imap" => {
             // IMAP: read and append in a single blocking task (one connection)
-            let imap_config = build_imap_config(&target_account).await?;
+            let credentials = state
+                .providers
+                .credentials()
+                .mail_credentials(&target_account)
+                .await?;
+            let imap = target_account.mail_imap_config().unwrap_or_default();
+            let imap_config = ImapConfig {
+                host: imap.imap_host,
+                port: imap.imap_port,
+                username: target_account.username.clone(),
+                password: credentials.secret,
+                use_tls: imap.use_tls,
+                use_xoauth2: credentials.use_xoauth2,
+            };
             let target_folder_clone = target_folder.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = ImapConnection::connect(&imap_config)?;
@@ -388,8 +371,7 @@ pub async fn move_messages_cross_account(
         }
         "jmap" => {
             // JMAP: read each message in a blocking task, then import async
-            let jmap_config = crate::auth::build_jmap_config(&target_account).await?;
-            let conn_jmap = crate::mail::jmap::JmapConnection::connect(&jmap_config).await?;
+            let (jmap_config, conn_jmap) = state.providers.jmap_client(&target_account).await?;
             for path in &validated_paths {
                 let path_clone = path.clone();
                 let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path_clone))

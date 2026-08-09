@@ -49,6 +49,92 @@ pub struct JmapConfig {
 #[cfg(test)]
 mod connect_tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    async fn session_server() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let body = serde_json::json!({
+            "apiUrl": "http://127.0.0.1:9/jmap/api",
+            "downloadUrl": "http://127.0.0.1:9/jmap/download/{blobId}",
+            "uploadUrl": "http://127.0.0.1:9/jmap/upload/{accountId}",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "account-1" }
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+        });
+
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    async fn connect_to_mock(access_token: Option<&str>) -> (JmapConnection, String) {
+        let (base_url, request_rx) = session_server().await;
+        let config = JmapConfig {
+            jmap_url: format!("{}/.well-known/jmap/", base_url),
+            email: "user@example.com".into(),
+            username: "user".into(),
+            password: "pass".into(),
+            access_token: access_token.map(str::to_string),
+            auth_method: if access_token.is_some() {
+                "bearer".into()
+            } else {
+                "basic".into()
+            },
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let discovery_http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-injected-client", HeaderValue::from_static("jmap-test"));
+        let api_http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+
+        let connection = JmapConnection::connect_with_clients(&config, discovery_http, api_http)
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+        assert_eq!(connection.account_id(), "account-1");
+        assert_eq!(connection.api_url, format!("{}/jmap/api", base_url));
+        assert!(request.starts_with("GET /.well-known/jmap HTTP/1.1\r\n"));
+        assert_eq!(header(&request, "x-injected-client"), Some("jmap-test"));
+        (connection, request)
+    }
 
     fn http_config() -> JmapConfig {
         JmapConfig {
@@ -116,6 +202,21 @@ mod connect_tests {
             .unwrap();
 
         assert_eq!(base_url, "https://api.example.com");
+    }
+
+    #[tokio::test]
+    async fn configured_session_uses_injected_client_and_basic_auth() {
+        let (_, request) = connect_to_mock(None).await;
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Basic dXNlcjpwYXNz")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_session_uses_injected_client_and_bearer_auth() {
+        let (_, request) = connect_to_mock(Some("token-1")).await;
+        assert_eq!(header(&request, "authorization"), Some("Bearer token-1"));
     }
 }
 

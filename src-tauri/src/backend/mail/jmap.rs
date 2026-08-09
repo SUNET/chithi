@@ -71,6 +71,7 @@ impl MailBackend for JmapMailBackend {
             ctx.data_dir.clone(),
             account.id.clone(),
             account.display_name.clone(),
+            ctx.providers.clone(),
             jmap_config,
             connection,
             current_folder,
@@ -91,6 +92,7 @@ impl MailBackend for JmapMailBackend {
             account.id.clone(),
             account.display_name.clone(),
             folder_path.to_string(),
+            ctx.providers.clone(),
             jmap_config,
             connection,
         )

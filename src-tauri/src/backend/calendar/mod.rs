@@ -578,7 +578,7 @@ mod contract_tests {
     }
 
     #[tokio::test]
-    async fn supported_scheduling_capabilities_attempt_provider_auth() {
+    async fn scheduling_capabilities_apply_provider_auth_policy() {
         let (_dir, db) = temp_pool();
         let graph = account("calendar", "graph");
         let google = account("calendar", "google");
@@ -596,19 +596,29 @@ mod contract_tests {
             .get_participant_schedules(&ctx(&db), &google, &request)
             .await
             .is_err());
-        assert!(graph::GraphCalendarBackend
-            .list_room_suggestions(&ctx(&db), &graph)
-            .await
-            .is_err());
+        assert_eq!(
+            graph::GraphCalendarBackend
+                .list_room_suggestions(&ctx(&db), &graph)
+                .await
+                .unwrap(),
+            CalendarCapability::Supported(Vec::new())
+        );
         let room_request = RoomAvailabilityRequest {
             room_address: "room@example.com".into(),
             start_time: request.start_time.clone(),
             end_time: request.end_time.clone(),
         };
-        assert!(graph::GraphCalendarBackend
-            .check_room_availability(&ctx(&db), &graph, &room_request)
-            .await
-            .is_err());
+        assert_eq!(
+            graph::GraphCalendarBackend
+                .check_room_availability(&ctx(&db), &graph, &room_request)
+                .await
+                .unwrap(),
+            CalendarCapability::Supported(RoomAvailability {
+                state: "unknown".into(),
+                busy_start: None,
+                busy_end: None,
+            })
+        );
     }
 
     #[tokio::test]

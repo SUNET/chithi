@@ -10,6 +10,7 @@ use crate::event::{
 };
 use crate::mail::compat::BackendMessageRef;
 use crate::mail::jmap::{JmapConfig, JmapConnection};
+use crate::provider::ProviderServices;
 
 /// Sync all folders for a JMAP account. This is the JMAP equivalent of
 /// `mail::sync::sync_account` for IMAP.
@@ -19,6 +20,7 @@ pub async fn sync_jmap_account(
     _data_dir: PathBuf,
     account_id: String,
     account_name: String,
+    providers: Arc<ProviderServices>,
     jmap_config: JmapConfig,
     conn_jmap: JmapConnection,
     current_folder: Option<String>,
@@ -31,6 +33,7 @@ pub async fn sync_jmap_account(
     let result = sync_jmap_account_inner(
         events.as_ref(),
         &db,
+        providers.as_ref(),
         &account_id,
         &jmap_config,
         &conn_jmap,
@@ -61,6 +64,7 @@ pub async fn sync_jmap_account(
 async fn sync_jmap_account_inner(
     events: &dyn EventSink,
     db: &Arc<DbPool>,
+    providers: &ProviderServices,
     account_id: &str,
     jmap_config: &JmapConfig,
     conn_jmap: &JmapConnection,
@@ -114,6 +118,7 @@ async fn sync_jmap_account_inner(
 
         match sync_jmap_folder(
             db,
+            providers,
             account_id,
             conn_jmap,
             jmap_config,
@@ -172,6 +177,7 @@ async fn sync_jmap_account_inner(
 /// Fastmail-support PR that introduced delta sync.
 async fn sync_jmap_folder(
     db: &Arc<DbPool>,
+    providers: &ProviderServices,
     account_id: &str,
     conn_jmap: &JmapConnection,
     jmap_config: &JmapConfig,
@@ -396,7 +402,7 @@ async fn sync_jmap_folder(
     // and swallowed so a transient JMAP hiccup can't poison the sync.
     if !new_ids.is_empty() {
         match crate::filters::service::apply_filters_to_new_messages(
-            db, account_id, mailbox_id, &new_ids,
+            db, providers, account_id, mailbox_id, &new_ids,
         )
         .await
         {
@@ -467,6 +473,7 @@ pub async fn sync_jmap_folder_public(
     account_id: String,
     account_name: String,
     mailbox_id: String,
+    providers: Arc<ProviderServices>,
     jmap_config: JmapConfig,
     conn_jmap: JmapConnection,
 ) -> Result<u32> {
@@ -478,6 +485,7 @@ pub async fn sync_jmap_folder_public(
     let folder_name = mailbox_id.clone();
     let result = sync_jmap_folder(
         &db,
+        providers.as_ref(),
         &account_id,
         &conn_jmap,
         &jmap_config,

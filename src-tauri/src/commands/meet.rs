@@ -15,16 +15,16 @@ use crate::meet;
 use crate::state::AppState;
 
 /// Wire-format Tauri response for `meet_talk_login_start`. The
-/// frontend opens `login_url` in the user's default browser, then
-/// hands `poll_endpoint` + `poll_token` back to
-/// `meet_talk_login_complete` so the backend can poll until the
-/// user finishes the in-browser login flow.
+/// The frontend opens `login_url` in the user's default browser, then hands
+/// only `session_id` back to `meet_talk_login_complete`. Poll credentials stay
+/// in backend session state.
 #[derive(Debug, Serialize)]
 pub struct TalkLoginStart {
     pub login_url: String,
-    pub poll_endpoint: String,
-    pub poll_token: String,
+    pub session_id: String,
 }
+
+const TALK_LOGIN_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[tauri::command]
 pub async fn meet_talk_login_start(
@@ -36,10 +36,22 @@ pub async fn meet_talk_login_start(
         &state.providers.transports.talk_http,
     )
     .await?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut sessions = state.talk_login_sessions.lock().unwrap();
+        let now = std::time::Instant::now();
+        sessions.retain(|_, session| now.duration_since(session.created) < TALK_LOGIN_SESSION_TTL);
+        sessions.insert(
+            session_id.clone(),
+            crate::state::TalkLoginSession {
+                created: now,
+                flow: flow.clone(),
+            },
+        );
+    }
     Ok(TalkLoginStart {
         login_url: flow.login,
-        poll_endpoint: flow.poll.endpoint,
-        poll_token: flow.poll.token,
+        session_id,
     })
 }
 
@@ -49,19 +61,22 @@ pub async fn meet_talk_login_start(
 #[tauri::command]
 pub async fn meet_talk_login_complete(
     state: State<'_, AppState>,
-    poll_endpoint: String,
-    poll_token: String,
+    session_id: String,
     display_name: Option<String>,
 ) -> Result<String> {
-    let flow = meet::talk::LoginFlowStart {
-        login: String::new(),
-        poll: meet::talk::LoginPoll {
-            token: poll_token,
-            endpoint: poll_endpoint,
-        },
-    };
+    let session = state
+        .talk_login_sessions
+        .lock()
+        .unwrap()
+        .remove(&session_id)
+        .ok_or_else(|| Error::Other("Talk login session expired; start again".into()))?;
+    if session.created.elapsed() >= TALK_LOGIN_SESSION_TTL {
+        return Err(Error::Other(
+            "Talk login session expired; start again".into(),
+        ));
+    }
     let creds = meet::talk::login_flow_v2_complete_with_client(
-        &flow,
+        &session.flow,
         300,
         &state.providers.transports.talk_http,
     )
@@ -111,7 +126,7 @@ pub async fn meet_talk_login_complete(
     db::accounts::insert_account(&conn, &id, &config)?;
     drop(conn);
 
-    crate::oauth::store_tokens(
+    state.providers.token_store().store(
         &id,
         &crate::oauth::OAuthTokens {
             access_token: creds.app_password,
@@ -162,6 +177,7 @@ pub async fn meet_matrix_login_start(
             port,
             crate::state::MatrixSsoSession {
                 created: std::time::Instant::now(),
+                homeserver: homeserver_url,
                 listener,
                 state: sso_state,
             },
@@ -178,7 +194,6 @@ pub async fn meet_matrix_login_start(
 #[tauri::command]
 pub async fn meet_matrix_login_complete(
     state: State<'_, AppState>,
-    homeserver_url: String,
     port: u16,
     display_name: Option<String>,
 ) -> Result<String> {
@@ -195,6 +210,7 @@ pub async fn meet_matrix_login_complete(
         })?;
     let listener = session.listener;
     let expected_state = session.state;
+    let homeserver_url = session.homeserver;
     let token = tokio::task::spawn_blocking(move || {
         meet::matrix::await_login_token(listener, &expected_state)
     })
@@ -250,7 +266,7 @@ pub async fn meet_matrix_login_complete(
     db::accounts::insert_account(&conn, &id, &config)?;
     drop(conn);
 
-    crate::oauth::store_tokens(
+    state.providers.token_store().store(
         &id,
         &crate::oauth::OAuthTokens {
             access_token: result.access_token,
@@ -393,14 +409,16 @@ pub async fn meet_zoom_login_complete(
         }
     }
 
-    let tokens = crate::oauth::exchange_code_with_client(
-        &crate::oauth::ZOOM,
-        &callback.code,
-        port,
-        verifier.as_deref(),
-        &state.providers.transports.zoom_http,
-    )
-    .await?;
+    let tokens = state
+        .providers
+        .token_endpoint()
+        .exchange_code(
+            &crate::oauth::ZOOM,
+            &callback.code,
+            port,
+            verifier.as_deref(),
+        )
+        .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -447,7 +465,7 @@ pub async fn meet_zoom_login_complete(
     db::accounts::insert_account(&conn, &id, &config)?;
     drop(conn);
 
-    crate::oauth::store_tokens(&id, &tokens)?;
+    state.providers.token_store().store(&id, &tokens)?;
     Ok(id)
 }
 

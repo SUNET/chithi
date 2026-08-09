@@ -2,8 +2,8 @@
 //!
 //! Owns the wire payloads for the Google side of calendar/contact sync
 //! and push (ADR 0016, ADR 0050). Token acquisition lives in
-//! `crate::auth::get_google_token`; this client just sends requests
-//! with a ready token, mirroring `GraphClient`.
+//! `ProviderCredentials`; this client just sends requests with a ready token,
+//! mirroring `GraphClient`.
 
 use crate::db::calendar::CalendarEvent;
 use crate::error::{Error, Result};
@@ -571,6 +571,109 @@ fn parse_google_schedules(value: &serde_json::Value, requested: &[String]) -> Ve
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(response_body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!(
+            "http://{}/injected-calendar",
+            listener.local_addr().unwrap()
+        );
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut expected_length = None;
+            loop {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let body_start = header_end + 4;
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = expected_length.get_or_insert_with(|| {
+                        headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0)
+                    });
+                    if bytes.len() >= body_start + *content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        (root, request)
+    }
+
+    #[tokio::test]
+    async fn create_event_uses_injected_root_client_and_google_wire_format() {
+        let (calendar_root, captured) =
+            serve_once(r#"{"id":"remote-event","iCalUID":"uid@example.org"}"#).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-injected-client", HeaderValue::from_static("google-test"));
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let client = GoogleClient::with_client(
+            http,
+            "test-access-token",
+            GoogleEndpoints {
+                calendar_api_root: calendar_root,
+                people_api_root: "http://127.0.0.1:1/unused-people".into(),
+            },
+        );
+        let event = serde_json::json!({
+            "summary": "Wire test",
+            "start": { "dateTime": "2026-08-09T09:00:00Z" },
+            "end": { "dateTime": "2026-08-09T10:00:00Z" },
+        });
+
+        let result = client
+            .create_event("team@example.org", &event, "all")
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ("remote-event".into(), Some("uid@example.org".into()))
+        );
+
+        let request = captured.await.unwrap();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line,
+            "POST /injected-calendar/calendars/team%40example.org/events?sendUpdates=all HTTP/1.1"
+        );
+        let headers = format!("{head}\r\n").to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-access-token\r\n"));
+        assert!(headers.contains("x-injected-client: google-test\r\n"));
+        assert!(headers.contains("content-type: application/json\r\n"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            event
+        );
+    }
 }
 
 #[cfg(test)]
