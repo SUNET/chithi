@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -32,12 +32,13 @@ struct WorkerHandle<T> {
     phase: WorkerPhase,
     sender: Option<mpsc::Sender<T>>,
     cancellation: CancellationToken,
-    task: Option<JoinHandle<WorkerTaskExit>>,
+    task: JoinHandle<()>,
+    completion: watch::Receiver<Option<WorkerTaskExit>>,
 }
 
 struct StoppingWorker {
     generation: u64,
-    task: JoinHandle<WorkerTaskExit>,
+    completion: watch::Receiver<Option<WorkerTaskExit>>,
 }
 
 /// Owns the complete lifecycle of one lazily spawned worker per account.
@@ -94,7 +95,7 @@ where
                         .sender
                         .as_ref()
                         .is_some_and(|sender| !sender.is_closed())
-                    && handle.task.as_ref().is_some_and(|task| !task.is_finished())
+                    && !handle.task.is_finished()
             })
         };
 
@@ -114,7 +115,19 @@ where
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let cancellation = self.shutdown.child_token();
         let (sender, receiver) = mpsc::channel(self.channel_capacity);
-        let spawned = spawn(receiver, cancellation.clone());
+        let SpawnedWorker {
+            task: worker_task,
+            ready,
+        } = spawn(receiver, cancellation.clone());
+        let (completion_tx, completion) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            let outcome = match worker_task.await {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_panic() => WorkerTaskExit::SupervisorPanicked,
+                Err(_) => WorkerTaskExit::SupervisorCancelled,
+            };
+            completion_tx.send_replace(Some(outcome));
+        });
 
         self.handles
             .lock()
@@ -126,11 +139,12 @@ where
                     phase: WorkerPhase::Running,
                     sender: Some(sender.clone()),
                     cancellation,
-                    task: Some(spawned.task),
+                    task,
+                    completion,
                 },
             );
 
-        match spawned.ready.await {
+        match ready.await {
             Ok(Ok(())) => {}
             Ok(Err(message)) => {
                 if let Some(stopping) = self.begin_stop(account_id) {
@@ -215,15 +229,18 @@ where
         handle.phase = WorkerPhase::Joining;
         Some(StoppingWorker {
             generation: handle.generation,
-            task: handle.task.take()?,
+            completion: handle.completion.clone(),
         })
     }
 
-    async fn finish_stop(&self, account_id: &str, stopping: StoppingWorker) -> WorkerTaskExit {
-        let outcome = match stopping.task.await {
-            Ok(outcome) => outcome,
-            Err(error) if error.is_panic() => WorkerTaskExit::SupervisorPanicked,
-            Err(_) => WorkerTaskExit::SupervisorCancelled,
+    async fn finish_stop(&self, account_id: &str, mut stopping: StoppingWorker) -> WorkerTaskExit {
+        let outcome = loop {
+            if let Some(outcome) = *stopping.completion.borrow() {
+                break outcome;
+            }
+            if stopping.completion.changed().await.is_err() {
+                break WorkerTaskExit::SupervisorCancelled;
+            }
         };
 
         let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,6 +392,68 @@ mod tests {
 
         release.notify_one();
         assert_eq!(stop.await.unwrap(), Some(WorkerTaskExit::Completed));
+        let _sender = replacement.await.unwrap();
+        assert_eq!(active_workers.load(Ordering::SeqCst), 1);
+        registry.stop_all().await;
+        assert_eq!(active_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn aborted_stop_cannot_detach_worker_or_allow_overlap() {
+        let registry = Arc::new(WorkerRegistry::<u8>::new(8));
+        let stopping = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let active_workers = Arc::new(AtomicUsize::new(0));
+
+        let worker_stopping = Arc::clone(&stopping);
+        let worker_release = Arc::clone(&release);
+        let worker_active = Arc::clone(&active_workers);
+        registry
+            .get_or_spawn("account", move |_receiver, cancellation| {
+                assert_eq!(worker_active.fetch_add(1, Ordering::SeqCst), 0);
+                ready_worker(tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    worker_stopping.notify_one();
+                    worker_release.notified().await;
+                    worker_active.fetch_sub(1, Ordering::SeqCst);
+                    WorkerTaskExit::Completed
+                }))
+            })
+            .await
+            .unwrap();
+
+        let stop_registry = Arc::clone(&registry);
+        let stop = tokio::spawn(async move { stop_registry.stop_account("account").await });
+        stopping.notified().await;
+        stop.abort();
+        assert!(stop.await.unwrap_err().is_cancelled());
+
+        let replacement_registry = Arc::clone(&registry);
+        let replacement_active = Arc::clone(&active_workers);
+        let mut replacement = tokio::spawn(async move {
+            replacement_registry
+                .get_or_spawn("account", move |mut receiver, cancellation| {
+                    assert_eq!(replacement_active.fetch_add(1, Ordering::SeqCst), 0);
+                    ready_worker(tokio::spawn(async move {
+                        cancellation.cancelled().await;
+                        receiver.close();
+                        while receiver.recv().await.is_some() {}
+                        replacement_active.fetch_sub(1, Ordering::SeqCst);
+                        WorkerTaskExit::Completed
+                    }))
+                })
+                .await
+                .unwrap()
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut replacement)
+                .await
+                .is_err()
+        );
+        assert_eq!(active_workers.load(Ordering::SeqCst), 1);
+
+        release.notify_one();
         let _sender = replacement.await.unwrap();
         assert_eq!(active_workers.load(Ordering::SeqCst), 1);
         registry.stop_all().await;
