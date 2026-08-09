@@ -245,7 +245,7 @@ pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_envelope, parse_message_body};
+    use super::{parse_envelope, parse_html_with_images, parse_message_body};
     use crate::db::messages::{Address, MessageBody, NewMessage};
 
     const ADDRESSES: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/addresses");
@@ -277,6 +277,31 @@ mod tests {
 
     fn addresses(json: &str) -> Vec<Address> {
         serde_json::from_str(json).expect("parser should emit valid address JSON")
+    }
+
+    fn html_message(html: &str) -> Vec<u8> {
+        format!(
+            "From: sender@example.org\r\n\
+             To: recipient@example.org\r\n\
+             Subject: Sanitizer test\r\n\
+             Message-ID: <sanitizer@example.org>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n\
+             {html}"
+        )
+        .into_bytes()
+    }
+
+    fn assert_html_is_removed(raw: &[u8], forbidden: &[&str]) {
+        let normal = body(raw).body_html.expect("HTML body should parse");
+        let with_images = parse_html_with_images(raw).expect("HTML body should parse");
+        for value in forbidden {
+            assert!(!normal.contains(value), "normal HTML retained {value}");
+            assert!(
+                !with_images.contains(value),
+                "image-enabled HTML retained {value}"
+            );
+        }
     }
 
     #[test]
@@ -342,5 +367,28 @@ mod tests {
         );
         assert_eq!(message.attachments[0].content_type, "image/jpeg");
         assert!(message.attachments[0].size > 1_000);
+    }
+
+    #[test]
+    fn strips_svg_animation_xss_from_rustsec_2026_0213() {
+        let raw = html_message(
+            r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <a><set attributeName="href" to="javascript:alert('xss')"></set>
+                <text>Click</text></a>
+            </svg>"#,
+        );
+
+        assert_html_is_removed(&raw, &["<svg", "<set", "javascript:"]);
+    }
+
+    #[test]
+    fn strips_mathml_mxss_from_rustsec_2026_0193() {
+        let raw = html_message(
+            r#"<math><annotation-xml encoding="text/html">
+                <style><!--</style><img src=x onerror=alert('xss')>
+            </annotation-xml></math>"#,
+        );
+
+        assert_html_is_removed(&raw, &["<math", "<annotation-xml", "onerror"]);
     }
 }
