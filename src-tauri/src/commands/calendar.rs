@@ -1,7 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tauri::State;
 
 use crate::auth::get_google_token;
+use crate::backend::calendar::{
+    CalendarCapability, ParticipantSchedule, ParticipantScheduleRequest, RoomAvailability,
+    RoomAvailabilityRequest, RoomSuggestion,
+};
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
@@ -86,32 +90,6 @@ pub struct MeetBindingInput {
     pub protocol: String,
     pub meeting_id: String,
     pub join_url: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RoomSuggestion {
-    pub name: String,
-    pub address: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RoomAvailability {
-    pub state: String,
-    pub busy_start: Option<String>,
-    pub busy_end: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ParticipantSchedule {
-    pub email: String,
-    pub available: bool,
-    pub busy: Vec<BusyPeriod>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BusyPeriod {
-    pub start: String,
-    pub end: String,
 }
 
 /// Defence-in-depth check on a client-supplied meet binding before
@@ -500,25 +478,19 @@ pub async fn list_room_suggestions(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.calendar_protocol_str() != "graph" {
-        log::debug!(
-            "list_room_suggestions: skipping non-graph account {} ({})",
-            account.id,
-            account.calendar_protocol_str()
-        );
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(Vec::new());
+    };
+    match backend.list_room_suggestions(&account).await? {
+        CalendarCapability::Supported(rooms) => Ok(rooms),
+        CalendarCapability::Unsupported => {
+            log::debug!(
+                "list_room_suggestions: {} backend does not support room lookup",
+                backend.protocol()
+            );
+            Ok(Vec::new())
+        }
     }
-
-    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-    let client = crate::mail::graph::GraphClient::new(&token);
-    let rooms = client.list_rooms().await?;
-    Ok(rooms
-        .into_iter()
-        .map(|room| RoomSuggestion {
-            name: room.name,
-            address: room.address,
-        })
-        .collect())
 }
 
 #[tauri::command]
@@ -534,25 +506,26 @@ pub async fn check_room_availability(
         db::accounts::get_account_full(&conn, &account_id)?
     };
 
-    if account.calendar_protocol_str() != "graph" {
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
         return Ok(RoomAvailability {
             state: "unknown".into(),
             busy_start: None,
             busy_end: None,
         });
+    };
+    let request = RoomAvailabilityRequest {
+        room_address,
+        start_time,
+        end_time,
+    };
+    match backend.check_room_availability(&account, &request).await? {
+        CalendarCapability::Supported(availability) => Ok(availability),
+        CalendarCapability::Unsupported => Ok(RoomAvailability {
+            state: "unknown".into(),
+            busy_start: None,
+            busy_end: None,
+        }),
     }
-
-    let token = crate::mail::graph::get_graph_token_for_rooms(&account.id).await?;
-    let client = crate::mail::graph::GraphClient::new(&token);
-    let availability = client
-        .get_room_availability(&room_address, &start_time, &end_time)
-        .await?;
-
-    Ok(RoomAvailability {
-        state: availability.state,
-        busy_start: availability.busy_start,
-        busy_end: availability.busy_end,
-    })
 }
 
 #[tauri::command]
@@ -563,6 +536,29 @@ pub async fn get_participant_schedules(
     start_time: String,
     end_time: String,
 ) -> Result<Vec<ParticipantSchedule>> {
+    let request = build_participant_schedule_request(emails, start_time, end_time)?;
+
+    let account = {
+        let conn = state.db.reader();
+        db::accounts::get_account_full(&conn, &account_id)?
+    };
+    let Some(backend) = crate::backend::calendar::for_account(&account) else {
+        return Ok(Vec::new());
+    };
+    match backend
+        .get_participant_schedules(&account, &request)
+        .await?
+    {
+        CalendarCapability::Supported(schedules) => Ok(schedules),
+        CalendarCapability::Unsupported => Ok(Vec::new()),
+    }
+}
+
+fn build_participant_schedule_request(
+    emails: Vec<String>,
+    start_time: String,
+    end_time: String,
+) -> Result<ParticipantScheduleRequest> {
     let mut emails: Vec<String> = emails
         .into_iter()
         .map(|email| email.trim().to_ascii_lowercase())
@@ -586,55 +582,11 @@ pub async fn get_participant_schedules(
         ));
     }
 
-    let account = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &account_id)?
-    };
-    match account.calendar_protocol_str() {
-        "graph" => {
-            let token = crate::mail::graph::get_graph_token(&account.id).await?;
-            let schedules = crate::mail::graph::GraphClient::new(&token)
-                .get_schedules(&emails, &start_time, &end_time)
-                .await?;
-            Ok(schedules
-                .into_iter()
-                .map(|schedule| ParticipantSchedule {
-                    email: schedule.email,
-                    available: schedule.available,
-                    busy: schedule
-                        .busy
-                        .into_iter()
-                        .map(|period| BusyPeriod {
-                            start: period.start,
-                            end: period.end,
-                        })
-                        .collect(),
-                })
-                .collect())
-        }
-        "google" => {
-            let token = get_google_token(&account.id).await?;
-            let schedules = crate::mail::google::GoogleClient::new(&token)
-                .get_schedules(&emails, &start_time, &end_time)
-                .await?;
-            Ok(schedules
-                .into_iter()
-                .map(|schedule| ParticipantSchedule {
-                    email: schedule.email,
-                    available: schedule.available,
-                    busy: schedule
-                        .busy
-                        .into_iter()
-                        .map(|period| BusyPeriod {
-                            start: period.start,
-                            end: period.end,
-                        })
-                        .collect(),
-                })
-                .collect())
-        }
-        _ => Ok(Vec::new()),
-    }
+    Ok(ParticipantScheduleRequest {
+        emails,
+        start_time,
+        end_time,
+    })
 }
 
 /// Push the event title back to the meet provider as the meeting's
@@ -2374,5 +2326,51 @@ mod tests {
         assert_eq!(invite_reply_transport("google"), InviteReplyTransport::Smtp);
         // An account with no calendar binding still falls back to SMTP.
         assert_eq!(invite_reply_transport(""), InviteReplyTransport::Smtp);
+    }
+
+    #[test]
+    fn participant_schedule_request_normalizes_addresses() {
+        let request = build_participant_schedule_request(
+            vec![
+                " Bob@Example.com ".into(),
+                "alice@example.com".into(),
+                "bob@example.com".into(),
+                " ".into(),
+            ],
+            "2026-08-10T09:00:00Z".into(),
+            "2026-08-10T10:00:00Z".into(),
+        )
+        .unwrap();
+
+        assert_eq!(request.emails, vec!["alice@example.com", "bob@example.com"]);
+    }
+
+    #[test]
+    fn participant_schedule_request_rejects_too_many_addresses() {
+        let emails = (0..51)
+            .map(|index| format!("person{index}@example.com"))
+            .collect();
+        assert!(build_participant_schedule_request(
+            emails,
+            "2026-08-10T09:00:00Z".into(),
+            "2026-08-10T10:00:00Z".into(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn participant_schedule_request_rejects_invalid_ranges() {
+        assert!(build_participant_schedule_request(
+            vec!["person@example.com".into()],
+            "2026-08-10T10:00:00Z".into(),
+            "2026-08-10T09:00:00Z".into(),
+        )
+        .is_err());
+        assert!(build_participant_schedule_request(
+            vec!["person@example.com".into()],
+            "not-a-date".into(),
+            "2026-08-10T09:00:00Z".into(),
+        )
+        .is_err());
     }
 }

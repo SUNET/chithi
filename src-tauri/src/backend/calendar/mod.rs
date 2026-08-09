@@ -494,4 +494,75 @@ mod contract_tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn unsupported_scheduling_capabilities_do_not_attempt_io() {
+        let caldav = account("calendar", "caldav");
+        let jmap = account("calendar", "jmap");
+        let room_request = RoomAvailabilityRequest {
+            room_address: "room@example.com".into(),
+            start_time: "2026-08-10T09:00:00Z".into(),
+            end_time: "2026-08-10T10:00:00Z".into(),
+        };
+        let schedule_request = ParticipantScheduleRequest {
+            emails: vec!["person@example.com".into()],
+            start_time: room_request.start_time.clone(),
+            end_time: room_request.end_time.clone(),
+        };
+
+        assert_eq!(
+            caldav::CalDavCalendarBackend
+                .list_room_suggestions(&caldav)
+                .await
+                .unwrap(),
+            CalendarCapability::Unsupported
+        );
+        assert_eq!(
+            jmap::JmapCalendarBackend
+                .check_room_availability(&jmap, &room_request)
+                .await
+                .unwrap(),
+            CalendarCapability::Unsupported
+        );
+        assert_eq!(
+            jmap::JmapCalendarBackend
+                .get_participant_schedules(&jmap, &schedule_request)
+                .await
+                .unwrap(),
+            CalendarCapability::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn supported_scheduling_capabilities_attempt_provider_auth() {
+        let graph = account("calendar", "graph");
+        let google = account("calendar", "google");
+        let request = ParticipantScheduleRequest {
+            emails: vec!["person@example.com".into()],
+            start_time: "2026-08-10T09:00:00Z".into(),
+            end_time: "2026-08-10T10:00:00Z".into(),
+        };
+
+        assert!(graph::GraphCalendarBackend
+            .get_participant_schedules(&graph, &request)
+            .await
+            .is_err());
+        assert!(google::GoogleCalendarBackend
+            .get_participant_schedules(&google, &request)
+            .await
+            .is_err());
+        assert!(graph::GraphCalendarBackend
+            .list_room_suggestions(&graph)
+            .await
+            .is_err());
+        let room_request = RoomAvailabilityRequest {
+            room_address: "room@example.com".into(),
+            start_time: request.start_time.clone(),
+            end_time: request.end_time.clone(),
+        };
+        assert!(graph::GraphCalendarBackend
+            .check_room_availability(&graph, &room_request)
+            .await
+            .is_err());
+    }
 }

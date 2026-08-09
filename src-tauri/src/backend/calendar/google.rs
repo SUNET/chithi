@@ -12,7 +12,10 @@ use crate::mail::google::{
     event_patch_to_google_json, event_to_google_json, send_updates_for, EventsPage, GoogleClient,
 };
 
-use super::{CalendarBackend, PushedEvent};
+use super::{
+    BusyPeriod, CalendarBackend, CalendarCapability, ParticipantSchedule,
+    ParticipantScheduleRequest, PushedEvent,
+};
 
 pub struct GoogleCalendarBackend;
 
@@ -327,6 +330,34 @@ async fn sync_google(db: &DbPool, account: &AccountFull) -> Result<()> {
 impl CalendarBackend for GoogleCalendarBackend {
     fn protocol(&self) -> &'static str {
         "google"
+    }
+
+    async fn get_participant_schedules(
+        &self,
+        account: &AccountFull,
+        request: &ParticipantScheduleRequest,
+    ) -> Result<CalendarCapability<Vec<ParticipantSchedule>>> {
+        let token = get_google_token(&account.id).await?;
+        let schedules = GoogleClient::new(&token)
+            .get_schedules(&request.emails, &request.start_time, &request.end_time)
+            .await?;
+        Ok(CalendarCapability::Supported(
+            schedules
+                .into_iter()
+                .map(|schedule| ParticipantSchedule {
+                    email: schedule.email,
+                    available: schedule.available,
+                    busy: schedule
+                        .busy
+                        .into_iter()
+                        .map(|period| BusyPeriod {
+                            start: period.start,
+                            end: period.end,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        ))
     }
 
     /// REST sync with a CalDAV fallback: accounts configured before
