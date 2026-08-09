@@ -605,4 +605,30 @@ mod contract_tests {
             CalendarCapability::Unsupported
         );
     }
+
+    #[tokio::test]
+    async fn only_jmap_handles_remote_attendee_responses() {
+        let update = AttendeeResponseUpdate {
+            remote_id: "event-1".into(),
+            attendee_email: "person@example.com".into(),
+            response: "accepted".into(),
+        };
+        let jmap = account("calendar", "jmap");
+        let graph = account("calendar", "graph");
+
+        assert_eq!(
+            jmap::JmapCalendarBackend
+                .push_attendee_responses(&jmap, std::slice::from_ref(&update))
+                .await
+                .unwrap(),
+            CalendarCapability::Supported(())
+        );
+        assert_eq!(
+            graph::GraphCalendarBackend
+                .push_attendee_responses(&graph, &[update])
+                .await
+                .unwrap(),
+            CalendarCapability::Unsupported
+        );
+    }
 }

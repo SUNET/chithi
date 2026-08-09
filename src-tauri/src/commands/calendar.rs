@@ -2,9 +2,9 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::backend::calendar::{
-    CalendarCapability, InviteReplyDelivery, InviteResponse, ParticipantSchedule,
-    ParticipantScheduleRequest, RemoteRsvpPolicy, RemoteRsvpRequest, RoomAvailability,
-    RoomAvailabilityRequest, RoomSuggestion,
+    AttendeeResponseUpdate, CalendarCapability, InviteReplyDelivery, InviteResponse,
+    ParticipantSchedule, ParticipantScheduleRequest, RemoteRsvpPolicy, RemoteRsvpRequest,
+    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
@@ -1825,18 +1825,12 @@ pub async fn process_invite_reply(
         return Ok(());
     }
 
-    // Phase 1: update local DB, collect any JMAP push we need to do
-    // afterwards. The writer guard is dropped at the end of this block
-    // so the JMAP network round-trip below doesn't block other writes.
-    struct JmapPush {
-        remote_id: String,
-        attendee_email: String,
-        status: String,
-    }
-    let (account, jmap_pushes) = {
+    // Phase 1: update local DB and collect provider-neutral remote updates.
+    // The writer guard is dropped before backend network activity.
+    let (account, attendee_updates) = {
         let conn = state.db.writer().await;
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        let mut jmap_pushes: Vec<JmapPush> = Vec::new();
+        let mut attendee_updates = Vec::new();
 
         for reply in &reply_invites {
             let event = db::calendar::get_event_by_uid(&conn, &account_id, &reply.uid)?;
@@ -1872,52 +1866,31 @@ pub async fn process_invite_reply(
                     }
                 }
 
-                if account.calendar_protocol_str() == "jmap" {
-                    if let Some(ref remote_id) = event.remote_id {
-                        jmap_pushes.push(JmapPush {
-                            remote_id: remote_id.clone(),
-                            attendee_email: attendee.email.clone(),
-                            status: status.clone(),
-                        });
-                    }
+                if let Some(ref remote_id) = event.remote_id {
+                    attendee_updates.push(AttendeeResponseUpdate {
+                        remote_id: remote_id.clone(),
+                        attendee_email: attendee.email.clone(),
+                        response: status.clone(),
+                    });
                 }
             }
         }
-        (account, jmap_pushes)
+        (account, attendee_updates)
     };
 
-    // Phase 2: JMAP push without holding the DB writer. Each REPLY component
-    // gets pushed; one fetch_calendar_events round-trip is reused for all.
-    if !jmap_pushes.is_empty() {
-        let jmap_config = crate::auth::build_jmap_config(&account).await?;
-        if let Ok(jmap_conn) = crate::mail::jmap::JmapConnection::connect(&jmap_config).await {
-            if let Ok(events) = jmap_conn.fetch_calendar_events(&jmap_config, None).await {
-                for push in &jmap_pushes {
-                    let Some(ev) = events.iter().find(|e| e.id == push.remote_id) else {
-                        continue;
-                    };
-                    let Some(ref aj) = ev.attendees_json else {
-                        continue;
-                    };
-                    let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(aj) else {
-                        continue;
-                    };
-                    for (i, a) in atts.iter().enumerate() {
-                        if a["email"].as_str() == Some(&push.attendee_email) {
-                            let key = format!("att{}", i);
-                            jmap_conn
-                                .update_participant_status(
-                                    &jmap_config,
-                                    &push.remote_id,
-                                    &key,
-                                    &push.status,
-                                )
-                                .await
-                                .ok();
-                            break;
-                        }
-                    }
-                }
+    // Phase 2: let the provider apply any supported remote participant update
+    // without holding the DB writer. JMAP preserves its fetch-once behavior;
+    // other providers explicitly report this capability as unsupported.
+    if !attendee_updates.is_empty() {
+        if let Some(backend) = crate::backend::calendar::for_account(&account) {
+            if let CalendarCapability::Unsupported = backend
+                .push_attendee_responses(&account, &attendee_updates)
+                .await?
+            {
+                log::debug!(
+                    "process_invite_reply: {} backend does not push attendee responses",
+                    backend.protocol()
+                );
             }
         }
     }
