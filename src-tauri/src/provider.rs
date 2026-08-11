@@ -246,6 +246,7 @@ impl OAuthTokenLifecycle {
                 )),
             };
         }
+        crate::oauth::clear_reauth_required(account_id);
         Ok(())
     }
 
@@ -253,9 +254,10 @@ impl OAuthTokenLifecycle {
     where
         F: FnOnce() -> Result<()>,
     {
+        let restore_reauth = crate::oauth::is_reauth_required(account_id);
         let previous = self.tokens.load(account_id)?;
         if let Err(error) = self.tokens.delete(account_id) {
-            return match previous {
+            let result = match previous {
                 Some(tokens) => match self.tokens.store(account_id, &tokens) {
                     Ok(()) => Err(error),
                     Err(restore_error) => Err(compensation_error(
@@ -267,10 +269,14 @@ impl OAuthTokenLifecycle {
                 },
                 None => Err(error),
             };
+            if restore_reauth {
+                crate::oauth::mark_reauth_required(account_id);
+            }
+            return result;
         }
 
         if let Err(error) = commit() {
-            return match previous {
+            let result = match previous {
                 Some(tokens) => match self.tokens.store(account_id, &tokens) {
                     Ok(()) => Err(error),
                     Err(restore_error) => Err(compensation_error(
@@ -282,7 +288,12 @@ impl OAuthTokenLifecycle {
                 },
                 None => Err(error),
             };
+            if restore_reauth {
+                crate::oauth::mark_reauth_required(account_id);
+            }
+            return result;
         }
+        crate::oauth::clear_reauth_required(account_id);
         Ok(())
     }
 }
@@ -742,6 +753,7 @@ impl ProviderCredentials for ProviderCredentialService {
 
     async fn zoom_access_token(&self, account_id: &str) -> Result<String> {
         let _guard = self.account_locks.lock_account(account_id).await;
+        crate::oauth::ensure_not_reauth_required(account_id)?;
         let tokens =
             self.required_tokens(account_id, "Zoom: no tokens in keyring; sign in again")?;
         if !tokens.is_expired() {
@@ -753,8 +765,12 @@ impl ProviderCredentials for ProviderCredentialService {
         let refreshed = self
             .endpoint
             .refresh(&crate::oauth::ZOOM, &refresh_token)
-            .await?;
+            .await
+            .map_err(|error| crate::oauth::auth_required_on_invalid_grant(account_id, error))?;
         self.tokens.store(account_id, &refreshed)?;
+        // Injected stores do not necessarily delegate to oauth::store_tokens,
+        // so clear only after their persistence boundary reports success.
+        crate::oauth::clear_reauth_required(account_id);
         Ok(refreshed.access_token)
     }
 
@@ -779,7 +795,8 @@ impl ProviderCredentials for ProviderCredentialService {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use super::*;
@@ -808,9 +825,135 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LatchAwareMemoryTokenStore {
+        inner: MemoryTokenStore,
+    }
+
+    impl OAuthTokenStore for LatchAwareMemoryTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<OAuthTokens>> {
+            self.inner.load(account_id)
+        }
+
+        fn store(&self, account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+            self.inner.store(account_id, tokens)?;
+            crate::oauth::clear_reauth_required(account_id);
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<()> {
+            self.inner.delete(account_id)?;
+            crate::oauth::clear_reauth_required(account_id);
+            Ok(())
+        }
+    }
+
+    struct DeleteFailingTokenStore {
+        inner: MemoryTokenStore,
+    }
+
+    impl OAuthTokenStore for DeleteFailingTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<OAuthTokens>> {
+            self.inner.load(account_id)
+        }
+
+        fn store(&self, account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+            self.inner.store(account_id, tokens)?;
+            crate::oauth::clear_reauth_required(account_id);
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<()> {
+            // Simulate a store that removes the credential and clears its
+            // latch before reporting a later backend failure.
+            self.inner.delete(account_id)?;
+            crate::oauth::clear_reauth_required(account_id);
+            Err(Error::Other("injected delete failure".into()))
+        }
+    }
+
     struct FakeTokenEndpoint {
         refreshed: OAuthTokens,
         scopes: Mutex<Vec<String>>,
+    }
+
+    struct ScriptedTokenEndpoint {
+        responses: Mutex<VecDeque<Result<OAuthTokens>>>,
+        refresh_calls: AtomicUsize,
+        block_first: bool,
+        first_entered: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+    }
+
+    impl ScriptedTokenEndpoint {
+        fn new(responses: Vec<Result<OAuthTokens>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                refresh_calls: AtomicUsize::new(0),
+                block_first: false,
+                first_entered: tokio::sync::Notify::new(),
+                release_first: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn blocking(responses: Vec<Result<OAuthTokens>>) -> Self {
+            Self {
+                block_first: true,
+                ..Self::new(responses)
+            }
+        }
+
+        fn refresh_calls(&self) -> usize {
+            self.refresh_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl TokenEndpointClient for ScriptedTokenEndpoint {
+        async fn exchange_code(
+            &self,
+            _provider: &OAuthProvider,
+            _code: &str,
+            _port: u16,
+            _code_verifier: Option<&str>,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+        ) -> Result<OAuthTokens> {
+            let call = self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_first && call == 0 {
+                self.first_entered.notify_one();
+                self.release_first.notified().await;
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected token refresh")
+        }
+
+        async fn refresh_scoped(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+            _scopes: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh_dynamic(
+            &self,
+            _token_url: &str,
+            _refresh_token: &str,
+            _client_id: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
     }
 
     struct CoordinatedBlockingCredentials {
@@ -1141,6 +1284,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zoom_invalid_grant_latches_concurrent_and_repeated_refreshes() {
+        let account_id = "zoom-invalid-grant-concurrent";
+        crate::oauth::clear_reauth_required(account_id);
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store(account_id, &expired_tokens()).unwrap();
+        let endpoint = Arc::new(ScriptedTokenEndpoint::blocking(vec![Err(Error::Other(
+            "Token refresh error: {\"error\":\"invalid_grant\",\
+             \"reason\":\"Invalid authorization grant\"}"
+                .into(),
+        ))]));
+        let credentials = Arc::new(ProviderCredentialService::new(store, endpoint.clone()));
+
+        let first_credentials = credentials.clone();
+        let first =
+            tokio::spawn(async move { first_credentials.zoom_access_token(account_id).await });
+        endpoint.first_entered.notified().await;
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second_credentials = credentials.clone();
+        let second = tokio::spawn(async move {
+            second_started_tx.send(()).unwrap();
+            second_credentials.zoom_access_token(account_id).await
+        });
+        second_started_rx.await.unwrap();
+        assert_eq!(endpoint.refresh_calls(), 1);
+        assert!(!second.is_finished());
+
+        endpoint.release_first.notify_one();
+
+        assert!(matches!(first.await.unwrap(), Err(Error::AuthRequired(_))));
+        assert!(matches!(second.await.unwrap(), Err(Error::AuthRequired(_))));
+        assert!(matches!(
+            credentials.zoom_access_token(account_id).await,
+            Err(Error::AuthRequired(_))
+        ));
+        assert_eq!(endpoint.refresh_calls(), 1);
+        crate::oauth::clear_reauth_required(account_id);
+    }
+
+    #[tokio::test]
+    async fn zoom_unrelated_refresh_error_allows_retry_and_rotation() {
+        let account_id = "zoom-retry-after-503";
+        crate::oauth::clear_reauth_required(account_id);
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store(account_id, &expired_tokens()).unwrap();
+        let endpoint = Arc::new(ScriptedTokenEndpoint::new(vec![
+            Err(Error::Other("Token refresh failed: 503".into())),
+            Ok(refreshed_tokens()),
+        ]));
+        let credentials = ProviderCredentialService::new(store.clone(), endpoint.clone());
+
+        let first = credentials.zoom_access_token(account_id).await;
+        assert!(matches!(first, Err(Error::Other(_))));
+        crate::oauth::ensure_not_reauth_required(account_id).unwrap();
+
+        assert_eq!(
+            credentials.zoom_access_token(account_id).await.unwrap(),
+            "fresh-access"
+        );
+        assert_eq!(endpoint.refresh_calls(), 2);
+        let stored = store.load(account_id).unwrap().unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated-refresh"));
+    }
+
+    #[tokio::test]
     async fn zoom_creation_commit_failure_removes_stored_tokens() {
         let store = Arc::new(MemoryTokenStore::default());
         let lifecycle = OAuthTokenLifecycle {
@@ -1158,24 +1365,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zoom_deletion_commit_failure_restores_previous_tokens() {
+    async fn successful_zoom_creation_clears_reauth_with_injected_store() {
+        let account_id = "zoom-creation-clears-reauth";
+        crate::oauth::mark_reauth_required(account_id);
         let store = Arc::new(MemoryTokenStore::default());
-        store.store("zoom", &refreshed_tokens()).unwrap();
         let lifecycle = OAuthTokenLifecycle {
             tokens: store.clone(),
             account_locks: Arc::new(ProviderAccountCoordinator::default()),
         };
-        let _guard = lifecycle.account_locks.lock_account("zoom").await;
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
 
-        let result = lifecycle.delete_zoom_and_commit("zoom", || {
+        lifecycle
+            .store_zoom_and_commit(account_id, &refreshed_tokens(), || Ok(()))
+            .unwrap();
+
+        crate::oauth::ensure_not_reauth_required(account_id).unwrap();
+        assert_eq!(
+            store.load(account_id).unwrap().unwrap().access_token,
+            "fresh-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn zoom_deletion_commit_failure_restores_previous_tokens() {
+        let account_id = "zoom-delete-compensation-reauth";
+        crate::oauth::clear_reauth_required(account_id);
+        let store = Arc::new(LatchAwareMemoryTokenStore::default());
+        store.store(account_id, &refreshed_tokens()).unwrap();
+        crate::oauth::mark_reauth_required(account_id);
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        let result = lifecycle.delete_zoom_and_commit(account_id, || {
             Err(Error::Other("injected commit failure".into()))
         });
 
         assert!(result.is_err());
-        let restored = store.load("zoom").unwrap().unwrap();
+        let restored = store.load(account_id).unwrap().unwrap();
         assert_eq!(restored.access_token, "fresh-access");
         assert_eq!(restored.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(restored.expires_at, Some(i64::MAX));
+        assert!(crate::oauth::ensure_not_reauth_required(account_id).is_err());
+        crate::oauth::clear_reauth_required(account_id);
+    }
+
+    #[tokio::test]
+    async fn successful_zoom_deletion_clears_reauth_without_stored_tokens() {
+        let account_id = "zoom-delete-no-entry-clears-reauth";
+        crate::oauth::mark_reauth_required(account_id);
+        let store = Arc::new(MemoryTokenStore::default());
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store,
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        lifecycle
+            .delete_zoom_and_commit(account_id, || Ok(()))
+            .unwrap();
+
+        crate::oauth::ensure_not_reauth_required(account_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_zoom_token_deletion_keeps_reauth_latched() {
+        let account_id = "zoom-delete-failure-keeps-reauth";
+        let store = Arc::new(DeleteFailingTokenStore {
+            inner: MemoryTokenStore::default(),
+        });
+        store.store(account_id, &refreshed_tokens()).unwrap();
+        crate::oauth::mark_reauth_required(account_id);
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        assert!(lifecycle
+            .delete_zoom_and_commit(account_id, || Ok(()))
+            .is_err());
+        assert!(crate::oauth::ensure_not_reauth_required(account_id).is_err());
+        assert_eq!(
+            store
+                .load(account_id)
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("rotated-refresh")
+        );
+        crate::oauth::clear_reauth_required(account_id);
     }
 
     #[tokio::test]
