@@ -687,6 +687,11 @@ export async function meetCreateUrl(
   });
 }
 
+/** Idempotently discard a backend-owned unbound remote meeting. */
+export async function meetDiscardPending(lifecycleId: string): Promise<void> {
+  return invoke("meet_discard_pending", { lifecycleId });
+}
+
 // IDLE
 export async function startIdle(): Promise<void> {
   return invoke("start_idle");

@@ -221,6 +221,18 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Durable ownership for newly-created, discarded, replaced, or
+        -- deletion-queued remote meetings. Deliberately has no foreign key:
+        -- deleting an account or event must not silently erase retry state.
+        CREATE TABLE IF NOT EXISTS meet_pending_meetings (
+            lifecycle_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            meeting_id TEXT NOT NULL,
+            join_url TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- FTS5 virtual table for fast message text search (quick filter)
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             subject,
@@ -829,5 +841,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!((prune, filters), (0, 0));
+    }
+
+    #[test]
+    fn pending_meeting_ownership_survives_account_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'account', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM accounts WHERE id = 'account'", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings
+                 WHERE lifecycle_id = 'lifecycle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

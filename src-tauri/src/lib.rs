@@ -47,6 +47,15 @@ pub fn run() {
 
             let app_state = AppState::new(data_dir)?;
             app.manage(app_state);
+            let lifecycle_ids = {
+                let state = app.state::<AppState>();
+                commands::meet::pending_lifecycle_ids(&state)
+            };
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                commands::meet::sweep_pending(&state, lifecycle_ids).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -103,6 +112,7 @@ pub fn run() {
             commands::meet::meet_zoom_login_start,
             commands::meet::meet_zoom_login_complete,
             commands::meet::meet_create_url,
+            commands::meet::meet_discard_pending,
             commands::sync_cmd::start_idle,
             commands::sync_cmd::stop_idle,
             commands::oauth::oauth_start,

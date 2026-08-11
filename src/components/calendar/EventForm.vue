@@ -64,65 +64,113 @@ const meetError = ref<string | null>(null);
  * cancellations can act on the same remote room. Reset when the
  * user replaces the meet URL (handled in `save()`). */
 const pendingMeetBinding = ref<import("@/lib/types").MeetBinding | null>(null);
+const closing = ref(false);
+let meetCreationPromise: Promise<void> | null = null;
+
+async function discardMeetBinding(binding: import("@/lib/types").MeetBinding) {
+  try {
+    await api.meetDiscardPending(binding.lifecycle_id);
+  } catch (e) {
+    // The backend retains durable ownership and retries on startup.
+    console.error("Failed to discard pending meeting:", e);
+  }
+}
+
+async function discardCurrentMeetBinding() {
+  const binding = pendingMeetBinding.value;
+  if (!binding) return;
+  pendingMeetBinding.value = null;
+  await discardMeetBinding(binding);
+}
+
+function removeGeneratedJoinLine(joinUrl: string) {
+  const line = `Join: ${joinUrl}`;
+  if (description.value === line) {
+    description.value = "";
+    return;
+  }
+  const generatedPrefix = `${line}\n\n`;
+  if (description.value.startsWith(generatedPrefix)) {
+    description.value = description.value.slice(generatedPrefix.length);
+  }
+}
+
+async function closeForm() {
+  if (closing.value || saving.value) return;
+  closing.value = true;
+  if (meetCreationPromise) await meetCreationPromise;
+  await discardCurrentMeetBinding();
+  emit("close");
+}
 
 async function addVideoLink(accountId: string) {
-  if (!accountId || generatingMeetUrl.value) return;
+  if (!accountId || generatingMeetUrl.value || closing.value) return;
   generatingMeetUrl.value = true;
   meetError.value = null;
-  try {
-    // Pass the event's start + duration so time-bound providers
-    // (Zoom) schedule the meeting on the event's day, not today.
-    // All-day events pin the start at noon in the user's display
-    // timezone (converted to UTC) so Zoom's UI shows the meeting
-    // on the right calendar day regardless of timezone, and use a
-    // 24h duration to cover the full day. Pinning at midnight
-    // instead would flip to the previous/next day in some
-    // timezones; noon avoids that.
-    let startIso: string;
-    let durationMinutes: number;
-    if (allDay.value) {
-      startIso = localInputToUTC(
-        startDate.value,
-        "12:00",
-        uiStore.displayTimezone,
+  const operation = (async () => {
+    try {
+      // Pass the event's start + duration so time-bound providers
+      // (Zoom) schedule the meeting on the event's day, not today.
+      // All-day events pin the start at noon in the user's display
+      // timezone (converted to UTC) so Zoom's UI shows the meeting
+      // on the right calendar day regardless of timezone, and use a
+      // 24h duration to cover the full day. Pinning at midnight
+      // instead would flip to the previous/next day in some
+      // timezones; noon avoids that.
+      let startIso: string;
+      let durationMinutes: number;
+      if (allDay.value) {
+        startIso = localInputToUTC(
+          startDate.value,
+          "12:00",
+          uiStore.displayTimezone,
+        );
+        durationMinutes = 24 * 60;
+      } else {
+        const startUTC = localInputToUTC(
+          startDate.value,
+          startTime.value,
+          uiStore.displayTimezone,
+        );
+        const endUTC = localInputToUTC(
+          endDate.value,
+          endTime.value,
+          uiStore.displayTimezone,
+        );
+        startIso = startUTC;
+        durationMinutes = Math.max(
+          1,
+          Math.round((new Date(endUTC).getTime() - new Date(startUTC).getTime()) / 60000),
+        );
+      }
+      const binding = await api.meetCreateUrl(
+        accountId,
+        title.value || "Meeting",
+        startIso,
+        durationMinutes,
       );
-      durationMinutes = 24 * 60;
-    } else {
-      const startUTC = localInputToUTC(
-        startDate.value,
-        startTime.value,
-        uiStore.displayTimezone,
-      );
-      const endUTC = localInputToUTC(
-        endDate.value,
-        endTime.value,
-        uiStore.displayTimezone,
-      );
-      startIso = startUTC;
-      durationMinutes = Math.max(
-        1,
-        Math.round((new Date(endUTC).getTime() - new Date(startUTC).getTime()) / 60000),
-      );
+      if (closing.value) {
+        await discardMeetBinding(binding);
+        return;
+      }
+      const previousBinding = pendingMeetBinding.value;
+      if (previousBinding) removeGeneratedJoinLine(previousBinding.join_url);
+      pendingMeetBinding.value = binding;
+      location.value = binding.join_url;
+      description.value = description.value
+        ? `Join: ${binding.join_url}\n\n${description.value}`
+        : `Join: ${binding.join_url}`;
+      if (previousBinding) await discardMeetBinding(previousBinding);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      meetError.value = `Could not create meeting: ${msg}`;
     }
-    const binding = await api.meetCreateUrl(
-      accountId,
-      title.value || "Meeting",
-      startIso,
-      durationMinutes,
-    );
-    pendingMeetBinding.value = binding;
-    // `location` is an <input type="text">: newlines aren't
-    // preserved there, so we replace the field outright rather
-    // than appending. The full link history lives in
-    // `description` (a textarea), where multi-line works.
-    location.value = binding.join_url;
-    description.value = description.value
-      ? `Join: ${binding.join_url}\n\n${description.value}`
-      : `Join: ${binding.join_url}`;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    meetError.value = `Could not create meeting: ${msg}`;
+  })();
+  meetCreationPromise = operation;
+  try {
+    await operation;
   } finally {
+    if (meetCreationPromise === operation) meetCreationPromise = null;
     generatingMeetUrl.value = false;
   }
 }
@@ -440,6 +488,8 @@ async function save() {
   const accountId = cal?.account_id ?? accountsStore.activeAccountId ?? "";
 
   try {
+    if (meetCreationPromise) await meetCreationPromise;
+
     const startISO = allDay.value
       ? `${startDate.value}T00:00:00Z`
       : localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
@@ -447,11 +497,14 @@ async function save() {
       ? `${endDate.value}T23:59:59Z`
       : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
-    // If the user blanked the location after we generated a meet
-    // link, treat the meeting as discarded so we don't bind a stale
-    // remote room to the saved event. The orphaned remote meeting
-    // is acceptable here for the same reason cancelling the form
-    // outright is.
+    // A changed location explicitly relinquishes this form's remote room.
+    if (
+      pendingMeetBinding.value &&
+      location.value !== pendingMeetBinding.value.join_url
+    ) {
+      removeGeneratedJoinLine(pendingMeetBinding.value.join_url);
+      await discardCurrentMeetBinding();
+    }
     const meetBinding =
       pendingMeetBinding.value &&
       location.value === pendingMeetBinding.value.join_url
@@ -472,6 +525,9 @@ async function save() {
       attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
       meet_binding: meetBinding,
     });
+    // createEvent atomically claimed the lifecycle; this form must no longer
+    // discard it, even while invite delivery is still running.
+    if (meetBinding) pendingMeetBinding.value = null;
 
     // Send invite emails if attendees were added
     if (attendeeEmails.value.length > 0) {
@@ -493,11 +549,11 @@ async function save() {
 </script>
 
 <template>
-  <div class="event-form-overlay" @click.self="emit('close')">
+  <div class="event-form-overlay" @click.self="closeForm">
     <div class="event-form">
       <div class="form-header">
         <h3>New Event</h3>
-        <button class="close-btn" @click="emit('close')">
+        <button class="close-btn" :disabled="closing || saving" @click="closeForm">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
         </button>
       </div>
@@ -590,7 +646,7 @@ async function save() {
               :key="opt.value"
               type="button"
               class="meet-btn"
-              :disabled="generatingMeetUrl"
+              :disabled="generatingMeetUrl || closing"
               :data-testid="`event-form-meet-${opt.value}`"
               @click="addVideoLink(opt.value)"
             >
@@ -657,8 +713,8 @@ async function save() {
       <div class="form-footer">
         <div></div>
         <div class="footer-actions">
-          <button class="btn-cancel" @click="emit('close')">Cancel</button>
-          <button class="btn-create" :disabled="saving" @click="save" data-testid="event-form-save">
+          <button class="btn-cancel" :disabled="closing || saving" @click="closeForm">Cancel</button>
+          <button class="btn-create" :disabled="saving || closing || generatingMeetUrl" @click="save" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Create" }}
           </button>
         </div>

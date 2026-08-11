@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -105,6 +105,31 @@ pub struct JmapPushHandle {
     pub task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Weak per-lifecycle lock registry. Entries cannot outlive their callers,
+/// and one registry mutex makes lookup-or-create atomic.
+#[derive(Default)]
+pub struct MeetLifecycleCoordinator {
+    locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl MeetLifecycleCoordinator {
+    pub fn acquire(&self, lifecycle_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        uuid::Uuid::parse_str(lifecycle_id).map_err(|_| {
+            crate::error::Error::Other("meeting lifecycle id must be a UUID".into())
+        })?;
+
+        let mut locks = self.locks.lock().unwrap_or_else(|error| error.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(lifecycle_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(lifecycle_id.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+}
+
 pub struct AppState {
     pub db: Arc<DbPool>,
     pub providers: Arc<crate::provider::ProviderServices>,
@@ -154,6 +179,8 @@ pub struct AppState {
     /// (Zoom is a public OAuth client and uses PKCE rather than
     /// a client_secret). (#148)
     pub zoom_oauth_sessions: std::sync::Mutex<HashMap<u16, ZoomOAuthSession>>,
+    /// Serializes claims and cleanup for each durable meeting lifecycle.
+    pub meet_lifecycle: MeetLifecycleCoordinator,
     /// Shared OpenPGP keystore (~/.tumpa/keys.db by default, overridable
     /// with $TUMPA_DIR / $TUMPA_KEYSTORE). Lazily opened on first use so a
     /// broken or missing keystore directory doesn't block app startup.
@@ -250,6 +277,7 @@ impl AppState {
             talk_login_sessions: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
             zoom_oauth_sessions: std::sync::Mutex::new(HashMap::new()),
+            meet_lifecycle: MeetLifecycleCoordinator::default(),
             pgp_store: OnceLock::new(),
             pgp_cache: Arc::new(std::sync::Mutex::new(
                 libtumpa::cache::CredentialCache::new(),
@@ -343,10 +371,11 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::IdleControl;
+    use super::{IdleControl, MeetLifecycleCoordinator};
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn idle_control_interrupts_registered_socket() {
@@ -393,5 +422,52 @@ mod tests {
         control.if_running(|| emitted.store(true, Ordering::Relaxed));
 
         assert!(!emitted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn meet_lifecycle_rejects_malformed_ids_without_inserting() {
+        let coordinator = MeetLifecycleCoordinator::default();
+        assert!(coordinator.acquire("renderer-controlled").is_err());
+        assert!(coordinator.locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn meet_lifecycle_prunes_sequential_stale_entries() {
+        let coordinator = MeetLifecycleCoordinator::default();
+        for _ in 0..32 {
+            let id = uuid::Uuid::new_v4().to_string();
+            drop(coordinator.acquire(&id).unwrap());
+        }
+
+        // Each acquisition prunes the dead entry from the preceding one.
+        assert_eq!(coordinator.locks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_meet_lifecycle_acquisitions_share_one_lock() {
+        let coordinator = Arc::new(MeetLifecycleCoordinator::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let coordinator = coordinator.clone();
+            let barrier = barrier.clone();
+            let id = id.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = coordinator.acquire(&id).unwrap();
+                barrier.wait();
+                lock
+            }));
+        }
+        barrier.wait();
+        barrier.wait();
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        let guard = first.try_lock().unwrap();
+        assert!(second.try_lock().is_err());
+        drop(guard);
     }
 }

@@ -479,6 +479,7 @@ pub async fn meet_zoom_login_complete(
 /// `update_event` know which one to reschedule.
 #[derive(Debug, Serialize)]
 pub struct MeetCreateResponse {
+    pub lifecycle_id: String,
     pub account_id: String,
     pub protocol: String,
     pub meeting_id: String,
@@ -513,12 +514,129 @@ pub async fn meet_create_url(
             duration_minutes,
         )
         .await?;
+    let lifecycle_id = uuid::Uuid::new_v4().to_string();
+    let pending = db::meet_pending_meetings::PendingMeeting {
+        lifecycle_id: lifecycle_id.clone(),
+        account_id: account.id.clone(),
+        protocol: protocol.clone(),
+        meeting_id: res.meeting_id.clone(),
+        join_url: res.join_url.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let persist_result = {
+        let conn = state.db.writer().await;
+        db::meet_pending_meetings::insert(&conn, &pending)
+    };
+    if let Err(persist_error) = persist_result {
+        // Provider creation and SQLite cannot share an atomic transaction.
+        // Never return an untracked room: compensate immediately, and report
+        // both failures if durable tracking and provider deletion both fail.
+        let compensation = provider
+            .delete_meeting(&ctx, &account, &res.meeting_id)
+            .await;
+        return match compensation {
+            Ok(()) => Err(Error::Other(format!(
+                "failed to track created meeting; remote meeting was removed: {persist_error}"
+            ))),
+            Err(delete_error) => Err(Error::Other(format!(
+                "failed to track created meeting ({persist_error}); compensation also failed ({delete_error})"
+            ))),
+        };
+    }
     Ok(MeetCreateResponse {
+        lifecycle_id,
         account_id: account.id,
         protocol,
         meeting_id: res.meeting_id,
         join_url: res.join_url,
     })
+}
+
+/// Delete one backend-owned pending meeting. The lifecycle lock spans the
+/// provider call, but database handles do not.
+pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()> {
+    let lifecycle_lock = state.meet_lifecycle.acquire(lifecycle_id)?;
+    let _guard = lifecycle_lock.lock().await;
+    let (pending, account) = {
+        let conn = state.db.reader();
+        let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
+            return Ok(());
+        };
+        let account =
+            db::accounts::get_account_full(&conn, &pending.account_id).map_err(|error| {
+                Error::Other(format!(
+                    "pending meeting {} account {} unavailable: {}",
+                    lifecycle_id, pending.account_id, error
+                ))
+            })?;
+        (pending, account)
+    };
+    let provider = meet::provider_for(&account).ok_or_else(|| {
+        Error::Other(format!(
+            "pending meeting {} account {} has no meet provider",
+            lifecycle_id, pending.account_id
+        ))
+    })?;
+    if provider.protocol() != pending.protocol {
+        return Err(Error::Other(format!(
+            "pending meeting {} protocol '{}' does not match account provider '{}'",
+            lifecycle_id,
+            pending.protocol,
+            provider.protocol()
+        )));
+    }
+    let provider_result = provider
+        .delete_meeting(
+            &meet::MeetProviderCtx {
+                services: &state.providers,
+            },
+            &account,
+            &pending.meeting_id,
+        )
+        .await;
+    let conn = state.db.writer().await;
+    complete_pending_discard(&conn, lifecycle_id, provider_result)
+}
+
+fn complete_pending_discard(
+    conn: &rusqlite::Connection,
+    lifecycle_id: &str,
+    provider_result: Result<()>,
+) -> Result<()> {
+    provider_result?;
+    db::meet_pending_meetings::delete(conn, lifecycle_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn meet_discard_pending(state: State<'_, AppState>, lifecycle_id: String) -> Result<()> {
+    discard_pending(&state, &lifecycle_id).await
+}
+
+pub fn pending_lifecycle_ids(state: &AppState) -> Vec<String> {
+    let conn = state.db.reader();
+    match db::meet_pending_meetings::list(&conn) {
+        Ok(rows) => rows.into_iter().map(|row| row.lifecycle_id).collect(),
+        Err(error) => {
+            log::warn!(
+                "failed to list pending meetings for startup cleanup: {}",
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub async fn sweep_pending(state: &AppState, lifecycle_ids: Vec<String>) {
+    for lifecycle_id in lifecycle_ids {
+        if let Err(error) = discard_pending(state, &lifecycle_id).await {
+            log::warn!(
+                "startup cleanup retained pending meeting {}: {}",
+                lifecycle_id,
+                error
+            );
+        }
+    }
 }
 
 /// Strip scheme + path from a URL for use as a fallback display
@@ -539,7 +657,28 @@ fn validate_returned_server_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_returned_server_url;
+    use super::{complete_pending_discard, validate_returned_server_url};
+    use crate::db;
+    use crate::error::Error;
+
+    fn pending_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO meet_pending_meetings VALUES
+                ('lifecycle', 'account', 'zoom', 'meeting',
+                 'https://example.test', '2026-08-11T20:00:00Z');",
+        )
+        .unwrap();
+        conn
+    }
 
     #[test]
     fn returned_server_url_accepts_https_and_debug_loopback_http() {
@@ -562,5 +701,30 @@ mod tests {
         assert!(validate_returned_server_url("not a URL").is_err());
         assert!(validate_returned_server_url("http://meet.example.com").is_err());
         assert!(validate_returned_server_url("http://192.0.2.1").is_err());
+    }
+
+    #[test]
+    fn provider_delete_failure_retains_pending_ownership() {
+        let conn = pending_connection();
+        let result = complete_pending_discard(
+            &conn,
+            "lifecycle",
+            Err(Error::Other("provider failed".into())),
+        );
+
+        assert!(result.is_err());
+        assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn provider_delete_success_removes_pending_ownership() {
+        let conn = pending_connection();
+        complete_pending_discard(&conn, "lifecycle", Ok(())).unwrap();
+
+        assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
+            .unwrap()
+            .is_none());
     }
 }

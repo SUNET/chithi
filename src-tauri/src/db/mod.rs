@@ -4,6 +4,7 @@ pub mod contacts;
 pub mod filters;
 pub mod folders;
 pub mod meet_meetings;
+pub mod meet_pending_meetings;
 pub mod messages;
 pub mod pool;
 pub mod schema;

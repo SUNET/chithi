@@ -403,6 +403,7 @@ export interface NewEventInput {
  * `createEvent` / `updateEvent` so the backend can persist the
  * link in `meet_meetings`. */
 export interface MeetBinding {
+  lifecycle_id: string;
   account_id: string;
   protocol: string;
   meeting_id: string;
