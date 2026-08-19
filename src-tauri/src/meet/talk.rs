@@ -23,6 +23,8 @@ use crate::error::{Error, Result};
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
+const DELETE_RESPONSE_LIMIT: usize = 64 * 1024;
+const DELETE_DIAGNOSTIC_LIMIT: usize = 500;
 
 /// Single shared `reqwest::Client` for the whole Talk module so
 /// the connection pool persists across the Login Flow v2 poll
@@ -334,6 +336,30 @@ pub async fn delete_room(
     delete_room_with_client(server, login_name, app_password, token, http_client()?).await
 }
 
+#[derive(Deserialize)]
+struct OcsDeleteEnvelope {
+    ocs: OcsDeleteResponse,
+}
+
+#[derive(Deserialize)]
+struct OcsDeleteResponse {
+    meta: OcsDeleteMeta,
+}
+
+#[derive(Deserialize)]
+struct OcsDeleteMeta {
+    status: OcsDeleteStatus,
+    statuscode: u16,
+    message: String,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum OcsDeleteStatus {
+    Ok,
+    Failure,
+}
+
 /// Delete a Talk room using an explicit HTTP client.
 pub async fn delete_room_with_client(
     server: &str,
@@ -358,14 +384,94 @@ pub async fn delete_room_with_client(
         .await
         .map_err(|e| Error::Other(format!("talk delete_room request: {}", e)))?;
     let status = resp.status();
-    if status.is_success() || status.as_u16() == 404 {
+
+    if resp
+        .content_length()
+        .is_some_and(|length| length > u64::try_from(DELETE_RESPONSE_LIMIT).unwrap_or(u64::MAX))
+    {
+        return Err(Error::Other(format!(
+            "talk delete_room: {} response exceeds {} bytes",
+            status, DELETE_RESPONSE_LIMIT,
+        )));
+    }
+
+    let mut resp = resp;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| Error::Other(format!("talk delete_room response: {}", e)))?
+    {
+        if body.len().saturating_add(chunk.len()) > DELETE_RESPONSE_LIMIT {
+            let diagnostic = String::from_utf8_lossy(&body)
+                .chars()
+                .take(DELETE_DIAGNOSTIC_LIMIT)
+                .collect::<String>();
+            return Err(Error::Other(format!(
+                "talk delete_room: {} response exceeds {} bytes ({})",
+                status, DELETE_RESPONSE_LIMIT, diagnostic,
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let diagnostic = String::from_utf8_lossy(&body)
+        .chars()
+        .take(DELETE_DIAGNOSTIC_LIMIT)
+        .collect::<String>();
+
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err(Error::Other(format!(
+            "talk delete_room: authorization failed: {} ({})",
+            status, diagnostic,
+        )));
+    }
+    if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+        return Err(Error::Other(format!(
+            "talk delete_room: {} ({})",
+            status, diagnostic,
+        )));
+    }
+
+    // OCS v2 communicates application success in the envelope, often while
+    // returning HTTP 200. A 204/empty body is therefore not proof of deletion.
+    let payload: OcsDeleteEnvelope = serde_json::from_slice(&body).map_err(|e| {
+        Error::Other(format!(
+            "talk delete_room: invalid OCS metadata: {} ({})",
+            e, diagnostic,
+        ))
+    })?;
+    let meta = payload.ocs.meta;
+    if meta.status == OcsDeleteStatus::Ok
+        && matches!(meta.statuscode, 100 | 200)
+        && status == reqwest::StatusCode::OK
+    {
         return Ok(());
     }
-    let body = resp.text().await.unwrap_or_default();
+    if meta.status == OcsDeleteStatus::Failure
+        && meta.statuscode == 404
+        && matches!(
+            status,
+            reqwest::StatusCode::OK | reqwest::StatusCode::NOT_FOUND
+        )
+    {
+        return Ok(());
+    }
+
+    let ocs_status = match meta.status {
+        OcsDeleteStatus::Ok => "ok",
+        OcsDeleteStatus::Failure => "failure",
+    };
+    let message = meta
+        .message
+        .chars()
+        .take(DELETE_DIAGNOSTIC_LIMIT)
+        .collect::<String>();
     Err(Error::Other(format!(
-        "talk delete_room: {} ({})",
-        status,
-        body.chars().take(500).collect::<String>(),
+        "talk delete_room: OCS {} {}: {} (HTTP {})",
+        ocs_status, meta.statuscode, message, status,
     )))
 }
 
@@ -540,6 +646,28 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    fn mock_server_without_content_length(
+        status: &str,
+        body: &str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            )
+            .unwrap();
+            String::from_utf8(request[..read].to_vec()).unwrap()
+        });
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn normalizes_trailing_slashes() {
         assert_eq!(normalize_base_url("https://x/"), "https://x");
@@ -701,5 +829,258 @@ mod tests {
         assert_eq!(body, "roomType=2&roomName=Team+sync");
         assert_eq!(result.meeting_id, "room-token");
         assert_eq!(result.join_url, format!("{root}/cloud/call/room-token"));
+    }
+
+    #[tokio::test]
+    async fn delete_room_validates_ocs_success_and_request() {
+        let (root, server) = mock_server(
+            "200 OK",
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"OK"},"data":[]}}"#,
+        );
+        let server_url = format!("{root}/cloud/");
+
+        delete_room_with_client(
+            &server_url,
+            "alice",
+            "app-secret",
+            "room token/part",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+
+        assert!(headers.starts_with(
+            "delete /cloud/ocs/v2.php/apps/spreed/api/v4/room/room%20token%2fpart \
+             http/1.1\r\n"
+        ));
+        assert!(headers.contains("authorization: basic ywxpy2u6yxbwlxnly3jlda=="));
+        assert!(headers.contains("ocs-apirequest: true"));
+        assert!(headers.contains("accept: application/json"));
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn delete_room_accepts_repeated_or_missing_room() {
+        for http_status in ["200 OK", "404 Not Found"] {
+            let (root, server) = mock_server(
+                http_status,
+                r#"{"ocs":{"meta":{"status":"failure","statuscode":404,"message":"Room not found"},"data":[]}}"#,
+            );
+
+            delete_room_with_client(
+                &root,
+                "alice",
+                "app-secret",
+                "missing-room",
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_ocs_auth_failure_wrapped_in_http_200() {
+        let (root, server) = mock_server(
+            "200 OK",
+            r#"{"ocs":{"meta":{"status":"failure","statuscode":403,"message":"Forbidden"},"data":[]}}"#,
+        );
+
+        let error = delete_room_with_client(
+            &root,
+            "alice",
+            "bad-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("OCS failure 403: Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_http_auth_failure() {
+        let (root, server) = mock_server(
+            "401 Unauthorized",
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"OK"}}}"#,
+        );
+
+        let error = delete_room_with_client(
+            &root,
+            "alice",
+            "bad-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("authorization failed: 401"));
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_malformed_or_missing_ocs_metadata() {
+        let bodies = [
+            "",
+            r#"{}"#,
+            r#"{"ocs":{}}"#,
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200}}}"#,
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":"200","message":"OK"}}}"#,
+            "not json",
+        ];
+
+        for body in bodies {
+            let (root, server) = mock_server("200 OK", body);
+            let error = delete_room_with_client(
+                &root,
+                "alice",
+                "app-secret",
+                "room-token",
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+            server.join().unwrap();
+
+            assert!(error.to_string().contains("invalid OCS metadata"));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_contradictory_ocs_metadata() {
+        let bodies = [
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":404,"message":"Not found"}}}"#,
+            r#"{"ocs":{"meta":{"status":"failure","statuscode":200,"message":"Failed"}}}"#,
+        ];
+
+        for body in bodies {
+            let (root, server) = mock_server("200 OK", body);
+            let error = delete_room_with_client(
+                &root,
+                "alice",
+                "app-secret",
+                "room-token",
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+            server.join().unwrap();
+
+            assert!(error.to_string().contains("talk delete_room: OCS"));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_undocumented_success_combinations() {
+        let cases = [
+            (
+                "202 Accepted",
+                r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"Accepted"}}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"ocs":{"meta":{"status":"ok","statuscode":206,"message":"Partial"}}}"#,
+            ),
+            (
+                "202 Accepted",
+                r#"{"ocs":{"meta":{"status":"failure","statuscode":404,"message":"Missing"}}}"#,
+            ),
+        ];
+
+        for (status, body) in cases {
+            let (root, server) = mock_server(status, body);
+            assert!(delete_room_with_client(
+                &root,
+                "alice",
+                "app-secret",
+                "room-token",
+                &reqwest::Client::new(),
+            )
+            .await
+            .is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_declared_oversized_response() {
+        let body = "x".repeat(DELETE_RESPONSE_LIMIT + 1);
+        let (root, server) = mock_server("200 OK", &body);
+
+        let error = delete_room_with_client(
+            &root,
+            "alice",
+            "app-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("response exceeds"));
+    }
+
+    #[tokio::test]
+    async fn delete_room_streaming_guard_rejects_oversized_response() {
+        let body = "x".repeat(DELETE_RESPONSE_LIMIT + 1);
+        let (root, server) = mock_server_without_content_length("200 OK", &body);
+
+        let error = delete_room_with_client(
+            &root,
+            "alice",
+            "app-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("response exceeds"));
+    }
+
+    #[tokio::test]
+    async fn delete_room_accepts_response_at_exact_size_limit() {
+        let base = r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"OK"}}}"#;
+        let body = format!("{}{}", base, " ".repeat(DELETE_RESPONSE_LIMIT - base.len()));
+        assert_eq!(body.len(), DELETE_RESPONSE_LIMIT);
+        let (root, server) = mock_server_without_content_length("200 OK", &body);
+
+        delete_room_with_client(
+            &root,
+            "alice",
+            "app-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_room_rejects_204_without_ocs_metadata() {
+        let (root, server) = mock_server("204 No Content", "");
+
+        let error = delete_room_with_client(
+            &root,
+            "alice",
+            "app-secret",
+            "room-token",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("invalid OCS metadata"));
     }
 }

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
+const MATRIX_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
 const SSO_CALLBACK_TIMEOUT_SECS: u64 = 300;
 
@@ -448,8 +449,7 @@ pub async fn rename_room_with_client(
 /// Leave a Matrix room the app created via `create_call`. Matrix
 /// has no "delete room" API (rooms outlive everyone in them), but
 /// leaving drops the room from this user's room list — which is
-/// the closest analogue to "cancelled this call." 403/404 are
-/// treated as already-gone so the local cleanup is idempotent.
+/// the closest analogue to "cancelled this call."
 pub async fn leave_room(homeserver: &str, access_token: &str, room_id: &str) -> Result<()> {
     leave_room_with_client(homeserver, access_token, room_id, http_client()?).await
 }
@@ -467,7 +467,7 @@ pub async fn leave_room_with_client(
         normalize_base_url(homeserver),
         urlencoding::encode(room_id),
     );
-    let resp = client
+    let mut resp = client
         .post(&url)
         .bearer_auth(access_token)
         .header("Content-Type", "application/json")
@@ -476,15 +476,103 @@ pub async fn leave_room_with_client(
         .await
         .map_err(|e| Error::Other(format!("matrix leave_room request: {}", e)))?;
     let status = resp.status();
-    if status.is_success() || status.as_u16() == 403 || status.as_u16() == 404 {
+    if status.is_success() {
         return Ok(());
     }
-    let body = resp.text().await.unwrap_or_default();
+
+    let (body, truncated) = read_bounded_matrix_error(&mut resp).await?;
+    let matrix_error = if truncated {
+        None
+    } else {
+        serde_json::from_slice::<MatrixError>(&body).ok()
+    };
+
+    // Matrix uses M_FORBIDDEN for both an idempotent repeated leave and real
+    // authorization failures. Only explicit absent-membership wording is safe
+    // to discard; an unknown 403 must keep durable ownership for a later retry.
+    let already_gone = matrix_error.as_ref().is_some_and(|error| {
+        (status.is_client_error() && error.errcode == "M_NOT_FOUND")
+            || (status == reqwest::StatusCode::FORBIDDEN
+                && error.errcode == "M_FORBIDDEN"
+                && is_absent_membership_error(&error.error, room_id))
+    });
+    if already_gone {
+        return Ok(());
+    }
+
+    let body = String::from_utf8_lossy(&body);
+    let truncation = if truncated { " [truncated]" } else { "" };
     Err(Error::Other(format!(
-        "matrix leave_room: {} ({})",
+        "matrix leave_room: {} ({}{})",
         status,
         body.chars().take(500).collect::<String>(),
+        truncation,
     )))
+}
+
+#[derive(Deserialize)]
+struct MatrixError {
+    errcode: String,
+    error: String,
+}
+
+async fn read_bounded_matrix_error(response: &mut reqwest::Response) -> Result<(Vec<u8>, bool)> {
+    let mut body = Vec::with_capacity(MATRIX_ERROR_BODY_LIMIT.min(1024));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Other(format!("matrix leave_room response: {}", e)))?
+    {
+        let remaining = MATRIX_ERROR_BODY_LIMIT + 1 - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() > MATRIX_ERROR_BODY_LIMIT {
+            body.truncate(MATRIX_ERROR_BODY_LIMIT);
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
+}
+
+fn is_absent_membership_error(error: &str, room_id: &str) -> bool {
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(prefix) = normalized.strip_suffix(room_id) else {
+        return false;
+    };
+    let prefix = prefix.trim_end().to_ascii_lowercase();
+    if matches!(
+        prefix.as_str(),
+        "you are not in room"
+            | "you are not in the room"
+            | "you are not joined to room"
+            | "you are not joined to the room"
+            | "you already left room"
+            | "you already left the room"
+    ) {
+        return true;
+    }
+
+    ["user ", "the user ", "requesting user "]
+        .iter()
+        .find_map(|subject| prefix.strip_prefix(subject))
+        .and_then(|user_and_state| user_and_state.split_once(' '))
+        .is_some_and(|(user_id, state)| {
+            !user_id.is_empty()
+                && matches!(
+                    state,
+                    "not in room"
+                        | "not in the room"
+                        | "is not in room"
+                        | "is not in the room"
+                        | "not joined to room"
+                        | "not joined to the room"
+                        | "is not joined to room"
+                        | "is not joined to the room"
+                        | "no longer in room"
+                        | "no longer in the room"
+                        | "already left room"
+                        | "already left the room"
+                )
+        })
 }
 
 /// Pull just the host out of a homeserver URL, so the matrix.to
@@ -640,6 +728,17 @@ mod tests {
     fn mock_server(
         responses: Vec<(&'static str, &'static str)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        mock_server_owned(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status.to_string(), body.to_string()))
+                .collect(),
+        )
+    }
+
+    fn mock_server_owned(
+        responses: Vec<(String, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -787,5 +886,173 @@ mod tests {
             .to_ascii_lowercase()
             .contains("authorization: bearer matrix-token"));
         assert_eq!(result.meeting_id, "!room:matrix.example");
+    }
+
+    #[tokio::test]
+    async fn leave_room_accepts_success() {
+        let (root, server) = mock_server(vec![("204 No Content", "")]);
+
+        leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!room:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_accepts_repeated_leave() {
+        let (root, server) = mock_server(vec![(
+            "403 Forbidden",
+            r#"{"errcode":"M_FORBIDDEN","error":"User @alice:matrix.example not in room !room:matrix.example"}"#,
+        )]);
+
+        leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!room:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_accepts_missing_room() {
+        let (root, server) = mock_server(vec![(
+            "404 Not Found",
+            r#"{"errcode":"M_NOT_FOUND","error":"Room not found"}"#,
+        )]);
+
+        leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!missing:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_accepts_matrix_not_found_on_other_client_error() {
+        let (root, server) = mock_server(vec![(
+            "400 Bad Request",
+            r#"{"errcode":"M_NOT_FOUND","error":"Room not found"}"#,
+        )]);
+
+        leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!missing:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_rejects_genuine_authorization_failure() {
+        let (root, server) = mock_server(vec![(
+            "403 Forbidden",
+            r#"{"errcode":"M_FORBIDDEN","error":"You do not have permission to leave this room"}"#,
+        )]);
+
+        let error = leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!room:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn leave_room_rejects_malformed_and_unknown_forbidden_errors() {
+        let (root, server) = mock_server(vec![
+            ("403 Forbidden", "not json"),
+            (
+                "403 Forbidden",
+                r#"{"errcode":"M_FORBIDDEN","error":"Insufficient power level"}"#,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"errcode":"M_FORBIDDEN","error":"You are not in the room's moderator list for !room:matrix.example"}"#,
+            ),
+        ]);
+        let client = reqwest::Client::new();
+
+        assert!(
+            leave_room_with_client(&root, "matrix-token", "!room:matrix.example", &client,)
+                .await
+                .is_err()
+        );
+        assert!(
+            leave_room_with_client(&root, "matrix-token", "!room:matrix.example", &client,)
+                .await
+                .is_err()
+        );
+        assert!(
+            leave_room_with_client(&root, "matrix-token", "!room:matrix.example", &client,)
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_rejects_oversized_error_body() {
+        let body = format!(
+            r#"{{"errcode":"M_NOT_FOUND","error":"{}"}}"#,
+            "x".repeat(MATRIX_ERROR_BODY_LIMIT)
+        );
+        let (root, server) = mock_server_owned(vec![("404 Not Found".to_string(), body)]);
+
+        let error = leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!room:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("[truncated]"));
+    }
+
+    #[tokio::test]
+    async fn leave_room_sends_expected_request() {
+        let (root, server) = mock_server(vec![("200 OK", "{}")]);
+        let homeserver = format!("{root}/tenant/");
+
+        leave_room_with_client(
+            &homeserver,
+            "matrix-token",
+            "!room:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let requests = server.join().unwrap();
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+
+        assert!(headers.starts_with(
+            "POST /tenant/_matrix/client/v3/rooms/%21room%3Amatrix.example/leave HTTP/1.1\r\n"
+        ));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer matrix-token"));
+        assert_eq!(body, "{}");
     }
 }
