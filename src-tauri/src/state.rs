@@ -256,6 +256,9 @@ pub struct ZoomOAuthSession {
     pub listener: std::net::TcpListener,
     pub verifier: Option<String>,
     pub state: String,
+    /// Existing account being reauthenticated, fixed when OAuth starts so a
+    /// renderer cannot redirect the completed authorization to another row.
+    pub account_id: Option<String>,
 }
 
 impl AppState {

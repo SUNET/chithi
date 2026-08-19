@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -73,6 +73,12 @@ pub struct DavBindingConfig {
 pub struct MeetBindingConfig {
     #[serde(default)]
     pub url: String,
+    /// Stable Zoom principal identifiers. Empty for non-Zoom and bindings
+    /// created before identity-bound reauthentication support.
+    #[serde(default)]
+    pub zoom_user_id: String,
+    #[serde(default)]
+    pub zoom_account_id: String,
 }
 
 /// A per-service binding that says "this account talks to this protocol for
@@ -406,8 +412,8 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
 /// `insert_account` / `update_account` (which build the fields from the
 /// wire-format `AccountConfig`).
 ///
-/// User-set fields stored in `config_json` that the legacy derivation
-/// doesn't know about (currently `default_contact_book_id`) are
+/// User-set and provider-owned fields stored in `config_json` that the legacy
+/// derivation doesn't know about (contact-book defaults and Zoom identity) are
 /// snapshotted before the wipe and re-applied after the re-insert so a
 /// trivial account-edit doesn't drop them.
 pub fn rebuild_for_account(
@@ -416,6 +422,7 @@ pub fn rebuild_for_account(
     fields: LegacyBindingFields<'_>,
 ) -> Result<()> {
     let preserved = snapshot_user_set_config(conn, account_id)?;
+    let zoom_identity = snapshot_zoom_identity(conn, account_id)?;
     delete_for_account(conn, account_id)?;
     for binding in derive_bindings(fields) {
         insert(conn, &binding)?;
@@ -437,8 +444,80 @@ pub fn rebuild_for_account(
             );
         }
     }
+    if let Some((user_id, zoom_account_id)) = zoom_identity {
+        if let Err(error) = set_zoom_identity(conn, account_id, &user_id, &zoom_account_id) {
+            log::debug!(
+                "rebuild_for_account: drop preserved Zoom identity for account {}: {}",
+                account_id,
+                error
+            );
+        }
+    }
     apply_default_contact_book_if_missing(conn, account_id)?;
     Ok(())
+}
+
+pub fn set_zoom_identity(
+    conn: &Connection,
+    account_id: &str,
+    user_id: &str,
+    zoom_account_id: &str,
+) -> Result<()> {
+    if user_id.trim().is_empty() || zoom_account_id.trim().is_empty() {
+        return Err(Error::Other("Zoom identity must not be empty".into()));
+    }
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'meet' AND protocol = 'zoom'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let config = config.ok_or_else(|| {
+        Error::Other(format!(
+            "no Zoom meet binding for account {} — cannot store identity",
+            account_id
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&config)
+        .map_err(|error| Error::Other(format!("malformed Zoom binding config: {error}")))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        Error::Other(format!(
+            "Zoom binding for account {} has non-object config_json",
+            account_id
+        ))
+    })?;
+    object.insert("zoom_user_id".into(), user_id.into());
+    object.insert("zoom_account_id".into(), zoom_account_id.into());
+    let serialized = serde_json::to_string(&value)
+        .map_err(|error| Error::Other(format!("serialize Zoom binding config: {error}")))?;
+    conn.execute(
+        "UPDATE service_bindings SET config_json = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = ?2 AND service = 'meet' AND protocol = 'zoom'",
+        params![serialized, account_id],
+    )?;
+    Ok(())
+}
+
+fn snapshot_zoom_identity(conn: &Connection, account_id: &str) -> Result<Option<(String, String)>> {
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'meet' AND protocol = 'zoom'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let config: MeetBindingConfig = serde_json::from_str(&config)
+        .map_err(|error| Error::Other(format!("malformed Zoom binding config: {error}")))?;
+    if config.zoom_user_id.is_empty() || config.zoom_account_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((config.zoom_user_id, config.zoom_account_id)))
 }
 
 /// Field name in `config_json` that holds the default contact book

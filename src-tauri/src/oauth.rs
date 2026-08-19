@@ -153,9 +153,12 @@ pub const MICROSOFT_GRAPH_ROOM_SCOPES: &str =
 /// - `meeting:write:meeting` for `POST /v2/users/me/meetings` (create)
 /// - `meeting:update:meeting` for `PATCH /v2/meetings/{id}` (reschedule on event move)
 /// - `meeting:delete:meeting` for `DELETE /v2/meetings/{id}` (cancel on event delete)
+/// - `user:read:user` for `GET /v2/users/me` (bind reauthentication to the
+///   original Zoom principal)
 ///
-/// All three must be checked under Marketplace, Scopes, Meeting on
-/// the registered app. Adding a scope after the app is already
+/// The meeting scopes and user-profile scope must be checked under
+/// Marketplace, Scopes on the registered app. Adding a scope after
+/// the app is already
 /// published forces existing users to re-authorize; without that,
 /// the access token keeps the old narrower scope set and the
 /// PATCH/DELETE calls 401.
@@ -178,6 +181,7 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
         "meeting:write:meeting",
         "meeting:update:meeting",
         "meeting:delete:meeting",
+        "user:read:user",
     ],
     token_exchange_scope: None,
     use_pkce: true,
@@ -1852,6 +1856,11 @@ mod tests {
     fn test_non_microsoft_providers_omit_token_exchange_scope() {
         assert!(GOOGLE.token_exchange_scope.is_none());
         assert!(ZOOM.token_exchange_scope.is_none());
+    }
+
+    #[test]
+    fn zoom_requests_identity_scope_for_safe_reauthentication() {
+        assert!(ZOOM.scopes.contains(&"user:read:user"));
     }
 
     #[tokio::test]

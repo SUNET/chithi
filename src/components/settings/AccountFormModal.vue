@@ -753,7 +753,9 @@ async function signInWithZoom() {
   meetSigningIn.value = true;
   error.value = null;
   try {
-    const start = await api.meetZoomLoginStart();
+    const start = await api.meetZoomLoginStart(
+      editingAccountId.value || undefined,
+    );
     await openUrl(start.login_url);
     const accountId = await api.meetZoomLoginComplete(
       start.port,

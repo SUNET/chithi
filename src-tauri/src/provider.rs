@@ -296,6 +296,57 @@ impl OAuthTokenLifecycle {
         crate::oauth::clear_reauth_required(account_id);
         Ok(())
     }
+
+    fn replace_zoom_and_commit<F>(
+        &self,
+        account_id: &str,
+        tokens: &OAuthTokens,
+        commit: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let restore_reauth = crate::oauth::is_reauth_required(account_id);
+        let previous = self.tokens.load(account_id)?;
+        if let Err(error) = self.tokens.store(account_id, tokens) {
+            let compensation = match previous.as_ref() {
+                Some(previous) => self.tokens.store(account_id, previous),
+                None => self.tokens.delete(account_id),
+            };
+            if restore_reauth {
+                crate::oauth::mark_reauth_required(account_id);
+            }
+            return match compensation {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(compensation_error(
+                    "replacing Zoom tokens",
+                    error,
+                    "restoring the token snapshot",
+                    restore_error,
+                )),
+            };
+        }
+        if let Err(error) = commit() {
+            let compensation = match previous.as_ref() {
+                Some(previous) => self.tokens.store(account_id, previous),
+                None => self.tokens.delete(account_id),
+            };
+            if restore_reauth {
+                crate::oauth::mark_reauth_required(account_id);
+            }
+            return match compensation {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(compensation_error(
+                    "committing Zoom reauthentication",
+                    error,
+                    "restoring the token snapshot",
+                    restore_error,
+                )),
+            };
+        }
+        crate::oauth::clear_reauth_required(account_id);
+        Ok(())
+    }
 }
 
 pub struct ZoomTokenLifecycleGuard<'a> {
@@ -319,6 +370,18 @@ impl ZoomTokenLifecycleGuard<'_> {
     {
         self.lifecycle
             .delete_zoom_and_commit(self.account_id, commit)
+    }
+
+    pub fn replace(&self, tokens: &OAuthTokens) -> Result<()> {
+        self.replace_and_commit(tokens, || Ok(()))
+    }
+
+    pub fn replace_and_commit<F>(&self, tokens: &OAuthTokens, commit: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.lifecycle
+            .replace_zoom_and_commit(self.account_id, tokens, commit)
     }
 }
 
@@ -796,7 +859,7 @@ impl ProviderCredentials for ProviderCredentialService {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use super::*;
@@ -869,6 +932,29 @@ mod tests {
             self.inner.delete(account_id)?;
             crate::oauth::clear_reauth_required(account_id);
             Err(Error::Other("injected delete failure".into()))
+        }
+    }
+
+    struct FailOnceAfterWriteTokenStore {
+        inner: MemoryTokenStore,
+        fail_next_store: AtomicBool,
+    }
+
+    impl OAuthTokenStore for FailOnceAfterWriteTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<OAuthTokens>> {
+            self.inner.load(account_id)
+        }
+
+        fn store(&self, account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+            self.inner.store(account_id, tokens)?;
+            if self.fail_next_store.swap(false, Ordering::SeqCst) {
+                return Err(Error::Other("injected failure after token write".into()));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<()> {
+            self.inner.delete(account_id)
         }
     }
 
@@ -1384,6 +1470,102 @@ mod tests {
             store.load(account_id).unwrap().unwrap().access_token,
             "fresh-access"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_zoom_reauth_replaces_tokens_and_clears_latch() {
+        let account_id = "zoom-reauth-success";
+        let store = Arc::new(MemoryTokenStore::default());
+        store
+            .store(
+                account_id,
+                &OAuthTokens {
+                    access_token: "old-access".into(),
+                    refresh_token: Some("old-refresh".into()),
+                    expires_at: Some(0),
+                },
+            )
+            .unwrap();
+        crate::oauth::mark_reauth_required(account_id);
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        lifecycle
+            .replace_zoom_and_commit(account_id, &refreshed_tokens(), || Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            store.load(account_id).unwrap().unwrap().access_token,
+            "fresh-access"
+        );
+        crate::oauth::ensure_not_reauth_required(account_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_zoom_reauth_restores_tokens_and_latch() {
+        let account_id = "zoom-reauth-rollback";
+        let store = Arc::new(FailOnceAfterWriteTokenStore {
+            inner: MemoryTokenStore::default(),
+            fail_next_store: AtomicBool::new(false),
+        });
+        let previous = OAuthTokens {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: Some(0),
+        };
+        store.store(account_id, &previous).unwrap();
+        store.fail_next_store.store(true, Ordering::SeqCst);
+        crate::oauth::mark_reauth_required(account_id);
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        assert!(lifecycle
+            .replace_zoom_and_commit(account_id, &refreshed_tokens(), || Ok(()))
+            .is_err());
+
+        let restored = store.load(account_id).unwrap().unwrap();
+        assert_eq!(restored.access_token, previous.access_token);
+        assert_eq!(restored.refresh_token, previous.refresh_token);
+        assert_eq!(restored.expires_at, previous.expires_at);
+        assert!(crate::oauth::ensure_not_reauth_required(account_id).is_err());
+        crate::oauth::clear_reauth_required(account_id);
+    }
+
+    #[tokio::test]
+    async fn zoom_reauth_commit_failure_restores_tokens_and_latch() {
+        let account_id = "zoom-reauth-commit-rollback";
+        let store = Arc::new(MemoryTokenStore::default());
+        let previous = OAuthTokens {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: Some(0),
+        };
+        store.store(account_id, &previous).unwrap();
+        crate::oauth::mark_reauth_required(account_id);
+        let lifecycle = OAuthTokenLifecycle {
+            tokens: store.clone(),
+            account_locks: Arc::new(ProviderAccountCoordinator::default()),
+        };
+        let _guard = lifecycle.account_locks.lock_account(account_id).await;
+
+        assert!(lifecycle
+            .replace_zoom_and_commit(account_id, &refreshed_tokens(), || {
+                Err(Error::Other("injected identity commit failure".into()))
+            })
+            .is_err());
+
+        let restored = store.load(account_id).unwrap().unwrap();
+        assert_eq!(restored.access_token, previous.access_token);
+        assert_eq!(restored.refresh_token, previous.refresh_token);
+        assert_eq!(restored.expires_at, previous.expires_at);
+        assert!(crate::oauth::ensure_not_reauth_required(account_id).is_err());
+        crate::oauth::clear_reauth_required(account_id);
     }
 
     #[tokio::test]

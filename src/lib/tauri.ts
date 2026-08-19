@@ -54,6 +54,13 @@ export async function deleteAccount(accountId: string): Promise<void> {
   return invoke("delete_account", { accountId });
 }
 
+export async function abandonZoomAccount(
+  accountId: string,
+  confirmation: string,
+): Promise<void> {
+  return invoke("abandon_zoom_account", { accountId, confirmation });
+}
+
 /// Thunderbird-style mail-server discovery for the IMAP tab
 /// (Mozilla ISP DB / provider autoconfig / .well-known / MX). No
 /// CalDAV / CardDAV probing — those live on their own dedicated
@@ -648,8 +655,12 @@ export interface ZoomLoginStart {
   port: number;
 }
 
-export async function meetZoomLoginStart(): Promise<ZoomLoginStart> {
-  return invoke("meet_zoom_login_start");
+export async function meetZoomLoginStart(
+  accountId?: string,
+): Promise<ZoomLoginStart> {
+  return invoke("meet_zoom_login_start", {
+    accountId: accountId ?? null,
+  });
 }
 
 export async function meetZoomLoginComplete(

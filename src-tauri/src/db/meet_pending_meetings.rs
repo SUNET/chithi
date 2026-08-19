@@ -67,6 +67,29 @@ pub fn list_cleanup_requested(conn: &Connection) -> Result<Vec<PendingMeeting>> 
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+pub fn list_cleanup_requested_for_account(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<PendingMeeting>> {
+    let mut statement = conn.prepare(
+        "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+                cleanup_requested
+         FROM meet_pending_meetings
+         WHERE cleanup_requested = 1 AND account_id = ?1
+         ORDER BY created_at, lifecycle_id",
+    )?;
+    let rows = statement.query_map(params![account_id], row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn request_cleanup(conn: &Connection, lifecycle_id: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE meet_pending_meetings SET cleanup_requested = 1
+         WHERE lifecycle_id = ?1",
+        params![lifecycle_id],
+    )? != 0)
+}
+
 pub fn delete(conn: &Connection, lifecycle_id: &str) -> Result<bool> {
     Ok(conn.execute(
         "DELETE FROM meet_pending_meetings WHERE lifecycle_id = ?1",
@@ -132,6 +155,13 @@ mod tests {
         assert_eq!(get(&conn, "first").unwrap(), Some(first.clone()));
         assert_eq!(list(&conn).unwrap(), vec![first, second.clone()]);
         assert_eq!(list_cleanup_requested(&conn).unwrap(), vec![second.clone()]);
+        assert_eq!(
+            list_cleanup_requested_for_account(&conn, "account").unwrap(),
+            vec![second.clone()]
+        );
+        assert!(request_cleanup(&conn, "first").unwrap());
+        assert!(get(&conn, "first").unwrap().unwrap().cleanup_requested);
+        assert!(!request_cleanup(&conn, "missing").unwrap());
         assert!(delete(&conn, "first").unwrap());
         assert!(!delete(&conn, "first").unwrap());
         assert!(get(&conn, "first").unwrap().is_none());

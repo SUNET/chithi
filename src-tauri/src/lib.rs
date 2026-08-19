@@ -67,6 +67,7 @@ pub fn run() {
             commands::accounts::get_account_config,
             commands::accounts::update_account,
             commands::accounts::delete_account,
+            commands::accounts::abandon_zoom_account,
             commands::accounts::discover_mail_servers,
             commands::mail::list_folders,
             commands::mail::get_messages,

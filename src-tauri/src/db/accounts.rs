@@ -858,7 +858,7 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 pub fn delete_account(conn: &Connection, id: &str) -> Result<()> {
     if crate::db::meet_meetings::account_has_lifecycle_references(conn, id)? {
         return Err(crate::error::Error::Other(
-            "Cannot delete this account while meetings still require it. Delete the related calendar events and wait for meeting cleanup to finish.".into(),
+            "Cannot delete this account while meetings still require it. Delete the related calendar events and wait for meeting cleanup to finish. If Zoom authentication expired, sign in again first.".into(),
         ));
     }
     // Remove password from keyring (best-effort, don't block deletion)
