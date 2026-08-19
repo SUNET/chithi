@@ -243,6 +243,7 @@ fn queue_meeting_cleanup(
             meeting_id: binding.meeting_id,
             join_url: binding.join_url,
             created_at: chrono::Utc::now().to_rfc3339(),
+            cleanup_requested: true,
         },
     )?;
     Ok(lifecycle_id)
@@ -404,11 +405,17 @@ async fn push_calendar_rename(
 #[tauri::command]
 pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("delete_calendar: id={}", calendar_id);
-    let mut conn = state.db.writer().await;
-    let transaction = conn.transaction()?;
-    db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
-    db::calendar::delete_calendar_row(&transaction, &calendar_id)?;
-    transaction.commit()?;
+    let cleanup_ids = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        let cleanup_ids =
+            db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?
+                .cleanup_lifecycle_ids;
+        db::calendar::delete_calendar_row(&transaction, &calendar_id)?;
+        transaction.commit()?;
+        cleanup_ids
+    };
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
     log::info!("delete_calendar: deleted calendar {}", calendar_id);
     Ok(())
 }
@@ -420,12 +427,17 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
 #[tauri::command]
 pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("unsubscribe_calendar: id={}", calendar_id);
-    let mut conn = state.db.writer().await;
-    let transaction = conn.transaction()?;
-    db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
-    let deleted =
-        db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?.deleted;
-    transaction.commit()?;
+    let deletion = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
+        let deletion =
+            db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
+        transaction.commit()?;
+        deletion
+    };
+    let deleted = deletion.deleted;
+    crate::commands::meet::sweep_pending(&state, deletion.cleanup_lifecycle_ids).await;
     log::info!(
         "unsubscribe_calendar: deleted {} events for calendar {}",
         deleted,
@@ -1126,6 +1138,10 @@ pub async fn sync_calendars(
             .ok();
         }
     }
+
+    // Backends queue cleanup inside their reconciliation transactions. Run
+    // after backend writers are released and never mask the sync result.
+    crate::commands::meet::sweep_cleanup_requested(&state).await;
 
     sync_result?;
 
@@ -2099,6 +2115,7 @@ pub async fn process_cancelled_invite(
 
     let mut conn = state.db.writer().await;
     let mut deleted = 0;
+    let mut cleanup_ids = Vec::new();
     for cancel in &cancels {
         if let Some(event) = db::calendar::get_event_by_uid(&conn, &account_id, &cancel.uid)? {
             // Verify the CANCEL's organizer matches the event's organizer to
@@ -2115,7 +2132,10 @@ pub async fn process_cancelled_invite(
                 }
             }
             let transaction = conn.transaction()?;
-            db::calendar_event_deletion::delete_event(&transaction, &event.id)?;
+            cleanup_ids.extend(
+                db::calendar_event_deletion::delete_event(&transaction, &event.id)?
+                    .cleanup_lifecycle_ids,
+            );
             transaction.commit()?;
             deleted += 1;
             log::info!(
@@ -2125,6 +2145,8 @@ pub async fn process_cancelled_invite(
             );
         }
     }
+    drop(conn);
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
 
     if deleted > 0 {
         use tauri::Emitter as _;
@@ -2215,6 +2237,7 @@ pub fn auto_process_calendar_emails(
     // Phase 2: acquire the writer ONCE and batch all calendar updates.
     let mut conn_w = tokio::runtime::Handle::current().block_on(db.writer());
     let mut calendar_changed = false;
+    let mut cleanup_ids = Vec::new();
 
     for invite in &all_invites {
         match invite.method.to_uppercase().as_str() {
@@ -2266,12 +2289,13 @@ pub fn auto_process_calendar_emails(
                 {
                     let deleted = match conn_w.transaction() {
                         Ok(transaction) => {
-                            if db::calendar_event_deletion::delete_event(&transaction, &event.id)
-                                .is_ok()
+                            match db::calendar_event_deletion::delete_event(&transaction, &event.id)
                             {
-                                transaction.commit().is_ok()
-                            } else {
-                                false
+                                Ok(result) if transaction.commit().is_ok() => {
+                                    cleanup_ids.extend(result.cleanup_lifecycle_ids);
+                                    true
+                                }
+                                _ => false,
                             }
                         }
                         Err(_) => false,
@@ -2292,6 +2316,15 @@ pub fn auto_process_calendar_emails(
 
     // Release writer before emitting events
     drop(conn_w);
+
+    if !cleanup_ids.is_empty() {
+        use tauri::Manager as _;
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = handle.state::<AppState>();
+            crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
+        });
+    }
 
     if calendar_changed {
         use tauri::Emitter;
@@ -2432,6 +2465,7 @@ mod tests {
             meeting_id: "meeting".into(),
             join_url: "https://example.test/join".into(),
             created_at: "2026-08-11T20:00:00Z".into(),
+            cleanup_requested: false,
         };
         let mut binding = MeetBindingInput {
             lifecycle_id: pending.lifecycle_id.clone(),
@@ -2479,6 +2513,7 @@ mod tests {
                 meeting_id: binding.meeting_id.clone(),
                 join_url: binding.join_url.clone(),
                 created_at: "2026-08-11T20:00:00Z".into(),
+                cleanup_requested: false,
             },
         )
         .unwrap();

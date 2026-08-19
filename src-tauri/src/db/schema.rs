@@ -231,7 +231,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             protocol TEXT NOT NULL,
             meeting_id TEXT NOT NULL,
             join_url TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            cleanup_requested INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_meet_pending_meetings_account
             ON meet_pending_meetings(account_id);
@@ -377,6 +378,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         log::info!("Migration: adding is_subscribed column to calendars table");
         conn.execute_batch(
             "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+
+    let has_cleanup_requested = conn
+        .prepare("SELECT cleanup_requested FROM meet_pending_meetings LIMIT 0")
+        .is_ok();
+    if !has_cleanup_requested {
+        log::info!("Migration: adding cleanup_requested to pending meetings");
+        conn.execute_batch(
+            "ALTER TABLE meet_pending_meetings
+             ADD COLUMN cleanup_requested INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
 
@@ -877,5 +889,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pending_cleanup_flag_migration_preserves_rows_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('existing', 'account', 'zoom', 'meeting', 'https://example.test');",
+        )
+        .unwrap();
+
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+
+        let cleanup_requested: bool = conn
+            .query_row(
+                "SELECT cleanup_requested FROM meet_pending_meetings
+                 WHERE lifecycle_id = 'existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!cleanup_requested);
     }
 }

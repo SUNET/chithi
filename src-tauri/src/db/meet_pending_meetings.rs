@@ -12,13 +12,15 @@ pub struct PendingMeeting {
     pub meeting_id: String,
     pub join_url: String,
     pub created_at: String,
+    pub cleanup_requested: bool,
 }
 
 pub fn insert(conn: &Connection, meeting: &PendingMeeting) -> Result<()> {
     conn.execute(
         "INSERT INTO meet_pending_meetings
-            (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+             cleanup_requested)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             meeting.lifecycle_id,
             meeting.account_id,
@@ -26,6 +28,7 @@ pub fn insert(conn: &Connection, meeting: &PendingMeeting) -> Result<()> {
             meeting.meeting_id,
             meeting.join_url,
             meeting.created_at,
+            meeting.cleanup_requested,
         ],
     )?;
     Ok(())
@@ -34,7 +37,8 @@ pub fn insert(conn: &Connection, meeting: &PendingMeeting) -> Result<()> {
 pub fn get(conn: &Connection, lifecycle_id: &str) -> Result<Option<PendingMeeting>> {
     Ok(conn
         .query_row(
-            "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at
+            "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+                    cleanup_requested
              FROM meet_pending_meetings WHERE lifecycle_id = ?1",
             params![lifecycle_id],
             row,
@@ -44,8 +48,20 @@ pub fn get(conn: &Connection, lifecycle_id: &str) -> Result<Option<PendingMeetin
 
 pub fn list(conn: &Connection) -> Result<Vec<PendingMeeting>> {
     let mut statement = conn.prepare(
-        "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at
+        "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+                cleanup_requested
          FROM meet_pending_meetings ORDER BY created_at, lifecycle_id",
+    )?;
+    let rows = statement.query_map([], row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn list_cleanup_requested(conn: &Connection) -> Result<Vec<PendingMeeting>> {
+    let mut statement = conn.prepare(
+        "SELECT lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+                cleanup_requested
+         FROM meet_pending_meetings WHERE cleanup_requested = 1
+         ORDER BY created_at, lifecycle_id",
     )?;
     let rows = statement.query_map([], row)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -66,6 +82,7 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingMeeting> {
         meeting_id: row.get(3)?,
         join_url: row.get(4)?,
         created_at: row.get(5)?,
+        cleanup_requested: row.get(6)?,
     })
 }
 
@@ -82,7 +99,8 @@ mod tests {
                 protocol TEXT NOT NULL,
                 meeting_id TEXT NOT NULL,
                 join_url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
             );",
         )
         .unwrap();
@@ -97,6 +115,7 @@ mod tests {
             meeting_id: "meeting".into(),
             join_url: "https://example.test/join".into(),
             created_at: "2026-08-11T20:00:00Z".into(),
+            cleanup_requested: false,
         }
     }
 
@@ -106,11 +125,13 @@ mod tests {
         let first = pending("first");
         let mut second = pending("second");
         second.created_at = "2026-08-11T21:00:00Z".into();
+        second.cleanup_requested = true;
 
         insert(&conn, &first).unwrap();
         insert(&conn, &second).unwrap();
         assert_eq!(get(&conn, "first").unwrap(), Some(first.clone()));
-        assert_eq!(list(&conn).unwrap(), vec![first, second]);
+        assert_eq!(list(&conn).unwrap(), vec![first, second.clone()]);
+        assert_eq!(list_cleanup_requested(&conn).unwrap(), vec![second.clone()]);
         assert!(delete(&conn, "first").unwrap());
         assert!(!delete(&conn, "first").unwrap());
         assert!(get(&conn, "first").unwrap().is_none());

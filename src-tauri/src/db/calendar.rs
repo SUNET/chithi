@@ -597,7 +597,8 @@ mod tests {
                 protocol TEXT NOT NULL,
                 meeting_id TEXT NOT NULL,
                 join_url TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO accounts (id, display_name, email, provider, username, password)
             VALUES ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass');

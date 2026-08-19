@@ -28,7 +28,7 @@ fn delete_account_data(
     conn: &rusqlite::Connection,
     account_id: &str,
     token_guard: &ZoomTokenLifecycleGuard<'_>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let transaction = conn.unchecked_transaction()?;
     let bindings = db::service_bindings::list_for_account(&transaction, account_id)?;
     let has_zoom = bindings
@@ -44,18 +44,19 @@ fn delete_account_data(
     // meetings into durable cleanup ownership first. If this same account
     // owns one of those meetings, `delete_account` rejects below and the
     // transaction rolls the event transfer back together with the deletion.
-    db::calendar_event_deletion::delete_account_events(&transaction, account_id)?;
+    let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
+        .cleanup_lifecycle_ids;
     db::accounts::delete_account(&transaction, account_id)?;
 
     if is_standalone_zoom {
         token_guard.delete_and_commit(move || {
             transaction.commit()?;
             Ok(())
-        })
+        })?;
     } else {
         transaction.commit()?;
-        Ok(())
     }
+    Ok(cleanup_ids)
 }
 
 /// Result of a Thunderbird-style mail-server discovery on the IMAP
@@ -312,6 +313,8 @@ pub async fn update_account(
     log::info!("Updating account {} ({})", account_id, config.email);
     state
         .with_op_worker_stopped(&account_id, || async {
+            let account_lock = state.account_lifecycle.acquire(&account_id);
+            let _account_guard = account_lock.lock().await;
             let conn = state.db.writer().await;
             db::accounts::update_account(&conn, &account_id, &config)
         })
@@ -321,22 +324,27 @@ pub async fn update_account(
 #[tauri::command]
 pub async fn delete_account(state: State<'_, AppState>, account_id: String) -> Result<()> {
     log::info!("Deleting account {}", account_id);
-    state
+    let cleanup_ids = state
         .with_op_worker_stopped(&account_id, || async {
+            // Global order is optional meeting lifecycle, account lifecycle,
+            // then provider credentials. Account deletion starts at account.
+            let account_lock = state.account_lifecycle.acquire(&account_id);
+            let _account_guard = account_lock.lock().await;
             let token_guard = state.providers.lock_zoom_tokens(&account_id).await;
-            {
+            let cleanup_ids = {
                 let conn = state.db.writer().await;
-                delete_account_data(&conn, &account_id, &token_guard)?;
-            }
+                delete_account_data(&conn, &account_id, &token_guard)?
+            };
             // Also remove Maildir
             let maildir_path = state.data_dir.join(&account_id);
             if maildir_path.exists() {
                 log::info!("Removing maildir at {}", maildir_path.display());
                 std::fs::remove_dir_all(&maildir_path).ok();
             }
-            Result::<()>::Ok(())
+            Result::<Vec<String>>::Ok(cleanup_ids)
         })
         .await?;
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
     log::info!("Account {} deleted", account_id);
     Ok(())
 }
@@ -484,7 +492,8 @@ mod tests {
                 protocol TEXT NOT NULL,
                 meeting_id TEXT NOT NULL,
                 join_url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE calendars (
                 id TEXT PRIMARY KEY,
@@ -771,10 +780,11 @@ mod tests {
         )
         .unwrap();
 
-        delete_account_data(&conn, "calendar", &token_guard).unwrap();
+        let cleanup_ids = delete_account_data(&conn, "calendar", &token_guard).unwrap();
 
         assert!(!account_exists(&conn, "calendar"));
         assert!(account_exists(&conn, "meet"));
+        assert_eq!(cleanup_ids.len(), 1);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM meet_pending_meetings
@@ -784,6 +794,12 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+        assert!(
+            db::meet_pending_meetings::get(&conn, &cleanup_ids[0])
+                .unwrap()
+                .unwrap()
+                .cleanup_requested
         );
     }
 

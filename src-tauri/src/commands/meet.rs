@@ -494,6 +494,11 @@ pub async fn meet_create_url(
     start_time: Option<String>,
     duration_minutes: Option<u32>,
 ) -> Result<MeetCreateResponse> {
+    let lifecycle_id = uuid::Uuid::new_v4().to_string();
+    let lifecycle_lock = state.meet_lifecycle.acquire(&lifecycle_id)?;
+    let _lifecycle_guard = lifecycle_lock.lock().await;
+    let account_lock = state.account_lifecycle.acquire(&account_id);
+    let _account_guard = account_lock.lock().await;
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
@@ -514,7 +519,6 @@ pub async fn meet_create_url(
             duration_minutes,
         )
         .await?;
-    let lifecycle_id = uuid::Uuid::new_v4().to_string();
     let pending = db::meet_pending_meetings::PendingMeeting {
         lifecycle_id: lifecycle_id.clone(),
         account_id: account.id.clone(),
@@ -522,6 +526,7 @@ pub async fn meet_create_url(
         meeting_id: res.meeting_id.clone(),
         join_url: res.join_url.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        cleanup_requested: false,
     };
     let persist_result = {
         let conn = state.db.writer().await;
@@ -557,6 +562,15 @@ pub async fn meet_create_url(
 pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()> {
     let lifecycle_lock = state.meet_lifecycle.acquire(lifecycle_id)?;
     let _guard = lifecycle_lock.lock().await;
+    let account_id = {
+        let conn = state.db.reader();
+        let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
+            return Ok(());
+        };
+        pending.account_id
+    };
+    let account_lock = state.account_lifecycle.acquire(&account_id);
+    let _account_guard = account_lock.lock().await;
     let (pending, account) = {
         let conn = state.db.reader();
         let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
@@ -571,20 +585,12 @@ pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()>
             })?;
         (pending, account)
     };
-    let provider = meet::provider_for(&account).ok_or_else(|| {
+    let provider = cleanup_provider_for(&account, &pending.protocol).ok_or_else(|| {
         Error::Other(format!(
-            "pending meeting {} account {} has no meet provider",
-            lifecycle_id, pending.account_id
+            "pending meeting {} protocol '{}' is not bound to account {}",
+            lifecycle_id, pending.protocol, pending.account_id
         ))
     })?;
-    if provider.protocol() != pending.protocol {
-        return Err(Error::Other(format!(
-            "pending meeting {} protocol '{}' does not match account provider '{}'",
-            lifecycle_id,
-            pending.protocol,
-            provider.protocol()
-        )));
-    }
     let provider_result = provider
         .delete_meeting(
             &meet::MeetProviderCtx {
@@ -596,6 +602,16 @@ pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()>
         .await;
     let conn = state.db.writer().await;
     complete_pending_discard(&conn, lifecycle_id, provider_result)
+}
+
+fn cleanup_provider_for(
+    account: &db::accounts::AccountFull,
+    protocol: &str,
+) -> Option<&'static dyn meet::MeetProvider> {
+    account
+        .meet_binding()
+        .filter(|binding| binding.protocol == protocol)
+        .and_then(|_| meet::provider_for_protocol(protocol))
 }
 
 fn complete_pending_discard(
@@ -627,16 +643,32 @@ pub fn pending_lifecycle_ids(state: &AppState) -> Vec<String> {
     }
 }
 
+pub fn cleanup_requested_lifecycle_ids(state: &AppState) -> Vec<String> {
+    let conn = state.db.reader();
+    match db::meet_pending_meetings::list_cleanup_requested(&conn) {
+        Ok(rows) => rows.into_iter().map(|row| row.lifecycle_id).collect(),
+        Err(error) => {
+            log::warn!("failed to list meetings queued for cleanup: {}", error);
+            Vec::new()
+        }
+    }
+}
+
 pub async fn sweep_pending(state: &AppState, lifecycle_ids: Vec<String>) {
     for lifecycle_id in lifecycle_ids {
         if let Err(error) = discard_pending(state, &lifecycle_id).await {
             log::warn!(
-                "startup cleanup retained pending meeting {}: {}",
+                "cleanup retained pending meeting {} for retry: {}",
                 lifecycle_id,
                 error
             );
         }
     }
+}
+
+pub async fn sweep_cleanup_requested(state: &AppState) {
+    let lifecycle_ids = cleanup_requested_lifecycle_ids(state);
+    sweep_pending(state, lifecycle_ids).await;
 }
 
 /// Strip scheme + path from a URL for use as a fallback display
@@ -657,7 +689,7 @@ fn validate_returned_server_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_pending_discard, validate_returned_server_url};
+    use super::{cleanup_provider_for, complete_pending_discard, validate_returned_server_url};
     use crate::db;
     use crate::error::Error;
 
@@ -670,11 +702,12 @@ mod tests {
                 protocol TEXT NOT NULL,
                 meeting_id TEXT NOT NULL,
                 join_url TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO meet_pending_meetings VALUES
                 ('lifecycle', 'account', 'zoom', 'meeting',
-                 'https://example.test', '2026-08-11T20:00:00Z');",
+                 'https://example.test', '2026-08-11T20:00:00Z', 1);",
         )
         .unwrap();
         conn
@@ -726,5 +759,54 @@ mod tests {
         assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
             .unwrap()
             .is_none());
+    }
+
+    fn account_with_meet_binding(protocol: Option<(&str, bool)>) -> db::accounts::AccountFull {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Account', 'account@example.test',
+                     'account@example.test')",
+            [],
+        )
+        .unwrap();
+        if let Some((protocol, enabled)) = protocol {
+            conn.execute(
+                "INSERT INTO service_bindings
+                    (id, account_id, service, protocol, enabled)
+                 VALUES ('binding', 'account', 'meet', ?1, ?2)",
+                rusqlite::params![protocol, enabled],
+            )
+            .unwrap();
+        }
+        db::accounts::get_account_full(&conn, "account").unwrap()
+    }
+
+    #[test]
+    fn disabled_matching_binding_resolves_only_for_cleanup() {
+        let account = account_with_meet_binding(Some(("zoom", false)));
+        assert!(crate::meet::provider_for(&account).is_none());
+        assert_eq!(
+            cleanup_provider_for(&account, "zoom").unwrap().protocol(),
+            "zoom"
+        );
+    }
+
+    #[test]
+    fn cleanup_rejects_missing_or_mismatched_binding() {
+        let missing = account_with_meet_binding(None);
+        let mismatch = account_with_meet_binding(Some(("talk", false)));
+        assert!(cleanup_provider_for(&missing, "zoom").is_none());
+        assert!(cleanup_provider_for(&mismatch, "zoom").is_none());
+    }
+
+    #[test]
+    fn enabled_normal_dispatch_is_unchanged() {
+        let account = account_with_meet_binding(Some(("zoom", true)));
+        assert_eq!(
+            crate::meet::provider_for(&account).unwrap().protocol(),
+            "zoom"
+        );
     }
 }

@@ -35,8 +35,9 @@ pub fn delete_events(conn: &Connection, event_ids: &[String]) -> Result<Deletion
         let lifecycle_id = uuid::Uuid::new_v4().to_string();
         let queued = conn.execute(
             "INSERT INTO meet_pending_meetings
-                (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at)
-             SELECT ?1, account_id, protocol, meeting_id, join_url, CURRENT_TIMESTAMP
+                (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
+                 cleanup_requested)
+             SELECT ?1, account_id, protocol, meeting_id, join_url, CURRENT_TIMESTAMP, 1
              FROM meet_meetings WHERE event_id = ?2",
             params![lifecycle_id, event_id],
         )?;
@@ -198,6 +199,10 @@ mod tests {
         assert_eq!(count(&conn, "calendar_events"), 0);
         assert_eq!(count(&conn, "meet_meetings"), 0);
         assert_eq!(count(&conn, "meet_pending_meetings"), 1);
+        assert!(db::meet_pending_meetings::list_cleanup_requested(&conn)
+            .unwrap()
+            .iter()
+            .any(|row| row.meeting_id == "event"));
     }
 
     #[test]

@@ -921,7 +921,8 @@ mod tests {
                 protocol TEXT NOT NULL,
                 meeting_id TEXT NOT NULL,
                 join_url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             ",
         )

@@ -155,5 +155,14 @@ pub fn provider_for(account: &AccountFull) -> Option<&'static dyn MeetProvider> 
     if proto.is_empty() {
         return None;
     }
-    registry().iter().copied().find(|p| p.protocol() == proto)
+    provider_for_protocol(proto)
+}
+
+/// Resolve a compiled provider by its stored protocol. Cleanup callers must
+/// separately validate that the owning account has an exact meet binding.
+pub fn provider_for_protocol(protocol: &str) -> Option<&'static dyn MeetProvider> {
+    registry()
+        .iter()
+        .copied()
+        .find(|provider| provider.protocol() == protocol)
 }
