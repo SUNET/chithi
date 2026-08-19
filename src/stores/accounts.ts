@@ -91,6 +91,14 @@ export const useAccountsStore = defineStore("accounts", () => {
     await fetchAccounts();
   }
 
+  async function abandonZoomAccount(id: string, confirmation: string) {
+    await api.abandonZoomAccount(id, confirmation);
+    if (activeAccountId.value === id) {
+      activeAccountId.value = null;
+    }
+    await fetchAccounts();
+  }
+
   function setActiveAccount(id: string) {
     activeAccountId.value = id;
   }
@@ -104,6 +112,7 @@ export const useAccountsStore = defineStore("accounts", () => {
     fetchAccounts,
     addAccount,
     deleteAccount,
+    abandonZoomAccount,
     setActiveAccount,
   };
 });

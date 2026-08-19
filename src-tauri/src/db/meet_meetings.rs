@@ -61,14 +61,23 @@ pub fn get(conn: &Connection, event_id: &str) -> Result<Option<MeetMeeting>> {
     Ok(row)
 }
 
-/// Drop the binding row. Used after the provider DELETE succeeds —
-/// the CASCADE on `calendar_events` deletion would catch it anyway,
-/// but `delete_event` looks the row up *before* removing the event,
-/// so it has to clear the side-table itself.
+/// Drop the binding row after ownership has moved elsewhere.
 pub fn delete(conn: &Connection, event_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM meet_meetings WHERE event_id = ?1",
         params![event_id],
     )?;
     Ok(())
+}
+
+pub fn account_has_lifecycle_references(conn: &Connection, account_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM meet_meetings WHERE account_id = ?1
+            UNION ALL
+            SELECT 1 FROM meet_pending_meetings WHERE account_id = ?1
+         )",
+        params![account_id],
+        |row| row.get(0),
+    )?)
 }

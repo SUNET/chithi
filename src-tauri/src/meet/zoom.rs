@@ -48,6 +48,46 @@ struct CreateMeetingResponse {
     pub password: String,
 }
 
+/// Stable Zoom principal identifiers returned by `GET /users/me`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ZoomUserIdentity {
+    #[serde(rename = "id")]
+    pub user_id: String,
+    pub account_id: String,
+}
+
+pub async fn current_user_identity_with_client(
+    access_token: &str,
+    client: &reqwest::Client,
+    api_root: &str,
+) -> Result<ZoomUserIdentity> {
+    let response = client
+        .get(zoom_api_url(api_root, "users/me"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| Error::Other(format!("zoom users/me request: {error}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Other(format!(
+            "zoom users/me: {} ({})",
+            status,
+            body.chars().take(500).collect::<String>()
+        )));
+    }
+    let identity: ZoomUserIdentity = response
+        .json()
+        .await
+        .map_err(|error| Error::Other(format!("zoom users/me parse: {error}")))?;
+    if identity.user_id.trim().is_empty() || identity.account_id.trim().is_empty() {
+        return Err(Error::Other(
+            "zoom users/me returned an incomplete identity".into(),
+        ));
+    }
+    Ok(identity)
+}
+
 /// Create a scheduled meeting on the user's Zoom account and
 /// return the join URL. `topic` becomes the meeting subject in
 /// Zoom (visible in the user's meeting list); we pick a default
@@ -483,5 +523,27 @@ mod tests {
         assert_eq!(payload["settings"]["waiting_room"], false);
         assert_eq!(result.meeting_id, "123456");
         assert_eq!(result.join_url, "https://zoom.example/j/123456");
+    }
+
+    #[tokio::test]
+    async fn current_user_identity_uses_injected_root_and_bearer_auth() {
+        let (root, server) = mock_server(
+            "200 OK",
+            r#"{"id":"zoom-user","account_id":"zoom-account"}"#,
+        );
+        let api_root = format!("{root}/injected/v2/");
+
+        let identity =
+            current_user_identity_with_client("zoom-token", &reqwest::Client::new(), &api_root)
+                .await
+                .unwrap();
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("GET /injected/v2/users/me HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer zoom-token"));
+        assert_eq!(identity.user_id, "zoom-user");
+        assert_eq!(identity.account_id, "zoom-account");
     }
 }

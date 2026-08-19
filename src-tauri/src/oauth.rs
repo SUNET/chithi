@@ -153,9 +153,12 @@ pub const MICROSOFT_GRAPH_ROOM_SCOPES: &str =
 /// - `meeting:write:meeting` for `POST /v2/users/me/meetings` (create)
 /// - `meeting:update:meeting` for `PATCH /v2/meetings/{id}` (reschedule on event move)
 /// - `meeting:delete:meeting` for `DELETE /v2/meetings/{id}` (cancel on event delete)
+/// - `user:read:user` for `GET /v2/users/me` (bind reauthentication to the
+///   original Zoom principal)
 ///
-/// All three must be checked under Marketplace, Scopes, Meeting on
-/// the registered app. Adding a scope after the app is already
+/// The meeting scopes and user-profile scope must be checked under
+/// Marketplace, Scopes on the registered app. Adding a scope after
+/// the app is already
 /// published forces existing users to re-authorize; without that,
 /// the access token keeps the old narrower scope set and the
 /// PATCH/DELETE calls 401.
@@ -178,6 +181,7 @@ pub const ZOOM: OAuthProvider = OAuthProvider {
         "meeting:write:meeting",
         "meeting:update:meeting",
         "meeting:delete:meeting",
+        "user:read:user",
     ],
     token_exchange_scope: None,
     use_pkce: true,
@@ -1381,28 +1385,43 @@ pub fn ensure_not_reauth_required(account_id: &str) -> Result<()> {
 /// room lookup, bypass this helper instead of calling it.
 pub fn auth_required_on_invalid_grant(account_id: &str, err: Error) -> Error {
     let msg = err.to_string();
-    if !msg.contains("invalid_grant") {
+    let error_code = msg
+        .find('{')
+        .and_then(|start| serde_json::from_str::<serde_json::Value>(&msg[start..]).ok())
+        .and_then(|body| body["error"].as_str().map(str::to_owned));
+    if error_code.as_deref() != Some("invalid_grant") {
         return err;
     }
     log::warn!(
         "OAuth2: refresh token rejected (invalid_grant) for account {}; re-authentication required",
         account_id
     );
-    reauth_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(account_id.to_string());
+    mark_reauth_required(account_id);
     Error::AuthRequired(format!(
         "Sign-in expired for account {}. Open Settings and sign in again.",
         account_id
     ))
 }
 
-fn clear_reauth_required(account_id: &str) {
+pub(crate) fn clear_reauth_required(account_id: &str) {
     reauth_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(account_id);
+}
+
+pub(crate) fn is_reauth_required(account_id: &str) -> bool {
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(account_id)
+}
+
+pub(crate) fn mark_reauth_required(account_id: &str) {
+    reauth_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(account_id.to_string());
 }
 
 pub fn store_tokens(account_id: &str, tokens: &OAuthTokens) -> Result<()> {
@@ -1520,18 +1539,22 @@ pub fn load_tokens(account_id: &str) -> Result<Option<OAuthTokens>> {
 pub fn delete_tokens(account_id: &str) -> Result<()> {
     #[cfg(target_os = "android")]
     {
-        return android_store::delete(account_id);
+        android_store::delete(account_id)?;
     }
     #[cfg(not(target_os = "android"))]
     {
         let entry = keyring::Entry::new(KEYRING_SERVICE, account_id)
             .map_err(|e| Error::Keyring(format!("Failed to create keyring entry: {}", e)))?;
         match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(Error::Keyring(format!("Failed to delete tokens: {}", e))),
-        }
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(Error::Keyring(format!("Failed to delete tokens: {}", e))),
+        };
     }
+    // A successful explicit deletion, including an already-absent credential,
+    // completes re-authentication cleanup. Failed deletion leaves the latch in
+    // place so background work cannot resume against rejected credentials.
+    clear_reauth_required(account_id);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1669,6 +1692,21 @@ mod tests {
         let acc = "test-latch-other";
         let out =
             auth_required_on_invalid_grant(acc, Error::Other("Token refresh failed: 503".into()));
+        assert!(!matches!(out, Error::AuthRequired(_)));
+        assert!(!is_flagged(acc));
+    }
+
+    #[test]
+    fn invalid_grant_text_outside_error_code_does_not_latch_reauth() {
+        let acc = "test-latch-description-only";
+        let err = Error::Other(
+            "Token refresh error: {\"error\":\"temporarily_unavailable\",\
+             \"error_description\":\"retry after prior invalid_grant\"}"
+                .into(),
+        );
+
+        let out = auth_required_on_invalid_grant(acc, err);
+
         assert!(!matches!(out, Error::AuthRequired(_)));
         assert!(!is_flagged(acc));
     }
@@ -1818,6 +1856,11 @@ mod tests {
     fn test_non_microsoft_providers_omit_token_exchange_scope() {
         assert!(GOOGLE.token_exchange_scope.is_none());
         assert!(ZOOM.token_exchange_scope.is_none());
+    }
+
+    #[test]
+    fn zoom_requests_identity_scope_for_safe_reauthentication() {
+        assert!(ZOOM.scopes.contains(&"user:read:user"));
     }
 
     #[tokio::test]

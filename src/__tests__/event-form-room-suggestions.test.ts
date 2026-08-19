@@ -7,6 +7,7 @@ vi.mock("@/lib/tauri", () => ({
   checkRoomAvailability: vi.fn().mockResolvedValue({ state: "unknown", busy_start: null, busy_end: null }),
   getParticipantSchedules: vi.fn().mockResolvedValue([]),
   meetCreateUrl: vi.fn(),
+  meetDiscardPending: vi.fn(),
   sendInvites: vi.fn(),
 }));
 

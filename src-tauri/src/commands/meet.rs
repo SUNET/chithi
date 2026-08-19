@@ -306,7 +306,22 @@ pub struct ZoomLoginStart {
 /// listener, and stash the PKCE verifier + state for the
 /// matching `meet_zoom_login_complete`.
 #[tauri::command]
-pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLoginStart> {
+pub async fn meet_zoom_login_start(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+) -> Result<ZoomLoginStart> {
+    if let Some(id) = account_id.as_deref() {
+        let (account, has_references) = {
+            let conn = state.db.reader();
+            (
+                db::accounts::get_account_full(&conn, id)?,
+                db::meet_meetings::account_has_lifecycle_references(&conn, id)?,
+            )
+        };
+        if zoom_reauth_identity(&account)?.is_none() && has_references {
+            return Err(legacy_zoom_reauth_error(id));
+        }
+    }
     // Evict any session that's still parked on the fixed Zoom
     // port BEFORE we ask the OS to bind it. Without this, an
     // abandoned previous flow (browser closed, renderer reload
@@ -341,6 +356,7 @@ pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLog
                 listener,
                 verifier: code_verifier,
                 state: oauth_state,
+                account_id,
             },
         );
     }
@@ -350,9 +366,9 @@ pub async fn meet_zoom_login_start(state: State<'_, AppState>) -> Result<ZoomLog
     })
 }
 
-/// Wait for the Zoom OAuth callback, validate state, exchange
-/// the code for tokens, persist the account row + keyring entry,
-/// return the new account id.
+/// Wait for the Zoom OAuth callback, validate state, and exchange the code.
+/// A supplied account id replaces that account's tokens; otherwise this
+/// persists a new account row and keyring entry.
 #[tauri::command]
 pub async fn meet_zoom_login_complete(
     state: State<'_, AppState>,
@@ -374,6 +390,7 @@ pub async fn meet_zoom_login_complete(
         listener,
         verifier,
         state: expected_state,
+        account_id,
         ..
     } = session;
 
@@ -421,6 +438,48 @@ pub async fn meet_zoom_login_complete(
             verifier.as_deref(),
         )
         .await?;
+    let identity = crate::meet::zoom::current_user_identity_with_client(
+        &tokens.access_token,
+        &state.providers.transports.zoom_http,
+        &state.providers.transports.zoom_api_root,
+    )
+    .await?;
+
+    if let Some(id) = account_id {
+        {
+            // Account mutation and meeting operations use the same order:
+            // account lifecycle before provider-token lifecycle.
+            let account_lock = state.account_lifecycle.acquire(&id);
+            let _account_guard = account_lock.lock().await;
+            let (account, has_references) = {
+                let conn = state.db.reader();
+                (
+                    db::accounts::get_account_full(&conn, &id)?,
+                    db::meet_meetings::account_has_lifecycle_references(&conn, &id)?,
+                )
+            };
+            if let Some(expected) = zoom_reauth_identity(&account)? {
+                validate_zoom_reauth_identity(&expected, &identity)?;
+            } else if has_references {
+                return Err(legacy_zoom_reauth_error(&id));
+            }
+            let token_guard = state.providers.lock_zoom_tokens(&id).await;
+            let mut conn = state.db.writer().await;
+            let transaction = conn.transaction()?;
+            db::service_bindings::set_zoom_identity(
+                &transaction,
+                &id,
+                &identity.user_id,
+                &identity.account_id,
+            )?;
+            token_guard.replace_and_commit(&tokens, move || {
+                transaction.commit()?;
+                Ok(())
+            })?;
+        }
+        sweep_cleanup_requested_for_account(&state, &id).await;
+        return Ok(id);
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let display = display_name
@@ -463,12 +522,53 @@ pub async fn meet_zoom_login_complete(
         pgp_encrypt_subject: true,
         pgp_encrypt_drafts: true,
     };
+    let token_guard = state.providers.lock_zoom_tokens(&id).await;
     let conn = state.db.writer().await;
-    db::accounts::insert_account(&conn, &id, &config)?;
-    drop(conn);
-
-    state.providers.token_store().store(&id, &tokens)?;
+    crate::commands::accounts::insert_zoom_account(
+        &conn,
+        &id,
+        &config,
+        &tokens,
+        &identity,
+        &token_guard,
+    )?;
     Ok(id)
+}
+
+fn zoom_reauth_identity(
+    account: &db::accounts::AccountFull,
+) -> Result<Option<crate::meet::zoom::ZoomUserIdentity>> {
+    let binding = account
+        .meet_binding()
+        .filter(|binding| binding.protocol == "zoom")
+        .ok_or_else(|| Error::Other(format!("account {} is not bound to Zoom", account.id)))?;
+    let config = binding.meet_config()?;
+    if config.zoom_user_id.is_empty() || config.zoom_account_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::meet::zoom::ZoomUserIdentity {
+        user_id: config.zoom_user_id,
+        account_id: config.zoom_account_id,
+    }))
+}
+
+fn validate_zoom_reauth_identity(
+    expected: &crate::meet::zoom::ZoomUserIdentity,
+    actual: &crate::meet::zoom::ZoomUserIdentity,
+) -> Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(Error::Other(
+        "Zoom sign-in belongs to a different user; the existing account was not changed".into(),
+    ))
+}
+
+fn legacy_zoom_reauth_error(account_id: &str) -> Error {
+    Error::Other(format!(
+        "Zoom account {} predates identity-bound sign-in and still owns meetings. Reauthentication cannot safely verify the original Zoom user; use the explicit local-abandon action if those remote meetings cannot be removed manually.",
+        account_id
+    ))
 }
 
 /// Provider-agnostic create. Looks up the account, finds its meet
@@ -481,6 +581,7 @@ pub async fn meet_zoom_login_complete(
 /// `update_event` know which one to reschedule.
 #[derive(Debug, Serialize)]
 pub struct MeetCreateResponse {
+    pub lifecycle_id: String,
     pub account_id: String,
     pub protocol: String,
     pub meeting_id: String,
@@ -495,6 +596,11 @@ pub async fn meet_create_url(
     start_time: Option<String>,
     duration_minutes: Option<u32>,
 ) -> Result<MeetCreateResponse> {
+    let lifecycle_id = uuid::Uuid::new_v4().to_string();
+    let lifecycle_lock = state.meet_lifecycle.acquire(&lifecycle_id)?;
+    let _lifecycle_guard = lifecycle_lock.lock().await;
+    let account_lock = state.account_lifecycle.acquire(&account_id);
+    let _account_guard = account_lock.lock().await;
     let account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
@@ -515,12 +621,183 @@ pub async fn meet_create_url(
             duration_minutes,
         )
         .await?;
+    let pending = db::meet_pending_meetings::PendingMeeting {
+        lifecycle_id: lifecycle_id.clone(),
+        account_id: account.id.clone(),
+        protocol: protocol.clone(),
+        meeting_id: res.meeting_id.clone(),
+        join_url: res.join_url.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        cleanup_requested: false,
+    };
+    let persist_result = {
+        let conn = state.db.writer().await;
+        db::meet_pending_meetings::insert(&conn, &pending)
+    };
+    if let Err(persist_error) = persist_result {
+        // Provider creation and SQLite cannot share an atomic transaction.
+        // Never return an untracked room: compensate immediately, and report
+        // both failures if durable tracking and provider deletion both fail.
+        let compensation = provider
+            .delete_meeting(&ctx, &account, &res.meeting_id)
+            .await;
+        return match compensation {
+            Ok(()) => Err(Error::Other(format!(
+                "failed to track created meeting; remote meeting was removed: {persist_error}"
+            ))),
+            Err(delete_error) => Err(Error::Other(format!(
+                "failed to track created meeting ({persist_error}); compensation also failed ({delete_error})"
+            ))),
+        };
+    }
     Ok(MeetCreateResponse {
+        lifecycle_id,
         account_id: account.id,
         protocol,
         meeting_id: res.meeting_id,
         join_url: res.join_url,
     })
+}
+
+/// Delete one backend-owned pending meeting. The lifecycle lock spans the
+/// provider call, but database handles do not.
+pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()> {
+    let lifecycle_lock = state.meet_lifecycle.acquire(lifecycle_id)?;
+    let _guard = lifecycle_lock.lock().await;
+    let account_id = {
+        let conn = state.db.reader();
+        let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
+            return Ok(());
+        };
+        pending.account_id
+    };
+    let account_lock = state.account_lifecycle.acquire(&account_id);
+    let _account_guard = account_lock.lock().await;
+    let (pending, account) = {
+        let conn = state.db.reader();
+        let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
+            return Ok(());
+        };
+        let account =
+            db::accounts::get_account_full(&conn, &pending.account_id).map_err(|error| {
+                Error::Other(format!(
+                    "pending meeting {} account {} unavailable: {}",
+                    lifecycle_id, pending.account_id, error
+                ))
+            })?;
+        (pending, account)
+    };
+    let provider = cleanup_provider_for(&account, &pending.protocol).ok_or_else(|| {
+        Error::Other(format!(
+            "pending meeting {} protocol '{}' is not bound to account {}",
+            lifecycle_id, pending.protocol, pending.account_id
+        ))
+    })?;
+    let provider_result = provider
+        .delete_meeting(
+            &meet::MeetProviderCtx {
+                services: &state.providers,
+            },
+            &account,
+            &pending.meeting_id,
+        )
+        .await;
+    let conn = state.db.writer().await;
+    complete_pending_discard(&conn, lifecycle_id, provider_result)
+}
+
+fn cleanup_provider_for(
+    account: &db::accounts::AccountFull,
+    protocol: &str,
+) -> Option<&'static dyn meet::MeetProvider> {
+    account
+        .meet_binding()
+        .filter(|binding| binding.protocol == protocol)
+        .and_then(|_| meet::provider_for_protocol(protocol))
+}
+
+fn complete_pending_discard(
+    conn: &rusqlite::Connection,
+    lifecycle_id: &str,
+    provider_result: Result<()>,
+) -> Result<()> {
+    provider_result?;
+    db::meet_pending_meetings::delete(conn, lifecycle_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn meet_discard_pending(state: State<'_, AppState>, lifecycle_id: String) -> Result<()> {
+    {
+        let conn = state.db.writer().await;
+        db::meet_pending_meetings::request_cleanup(&conn, &lifecycle_id)?;
+    }
+    discard_pending(&state, &lifecycle_id).await
+}
+
+pub fn pending_lifecycle_ids(state: &AppState) -> Vec<String> {
+    let conn = state.db.reader();
+    match db::meet_pending_meetings::list(&conn) {
+        Ok(rows) => rows.into_iter().map(|row| row.lifecycle_id).collect(),
+        Err(error) => {
+            log::warn!(
+                "failed to list pending meetings for startup cleanup: {}",
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub fn cleanup_requested_lifecycle_ids(state: &AppState) -> Vec<String> {
+    let conn = state.db.reader();
+    match db::meet_pending_meetings::list_cleanup_requested(&conn) {
+        Ok(rows) => rows.into_iter().map(|row| row.lifecycle_id).collect(),
+        Err(error) => {
+            log::warn!("failed to list meetings queued for cleanup: {}", error);
+            Vec::new()
+        }
+    }
+}
+
+pub fn cleanup_requested_lifecycle_ids_for_account(
+    state: &AppState,
+    account_id: &str,
+) -> Vec<String> {
+    let conn = state.db.reader();
+    match db::meet_pending_meetings::list_cleanup_requested_for_account(&conn, account_id) {
+        Ok(rows) => rows.into_iter().map(|row| row.lifecycle_id).collect(),
+        Err(error) => {
+            log::warn!(
+                "failed to list meetings queued for cleanup for account {}: {}",
+                account_id,
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub async fn sweep_pending(state: &AppState, lifecycle_ids: Vec<String>) {
+    for lifecycle_id in lifecycle_ids {
+        if let Err(error) = discard_pending(state, &lifecycle_id).await {
+            log::warn!(
+                "cleanup retained pending meeting {} for retry: {}",
+                lifecycle_id,
+                error
+            );
+        }
+    }
+}
+
+pub async fn sweep_cleanup_requested(state: &AppState) {
+    let lifecycle_ids = cleanup_requested_lifecycle_ids(state);
+    sweep_pending(state, lifecycle_ids).await;
+}
+
+pub async fn sweep_cleanup_requested_for_account(state: &AppState, account_id: &str) {
+    let lifecycle_ids = cleanup_requested_lifecycle_ids_for_account(state, account_id);
+    sweep_pending(state, lifecycle_ids).await;
 }
 
 /// Strip scheme + path from a URL for use as a fallback display
@@ -541,7 +818,32 @@ fn validate_returned_server_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_returned_server_url;
+    use super::{
+        cleanup_provider_for, complete_pending_discard, validate_returned_server_url,
+        validate_zoom_reauth_identity, zoom_reauth_identity,
+    };
+    use crate::db;
+    use crate::error::Error;
+
+    fn pending_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO meet_pending_meetings VALUES
+                ('lifecycle', 'account', 'zoom', 'meeting',
+                 'https://example.test', '2026-08-11T20:00:00Z', 1);",
+        )
+        .unwrap();
+        conn
+    }
 
     #[test]
     fn returned_server_url_accepts_https_and_debug_loopback_http() {
@@ -564,5 +866,116 @@ mod tests {
         assert!(validate_returned_server_url("not a URL").is_err());
         assert!(validate_returned_server_url("http://meet.example.com").is_err());
         assert!(validate_returned_server_url("http://192.0.2.1").is_err());
+    }
+
+    #[test]
+    fn provider_delete_failure_retains_pending_ownership() {
+        let conn = pending_connection();
+        let result = complete_pending_discard(
+            &conn,
+            "lifecycle",
+            Err(Error::Other("provider failed".into())),
+        );
+
+        assert!(result.is_err());
+        assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn provider_delete_success_removes_pending_ownership() {
+        let conn = pending_connection();
+        complete_pending_discard(&conn, "lifecycle", Ok(())).unwrap();
+
+        assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
+            .unwrap()
+            .is_none());
+    }
+
+    fn account_with_meet_binding(protocol: Option<(&str, bool)>) -> db::accounts::AccountFull {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Account', 'account@example.test',
+                     'account@example.test')",
+            [],
+        )
+        .unwrap();
+        if let Some((protocol, enabled)) = protocol {
+            let config = if protocol == "zoom" {
+                r#"{"zoom_user_id":"zoom-user","zoom_account_id":"zoom-account"}"#
+            } else {
+                "{}"
+            };
+            conn.execute(
+                "INSERT INTO service_bindings
+                    (id, account_id, service, protocol, enabled, config_json)
+                 VALUES ('binding', 'account', 'meet', ?1, ?2, ?3)",
+                rusqlite::params![protocol, enabled, config],
+            )
+            .unwrap();
+        }
+        db::accounts::get_account_full(&conn, "account").unwrap()
+    }
+
+    #[test]
+    fn disabled_matching_binding_resolves_only_for_cleanup() {
+        let account = account_with_meet_binding(Some(("zoom", false)));
+        assert!(crate::meet::provider_for(&account).is_none());
+        assert_eq!(
+            cleanup_provider_for(&account, "zoom").unwrap().protocol(),
+            "zoom"
+        );
+    }
+
+    #[test]
+    fn cleanup_rejects_missing_or_mismatched_binding() {
+        let missing = account_with_meet_binding(None);
+        let mismatch = account_with_meet_binding(Some(("talk", false)));
+        assert!(cleanup_provider_for(&missing, "zoom").is_none());
+        assert!(cleanup_provider_for(&mismatch, "zoom").is_none());
+    }
+
+    #[test]
+    fn enabled_normal_dispatch_is_unchanged() {
+        let account = account_with_meet_binding(Some(("zoom", true)));
+        assert_eq!(
+            crate::meet::provider_for(&account).unwrap().protocol(),
+            "zoom"
+        );
+    }
+
+    #[test]
+    fn zoom_reauth_accepts_disabled_zoom_binding_and_rejects_other_bindings() {
+        let zoom = account_with_meet_binding(Some(("zoom", false)));
+        assert_eq!(
+            zoom_reauth_identity(&zoom).unwrap(),
+            Some(crate::meet::zoom::ZoomUserIdentity {
+                user_id: "zoom-user".into(),
+                account_id: "zoom-account".into(),
+            })
+        );
+        let mut legacy = zoom.clone();
+        legacy.bindings[0].config_json = "{}".into();
+        assert!(zoom_reauth_identity(&legacy).unwrap().is_none());
+
+        let different_user = crate::meet::zoom::ZoomUserIdentity {
+            user_id: "different-user".into(),
+            account_id: "zoom-account".into(),
+        };
+        let expected = zoom_reauth_identity(&zoom).unwrap().unwrap();
+        assert!(validate_zoom_reauth_identity(&expected, &different_user).is_err());
+        let different_account = crate::meet::zoom::ZoomUserIdentity {
+            user_id: "zoom-user".into(),
+            account_id: "different-account".into(),
+        };
+        assert!(validate_zoom_reauth_identity(&expected, &different_account).is_err());
+
+        let talk = account_with_meet_binding(Some(("talk", true)));
+        assert!(zoom_reauth_identity(&talk).is_err());
+        let missing = account_with_meet_binding(None);
+        assert!(zoom_reauth_identity(&missing).is_err());
     }
 }

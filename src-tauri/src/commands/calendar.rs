@@ -94,11 +94,11 @@ pub struct UpdateEventInput {
     pub meet_binding: Option<MeetBindingInput>,
 }
 
-/// Frontend-supplied meet binding metadata returned from a previous
-/// `meet_create_url` call. Stored verbatim in `meet_meetings` so the
-/// later delete / reschedule code knows which remote meeting to act on.
+/// Frontend-supplied copy of metadata returned from `meet_create_url`.
+/// The backend accepts it only when it exactly matches a pending lifecycle.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MeetBindingInput {
+    pub lifecycle_id: String,
     pub account_id: String,
     pub protocol: String,
     pub meeting_id: String,
@@ -113,29 +113,151 @@ pub struct MeetBindingInput {
 /// account's resolved meet provider stops an attacker from forging
 /// e.g. a Zoom protocol entry against a Talk account and causing
 /// Chithi to PATCH/DELETE arbitrary meetings.
-fn validate_meet_binding(conn: &rusqlite::Connection, b: &MeetBindingInput) -> Result<()> {
-    if b.meeting_id.trim().is_empty() || b.join_url.trim().is_empty() {
-        return Err(crate::error::Error::Other(
-            "meet binding: meeting_id and join_url must be non-empty".into(),
-        ));
-    }
-    let account = db::accounts::get_account_full(conn, &b.account_id).map_err(|_| {
-        crate::error::Error::Other(format!("meet binding: unknown account {}", b.account_id))
+fn claim_meet_binding(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    b: &MeetBindingInput,
+) -> Result<()> {
+    let pending = matching_pending_meeting(conn, b)?;
+    validate_pending_provider(conn, &pending)?;
+    transfer_pending_meeting(conn, event_id, b, pending)
+}
+
+fn validate_pending_provider(
+    conn: &rusqlite::Connection,
+    pending: &db::meet_pending_meetings::PendingMeeting,
+) -> Result<()> {
+    let account = db::accounts::get_account_full(conn, &pending.account_id).map_err(|_| {
+        crate::error::Error::Other(format!(
+            "meet binding: unknown account {}",
+            pending.account_id
+        ))
     })?;
     let provider = meet::provider_for(&account).ok_or_else(|| {
         crate::error::Error::Other(format!(
             "meet binding: account {} has no meet provider",
-            b.account_id
+            pending.account_id
         ))
     })?;
-    if provider.protocol() != b.protocol {
+    if provider.protocol() != pending.protocol {
         return Err(crate::error::Error::Other(format!(
             "meet binding: protocol '{}' doesn't match account's resolved provider '{}'",
-            b.protocol,
+            pending.protocol,
             provider.protocol()
         )));
     }
     Ok(())
+}
+
+fn matching_pending_meeting(
+    conn: &rusqlite::Connection,
+    binding: &MeetBindingInput,
+) -> Result<db::meet_pending_meetings::PendingMeeting> {
+    if binding.meeting_id.trim().is_empty() || binding.join_url.trim().is_empty() {
+        return Err(crate::error::Error::Other(
+            "meet binding: meeting_id and join_url must be non-empty".into(),
+        ));
+    }
+    let pending =
+        db::meet_pending_meetings::get(conn, &binding.lifecycle_id)?.ok_or_else(|| {
+            crate::error::Error::Other(format!(
+                "meet binding: lifecycle {} is not pending",
+                binding.lifecycle_id
+            ))
+        })?;
+    if !pending_matches_binding(&pending, binding) {
+        return Err(crate::error::Error::Other(format!(
+            "meet binding: metadata does not match lifecycle {}",
+            binding.lifecycle_id
+        )));
+    }
+    Ok(pending)
+}
+
+fn transfer_pending_meeting(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    binding: &MeetBindingInput,
+    pending: db::meet_pending_meetings::PendingMeeting,
+) -> Result<()> {
+    db::meet_meetings::upsert(
+        conn,
+        &db::meet_meetings::MeetMeeting {
+            event_id: event_id.to_string(),
+            account_id: pending.account_id,
+            protocol: pending.protocol,
+            meeting_id: pending.meeting_id,
+            join_url: pending.join_url,
+        },
+    )?;
+    if !db::meet_pending_meetings::delete(conn, &binding.lifecycle_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "meet binding: lifecycle {} disappeared during claim",
+            binding.lifecycle_id
+        )));
+    }
+    Ok(())
+}
+
+fn replace_meet_binding(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    binding: &MeetBindingInput,
+) -> Result<Option<String>> {
+    let pending = matching_pending_meeting(conn, binding)?;
+    validate_pending_provider(conn, &pending)?;
+    replace_meet_binding_ownership(conn, event_id, binding)
+}
+
+fn replace_meet_binding_ownership(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    binding: &MeetBindingInput,
+) -> Result<Option<String>> {
+    let pending = matching_pending_meeting(conn, binding)?;
+    let cleanup_lifecycle_id = match db::meet_meetings::get(conn, event_id)? {
+        Some(old)
+            if old.account_id != binding.account_id
+                || old.protocol != binding.protocol
+                || old.meeting_id != binding.meeting_id =>
+        {
+            Some(queue_meeting_cleanup(conn, old)?)
+        }
+        _ => None,
+    };
+    transfer_pending_meeting(conn, event_id, binding, pending)?;
+    Ok(cleanup_lifecycle_id)
+}
+
+fn queue_meeting_cleanup(
+    conn: &rusqlite::Connection,
+    binding: db::meet_meetings::MeetMeeting,
+) -> Result<String> {
+    let lifecycle_id = uuid::Uuid::new_v4().to_string();
+    db::meet_pending_meetings::insert(
+        conn,
+        &db::meet_pending_meetings::PendingMeeting {
+            lifecycle_id: lifecycle_id.clone(),
+            account_id: binding.account_id,
+            protocol: binding.protocol,
+            meeting_id: binding.meeting_id,
+            join_url: binding.join_url,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            cleanup_requested: true,
+        },
+    )?;
+    Ok(lifecycle_id)
+}
+
+fn pending_matches_binding(
+    pending: &db::meet_pending_meetings::PendingMeeting,
+    binding: &MeetBindingInput,
+) -> bool {
+    pending.lifecycle_id == binding.lifecycle_id
+        && pending.account_id == binding.account_id
+        && pending.protocol == binding.protocol
+        && pending.meeting_id == binding.meeting_id
+        && pending.join_url == binding.join_url
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +405,17 @@ async fn push_calendar_rename(
 #[tauri::command]
 pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("delete_calendar: id={}", calendar_id);
-    let conn = state.db.writer().await;
-    db::calendar::delete_calendar(&conn, &calendar_id)?;
+    let cleanup_ids = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        let cleanup_ids =
+            db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?
+                .cleanup_lifecycle_ids;
+        db::calendar::delete_calendar_row(&transaction, &calendar_id)?;
+        transaction.commit()?;
+        cleanup_ids
+    };
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
     log::info!("delete_calendar: deleted calendar {}", calendar_id);
     Ok(())
 }
@@ -296,9 +427,17 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
 #[tauri::command]
 pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("unsubscribe_calendar: id={}", calendar_id);
-    let conn = state.db.writer().await;
-    db::calendar::set_calendar_subscribed(&conn, &calendar_id, false)?;
-    let deleted = db::calendar::delete_calendar_events(&conn, &calendar_id)?;
+    let deletion = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
+        let deletion =
+            db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
+        transaction.commit()?;
+        deletion
+    };
+    let deleted = deletion.deleted;
+    crate::commands::meet::sweep_pending(&state, deletion.cleanup_lifecycle_ids).await;
     log::info!(
         "unsubscribe_calendar: deleted {} events for calendar {}",
         deleted,
@@ -397,80 +536,80 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
 
     let meet_binding = event.meet_binding;
 
-    // Insert locally first, then push to server
-    {
-        let conn = state.db.writer().await;
-        if let Some(ref b) = meet_binding {
-            validate_meet_binding(&conn, b)?;
+    let lifecycle_lock = match meet_binding.as_ref() {
+        Some(binding) => Some(state.meet_lifecycle.acquire(&binding.lifecycle_id)?),
+        None => None,
+    };
+    let _lifecycle_guard = match lifecycle_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    // Insert the event and transfer meeting ownership in one transaction.
+    let (account, remote_cal_id) = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        db::calendar::insert_event(&transaction, &cal_event)?;
+        if let Some(ref binding) = meet_binding {
+            claim_meet_binding(&transaction, &id, binding)?;
         }
-        db::calendar::insert_event(&conn, &cal_event)?;
-        if let Some(ref b) = meet_binding {
-            db::meet_meetings::upsert(
-                &conn,
-                &db::meet_meetings::MeetMeeting {
-                    event_id: id.clone(),
-                    account_id: b.account_id.clone(),
-                    protocol: b.protocol.clone(),
-                    meeting_id: b.meeting_id.clone(),
-                    join_url: b.join_url.clone(),
-                },
-            )?;
-        }
-        let account = db::accounts::get_account_full(&conn, &cal_event.account_id)?;
+        let account = db::accounts::get_account_full(&transaction, &cal_event.account_id)?;
 
         // The event's calendar's remote handle — the JMAP backend
         // creates the event on that specific calendar; Google/Graph
         // write to their default calendar and ignore it.
-        let remote_cal_id = db::calendar::get_calendar(&conn, &cal_event.calendar_id)
+        let remote_cal_id = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)
             .ok()
             .and_then(|c| c.remote_id)
             .unwrap_or_default();
-        drop(conn); // Release lock before async push
+        transaction.commit()?;
+        (account, remote_cal_id)
+    };
+    drop(_lifecycle_guard);
 
-        if let Some(backend) = crate::backend::calendar::for_account(&account) {
-            if remote_cal_id.is_empty() {
-                log::warn!(
-                    "create_event: no remote calendar ID for local calendar '{}'",
-                    cal_event.calendar_id
+    if let Some(backend) = crate::backend::calendar::for_account(&account) {
+        if remote_cal_id.is_empty() {
+            log::warn!(
+                "create_event: no remote calendar ID for local calendar '{}'",
+                cal_event.calendar_id
+            );
+        }
+        // Best-effort: the local insert above always stands; a failed
+        // push is logged and the event goes out with a later sync.
+        let ctx = calendar_backend_ctx(&state);
+        match backend
+            .push_created_event(&ctx, &account, &cal_event, &remote_cal_id)
+            .await
+        {
+            Ok(Some(pushed)) => {
+                log::info!(
+                    "create_event: pushed via {}, remote_id={}",
+                    backend.protocol(),
+                    pushed.remote_id
                 );
-            }
-            // Best-effort: the local insert above always stands; a failed
-            // push is logged and the event goes out with a later sync.
-            let ctx = calendar_backend_ctx(&state);
-            match backend
-                .push_created_event(&ctx, &account, &cal_event, &remote_cal_id)
-                .await
-            {
-                Ok(Some(pushed)) => {
-                    log::info!(
-                        "create_event: pushed via {}, remote_id={}",
-                        backend.protocol(),
-                        pushed.remote_id
-                    );
-                    let conn = state.db.writer().await;
+                let conn = state.db.writer().await;
+                conn.execute(
+                    "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+                    rusqlite::params![pushed.remote_id, id],
+                )
+                .ok();
+                // Update the local UID to the server's canonical UID
+                // (Google iCalUID / Exchange iCalUid) so incoming RSVP
+                // replies can be matched back to the event.
+                if let Some(ref canonical_uid) = pushed.canonical_uid {
                     conn.execute(
-                        "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
-                        rusqlite::params![pushed.remote_id, id],
+                        "UPDATE calendar_events SET uid = ?1 WHERE id = ?2",
+                        rusqlite::params![canonical_uid, id],
                     )
                     .ok();
-                    // Update the local UID to the server's canonical UID
-                    // (Google iCalUID / Exchange iCalUid) so incoming RSVP
-                    // replies can be matched back to the event.
-                    if let Some(ref canonical_uid) = pushed.canonical_uid {
-                        conn.execute(
-                            "UPDATE calendar_events SET uid = ?1 WHERE id = ?2",
-                            rusqlite::params![canonical_uid, id],
-                        )
-                        .ok();
-                        log::info!(
-                            "create_event: updated local UID to canonical UID={}",
-                            canonical_uid
-                        );
-                    }
+                    log::info!(
+                        "create_event: updated local UID to canonical UID={}",
+                        canonical_uid
+                    );
                 }
-                Ok(None) => {} // provider defers the push to its next sync
-                Err(e) => log::error!("create_event: {} push failed: {}", backend.protocol(), e),
             }
+            Ok(None) => {} // provider defers the push to its next sync
+            Err(e) => log::error!("create_event: {} push failed: {}", backend.protocol(), e),
         }
     }
 
@@ -649,86 +788,106 @@ pub async fn update_event(
     event: UpdateEventInput,
 ) -> Result<()> {
     log::info!("update_event: id={}", event_id);
-    let conn = state.db.writer().await;
-
-    // Load existing event, apply updates
-    let mut existing = db::calendar::get_event(&conn, &event_id)?;
-    let prev_start = existing.start_time.clone();
-    let prev_end = existing.end_time.clone();
-    let prev_title = existing.title.clone();
-
-    if let Some(calendar_id) = event.calendar_id {
-        existing.calendar_id = calendar_id;
-    }
-    if let Some(title) = event.title {
-        existing.title = title;
-    }
-    if let Some(description) = event.description {
-        existing.description = Some(description);
-    }
-    if let Some(location) = event.location {
-        existing.location = Some(location);
-    }
-    if let Some(start_time) = event.start_time {
-        existing.start_time = start_time;
-    }
-    if let Some(end_time) = event.end_time {
-        existing.end_time = end_time;
-    }
-    if let Some(all_day) = event.all_day {
-        existing.all_day = all_day;
-    }
-    if let Some(timezone) = event.timezone {
-        existing.timezone = Some(timezone);
-    }
-    if let Some(recurrence_rule) = event.recurrence_rule {
-        existing.recurrence_rule = Some(recurrence_rule);
-    }
-    if let Some(attendees) = event.attendees {
-        existing.attendees_json = if attendees.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
-        };
-    }
-
-    db::calendar::update_event(&conn, &existing)?;
-    log::info!("update_event: updated event {}", event_id);
-
-    // Persist a freshly attached meet binding, if any. Replaces a prior
-    // binding for the same event (one per event).
-    if let Some(ref b) = event.meet_binding {
-        validate_meet_binding(&conn, b)?;
-        db::meet_meetings::upsert(
-            &conn,
-            &db::meet_meetings::MeetMeeting {
-                event_id: event_id.clone(),
-                account_id: b.account_id.clone(),
-                protocol: b.protocol.clone(),
-                meeting_id: b.meeting_id.clone(),
-                join_url: b.join_url.clone(),
-            },
-        )?;
-    }
-
-    // If start/end changed and the event has a meet binding, ask the
-    // provider to move the remote meeting to the new slot. Best-effort:
-    // a provider failure logs but doesn't block the local update, since
-    // the user can still open the room via the saved join URL.
-    let time_changed = prev_start != existing.start_time || prev_end != existing.end_time;
-    let reschedule_with = if time_changed && !existing.all_day {
-        match db::meet_meetings::get(&conn, &event_id)? {
-            Some(b) => db::accounts::get_account_full(&conn, &b.account_id)
-                .ok()
-                .map(|acc| (b, acc)),
-            None => None,
-        }
-    } else {
-        None
+    let meet_binding = event.meet_binding;
+    let lifecycle_lock = match meet_binding.as_ref() {
+        Some(binding) => Some(state.meet_lifecycle.acquire(&binding.lifecycle_id)?),
+        None => None,
     };
+    let _lifecycle_guard = match lifecycle_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    let (existing, prev_title, cleanup_lifecycle_id, reschedule_with, account) = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
 
-    let account = db::accounts::get_account_full(&conn, &existing.account_id)?;
-    drop(conn);
+        // Load existing event, apply updates
+        let mut existing = db::calendar::get_event(&transaction, &event_id)?;
+        let prev_start = existing.start_time.clone();
+        let prev_end = existing.end_time.clone();
+        let prev_title = existing.title.clone();
+
+        if let Some(calendar_id) = event.calendar_id {
+            existing.calendar_id = calendar_id;
+        }
+        if let Some(title) = event.title {
+            existing.title = title;
+        }
+        if let Some(description) = event.description {
+            existing.description = Some(description);
+        }
+        if let Some(location) = event.location {
+            existing.location = Some(location);
+        }
+        if let Some(start_time) = event.start_time {
+            existing.start_time = start_time;
+        }
+        if let Some(end_time) = event.end_time {
+            existing.end_time = end_time;
+        }
+        if let Some(all_day) = event.all_day {
+            existing.all_day = all_day;
+        }
+        if let Some(timezone) = event.timezone {
+            existing.timezone = Some(timezone);
+        }
+        if let Some(recurrence_rule) = event.recurrence_rule {
+            existing.recurrence_rule = Some(recurrence_rule);
+        }
+        if let Some(attendees) = event.attendees {
+            existing.attendees_json = if attendees.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
+            };
+        }
+
+        db::calendar::update_event(&transaction, &existing)?;
+        log::info!("update_event: updated event {}", event_id);
+
+        // Queue the old room and claim the new lifecycle in this transaction.
+        let cleanup_lifecycle_id = match meet_binding.as_ref() {
+            Some(binding) => replace_meet_binding(&transaction, &event_id, binding)?,
+            None => None,
+        };
+
+        // If start/end changed and the event has a meet binding, ask the
+        // provider to move the remote meeting to the new slot. Best-effort:
+        // a provider failure logs but doesn't block the local update, since
+        // the user can still open the room via the saved join URL.
+        let time_changed = prev_start != existing.start_time || prev_end != existing.end_time;
+        let reschedule_with = if time_changed && !existing.all_day {
+            match db::meet_meetings::get(&transaction, &event_id)? {
+                Some(b) => db::accounts::get_account_full(&transaction, &b.account_id)
+                    .ok()
+                    .map(|acc| (b, acc)),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let account = db::accounts::get_account_full(&transaction, &existing.account_id)?;
+        transaction.commit()?;
+        (
+            existing,
+            prev_title,
+            cleanup_lifecycle_id,
+            reschedule_with,
+            account,
+        )
+    };
+    drop(_lifecycle_guard);
+
+    if let Some(lifecycle_id) = cleanup_lifecycle_id {
+        if let Err(error) = crate::commands::meet::discard_pending(&state, &lifecycle_id).await {
+            log::warn!(
+                "update_event: retained replaced meeting {} for retry: {}",
+                lifecycle_id,
+                error
+            );
+        }
+    }
 
     if let Some((binding, meet_account)) = reschedule_with {
         if let Some(provider) = meet::provider_for(&meet_account) {
@@ -781,7 +940,7 @@ pub async fn update_event(
     // video link" with an empty title). Cheaper to look the binding
     // up fresh than to pipe one through from the writer scope above.
     let title_changed = prev_title != existing.title;
-    let just_attached = event.meet_binding.is_some();
+    let just_attached = meet_binding.is_some();
     if title_changed || just_attached {
         let binding = {
             let conn = state.db.reader();
@@ -789,6 +948,7 @@ pub async fn update_event(
         };
         if let Some(b) = binding {
             let input = MeetBindingInput {
+                lifecycle_id: String::new(),
                 account_id: b.account_id,
                 protocol: b.protocol,
                 meeting_id: b.meeting_id,
@@ -805,11 +965,8 @@ pub async fn update_event(
 pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
-    // Look up the event, account, calendar remote_id, and any meet
-    // binding. The meet binding has to be read *before* the event row
-    // is deleted, otherwise the CASCADE drops it and we lose track of
-    // which remote meeting to cancel.
-    let (event, account, cal_remote_id, meet_cleanup) = {
+    // Load calendar push data before the local transaction.
+    let (event, account, cal_remote_id) = {
         let conn = state.db.reader();
         let evt = db::calendar::get_event(&conn, &event_id)?;
         let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
@@ -817,41 +974,32 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
         let cal_rid = cal
             .and_then(|c| c.remote_id)
             .unwrap_or_else(|| "primary".to_string());
-        let cleanup = match db::meet_meetings::get(&conn, &event_id)? {
-            Some(b) => db::accounts::get_account_full(&conn, &b.account_id)
-                .ok()
-                .map(|meet_acc| (b, meet_acc)),
-            None => None,
-        };
-        (evt, acc, cal_rid, cleanup)
+        (evt, acc, cal_rid)
     };
 
-    // Best-effort delete on the meet provider. Failure logs but
-    // doesn't block the rest of the event deletion: an undeletable
-    // remote room is annoying, an undeletable calendar event is worse.
-    if let Some((binding, meet_account)) = meet_cleanup {
-        if let Some(provider) = meet::provider_for(&meet_account) {
-            log::info!(
-                "delete_event: deleting {} meeting {}",
-                binding.protocol,
-                binding.meeting_id,
+    // Persist cleanup ownership before the event cascade removes the bound
+    // row. The queue insert and local event deletion are atomic.
+    let cleanup_lifecycle_id = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        let mut cleanup = db::calendar_event_deletion::delete_event(&transaction, &event_id)?
+            .cleanup_lifecycle_ids;
+        transaction.commit()?;
+        cleanup.pop()
+    };
+
+    if let Some(lifecycle_id) = cleanup_lifecycle_id {
+        if let Err(error) = crate::commands::meet::discard_pending(&state, &lifecycle_id).await {
+            log::warn!(
+                "delete_event: retained meeting {} for cleanup retry: {}",
+                lifecycle_id,
+                error
             );
-            if let Err(e) = provider
-                .delete_meeting(
-                    &meet_provider_ctx(&state),
-                    &meet_account,
-                    &binding.meeting_id,
-                )
-                .await
-            {
-                log::warn!("delete_event: meet provider delete failed: {}", e);
-            }
         }
     }
 
-    // Delete from server if event has a remote_id. Best-effort: the
-    // local delete below proceeds even if the remote delete fails (an
-    // undeletable remote copy is less bad than a local ghost event).
+    // Delete from the calendar server if the event has a remote_id.
+    // Best-effort: the committed local deletion stands if this fails.
     if let Some(ref remote_id) = event.remote_id {
         if !remote_id.is_empty() {
             if let Some(backend) = crate::backend::calendar::for_account(&account) {
@@ -878,8 +1026,6 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
         }
     }
 
-    let conn = state.db.writer().await;
-    db::calendar::delete_event(&conn, &event_id)?;
     log::info!("delete_event: deleted event {}", event_id);
     Ok(())
 }
@@ -992,6 +1138,10 @@ pub async fn sync_calendars(
             .ok();
         }
     }
+
+    // Backends queue cleanup inside their reconciliation transactions. Run
+    // after backend writers are released and never mask the sync result.
+    crate::commands::meet::sweep_cleanup_requested(&state).await;
 
     sync_result?;
 
@@ -1963,8 +2113,9 @@ pub async fn process_cancelled_invite(
         return Ok(());
     }
 
-    let conn = state.db.writer().await;
+    let mut conn = state.db.writer().await;
     let mut deleted = 0;
+    let mut cleanup_ids = Vec::new();
     for cancel in &cancels {
         if let Some(event) = db::calendar::get_event_by_uid(&conn, &account_id, &cancel.uid)? {
             // Verify the CANCEL's organizer matches the event's organizer to
@@ -1980,7 +2131,12 @@ pub async fn process_cancelled_invite(
                     }
                 }
             }
-            db::calendar::delete_event(&conn, &event.id)?;
+            let transaction = conn.transaction()?;
+            cleanup_ids.extend(
+                db::calendar_event_deletion::delete_event(&transaction, &event.id)?
+                    .cleanup_lifecycle_ids,
+            );
+            transaction.commit()?;
             deleted += 1;
             log::info!(
                 "process_cancelled_invite: deleted event '{}' (UID={})",
@@ -1989,6 +2145,8 @@ pub async fn process_cancelled_invite(
             );
         }
     }
+    drop(conn);
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
 
     if deleted > 0 {
         use tauri::Emitter as _;
@@ -2077,8 +2235,9 @@ pub fn auto_process_calendar_emails(
     }
 
     // Phase 2: acquire the writer ONCE and batch all calendar updates.
-    let conn_w = tokio::runtime::Handle::current().block_on(db.writer());
+    let mut conn_w = tokio::runtime::Handle::current().block_on(db.writer());
     let mut calendar_changed = false;
+    let mut cleanup_ids = Vec::new();
 
     for invite in &all_invites {
         match invite.method.to_uppercase().as_str() {
@@ -2128,7 +2287,20 @@ pub fn auto_process_calendar_emails(
                         .ok()
                         .flatten()
                 {
-                    if db::calendar::delete_event(&conn_w, &event.id).is_ok() {
+                    let deleted = match conn_w.transaction() {
+                        Ok(transaction) => {
+                            match db::calendar_event_deletion::delete_event(&transaction, &event.id)
+                            {
+                                Ok(result) if transaction.commit().is_ok() => {
+                                    cleanup_ids.extend(result.cleanup_lifecycle_ids);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        Err(_) => false,
+                    };
+                    if deleted {
                         log::info!(
                             "auto_process: deleted cancelled event '{}' (UID={})",
                             event.title,
@@ -2144,6 +2316,15 @@ pub fn auto_process_calendar_emails(
 
     // Release writer before emitting events
     drop(conn_w);
+
+    if !cleanup_ids.is_empty() {
+        use tauri::Manager as _;
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = handle.state::<AppState>();
+            crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
+        });
+    }
 
     if calendar_changed {
         use tauri::Emitter;
@@ -2273,5 +2454,249 @@ mod tests {
             "2026-08-10T09:00:00Z".into(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn pending_claim_requires_exact_backend_metadata() {
+        let pending = db::meet_pending_meetings::PendingMeeting {
+            lifecycle_id: "lifecycle".into(),
+            account_id: "account".into(),
+            protocol: "zoom".into(),
+            meeting_id: "meeting".into(),
+            join_url: "https://example.test/join".into(),
+            created_at: "2026-08-11T20:00:00Z".into(),
+            cleanup_requested: false,
+        };
+        let mut binding = MeetBindingInput {
+            lifecycle_id: pending.lifecycle_id.clone(),
+            account_id: pending.account_id.clone(),
+            protocol: pending.protocol.clone(),
+            meeting_id: pending.meeting_id.clone(),
+            join_url: pending.join_url.clone(),
+        };
+        assert!(pending_matches_binding(&pending, &binding));
+
+        binding.meeting_id = "forged".into();
+        assert!(!pending_matches_binding(&pending, &binding));
+    }
+
+    fn pending_claim_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Account', 'account@example.test',
+                     'account@example.test')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn pending_claim_binding() -> MeetBindingInput {
+        MeetBindingInput {
+            lifecycle_id: "37b4c2b4-9256-4f42-a453-406aa2f3f0ef".into(),
+            account_id: "account".into(),
+            protocol: "zoom".into(),
+            meeting_id: "meeting".into(),
+            join_url: "https://example.test/join".into(),
+        }
+    }
+
+    fn insert_pending_claim_fixture(conn: &rusqlite::Connection, binding: &MeetBindingInput) {
+        db::meet_pending_meetings::insert(
+            conn,
+            &db::meet_pending_meetings::PendingMeeting {
+                lifecycle_id: binding.lifecycle_id.clone(),
+                account_id: binding.account_id.clone(),
+                protocol: binding.protocol.clone(),
+                meeting_id: binding.meeting_id.clone(),
+                join_url: binding.join_url.clone(),
+                created_at: "2026-08-11T20:00:00Z".into(),
+                cleanup_requested: false,
+            },
+        )
+        .unwrap();
+    }
+
+    fn insert_claim_event(conn: &rusqlite::Connection, event_id: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES (?1, 'account', 'calendar', 'Event',
+                     '2026-08-11T20:00:00Z', '2026-08-11T21:00:00Z')",
+            rusqlite::params![event_id],
+        )?;
+        Ok(())
+    }
+
+    fn bind_meeting(conn: &rusqlite::Connection, event_id: &str, meeting_id: &str) {
+        db::meet_meetings::upsert(
+            conn,
+            &db::meet_meetings::MeetMeeting {
+                event_id: event_id.into(),
+                account_id: "account".into(),
+                protocol: "zoom".into(),
+                meeting_id: meeting_id.into(),
+                join_url: format!("https://example.test/{meeting_id}"),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn exact_pending_claim_transfers_ownership_transactionally() {
+        let mut conn = pending_claim_connection();
+        let binding = pending_claim_binding();
+        insert_pending_claim_fixture(&conn, &binding);
+
+        let transaction = conn.transaction().unwrap();
+        insert_claim_event(&transaction, "event").unwrap();
+        let pending = matching_pending_meeting(&transaction, &binding).unwrap();
+        transfer_pending_meeting(&transaction, "event", &binding, pending).unwrap();
+        transaction.commit().unwrap();
+
+        assert!(db::meet_pending_meetings::get(&conn, &binding.lifecycle_id)
+            .unwrap()
+            .is_none());
+        let bound = db::meet_meetings::get(&conn, "event").unwrap().unwrap();
+        assert_eq!(bound.meeting_id, binding.meeting_id);
+    }
+
+    #[test]
+    fn mismatched_pending_claim_rolls_back_event_and_preserves_ownership() {
+        let mut conn = pending_claim_connection();
+        let binding = pending_claim_binding();
+        insert_pending_claim_fixture(&conn, &binding);
+        let mut forged = binding.clone();
+        forged.join_url = "https://attacker.test/join".into();
+
+        let transaction = conn.transaction().unwrap();
+        insert_claim_event(&transaction, "event").unwrap();
+        let result = matching_pending_meeting(&transaction, &forged)
+            .and_then(|pending| transfer_pending_meeting(&transaction, "event", &forged, pending));
+        assert!(result.is_err());
+        transaction.rollback().unwrap();
+
+        assert!(db::meet_pending_meetings::get(&conn, &binding.lifecycle_id)
+            .unwrap()
+            .is_some());
+        assert!(db::meet_meetings::get(&conn, "event").unwrap().is_none());
+        assert!(db::calendar::get_event(&conn, "event").is_err());
+    }
+
+    #[test]
+    fn replacement_queues_old_and_claims_new_atomically() {
+        let mut conn = pending_claim_connection();
+        insert_claim_event(&conn, "event").unwrap();
+        bind_meeting(&conn, "event", "old");
+        let binding = pending_claim_binding();
+        insert_pending_claim_fixture(&conn, &binding);
+
+        let transaction = conn.transaction().unwrap();
+        let cleanup_id = replace_meet_binding_ownership(&transaction, "event", &binding)
+            .unwrap()
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let bound = db::meet_meetings::get(&conn, "event").unwrap().unwrap();
+        assert_eq!(bound.meeting_id, "meeting");
+        assert!(db::meet_pending_meetings::get(&conn, &binding.lifecycle_id)
+            .unwrap()
+            .is_none());
+        let cleanup = db::meet_pending_meetings::get(&conn, &cleanup_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.meeting_id, "old");
+    }
+
+    #[test]
+    fn failed_replacement_rolls_back_without_cleanup_row() {
+        let mut conn = pending_claim_connection();
+        insert_claim_event(&conn, "event").unwrap();
+        bind_meeting(&conn, "event", "old");
+        let binding = pending_claim_binding();
+        insert_pending_claim_fixture(&conn, &binding);
+        let mut forged = binding.clone();
+        forged.meeting_id = "forged".into();
+
+        let transaction = conn.transaction().unwrap();
+        assert!(replace_meet_binding_ownership(&transaction, "event", &forged).is_err());
+        transaction.rollback().unwrap();
+
+        let bound = db::meet_meetings::get(&conn, "event").unwrap().unwrap();
+        assert_eq!(bound.meeting_id, "old");
+        let pending = db::meet_pending_meetings::list(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].lifecycle_id, binding.lifecycle_id);
+    }
+
+    #[test]
+    fn deletion_queues_bound_meeting_before_cascade() {
+        let mut conn = pending_claim_connection();
+        insert_claim_event(&conn, "event").unwrap();
+        bind_meeting(&conn, "event", "old");
+
+        let transaction = conn.transaction().unwrap();
+        let cleanup_id = db::calendar_event_deletion::delete_event(&transaction, "event")
+            .unwrap()
+            .cleanup_lifecycle_ids
+            .pop()
+            .unwrap();
+        transaction.commit().unwrap();
+
+        assert!(db::calendar::get_event(&conn, "event").is_err());
+        assert!(db::meet_meetings::get(&conn, "event").unwrap().is_none());
+        let cleanup = db::meet_pending_meetings::get(&conn, &cleanup_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.meeting_id, "old");
+    }
+
+    #[test]
+    fn deletion_rollback_preserves_event_and_bound_meeting() {
+        let mut conn = pending_claim_connection();
+        insert_claim_event(&conn, "event").unwrap();
+        bind_meeting(&conn, "event", "old");
+
+        let transaction = conn.transaction().unwrap();
+        db::calendar_event_deletion::delete_event(&transaction, "event").unwrap();
+        transaction.rollback().unwrap();
+
+        assert!(db::calendar::get_event(&conn, "event").is_ok());
+        assert_eq!(
+            db::meet_meetings::get(&conn, "event")
+                .unwrap()
+                .unwrap()
+                .meeting_id,
+            "old"
+        );
+        assert!(db::meet_pending_meetings::list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_claim_cannot_bind_two_events() {
+        let mut conn = pending_claim_connection();
+        let binding = pending_claim_binding();
+        insert_pending_claim_fixture(&conn, &binding);
+
+        let first = conn.transaction().unwrap();
+        insert_claim_event(&first, "event-one").unwrap();
+        let pending = matching_pending_meeting(&first, &binding).unwrap();
+        transfer_pending_meeting(&first, "event-one", &binding, pending).unwrap();
+        first.commit().unwrap();
+
+        let second = conn.transaction().unwrap();
+        insert_claim_event(&second, "event-two").unwrap();
+        assert!(matching_pending_meeting(&second, &binding).is_err());
+        second.rollback().unwrap();
+
+        assert!(db::meet_meetings::get(&conn, "event-one")
+            .unwrap()
+            .is_some());
+        assert!(db::calendar::get_event(&conn, "event-two").is_err());
+        assert!(db::meet_meetings::get(&conn, "event-two")
+            .unwrap()
+            .is_none());
     }
 }

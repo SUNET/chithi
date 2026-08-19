@@ -109,7 +109,7 @@ impl CalendarBackend for CalDavCalendarBackend {
                 cal.name
             );
 
-            let conn = db.writer().await;
+            let mut conn = db.writer().await;
             for ev in &caldav_events {
                 // Parse the iCalendar data to extract event details
                 let parsed = ical::parse_ical_data(&ev.ical_data);
@@ -181,17 +181,25 @@ impl CalendarBackend for CalDavCalendarBackend {
                 })
                 .unwrap_or_default();
 
-            let mut deleted = 0u32;
-            for (local_id, remote_id) in &local_synced {
-                if !server_hrefs.contains(remote_id) {
-                    conn.execute(
-                        "DELETE FROM calendar_events WHERE id = ?1",
-                        rusqlite::params![local_id],
-                    )
-                    .ok();
-                    deleted += 1;
+            let deleted_ids: Vec<String> = local_synced
+                .iter()
+                .filter(|(_, remote_id)| !server_hrefs.contains(remote_id))
+                .map(|(local_id, _)| local_id.clone())
+                .collect();
+            let deleted = if deleted_ids.is_empty() {
+                0
+            } else {
+                match conn.transaction() {
+                    Ok(transaction) => {
+                        match db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
+                        {
+                            Ok(result) if transaction.commit().is_ok() => result.deleted,
+                            _ => 0,
+                        }
+                    }
+                    Err(_) => 0,
                 }
-            }
+            };
             if deleted > 0 {
                 log::info!(
                     "sync_calendars: removed {} server-deleted events from CalDAV calendar '{}'",

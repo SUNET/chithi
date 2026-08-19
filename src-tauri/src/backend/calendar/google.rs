@@ -146,7 +146,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
             remote_cal_id
         );
 
-        let conn = db.writer().await;
+        let mut conn = db.writer().await;
         let mut server_event_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut server_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -160,18 +160,32 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
 
                 // Incremental sync: cancelled events should be deleted locally
                 if ev["status"].as_str() == Some("cancelled") {
-                    let deleted = conn
-                        .execute(
-                            "DELETE FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-                            rusqlite::params![account_id, event_id_remote],
-                        )
-                        .unwrap_or(0);
+                    let transaction = match conn.transaction() {
+                        Ok(transaction) => transaction,
+                        Err(_) => continue,
+                    };
+                    let deleted = match db::calendar_event_deletion::delete_events_by_remote_id(
+                        &transaction,
+                        account_id,
+                        event_id_remote,
+                    ) {
+                        Ok(result) => result.deleted,
+                        Err(_) => continue,
+                    };
                     // Also delete by iCalUID for events created locally via respond_to_invite
                     if let Some(ical_uid) = ev["iCalUID"].as_str() {
-                        conn.execute(
-                            "DELETE FROM calendar_events WHERE account_id = ?1 AND uid = ?2 AND remote_id IS NULL",
-                            rusqlite::params![account_id, ical_uid],
-                        ).ok();
+                        if db::calendar_event_deletion::delete_unpushed_events_by_uid(
+                            &transaction,
+                            account_id,
+                            ical_uid,
+                        )
+                        .is_err()
+                        {
+                            continue;
+                        }
+                    }
+                    if transaction.commit().is_err() {
+                        continue;
                     }
                     if deleted > 0 {
                         log::info!(
@@ -260,7 +274,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
         // whose remote_id no longer appears on the server. Incremental sync
         // handles deletions via "status: cancelled" (see above).
         if existing_token.is_none() && !server_event_ids.is_empty() {
-            let conn = db.writer().await;
+            let mut conn = db.writer().await;
             let local_events: Vec<(String, String)> = conn
                 .prepare(
                     "SELECT ce.id, ce.remote_id FROM calendar_events ce
@@ -277,11 +291,10 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                 })
                 .unwrap_or_default();
 
-            let mut deleted = 0;
+            let mut deleted_ids = Vec::new();
             for (local_id, remote_id) in &local_events {
                 if !server_event_ids.contains(remote_id) {
-                    db::calendar::delete_event(&conn, local_id).ok();
-                    deleted += 1;
+                    deleted_ids.push(local_id.clone());
                 }
             }
             // Also remove orphan events (no remote_id) by matching UID
@@ -303,11 +316,24 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                     .unwrap_or_default();
                 for (local_id, uid) in &orphans {
                     if !server_uids.contains(uid) {
-                        db::calendar::delete_event(&conn, local_id).ok();
-                        deleted += 1;
+                        deleted_ids.push(local_id.clone());
                     }
                 }
             }
+            let deleted = if deleted_ids.is_empty() {
+                0
+            } else {
+                match conn.transaction() {
+                    Ok(transaction) => {
+                        match db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
+                        {
+                            Ok(result) if transaction.commit().is_ok() => result.deleted,
+                            _ => 0,
+                        }
+                    }
+                    Err(_) => 0,
+                }
+            };
             if deleted > 0 {
                 log::info!(
                     "sync_calendars_google: removed {} server-deleted events from '{}'",

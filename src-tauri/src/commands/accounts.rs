@@ -5,7 +5,104 @@ use crate::commands::calendar::random_calendar_color;
 use crate::db;
 use crate::db::calendar::NewCalendar;
 use crate::error::Result;
+use crate::oauth::OAuthTokens;
+use crate::provider::ZoomTokenLifecycleGuard;
 use crate::state::AppState;
+
+pub(crate) fn insert_zoom_account(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    config: &db::accounts::AccountConfig,
+    tokens: &OAuthTokens,
+    identity: &crate::meet::zoom::ZoomUserIdentity,
+    token_guard: &ZoomTokenLifecycleGuard<'_>,
+) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    db::accounts::insert_account(&transaction, account_id, config)?;
+    db::service_bindings::set_zoom_identity(
+        &transaction,
+        account_id,
+        &identity.user_id,
+        &identity.account_id,
+    )?;
+    token_guard.store_and_commit(tokens, move || {
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn delete_account_data(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    token_guard: &ZoomTokenLifecycleGuard<'_>,
+) -> Result<Vec<String>> {
+    let transaction = conn.unchecked_transaction()?;
+    let bindings = db::service_bindings::list_for_account(&transaction, account_id)?;
+    let has_zoom = bindings
+        .iter()
+        .any(|binding| binding.service == "meet" && binding.protocol == "zoom");
+    let is_standalone_zoom = bindings.len() == 1 && has_zoom;
+    if has_zoom && !is_standalone_zoom {
+        return Err(crate::error::Error::Other(
+            "Cannot delete Zoom credentials: the account has additional service bindings".into(),
+        ));
+    }
+    // Account deletion cascades through calendars and events. Move any bound
+    // meetings into durable cleanup ownership first. If this same account
+    // owns one of those meetings, `delete_account` rejects below and the
+    // transaction rolls the event transfer back together with the deletion.
+    let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
+        .cleanup_lifecycle_ids;
+    db::accounts::delete_account(&transaction, account_id)?;
+
+    if is_standalone_zoom {
+        token_guard.delete_and_commit(move || {
+            transaction.commit()?;
+            Ok(())
+        })?;
+    } else {
+        transaction.commit()?;
+    }
+    Ok(cleanup_ids)
+}
+
+fn abandon_zoom_account_data(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    token_guard: &ZoomTokenLifecycleGuard<'_>,
+) -> Result<Vec<String>> {
+    let transaction = conn.unchecked_transaction()?;
+    let bindings = db::service_bindings::list_for_account(&transaction, account_id)?;
+    if bindings.len() != 1
+        || !bindings
+            .iter()
+            .any(|binding| binding.service == "meet" && binding.protocol == "zoom")
+    {
+        return Err(crate::error::Error::Other(
+            "Local abandonment is restricted to standalone Zoom accounts".into(),
+        ));
+    }
+
+    // Explicitly relinquish remote ownership. This is intentionally separate
+    // from normal deletion: the caller has confirmed these meetings may remain
+    // active in Zoom and can no longer be managed by Chithi.
+    transaction.execute(
+        "DELETE FROM meet_meetings WHERE account_id = ?1",
+        [account_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM meet_pending_meetings WHERE account_id = ?1",
+        [account_id],
+    )?;
+    let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
+        .cleanup_lifecycle_ids;
+    db::accounts::delete_account(&transaction, account_id)?;
+    token_guard.delete_and_commit(move || {
+        transaction.commit()?;
+        Ok(())
+    })?;
+    Ok(cleanup_ids)
+}
 
 /// Result of a Thunderbird-style mail-server discovery on the IMAP
 /// tab. Empty strings / zero ports mean "not found" — the UI keeps
@@ -261,6 +358,8 @@ pub async fn update_account(
     log::info!("Updating account {} ({})", account_id, config.email);
     state
         .with_op_worker_stopped(&account_id, || async {
+            let account_lock = state.account_lifecycle.acquire(&account_id);
+            let _account_guard = account_lock.lock().await;
             let conn = state.db.writer().await;
             db::accounts::update_account(&conn, &account_id, &config)
         })
@@ -270,21 +369,818 @@ pub async fn update_account(
 #[tauri::command]
 pub async fn delete_account(state: State<'_, AppState>, account_id: String) -> Result<()> {
     log::info!("Deleting account {}", account_id);
-    state
+    // A previous cleanup may have failed only because OAuth needed renewal.
+    // Retry before checking the hard lifecycle-reference deletion guard.
+    crate::commands::meet::sweep_cleanup_requested_for_account(&state, &account_id).await;
+    let cleanup_ids = state
         .with_op_worker_stopped(&account_id, || async {
-            {
+            // Global order is optional meeting lifecycle, account lifecycle,
+            // then provider credentials. Account deletion starts at account.
+            let account_lock = state.account_lifecycle.acquire(&account_id);
+            let _account_guard = account_lock.lock().await;
+            let token_guard = state.providers.lock_zoom_tokens(&account_id).await;
+            let cleanup_ids = {
                 let conn = state.db.writer().await;
-                db::accounts::delete_account(&conn, &account_id)?;
-            }
+                delete_account_data(&conn, &account_id, &token_guard)?
+            };
             // Also remove Maildir
             let maildir_path = state.data_dir.join(&account_id);
             if maildir_path.exists() {
                 log::info!("Removing maildir at {}", maildir_path.display());
                 std::fs::remove_dir_all(&maildir_path).ok();
             }
-            Result::<()>::Ok(())
+            Result::<Vec<String>>::Ok(cleanup_ids)
         })
         .await?;
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
     log::info!("Account {} deleted", account_id);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn abandon_zoom_account(
+    state: State<'_, AppState>,
+    account_id: String,
+    confirmation: String,
+) -> Result<()> {
+    const REQUIRED_CONFIRMATION: &str = "ABANDON REMOTE ZOOM MEETINGS";
+    if confirmation != REQUIRED_CONFIRMATION {
+        return Err(crate::error::Error::Other(
+            "Local Zoom abandonment requires explicit confirmation".into(),
+        ));
+    }
+    let cleanup_ids = state
+        .with_op_worker_stopped(&account_id, || async {
+            let account_lock = state.account_lifecycle.acquire(&account_id);
+            let _account_guard = account_lock.lock().await;
+            let token_guard = state.providers.lock_zoom_tokens(&account_id).await;
+            let conn = state.db.writer().await;
+            abandon_zoom_account_data(&conn, &account_id, &token_guard)
+        })
+        .await?;
+    crate::commands::meet::sweep_pending(&state, cleanup_ids).await;
+    log::warn!(
+        "Locally abandoned Zoom account {}; remote meetings may remain",
+        account_id
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::error::Error;
+    use crate::oauth::OAuthProvider;
+    use crate::provider::{
+        OAuthTokenStore, ProviderCredentialService, ProviderServices, ProviderTransports,
+        TokenEndpointClient,
+    };
+
+    #[derive(Default)]
+    struct FakeTokenStore {
+        tokens: Mutex<HashMap<String, OAuthTokens>>,
+        fail_store_after_write: AtomicBool,
+        fail_delete: AtomicBool,
+        fail_delete_after_remove: AtomicBool,
+        deletes: AtomicUsize,
+    }
+
+    impl OAuthTokenStore for FakeTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<OAuthTokens>> {
+            Ok(self.tokens.lock().unwrap().get(account_id).cloned())
+        }
+
+        fn store(&self, account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string(), tokens.clone());
+            if self.fail_store_after_write.load(Ordering::SeqCst) {
+                return Err(Error::Other("injected token store failure".into()));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<()> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(Error::Other("injected token delete failure".into()));
+            }
+            self.tokens.lock().unwrap().remove(account_id);
+            if self.fail_delete_after_remove.load(Ordering::SeqCst) {
+                return Err(Error::Other("injected token failure after deletion".into()));
+            }
+            Ok(())
+        }
+    }
+
+    struct UnusedEndpoint;
+
+    #[async_trait]
+    impl TokenEndpointClient for UnusedEndpoint {
+        async fn exchange_code(
+            &self,
+            _provider: &OAuthProvider,
+            _code: &str,
+            _port: u16,
+            _code_verifier: Option<&str>,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh_scoped(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+            _scopes: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+
+        async fn refresh_dynamic(
+            &self,
+            _token_url: &str,
+            _refresh_token: &str,
+            _client_id: &str,
+        ) -> Result<OAuthTokens> {
+            unreachable!()
+        }
+    }
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE accounts (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                username TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                signature TEXT NOT NULL DEFAULT '',
+                auth_method TEXT NOT NULL DEFAULT '',
+                oidc_token_endpoint TEXT NOT NULL DEFAULT '',
+                oidc_client_id TEXT NOT NULL DEFAULT '',
+                pgp_attach_pubkey_on_sign INTEGER NOT NULL DEFAULT 1,
+                pgp_autocrypt_header INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_subject INTEGER NOT NULL DEFAULT 1,
+                pgp_encrypt_drafts INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE service_bindings (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                service TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sync_interval_seconds INTEGER,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(account_id, service, protocol)
+            );
+            CREATE TABLE meet_meetings (
+                event_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL
+            );
+            CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cleanup_requested INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE calendars (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE calendar_events (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                calendar_id TEXT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn providers(store: Arc<FakeTokenStore>) -> ProviderServices {
+        let endpoint: Arc<dyn TokenEndpointClient> = Arc::new(UnusedEndpoint);
+        let credentials = Arc::new(ProviderCredentialService::new(
+            store.clone(),
+            endpoint.clone(),
+        ));
+        ProviderServices::new(
+            credentials,
+            store,
+            endpoint,
+            ProviderTransports::production().unwrap(),
+        )
+    }
+
+    fn tokens() -> OAuthTokens {
+        OAuthTokens {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: Some(i64::MAX),
+        }
+    }
+
+    fn account_config(protocol: &str) -> db::accounts::AccountConfig {
+        db::accounts::AccountConfig {
+            display_name: protocol.to_string(),
+            email: String::new(),
+            provider: "generic".into(),
+            mail_protocol: String::new(),
+            imap_host: String::new(),
+            imap_port: 0,
+            smtp_host: String::new(),
+            smtp_port: 0,
+            jmap_url: String::new(),
+            caldav_url: String::new(),
+            meet_url: if protocol.is_empty() {
+                String::new()
+            } else {
+                "https://example.com".into()
+            },
+            meet_protocol: protocol.into(),
+            username: String::new(),
+            password: String::new(),
+            use_tls: true,
+            signature: String::new(),
+            jmap_auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+            calendar_sync_enabled: false,
+            mail_sync_enabled: false,
+            contacts_sync_enabled: false,
+            mail_sync_interval_seconds: None,
+            calendar_sync_interval_seconds: None,
+            contacts_sync_interval_seconds: None,
+            has_calendar_binding: false,
+            has_contacts_binding: false,
+            pgp_attach_pubkey_on_sign: true,
+            pgp_autocrypt_header: true,
+            pgp_encrypt_subject: true,
+            pgp_encrypt_drafts: true,
+        }
+    }
+
+    fn account_exists(conn: &Connection, account_id: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+            [account_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn insert_zoom_account(
+        conn: &rusqlite::Connection,
+        account_id: &str,
+        config: &db::accounts::AccountConfig,
+        tokens: &OAuthTokens,
+        token_guard: &ZoomTokenLifecycleGuard<'_>,
+    ) -> Result<()> {
+        super::insert_zoom_account(
+            conn,
+            account_id,
+            config,
+            tokens,
+            &crate::meet::zoom::ZoomUserIdentity {
+                user_id: "zoom-user".into(),
+                account_id: "zoom-account".into(),
+            },
+            token_guard,
+        )
+    }
+
+    #[tokio::test]
+    async fn zoom_creation_and_deletion_persist_as_one_lifecycle() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        let binding = db::service_bindings::list_for_account(&conn, "zoom")
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.service == "meet")
+            .unwrap();
+        let identity = binding.meet_config().unwrap();
+        assert_eq!(identity.zoom_user_id, "zoom-user");
+        assert_eq!(identity.zoom_account_id, "zoom-account");
+
+        db::accounts::update_account(&conn, "zoom", &account_config("zoom")).unwrap();
+        let binding = db::service_bindings::list_for_account(&conn, "zoom")
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.service == "meet")
+            .unwrap();
+        let identity = binding.meet_config().unwrap();
+        assert_eq!(identity.zoom_user_id, "zoom-user");
+        assert_eq!(identity.zoom_account_id, "zoom-account");
+
+        delete_account_data(&conn, "zoom", &token_guard).unwrap();
+        assert!(!account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_token_store_failure_rolls_back_zoom_account_and_token() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        store.fail_store_after_write.store(true, Ordering::SeqCst);
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+
+        let result = insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        );
+
+        assert!(result.is_err());
+        assert!(!account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn zoom_token_delete_failure_retains_account_and_binding() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        store.fail_delete.store(true, Ordering::SeqCst);
+
+        assert!(delete_account_data(&conn, "zoom", &token_guard).is_err());
+        assert!(account_exists(&conn, "zoom"));
+        assert_eq!(
+            db::service_bindings::list_for_account(&conn, "zoom")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.load("zoom").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn bound_meeting_blocks_zoom_account_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_account_data(&conn, "zoom", &token_guard).unwrap_err();
+
+        assert!(error.to_string().contains("meetings still require it"));
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_meeting_blocks_zoom_account_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_account_data(&conn, "zoom", &token_guard).unwrap_err();
+
+        assert!(error.to_string().contains("meetings still require it"));
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_zoom_abandonment_removes_local_ownership_and_tokens() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'zoom', 'zoom', 'bound', 'https://example.test/bound')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('pending', 'zoom', 'zoom', 'pending', 'https://example.test/pending')",
+            [],
+        )
+        .unwrap();
+
+        abandon_zoom_account_data(&conn, "zoom", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_none());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM meet_meetings", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM meet_pending_meetings", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_zoom_abandonment_restores_local_ownership() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('pending', 'zoom', 'zoom', 'pending', 'https://example.test/pending')",
+            [],
+        )
+        .unwrap();
+        store.fail_delete.store(true, Ordering::SeqCst);
+
+        assert!(abandon_zoom_account_data(&conn, "zoom", &token_guard).is_err());
+
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM meet_pending_meetings", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_meeting_does_not_block_zoom_account_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'other', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        delete_account_data(&conn, "zoom", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_deletion_queues_meeting_owned_by_another_account() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("calendar").await;
+        db::accounts::insert_account(&conn, "calendar", &account_config("")).unwrap();
+        db::accounts::insert_account(&conn, "meet", &account_config("zoom")).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar-id', 'calendar', 'Calendar')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('event', 'calendar', 'calendar-id', 'Event', 'start', 'end')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'meet', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        let cleanup_ids = delete_account_data(&conn, "calendar", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "calendar"));
+        assert!(account_exists(&conn, "meet"));
+        assert_eq!(cleanup_ids.len(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings
+                 WHERE account_id = 'meet' AND meeting_id = 'meeting'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            db::meet_pending_meetings::get(&conn, &cleanup_ids[0])
+                .unwrap()
+                .unwrap()
+                .cleanup_requested
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_bound_event_rolls_back_account_event_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar-id', 'zoom', 'Calendar')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('event', 'zoom', 'calendar-id', 'Event', 'start', 'end')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        assert!(delete_account_data(&conn, "zoom", &token_guard).is_err());
+
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE id = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM meet_pending_meetings", [], |row| row
+                .get::<_, i64>(
+                0
+            ),)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_after_token_delete_restores_snapshot_and_account() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        let expected = tokens();
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &expected,
+            &token_guard,
+        )
+        .unwrap();
+        store.fail_delete_after_remove.store(true, Ordering::SeqCst);
+
+        assert!(delete_account_data(&conn, "zoom", &token_guard).is_err());
+        assert!(account_exists(&conn, "zoom"));
+        assert_eq!(
+            db::service_bindings::list_for_account(&conn, "zoom")
+                .unwrap()
+                .len(),
+            1
+        );
+        let restored = store.load("zoom").unwrap().unwrap();
+        assert_eq!(restored.access_token, expected.access_token);
+        assert_eq!(restored.refresh_token, expected.refresh_token);
+        assert_eq!(restored.expires_at, expected.expires_at);
+    }
+
+    #[tokio::test]
+    async fn disabled_zoom_binding_still_deletes_tokens() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE service_bindings SET enabled = 0 WHERE account_id = 'zoom'",
+            [],
+        )
+        .unwrap();
+
+        delete_account_data(&conn, "zoom", &token_guard).unwrap();
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_zoom_with_oauth_mail_binding_is_not_deleted() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("mixed").await;
+        let mut config = account_config("zoom");
+        config.provider = "gmail".into();
+        config.mail_protocol = "imap".into();
+        config.imap_host = "imap.gmail.com".into();
+        insert_zoom_account(&conn, "mixed", &config, &tokens(), &token_guard).unwrap();
+        conn.execute(
+            "UPDATE service_bindings SET enabled = 0
+             WHERE account_id = 'mixed' AND service = 'meet' AND protocol = 'zoom'",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_account_data(&conn, "mixed", &token_guard).unwrap_err();
+        assert!(error.to_string().contains("additional service bindings"));
+        assert!(account_exists(&conn, "mixed"));
+        assert!(
+            db::service_bindings::list_for_account(&conn, "mixed")
+                .unwrap()
+                .len()
+                > 1
+        );
+        assert!(store.load("mixed").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_zoom_accounts_do_not_touch_provider_token_entries() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+
+        for id in ["gmail", "microsoft", "jmap", "talk", "matrix", "password"] {
+            let mut config = account_config("");
+            match id {
+                "gmail" => {
+                    config.provider = "gmail".into();
+                    config.mail_protocol = "imap".into();
+                    config.imap_host = "imap.gmail.com".into();
+                }
+                "microsoft" => {
+                    config.provider = "o365".into();
+                    config.mail_protocol = "graph".into();
+                }
+                "jmap" => {
+                    config.mail_protocol = "jmap".into();
+                    config.jmap_url = "https://jmap.example.com".into();
+                    config.jmap_auth_method = "oidc".into();
+                }
+                "talk" | "matrix" => {
+                    config.meet_url = "https://meet.example.com".into();
+                    config.meet_protocol = id.into();
+                }
+                "password" => {
+                    config.mail_protocol = "imap".into();
+                    config.imap_host = "imap.example.com".into();
+                }
+                _ => unreachable!(),
+            }
+            db::accounts::insert_account(&conn, id, &config).unwrap();
+            store.store(id, &tokens()).unwrap();
+            let token_guard = providers.lock_zoom_tokens(id).await;
+            delete_account_data(&conn, id, &token_guard).unwrap();
+            assert!(store.load(id).unwrap().is_some(), "token changed for {id}");
+        }
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
 }

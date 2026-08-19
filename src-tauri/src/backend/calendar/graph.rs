@@ -289,7 +289,7 @@ impl CalendarBackend for GraphCalendarBackend {
                 gc.name
             );
 
-            let conn = db.writer().await;
+            let mut conn = db.writer().await;
             let server_ids: std::collections::HashSet<String> =
                 calendar_events.iter().map(|e| e.id.clone()).collect();
 
@@ -369,12 +369,17 @@ impl CalendarBackend for GraphCalendarBackend {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let deleted_ids: Vec<String> = local_events
+                .iter()
+                .filter(|(_, remote_id)| !server_ids.contains(remote_id))
+                .map(|(local_id, _)| local_id.clone())
+                .collect();
             let mut deleted = 0;
-            for (local_id, remote_id) in &local_events {
-                if !server_ids.contains(remote_id) {
-                    db::calendar::delete_event(&conn, local_id)?;
-                    deleted += 1;
-                }
+            if !deleted_ids.is_empty() {
+                let transaction = conn.transaction()?;
+                deleted =
+                    db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)?.deleted;
+                transaction.commit()?;
             }
             if deleted > 0 {
                 log::info!(

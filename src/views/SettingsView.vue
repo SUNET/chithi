@@ -6,6 +6,7 @@ import { useAccountsStore } from "@/stores/accounts";
 import { usePlatformStore } from "@/stores/platform";
 import { useUiStore } from "@/stores/ui";
 import { acctColor } from "@/lib/account-colors";
+import * as api from "@/lib/tauri";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import AccountTypePicker from "@/components/settings/AccountTypePicker.vue";
 import AccountFormModal from "@/components/settings/AccountFormModal.vue";
@@ -43,6 +44,8 @@ const formModal = ref<InstanceType<typeof AccountFormModal> | null>(null);
 const showPicker = ref(false);
 const showDeleteConfirm = ref(false);
 const deletingAccountId = ref<string | null>(null);
+const abandonZoomAcknowledged = ref(false);
+const deletingZoomAccount = ref(false);
 
 function getInitials(name: string): string {
   const words = name.split(/\s+/);
@@ -69,17 +72,43 @@ function openEditForm(id: string) {
   formModal.value?.openEdit(id);
 }
 
-function confirmDelete(id: string) {
+async function confirmDelete(id: string) {
+  abandonZoomAcknowledged.value = false;
   deletingAccountId.value = id;
+  deletingZoomAccount.value = accountsStore.accounts.find(
+    (account) => account.id === id,
+  )?.meet_protocol === "zoom";
   showDeleteConfirm.value = true;
+
+  try {
+    const config = await api.getAccountConfig(id);
+    if (showDeleteConfirm.value && deletingAccountId.value === id) {
+      deletingZoomAccount.value = config.meet_protocol === "zoom";
+    }
+  } catch {
+    // The account summary remains the fallback if config loading fails.
+  }
+}
+
+function closeDeleteConfirm() {
+  showDeleteConfirm.value = false;
+  deletingAccountId.value = null;
+  abandonZoomAcknowledged.value = false;
+  deletingZoomAccount.value = false;
 }
 
 async function doDelete() {
   if (deletingAccountId.value) {
-    await accountsStore.deleteAccount(deletingAccountId.value);
+    if (deletingZoomAccount.value && abandonZoomAcknowledged.value) {
+      await accountsStore.abandonZoomAccount(
+        deletingAccountId.value,
+        "ABANDON REMOTE ZOOM MEETINGS",
+      );
+    } else {
+      await accountsStore.deleteAccount(deletingAccountId.value);
+    }
   }
-  showDeleteConfirm.value = false;
-  deletingAccountId.value = null;
+  closeDeleteConfirm();
 }
 
 // Onboarding hands off via ?addAccount=<provider>. Auto-open the new-account
@@ -117,27 +146,47 @@ onMounted(() => {
       <div class="section">
         <div class="section-label">Accounts</div>
         <div class="section-card">
-          <button
+          <div
             v-for="account in accountsStore.accounts"
             :key="account.id"
-            class="mobile-account-row"
+            class="mobile-account-item"
             :style="{ ['--acct-color']: acctColor(account.id).fill }"
-            @click="openEditForm(account.id)"
           >
-            <span class="mobile-account-avatar" :style="{ background: acctColor(account.id).fill }">
-              {{ getInitials(account.display_name) }}
-            </span>
-            <span class="mobile-account-info">
-              <span class="mobile-account-name">{{ account.display_name }}</span>
-              <span class="mobile-account-email">{{ accountSecondaryLabel(account) }}</span>
-              <span class="mobile-account-type" :style="{ color: acctColor(account.id).fill }">
-                {{ accountTypeLabel(account) }}
+            <button
+              type="button"
+              class="mobile-account-row"
+              :aria-label="`Edit ${account.display_name}`"
+              data-testid="mobile-account-edit"
+              @click="openEditForm(account.id)"
+            >
+              <span class="mobile-account-avatar" :style="{ background: acctColor(account.id).fill }">
+                {{ getInitials(account.display_name) }}
               </span>
-            </span>
-            <svg class="mobile-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </button>
+              <span class="mobile-account-info">
+                <span class="mobile-account-name">{{ account.display_name }}</span>
+                <span class="mobile-account-email">{{ accountSecondaryLabel(account) }}</span>
+                <span class="mobile-account-type" :style="{ color: acctColor(account.id).fill }">
+                  {{ accountTypeLabel(account) }}
+                </span>
+              </span>
+              <svg class="mobile-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="mobile-account-delete"
+              :aria-label="`Delete ${account.display_name}`"
+              data-testid="mobile-account-delete"
+              @click="confirmDelete(account.id)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              </svg>
+              <span>Delete</span>
+            </button>
+          </div>
           <button class="mobile-add-account" @click="openNewForm">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
               <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
@@ -268,15 +317,41 @@ onMounted(() => {
 
     <!-- Delete Confirmation Modal -->
     <Teleport to="body">
-      <div v-if="showDeleteConfirm" class="modal-overlay" @click.self="showDeleteConfirm = false">
+      <div v-if="showDeleteConfirm" class="modal-overlay" @click.self="closeDeleteConfirm">
         <div class="modal modal-sm">
           <div class="modal-body">
             <h3 class="confirm-title">Delete Account</h3>
             <p class="confirm-text">Are you sure you want to delete this account? This action cannot be undone.</p>
+            <div
+              v-if="deletingZoomAccount"
+              class="zoom-abandon-warning"
+              data-testid="zoom-abandon-warning"
+            >
+              <strong>Remote Zoom meetings may remain.</strong>
+              <p>
+                If normal deletion cannot clean up Zoom, you can remove only
+                the local account. Meetings already created in Zoom may remain
+                active and must be removed from Zoom separately.
+              </p>
+              <label class="zoom-abandon-acknowledgement">
+                <input
+                  v-model="abandonZoomAcknowledged"
+                  type="checkbox"
+                  data-testid="zoom-abandon-checkbox"
+                />
+                I understand that remote Zoom meetings may remain
+              </label>
+            </div>
           </div>
           <div class="modal-footer">
-            <button class="btn-secondary" @click="showDeleteConfirm = false">Cancel</button>
-            <button class="btn-danger" @click="doDelete">Delete</button>
+            <button class="btn-secondary" @click="closeDeleteConfirm">Cancel</button>
+            <button
+              class="btn-danger"
+              data-testid="delete-account-confirm"
+              @click="doDelete"
+            >
+              {{ deletingZoomAccount && abandonZoomAcknowledged ? "Delete locally" : "Delete" }}
+            </button>
           </div>
         </div>
       </div>
@@ -526,6 +601,33 @@ onMounted(() => {
   line-height: 1.5;
 }
 
+.zoom-abandon-warning {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--color-danger);
+  border-radius: 6px;
+  background: rgba(194, 65, 12, 0.08);
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.zoom-abandon-warning p {
+  margin: 6px 0 10px;
+  color: var(--color-text-secondary);
+}
+
+.zoom-abandon-acknowledgement {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.zoom-abandon-acknowledgement input {
+  margin-top: 2px;
+}
+
 /* ============================================================
    Mobile layout
    ============================================================ */
@@ -570,7 +672,20 @@ onMounted(() => {
   overflow: hidden;
 }
 
+.mobile-account-item {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--color-border);
+  border-left: 4px solid var(--acct-color, var(--color-accent));
+}
+
+.mobile-account-item:last-of-type {
+  border-bottom: 0;
+}
+
 .mobile-account-row {
+  flex: 1;
+  min-width: 0;
   width: 100%;
   display: flex;
   align-items: center;
@@ -578,15 +693,38 @@ onMounted(() => {
   min-height: 68px;
   padding: 10px 14px;
   border: 0;
-  border-left: 4px solid var(--acct-color, var(--color-accent));
-  border-bottom: 1px solid var(--color-border);
   background: transparent;
   text-align: left;
   cursor: pointer;
 }
 
-.mobile-account-row:last-child {
-  border-bottom: 0;
+.mobile-account-delete {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 70px;
+  border: 0;
+  border-left: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-danger);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-account-delete svg {
+  width: 17px;
+  height: 17px;
+  stroke-width: 1.7;
+}
+
+.mobile-account-delete:focus-visible,
+.mobile-account-row:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
 }
 
 .mobile-account-avatar {

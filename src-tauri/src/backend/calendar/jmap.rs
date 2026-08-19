@@ -111,7 +111,7 @@ impl CalendarBackend for JmapCalendarBackend {
 
             let local_cal_id = remote_to_local.get(&jcal.id).cloned().unwrap_or_default();
 
-            let conn = db.writer().await;
+            let mut conn = db.writer().await;
             for ev in &events {
                 let event_id = uuid::Uuid::new_v4().to_string();
                 let cal_event = CalendarEvent {
@@ -160,17 +160,25 @@ impl CalendarBackend for JmapCalendarBackend {
                 })
                 .unwrap_or_default();
 
-            let mut deleted = 0u32;
-            for (local_id, remote_id) in &local_synced {
-                if !server_ids.contains(remote_id) {
-                    conn.execute(
-                        "DELETE FROM calendar_events WHERE id = ?1",
-                        rusqlite::params![local_id],
-                    )
-                    .ok();
-                    deleted += 1;
+            let deleted_ids: Vec<String> = local_synced
+                .iter()
+                .filter(|(_, remote_id)| !server_ids.contains(remote_id))
+                .map(|(local_id, _)| local_id.clone())
+                .collect();
+            let deleted = if deleted_ids.is_empty() {
+                0
+            } else {
+                match conn.transaction() {
+                    Ok(transaction) => {
+                        match db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
+                        {
+                            Ok(result) if transaction.commit().is_ok() => result.deleted,
+                            _ => 0,
+                        }
+                    }
+                    Err(_) => 0,
                 }
-            }
+            };
             if deleted > 0 {
                 log::info!(
                     "sync_calendars: removed {} server-deleted events from '{}'",

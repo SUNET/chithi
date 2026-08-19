@@ -37,14 +37,10 @@ const emit = defineEmits<{ signIn: [] }>();
         : 'Base URL of your Nextcloud server. Login Flow v2 will open in your browser.' }}
     </span>
   </div>
-  <!-- Sign-in button only shows on the new-account
-       flow. The login flow always inserts a fresh
-       account row (it can't update an existing one),
-       so on edit we hide the button to avoid
-       duplicating the account when the user clicks
-       it. Re-auth of an existing meet account is a
-       delete-and-add operation today. -->
-  <div v-if="!editing" class="form-group">
+  <!-- Talk and Matrix still create a new account through their login
+       flows, so their edit forms keep the delete-and-add guidance.
+       Zoom can update an existing account's OAuth credentials. -->
+  <div v-if="!editing || accountType === 'zoom'" class="form-group">
     <button
       type="button"
       class="btn-oauth"
@@ -58,7 +54,9 @@ const emit = defineEmits<{ signIn: [] }>();
       {{
         signingIn
           ? 'Waiting for browser…'
-          : accountType === 'matrix'
+          : editing && accountType === 'zoom'
+            ? 'Sign in again with Zoom'
+            : accountType === 'matrix'
             ? 'Sign in with Matrix'
             : accountType === 'zoom'
               ? 'Sign in with Zoom'
@@ -75,7 +73,7 @@ const emit = defineEmits<{ signIn: [] }>();
   </div>
   <div v-else class="form-group">
     <span class="field-hint">
-      To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : accountType === 'zoom' ? 'Zoom' : 'Nextcloud' }} server.
+      To re-authenticate, delete this account and add it again. The session token is stored once and stays valid until you sign out from the {{ accountType === 'matrix' ? 'Matrix' : 'Nextcloud' }} server.
     </span>
   </div>
 </template>

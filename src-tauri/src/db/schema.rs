@@ -206,10 +206,9 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         -- Local link between a calendar event and a video-conferencing
         -- meeting created via the meet integrations (#148). Keyed on
         -- event_id so a single event has at most one meet binding;
-        -- ON DELETE CASCADE drops the binding when the event row goes,
-        -- which lets `delete_event` look the binding up *before* it
-        -- removes the event row and then call into the provider to
-        -- delete the remote meeting too. Survives normal resync (sync
+        -- ON DELETE CASCADE drops the binding after the meeting-aware
+        -- deletion helper has copied it into the durable cleanup queue.
+        -- Survives normal resync (sync
         -- updates `calendar_events` rows in place by remote_id rather
         -- than DELETE+INSERT).
         CREATE TABLE IF NOT EXISTS meet_meetings (
@@ -220,6 +219,23 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             join_url TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_meet_meetings_account
+            ON meet_meetings(account_id);
+
+        -- Durable ownership for newly-created, discarded, replaced, or
+        -- deletion-queued remote meetings. Deliberately has no foreign key:
+        -- deleting an account or event must not silently erase retry state.
+        CREATE TABLE IF NOT EXISTS meet_pending_meetings (
+            lifecycle_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            meeting_id TEXT NOT NULL,
+            join_url TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            cleanup_requested INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_meet_pending_meetings_account
+            ON meet_pending_meetings(account_id);
 
         -- FTS5 virtual table for fast message text search (quick filter)
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -362,6 +378,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         log::info!("Migration: adding is_subscribed column to calendars table");
         conn.execute_batch(
             "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+
+    let has_cleanup_requested = conn
+        .prepare("SELECT cleanup_requested FROM meet_pending_meetings LIMIT 0")
+        .is_ok();
+    if !has_cleanup_requested {
+        log::info!("Migration: adding cleanup_requested to pending meetings");
+        conn.execute_batch(
+            "ALTER TABLE meet_pending_meetings
+             ADD COLUMN cleanup_requested INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
 
@@ -829,5 +856,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!((prune, filters), (0, 0));
+    }
+
+    #[test]
+    fn pending_meeting_ownership_survives_account_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'account', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM accounts WHERE id = 'account'", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings
+                 WHERE lifecycle_id = 'lifecycle'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pending_cleanup_flag_migration_preserves_rows_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('existing', 'account', 'zoom', 'meeting', 'https://example.test');",
+        )
+        .unwrap();
+
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+
+        let cleanup_requested: bool = conn
+            .query_row(
+                "SELECT cleanup_requested FROM meet_pending_meetings
+                 WHERE lifecycle_id = 'existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!cleanup_requested);
     }
 }
