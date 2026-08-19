@@ -135,14 +135,6 @@ pub fn set_calendar_subscribed(conn: &Connection, id: &str, subscribed: bool) ->
     Ok(())
 }
 
-pub fn delete_calendar_events(conn: &Connection, calendar_id: &str) -> Result<usize> {
-    let count = conn.execute(
-        "DELETE FROM calendar_events WHERE calendar_id = ?1",
-        params![calendar_id],
-    )?;
-    Ok(count)
-}
-
 pub fn insert_calendar(conn: &Connection, id: &str, calendar: &NewCalendar) -> Result<()> {
     conn.execute(
         "INSERT INTO calendars (id, account_id, name, color, is_default)
@@ -172,12 +164,7 @@ pub fn update_calendar(conn: &Connection, id: &str, name: &str, color: &str) -> 
     Ok(())
 }
 
-pub fn delete_calendar(conn: &Connection, id: &str) -> Result<()> {
-    // Delete associated events first
-    conn.execute(
-        "DELETE FROM calendar_events WHERE calendar_id = ?1",
-        params![id],
-    )?;
+pub fn delete_calendar_row(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM calendars WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -273,7 +260,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
         }
     }
 
-    // No remote_id match — insert (INSERT OR REPLACE keyed on primary id)
+    // No remote_id match: insert a new event.
     insert_event(conn, event)?;
     Ok(())
 }
@@ -414,7 +401,7 @@ pub fn get_event(conn: &Connection, id: &str) -> Result<CalendarEvent> {
 
 pub fn insert_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO calendar_events
+        "INSERT INTO calendar_events
          (id, account_id, calendar_id, uid, title, description, location,
           start_time, end_time, all_day, timezone, recurrence_rule,
           organizer_email, attendees_json, my_status, source_message_id,
@@ -482,11 +469,6 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             event.id
         )));
     }
-    Ok(())
-}
-
-pub fn delete_event(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM calendar_events WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -602,6 +584,21 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE meet_meetings (
+                event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL
+            );
+            CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             INSERT INTO accounts (id, display_name, email, provider, username, password)
             VALUES ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass');
             ",
@@ -689,11 +686,13 @@ mod tests {
 
     #[test]
     fn test_delete_event() {
-        let conn = setup_db();
+        let mut conn = setup_db();
         let event = make_event("e1", "Meeting", None);
         insert_event(&conn, &event).unwrap();
 
-        delete_event(&conn, "e1").unwrap();
+        let transaction = conn.transaction().unwrap();
+        crate::db::calendar_event_deletion::delete_event(&transaction, "e1").unwrap();
+        transaction.commit().unwrap();
 
         let result = get_event(&conn, "e1");
         assert!(result.is_err(), "Event should not exist after deletion");
@@ -950,7 +949,7 @@ mod tests {
 
     #[test]
     fn test_delete_calendar_cascades_events() {
-        let conn = setup_db();
+        let mut conn = setup_db();
         let cal = NewCalendar {
             account_id: "acc1".to_string(),
             name: "Work".to_string(),
@@ -962,7 +961,10 @@ mod tests {
         let event = make_event("e1", "Meeting", None);
         insert_event(&conn, &event).unwrap();
 
-        delete_calendar(&conn, "cal1").unwrap();
+        let transaction = conn.transaction().unwrap();
+        crate::db::calendar_event_deletion::delete_calendar_events(&transaction, "cal1").unwrap();
+        delete_calendar_row(&transaction, "cal1").unwrap();
+        transaction.commit().unwrap();
 
         assert!(
             get_event(&conn, "e1").is_err(),
@@ -974,7 +976,7 @@ mod tests {
     fn test_deletion_reconciliation_pattern() {
         // Simulates the sync deletion reconciliation:
         // server has events A, B. Local has A, B, C (C was deleted on server).
-        let conn = setup_db();
+        let mut conn = setup_db();
         insert_event(&conn, &make_event("e1", "A", Some("remote-a"))).unwrap();
         insert_event(&conn, &make_event("e2", "B", Some("remote-b"))).unwrap();
         insert_event(&conn, &make_event("e3", "C", Some("remote-c"))).unwrap();
@@ -998,17 +1000,16 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut deleted = 0u32;
-        for (local_id, remote_id) in &local_synced {
-            if !server_ids.contains(remote_id) {
-                conn.execute(
-                    "DELETE FROM calendar_events WHERE id = ?1",
-                    params![local_id],
-                )
-                .ok();
-                deleted += 1;
-            }
-        }
+        let deleted_ids: Vec<String> = local_synced
+            .iter()
+            .filter(|(_, remote_id)| !server_ids.contains(remote_id))
+            .map(|(local_id, _)| local_id.clone())
+            .collect();
+        let transaction = conn.transaction().unwrap();
+        let deleted = crate::db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
+            .unwrap()
+            .deleted;
+        transaction.commit().unwrap();
 
         assert_eq!(deleted, 1);
         assert!(get_event(&conn, "e1").is_ok());
@@ -1051,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_delete_calendar_events() {
-        let conn = setup_db();
+        let mut conn = setup_db();
         insert_calendar(&conn, "cal1", &make_cal("acc1", "Work", true)).unwrap();
         insert_calendar(&conn, "cal2", &make_cal("acc1", "Personal", false)).unwrap();
         let mut e1 = make_event("e1", "Event 1", None);
@@ -1064,7 +1065,12 @@ mod tests {
         e3.calendar_id = "cal2".to_string();
         insert_event(&conn, &e3).unwrap();
 
-        let deleted = delete_calendar_events(&conn, "cal1").unwrap();
+        let transaction = conn.transaction().unwrap();
+        let deleted =
+            crate::db::calendar_event_deletion::delete_calendar_events(&transaction, "cal1")
+                .unwrap()
+                .deleted;
+        transaction.commit().unwrap();
         assert_eq!(deleted, 2);
 
         assert!(get_event(&conn, "e3").is_ok());
@@ -1074,9 +1080,14 @@ mod tests {
 
     #[test]
     fn test_delete_calendar_events_empty() {
-        let conn = setup_db();
+        let mut conn = setup_db();
         insert_calendar(&conn, "cal1", &make_cal("acc1", "Work", true)).unwrap();
-        let deleted = delete_calendar_events(&conn, "cal1").unwrap();
+        let transaction = conn.transaction().unwrap();
+        let deleted =
+            crate::db::calendar_event_deletion::delete_calendar_events(&transaction, "cal1")
+                .unwrap()
+                .deleted;
+        transaction.commit().unwrap();
         assert_eq!(deleted, 0);
     }
 }

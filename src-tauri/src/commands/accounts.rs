@@ -40,6 +40,11 @@ fn delete_account_data(
             "Cannot delete Zoom credentials: the account has additional service bindings".into(),
         ));
     }
+    // Account deletion cascades through calendars and events. Move any bound
+    // meetings into durable cleanup ownership first. If this same account
+    // owns one of those meetings, `delete_account` rejects below and the
+    // transaction rolls the event transfer back together with the deletion.
+    db::calendar_event_deletion::delete_account_events(&transaction, account_id)?;
     db::accounts::delete_account(&transaction, account_id)?;
 
     if is_standalone_zoom {
@@ -466,6 +471,34 @@ mod tests {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(account_id, service, protocol)
             );
+            CREATE TABLE meet_meetings (
+                event_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL
+            );
+            CREATE TABLE meet_pending_meetings (
+                lifecycle_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                meeting_id TEXT NOT NULL,
+                join_url TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE calendars (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE calendar_events (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                calendar_id TEXT NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL
+            );
             ",
         )
         .unwrap();
@@ -612,6 +645,205 @@ mod tests {
             1
         );
         assert!(store.load("zoom").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn bound_meeting_blocks_zoom_account_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_account_data(&conn, "zoom", &token_guard).unwrap_err();
+
+        assert!(error.to_string().contains("meetings still require it"));
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_meeting_blocks_zoom_account_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        let error = delete_account_data(&conn, "zoom", &token_guard).unwrap_err();
+
+        assert!(error.to_string().contains("meetings still require it"));
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unrelated_meeting_does_not_block_zoom_account_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('lifecycle', 'other', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        delete_account_data(&conn, "zoom", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_deletion_queues_meeting_owned_by_another_account() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("calendar").await;
+        insert_zoom_account(
+            &conn,
+            "calendar",
+            &account_config(""),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        db::accounts::insert_account(&conn, "meet", &account_config("zoom")).unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar-id', 'calendar', 'Calendar')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('event', 'calendar', 'calendar-id', 'Event', 'start', 'end')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'meet', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        delete_account_data(&conn, "calendar", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "calendar"));
+        assert!(account_exists(&conn, "meet"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings
+                 WHERE account_id = 'meet' AND meeting_id = 'meeting'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_bound_event_rolls_back_account_event_and_token_deletion() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("zoom").await;
+        insert_zoom_account(
+            &conn,
+            "zoom",
+            &account_config("zoom"),
+            &tokens(),
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar-id', 'zoom', 'Calendar')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('event', 'zoom', 'calendar-id', 'Event', 'start', 'end')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'zoom', 'zoom', 'meeting', 'https://example.test')",
+            [],
+        )
+        .unwrap();
+
+        assert!(delete_account_data(&conn, "zoom", &token_guard).is_err());
+
+        assert!(account_exists(&conn, "zoom"));
+        assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE id = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM meet_pending_meetings", [], |row| row
+                .get::<_, i64>(
+                0
+            ),)
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

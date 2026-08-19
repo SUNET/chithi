@@ -170,7 +170,7 @@ async function addVideoLink(accountId: string) {
   try {
     await operation;
   } finally {
-    if (meetCreationPromise === operation) meetCreationPromise = null;
+    meetCreationPromise = null;
     generatingMeetUrl.value = false;
   }
 }

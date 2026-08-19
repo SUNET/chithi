@@ -229,15 +229,6 @@ fn replace_meet_binding_ownership(
     Ok(cleanup_lifecycle_id)
 }
 
-fn queue_bound_meeting_cleanup(
-    conn: &rusqlite::Connection,
-    event_id: &str,
-) -> Result<Option<String>> {
-    db::meet_meetings::get(conn, event_id)?
-        .map(|binding| queue_meeting_cleanup(conn, binding))
-        .transpose()
-}
-
 fn queue_meeting_cleanup(
     conn: &rusqlite::Connection,
     binding: db::meet_meetings::MeetMeeting,
@@ -413,8 +404,11 @@ async fn push_calendar_rename(
 #[tauri::command]
 pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("delete_calendar: id={}", calendar_id);
-    let conn = state.db.writer().await;
-    db::calendar::delete_calendar(&conn, &calendar_id)?;
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
+    db::calendar::delete_calendar_row(&transaction, &calendar_id)?;
+    transaction.commit()?;
     log::info!("delete_calendar: deleted calendar {}", calendar_id);
     Ok(())
 }
@@ -426,9 +420,12 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
 #[tauri::command]
 pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: String) -> Result<()> {
     log::info!("unsubscribe_calendar: id={}", calendar_id);
-    let conn = state.db.writer().await;
-    db::calendar::set_calendar_subscribed(&conn, &calendar_id, false)?;
-    let deleted = db::calendar::delete_calendar_events(&conn, &calendar_id)?;
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
+    let deleted =
+        db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?.deleted;
+    transaction.commit()?;
     log::info!(
         "unsubscribe_calendar: deleted {} events for calendar {}",
         deleted,
@@ -973,10 +970,10 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
     let cleanup_lifecycle_id = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
-        let cleanup = queue_bound_meeting_cleanup(&transaction, &event_id)?;
-        db::calendar::delete_event(&transaction, &event_id)?;
+        let mut cleanup = db::calendar_event_deletion::delete_event(&transaction, &event_id)?
+            .cleanup_lifecycle_ids;
         transaction.commit()?;
-        cleanup
+        cleanup.pop()
     };
 
     if let Some(lifecycle_id) = cleanup_lifecycle_id {
@@ -2100,7 +2097,7 @@ pub async fn process_cancelled_invite(
         return Ok(());
     }
 
-    let conn = state.db.writer().await;
+    let mut conn = state.db.writer().await;
     let mut deleted = 0;
     for cancel in &cancels {
         if let Some(event) = db::calendar::get_event_by_uid(&conn, &account_id, &cancel.uid)? {
@@ -2117,7 +2114,9 @@ pub async fn process_cancelled_invite(
                     }
                 }
             }
-            db::calendar::delete_event(&conn, &event.id)?;
+            let transaction = conn.transaction()?;
+            db::calendar_event_deletion::delete_event(&transaction, &event.id)?;
+            transaction.commit()?;
             deleted += 1;
             log::info!(
                 "process_cancelled_invite: deleted event '{}' (UID={})",
@@ -2214,7 +2213,7 @@ pub fn auto_process_calendar_emails(
     }
 
     // Phase 2: acquire the writer ONCE and batch all calendar updates.
-    let conn_w = tokio::runtime::Handle::current().block_on(db.writer());
+    let mut conn_w = tokio::runtime::Handle::current().block_on(db.writer());
     let mut calendar_changed = false;
 
     for invite in &all_invites {
@@ -2265,7 +2264,19 @@ pub fn auto_process_calendar_emails(
                         .ok()
                         .flatten()
                 {
-                    if db::calendar::delete_event(&conn_w, &event.id).is_ok() {
+                    let deleted = match conn_w.transaction() {
+                        Ok(transaction) => {
+                            if db::calendar_event_deletion::delete_event(&transaction, &event.id)
+                                .is_ok()
+                            {
+                                transaction.commit().is_ok()
+                            } else {
+                                false
+                            }
+                        }
+                        Err(_) => false,
+                    };
+                    if deleted {
                         log::info!(
                             "auto_process: deleted cancelled event '{}' (UID={})",
                             event.title,
@@ -2592,10 +2603,11 @@ mod tests {
         bind_meeting(&conn, "event", "old");
 
         let transaction = conn.transaction().unwrap();
-        let cleanup_id = queue_bound_meeting_cleanup(&transaction, "event")
+        let cleanup_id = db::calendar_event_deletion::delete_event(&transaction, "event")
             .unwrap()
+            .cleanup_lifecycle_ids
+            .pop()
             .unwrap();
-        db::calendar::delete_event(&transaction, "event").unwrap();
         transaction.commit().unwrap();
 
         assert!(db::calendar::get_event(&conn, "event").is_err());
@@ -2613,8 +2625,7 @@ mod tests {
         bind_meeting(&conn, "event", "old");
 
         let transaction = conn.transaction().unwrap();
-        queue_bound_meeting_cleanup(&transaction, "event").unwrap();
-        db::calendar::delete_event(&transaction, "event").unwrap();
+        db::calendar_event_deletion::delete_event(&transaction, "event").unwrap();
         transaction.rollback().unwrap();
 
         assert!(db::calendar::get_event(&conn, "event").is_ok());

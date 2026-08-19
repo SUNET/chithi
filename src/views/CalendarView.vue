@@ -597,12 +597,6 @@ onMounted(() => {
       v-if="calendarStore.selectedEvent"
       @close="calendarStore.selectEvent(null)"
     />
-    <EventForm
-      v-if="showEventForm"
-      :initial-start="newEventStart || undefined"
-      @close="showEventForm = false; newEventStart = '';"
-      @saved="calendarStore.fetchEvents()"
-    />
   </div>
 
   <!-- Desktop -->
@@ -666,14 +660,15 @@ onMounted(() => {
       @close="calendarStore.selectEvent(null)"
     />
 
-    <!-- New event form -->
-    <EventForm
-      v-if="showEventForm"
-      :initial-start="newEventStart || undefined"
-      @close="showEventForm = false; newEventStart = '';"
-      @saved="calendarStore.fetchEvents()"
-    />
   </div>
+
+  <!-- Keep one form mounted while responsive layout branches switch. -->
+  <EventForm
+    v-if="showEventForm"
+    :initial-start="newEventStart || undefined"
+    @close="showEventForm = false; newEventStart = '';"
+    @saved="calendarStore.fetchEvents()"
+  />
 </template>
 
 <style scoped>
