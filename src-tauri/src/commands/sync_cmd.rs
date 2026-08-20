@@ -554,13 +554,14 @@ async fn run_mail_sync_once(
         );
         return Ok(());
     }
+    let mail_config = account.mail_config();
 
     // Non-empty protocol always resolves (unknown falls back to IMAP,
     // matching the pre-trait else-is-IMAP chain).
-    let backend = crate::backend::mail::for_account(&account)
+    let backend = crate::backend::mail::for_account(&mail_config)
         .expect("non-empty mail protocol resolves to a backend");
 
-    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+    let suspended_idle = if backend.suspends_idle_for_ops(&mail_config) {
         log::info!(
             "Suspending IMAP IDLE for account {} before sync",
             account_id
@@ -579,7 +580,9 @@ async fn run_mail_sync_once(
     };
     // Calendar sync is independent — triggered by its own interval,
     // not chained to mail sync. See CalendarView.vue / calendar.ts.
-    let sync_result = backend.sync_account(&ctx, &account, current_folder).await;
+    let sync_result = backend
+        .sync_account(&ctx, &mail_config, current_folder)
+        .await;
 
     let resume_result =
         resume_imap_idle_for_account(app, state, &resume_account, suspended_idle).await;
@@ -706,14 +709,15 @@ pub async fn sync_folder(
         );
         return Ok(0);
     }
+    let mail_config = account.mail_config();
 
     // sync-started is emitted by each backend's sync path, so the
     // activity store sees exactly one start per sync.
 
-    let backend = crate::backend::mail::for_account(&account)
+    let backend = crate::backend::mail::for_account(&mail_config)
         .expect("non-empty mail protocol resolves to a backend");
 
-    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+    let suspended_idle = if backend.suspends_idle_for_ops(&mail_config) {
         log::info!(
             "Suspending IMAP IDLE for account {} before single-folder sync",
             account_id
@@ -734,7 +738,7 @@ pub async fn sync_folder(
     // Every backend syncs exactly the requested folder synchronously —
     // a right-click "sync folder" must never escalate to a whole-account
     // sync (Graph used to background one here before delta sync).
-    let sync_result: Result<u32> = backend.sync_folder(&ctx, &account, &folder_path).await;
+    let sync_result: Result<u32> = backend.sync_folder(&ctx, &mail_config, &folder_path).await;
 
     let resume_result =
         resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
@@ -812,11 +816,12 @@ pub async fn prefetch_bodies(
             let conn = state.db.reader();
             db::accounts::get_account_full(&conn, &account_id)?
         };
+        let mail_config = account.mail_config();
 
         // JMAP inherits the trait's no-op prefetch (bodies are fetched on
         // demand via the JMAP API); accounts without a mail binding have
         // nothing to prefetch.
-        let Some(backend) = crate::backend::mail::for_account(&account) else {
+        let Some(backend) = crate::backend::mail::for_account(&mail_config) else {
             log::debug!(
                 "Prefetch: account {} has no enabled mail binding, skipping",
                 account_id
@@ -824,7 +829,7 @@ pub async fn prefetch_bodies(
             return Ok(0);
         };
 
-        let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+        let suspended_idle = if backend.suspends_idle_for_ops(&mail_config) {
             log::info!(
                 "Suspending IMAP IDLE for account {} before body prefetch",
                 account_id
@@ -842,7 +847,7 @@ pub async fn prefetch_bodies(
             data_dir: state.data_dir.clone(),
             providers: state.providers.clone(),
         };
-        let prefetch_result = backend.prefetch_bodies(&ctx, &account).await;
+        let prefetch_result = backend.prefetch_bodies(&ctx, &mail_config).await;
         let resume_result =
             resume_imap_idle_for_account(&app, &state, &resume_account, suspended_idle).await;
 

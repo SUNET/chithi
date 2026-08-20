@@ -222,6 +222,10 @@ mod connect_tests {
 
 impl JmapConfig {
     pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
+        Self::from_mail_account(&account.mail_config())
+    }
+
+    pub fn from_mail_account(account: &crate::account::MailAccountConfig) -> Self {
         // "bearer" mode stores the API token in the password field but the
         // server (e.g. Fastmail) expects Authorization: Bearer <token>, not
         // Basic auth. Promote it to access_token so apply_auth() routes it
@@ -315,7 +319,8 @@ mod from_account_tests {
 
     #[test]
     fn bearer_mode_moves_password_to_access_token() {
-        let cfg = JmapConfig::from_account(&account_with("bearer", "fmu1-secret-api-token"));
+        let account = account_with("bearer", "fmu1-secret-api-token").mail_config();
+        let cfg = JmapConfig::from_mail_account(&account);
         assert_eq!(cfg.password, "");
         assert_eq!(cfg.access_token.as_deref(), Some("fmu1-secret-api-token"));
     }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::account::MailAccountConfig;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::jmap::JmapConfig;
@@ -171,8 +172,21 @@ pub trait ProviderCredentials: Send + Sync {
         account_id: &str,
         purpose: GraphTokenPurpose,
     ) -> Result<String>;
-    async fn mail_credentials(&self, account: &AccountFull) -> Result<MailCredentials>;
-    async fn jmap_config(&self, account: &AccountFull) -> Result<JmapConfig>;
+    async fn mail_credentials_for(&self, account: &MailAccountConfig) -> Result<MailCredentials>;
+    async fn jmap_config_for(&self, account: &MailAccountConfig) -> Result<JmapConfig>;
+
+    /// Compatibility wrapper for service paths not yet migrated to focused
+    /// account views.
+    async fn mail_credentials(&self, account: &AccountFull) -> Result<MailCredentials> {
+        let config = account.mail_config();
+        self.mail_credentials_for(&config).await
+    }
+
+    /// Compatibility wrapper for shared JMAP calendar/contact paths.
+    async fn jmap_config(&self, account: &AccountFull) -> Result<JmapConfig> {
+        let config = account.mail_config();
+        self.jmap_config_for(&config).await
+    }
     async fn jmap_push_access_token(
         &self,
         account_id: &str,
@@ -576,7 +590,15 @@ impl ProviderServices {
         &self,
         account: &AccountFull,
     ) -> Result<(JmapConfig, crate::mail::jmap::JmapConnection)> {
-        let config = self.credentials.jmap_config(account).await?;
+        let config = account.mail_config();
+        self.jmap_client_for(&config).await
+    }
+
+    pub async fn jmap_client_for(
+        &self,
+        account: &MailAccountConfig,
+    ) -> Result<(JmapConfig, crate::mail::jmap::JmapConnection)> {
+        let config = self.credentials.jmap_config_for(account).await?;
         let connection = crate::mail::jmap::JmapConnection::connect_with_clients(
             &config,
             self.transports.jmap_discovery_http.clone(),
@@ -637,7 +659,7 @@ impl ProviderCredentialService {
             .ok_or_else(|| Error::Other(missing_message.into()))
     }
 
-    async fn jmap_oidc_access_token(&self, account: &AccountFull) -> Result<Option<String>> {
+    async fn jmap_oidc_access_token(&self, account: &MailAccountConfig) -> Result<Option<String>> {
         if account.jmap_auth_method != "oidc" {
             return Ok(None);
         }
@@ -746,7 +768,7 @@ impl ProviderCredentials for ProviderCredentialService {
         Ok(refreshed.access_token)
     }
 
-    async fn mail_credentials(&self, account: &AccountFull) -> Result<MailCredentials> {
+    async fn mail_credentials_for(&self, account: &MailAccountConfig) -> Result<MailCredentials> {
         if account.auth_method != "oauth-microsoft" {
             return Ok(MailCredentials {
                 secret: account.password.clone(),
@@ -779,8 +801,8 @@ impl ProviderCredentials for ProviderCredentialService {
         })
     }
 
-    async fn jmap_config(&self, account: &AccountFull) -> Result<JmapConfig> {
-        let mut config = JmapConfig::from_account(account);
+    async fn jmap_config_for(&self, account: &MailAccountConfig) -> Result<JmapConfig> {
+        let mut config = JmapConfig::from_mail_account(account);
         if let Some(token) = self.jmap_oidc_access_token(account).await? {
             config.access_token = Some(token);
         }
@@ -1067,11 +1089,14 @@ mod tests {
             unreachable!()
         }
 
-        async fn mail_credentials(&self, _account: &AccountFull) -> Result<MailCredentials> {
+        async fn mail_credentials_for(
+            &self,
+            _account: &MailAccountConfig,
+        ) -> Result<MailCredentials> {
             unreachable!()
         }
 
-        async fn jmap_config(&self, _account: &AccountFull) -> Result<JmapConfig> {
+        async fn jmap_config_for(&self, _account: &MailAccountConfig) -> Result<JmapConfig> {
             unreachable!()
         }
 
@@ -1238,6 +1263,73 @@ mod tests {
             refresh_token: Some("rotated-refresh".into()),
             expires_at: Some(i64::MAX),
         }
+    }
+
+    fn mail_account(auth_method: &str, password: &str) -> MailAccountConfig {
+        MailAccountConfig {
+            id: "mail-focused".into(),
+            display_name: "Focused Mail".into(),
+            email: "user@example.com".into(),
+            protocol: "imap".into(),
+            username: "user@example.com".into(),
+            password: password.into(),
+            auth_method: auth_method.into(),
+            imap_host: "imap.example.com".into(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 587,
+            use_tls: true,
+            jmap_url: String::new(),
+            jmap_auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn focused_password_mail_credentials_preserve_keyring_secret() {
+        let service = ProviderCredentialService::new(
+            Arc::new(MemoryTokenStore::default()),
+            Arc::new(FakeTokenEndpoint {
+                refreshed: refreshed_tokens(),
+                scopes: Mutex::new(Vec::new()),
+            }),
+        );
+
+        let credentials = service
+            .mail_credentials_for(&mail_account("password", "keyring-secret"))
+            .await
+            .unwrap();
+
+        assert_eq!(credentials.secret, "keyring-secret");
+        assert!(!credentials.use_xoauth2);
+    }
+
+    #[tokio::test]
+    async fn focused_microsoft_mail_credentials_use_imap_scope_and_rotate() {
+        let store = Arc::new(MemoryTokenStore::default());
+        store.store("mail-focused", &expired_tokens()).unwrap();
+        let endpoint = Arc::new(FakeTokenEndpoint {
+            refreshed: refreshed_tokens(),
+            scopes: Mutex::new(Vec::new()),
+        });
+        let service = ProviderCredentialService::new(store.clone(), endpoint.clone());
+
+        let credentials = service
+            .mail_credentials_for(&mail_account("oauth-microsoft", "ignored"))
+            .await
+            .unwrap();
+
+        assert_eq!(credentials.secret, "fresh-access");
+        assert!(credentials.use_xoauth2);
+        assert_eq!(
+            endpoint.scopes.lock().unwrap().as_slice(),
+            [crate::oauth::MICROSOFT_IMAP_SCOPES]
+        );
+        assert_eq!(
+            store.load("mail-focused").unwrap().unwrap().refresh_token,
+            Some("rotated-refresh".into())
+        );
     }
 
     #[tokio::test]
