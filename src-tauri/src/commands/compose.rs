@@ -3,8 +3,8 @@ use tauri::{Emitter, State};
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::mail::msgid::normalize_message_id;
 use crate::mail::smtp;
+use crate::message::normalize_message_id;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]

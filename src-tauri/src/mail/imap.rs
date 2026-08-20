@@ -4,8 +4,8 @@ use native_tls::TlsStream;
 use std::net::TcpStream;
 
 use crate::error::{Error, Result};
-use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
+use crate::message::normalize_message_id;
 use crate::state::IdleControl;
 
 fn mailbox_is_selectable(attributes: &[NameAttribute<'_>]) -> bool {
@@ -21,21 +21,6 @@ pub struct ImapConfig {
     pub use_tls: bool,
     /// If true, use XOAUTH2 authentication (password field contains the access token).
     pub use_xoauth2: bool,
-}
-
-impl ImapConfig {
-    /// Build an ImapConfig from an account. For O365 accounts, fetches an
-    /// IMAP-scoped OAuth token and sets use_xoauth2=true.
-    pub fn from_account(account: &crate::db::accounts::AccountFull) -> ImapConfig {
-        ImapConfig {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: account.username.clone(),
-            password: account.password.clone(),
-            use_tls: account.use_tls,
-            use_xoauth2: account.auth_method == "oauth-microsoft",
-        }
-    }
 }
 
 /// XOAUTH2 SASL authenticator for IMAP (used by O365).

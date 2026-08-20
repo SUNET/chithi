@@ -13,6 +13,7 @@ mod keyring;
 mod logging;
 mod mail;
 mod meet;
+mod message;
 mod oauth;
 mod ops;
 mod path_validation;

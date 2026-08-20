@@ -55,10 +55,10 @@ The JMAP URL (`https://api.fastmail.com`) and the auth method
 `password` column (and the OS keyring, per ADR 0011) — the same slot
 every other JMAP account uses for its secret.
 
-### Bearer routing through `JmapConfig::from_account`
+### Bearer routing through `JmapConfig::from_mail_account`
 
 `JmapConfig` carries an `Option<String>` `access_token` field. In
-`from_account`, when `jmap_auth_method == "bearer"` and the password
+`from_mail_account`, when `jmap_auth_method == "bearer"` and the password
 is non-empty we **promote** the password into `access_token` and clear
 the password field. `apply_auth()` is then a single branch: if
 `access_token` is set, use `bearer_auth(token)`; otherwise
@@ -144,9 +144,9 @@ the heuristic.
 - ADR 0010 — Account type selection.
 - ADR 0011 — System keyring for passwords.
 - ADR 0020 — JMAP EventSource push notifications.
-- `src-tauri/src/mail/jmap.rs` — `JmapConfig::from_account`,
-  `apply_auth`, `rewrite_url`, `is_internal_url`,
-  `fetch_email_changes`.
+- `src-tauri/src/mail/jmap/mod.rs` — `JmapConfig::from_mail_account`,
+  `apply_auth`, `rewrite_url`, `is_internal_url`.
+- `src-tauri/src/mail/jmap/mail.rs` — `fetch_email_changes`.
 - `src-tauri/src/db/accounts.rs` —
   `populate_legacy_from_bindings`, `list_accounts`
   (Fastmail provider recovery from the JMAP binding URL).

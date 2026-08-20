@@ -221,10 +221,6 @@ mod connect_tests {
 }
 
 impl JmapConfig {
-    pub fn from_account(account: &crate::db::accounts::AccountFull) -> Self {
-        Self::from_mail_account(&account.mail_config())
-    }
-
     pub fn from_mail_account(account: &crate::account::MailAccountConfig) -> Self {
         // "bearer" mode stores the API token in the password field but the
         // server (e.g. Fastmail) expects Authorization: Bearer <token>, not
@@ -268,59 +264,41 @@ impl JmapConfig {
 }
 
 #[cfg(test)]
-mod from_account_tests {
+mod from_mail_account_tests {
     use super::*;
-    use crate::db::accounts::AccountFull;
+    use crate::account::MailAccountConfig;
 
-    fn account_with(auth: &str, password: &str) -> AccountFull {
-        AccountFull {
+    fn account_with(auth: &str, password: &str) -> MailAccountConfig {
+        MailAccountConfig {
             id: "acc1".into(),
             display_name: "Test".into(),
             email: "u@example.com".into(),
-            provider: "generic".into(),
-            mail_protocol: "jmap".into(),
+            protocol: "jmap".into(),
+            username: "u@example.com".into(),
+            password: password.into(),
+            auth_method: String::new(),
             imap_host: String::new(),
             imap_port: 0,
             smtp_host: String::new(),
             smtp_port: 0,
-            jmap_url: "https://api.example.com".into(),
-            caldav_url: String::new(),
-            meet_url: String::new(),
-            meet_protocol: String::new(),
-            username: "u@example.com".into(),
-            password: password.into(),
             use_tls: true,
-            enabled: true,
-            signature: String::new(),
+            jmap_url: "https://api.example.com".into(),
             jmap_auth_method: auth.into(),
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
-            calendar_sync_enabled: false,
-            auth_method: String::new(),
-            bindings: Vec::new(),
-            mail_sync_enabled: true,
-            contacts_sync_enabled: false,
-            mail_sync_interval_seconds: None,
-            calendar_sync_interval_seconds: None,
-            contacts_sync_interval_seconds: None,
-            pgp_attach_pubkey_on_sign: false,
-            pgp_autocrypt_header: false,
-            pgp_encrypt_subject: false,
-            pgp_encrypt_drafts: false,
         }
     }
 
     #[test]
     fn basic_mode_keeps_password_clears_access_token() {
-        let cfg = JmapConfig::from_account(&account_with("basic", "hunter2"));
+        let cfg = JmapConfig::from_mail_account(&account_with("basic", "hunter2"));
         assert_eq!(cfg.password, "hunter2");
         assert!(cfg.access_token.is_none());
     }
 
     #[test]
     fn bearer_mode_moves_password_to_access_token() {
-        let account = account_with("bearer", "fmu1-secret-api-token").mail_config();
-        let cfg = JmapConfig::from_mail_account(&account);
+        let cfg = JmapConfig::from_mail_account(&account_with("bearer", "fmu1-secret-api-token"));
         assert_eq!(cfg.password, "");
         assert_eq!(cfg.access_token.as_deref(), Some("fmu1-secret-api-token"));
     }
@@ -332,7 +310,8 @@ mod from_account_tests {
         // newline turns "Bearer fmu1-xxx\n" into a malformed header
         // and Fastmail returns "Invalid Authorization bearer
         // parameters, not valid format". Verify the trim happens.
-        let cfg = JmapConfig::from_account(&account_with("bearer", "  fmu1-secret-api-token\n"));
+        let cfg =
+            JmapConfig::from_mail_account(&account_with("bearer", "  fmu1-secret-api-token\n"));
         assert_eq!(cfg.access_token.as_deref(), Some("fmu1-secret-api-token"));
         assert_eq!(cfg.password, "");
     }
@@ -342,7 +321,7 @@ mod from_account_tests {
         // Token-less bearer (editing account form, password preserved in
         // keyring) must not promote an empty string to access_token —
         // apply_auth would then send "Bearer " with no value.
-        let cfg = JmapConfig::from_account(&account_with("bearer", ""));
+        let cfg = JmapConfig::from_mail_account(&account_with("bearer", ""));
         assert_eq!(cfg.password, "");
         assert!(cfg.access_token.is_none());
     }
@@ -350,8 +329,8 @@ mod from_account_tests {
     #[test]
     fn oidc_mode_leaves_access_token_for_caller() {
         // OIDC populates access_token at the call site (sync_cmd / push
-        // loop) after refresh — from_account itself should leave it None.
-        let cfg = JmapConfig::from_account(&account_with("oidc", ""));
+        // loop) after refresh — construction itself should leave it None.
+        let cfg = JmapConfig::from_mail_account(&account_with("oidc", ""));
         assert!(cfg.access_token.is_none());
     }
 

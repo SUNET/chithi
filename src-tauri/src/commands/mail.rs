@@ -426,7 +426,7 @@ pub async fn get_message_body(
     state: State<'_, AppState>,
     account_id: String,
     message_id: String,
-) -> Result<db::messages::MessageBody> {
+) -> Result<crate::message::MessageBody> {
     log::debug!("Loading message body: {}", message_id);
 
     let (maildir_path, from_email, to_json, cc_json, flags_json, is_encrypted, is_signed) = {

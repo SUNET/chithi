@@ -1,8 +1,8 @@
 //! JMAP mail domain: `Email/*` and `EmailSubmission/*` methods.
 
 use crate::error::{Error, Result};
-use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_jmap_filter, SearchHit, SearchQuery};
+use crate::message::normalize_message_id;
 use serde::Serialize;
 
 use super::{JmapConfig, JmapConnection};

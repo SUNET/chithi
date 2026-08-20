@@ -616,7 +616,7 @@ async fn prompt_via_dialog(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PgpDecryptedMessage {
-    pub plaintext_body: crate::db::messages::MessageBody,
+    pub plaintext_body: crate::message::MessageBody,
     pub verify_outcome: PgpVerifyOutcome,
 }
 
