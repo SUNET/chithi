@@ -7,8 +7,7 @@ use crate::error::{Error, Result};
 use crate::event::tauri::{emit_folders_changed, emit_messages_changed};
 use crate::mail::imap::ImapConfig;
 use crate::mail::parser;
-use crate::mail::search::{SearchHit, SearchQuery};
-use crate::message::{BackendMessageRef, BodyLocation};
+use crate::message::{BackendMessageRef, BodyLocation, SearchHit, SearchQuery};
 use crate::state::AppState;
 
 /// Check if an IP address is in a private/reserved range (SSRF protection).

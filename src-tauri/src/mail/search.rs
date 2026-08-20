@@ -1,60 +1,6 @@
-//! Shared types for server-side mail search across IMAP / JMAP / Graph.
+//! Protocol query encoders for server-side mail search.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SearchQuery {
-    pub text: String,
-    #[serde(default)]
-    pub fields: SearchFields,
-    #[serde(default)]
-    pub has_attachment: Option<bool>,
-    #[serde(default)]
-    pub since_days: Option<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SearchFields {
-    pub subject: bool,
-    pub from: bool,
-    pub to: bool,
-    pub body: bool,
-}
-
-impl Default for SearchFields {
-    fn default() -> Self {
-        Self {
-            subject: true,
-            from: true,
-            to: true,
-            body: true,
-        }
-    }
-}
-
-impl SearchFields {
-    pub fn all_enabled(&self) -> bool {
-        self.subject && self.from && self.to && self.body
-    }
-
-    pub fn any_enabled(&self) -> bool {
-        self.subject || self.from || self.to || self.body
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchHit {
-    pub account_id: String,
-    pub folder_path: String,
-    pub uid: Option<u32>,
-    pub message_id: Option<String>,
-    pub backend_id: String,
-    pub subject: String,
-    pub from_name: Option<String>,
-    pub from_email: Option<String>,
-    pub date: i64,
-    pub snippet: Option<String>,
-}
+use crate::message::SearchQuery;
 
 /// Build an IMAP `UID SEARCH` argument from a query.
 ///
@@ -234,6 +180,7 @@ pub fn build_graph_kql(query: &SearchQuery) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::SearchFields;
 
     fn q(text: &str) -> SearchQuery {
         SearchQuery {

@@ -46,6 +46,62 @@ pub struct MessageBody {
     pub pgp_kind: Option<PgpKind>,
 }
 
+/// Provider-neutral inputs for server-side mail search.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchQuery {
+    pub text: String,
+    #[serde(default)]
+    pub fields: SearchFields,
+    #[serde(default)]
+    pub has_attachment: Option<bool>,
+    #[serde(default)]
+    pub since_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchFields {
+    pub subject: bool,
+    pub from: bool,
+    pub to: bool,
+    pub body: bool,
+}
+
+impl Default for SearchFields {
+    fn default() -> Self {
+        Self {
+            subject: true,
+            from: true,
+            to: true,
+            body: true,
+        }
+    }
+}
+
+impl SearchFields {
+    pub fn all_enabled(&self) -> bool {
+        self.subject && self.from && self.to && self.body
+    }
+
+    pub fn any_enabled(&self) -> bool {
+        self.subject || self.from || self.to || self.body
+    }
+}
+
+/// Provider-neutral result returned from server-side mail search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub account_id: String,
+    pub folder_path: String,
+    pub uid: Option<u32>,
+    pub message_id: Option<String>,
+    pub backend_id: String,
+    pub subject: String,
+    pub from_name: Option<String>,
+    pub from_email: Option<String>,
+    pub date: i64,
+    pub snippet: Option<String>,
+}
+
 /// A provider-specific message identity.
 ///
 /// Database ids retain their existing underscore-delimited representation.
@@ -247,6 +303,7 @@ pub fn normalize_message_id(value: &str) -> Option<String> {
 mod tests {
     use super::{
         normalize_message_id, Address, BackendMessageRef, BodyLocation, MessageBody, PgpKind,
+        SearchHit, SearchQuery,
     };
 
     fn message_body(pgp_kind: Option<PgpKind>) -> MessageBody {
@@ -344,6 +401,127 @@ mod tests {
 
         let encrypted = serde_json::to_value(message_body(Some(PgpKind::MimeEncrypted))).unwrap();
         assert_eq!(encrypted["pgp_kind"], "mimeEncrypted");
+    }
+
+    #[test]
+    fn search_query_omitted_fields_use_all_enabled_default() {
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "text": "invoice",
+        }))
+        .unwrap();
+
+        assert_eq!(query.text, "invoice");
+        assert!(query.fields.all_enabled());
+        assert!(query.fields.any_enabled());
+        assert_eq!(query.has_attachment, None);
+        assert_eq!(query.since_days, None);
+    }
+
+    #[test]
+    fn search_query_preserves_explicit_false_and_zero() {
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "text": "invoice",
+            "fields": {
+                "from": true,
+                "to": false,
+                "subject": true,
+                "body": false,
+            },
+            "has_attachment": false,
+            "since_days": 0,
+        }))
+        .unwrap();
+
+        assert!(query.fields.from);
+        assert!(!query.fields.to);
+        assert!(query.fields.subject);
+        assert!(!query.fields.body);
+        assert_eq!(query.has_attachment, Some(false));
+        assert_eq!(query.since_days, Some(0));
+    }
+
+    #[test]
+    fn search_hit_json_contract_is_stable() {
+        let hit = SearchHit {
+            account_id: "acc1".into(),
+            folder_path: "INBOX".into(),
+            uid: Some(42),
+            message_id: None,
+            backend_id: "INBOX:42".into(),
+            subject: "Invoice".into(),
+            from_name: None,
+            from_email: Some("sender@example.com".into()),
+            date: 1_700_000_000,
+            snippet: None,
+        };
+        let expected = serde_json::json!({
+            "account_id": "acc1",
+            "folder_path": "INBOX",
+            "uid": 42,
+            "message_id": null,
+            "backend_id": "INBOX:42",
+            "subject": "Invoice",
+            "from_name": null,
+            "from_email": "sender@example.com",
+            "date": 1_700_000_000,
+            "snippet": null,
+        });
+
+        assert_eq!(serde_json::to_value(&hit).unwrap(), expected);
+
+        let decoded: SearchHit = serde_json::from_value(expected).unwrap();
+        assert_eq!(decoded.account_id, "acc1");
+        assert_eq!(decoded.folder_path, "INBOX");
+        assert_eq!(decoded.uid, Some(42));
+        assert_eq!(decoded.message_id, None);
+        assert_eq!(decoded.backend_id, "INBOX:42");
+        assert_eq!(decoded.subject, "Invoice");
+        assert_eq!(decoded.from_name, None);
+        assert_eq!(decoded.from_email.as_deref(), Some("sender@example.com"));
+        assert_eq!(decoded.date, 1_700_000_000);
+        assert_eq!(decoded.snippet, None);
+
+        let minimal: SearchHit = serde_json::from_value(serde_json::json!({
+            "account_id": "acc1",
+            "folder_path": "INBOX",
+            "backend_id": "item",
+            "subject": "Minimal",
+            "date": 0,
+        }))
+        .unwrap();
+        assert_eq!(minimal.uid, None);
+        assert_eq!(minimal.message_id, None);
+        assert_eq!(minimal.from_name, None);
+        assert_eq!(minimal.from_email, None);
+        assert_eq!(minimal.snippet, None);
+
+        let all_null = SearchHit {
+            account_id: "acc1".into(),
+            folder_path: "INBOX".into(),
+            uid: None,
+            message_id: None,
+            backend_id: "item".into(),
+            subject: "Minimal".into(),
+            from_name: None,
+            from_email: None,
+            date: 0,
+            snippet: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&all_null).unwrap(),
+            serde_json::json!({
+                "account_id": "acc1",
+                "folder_path": "INBOX",
+                "uid": null,
+                "message_id": null,
+                "backend_id": "item",
+                "subject": "Minimal",
+                "from_name": null,
+                "from_email": null,
+                "date": 0,
+                "snippet": null,
+            })
+        );
     }
 
     #[test]

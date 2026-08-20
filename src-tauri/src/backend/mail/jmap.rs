@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::account::MailAccountConfig;
 use crate::error::{Error, Result};
 use crate::mail::jmap_sync;
-use crate::mail::search::{SearchHit, SearchQuery};
+use crate::message::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 

@@ -14,8 +14,7 @@ use crate::account::MailAccountConfig;
 use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::event::SharedEventSink;
-use crate::mail::search::{SearchHit, SearchQuery};
-use crate::message::{BackendMessageRef, BodyLocation};
+use crate::message::{BackendMessageRef, BodyLocation, SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
 use crate::provider::ProviderServices;
 
