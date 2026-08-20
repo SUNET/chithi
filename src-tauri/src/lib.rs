@@ -5,6 +5,7 @@ mod account;
 mod backend;
 mod calendar;
 mod commands;
+mod contact;
 mod db;
 mod error;
 mod event;

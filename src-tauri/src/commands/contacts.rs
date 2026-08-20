@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use tauri::State;
 
+use crate::contact::Contact;
 use crate::db;
-use crate::db::contacts::{CollectedContact, Contact, ContactBook};
+use crate::db::contacts::{CollectedContact, ContactBook};
 use crate::error::Result;
 use crate::state::AppState;
 

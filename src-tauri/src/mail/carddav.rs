@@ -4,6 +4,7 @@
 //! auth) and adds CardDAV-specific discovery, address book listing, contact
 //! fetching, and vCard parsing/generation.
 
+use crate::contact::Contact;
 use crate::error::{Error, Result};
 use crate::mail::caldav::{
     find_elements, find_text_in, has_descendant, parse_href_from_xml, resolve_dav_url, DavAuth,
@@ -619,9 +620,9 @@ pub fn generate_vcard(
     lines.join("\r\n")
 }
 
-/// Generate a vCard from a stored contact row, converting its JSON
+/// Generate a vCard from a contact, converting its JSON
 /// email/phone lists to vCard entries (labels default to "work").
-pub fn contact_to_vcard(uid: &str, contact: &crate::db::contacts::Contact) -> String {
+pub fn contact_to_vcard(uid: &str, contact: &Contact) -> String {
     let emails: Vec<VCardEmail> =
         serde_json::from_str::<Vec<serde_json::Value>>(&contact.emails_json)
             .unwrap_or_default()
@@ -838,7 +839,7 @@ mod tests {
 
     #[test]
     fn contact_to_vcard_converts_json_lists() {
-        let contact = crate::db::contacts::Contact {
+        let contact = Contact {
             id: "c1".into(),
             book_id: "b1".into(),
             uid: Some("uid-1".into()),
@@ -867,7 +868,7 @@ mod tests {
 
     #[test]
     fn contact_to_vcard_handles_malformed_json() {
-        let contact = crate::db::contacts::Contact {
+        let contact = Contact {
             id: "c1".into(),
             book_id: "b1".into(),
             uid: None,

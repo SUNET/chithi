@@ -14,8 +14,8 @@
 
 use async_trait::async_trait;
 
+use crate::contact::Contact;
 use crate::db::accounts::AccountFull;
-use crate::db::contacts::Contact;
 use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::provider::ProviderServices;
