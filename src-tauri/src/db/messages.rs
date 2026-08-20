@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::mail::msgid::normalize_message_id;
+use crate::message::normalize_message_id;
 
 /// Quick filter options for the message list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,43 +51,6 @@ pub struct MessagePage {
     pub total: i64,
     pub page: u32,
     pub per_page: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Address {
-    pub name: Option<String>,
-    pub email: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Attachment {
-    pub index: u32,
-    pub filename: Option<String>,
-    pub content_type: String,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MessageBody {
-    pub id: String,
-    pub subject: Option<String>,
-    pub from: Address,
-    pub to: Vec<Address>,
-    pub cc: Vec<Address>,
-    pub date: String,
-    pub flags: Vec<String>,
-    pub body_html: Option<String>,
-    pub body_text: Option<String>,
-    pub attachments: Vec<Attachment>,
-    pub is_encrypted: bool,
-    pub is_signed: bool,
-    pub list_id: Option<String>,
-    pub has_remote_images: bool,
-    /// Detected PGP shape (None for plain mail). Drives the reader's
-    /// Decrypt button / signature badge. Set by the parser via
-    /// `mail::pgp_mime::detect_kind`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pgp_kind: Option<crate::mail::pgp_mime::PgpKind>,
 }
 
 pub struct NewMessage {

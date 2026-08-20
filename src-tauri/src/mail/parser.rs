@@ -1,7 +1,8 @@
 use mail_parser::{Address as MailAddress, HeaderValue, MessageParser, MimeHeaders};
 
-use crate::db::messages::{Address, Attachment, MessageBody, NewMessage};
+use crate::db::messages::NewMessage;
 use crate::mail::compat::BackendMessageRef;
+use crate::message::{Address, Attachment, MessageBody};
 
 fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
     match addr {
@@ -246,7 +247,8 @@ pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_envelope, parse_html_with_images, parse_message_body};
-    use crate::db::messages::{Address, MessageBody, NewMessage};
+    use crate::db::messages::NewMessage;
+    use crate::message::{Address, MessageBody};
 
     const ADDRESSES: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/addresses");
     const ATTACHMENT: &[u8] =

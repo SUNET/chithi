@@ -21,16 +21,7 @@
 
 use std::borrow::Cow;
 
-/// Detected PGP shape, surfaced to the frontend so the reader knows
-/// whether to show a Decrypt button (encrypted), an auto-verified
-/// signature badge (signed), or a banner for legacy inline armor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PgpKind {
-    MimeEncrypted,
-    MimeSigned,
-    InlineArmor,
-}
+use crate::message::PgpKind;
 
 /// Cheap precheck. Returns true if the raw bytes contain any token that
 /// hints at PGP/MIME, so the caller can short-circuit fast on the 99% of

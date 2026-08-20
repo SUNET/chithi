@@ -4,8 +4,8 @@
 //! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
 
 use crate::error::{Error, Result};
-use crate::mail::msgid::normalize_message_id;
 use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
+use crate::message::normalize_message_id;
 use serde::{Deserialize, Serialize};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
@@ -1036,7 +1036,7 @@ impl GraphClient {
     pub async fn get_attachments(
         &self,
         message_id: &str,
-    ) -> Result<Vec<crate::db::messages::Attachment>> {
+    ) -> Result<Vec<crate::message::Attachment>> {
         let resp = self
             .get(
                 &format!("/me/messages/{}/attachments", message_id),
@@ -1047,7 +1047,7 @@ impl GraphClient {
         let mut attachments = Vec::new();
         if let Some(values) = resp["value"].as_array() {
             for (i, att) in values.iter().enumerate() {
-                attachments.push(crate::db::messages::Attachment {
+                attachments.push(crate::message::Attachment {
                     index: i as u32,
                     filename: att["name"].as_str().map(|s| s.to_string()),
                     content_type: att["contentType"]

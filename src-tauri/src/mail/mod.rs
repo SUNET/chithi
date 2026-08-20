@@ -10,7 +10,6 @@ pub mod imap;
 pub mod jmap;
 pub mod jmap_push;
 pub mod jmap_sync;
-pub mod msgid;
 pub mod parser;
 pub mod pgp_agent;
 pub mod pgp_mime;
