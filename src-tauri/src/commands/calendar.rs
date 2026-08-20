@@ -7,9 +7,10 @@ use crate::backend::calendar::{
     RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
+use crate::calendar::{Attendee, CalendarEvent};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
-use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
+use crate::db::calendar::{Calendar, Invite, NewCalendar};
 use crate::error::Result;
 use crate::meet;
 use crate::message::BodyLocation;

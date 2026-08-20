@@ -3,9 +3,9 @@
 use async_trait::async_trait;
 
 use crate::calendar::ical;
+use crate::calendar::CalendarEvent;
 use crate::db;
 use crate::db::accounts::AccountFull;
-use crate::db::calendar::CalendarEvent;
 use crate::error::Result;
 use crate::mail::caldav::{CalDavClient, CalDavConfig};
 

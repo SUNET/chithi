@@ -5,7 +5,7 @@
 //! `ProviderCredentials`; this client just sends requests with a ready token,
 //! mirroring `GraphClient`.
 
-use crate::db::calendar::CalendarEvent;
+use crate::calendar::CalendarEvent;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]

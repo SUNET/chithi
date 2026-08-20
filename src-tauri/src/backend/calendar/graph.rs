@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::CalendarEvent;
 use crate::db;
 use crate::db::accounts::AccountFull;
-use crate::db::calendar::{CalendarEvent, NewCalendar};
+use crate::db::calendar::NewCalendar;
 use crate::error::Result;
 use crate::mail::graph::{event_patch_to_graph_json, event_to_graph_json};
 use crate::provider::GraphTokenPurpose;

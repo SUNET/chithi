@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 
-use crate::db::calendar::Attendee;
+use super::Attendee;
 
 /// A parsed calendar invite extracted from an email or raw iCalendar text.
 #[derive(Debug, Clone, Serialize, Deserialize)]

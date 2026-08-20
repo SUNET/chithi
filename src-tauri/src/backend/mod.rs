@@ -17,8 +17,8 @@ pub mod mail;
 
 #[cfg(test)]
 pub(crate) mod testutil {
+    use crate::calendar::CalendarEvent;
     use crate::db::accounts::AccountFull;
-    use crate::db::calendar::CalendarEvent;
     use crate::db::contacts::Contact;
     use crate::db::pool::DbPool;
     use crate::db::service_bindings::ServiceBinding;

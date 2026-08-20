@@ -14,8 +14,8 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::CalendarEvent;
 use crate::db::accounts::AccountFull;
-use crate::db::calendar::CalendarEvent;
 use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::provider::ProviderServices;
