@@ -14,7 +14,7 @@ edit_uri: edit/main/web/
 docs_dir: web
 
 # `web/CNAME` and the static OAuth bounce under
-# `web/oauth/zoom/index.html` are not part of the navigation but
+# `web/oauth/zoom/index.html` are not documentation pages but
 # need to round-trip through the build untouched. mkdocs copies
 # unrecognised files in the docs source verbatim; this entry
 # silences the "not in nav" warnings the strict CI build would
@@ -22,6 +22,21 @@ docs_dir: web
 not_in_nav: |
   /CNAME
   /oauth/**
+
+nav:
+  - Home: index.md
+  - User guide:
+      - Overview: user/index.md
+      - Install Chithi: user/install.md
+      - First launch: user/getting-started.md
+      - Account setup: user/accounts.md
+      - Troubleshooting: user/troubleshooting.md
+      - Privacy and local data: user/data-removal.md
+  - Administration: admin/index.md
+  - Project:
+      - Privacy policy: privacy.md
+      - Terms of use: terms.md
+      - Zoom Marketplace test plan: zoom-test-plan.md
 
 theme:
   name: material
@@ -65,7 +80,3 @@ markdown_extensions:
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
-
-# Letting mkdocs auto-derive the nav from the `web/` tree keeps
-# new pages picked up without bookkeeping. Top-level pages render
-# as tabs; nested directories (user/, admin/) become sections.

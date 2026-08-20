@@ -1,23 +1,26 @@
 # User guide
 
-End-user documentation for Chithi. This section is being built out
-alongside the app itself; the topics below are placeholders and will
-be filled in over coming releases.
+Use this guide to install Chithi, connect accounts, understand its local
+data, and diagnose common problems.
 
-## Coming soon
+## Start here
 
-- **Installing Chithi** — desktop builds for Linux, macOS, Windows
-  (and the mobile work in progress).
-- **Adding a mail account** — IMAP / JMAP / Gmail / Microsoft 365
-  walkthroughs, including the auto-discovery flow.
-- **Adding a calendar / contacts account** — CalDAV / CardDAV setup,
-  Gmail and Microsoft 365 OAuth flows.
-- **Video conferencing** — connecting Nextcloud Talk, Matrix /
-  Element Call, and Zoom accounts; using "Add video conference"
-  in the calendar event editor.
-- **Privacy defaults** — remote-image blocking, plain-text rendering,
-  the rationale behind each default.
+1. Read [Install Chithi](install.md) for current platform and release
+   status.
+2. Follow [First launch](getting-started.md) to open Chithi and add an
+   account.
+3. Use [Account setup](accounts.md) for the fields and authorization flow
+   required by your provider.
 
-In the meantime, the in-app help text and the
-[features overview in the source repository](https://github.com/SUNET/chithi/blob/main/docs/features.md)
-cover the same ground.
+## Keep Chithi working
+
+- [Troubleshooting](troubleshooting.md) covers browser sign-in, keyring,
+  synchronization, remote images, and update behavior.
+- [Privacy and local data](data-removal.md) lists data, logs, credentials,
+  and the steps needed to remove them.
+- The public [privacy policy](../privacy.md) explains the roles of Chithi,
+  configured providers, and the documentation website.
+
+Chithi is pre-1.0 software. Features and storage formats can change, so
+back up local data before upgrades and verify the behavior important to
+you.

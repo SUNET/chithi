@@ -61,9 +61,9 @@
       <a id="continue" class="button" href="#">Open Chithi</a>
     </p>
     <p style="font-size: 0.85em; color: #998c75;">
-      This page is a static redirect helper used by the Chithi desktop
-      app's Zoom OAuth flow. It runs entirely client-side: nothing on
-      <code>chithi.org</code> reads or stores your OAuth code.
+      This static page forwards the response in your browser. No
+      Chithi-operated application server processes your OAuth code.
+      GitHub Pages serves this page and receives the requested URL.
     </p>
   </div>
   <script>
@@ -75,8 +75,9 @@
     // /oauth/zoom and /oauth/zoom/ — the no-slash form 301-redirects to
     // the slash form, preserving the query string.)
     //
-    // Everything happens in the browser — the page never touches a
-    // server side, so there's nowhere to log or cache the OAuth code.
+    // The forwarding logic is client-side. GitHub Pages still receives
+    // the requested URL while serving this file; no Chithi-operated
+    // application server receives or processes the OAuth response.
     (function () {
       var params = window.location.search || "";
       var target = "http://127.0.0.1:47832/" + params;

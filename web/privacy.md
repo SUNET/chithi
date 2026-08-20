@@ -15,19 +15,24 @@ UK GDPR.
 Chithi runs entirely on your own device. When you connect a mail,
 calendar, contacts, or video-conferencing account, Chithi:
 
-- Stores your account credentials (passwords or OAuth tokens) in the
-  operating-system keyring on your device.
+- On desktop, stores account passwords and OAuth tokens in the
+  operating-system keyring. Android OAuth tokens are stored in the
+  application's private sandbox.
 - Stores cached copies of mail, calendar entries, and contacts in a
   local database under your user profile.
-- Sends and receives data only between your device and the servers of
-  the providers you have configured (your IMAP/SMTP/CalDAV/CardDAV
-  server, Gmail, Microsoft 365, Nextcloud Talk, Matrix, Zoom, and
-  similar).
+- Sends and receives account data directly between your device and the
+  providers you configure (your IMAP/SMTP/CalDAV/CardDAV server, Gmail,
+  Microsoft 365, Nextcloud Talk, Matrix, Zoom, and similar).
 
-The Chithi authors do not operate any backend that receives your
-mail, calendar, contact, or meeting data. We have no copy of, and no
-access to, the content stored on your device or transmitted between
-your device and your providers.
+Supporting operations can contact other services: OAuth authorization
+and token endpoints, DNS and account auto-configuration sources, the
+static `chithi.org` Zoom redirect, WKD servers when you request an
+OpenPGP key, and remote-image hosts when you choose to load images.
+
+The Chithi authors do not operate any backend that receives your mail,
+calendar, contact, or meeting data. We have no copy of, and no access to,
+the content stored on your device or transmitted between your device and
+your providers.
 
 For information on how those providers handle your data once it
 leaves Chithi, please consult their respective privacy policies
@@ -46,10 +51,12 @@ and user agent for the underlying GitHub Pages service: see
 for what GitHub does with that data.
 
 The page at [chithi.org/oauth/zoom](https://chithi.org/oauth/zoom) is
-a static OAuth redirect helper that runs entirely in your browser.
-It receives a Zoom authorization code in the URL and forwards it to
-the Chithi desktop app on your own machine. The code is not
-transmitted to any server we operate.
+a static OAuth redirect helper. GitHub Pages infrastructure receives
+the request URL, which contains a short-lived Zoom authorization code.
+Client-side JavaScript then forwards the response to the Chithi desktop
+app on your own machine. No Chithi-operated application server receives
+or processes the code, and PKCE prevents it from being redeemed without
+the verifier held by Chithi.
 
 ## Your rights
 
@@ -74,11 +81,16 @@ personal data a controller holds about you:
   authority. In Sweden this is the
   [Integritetsskyddsmyndigheten (IMY)](https://www.imy.se).
 
-Because Chithi the application processes your data only on your own
-device, you can exercise these rights for that data by using the
-application itself: removing accounts, clearing the local cache, or
-uninstalling the app removes the corresponding data from your
-device.
+Chithi keeps its local application data under your user profile. Removing
+an account deletes its local database records and attempts to delete its
+mail directory, but
+uninstalling a desktop package does not necessarily remove application
+data, preferences, or keyring entries. Chithi does not currently provide
+a general **Clear cache** action. Follow the
+[data-removal guide](user/data-removal.md) if you want to remove all
+local data. OpenPGP keys use a separate, shared Tumpa keystore and must
+not be deleted unless you intend to remove them from every application
+that uses that keystore.
 
 To exercise rights against data held by your mail, calendar,
 contacts, or video-conferencing provider, please contact that
