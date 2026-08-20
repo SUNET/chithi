@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::contact::Contact;
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -14,23 +15,6 @@ pub struct ContactBook {
     pub name: String,
     pub remote_id: Option<String>,
     pub sync_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Contact {
-    pub id: String,
-    pub book_id: String,
-    pub uid: Option<String>,
-    pub display_name: String,
-    pub emails_json: String,
-    pub phones_json: String,
-    pub addresses_json: String,
-    pub organization: Option<String>,
-    pub title: Option<String>,
-    pub notes: Option<String>,
-    pub vcard_data: Option<String>,
-    pub remote_id: Option<String>,
-    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

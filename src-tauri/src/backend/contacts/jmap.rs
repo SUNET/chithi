@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 
+use crate::contact::Contact;
 use crate::db::accounts::AccountFull;
-use crate::db::contacts::Contact;
 use crate::error::Result;
 
 use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};

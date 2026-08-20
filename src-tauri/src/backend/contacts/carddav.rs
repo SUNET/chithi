@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 
+use crate::contact::Contact;
 use crate::db;
 use crate::db::accounts::AccountFull;
-use crate::db::contacts::Contact;
 use crate::error::Result;
 use crate::mail::carddav::{contact_to_vcard, parse_vcard};
 
@@ -99,11 +99,10 @@ impl ContactBackend for CardDavContactBackend {
 
                 // Get existing local contacts for this book
                 let local_contacts = db::contacts::list_contacts(&conn, &book_id)?;
-                let mut local_by_uid: std::collections::HashMap<String, db::contacts::Contact> =
-                    local_contacts
-                        .into_iter()
-                        .filter_map(|c| c.uid.clone().map(|uid| (uid, c)))
-                        .collect();
+                let mut local_by_uid: std::collections::HashMap<String, Contact> = local_contacts
+                    .into_iter()
+                    .filter_map(|c| c.uid.clone().map(|uid| (uid, c)))
+                    .collect();
 
                 // Upsert server contacts
                 for sc in &server_contacts {
@@ -117,7 +116,7 @@ impl ContactBackend for CardDavContactBackend {
                     if let Some(existing) = local_by_uid.remove(&sc.uid) {
                         // Update if etag changed
                         if existing.etag.as_deref() != Some(&sc.etag) {
-                            let updated = db::contacts::Contact {
+                            let updated = Contact {
                                 display_name: parsed.display_name,
                                 emails_json,
                                 phones_json,
@@ -133,7 +132,7 @@ impl ContactBackend for CardDavContactBackend {
                         }
                     } else {
                         // New contact from server
-                        let contact = db::contacts::Contact {
+                        let contact = Contact {
                             id: uuid::Uuid::new_v4().to_string(),
                             book_id: book_id.clone(),
                             uid: Some(sc.uid.clone()),

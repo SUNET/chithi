@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 
+use crate::contact::Contact;
 use crate::db::accounts::AccountFull;
-use crate::db::contacts::Contact;
 use crate::error::Result;
 use crate::mail::graph::contact_to_graph_json;
 use crate::provider::GraphTokenPurpose;
