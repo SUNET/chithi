@@ -1,8 +1,12 @@
 # Chithi
 
-A desktop email client built with Tauri v2 (Rust) and Vue 3 (TypeScript).
+A desktop email, calendar, and contacts client built with Tauri v2
+(Rust) and Vue 3 (TypeScript).
 
-Supports IMAP, JMAP, CalDAV, and JMAP Calendar with a Thunderbird-style three-pane layout. Passwords are stored in the system keyring (GNOME Keyring, KDE Wallet, macOS Keychain, or Windows Credential Manager).
+Supports IMAP, SMTP, JMAP, CalDAV, and CardDAV with a
+Thunderbird-style three-pane layout. On desktop, passwords are stored
+in the system keyring (Secret Service, macOS Keychain, or Windows
+Credential Manager).
 
 ## Why?
 
@@ -10,19 +14,22 @@ Need a client with first class support for OpenPGP. Also allowing doing Calendar
 
 ## Features
 
-- Multi-account support (Gmail app password, IMAP, JMAP, CalDAV-only)
+- Multi-account support for Gmail, Microsoft 365, Fastmail, IMAP,
+  JMAP, CalDAV, and CardDAV
 - Email threading with In-Reply-To and subject-based fallback
 - Calendar with day/week/month views, recurring events, and meeting invite handling
 - Accept/Maybe/Decline meeting invites from email with iTIP replies
 - Client-side message filtering rules
 - HTML email sanitization (no scripts, no remote content by default)
+- OpenPGP signing and encryption, including smartcard support
+- Nextcloud Talk, Matrix / Element Call, and Zoom meeting integration
 - Dark and light themes
 
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
-- [Node.js](https://nodejs.org/) (v20+)
-- [pnpm](https://pnpm.io/) (v10+)
+- [Node.js](https://nodejs.org/) (v20.19.x or v22.12+)
+- [pnpm](https://pnpm.io/) (v10; the repository pins the exact version)
 
 ## System Dependencies
 
@@ -35,6 +42,7 @@ Need a client with first class support for OpenPGP. Also allowing doing Calendar
     gtk3 \
     webkit2gtk-4.1 \
     libayatana-appindicator \
+    pcsclite \
     librsvg \
     curl \
     wget
@@ -52,6 +60,7 @@ sudo apt install -y \
   libgtk-3-dev \
   libwebkit2gtk-4.1-dev \
   libayatana-appindicator3-dev \
+  libpcsclite-dev \
   librsvg2-dev \
   curl \
   wget
@@ -88,9 +97,8 @@ Tauri uses the built-in WebKit framework on macOS. The `keyring` crate uses the 
 ## Build & Run
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd emails
+git clone https://github.com/SUNET/chithi.git
+cd chithi
 
 # Install frontend dependencies
 pnpm install
@@ -119,12 +127,22 @@ pnpm exec vue-tsc --noEmit
 
 ## Data Storage
 
-| Data | Location |
-|------|----------|
-| Email bodies (Maildir) | `~/.local/share/chithi/<account_id>/` |
-| SQLite database | `~/.local/share/chithi/chithi.db` |
-| Log file | `~/.local/share/chithi/chithi.log` |
-| Passwords | System keyring (GNOME Keyring / KDE Wallet / macOS Keychain) |
+Desktop application data is stored below the platform's local data
+directory:
+
+| Platform | Base directory |
+|----------|----------------|
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/chithi/` |
+| macOS | `~/Library/Application Support/chithi/` |
+| Windows | `%LOCALAPPDATA%\chithi\` |
+
+Linux honors `XDG_DATA_HOME`. The exact macOS and Windows locations
+should be verified with packaged builds. Within the base directory,
+`chithi.db` is the SQLite database,
+`chithi.log` is the log, and each mail account has its own directory.
+Desktop passwords and OAuth tokens are stored separately in the system
+keyring. See the [data-removal guide](web/user/data-removal.md) before
+deleting data manually.
 
 ## Architecture
 
@@ -154,11 +172,14 @@ Access model:
 - Delegated permissions only
 - Access is limited to the signed-in user’s own mailbox, calendars, shared calendars, and contacts
 - No client secret is stored on the device
-- OAuth tokens are stored locally in the OS keyring
+- On desktop, OAuth tokens are stored locally in the OS keyring
 
 Requested permissions:
 
-- Microsoft Graph: User.Read, Calendars.ReadWrite, Calendars.Read.Shared Contacts.ReadWrite, IMAP.AccessAsUser.All, SMTP.Send, Mail.ReadWrite, Mail.Send, offline_access, openid, profile, email
+- Microsoft Graph: `User.Read`, `Mail.ReadWrite`,
+  `Calendars.ReadWrite`, `Contacts.ReadWrite`, `Place.Read.All`
+- Outlook: `IMAP.AccessAsUser.All`, `SMTP.Send`
+- Sign-in: `offline_access`, `openid`, `profile`, `email`
 ```
 
 

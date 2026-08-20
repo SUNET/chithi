@@ -2,11 +2,11 @@
 
 This page is written for the Zoom App Marketplace reviewers. It
 describes, step by step, how to install Chithi, connect a Zoom account,
-and exercise the three Zoom REST scopes that Chithi requests:
-`meeting:write:meeting`, `meeting:update:meeting`, and
-`meeting:delete:meeting`. The three scopes correspond, one-to-one, to
-the three Zoom REST endpoints Chithi calls; each is exercised by a
-distinct user action in the calendar event editor.
+and exercise the four Zoom REST scopes that Chithi requests:
+`meeting:write:meeting`, `meeting:update:meeting`,
+`meeting:delete:meeting`, and `user:read:user`. The first three scopes
+manage meetings from the calendar event editor. The fourth verifies that
+reauthorization is for the same Zoom user and account.
 
 Chithi is a community-driven, open-source desktop project hosted by
 SUNET (the Swedish University Computer Network) under the GPL-3.0
@@ -25,8 +25,8 @@ the bottom of this page.
 | -------------------------- | ----------------------------------------------------------------------------------- |
 | App name                   | Chithi                                                                              |
 | App type                   | OAuth, user-managed, public client with PKCE (no secret)                            |
-| Scopes requested           | `meeting:write:meeting`, `meeting:update:meeting`, `meeting:delete:meeting`         |
-| Zoom REST endpoints called | `POST /v2/users/me/meetings`, `PATCH /v2/meetings/{id}`, `DELETE /v2/meetings/{id}` |
+| Scopes requested           | `meeting:write:meeting`, `meeting:update:meeting`, `meeting:delete:meeting`, `user:read:user` |
+| Zoom REST endpoints called | `GET /v2/users/me`, `POST /v2/users/me/meetings`, `PATCH /v2/meetings/{id}`, `DELETE /v2/meetings/{id}` |
 | Where credentials live     | OS-native secret store (Secret Service / Keychain / Cred. Mgr)                      |
 | Webhooks / SDK / S2S OAuth | None                                                                                |
 
@@ -34,9 +34,10 @@ Each scope maps to exactly one user-visible action:
 
 | Scope                    | Action in Chithi                                 | REST call                    |
 | ------------------------ | ------------------------------------------------ | ---------------------------- |
-| `meeting:write:meeting`  | "Add Zoom" button in the event editor            | `POST /v2/users/me/meetings` |
+| `meeting:write:meeting`  | "Add account name (Zoom)" in the event editor    | `POST /v2/users/me/meetings` |
 | `meeting:update:meeting` | Saving the event after editing its title or time | `PATCH /v2/meetings/{id}`    |
 | `meeting:delete:meeting` | Deleting a calendar event that has a Zoom link   | `DELETE /v2/meetings/{id}`   |
+| `user:read:user`         | Sign-in and reauthorization identity check       | `GET /v2/users/me`           |
 
 ## Prerequisites for the reviewer
 
@@ -44,38 +45,30 @@ The reviewer needs:
 
 1. A working Zoom account (any tier — a free account is sufficient to
    test meeting creation).
-2. A mail and calendar account the reviewer already uses. Any of the
-   following works, because Chithi only needs _somewhere_ to show a
-   calendar event. **Any standards-compliant IMAP + CalDAV or JMAP
-   account works without third-party gating; the OAuth-based providers
-   are subject to the publisher-verification state of Chithi's other
-   pending app reviews.**
-   - A generic IMAP + CalDAV account (e.g. Apple Mail, Migadu, a
-     self-hosted Dovecot + Radicale server). **Recommended.** No
-     third-party review involved.
-   - A generic JMAP account (Fastmail, a self-hosted Stalwart server).
-     **Recommended.** Same as above.
-   - A Microsoft 365 / Outlook account (OAuth). Works today, but
-     Microsoft still flags Chithi as an unverified publisher at the
-     consent screen, so the reviewer sees a warning and has to click
-     through it; sign-in completes normally afterwards.
-   - A Gmail account (OAuth or app password). **Likely to fail right now:**
-     Chithi's Google OAuth verification is itself still pending review, so
-     the Google consent screen typically blocks sign-in with an
-     `access_denied` / unverified-app error. Use one of the other three
-     account types unless the reviewer wants to confirm the failure mode.
+2. A calendar account the reviewer already uses. Chithi only needs
+   somewhere to store the event used by this test. OAuth-based providers
+   can be subject to publisher verification and tenant consent policy.
+   - A standalone CalDAV account, such as Radicale. **Recommended.** No
+     third-party review is involved. Add an IMAP account separately only
+     if mail is also needed.
+   - A generic JMAP account on a server with calendar support, such as
+     Stalwart. **Recommended.** No third-party review is involved.
+   - A Fastmail account, added through Chithi's dedicated Fastmail type
+     with a Fastmail API token.
+   - A Microsoft 365 account (OAuth), if the tenant permits or an
+     administrator approves Chithi's delegated permissions.
+   - A Gmail account, if Google permits the OAuth consent flow. Gmail
+     mail additionally requires an app password; Calendar uses OAuth.
 3. A development machine with these tools installed:
    - Rust stable toolchain (via [rustup](https://rustup.rs/)).
-   - Node.js v20 or newer.
-   - pnpm v10 or newer.
+   - Node.js 20.19.x, or 22.12 or newer.
+   - pnpm v10 (the repository pins the exact version).
    - Git.
    - Platform-specific system packages listed in the
      [project README](https://github.com/SUNET/chithi#system-dependencies)
      (GTK + WebKit on Linux, Xcode CLT on macOS, MSVC build tools on
      Windows).
-   - Chithi is still under development and Zoom-integration is one of
-     the features we want before entering public beta where we provide
-     prebuilt artifacts to end users.
+   - No prebuilt package is required; this plan runs Chithi from source.
 
 Estimated time to complete the full test plan from a fresh checkout:
 **15–25 minutes**, most of which is the first `cargo` build.
@@ -98,27 +91,25 @@ several minutes; subsequent runs are fast.
 **Expected result:** the Chithi desktop window opens and shows the
 account-setup screen.
 
-## Step 2 — Add a mail and calendar account
+## Step 2 — Add a calendar account
 
-From the account-setup screen, choose the account type the reviewer
-prefers. The IMAP / CalDAV and JMAP options are the most reliable
-because they don't depend on third-party OAuth verification:
+On first launch, choose **Skip and add an account later**, then open
+**Settings** and choose **+ Add Account**. Pick one of these cards:
 
-- **Generic IMAP / CalDAV (recommended):** click "Add IMAP account",
-  enter server, port, username, password.
-- **Generic JMAP (recommended):** click "Add JMAP account", enter the
-  JMAP session URL and credentials.
-- **Microsoft 365:** click "Add Microsoft account", complete the
-  Microsoft OAuth flow. Microsoft still shows an unverified-publisher
-  warning for Chithi at the consent screen; click through to proceed.
-- **Gmail (likely to fail):** Chithi's Google OAuth verification is
-  pending review, so Google currently blocks sign-in with an
-  `access_denied` / unverified-app error. Skip this unless the reviewer
-  specifically wants to confirm the failure mode.
+- **CalDAV (recommended):** enter the account name, server username,
+  password, and complete HTTPS CalDAV URL.
+- **JMAP (recommended):** enter the email address, JMAP URL, and password
+  or complete OIDC sign-in. The server must advertise calendar support.
+- **Fastmail:** enter the email address and a bearer API token generated
+  under Fastmail's **Privacy & Security → Manage API tokens** settings.
+- **Microsoft 365:** complete the Microsoft browser OAuth flow. Tenant
+  policy can require administrator approval.
+- **Gmail:** enter a Gmail app password for mail and complete Google
+  browser OAuth for Calendar and Contacts. Google publisher-verification
+  state can affect whether sign-in is permitted.
 
-**Expected result:** Chithi's three-pane mail view loads with the
-reviewer's inbox, and the calendar view (left sidebar → Calendar) shows
-their existing events.
+**Expected result:** the calendar view in the sidebar shows the
+reviewer's calendars and existing events.
 
 This step is required because the Zoom integration is exercised from
 _inside_ a calendar event editor — there is no standalone "create
@@ -131,10 +122,9 @@ Zoom is exposed as one of Chithi's _account types_, alongside the mail
 and calendar account types.
 
 1. In Settings, click **+ Add Account**.
-2. From the account-type chips at the top of the form (Gmail / Microsoft
-   365 / IMAP / JMAP / CalDAV / CardDAV / Nextcloud Talk / Matrix /
-   **Zoom**), select **Zoom**. The form collapses to a single button
-   because Zoom is hosted and needs no per-user server URL.
+2. In the account-type picker, select the **Zoom** card. The form contains
+   only a sign-in button because Zoom is hosted and needs no per-user
+   server URL.
 3. Click **Sign in with Zoom**.
 
 Chithi opens the reviewer's default system browser at Zoom's OAuth
@@ -143,7 +133,8 @@ authorize URL. The request is:
 - `response_type=code`
 - `client_id=<Chithi's public client id>`
 - `redirect_uri=https://chithi.org/oauth/zoom`
-- `scope=meeting:write:meeting meeting:update:meeting meeting:delete:meeting`
+- `scope=meeting:write:meeting meeting:update:meeting`
+  `meeting:delete:meeting user:read:user`
 - `code_challenge=<PKCE S256>`
 - `state=<random>`
 
@@ -158,9 +149,10 @@ registered redirect has to be an HTTPS URL. The page at
 rewrites its own URL to `http://127.0.0.1:47832/?code=…&state=…` and
 calls `window.location.replace(...)`. Chithi has already bound a TCP
 listener on `127.0.0.1:47832` just before opening the browser, and that
-listener receives the redirect. The bounce page is purely client-side —
-nothing on `chithi.org` reads, logs, or stores the OAuth code. The page
-source is visible at
+listener receives the redirect. The forwarding logic is client-side and
+no Chithi-operated application server processes the code. GitHub Pages
+serves the request and therefore receives its URL. The page source is
+visible at
 [github.com/SUNET/chithi/tree/main/web/oauth/zoom](https://github.com/SUNET/chithi/tree/main/web/oauth/zoom).
 
 Chithi exchanges the code for tokens directly with Zoom
@@ -179,7 +171,8 @@ This step exercises `meeting:write:meeting` /
 1. Switch to the calendar view.
 2. Click any time slot to open the new-event editor.
 3. Fill in a title, e.g. "Zoom marketplace review meeting".
-4. Click **Add video conference** and choose **Zoom**.
+4. Click **Add _account name_ (Zoom)**. Chithi shows one direct button
+   for each configured meeting account.
 
 Chithi calls `POST https://api.zoom.us/v2/users/me/meetings` with the
 reviewer's access token. The request body contains a topic (the event
@@ -206,8 +199,9 @@ steps below can act on it.
 
 This step exercises `meeting:update:meeting` /
 `PATCH /v2/meetings/{id}`. It is also the path that fixes the common
-case where the reviewer clicks **Add Zoom** _before_ typing the event
-title; without it, the Zoom meeting would stay named "Meeting" forever.
+case where the reviewer clicks **Add _account name_ (Zoom)** before
+typing the event title; without it, the Zoom meeting would stay named
+"Meeting" forever.
 
 1. Open the event created in Step 4.
 2. Edit the title, e.g. to "Renamed marketplace review meeting".
@@ -263,25 +257,29 @@ the local cleanup is idempotent.
 - The event disappears from Chithi's calendar.
 - The meeting disappears from **Meetings → Upcoming** on web.zoom.us.
 
-## Step 8 — Verify that no other endpoints are exercised
+## Step 8 — Verify the endpoints exercised
 
-The three REST endpoints listed in the table at the top of this page
-(plus `zoom.us/oauth/token` for token exchange and refresh) are the only
-Zoom REST calls Chithi ever makes. To confirm, the reviewer can:
+The four REST endpoints listed in the table at the top of this page
+(plus `zoom.us/oauth/token` for token exchange and refresh) are the Zoom
+REST calls Chithi makes. To confirm, the reviewer can:
 
 - Inspect network traffic from the Chithi process (e.g. `mitmproxy`
   configured as the system HTTPS proxy with Chithi's CA store trusting
-  the mitmproxy cert). Only the three `api.zoom.us/v2/...` paths above
+  the mitmproxy cert). Only the four `api.zoom.us/v2/...` paths above
   and `zoom.us/oauth/token` will appear.
-- Read the Zoom-touching source. All Zoom-specific code lives in a
-  single file,
+- Read the Zoom-touching source. API request and response handling lives
+  in
   [`src-tauri/src/meet/zoom.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/meet/zoom.rs),
-  containing `create_meeting` (`POST /v2/users/me/meetings`),
+  containing the identity check (`GET /v2/users/me`), `create_meeting`
+  (`POST /v2/users/me/meetings`),
   `api_update_meeting_topic` and `api_update_meeting_schedule` (both
   `PATCH /v2/meetings/{id}`), `api_delete_meeting`
   (`DELETE /v2/meetings/{id}`), and the `get_access_token` helper that
-  drives the OAuth refresh. The generic PKCE / code-exchange / keychain
-  plumbing it sits on top of lives in
+  drives the OAuth refresh. Sign-in orchestration, identity binding, and
+  account persistence live in
+  [`src-tauri/src/commands/meet.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/commands/meet.rs).
+  The provider scopes and generic PKCE / code-exchange / keychain
+  plumbing live in
   [`src-tauri/src/oauth.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/oauth.rs)
   and is shared with the Gmail and Microsoft 365 integrations.
 
@@ -300,20 +298,23 @@ removing the Zoom account from the Settings accounts list.
 - The Zoom account disappears from the accounts list.
 - Chithi removes the OAuth access and refresh tokens for that account
   from the OS keychain.
-- The **Add video conference → Zoom** option no longer appears in the
+- The **Add _account name_ (Zoom)** button no longer appears in the
   calendar event editor (until a Zoom account is added again).
 
 Note: removing the account in Chithi clears the _local_ credentials only
 — it does not call Zoom's token revocation endpoint, because Chithi only
-ever talks to `api.zoom.us/v2/users/me/meetings`,
+ever talks to `api.zoom.us/v2/users/me`,
+`api.zoom.us/v2/users/me/meetings`,
 `api.zoom.us/v2/meetings/{id}` (for PATCH and DELETE), and
 `zoom.us/oauth/token`. A reviewer who wants Zoom-side revocation as well
 should additionally uninstall Chithi from
 [Zoom's installed-apps page](https://marketplace.zoom.us/user/installed).
 
-A reviewer who cloned Chithi solely to run this test plan can uninstall
-it after this step by deleting the cloned repository; no system files
-outside the (now-deleted) keychain entry need to be cleaned up.
+A reviewer who cloned Chithi solely to run this test plan can remove the
+build by deleting the cloned repository. Chithi's database, log, and
+preferences are stored separately under the user's local application-data
+directory. See [Removing Chithi data](user/data-removal.md) if those
+files should also be removed.
 
 ## Deauthorization
 
