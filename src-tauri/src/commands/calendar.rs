@@ -11,8 +11,8 @@ use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
 use crate::db::calendar::{Attendee, Calendar, CalendarEvent, Invite, NewCalendar};
 use crate::error::Result;
-use crate::mail::compat::BodyLocation;
 use crate::meet;
+use crate::message::BodyLocation;
 use crate::state::AppState;
 
 fn calendar_backend_ctx(state: &AppState) -> CalendarBackendCtx<'_> {

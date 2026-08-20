@@ -6,8 +6,8 @@ use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::{FilterAction, FilterRule};
-use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::message::BackendMessageRef;
 use crate::provider::{GraphTokenPurpose, ProviderServices};
 
 /// Detect Graph "item not found" errors — i.e. the local id is stale because

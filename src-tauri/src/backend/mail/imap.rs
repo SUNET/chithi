@@ -27,9 +27,7 @@ const DRAFT_FOLDERS: [&str; 3] = ["Drafts", "INBOX.Drafts", "[Gmail]/Drafts"];
 
 fn body_fetch_target(request: &BodyFetchRequest) -> Result<(&str, u32)> {
     match &request.message_ref {
-        crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } => {
-            Ok((folder_path, *uid))
-        }
+        crate::message::BackendMessageRef::Imap { folder_path, uid } => Ok((folder_path, *uid)),
         _ => Err(Error::Other(
             "IMAP body fetch received a non-IMAP message reference".into(),
         )),
@@ -774,7 +772,7 @@ fn execute_imap_op(
         } => {
             let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
             for message_ref in message_refs {
-                let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref
+                let crate::message::BackendMessageRef::Imap { folder_path, uid } = message_ref
                 else {
                     return Err(Error::Other(
                         "IMAP executor received a non-IMAP message reference".into(),
@@ -790,7 +788,7 @@ fn execute_imap_op(
         MailOp::DeleteMessages { message_refs } => {
             let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
             for message_ref in message_refs {
-                let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref
+                let crate::message::BackendMessageRef::Imap { folder_path, uid } = message_ref
                 else {
                     return Err(Error::Other(
                         "IMAP executor received a non-IMAP message reference".into(),
@@ -809,7 +807,7 @@ fn execute_imap_op(
                     FlagTarget::Messages(message_refs) => {
                         let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
                         for message_ref in message_refs {
-                            let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                            let crate::message::BackendMessageRef::Imap { folder_path, uid } =
                                 message_ref
                             else {
                                 return Err(Error::Other(
@@ -840,7 +838,7 @@ fn execute_imap_op(
                         let mut excluded_by_folder =
                             std::collections::HashMap::<String, Vec<u32>>::new();
                         for message_ref in excluded_refs {
-                            let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
+                            let crate::message::BackendMessageRef::Imap { folder_path, uid } =
                                 message_ref
                             else {
                                 return Err(Error::Other(
@@ -889,11 +887,11 @@ fn execute_imap_op(
 }
 
 fn group_imap_message_refs(
-    message_refs: Vec<crate::mail::compat::BackendMessageRef>,
+    message_refs: Vec<crate::message::BackendMessageRef>,
 ) -> Result<std::collections::HashMap<String, Vec<u32>>> {
     let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
     for message_ref in message_refs {
-        let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } = message_ref else {
+        let crate::message::BackendMessageRef::Imap { folder_path, uid } = message_ref else {
             return Err(Error::Other(
                 "IMAP executor received a non-IMAP message reference".into(),
             ));
@@ -923,8 +921,8 @@ mod tests {
         validate_search_query,
     };
     use crate::backend::mail::BodyFetchRequest;
-    use crate::mail::compat::{BackendMessageRef, BodyLocation};
     use crate::mail::search::{SearchFields, SearchQuery};
+    use crate::message::{BackendMessageRef, BodyLocation};
 
     #[test]
     fn copy_references_are_grouped_by_source_folder() {

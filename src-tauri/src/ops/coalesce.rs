@@ -131,8 +131,8 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
 }
 
 fn push_unique_ref(
-    message_refs: &mut Vec<crate::mail::compat::BackendMessageRef>,
-    candidate: crate::mail::compat::BackendMessageRef,
+    message_refs: &mut Vec<crate::message::BackendMessageRef>,
+    candidate: crate::message::BackendMessageRef,
 ) {
     if !message_refs
         .iter()
@@ -145,7 +145,7 @@ fn push_unique_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::compat::BackendMessageRef;
+    use crate::message::BackendMessageRef;
     use crate::ops::flags::FlagMutation;
     use crate::ops::queue::OpPriority;
 

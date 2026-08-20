@@ -8,8 +8,8 @@ use crate::event::{
     ApplicationEvent, EventSink, SharedEventSink, SyncComplete, SyncError, SyncProgress,
     SyncStarted,
 };
-use crate::mail::compat::BackendMessageRef;
 use crate::mail::jmap::{JmapConfig, JmapConnection};
+use crate::message::BackendMessageRef;
 use crate::provider::ProviderServices;
 
 /// Sync all folders for a JMAP account. This is the JMAP equivalent of
