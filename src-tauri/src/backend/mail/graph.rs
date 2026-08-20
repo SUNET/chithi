@@ -6,8 +6,8 @@ use crate::account::MailAccountConfig;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::event::{ApplicationEvent, SyncComplete, SyncStarted};
-use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
+use crate::message::{BackendMessageRef, BodyLocation};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
@@ -873,8 +873,8 @@ impl MailOpExecutor for GraphOpExecutor {
 mod tests {
     use super::{body_fetch_item_id, validate_search_query};
     use crate::backend::mail::BodyFetchRequest;
-    use crate::mail::compat::{BackendMessageRef, BodyLocation};
     use crate::mail::search::{SearchFields, SearchQuery};
+    use crate::message::{BackendMessageRef, BodyLocation};
 
     #[test]
     fn age_filtering_is_explicitly_unsupported() {

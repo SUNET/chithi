@@ -1,8 +1,7 @@
 use mail_parser::{Address as MailAddress, HeaderValue, MessageParser, MimeHeaders};
 
 use crate::db::messages::NewMessage;
-use crate::mail::compat::BackendMessageRef;
-use crate::message::{Address, Attachment, MessageBody};
+use crate::message::{Address, Attachment, BackendMessageRef, MessageBody};
 
 fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
     match addr {

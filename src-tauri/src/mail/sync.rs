@@ -10,8 +10,8 @@ use crate::event::{
 };
 use crate::filters::engine::{self, AddressEntry, MessageData};
 use crate::filters::rules::FilterAction;
-use crate::mail::compat::BackendMessageRef;
 use crate::mail::imap::{ImapConfig, ImapConnection};
+use crate::message::BackendMessageRef;
 
 /// Sync all folders for an account. If `current_folder` is set, sync it first.
 pub async fn sync_account(

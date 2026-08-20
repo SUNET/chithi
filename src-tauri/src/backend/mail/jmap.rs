@@ -37,7 +37,7 @@ async fn connect(
 
 fn body_fetch_email_id(request: &BodyFetchRequest) -> Result<&str> {
     match &request.message_ref {
-        crate::mail::compat::BackendMessageRef::Jmap { email_id, .. } => Ok(email_id),
+        crate::message::BackendMessageRef::Jmap { email_id, .. } => Ok(email_id),
         _ => Err(Error::Other(
             "JMAP body fetch received a non-JMAP message reference".into(),
         )),
@@ -183,7 +183,7 @@ impl MailOpExecutor for JmapOpExecutor {
             } => {
                 let mut by_mailbox = std::collections::HashMap::<String, Vec<String>>::new();
                 for message_ref in message_refs {
-                    let crate::mail::compat::BackendMessageRef::Jmap {
+                    let crate::message::BackendMessageRef::Jmap {
                         mailbox_id,
                         email_id,
                     } = message_ref
@@ -289,7 +289,7 @@ impl MailOpExecutor for JmapOpExecutor {
 mod tests {
     use super::body_fetch_email_id;
     use crate::backend::mail::BodyFetchRequest;
-    use crate::mail::compat::{BackendMessageRef, BodyLocation};
+    use crate::message::{BackendMessageRef, BodyLocation};
 
     #[test]
     fn body_fetch_accepts_opaque_email_id_with_underscores() {

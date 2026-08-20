@@ -1,4 +1,4 @@
-use crate::mail::compat::BackendMessageRef;
+use crate::message::BackendMessageRef;
 
 /// The provider objects affected by one ordered flag mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]

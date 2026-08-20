@@ -18,7 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::mail::compat::BodyLocation;
+use crate::message::BodyLocation;
 use crate::state::{AppState, PendingSecret};
 
 /// Tauri event emitted when the backend needs a passphrase or PIN.

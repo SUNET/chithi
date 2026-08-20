@@ -14,8 +14,8 @@ use crate::account::MailAccountConfig;
 use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::event::SharedEventSink;
-use crate::mail::compat::{BackendMessageRef, BodyLocation};
 use crate::mail::search::{SearchHit, SearchQuery};
+use crate::message::{BackendMessageRef, BodyLocation};
 use crate::ops::queue::MailOp;
 use crate::provider::ProviderServices;
 
@@ -228,7 +228,7 @@ mod registry_tests {
     use super::*;
     use crate::db::accounts::AccountFull;
     use crate::db::service_bindings::ServiceBinding;
-    use crate::mail::compat::BodyLocation;
+    use crate::message::BodyLocation;
 
     fn account(mail_protocol: &str, auth_method: &str) -> AccountFull {
         let bindings = if mail_protocol.is_empty() {

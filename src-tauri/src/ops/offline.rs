@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::mail::compat::BackendMessageRef;
+use crate::message::BackendMessageRef;
 use crate::ops::flags::{remove_deleted_refs, subtract_flag_mutation, FlagMutation, FlagTarget};
 use crate::ops::queue::MailOp;
 
@@ -514,17 +514,12 @@ fn flag_mutation_to_json(mutation: &FlagMutation) -> serde_json::Value {
     match &mutation.target {
         FlagTarget::Messages(message_refs)
             if message_refs.iter().all(|message_ref| {
-                matches!(
-                    message_ref,
-                    crate::mail::compat::BackendMessageRef::Imap { .. }
-                )
+                matches!(message_ref, crate::message::BackendMessageRef::Imap { .. })
             }) =>
         {
             let mut by_folder = std::collections::HashMap::<String, Vec<u32>>::new();
             for message_ref in message_refs {
-                if let crate::mail::compat::BackendMessageRef::Imap { folder_path, uid } =
-                    message_ref
-                {
+                if let crate::message::BackendMessageRef::Imap { folder_path, uid } = message_ref {
                     by_folder.entry(folder_path.clone()).or_default().push(*uid);
                 }
             }
@@ -587,7 +582,7 @@ fn flag_mutation_from_json(value: &serde_json::Value) -> Option<FlagMutation> {
         if !excluded_refs.iter().all(|message_ref| {
             matches!(
                 message_ref,
-                crate::mail::compat::BackendMessageRef::Imap { folder_path, .. }
+                crate::message::BackendMessageRef::Imap { folder_path, .. }
                     if folder_paths.contains(folder_path)
             )
         }) {
@@ -610,7 +605,7 @@ fn flag_mutation_from_json(value: &serde_json::Value) -> Option<FlagMutation> {
                 .into_iter()
                 .flat_map(|(folder_path, uids)| {
                     uids.into_iter().map(move |uid| {
-                        crate::mail::compat::BackendMessageRef::imap(folder_path.clone(), uid)
+                        crate::message::BackendMessageRef::imap(folder_path.clone(), uid)
                     })
                 })
                 .collect(),
@@ -632,8 +627,8 @@ fn valid_folder_path(path: &str) -> bool {
     !path.contains('\0') && !path.contains('\n') && !path.contains('\r')
 }
 
-fn message_ref_to_json(message_ref: &crate::mail::compat::BackendMessageRef) -> serde_json::Value {
-    use crate::mail::compat::BackendMessageRef;
+fn message_ref_to_json(message_ref: &crate::message::BackendMessageRef) -> serde_json::Value {
+    use crate::message::BackendMessageRef;
 
     match message_ref {
         BackendMessageRef::Imap { folder_path, uid } => serde_json::json!({
@@ -656,10 +651,8 @@ fn message_ref_to_json(message_ref: &crate::mail::compat::BackendMessageRef) -> 
     }
 }
 
-fn message_ref_from_json(
-    value: &serde_json::Value,
-) -> Option<crate::mail::compat::BackendMessageRef> {
-    use crate::mail::compat::BackendMessageRef;
+fn message_ref_from_json(value: &serde_json::Value) -> Option<crate::message::BackendMessageRef> {
+    use crate::message::BackendMessageRef;
 
     match value.get("kind")?.as_str()? {
         "imap" => Some(BackendMessageRef::imap(
@@ -911,7 +904,7 @@ pub fn is_dead(entry: &OutboxEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::compat::BackendMessageRef;
+    use crate::message::BackendMessageRef;
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -928,6 +921,40 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn provider_message_reference_json_is_stable() {
+        let cases = [
+            (
+                BackendMessageRef::imap("INBOX", 7),
+                serde_json::json!({
+                    "kind": "imap",
+                    "folder_path": "INBOX",
+                    "uid": 7,
+                }),
+            ),
+            (
+                BackendMessageRef::jmap("mailbox", "email"),
+                serde_json::json!({
+                    "kind": "jmap",
+                    "mailbox_id": "mailbox",
+                    "email_id": "email",
+                }),
+            ),
+            (
+                BackendMessageRef::graph("item"),
+                serde_json::json!({
+                    "kind": "graph",
+                    "item_id": "item",
+                }),
+            ),
+        ];
+
+        for (message_ref, expected) in cases {
+            assert_eq!(message_ref_to_json(&message_ref), expected);
+            assert_eq!(message_ref_from_json(&expected), Some(message_ref));
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::flags::FlagMutation;
-use crate::mail::compat::BackendMessageRef;
+use crate::message::BackendMessageRef;
 
 /// A single mail operation to be processed by the per-account worker.
 #[derive(Debug, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub struct OpEntry {
 #[cfg(test)]
 mod tests {
     use super::MailOp;
-    use crate::mail::compat::BackendMessageRef;
+    use crate::message::BackendMessageRef;
 
     #[test]
     fn only_jmap_copy_is_safe_to_retry_after_execution_failure() {
