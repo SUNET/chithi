@@ -42,7 +42,11 @@ const emit = defineEmits<{ signIn: []; reauth: [] }>();
       </svg>
       {{ inProgress ? "Waiting for browser..." : (provider === 'google' ? "Sign in with Google" : "Sign in with Microsoft") }}
     </button>
-    <span v-if="provider === 'google'" class="field-hint">Sign in to sync Google Calendar and Contacts. IMAP/SMTP uses app password above.</span>
+    <span
+      v-if="provider === 'google'"
+      class="field-hint"
+      data-testid="google-oauth-hint"
+    >Sign in to sync Google Calendar and Contacts. On Google's consent screen, select all requested permissions. IMAP/SMTP uses the app password above.</span>
     <span v-else class="field-hint">Sign in to access mail, calendar, and contacts via Microsoft Graph API.</span>
   </div>
 </template>
