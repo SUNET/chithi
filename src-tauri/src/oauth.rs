@@ -359,10 +359,55 @@ pub struct CallbackResult {
     pub state: Option<String>,
 }
 
+enum CallbackPage {
+    Success,
+    AccessDenied,
+    Failure,
+}
+
+fn write_callback_page(stream: &mut impl Write, page: CallbackPage) {
+    let (status, title, message) = match page {
+        CallbackPage::Success => (
+            "200 OK",
+            "Authorization successful!",
+            "You can close this window and return to Chithi.",
+        ),
+        CallbackPage::AccessDenied => (
+            "400 Bad Request",
+            "Authorization not completed",
+            "Access was not granted. Return to Chithi and try again.",
+        ),
+        CallbackPage::Failure => (
+            "400 Bad Request",
+            "Authorization failed",
+            "The provider did not complete authorization. Return to Chithi and try again.",
+        ),
+    };
+    let body = format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title></head>\
+         <body><main><h2>{title}</h2><p>{message}</p></main></body></html>"
+    );
+    let response = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Security-Policy: default-src 'none'\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len(),
+    );
+    // The browser may already have closed the tab. Callback processing must
+    // not fail merely because the informational response cannot be written.
+    stream.write_all(response.as_bytes()).ok();
+}
+
 /// Listen on the given listener for the OAuth2 redirect callback.
 /// Times out after 5 minutes to prevent indefinite resource holding.
-/// Returns the authorization code and state parameter.
-pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
+/// Validates the state parameter before reporting browser success and returns
+/// the authorization code plus the validated state.
+pub fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<CallbackResult> {
     use std::time::{Duration, Instant};
 
     let timeout = Duration::from_secs(300);
@@ -427,23 +472,7 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
         })
         .unwrap_or_default();
 
-    let code = query_params.get("code").cloned().ok_or_else(|| {
-        let error = query_params
-            .get("error")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        Error::Other(format!("OAuth2 authorization failed: {}", error))
-    })?;
-
     let state = query_params.get("state").cloned();
-
-    // Send a success response to the browser
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
-        <html><body style='font-family:sans-serif;text-align:center;padding:60px'>\
-        <h2>Authorization successful!</h2>\
-        <p>You can close this window and return to Chithi.</p>\
-        </body></html>";
-    stream.write_all(response.as_bytes()).ok();
 
     // Don't log the authorization `code` or `state` — both are secrets.
     log::info!(
@@ -454,6 +483,48 @@ pub fn wait_for_callback(listener: TcpListener) -> Result<CallbackResult> {
             .filter(|k| k.as_str() != "code" && k.as_str() != "state")
             .collect::<Vec<_>>(),
     );
+
+    match state.as_deref() {
+        Some(returned_state) if returned_state == expected_state => {}
+        Some(_) => {
+            write_callback_page(&mut stream, CallbackPage::Failure);
+            return Err(Error::OAuthStateMismatch);
+        }
+        None => {
+            write_callback_page(&mut stream, CallbackPage::Failure);
+            return Err(Error::OAuthStateMissing);
+        }
+    }
+
+    if let Some(error) = query_params.get("error").map(String::as_str) {
+        let access_denied = error == "access_denied";
+        write_callback_page(
+            &mut stream,
+            if access_denied {
+                CallbackPage::AccessDenied
+            } else {
+                CallbackPage::Failure
+            },
+        );
+        let message = if access_denied {
+            "OAuth2 authorization was denied or cancelled"
+        } else {
+            "OAuth2 authorization failed"
+        };
+        return Err(Error::Other(message.into()));
+    }
+
+    let code = match query_params.get("code").filter(|code| !code.is_empty()) {
+        Some(code) => code.clone(),
+        None => {
+            write_callback_page(&mut stream, CallbackPage::Failure);
+            return Err(Error::Other(
+                "OAuth2 callback did not contain an authorization code".into(),
+            ));
+        }
+    };
+
+    write_callback_page(&mut stream, CallbackPage::Success);
     Ok(CallbackResult { code, state })
 }
 
@@ -1610,6 +1681,128 @@ mod tests {
             }
         });
         (format!("http://{address}/token"), handle)
+    }
+
+    fn callback_request(target: &str, expected_state: &str) -> (Result<CallbackResult>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_state = expected_state.to_string();
+        let callback = std::thread::spawn(move || wait_for_callback(listener, &expected_state));
+
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        (callback.join().unwrap(), response)
+    }
+
+    fn assert_callback_response(response: &str, status: &str) {
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .expect("callback response has a header terminator");
+        assert!(headers.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+        assert!(headers.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(headers.contains("Cache-Control: no-store\r\n"));
+        assert!(headers.contains("Content-Security-Policy: default-src 'none'\r\n"));
+        assert!(headers.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert!(headers.lines().any(|line| line == "Connection: close"));
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("callback response has Content-Length")
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(content_length, body.len());
+    }
+
+    #[test]
+    fn callback_success_returns_code_and_browser_page() {
+        let (result, response) =
+            callback_request("/?code=test-code&state=test-state", "test-state");
+        let callback = result.unwrap();
+
+        assert_eq!(callback.code, "test-code");
+        assert_eq!(callback.state.as_deref(), Some("test-state"));
+        assert_callback_response(&response, "200 OK");
+        assert!(response.contains("Authorization successful!"));
+        assert!(!response.contains("test-code"));
+        assert!(!response.contains("test-state"));
+    }
+
+    #[test]
+    fn callback_access_denied_returns_safe_browser_page() {
+        let (result, response) = callback_request(
+            "/?error=access_denied&error_description=provider-marker-%3Cscript%3Ebad%3C%2Fscript%3E&state=test-state",
+            "test-state",
+        );
+        let error = match result {
+            Ok(_) => panic!("access_denied must fail"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("denied or cancelled"));
+        assert_callback_response(&response, "400 Bad Request");
+        assert!(response.contains("Authorization not completed"));
+        assert!(response.contains("Access was not granted"));
+        assert!(!error.contains("provider-marker"));
+        assert!(!response.contains("provider-marker"));
+        assert!(!response.contains("<script>"));
+        assert!(!response.contains("test-state"));
+    }
+
+    #[test]
+    fn callback_without_code_returns_generic_browser_page() {
+        let (result, response) = callback_request("/?state=test-state", "test-state");
+        let error = match result {
+            Ok(_) => panic!("missing code must fail"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("did not contain an authorization code"));
+        assert_callback_response(&response, "400 Bad Request");
+        assert!(response.contains("Authorization failed"));
+        assert!(!response.contains("test-state"));
+    }
+
+    #[test]
+    fn callback_rejects_empty_code_and_unverified_state() {
+        for (target, expected_state, expected_error) in [
+            (
+                "/?code=&state=test-state",
+                "test-state",
+                "did not contain an authorization code",
+            ),
+            (
+                "/?code=test-code",
+                "test-state",
+                "missing required state parameter",
+            ),
+            (
+                "/?code=test-code&state=wrong-state",
+                "test-state",
+                "state mismatch",
+            ),
+        ] {
+            let (result, response) = callback_request(target, expected_state);
+            let error = match result {
+                Ok(_) => panic!("invalid callback must fail"),
+                Err(error) => error.to_string(),
+            };
+
+            assert!(error.contains(expected_error));
+            assert_callback_response(&response, "400 Bad Request");
+            assert!(response.contains("Authorization failed"));
+            assert!(!response.contains("test-code"));
+            assert!(!response.contains("test-state"));
+            assert!(!response.contains("wrong-state"));
+        }
     }
 
     fn provider_at(

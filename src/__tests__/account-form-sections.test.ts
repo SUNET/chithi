@@ -60,6 +60,9 @@ describe("OauthSignInSection", () => {
       props: { provider: "google", status: null, inProgress: false },
     });
     expect(wrapper.text()).toContain("Sign in with Google");
+    expect(wrapper.get('[data-testid="google-oauth-hint"]').text()).toContain(
+      "select all requested permissions",
+    );
     await wrapper.find(".btn-oauth").trigger("click");
     expect(wrapper.emitted("signIn")).toHaveLength(1);
   });
@@ -69,6 +72,8 @@ describe("OauthSignInSection", () => {
       props: { provider: "microsoft", status: "Signed in with Microsoft", inProgress: false },
     });
     expect(wrapper.find(".oauth-status").text()).toContain("Signed in with Microsoft");
+    expect(wrapper.find('[data-testid="google-oauth-hint"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("select all requested permissions");
     await wrapper.find(".btn-reauth").trigger("click");
     expect(wrapper.emitted("reauth")).toHaveLength(1);
   });

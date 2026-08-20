@@ -35,6 +35,12 @@ pub enum Error {
     #[error("Re-authentication required: {0}")]
     AuthRequired(String),
 
+    #[error("OAuth2 callback missing required state parameter")]
+    OAuthStateMissing,
+
+    #[error("OAuth2 state mismatch (possible CSRF)")]
+    OAuthStateMismatch,
+
     #[error("{protocol} does not support {capability}")]
     UnsupportedCapability {
         protocol: &'static str,

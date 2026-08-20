@@ -366,6 +366,15 @@ pub async fn meet_zoom_login_start(
     })
 }
 
+fn map_zoom_callback_error(error: Error) -> Error {
+    match error {
+        Error::OAuthStateMissing | Error::OAuthStateMismatch => {
+            Error::Other("Zoom sign-in could not be verified — please try again.".into())
+        }
+        other => other,
+    }
+}
+
 /// Wait for the Zoom OAuth callback, validate state, and exchange the code.
 /// A supplied account id replaces that account's tokens; otherwise this
 /// persists a new account row and keyring entry.
@@ -394,9 +403,13 @@ pub async fn meet_zoom_login_complete(
         ..
     } = session;
 
-    let callback = tokio::task::spawn_blocking(move || crate::oauth::wait_for_callback(listener))
-        .await
-        .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))??;
+    let callback_expected_state = expected_state.clone();
+    let callback_result = tokio::task::spawn_blocking(move || {
+        crate::oauth::wait_for_callback(listener, &callback_expected_state)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("zoom oauth join: {}", e)))?;
+    let callback = callback_result.map_err(map_zoom_callback_error)?;
 
     // Don't log raw `state` values — they're CSRF secrets.
     log::info!(
@@ -819,8 +832,8 @@ fn validate_returned_server_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_provider_for, complete_pending_discard, validate_returned_server_url,
-        validate_zoom_reauth_identity, zoom_reauth_identity,
+        cleanup_provider_for, complete_pending_discard, map_zoom_callback_error,
+        validate_returned_server_url, validate_zoom_reauth_identity, zoom_reauth_identity,
     };
     use crate::db;
     use crate::error::Error;
@@ -859,6 +872,19 @@ mod tests {
                 cfg!(debug_assertions)
             );
         }
+    }
+
+    #[test]
+    fn zoom_state_callback_errors_keep_friendly_message() {
+        let expected = "Zoom sign-in could not be verified — please try again.";
+        for error in [Error::OAuthStateMissing, Error::OAuthStateMismatch] {
+            assert_eq!(map_zoom_callback_error(error).to_string(), expected);
+        }
+
+        assert_eq!(
+            map_zoom_callback_error(Error::Other("provider denied access".into())).to_string(),
+            "provider denied access"
+        );
     }
 
     #[test]

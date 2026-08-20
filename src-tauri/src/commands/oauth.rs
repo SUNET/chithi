@@ -106,9 +106,12 @@ pub async fn oauth_complete(
     let code_verifier = session.verifier.clone();
 
     // Wait for callback in a blocking thread (TcpListener::accept blocks)
-    let result = tokio::task::spawn_blocking(move || oauth::wait_for_callback(session.listener))
-        .await
-        .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
+    let callback_expected_state = expected_state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        oauth::wait_for_callback(session.listener, &callback_expected_state)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("OAuth callback task failed: {}", e)))??;
 
     // Validate CSRF state parameter. Don't log the raw values — `state`
     // is a CSRF secret and logging it (or returning it in the error
