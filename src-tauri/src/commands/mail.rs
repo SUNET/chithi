@@ -125,8 +125,9 @@ pub async fn search_messages_server(
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
+    let mail_config = account.mail_config();
 
-    let backend = crate::backend::mail::for_account(&account).ok_or_else(|| {
+    let backend = crate::backend::mail::for_account(&mail_config).ok_or_else(|| {
         Error::Other(format!(
             "Account {} has no enabled mail service for server search",
             account_id
@@ -139,14 +140,14 @@ pub async fn search_messages_server(
         providers: state.providers.clone(),
     };
 
-    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+    let suspended_idle = if backend.suspends_idle_for_ops(&mail_config) {
         Some(suspend_imap_idle_for_operation(&app, &state, &account).await?)
     } else {
         None
     };
 
     let hits = if let Some(suspended_idle) = suspended_idle {
-        let search_account = account.clone();
+        let search_account = mail_config.clone();
         let resume_account = account.clone();
         let resume_app = app.clone();
         let task = spawn_with_imap_idle_resume(
@@ -167,7 +168,7 @@ pub async fn search_messages_server(
         task.await
             .map_err(|e| Error::Other(format!("Server search task panicked: {}", e)))??
     } else {
-        backend.search_messages(&ctx, &account, &query).await?
+        backend.search_messages(&ctx, &mail_config, &query).await?
     };
 
     log::info!("Server search returned {} hits", hits.len());
@@ -285,17 +286,18 @@ async fn ensure_message_body_on_disk(
         let (fp, u) = db::messages::get_folder_and_uid(&conn, message_id)?;
         (account, fp, u)
     };
+    let mail_config = account.mail_config();
 
     let flags = serde_json::from_str(flags_json).unwrap_or_default();
     let request = crate::backend::mail::BodyFetchRequest::from_db_row(
-        &account,
+        &mail_config,
         message_id,
         &folder_path,
         uid,
         flags,
         body_location,
     )?;
-    let backend = crate::backend::mail::for_account(&account).ok_or_else(|| {
+    let backend = crate::backend::mail::for_account(&mail_config).ok_or_else(|| {
         Error::Other(format!(
             "Account {} has no enabled mail service for body fetch",
             account_id
@@ -308,14 +310,14 @@ async fn ensure_message_body_on_disk(
         providers: state.providers.clone(),
     };
 
-    let suspended_idle = if backend.suspends_idle_for_ops(&account) {
+    let suspended_idle = if backend.suspends_idle_for_ops(&mail_config) {
         Some(suspend_imap_idle_for_operation(app, state, &account).await?)
     } else {
         None
     };
 
     if let Some(suspended_idle) = suspended_idle {
-        let fetch_account = account.clone();
+        let fetch_account = mail_config.clone();
         let resume_account = account;
         let resume_app = app.clone();
         let task = spawn_with_imap_idle_resume(
@@ -336,14 +338,14 @@ async fn ensure_message_body_on_disk(
         task.await
             .map_err(|e| Error::Other(format!("Body fetch owner task panicked: {}", e)))?
     } else {
-        fetch_body_and_record_path(backend, ctx, account, request).await
+        fetch_body_and_record_path(backend, ctx, mail_config, request).await
     }
 }
 
 async fn fetch_body_and_record_path(
     backend: &'static dyn crate::backend::mail::MailBackend,
     ctx: crate::backend::mail::MailSyncCtx,
-    account: db::accounts::AccountFull,
+    account: crate::account::MailAccountConfig,
     request: crate::backend::mail::BodyFetchRequest,
 ) -> Result<String> {
     log::info!(

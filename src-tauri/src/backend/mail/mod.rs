@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 
-use crate::db::accounts::AccountFull;
+use crate::account::MailAccountConfig;
 use crate::db::pool::DbPool;
 use crate::error::Result;
 use crate::event::SharedEventSink;
@@ -68,14 +68,14 @@ pub struct DraftSaveRequest {
 
 impl BodyFetchRequest {
     pub fn from_db_row(
-        account: &AccountFull,
+        account: &MailAccountConfig,
         message_id: &str,
         folder_path: &str,
         uid: u32,
         flags: Vec<String>,
         body_location: BodyLocation,
     ) -> Result<Self> {
-        let protocol = account.mail_protocol_str();
+        let protocol = account.protocol.as_str();
         let message_ref =
             BackendMessageRef::from_db_row(protocol, &account.id, message_id, folder_path, uid)
                 .or_else(|| {
@@ -110,7 +110,7 @@ pub trait MailBackend: Send + Sync {
     /// IDLE must be suspended around any other server operation. The
     /// command owns the suspend/resume because it owns the idle-handle
     /// state.
-    fn suspends_idle_for_ops(&self, _account: &AccountFull) -> bool {
+    fn suspends_idle_for_ops(&self, _account: &MailAccountConfig) -> bool {
         false
     }
 
@@ -120,7 +120,7 @@ pub trait MailBackend: Send + Sync {
     async fn sync_account(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         current_folder: Option<String>,
     ) -> Result<()>;
 
@@ -132,13 +132,17 @@ pub trait MailBackend: Send + Sync {
     async fn sync_folder(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         folder_path: &str,
     ) -> Result<u32>;
 
     /// Prefetch message bodies into the Maildir. Default no-op for
     /// providers that fetch bodies on demand (JMAP) or during sync.
-    async fn prefetch_bodies(&self, _ctx: &MailSyncCtx, _account: &AccountFull) -> Result<u32> {
+    async fn prefetch_bodies(
+        &self,
+        _ctx: &MailSyncCtx,
+        _account: &MailAccountConfig,
+    ) -> Result<u32> {
         Ok(0)
     }
 
@@ -147,7 +151,7 @@ pub trait MailBackend: Send + Sync {
     async fn fetch_body_to_disk(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &BodyFetchRequest,
     ) -> Result<String>;
 
@@ -155,7 +159,7 @@ pub trait MailBackend: Send + Sync {
     async fn search_messages(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>>;
 
@@ -166,7 +170,7 @@ pub trait MailBackend: Send + Sync {
     async fn save_draft(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &DraftSaveRequest,
     ) -> Result<()>;
 
@@ -205,8 +209,8 @@ pub fn registry() -> &'static [&'static dyn MailBackend] {
 /// pre-trait dispatch chains all ended in an IMAP else-branch, and
 /// pre-binding accounts rely on it. Empty (no enabled mail binding)
 /// returns `None`; callers skip those accounts.
-pub fn for_account(account: &AccountFull) -> Option<&'static dyn MailBackend> {
-    let proto = account.mail_protocol_str();
+pub fn for_account(account: &MailAccountConfig) -> Option<&'static dyn MailBackend> {
+    let proto = account.protocol.as_str();
     if proto.is_empty() {
         return None;
     }
@@ -222,6 +226,7 @@ pub fn for_account(account: &AccountFull) -> Option<&'static dyn MailBackend> {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+    use crate::db::accounts::AccountFull;
     use crate::db::service_bindings::ServiceBinding;
     use crate::mail::compat::BodyLocation;
 
@@ -279,7 +284,8 @@ mod registry_tests {
     #[test]
     fn protocols_resolve_to_matching_backends() {
         for proto in ["imap", "jmap", "graph"] {
-            let b = for_account(&account(proto, "password")).expect(proto);
+            let config = account(proto, "password").mail_config();
+            let b = for_account(&config).expect(proto);
             assert_eq!(b.protocol(), proto);
         }
     }
@@ -293,20 +299,52 @@ mod registry_tests {
         ];
 
         for (protocol, expected) in cases {
-            let backend = for_account(&account(protocol, "password")).unwrap();
+            let config = account(protocol, "password").mail_config();
+            let backend = for_account(&config).unwrap();
             assert_eq!(backend.draft_storage_format(), expected);
         }
     }
 
     #[test]
     fn unknown_protocol_falls_back_to_imap() {
-        let b = for_account(&account("pop3", "password")).unwrap();
+        let config = account("pop3", "password").mail_config();
+        let b = for_account(&config).unwrap();
         assert_eq!(b.protocol(), "imap");
     }
 
     #[test]
     fn empty_protocol_is_none() {
-        assert!(for_account(&account("", "password")).is_none());
+        assert!(for_account(&account("", "password").mail_config()).is_none());
+    }
+
+    #[test]
+    fn focused_config_uses_enabled_binding_and_mail_fields() {
+        let mut account = account("imap", "oauth-microsoft");
+        account.imap_host = "imap.example.com".into();
+        account.imap_port = 993;
+        account.smtp_host = "smtp.example.com".into();
+        account.smtp_port = 587;
+        account.password = "keyring-secret".into();
+
+        let config = account.mail_config();
+
+        assert_eq!(config.protocol, "imap");
+        assert_eq!(config.id, "acc1");
+        assert_eq!(config.imap_host, "imap.example.com");
+        assert_eq!(config.smtp_host, "smtp.example.com");
+        assert_eq!(config.password, "keyring-secret");
+        assert_eq!(config.auth_method, "oauth-microsoft");
+    }
+
+    #[test]
+    fn focused_config_does_not_route_disabled_legacy_mail_protocol() {
+        let mut account = account("imap", "password");
+        account.bindings[0].enabled = false;
+
+        let config = account.mail_config();
+
+        assert!(config.protocol.is_empty());
+        assert!(for_account(&config).is_none());
     }
 
     #[test]
@@ -314,6 +352,9 @@ mod registry_tests {
         let imap_o365 = account("imap", "oauth-microsoft");
         let imap_plain = account("imap", "password");
         let graph = account("graph", "oauth-microsoft");
+        let imap_o365 = imap_o365.mail_config();
+        let imap_plain = imap_plain.mail_config();
+        let graph = graph.mail_config();
         assert!(for_account(&imap_o365)
             .unwrap()
             .suspends_idle_for_ops(&imap_o365));
@@ -332,7 +373,7 @@ mod registry_tests {
         ];
 
         for (protocol, message_id, folder, uid) in cases {
-            let account = account(protocol, "password");
+            let account = account(protocol, "password").mail_config();
             let request = BodyFetchRequest::from_db_row(
                 &account,
                 message_id,
@@ -348,7 +389,7 @@ mod registry_tests {
 
     #[test]
     fn body_fetch_request_preserves_legacy_jmap_raw_id_fallback() {
-        let account = account("jmap", "password");
+        let account = account("jmap", "password").mail_config();
         let request = BodyFetchRequest::from_db_row(
             &account,
             "raw_email_id",

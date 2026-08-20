@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
+use crate::account::MailAccountConfig;
 use crate::db;
-use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::event::{ApplicationEvent, SyncStarted};
 use crate::mail::imap::{ImapConfig, ImapConnection};
@@ -59,11 +59,11 @@ fn prefetch_connection_limit(auth_method: &str, folder_count: usize) -> usize {
 
 /// Build the connection config, refreshing the O365 IMAP-scoped token
 /// when needed.
-async fn build_imap_config(ctx: &MailSyncCtx, account: &AccountFull) -> Result<ImapConfig> {
+async fn build_imap_config(ctx: &MailSyncCtx, account: &MailAccountConfig) -> Result<ImapConfig> {
     let credentials = ctx
         .providers
         .credentials()
-        .mail_credentials(account)
+        .mail_credentials_for(account)
         .await?;
     Ok(ImapConfig {
         host: account.imap_host.clone(),
@@ -80,7 +80,10 @@ async fn build_imap_config(ctx: &MailSyncCtx, account: &AccountFull) -> Result<I
 /// SELECTs, spread over up to 3 parallel connections. Also used by
 /// the Graph backend — O365 accounts keep IMAP access and their
 /// Graph sync can leave on-demand rows behind.
-pub(super) async fn prefetch_pipeline(ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
+pub(super) async fn prefetch_pipeline(
+    ctx: &MailSyncCtx,
+    account: &MailAccountConfig,
+) -> Result<u32> {
     // Graph-protocol accounts without an IMAP binding have no host to
     // connect to. Without this guard every sync-complete kicked off a
     // doomed connect to ":993" plus keyring/token reads for credentials.
@@ -305,14 +308,14 @@ impl MailBackend for ImapMailBackend {
     /// account at a time. Identifying O365 via auth_method is more
     /// accurate than the legacy `provider` string since Phase 3
     /// dropped that column.
-    fn suspends_idle_for_ops(&self, account: &AccountFull) -> bool {
+    fn suspends_idle_for_ops(&self, account: &MailAccountConfig) -> bool {
         account.auth_method == "oauth-microsoft"
     }
 
     async fn sync_account(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         current_folder: Option<String>,
     ) -> Result<()> {
         log::info!(
@@ -340,7 +343,7 @@ impl MailBackend for ImapMailBackend {
     async fn sync_folder(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         folder_path: &str,
     ) -> Result<u32> {
         // sync_folder_envelopes_public is a low-level helper and
@@ -373,14 +376,14 @@ impl MailBackend for ImapMailBackend {
         .map_err(|e| Error::Sync(format!("Folder sync panicked: {}", e)))?
     }
 
-    async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
+    async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &MailAccountConfig) -> Result<u32> {
         prefetch_pipeline(ctx, account).await
     }
 
     async fn fetch_body_to_disk(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &BodyFetchRequest,
     ) -> Result<String> {
         let (folder_path, uid) = body_fetch_target(request)?;
@@ -407,7 +410,7 @@ impl MailBackend for ImapMailBackend {
     async fn search_messages(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>> {
         validate_search_query(query)?;
@@ -429,7 +432,7 @@ impl MailBackend for ImapMailBackend {
     async fn save_draft(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &DraftSaveRequest,
     ) -> Result<()> {
         let imap_config = build_imap_config(ctx, account).await?;
@@ -474,7 +477,7 @@ impl MailBackend for ImapMailBackend {
 /// nudge.
 pub(crate) async fn sync_folder_quiet(
     ctx: &MailSyncCtx,
-    account: &AccountFull,
+    account: &MailAccountConfig,
     folder_path: &str,
 ) -> Result<()> {
     let imap_config = build_imap_config(ctx, account).await?;
@@ -565,7 +568,8 @@ impl ImapOpExecutor {
             let account = {
                 let conn = ctx.db.reader();
                 crate::db::accounts::get_account_full(&conn, account_id)?
-            };
+            }
+            .mail_config();
             let config = build_imap_config(ctx, &account).await?;
 
             let conn = tokio::task::spawn_blocking(move || ImapConnection::connect(&config))
@@ -613,7 +617,8 @@ impl ImapOpExecutor {
         let account = {
             let conn = ctx.db.reader();
             crate::db::accounts::get_account_full(&conn, account_id)?
-        };
+        }
+        .mail_config();
 
         // For O365 SMTP, refresh the OAuth token (XOAUTH2; SMTP shares
         // the IMAP scope set). For password accounts, just use the
@@ -622,7 +627,7 @@ impl ImapOpExecutor {
         let credentials = ctx
             .providers
             .credentials()
-            .mail_credentials(&account)
+            .mail_credentials_for(&account)
             .await?;
         let smtp_password = credentials.secret;
         let use_xoauth2 = credentials.use_xoauth2;

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+mod account;
 mod backend;
 mod calendar;
 mod commands;

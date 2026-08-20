@@ -270,6 +270,29 @@ pub struct AccountFull {
 }
 
 impl AccountFull {
+    /// Build the backend-only mail view from this compatibility aggregate.
+    /// Routing follows the enabled mail binding rather than the legacy mirror.
+    pub fn mail_config(&self) -> crate::account::MailAccountConfig {
+        crate::account::MailAccountConfig {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            email: self.email.clone(),
+            protocol: self.mail_protocol_str().to_string(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            auth_method: self.auth_method.clone(),
+            imap_host: self.imap_host.clone(),
+            imap_port: self.imap_port,
+            smtp_host: self.smtp_host.clone(),
+            smtp_port: self.smtp_port,
+            use_tls: self.use_tls,
+            jmap_url: self.jmap_url.clone(),
+            jmap_auth_method: self.jmap_auth_method.clone(),
+            oidc_token_endpoint: self.oidc_token_endpoint.clone(),
+            oidc_client_id: self.oidc_client_id.clone(),
+        }
+    }
+
     /// Look up the binding for a given service ("mail" | "calendar" |
     /// "contacts"). Returns `None` if the account has no binding for that
     /// service (e.g. a CalDAV-only account has no mail binding).

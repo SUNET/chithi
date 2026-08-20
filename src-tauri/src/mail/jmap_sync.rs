@@ -18,7 +18,7 @@ pub(crate) async fn sync_jmap_account(
     events: SharedEventSink,
     db: Arc<DbPool>,
     _data_dir: PathBuf,
-    account: &crate::db::accounts::AccountFull,
+    account: &crate::account::MailAccountConfig,
     providers: Arc<ProviderServices>,
     current_folder: Option<String>,
 ) -> Result<()> {
@@ -28,7 +28,7 @@ pub(crate) async fn sync_jmap_account(
     }));
 
     let result = async {
-        let (jmap_config, conn_jmap) = providers.jmap_client(account).await?;
+        let (jmap_config, conn_jmap) = providers.jmap_client_for(account).await?;
         sync_jmap_account_inner(
             events.as_ref(),
             &db,
@@ -471,7 +471,7 @@ fn count_unread(conn: &rusqlite::Connection, account_id: &str, folder_path: &str
 pub(crate) async fn sync_jmap_folder_public(
     events: SharedEventSink,
     db: Arc<DbPool>,
-    account: &crate::db::accounts::AccountFull,
+    account: &crate::account::MailAccountConfig,
     mailbox_id: String,
     providers: Arc<ProviderServices>,
 ) -> Result<u32> {
@@ -482,7 +482,7 @@ pub(crate) async fn sync_jmap_folder_public(
 
     let folder_name = mailbox_id.clone();
     let result = async {
-        let (jmap_config, conn_jmap) = providers.jmap_client(account).await?;
+        let (jmap_config, conn_jmap) = providers.jmap_client_for(account).await?;
         sync_jmap_folder(
             &db,
             providers.as_ref(),
@@ -665,7 +665,7 @@ mod tests {
         let db = Arc::new(DbPool::new(&temp.path().join("test.db"), 1).unwrap());
         let recording = Arc::new(RecordingEvents::default());
         let events: SharedEventSink = recording.clone();
-        let account = jmap_account("http://mail.example.com");
+        let account = jmap_account("http://mail.example.com").mail_config();
 
         let result = sync_jmap_account(
             events,

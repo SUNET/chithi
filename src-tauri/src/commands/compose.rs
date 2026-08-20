@@ -511,7 +511,8 @@ pub async fn save_draft(
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &account_id)?
     };
-    let backend = crate::backend::mail::for_account(&account)
+    let mail_config = account.mail_config();
+    let backend = crate::backend::mail::for_account(&mail_config)
         .ok_or_else(|| Error::Other("Account has no enabled mail binding".into()))?;
 
     // Drafts peek rather than consume tokens: the user may save a draft
@@ -608,7 +609,7 @@ pub async fn save_draft(
     backend
         .save_draft(
             &ctx,
-            &account,
+            &mail_config,
             &crate::backend::mail::DraftSaveRequest {
                 raw_message,
                 to: message.to,

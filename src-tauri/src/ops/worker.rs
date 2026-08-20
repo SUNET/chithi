@@ -207,7 +207,7 @@ impl AccountWorker {
             let conn = self.db.reader();
             crate::db::accounts::get_account_full(&conn, &self.account_id)?
         };
-        self.backend = crate::backend::mail::for_account(&account);
+        self.backend = crate::backend::mail::for_account(&account.mail_config());
         self.executor = self.backend.map(|b| b.op_executor());
         let data_dir = self.app.state::<crate::state::AppState>().data_dir.clone();
         let providers = self.app.state::<crate::state::AppState>().providers.clone();
@@ -530,12 +530,12 @@ impl AccountWorker {
     /// the executor's.
     fn sync_target(
         &self,
-    ) -> Result<Option<(&'static dyn MailBackend, crate::db::accounts::AccountFull)>> {
+    ) -> Result<Option<(&'static dyn MailBackend, crate::account::MailAccountConfig)>> {
         let account = {
             let conn = self.db.reader();
             crate::db::accounts::get_account_full(&conn, &self.account_id)?
         };
-        Ok(self.backend.map(|b| (b, account)))
+        Ok(self.backend.map(|b| (b, account.mail_config())))
     }
 
     /// Delegate a full account sync to the backend. Deliberate

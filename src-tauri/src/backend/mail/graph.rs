@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 
+use crate::account::MailAccountConfig;
 use crate::db;
-use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::event::{ApplicationEvent, SyncComplete, SyncStarted};
 use crate::mail::compat::{BackendMessageRef, BodyLocation};
@@ -79,6 +79,7 @@ const MAX_DELTA_PAGES_PER_CYCLE: usize = 25;
 async fn sync_graph_account(
     ctx: &MailSyncCtx,
     account_id: &str,
+    account_name: &str,
     current_folder: Option<&str>,
 ) -> Result<()> {
     use crate::mail::graph;
@@ -89,16 +90,10 @@ async fn sync_graph_account(
     // Mirror sync_account / sync_jmap_account: emit sync-started so the
     // activity store can mark the operation running and spin the StatusBar
     // icon. Without this, Graph syncs are silent on the frontend.
-    let account_name = {
-        let conn = db_arc.reader();
-        db::accounts::get_account_full(&conn, account_id)
-            .map(|a| a.display_name)
-            .unwrap_or_else(|_| account_id.to_string())
-    };
     ctx.events
         .publish(ApplicationEvent::SyncStarted(SyncStarted {
             account_id: account_id.to_string(),
-            account_name,
+            account_name: account_name.to_string(),
         }));
 
     let client = ctx
@@ -501,7 +496,7 @@ impl MailBackend for GraphMailBackend {
     async fn sync_account(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         current_folder: Option<String>,
     ) -> Result<()> {
         log::info!(
@@ -509,7 +504,13 @@ impl MailBackend for GraphMailBackend {
             account.display_name,
             account.email,
         );
-        sync_graph_account(ctx, &account.id, current_folder.as_deref()).await
+        sync_graph_account(
+            ctx,
+            &account.id,
+            &account.display_name,
+            current_folder.as_deref(),
+        )
+        .await
     }
 
     /// Sync exactly one folder via its delta link. Refreshes the folder's
@@ -518,7 +519,7 @@ impl MailBackend for GraphMailBackend {
     async fn sync_folder(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         folder_path: &str,
     ) -> Result<u32> {
         use crate::mail::graph;
@@ -565,7 +566,7 @@ impl MailBackend for GraphMailBackend {
     /// delegating there just produced failed selects after every sync.
     /// Instead, stream full MIME for the newest unfetched rows via the
     /// same `download_mime_to_file` path the on-demand fetch uses.
-    async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &AccountFull) -> Result<u32> {
+    async fn prefetch_bodies(&self, ctx: &MailSyncCtx, account: &MailAccountConfig) -> Result<u32> {
         use crate::provider::GraphTokenPurpose;
 
         /// Bodies fetched per prefetch pass; the pass re-runs after every
@@ -636,7 +637,7 @@ impl MailBackend for GraphMailBackend {
     async fn fetch_body_to_disk(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &BodyFetchRequest,
     ) -> Result<String> {
         let graph_msg_id = body_fetch_item_id(request)?;
@@ -658,7 +659,7 @@ impl MailBackend for GraphMailBackend {
     async fn search_messages(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         query: &SearchQuery,
     ) -> Result<Vec<SearchHit>> {
         validate_search_query(query)?;
@@ -677,7 +678,7 @@ impl MailBackend for GraphMailBackend {
     async fn save_draft(
         &self,
         ctx: &MailSyncCtx,
-        account: &AccountFull,
+        account: &MailAccountConfig,
         request: &super::DraftSaveRequest,
     ) -> Result<()> {
         let client = ctx
