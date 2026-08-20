@@ -4,8 +4,8 @@ use native_tls::TlsStream;
 use std::net::TcpStream;
 
 use crate::error::{Error, Result};
-use crate::mail::search::{build_imap_search, SearchHit, SearchQuery};
-use crate::message::normalize_message_id;
+use crate::mail::search::build_imap_search;
+use crate::message::{normalize_message_id, SearchHit, SearchQuery};
 use crate::state::IdleControl;
 
 fn mailbox_is_selectable(attributes: &[NameAttribute<'_>]) -> bool {

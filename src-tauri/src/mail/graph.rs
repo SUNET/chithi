@@ -4,8 +4,8 @@
 //! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
 
 use crate::error::{Error, Result};
-use crate::mail::search::{build_graph_kql, SearchHit, SearchQuery};
-use crate::message::normalize_message_id;
+use crate::mail::search::build_graph_kql;
+use crate::message::{normalize_message_id, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";

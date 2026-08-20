@@ -11,8 +11,8 @@ use crate::db;
 use crate::error::{Error, Result};
 use crate::event::{ApplicationEvent, SyncStarted};
 use crate::mail::imap::{ImapConfig, ImapConnection};
-use crate::mail::search::{SearchHit, SearchQuery};
 use crate::mail::sync as mail_sync;
+use crate::message::{SearchHit, SearchQuery};
 use crate::ops::flags::FlagTarget;
 use crate::ops::queue::MailOp;
 
@@ -921,8 +921,7 @@ mod tests {
         validate_search_query,
     };
     use crate::backend::mail::BodyFetchRequest;
-    use crate::mail::search::{SearchFields, SearchQuery};
-    use crate::message::{BackendMessageRef, BodyLocation};
+    use crate::message::{BackendMessageRef, BodyLocation, SearchFields, SearchQuery};
 
     #[test]
     fn copy_references_are_grouped_by_source_folder() {
