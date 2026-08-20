@@ -360,6 +360,30 @@ enum OcsDeleteStatus {
     Failure,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OcsDeleteMessageKind {
+    Success,
+    Unknown,
+}
+
+fn classify_ocs_delete_message(message: &str) -> OcsDeleteMessageKind {
+    let message = message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if matches!(
+        message.as_str(),
+        "ok" | "conversation deleted successfully"
+            | "room deleted successfully"
+            | "conversation successfully deleted"
+            | "room successfully deleted"
+    ) {
+        return OcsDeleteMessageKind::Success;
+    }
+    OcsDeleteMessageKind::Unknown
+}
+
 /// Delete a Talk room using an explicit HTTP client.
 pub async fn delete_room_with_client(
     server: &str,
@@ -444,22 +468,14 @@ pub async fn delete_room_with_client(
         ))
     })?;
     let meta = payload.ocs.meta;
+    let message_kind = classify_ocs_delete_message(&meta.message);
     if meta.status == OcsDeleteStatus::Ok
         && matches!(meta.statuscode, 100 | 200)
         && status == reqwest::StatusCode::OK
+        && message_kind == OcsDeleteMessageKind::Success
     {
         return Ok(());
     }
-    if meta.status == OcsDeleteStatus::Failure
-        && meta.statuscode == 404
-        && matches!(
-            status,
-            reqwest::StatusCode::OK | reqwest::StatusCode::NOT_FOUND
-        )
-    {
-        return Ok(());
-    }
-
     let ocs_status = match meta.status {
         OcsDeleteStatus::Ok => "ok",
         OcsDeleteStatus::Failure => "failure",
@@ -863,14 +879,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_room_accepts_repeated_or_missing_room() {
+    async fn delete_room_rejects_missing_room_without_proof_of_deletion() {
         for http_status in ["200 OK", "404 Not Found"] {
             let (root, server) = mock_server(
                 http_status,
                 r#"{"ocs":{"meta":{"status":"failure","statuscode":404,"message":"Room not found"},"data":[]}}"#,
             );
 
-            delete_room_with_client(
+            let error = delete_room_with_client(
                 &root,
                 "alice",
                 "app-secret",
@@ -878,8 +894,12 @@ mod tests {
                 &reqwest::Client::new(),
             )
             .await
-            .unwrap();
+            .unwrap_err();
             server.join().unwrap();
+
+            assert!(error
+                .to_string()
+                .contains("talk delete_room: OCS failure 404: Room not found"));
         }
     }
 
@@ -958,6 +978,11 @@ mod tests {
         let bodies = [
             r#"{"ocs":{"meta":{"status":"ok","statuscode":404,"message":"Not found"}}}"#,
             r#"{"ocs":{"meta":{"status":"failure","statuscode":200,"message":"Failed"}}}"#,
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"Forbidden"}}}"#,
+            r#"{"ocs":{"meta":{"status":"failure","statuscode":404,"message":"Forbidden"}}}"#,
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"Done"}}}"#,
+            r#"{"ocs":{"meta":{"status":"ok","statuscode":200,"message":"Room was not deleted successfully"}}}"#,
+            r#"{"ocs":{"meta":{"status":"failure","statuscode":404,"message":"Room not found; authorization failed"}}}"#,
         ];
 
         for body in bodies {

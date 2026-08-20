@@ -492,6 +492,9 @@ pub async fn leave_room_with_client(
     // to discard; an unknown 403 must keep durable ownership for a later retry.
     let already_gone = matrix_error.as_ref().is_some_and(|error| {
         (status.is_client_error() && error.errcode == "M_NOT_FOUND")
+            || (status == reqwest::StatusCode::NOT_FOUND
+                && error.errcode == "M_UNKNOWN"
+                && error.error.trim() == "Not a known room")
             || (status == reqwest::StatusCode::FORBIDDEN
                 && error.errcode == "M_FORBIDDEN"
                 && is_absent_membership_error(&error.error, room_id))
@@ -926,6 +929,24 @@ mod tests {
         let (root, server) = mock_server(vec![(
             "404 Not Found",
             r#"{"errcode":"M_NOT_FOUND","error":"Room not found"}"#,
+        )]);
+
+        leave_room_with_client(
+            &root,
+            "matrix-token",
+            "!missing:matrix.example",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn leave_room_accepts_synapse_unknown_missing_room() {
+        let (root, server) = mock_server(vec![(
+            "404 Not Found",
+            r#"{"errcode":"M_UNKNOWN","error":"Not a known room"}"#,
         )]);
 
         leave_room_with_client(
