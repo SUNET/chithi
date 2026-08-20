@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::calendar::{Attendee, CalendarEvent};
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -24,37 +25,6 @@ pub struct NewCalendar {
     pub name: String,
     pub color: String,
     pub is_default: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarEvent {
-    pub id: String,
-    pub account_id: String,
-    pub calendar_id: String,
-    pub uid: Option<String>,
-    pub title: String,
-    pub description: Option<String>,
-    pub location: Option<String>,
-    pub start_time: String,
-    pub end_time: String,
-    pub all_day: bool,
-    pub timezone: Option<String>,
-    pub recurrence_rule: Option<String>,
-    pub organizer_email: Option<String>,
-    pub attendees_json: Option<String>,
-    pub my_status: Option<String>,
-    pub source_message_id: Option<String>,
-    pub ical_data: Option<String>,
-    pub remote_id: Option<String>,
-    pub etag: Option<String>,
-}
-
-/// Attendee for JSON serialization inside `attendees_json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attendee {
-    pub email: String,
-    pub name: Option<String>,
-    pub status: String, // "accepted", "tentative", "declined", "needs-action"
 }
 
 /// A calendar invite — a `CalendarEvent` plus its row `created_at`

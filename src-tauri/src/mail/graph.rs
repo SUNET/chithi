@@ -2851,7 +2851,7 @@ fn graph_time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
 /// Graph payload for creating an event. Includes the attendee list plus
 /// the organizer as an attendee with `response: organizer` — Exchange
 /// needs it to render the organizer row correctly.
-pub fn event_to_graph_json(event: &crate::db::calendar::CalendarEvent) -> serde_json::Value {
+pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> serde_json::Value {
     let mut graph_event = serde_json::json!({
         "subject": event.title,
         "start": graph_time_json(&event.start_time, event.all_day),
@@ -2896,7 +2896,7 @@ pub fn event_to_graph_json(event: &crate::db::calendar::CalendarEvent) -> serde_
 /// Graph payload for patching an event. Narrower than the create
 /// payload: raw timestamps (no all-day midnight anchoring) and no
 /// attendee rewrite, matching what update_event has always sent.
-pub fn event_patch_to_graph_json(event: &crate::db::calendar::CalendarEvent) -> serde_json::Value {
+pub fn event_patch_to_graph_json(event: &crate::calendar::CalendarEvent) -> serde_json::Value {
     let mut patch = serde_json::json!({
         "subject": event.title,
         "start": {"dateTime": event.start_time, "timeZone": "UTC"},
@@ -3515,7 +3515,7 @@ mod color_tests {
 #[cfg(test)]
 mod builder_tests {
     use super::{contact_to_graph_json, event_patch_to_graph_json, event_to_graph_json};
-    use crate::db::calendar::CalendarEvent;
+    use crate::calendar::CalendarEvent;
 
     fn event(all_day: bool, attendees_json: Option<&str>) -> CalendarEvent {
         CalendarEvent {

@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::CalendarEvent;
 use crate::db;
 use crate::db::accounts::AccountFull;
-use crate::db::calendar::CalendarEvent;
 use crate::error::Result;
 use crate::mail::jmap::{JmapCalendarEvent, JmapConfig, JmapConnection};
 
