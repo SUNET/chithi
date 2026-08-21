@@ -108,9 +108,10 @@ pub struct MeetLifecycleCoordinator {
     locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
-/// Weak per-account lock registry for meeting creation and account mutation.
-/// Meeting callers acquire their lifecycle lock first; all callers acquire
-/// this before any provider credential lock.
+/// Weak per-account lock registry for remote operations and account mutation.
+/// Meeting callers acquire their lifecycle lock first; multi-account contact
+/// moves acquire account locks in lexical order. All callers acquire this
+/// before any provider credential lock.
 #[derive(Default)]
 pub struct AccountLifecycleCoordinator {
     locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,

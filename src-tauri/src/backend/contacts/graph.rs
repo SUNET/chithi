@@ -4,7 +4,12 @@
 //! `sync_type = 'o365'` value (see `for_sync_type` and ADR 0050).
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
+use crate::contact::reconcile::{
+    capture_remote_id_baseline, reconcile_remote_id_snapshot, repair_duplicate_managed_remote_ids,
+    CompleteRemoteIdSnapshot, RemoteContactPatch, RemoteField,
+};
 use crate::contact::Contact;
 use crate::db::accounts::AccountFull;
 use crate::error::Result;
@@ -14,6 +19,8 @@ use crate::provider::GraphTokenPurpose;
 use super::{BookRef, ContactBackend, ContactBackendCtx, PushedContact};
 
 pub struct GraphContactBackend;
+
+const GRAPH_BOOK_SYNC_TYPE: &str = "o365";
 
 #[async_trait]
 impl ContactBackend for GraphContactBackend {
@@ -37,16 +44,17 @@ impl ContactBackend for GraphContactBackend {
             }
         };
 
-        // 1. Ensure contact book exists
         let book_id = {
             let conn = ctx.db.writer().await;
             let existing: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'o365'",
-                    rusqlite::params![account_id],
+                    "SELECT id FROM contact_books
+                     WHERE account_id = ?1 AND sync_type = ?2
+                     ORDER BY created_at, id LIMIT 1",
+                    rusqlite::params![account_id, GRAPH_BOOK_SYNC_TYPE],
                     |row| row.get(0),
                 )
-                .ok();
+                .optional()?;
 
             match existing {
                 Some(id) => id,
@@ -62,7 +70,6 @@ impl ContactBackend for GraphContactBackend {
             }
         };
 
-        // 2. Fetch contacts from Graph
         let graph_contacts = match client.list_contacts().await {
             Ok(c) => c,
             Err(e) => {
@@ -75,89 +82,57 @@ impl ContactBackend for GraphContactBackend {
             graph_contacts.len()
         );
 
-        let conn = ctx.db.writer().await;
-
-        // Build set of server IDs for reconciliation
-        let server_ids: std::collections::HashSet<String> =
-            graph_contacts.iter().map(|c| c.id.clone()).collect();
-
-        // 3. Upsert contacts
-        for gc in &graph_contacts {
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM contacts WHERE book_id = ?1 AND remote_id = ?2",
-                    rusqlite::params![book_id, gc.id],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            match existing {
-                Some(local_id) => {
-                    // Update existing contact
-                    conn.execute(
-                        "UPDATE contacts SET display_name = ?1, emails_json = ?2, phones_json = ?3,
-                         organization = ?4, title = ?5, updated_at = CURRENT_TIMESTAMP
-                         WHERE id = ?6",
-                        rusqlite::params![
-                            gc.display_name,
-                            gc.emails_json,
-                            gc.phones_json,
-                            gc.organization,
-                            gc.title,
-                            local_id,
-                        ],
-                    )
-                    .ok();
-                }
-                None => {
-                    // Insert new contact
-                    let id = uuid::Uuid::new_v4().to_string();
-                    conn.execute(
-                        "INSERT INTO contacts (id, book_id, display_name, emails_json, phones_json, organization, title, remote_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![
-                            id,
-                            book_id,
-                            gc.display_name,
-                            gc.emails_json,
-                            gc.phones_json,
-                            gc.organization,
-                            gc.title,
-                            gc.id,
-                        ],
-                    )?;
-                }
-            }
-        }
-
-        // 4. Remove contacts deleted on server
-        let local_contacts: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT id, remote_id FROM contacts WHERE book_id = ?1 AND remote_id IS NOT NULL AND remote_id != ''",
-            )?
-            .query_map(rusqlite::params![book_id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let mut deleted = 0;
-        for (local_id, remote_id) in &local_contacts {
-            if !server_ids.contains(remote_id) {
-                conn.execute(
-                    "DELETE FROM contacts WHERE id = ?1",
-                    rusqlite::params![local_id],
-                )
-                .ok();
-                deleted += 1;
-            }
-        }
-        if deleted > 0 {
-            log::info!(
-                "sync_contacts_graph: removed {} server-deleted contacts",
-                deleted
+        let snapshot = CompleteRemoteIdSnapshot::new(
+            graph_contacts
+                .into_iter()
+                .map(|contact| RemoteContactPatch {
+                    uid: RemoteField::Preserve,
+                    display_name: RemoteField::Set(contact.display_name),
+                    emails_json: RemoteField::Set(contact.emails_json),
+                    phones_json: RemoteField::Set(contact.phones_json),
+                    addresses_json: RemoteField::Preserve,
+                    organization: RemoteField::Set(contact.organization),
+                    title: RemoteField::Set(contact.title),
+                    notes: RemoteField::Preserve,
+                    vcard_data: RemoteField::Preserve,
+                    remote_id: RemoteField::Set(Some(contact.id)),
+                    etag: RemoteField::Preserve,
+                })
+                .collect(),
+        )?;
+        let (repair_report, baseline) = {
+            let mut conn = ctx.db.writer().await;
+            let repair_report = repair_duplicate_managed_remote_ids(
+                &mut conn,
+                account_id,
+                &book_id,
+                GRAPH_BOOK_SYNC_TYPE,
+            )?;
+            let baseline =
+                capture_remote_id_baseline(&conn, account_id, &book_id, GRAPH_BOOK_SYNC_TYPE)?;
+            (repair_report, baseline)
+        };
+        if repair_report.detached > 0 {
+            log::warn!(
+                "sync_contacts_graph: detached {} duplicate managed remote ID assignments across \
+                 {} remote IDs in book {}",
+                repair_report.detached,
+                repair_report.duplicate_remote_ids,
+                book_id
             );
         }
+        let report = {
+            let mut conn = ctx.db.writer().await;
+            reconcile_remote_id_snapshot(&mut conn, &baseline, snapshot)?
+        };
+        log::info!(
+            "sync_contacts_graph: reconciled inserted={}, updated={}, deleted={}, \
+             unchanged_or_stale={}",
+            report.inserted,
+            report.updated,
+            report.deleted,
+            report.unchanged_or_stale
+        );
 
         log::info!("sync_contacts_graph: completed for account {}", account_id);
         Ok(())
@@ -180,7 +155,7 @@ impl ContactBackend for GraphContactBackend {
             &contact.phones_json,
             contact.organization.as_deref(),
             contact.title.as_deref(),
-        );
+        )?;
         let remote_id = client.create_contact(&gc).await?;
         Ok(Some(PushedContact {
             remote_id: Some(remote_id),
@@ -207,7 +182,7 @@ impl ContactBackend for GraphContactBackend {
             &contact.phones_json,
             contact.organization.as_deref(),
             contact.title.as_deref(),
-        );
+        )?;
         client.update_contact(remote_id, &gc).await?;
         Ok(None)
     }
