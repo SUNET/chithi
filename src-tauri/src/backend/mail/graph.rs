@@ -851,12 +851,11 @@ impl MailOpExecutor for GraphOpExecutor {
                     client.set_flags(&item_ids, &flags, add).await?;
                 }
             }
-            MailOp::SendRaw { .. } => {
-                // O365 delivery belongs to SMTP+XOAUTH2. Never reinterpret
-                // raw MIME as a Graph sendMail payload.
-                return Err(Error::Other(
-                    "Graph cannot send raw mail; O365 delivery must use SMTP+XOAUTH2.".into(),
-                ));
+            send @ MailOp::SendRaw { .. } => {
+                // O365 delivery belongs to SMTP+XOAUTH2. The shared replay
+                // path preserves the raw MIME and envelope and deliberately
+                // skips IMAP's Sent-folder hook for Graph accounts.
+                super::replay_send_raw_via_smtp(ctx, account_id, send).await?;
             }
             _ => {}
         }

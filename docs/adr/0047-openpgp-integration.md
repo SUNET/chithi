@@ -145,11 +145,17 @@ card public-only bytes into the software signing API produces opaque
 "expected SecretKey, got PublicKey" parse errors. Software keys use the
 passphrase API instead.
 
-**Wire transmission:** all outgoing mail -- IMAP, JMAP, and Microsoft
-Graph accounts alike -- is transmitted via SMTP (`smtp::send_raw`; Graph
-accounts use the IMAP/SMTP binding with XOAUTH2). The PGP-wrapped bytes
-are persisted to the outbox and sent verbatim, so the envelope survives
-the first-attempt send and any later outbox replay identically.
+**Wire transmission (current state, 2026-08-21):** IMAP and Microsoft
+Graph accounts transmit through SMTP (`smtp::send_raw`; Graph uses
+XOAUTH2 with the Microsoft IMAP/SMTP scope), while JMAP retains native
+JMAP Submission. The PGP-wrapped raw bytes are persisted for every
+backend and replayed unchanged. SMTP replay also passes the separately
+persisted sender and recipient envelope unchanged. Native JMAP
+Submission receives only the raw MIME, with no explicit JMAP envelope;
+this leaves a known Bcc-delivery limitation when Bcc recipients are not
+present in those bytes, queued for a separate fix. Graph replay never
+converts the MIME to a Graph `sendMail` payload or invokes IMAP
+Sent-folder handling.
 
 ### Receive path
 `pgp_decrypt_message` extracts the ciphertext, then tries a **software**
@@ -242,7 +248,8 @@ Design decisions for this layer:
 
 The attach-pubkey, Autocrypt, and protected-subject features only alter
 outgoing MIME bytes, so they work uniformly across IMAP/JMAP/Graph (all
-send via SMTP). Only encrypted drafts diverge by backend, as above.
+transmit the same final bytes, via SMTP or native JMAP Submission). Only
+encrypted drafts diverge by backend, as above.
 
 ## Security considerations
 - **Secrets:** passphrases and PINs enter only through the prompt

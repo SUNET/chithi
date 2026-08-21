@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::event::SharedEventSink;
 use crate::message::{BackendMessageRef, BodyLocation, SearchHit, SearchQuery};
 use crate::ops::queue::MailOp;
-use crate::provider::ProviderServices;
+use crate::provider::{MailCredentials, ProviderServices};
 
 pub mod graph;
 pub mod imap;
@@ -30,6 +30,71 @@ pub struct MailSyncCtx {
     pub db: std::sync::Arc<DbPool>,
     pub data_dir: std::path::PathBuf,
     pub providers: std::sync::Arc<ProviderServices>,
+}
+
+/// State retained after SMTP accepts a replayed message. Only the IMAP
+/// executor consumes it for its best-effort APPEND-to-Sent hook.
+struct RawSmtpDelivery {
+    account: MailAccountConfig,
+    credentials: MailCredentials,
+    raw_message: Vec<u8>,
+}
+
+/// Replay a persisted raw send through the account's current SMTP settings.
+///
+/// The account and credentials are deliberately reloaded for each attempt so
+/// password changes and Microsoft IMAP/SMTP-scoped OAuth tokens are current.
+/// The persisted envelope and RFC 5322 bytes are passed to SMTP unchanged.
+async fn replay_send_raw_via_smtp(
+    ctx: &MailSyncCtx,
+    account_id: &str,
+    op: MailOp,
+) -> Result<RawSmtpDelivery> {
+    let MailOp::SendRaw {
+        raw_message,
+        from,
+        to,
+        cc,
+        bcc,
+        ..
+    } = op
+    else {
+        return Err(crate::error::Error::Other(
+            "SMTP replay received a non-SendRaw operation".into(),
+        ));
+    };
+
+    let account = {
+        let conn = ctx.db.reader();
+        crate::db::accounts::get_account_full(&conn, account_id)?
+    }
+    .mail_config();
+    let credentials = ctx
+        .providers
+        .credentials()
+        .mail_credentials_for(&account)
+        .await?;
+
+    crate::mail::smtp::send_raw(
+        &account.smtp_host,
+        account.smtp_port,
+        &account.username,
+        &credentials.secret,
+        account.use_tls,
+        credentials.use_xoauth2,
+        &from,
+        &to,
+        &cc,
+        &bcc,
+        &raw_message,
+    )
+    .await?;
+
+    Ok(RawSmtpDelivery {
+        account,
+        credentials,
+        raw_message,
+    })
 }
 
 /// Provider-neutral inputs for fetching one raw RFC 822 body into Maildir.
@@ -224,10 +289,114 @@ pub fn for_account(account: &MailAccountConfig) -> Option<&'static dyn MailBacke
 
 #[cfg(test)]
 mod registry_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::db::accounts::AccountFull;
+    use crate::db::pool::DbPool;
     use crate::db::service_bindings::ServiceBinding;
+    use crate::error::Error;
+    use crate::event::{ApplicationEvent, EventSink};
     use crate::message::BodyLocation;
+    use crate::oauth::{OAuthProvider, OAuthTokens};
+    use crate::ops::offline::{mail_op_to_outbox, outbox_to_mail_op, OutboxEntry};
+    use crate::provider::{
+        OAuthTokenStore, ProviderCredentialService, ProviderTransports, TokenEndpointClient,
+    };
+
+    #[derive(Default)]
+    struct MemoryTokenStore {
+        tokens: Mutex<HashMap<String, OAuthTokens>>,
+        loads: Mutex<Vec<String>>,
+    }
+
+    impl MemoryTokenStore {
+        fn was_loaded(&self, account_id: &str) -> bool {
+            self.loads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|loaded| loaded == account_id)
+        }
+    }
+
+    impl OAuthTokenStore for MemoryTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<OAuthTokens>> {
+            self.loads.lock().unwrap().push(account_id.to_string());
+            Ok(self.tokens.lock().unwrap().get(account_id).cloned())
+        }
+
+        fn store(&self, account_id: &str, tokens: &OAuthTokens) -> Result<()> {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string(), tokens.clone());
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<()> {
+            self.tokens.lock().unwrap().remove(account_id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ScopeRecordingEndpoint {
+        scopes: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl TokenEndpointClient for ScopeRecordingEndpoint {
+        async fn exchange_code(
+            &self,
+            _provider: &OAuthProvider,
+            _code: &str,
+            _port: u16,
+            _code_verifier: Option<&str>,
+        ) -> Result<OAuthTokens> {
+            Err(Error::Other("unexpected code exchange".into()))
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+        ) -> Result<OAuthTokens> {
+            Err(Error::Other("unexpected unscoped refresh".into()))
+        }
+
+        async fn refresh_scoped(
+            &self,
+            _provider: &OAuthProvider,
+            _refresh_token: &str,
+            scopes: &str,
+        ) -> Result<OAuthTokens> {
+            self.scopes.lock().unwrap().push(scopes.to_string());
+            Ok(OAuthTokens {
+                access_token: "smtp-access-token".into(),
+                refresh_token: Some("rotated-refresh-token".into()),
+                expires_at: Some(i64::MAX),
+            })
+        }
+
+        async fn refresh_dynamic(
+            &self,
+            _token_url: &str,
+            _refresh_token: &str,
+            _client_id: &str,
+        ) -> Result<OAuthTokens> {
+            Err(Error::Other("unexpected dynamic refresh".into()))
+        }
+    }
+
+    struct NoopEventSink;
+
+    impl EventSink for NoopEventSink {
+        fn publish(&self, _event: ApplicationEvent) {}
+    }
 
     fn account(mail_protocol: &str, auth_method: &str) -> AccountFull {
         let bindings = if mail_protocol.is_empty() {
@@ -278,6 +447,85 @@ mod registry_tests {
             pgp_encrypt_subject: false,
             pgp_encrypt_drafts: false,
         }
+    }
+
+    async fn insert_executor_account(
+        db: &DbPool,
+        account_id: &str,
+        protocol: &str,
+        auth_method: &str,
+    ) {
+        let config_json = match protocol {
+            "imap" => serde_json::json!({
+                "imap_host": "imap.example.test",
+                "imap_port": 993,
+                "smtp_host": "smtp.example.test",
+                "smtp_port": 587,
+                "use_tls": true,
+            }),
+            "jmap" => serde_json::json!({
+                "url": "http://example.test/jmap",
+                "auth_method": "oidc",
+            }),
+            _ => serde_json::json!({}),
+        };
+        let conn = db.writer().await;
+        conn.execute(
+            "INSERT INTO accounts
+             (id, display_name, email, username, auth_method)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![
+                account_id,
+                format!("{protocol} executor"),
+                format!("{protocol}@example.test"),
+                auth_method,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO service_bindings
+             (id, account_id, service, protocol, enabled, config_json)
+             VALUES (?1, ?2, 'mail', ?3, 1, ?4)",
+            rusqlite::params![
+                format!("{account_id}-mail"),
+                account_id,
+                protocol,
+                config_json.to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn persisted_send_with_invalid_sender(account_id: &str) -> MailOp {
+        let original = MailOp::SendRaw {
+            raw_message: b"From: sender@example.test\r\nTo: recipient@example.test\r\n\r\nbody"
+                .to_vec(),
+            from: "invalid sender".into(),
+            to: vec!["recipient@example.test".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "routing fixture".into(),
+        };
+        let (action_type, payload) = mail_op_to_outbox(&original).unwrap();
+        let entry = OutboxEntry {
+            id: 1,
+            account_id: account_id.into(),
+            action_type: action_type.into(),
+            payload_json: payload.to_string(),
+            status: "pending".into(),
+            retry_count: 0,
+            error_message: None,
+        };
+        let replayed = outbox_to_mail_op(&entry).expect("valid send must replay from outbox");
+        assert_eq!(replayed, original);
+        replayed
+    }
+
+    fn assert_invalid_sender_error(protocol: &str, error: &str) {
+        assert!(
+            error.starts_with("Invalid SMTP address 'invalid sender':"),
+            "{protocol} SendRaw must reach SMTP sender validation: {error}"
+        );
     }
 
     #[test]
@@ -401,6 +649,138 @@ mod registry_tests {
         assert_eq!(
             request.message_ref.into_jmap_email_id().as_deref(),
             Some("raw_email_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_routing_uses_smtp_for_graph_and_imap_but_jmap_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DbPool::new(&temp.path().join("mail-routing.db"), 1).unwrap());
+        {
+            let conn = db.writer().await;
+            crate::db::schema::initialize(&conn).unwrap();
+        }
+
+        let suffix = uuid::Uuid::new_v4();
+        let graph_id = format!("graph-{suffix}");
+        let imap_id = format!("imap-{suffix}");
+        let jmap_id = format!("jmap-{suffix}");
+        insert_executor_account(&db, &graph_id, "graph", "oauth-microsoft").await;
+        insert_executor_account(&db, &imap_id, "imap", "oauth-microsoft").await;
+        insert_executor_account(&db, &jmap_id, "jmap", "oauth-jmap-oidc").await;
+
+        let token_store = Arc::new(MemoryTokenStore::default());
+        for account_id in [&graph_id, &imap_id] {
+            token_store
+                .store(
+                    account_id,
+                    &OAuthTokens {
+                        access_token: "stale-access-token".into(),
+                        refresh_token: Some("refresh-token".into()),
+                        expires_at: Some(0),
+                    },
+                )
+                .unwrap();
+        }
+        token_store
+            .store(
+                &jmap_id,
+                &OAuthTokens {
+                    access_token: "jmap-oidc-access-token".into(),
+                    refresh_token: Some("jmap-refresh-token".into()),
+                    expires_at: Some(i64::MAX),
+                },
+            )
+            .unwrap();
+        let endpoint = Arc::new(ScopeRecordingEndpoint::default());
+        let credentials = Arc::new(ProviderCredentialService::new(
+            token_store.clone(),
+            endpoint.clone(),
+        ));
+        let providers = Arc::new(ProviderServices::new(
+            credentials,
+            token_store.clone(),
+            endpoint.clone(),
+            ProviderTransports::production().unwrap(),
+        ));
+        let ctx = MailSyncCtx {
+            events: Arc::new(NoopEventSink),
+            db: db.clone(),
+            data_dir: temp.path().to_path_buf(),
+            providers,
+        };
+
+        let graph_account = {
+            let conn = db.reader();
+            crate::db::accounts::get_account_full(&conn, &graph_id)
+                .unwrap()
+                .mail_config()
+        };
+        let mut graph = for_account(&graph_account).unwrap().op_executor();
+        let graph_error = graph
+            .execute(
+                &ctx,
+                &graph_id,
+                persisted_send_with_invalid_sender(&graph_id),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_invalid_sender_error("Graph", &graph_error);
+        assert!(!graph_error.contains("Graph cannot send raw mail"));
+        assert_eq!(
+            *endpoint.scopes.lock().unwrap(),
+            vec![crate::oauth::MICROSOFT_IMAP_SCOPES]
+        );
+
+        let imap_account = {
+            let conn = db.reader();
+            crate::db::accounts::get_account_full(&conn, &imap_id)
+                .unwrap()
+                .mail_config()
+        };
+        let mut imap = for_account(&imap_account).unwrap().op_executor();
+        let imap_error = imap
+            .execute(&ctx, &imap_id, persisted_send_with_invalid_sender(&imap_id))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_invalid_sender_error("IMAP", &imap_error);
+        assert_eq!(
+            *endpoint.scopes.lock().unwrap(),
+            vec![
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ]
+        );
+
+        let jmap_account = {
+            let conn = db.reader();
+            crate::db::accounts::get_account_full(&conn, &jmap_id)
+                .unwrap()
+                .mail_config()
+        };
+        let mut jmap = for_account(&jmap_account).unwrap().op_executor();
+        let jmap_error = jmap
+            .execute(&ctx, &jmap_id, persisted_send_with_invalid_sender(&jmap_id))
+            .await
+            .unwrap_err()
+            .to_string();
+        // JMAP resolves this account's fresh in-memory OIDC token, then
+        // rejects the cleartext fixture URL before making a request. No
+        // password or persistent keyring secret participates in the test.
+        assert!(token_store.was_loaded(&jmap_id));
+        assert!(
+            jmap_error.contains("URL must use https://"),
+            "JMAP SendRaw must retain native JMAP submission: {jmap_error}"
+        );
+        assert!(!jmap_error.contains("SMTP send_raw"));
+        assert_eq!(
+            *endpoint.scopes.lock().unwrap(),
+            vec![
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+                crate::oauth::MICROSOFT_IMAP_SCOPES,
+            ]
         );
     }
 }
