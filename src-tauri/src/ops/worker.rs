@@ -26,7 +26,7 @@ pub enum WorkerExit {
 /// - Prioritises user ops (move/copy/delete/flag) over background sync
 /// - Executes ops through the account's [`MailOpExecutor`] (the IMAP
 ///   executor maintains a persistent connection and reconnects when it
-///   goes stale; JMAP/Graph executors are stateless HTTP)
+///   goes stale; JMAP/Graph executors are stateless)
 /// - Routes sync ops through the account's [`MailBackend`]
 pub struct AccountWorker {
     pub account_id: String,

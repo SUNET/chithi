@@ -591,59 +591,19 @@ impl ImapOpExecutor {
 
     /// Send a queued `MailOp::SendRaw` over the account's SMTP host —
     /// not the persistent IMAP connection, so a stalled mail server
-    /// doesn't gate retries of a queued send.
+    /// doesn't gate retries of a queued send. SMTP delivery is shared
+    /// with Graph; only IMAP runs the post-delivery Sent hook below.
     async fn execute_smtp_send(
         &mut self,
         ctx: &MailSyncCtx,
         account_id: &str,
         op: MailOp,
     ) -> Result<()> {
-        let MailOp::SendRaw {
+        let super::RawSmtpDelivery {
+            account,
+            credentials,
             raw_message,
-            from,
-            to,
-            cc,
-            bcc,
-            ..
-        } = op
-        else {
-            return Err(Error::Other(
-                "execute_smtp_send called with non-SendRaw op".into(),
-            ));
-        };
-
-        let account = {
-            let conn = ctx.db.reader();
-            crate::db::accounts::get_account_full(&conn, account_id)?
-        }
-        .mail_config();
-
-        // For O365 SMTP, refresh the OAuth token (XOAUTH2; SMTP shares
-        // the IMAP scope set). For password accounts, just use the
-        // stored password.
-        let smtp_username = account.username.clone();
-        let credentials = ctx
-            .providers
-            .credentials()
-            .mail_credentials_for(&account)
-            .await?;
-        let smtp_password = credentials.secret;
-        let use_xoauth2 = credentials.use_xoauth2;
-
-        crate::mail::smtp::send_raw(
-            &account.smtp_host,
-            account.smtp_port,
-            &smtp_username,
-            &smtp_password,
-            account.use_tls,
-            use_xoauth2,
-            &from,
-            &to,
-            &cc,
-            &bcc,
-            &raw_message,
-        )
-        .await?;
+        } = super::replay_send_raw_via_smtp(ctx, account_id, op).await?;
 
         // Best-effort APPEND to Sent (#189). Same rule as the live-send
         // path in `commands::compose`: a failure here MUST NOT propagate,
@@ -658,10 +618,10 @@ impl ImapOpExecutor {
         let imap_config = ImapConfig {
             host: account.imap_host.clone(),
             port: account.imap_port,
-            username: smtp_username,
-            password: smtp_password,
+            username: account.username.clone(),
+            password: credentials.secret,
             use_tls: account.use_tls,
-            use_xoauth2,
+            use_xoauth2: credentials.use_xoauth2,
         };
         let account_id_append = account_id.to_string();
         let append_result = tokio::task::spawn_blocking(move || {
