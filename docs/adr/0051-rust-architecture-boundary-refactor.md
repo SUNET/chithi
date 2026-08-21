@@ -36,8 +36,8 @@ leak through:
 - `MailSyncCtx` and several sync/provider modules depend directly on Tauri
   runtime objects (`AppHandle`, event names/payloads), making providers hard
   to test outside the desktop app.
-- `AppState` is a broad service locator for unrelated domains: DB, sync
-  handles, IDLE/push state, operation workers, attachment tokens, OAuth/SSO
+- `AppState` is a broad service locator for unrelated domains: DB, IDLE/push
+  state, operation workers, attachment tokens, OAuth/SSO
   sessions, PGP keystore/cache and pending prompts.
 - Some architecture issues are also correctness risks: manual SQLite
   transactions can leak open transactions on early error, IDLE/push

@@ -27,9 +27,7 @@ pub struct OutboxEntry {
     pub account_id: String,
     pub action_type: String,
     pub payload_json: String,
-    pub status: String,
     pub retry_count: i32,
-    pub error_message: Option<String>,
 }
 
 /// Write a failed operation to the outbox for later replay.
@@ -116,7 +114,7 @@ pub fn revive_stuck_sending(conn: &Connection) -> Result<usize> {
 pub fn get_pending_ops(conn: &Connection, account_id: &str) -> Result<Vec<OutboxEntry>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, action_type, payload_json, status, retry_count, error_message
+            "SELECT id, account_id, action_type, payload_json, retry_count
              FROM outbox
              WHERE account_id = ?1 AND status = 'pending'
              ORDER BY id ASC",
@@ -130,9 +128,7 @@ pub fn get_pending_ops(conn: &Connection, account_id: &str) -> Result<Vec<Outbox
                 account_id: row.get(1)?,
                 action_type: row.get(2)?,
                 payload_json: row.get(3)?,
-                status: row.get(4)?,
-                retry_count: row.get(5)?,
-                error_message: row.get(6)?,
+                retry_count: row.get(4)?,
             })
         })
         .map_err(Error::Database)?
@@ -188,36 +184,6 @@ pub fn mark_invalid(conn: &Connection, outbox_id: i64, error: &str) -> Result<()
     )
     .map_err(Error::Database)?;
     Ok(())
-}
-
-/// Get dead operations (retry_count >= max_retries) for surfacing to user.
-pub fn get_dead_ops(conn: &Connection, account_id: &str) -> Result<Vec<OutboxEntry>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, account_id, action_type, payload_json, status, retry_count, error_message
-             FROM outbox
-             WHERE account_id = ?1 AND status = 'dead'
-             ORDER BY id ASC",
-        )
-        .map_err(Error::Database)?;
-
-    let entries = stmt
-        .query_map(rusqlite::params![account_id], |row| {
-            Ok(OutboxEntry {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                action_type: row.get(2)?,
-                payload_json: row.get(3)?,
-                status: row.get(4)?,
-                retry_count: row.get(5)?,
-                error_message: row.get(6)?,
-            })
-        })
-        .map_err(Error::Database)?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(entries)
 }
 
 /// Convert a MailOp to an action_type string and JSON payload for outbox storage.
@@ -923,6 +889,15 @@ mod tests {
         conn
     }
 
+    fn row_state(conn: &Connection, id: i64) -> (String, i32, Option<String>) {
+        conn.query_row(
+            "SELECT status, retry_count, error_message FROM outbox WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn provider_message_reference_json_is_stable() {
         let cases = [
@@ -997,11 +972,9 @@ mod tests {
         let id = queue_offline_op(&conn, "acc1", "delete", &serde_json::json!({})).unwrap();
         mark_invalid(&conn, id, "invalid delete payload").unwrap();
 
-        let dead = get_dead_ops(&conn, "acc1").unwrap();
-        assert_eq!(dead.len(), 1);
         assert_eq!(
-            dead[0].error_message.as_deref(),
-            Some("invalid delete payload")
+            row_state(&conn, id),
+            ("dead".into(), 0, Some("invalid delete payload".into()))
         );
     }
 
@@ -1018,12 +991,9 @@ mod tests {
         .unwrap();
 
         assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
-        let dead = get_dead_ops(&conn, "acc1").unwrap();
-        assert_eq!(dead.len(), 1);
-        assert_eq!(dead[0].id, id);
         assert_eq!(
-            dead[0].error_message.as_deref(),
-            Some("ambiguous copy outcome")
+            row_state(&conn, id),
+            ("dead".into(), 0, Some("ambiguous copy outcome".into()))
         );
     }
 
@@ -1034,8 +1004,10 @@ mod tests {
         mark_failed(&conn, id, "network error").unwrap();
         mark_failed(&conn, id, "network error").unwrap();
 
-        let pending = get_pending_ops(&conn, "acc1").unwrap();
-        assert_eq!(pending[0].retry_count, 2);
+        assert_eq!(
+            row_state(&conn, id),
+            ("pending".into(), 2, Some("network error".into()))
+        );
     }
 
     #[test]
@@ -1049,8 +1021,10 @@ mod tests {
         assert!(is_dead(&pending[0]));
 
         mark_dead(&conn, id).unwrap();
-        let dead = get_dead_ops(&conn, "acc1").unwrap();
-        assert_eq!(dead.len(), 1);
+        assert_eq!(
+            row_state(&conn, id),
+            ("dead".into(), 5, Some("timeout".into()))
+        );
         // Should no longer be in pending
         let pending = get_pending_ops(&conn, "acc1").unwrap();
         assert!(pending.is_empty());
@@ -1258,9 +1232,7 @@ mod tests {
             account_id: "acc1".into(),
             action_type: action_type.into(),
             payload_json: payload.to_string(),
-            status: "pending".into(),
             retry_count: 0,
-            error_message: None,
         }
     }
 
@@ -1385,9 +1357,7 @@ mod tests {
             account_id: "acc1".into(),
             action_type: action_type.into(),
             payload_json: payload.to_string(),
-            status: "pending".into(),
             retry_count: 0,
-            error_message: None,
         };
         match outbox_to_mail_op(&entry).unwrap() {
             MailOp::SetFlags { mutations } => assert_eq!(
@@ -1422,9 +1392,7 @@ mod tests {
                 account_id: "acc1".into(),
                 action_type: action_type.into(),
                 payload_json: payload.to_string(),
-                status: "pending".into(),
                 retry_count: 0,
-                error_message: None,
             };
             match outbox_to_mail_op(&entry).unwrap() {
                 MailOp::SetFlags { mutations } => {
@@ -1633,9 +1601,7 @@ mod tests {
             account_id: "acc1".into(),
             action_type: action_type.into(),
             payload_json: payload.to_string(),
-            status: "pending".into(),
             retry_count: 0,
-            error_message: None,
         };
 
         assert_eq!(outbox_to_mail_op(&entry).unwrap(), op);
@@ -1834,9 +1800,7 @@ mod tests {
                 "add": true,
             })
             .to_string(),
-            status: "pending".into(),
             retry_count: 0,
-            error_message: None,
         };
 
         assert!(outbox_to_mail_op(&entry).is_none());

@@ -358,21 +358,6 @@ async fn fetch_body_and_record_path(
     Ok(relative_path)
 }
 
-async fn run_with_imap_idle_resume<T, F, R>(
-    account_id: &str,
-    operation: &'static str,
-    operation_future: F,
-    resume: R,
-) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-    R: std::future::Future<Output = Result<()>>,
-{
-    let operation_result = operation_future.await;
-    let resume_result = resume.await;
-    finish_with_imap_idle_resume(account_id, operation, operation_result, resume_result)
-}
-
 fn spawn_with_imap_idle_resume<T, F, R>(
     account_id: String,
     operation: &'static str,
@@ -1118,10 +1103,7 @@ pub async fn save_message_as_eml(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        finish_with_imap_idle_resume, run_with_imap_idle_resume, spawn_with_imap_idle_resume,
-        split_folder_path,
-    };
+    use super::{finish_with_imap_idle_resume, spawn_with_imap_idle_resume, split_folder_path};
     use crate::error::Error;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1132,16 +1114,16 @@ mod tests {
     async fn body_fetch_failure_still_runs_resume() {
         let resumed = Arc::new(AtomicBool::new(false));
         let resumed_in_future = resumed.clone();
-        let result = run_with_imap_idle_resume::<String, _, _>(
-            "account",
+        let task = spawn_with_imap_idle_resume::<String, _, _>(
+            "account".into(),
             "body fetch",
             async { Err(Error::Other("fetch failed".into())) },
             async move {
                 resumed_in_future.store(true, Ordering::Relaxed);
                 Ok(())
             },
-        )
-        .await;
+        );
+        let result = task.await.expect("body-fetch owner task panicked");
 
         assert!(resumed.load(Ordering::Relaxed));
         assert_eq!(result.unwrap_err().to_string(), "fetch failed");
@@ -1237,16 +1219,16 @@ mod tests {
     async fn server_search_failure_still_runs_resume() {
         let resumed = Arc::new(AtomicBool::new(false));
         let resumed_in_future = resumed.clone();
-        let result = run_with_imap_idle_resume::<Vec<String>, _, _>(
-            "account",
+        let task = spawn_with_imap_idle_resume::<Vec<String>, _, _>(
+            "account".into(),
             "server search",
             async { Err(Error::Other("search failed".into())) },
             async move {
                 resumed_in_future.store(true, Ordering::Relaxed);
                 Ok(())
             },
-        )
-        .await;
+        );
+        let result = task.await.expect("search owner task panicked");
 
         assert!(resumed.load(Ordering::Relaxed));
         assert_eq!(result.unwrap_err().to_string(), "search failed");

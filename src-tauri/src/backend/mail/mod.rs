@@ -113,9 +113,9 @@ pub trait MailBackend: Send + Sync {
         false
     }
 
-    /// Full account sync. Emits its own `sync-started` /
-    /// `sync-complete` progress events (inside the provider sync
-    /// loops); errors are emitted as `sync-error` by the command.
+    /// Full account sync, invoked directly by the sync command. Emits its own
+    /// `sync-started` / `sync-complete` progress events (inside the provider
+    /// sync loops); errors are emitted as `sync-error` by the command.
     async fn sync_account(
         &self,
         ctx: &MailSyncCtx,
@@ -185,8 +185,8 @@ pub trait MailBackend: Send + Sync {
 /// staleness tracking and reconnect backoff.
 #[async_trait]
 pub trait MailOpExecutor: Send {
-    /// Execute one queued operation. Sync ops never reach this — the
-    /// worker routes them through [`MailBackend::sync_account`].
+    /// Execute one queued operation. Sync and replay operations never reach
+    /// this; the worker handles them directly.
     async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()>;
 
     /// Called once when the worker shuts down; close connections.

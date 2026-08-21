@@ -412,7 +412,6 @@ impl AccountWorker {
     /// routing decision here at compile time.
     async fn execute(&mut self, op: MailOp) -> Result<()> {
         match op {
-            MailOp::SyncAll { current_folder } => self.sync_all(current_folder).await,
             MailOp::SyncFolder { folder_path } => self.sync_folder(folder_path).await,
             MailOp::ReplayOffline => Ok(()),
             op @ (MailOp::MoveMessages { .. }
@@ -536,21 +535,6 @@ impl AccountWorker {
             crate::db::accounts::get_account_full(&conn, &self.account_id)?
         };
         Ok(self.backend.map(|b| (b, account.mail_config())))
-    }
-
-    /// Delegate a full account sync to the backend. Deliberate
-    /// carve-out from the trait's command-path semantics: Graph account
-    /// syncs are owned by `sync_cmd`, so a queued SyncAll is a no-op.
-    async fn sync_all(&mut self, current_folder: Option<String>) -> Result<()> {
-        let Some((backend, account)) = self.sync_target()? else {
-            return Ok(());
-        };
-        if backend.protocol() == "graph" {
-            // Graph sync handled by sync_cmd directly
-            return Ok(());
-        }
-        let ctx = self.ctx.as_ref().expect("worker initialized");
-        backend.sync_account(ctx, &account, current_folder).await
     }
 
     /// Sync a single folder. Deliberate carve-outs from the trait's

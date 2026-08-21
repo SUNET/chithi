@@ -59,14 +59,6 @@ fn should_start_imap_idle(_auth_method: &str) -> bool {
     true
 }
 
-/// O365 IMAP needs IDLE suspended around any other operation because
-/// Microsoft's server only allows one connection per account at a time.
-/// Identifying O365 via auth_method is more accurate than the legacy
-/// `provider` string since Phase 3 dropped that column.
-pub(crate) fn should_suspend_idle_for_imap_operation(auth_method: &str) -> bool {
-    auth_method == "oauth-microsoft"
-}
-
 pub(crate) struct ImapIdleSuspension {
     _account_guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -774,27 +766,6 @@ pub async fn sync_folder(
     sync_result
 }
 
-#[derive(serde::Serialize)]
-pub struct SyncStatus {
-    pub account_id: String,
-    pub is_syncing: bool,
-    pub last_sync: Option<String>,
-    pub error: Option<String>,
-}
-
-#[tauri::command]
-pub async fn get_sync_status(
-    _state: State<'_, AppState>,
-    account_id: String,
-) -> Result<SyncStatus> {
-    Ok(SyncStatus {
-        account_id,
-        is_syncing: false,
-        last_sync: None,
-        error: None,
-    })
-}
-
 /// Prefetch message bodies in the background after sync completes.
 /// Opens a single IMAP connection, groups messages by folder to minimize
 /// SELECT commands, fetches each body, writes to Maildir, and updates DB.
@@ -1254,16 +1225,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn o365_sync_suspends_idle_but_still_allows_idle_startup() {
-        // Phase 3: these helpers now key off auth_method, not provider.
+    fn o365_auth_allows_idle_startup() {
         assert!(super::should_start_imap_idle("oauth-microsoft"));
-        assert!(super::should_suspend_idle_for_imap_operation(
-            "oauth-microsoft"
-        ));
-        assert!(!super::should_suspend_idle_for_imap_operation(
-            "oauth-google"
-        ));
-        assert!(!super::should_suspend_idle_for_imap_operation("password"));
     }
 
     #[test]

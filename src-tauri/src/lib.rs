@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
 mod account;
@@ -87,7 +86,6 @@ pub fn run() {
             commands::mail::save_message_as_eml,
             commands::sync_cmd::trigger_sync,
             commands::sync_cmd::sync_folder,
-            commands::sync_cmd::get_sync_status,
             commands::sync_cmd::prefetch_bodies,
             commands::compose::send_message,
             commands::compose::save_draft,

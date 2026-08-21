@@ -201,13 +201,6 @@ export interface ThreadedPage {
   per_page: number;
 }
 
-export interface SyncStatus {
-  account_id: string;
-  is_syncing: boolean;
-  last_sync: string | null;
-  error: string | null;
-}
-
 export interface AccountConfig {
   display_name: string;
   email: string;

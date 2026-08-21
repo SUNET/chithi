@@ -3,7 +3,6 @@ use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
@@ -12,10 +11,6 @@ use crate::error::Result;
 use crate::ops::lifecycle::WorkerRegistry;
 use crate::ops::queue::OpEntry;
 use crate::ops::worker::AccountWorker;
-
-pub struct SyncHandle {
-    pub abort_handle: tokio::task::AbortHandle,
-}
 
 /// Shared cancellation state for one generation of an IMAP IDLE loop.
 pub struct IdleControl {
@@ -155,7 +150,6 @@ impl MeetLifecycleCoordinator {
 pub struct AppState {
     pub db: Arc<DbPool>,
     pub providers: Arc<crate::provider::ProviderServices>,
-    pub sync_handles: RwLock<HashMap<String, SyncHandle>>,
     pub idle_handles: std::sync::Mutex<HashMap<String, IdleHandle>>,
     pub idle_generation: AtomicU64,
     pub idle_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
@@ -287,7 +281,6 @@ impl AppState {
         Ok(Self {
             db: Arc::new(pool),
             providers: Arc::new(crate::provider::ProviderServices::production()?),
-            sync_handles: RwLock::new(HashMap::new()),
             idle_handles: std::sync::Mutex::new(HashMap::new()),
             idle_generation: AtomicU64::new(1),
             idle_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -360,17 +353,6 @@ impl AppState {
                 drop(receiver);
                 sender
             }
-        }
-    }
-
-    /// Gracefully stop and join an account's operation worker, if present.
-    pub async fn stop_op_worker(&self, account_id: &str) {
-        if let Some(outcome) = self.op_workers.stop_account(account_id).await {
-            log::info!(
-                "Stopped operation worker for account {}: {:?}",
-                account_id,
-                outcome
-            );
         }
     }
 

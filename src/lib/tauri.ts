@@ -7,7 +7,6 @@ import type {
   LastView,
   MessagePage,
   MessageBody,
-  SyncStatus,
   QuickFilter,
   SearchQuery,
   SearchHit,
@@ -189,10 +188,6 @@ export async function triggerSync(
     accountId,
     currentFolder: currentFolder ?? null,
   });
-}
-
-export async function getSyncStatus(accountId: string): Promise<SyncStatus> {
-  return invoke("get_sync_status", { accountId });
 }
 
 export async function prefetchBodies(accountId: string): Promise<number> {

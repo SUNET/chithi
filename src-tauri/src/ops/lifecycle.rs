@@ -163,15 +163,6 @@ where
         Ok(sender)
     }
 
-    pub async fn stop_account(&self, account_id: &str) -> Option<WorkerTaskExit> {
-        let _shutdown_guard = self.shutdown_gate.read().await;
-        let account_lock = self.account_lock(account_id);
-        let _account_guard = account_lock.lock().await;
-
-        let stopping = self.begin_stop(account_id)?;
-        Some(self.finish_stop(account_id, stopping).await)
-    }
-
     pub async fn with_account_stopped<R, F, Fut>(&self, account_id: &str, action: F) -> R
     where
         F: FnOnce() -> Fut,
@@ -330,8 +321,8 @@ mod tests {
         sender.send(1).await.unwrap();
         sender.send(2).await.unwrap();
         assert_eq!(
-            registry.stop_account("account").await,
-            Some(WorkerTaskExit::Completed)
+            registry.stop_all().await,
+            vec![("account".to_string(), WorkerTaskExit::Completed)]
         );
         assert_eq!(processed.load(Ordering::SeqCst), 2);
         assert!(sender.is_closed());
@@ -362,7 +353,11 @@ mod tests {
             .unwrap();
 
         let stop_registry = Arc::clone(&registry);
-        let stop = tokio::spawn(async move { stop_registry.stop_account("account").await });
+        let stop = tokio::spawn(async move {
+            stop_registry
+                .with_account_stopped("account", || async {})
+                .await
+        });
         stopping.notified().await;
 
         let replacement_registry = Arc::clone(&registry);
@@ -391,7 +386,7 @@ mod tests {
         assert_eq!(active_workers.load(Ordering::SeqCst), 1);
 
         release.notify_one();
-        assert_eq!(stop.await.unwrap(), Some(WorkerTaskExit::Completed));
+        stop.await.unwrap();
         let _sender = replacement.await.unwrap();
         assert_eq!(active_workers.load(Ordering::SeqCst), 1);
         registry.stop_all().await;
@@ -423,7 +418,11 @@ mod tests {
             .unwrap();
 
         let stop_registry = Arc::clone(&registry);
-        let stop = tokio::spawn(async move { stop_registry.stop_account("account").await });
+        let stop = tokio::spawn(async move {
+            stop_registry
+                .with_account_stopped("account", || async {})
+                .await
+        });
         stopping.notified().await;
         stop.abort();
         assert!(stop.await.unwrap_err().is_cancelled());
@@ -474,8 +473,8 @@ mod tests {
 
         sender.closed().await;
         assert_eq!(
-            registry.stop_account("account").await,
-            Some(WorkerTaskExit::SupervisorPanicked)
+            registry.stop_all().await,
+            vec![("account".to_string(), WorkerTaskExit::SupervisorPanicked)]
         );
     }
 
@@ -496,7 +495,7 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap_err(), "initialization failed");
-        assert!(registry.stop_account("account").await.is_none());
+        assert!(registry.stop_all().await.is_empty());
     }
 
     #[tokio::test]
