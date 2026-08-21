@@ -8,6 +8,20 @@ Accepted
 
 2026-07-14
 
+## Current implementation note
+
+As of 2026-08-21, callers construct JMAP connections through
+`JmapConnection::connect_with_clients`, injecting the separately
+configured discovery and API HTTP clients. The convenience
+`JmapConnection::connect` described in the historical decision below
+has been removed.
+
+Ordinary event field updates are deliberately not pushed for JMAP or
+CalDAV. Both backends retain the calendar trait's successful no-op
+policy; event creation, deletion and JMAP attendee responses remain
+separate supported paths. The original context and decision text are
+retained unchanged as a historical record.
+
 ## Context
 
 The spec treats Google, Microsoft Graph, JMAP, CalDAV, CardDAV and IMAP

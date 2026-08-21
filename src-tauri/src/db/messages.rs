@@ -40,8 +40,7 @@ pub struct MessageSummary {
     pub message_id: Option<String>,
     /// In-Reply-To header pointing at this message's parent within the
     /// thread. Empty for the thread root or when the source message/backend
-    /// does not provide the header; Microsoft Graph populates this from
-    /// `internetMessageHeaders` when available.
+    /// does not provide the header.
     pub in_reply_to: Option<String>,
 }
 

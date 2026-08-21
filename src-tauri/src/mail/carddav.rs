@@ -66,17 +66,6 @@ pub struct CardDavClient {
 }
 
 impl CardDavClient {
-    /// Create a new CardDAV client with Basic auth.
-    pub async fn connect(
-        carddav_url: &str,
-        username: &str,
-        password: &str,
-        email: &str,
-    ) -> Result<Self> {
-        let http = crate::mail::dav_http::build_dav_client()?;
-        Self::connect_with_client(carddav_url, username, password, email, http).await
-    }
-
     /// Create a CardDAV client using the provided HTTP client.
     pub async fn connect_with_client(
         carddav_url: &str,
@@ -85,7 +74,7 @@ impl CardDavClient {
         email: &str,
         http: reqwest::Client,
     ) -> Result<Self> {
-        let auth = DavAuth::Basic {
+        let auth = DavAuth {
             username: username.to_string(),
             password: password.to_string(),
         };
@@ -107,10 +96,7 @@ impl CardDavClient {
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth {
-            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
-            DavAuth::Bearer { token } => req.bearer_auth(token),
-        }
+        req.basic_auth(&self.auth.username, Some(&self.auth.password))
     }
 
     async fn propfind(&self, url: &str, depth: &str, body: &str) -> Result<String> {
@@ -317,12 +303,9 @@ pub(crate) async fn auto_discover_hosts(
         }
         let url = format!("https://{}/.well-known/carddav", host);
         log::debug!("carddav: trying auto-discovery at {}", url);
-        let req = http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url);
-        let req = match auth {
-            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
-            DavAuth::Bearer { token } => req.bearer_auth(token),
-        };
-        match req
+        match http
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+            .basic_auth(&auth.username, Some(&auth.password))
             .header("Depth", "0")
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(PROPFIND_PRINCIPAL)
@@ -705,9 +688,15 @@ mod connect_tests {
     }
 
     #[tokio::test]
-    async fn connect_rejects_http_url() {
-        let msg = match CardDavClient::connect("http://example.com/dav/", "u", "p", "u@example.com")
-            .await
+    async fn connect_with_client_rejects_http_url() {
+        let msg = match CardDavClient::connect_with_client(
+            "http://example.com/dav/",
+            "u",
+            "p",
+            "u@example.com",
+            reqwest::Client::new(),
+        )
+        .await
         {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
@@ -751,7 +740,7 @@ mod connect_tests {
         CardDavClient {
             http: reqwest::Client::new(),
             base_url: base.to_string(),
-            auth: DavAuth::Basic {
+            auth: DavAuth {
                 username: "u".into(),
                 password: "p".into(),
             },

@@ -909,11 +909,11 @@ pub fn search_account_blocking(
 /// (`Sent Messages`) and Gmail (`[Gmail]/Sent Mail`).
 ///
 /// This is the post-SMTP-send hook from #189: SMTP submission alone
-/// never writes to Sent (JMAP/Graph send APIs handle Sent server-side,
-/// but Exchange-via-SMTP and plain IMAP do not). Callers should treat
-/// failures as best-effort — the message has already been delivered,
-/// so a failed APPEND must NOT bubble up and trigger an outbox retry
-/// (that would cause duplicate delivery).
+/// never writes to Sent for plain IMAP or O365 SMTP+XOAUTH2 accounts.
+/// JMAP submission handles Sent server-side and does not use this hook.
+/// Callers should treat failures as best-effort — the message has already
+/// been delivered, so a failed APPEND must NOT bubble up and trigger an
+/// outbox retry (that would cause duplicate delivery).
 ///
 /// Blocking. Wrap in `tokio::task::spawn_blocking` from async code.
 pub fn append_message_to_sent(

@@ -398,6 +398,9 @@ mod registry_tests {
             BodyLocation::NotFetched,
         )
         .unwrap();
-        assert_eq!(request.message_ref.jmap_email_id(), Some("raw_email_id"));
+        assert_eq!(
+            request.message_ref.into_jmap_email_id().as_deref(),
+            Some("raw_email_id")
+        );
     }
 }

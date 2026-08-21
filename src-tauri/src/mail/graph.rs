@@ -1,7 +1,7 @@
 //! Microsoft Graph API client for O365 mail, calendar, and contacts.
 //!
 //! All operations go through `https://graph.microsoft.com/v1.0` with
-//! Bearer token authentication. No IMAP/SMTP needed for O365 accounts.
+//! Bearer token authentication. O365 mail delivery remains on SMTP+XOAUTH2.
 
 use crate::error::{Error, Result};
 use crate::mail::search::build_graph_kql;
@@ -313,14 +313,6 @@ pub struct GraphBusyPeriod {
 }
 
 impl GraphClient {
-    pub fn new(access_token: &str) -> Self {
-        Self::with_client(
-            reqwest::Client::new(),
-            access_token,
-            GraphEndpoints::default(),
-        )
-    }
-
     pub fn with_client(
         http: reqwest::Client,
         access_token: &str,
@@ -340,7 +332,7 @@ impl GraphClient {
     /// retry storm made the throttling worse.
     ///
     /// `retry_transient` must be `false` for non-idempotent requests
-    /// (POSTs like `/sendMail`, resource creation, `$batch` with moves):
+    /// (POSTs like resource creation and `$batch` with moves):
     /// a gateway 503/504 can arrive after Graph has already committed the
     /// request, and a blind retry would duplicate mail or resources. 429
     /// is always safe to retry — it means the request was rejected before
@@ -579,8 +571,8 @@ impl GraphClient {
                         .json(body)
                 },
                 &format!("POST {}", path),
-                // POST is not idempotent (sendMail, resource creation,
-                // $batch moves): 429-only retry.
+                // POST is not idempotent (resource creation and $batch
+                // moves): 429-only retry.
                 false,
             )
             .await?;
@@ -841,36 +833,6 @@ impl GraphClient {
     // Messages
     // -----------------------------------------------------------------------
 
-    /// Fetch messages from a mail folder.
-    pub async fn list_messages(
-        &self,
-        folder_id: &str,
-        top: u32,
-        skip: u32,
-    ) -> Result<(Vec<GraphMessage>, i64)> {
-        let resp = self.get(
-            &format!("/me/mailFolders/{}/messages", folder_id),
-            &[
-                ("$select", "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,flag,internetMessageId,conversationId,bodyPreview,importance,internetMessageHeaders"),
-                ("$top", &top.to_string()),
-                ("$skip", &skip.to_string()),
-                ("$orderby", "receivedDateTime desc"),
-                ("$count", "true"),
-            ],
-        ).await?;
-
-        let total = resp["@odata.count"].as_i64().unwrap_or(0);
-        let mut messages = Vec::new();
-
-        if let Some(values) = resp["value"].as_array() {
-            for m in values {
-                messages.push(parse_graph_message(m));
-            }
-        }
-
-        Ok((messages, total))
-    }
-
     /// Fetch one page of a messages delta query for a folder.
     ///
     /// With `link == None` this starts a fresh (full) enumeration; with a
@@ -889,7 +851,7 @@ impl GraphClient {
     ) -> Result<GraphDeltaPage> {
         const DELTA_SELECT: &str = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,\
                                     isRead,hasAttachments,flag,internetMessageId,conversationId,\
-                                    bodyPreview,importance";
+                                    bodyPreview";
 
         let what = format!("GET messages/delta for {}", folder_id);
         let resp = self
@@ -1015,52 +977,6 @@ impl GraphClient {
         Ok(hits)
     }
 
-    /// Fetch the full body of a message.
-    pub async fn get_message_body(&self, message_id: &str) -> Result<GraphMessageBody> {
-        let resp = self
-            .get(
-                &format!("/me/messages/{}", message_id),
-                &[("$select", "body,uniqueBody")],
-            )
-            .await?;
-
-        let content_type = resp["body"]["contentType"].as_str().unwrap_or("text");
-        let content = resp["body"]["content"].as_str().unwrap_or("").to_string();
-
-        Ok(GraphMessageBody {
-            content_type: content_type.to_string(),
-            content,
-        })
-    }
-
-    pub async fn get_attachments(
-        &self,
-        message_id: &str,
-    ) -> Result<Vec<crate::message::Attachment>> {
-        let resp = self
-            .get(
-                &format!("/me/messages/{}/attachments", message_id),
-                &[("$select", "id,name,contentType,size")],
-            )
-            .await?;
-
-        let mut attachments = Vec::new();
-        if let Some(values) = resp["value"].as_array() {
-            for (i, att) in values.iter().enumerate() {
-                attachments.push(crate::message::Attachment {
-                    index: i as u32,
-                    filename: att["name"].as_str().map(|s| s.to_string()),
-                    content_type: att["contentType"]
-                        .as_str()
-                        .unwrap_or("application/octet-stream")
-                        .to_string(),
-                    size: att["size"].as_u64().unwrap_or(0),
-                });
-            }
-        }
-        Ok(attachments)
-    }
-
     /// Download the raw RFC 5322 MIME message and stream it directly to a file.
     /// Returns the number of bytes written. Never buffers the full message in memory.
     pub async fn download_mime_to_file(
@@ -1072,38 +988,11 @@ impl GraphClient {
             .await
     }
 
-    pub async fn save_draft(&self, message: &GraphSendMessage) -> Result<()> {
+    pub async fn save_draft(&self, message: &GraphDraftMessage) -> Result<()> {
         let body = graph_draft_json(message);
 
         self.post_json("/me/messages", &body).await?;
         log::info!("Graph: draft saved successfully");
-        Ok(())
-    }
-
-    /// Send a mail message via Graph API.
-    pub async fn send_mail(&self, message: &GraphSendMessage) -> Result<()> {
-        let body = serde_json::json!({
-            "message": {
-                "subject": message.subject,
-                "body": {
-                    "contentType": "Text",
-                    "content": message.body_text
-                },
-                "toRecipients": message.to.iter().map(|e| {
-                    serde_json::json!({ "emailAddress": { "address": e } })
-                }).collect::<Vec<_>>(),
-                "ccRecipients": message.cc.iter().map(|e| {
-                    serde_json::json!({ "emailAddress": { "address": e } })
-                }).collect::<Vec<_>>(),
-                "bccRecipients": message.bcc.iter().map(|e| {
-                    serde_json::json!({ "emailAddress": { "address": e } })
-                }).collect::<Vec<_>>(),
-            },
-            "saveToSentItems": true
-        });
-
-        self.post_json("/me/sendMail", &body).await?;
-        log::info!("Graph: mail sent successfully");
         Ok(())
     }
 
@@ -1241,18 +1130,6 @@ impl GraphClient {
         self.execute_batch_with_retry(requests, true).await
     }
 
-    pub async fn move_message(&self, message_id: &str, dest_folder_id: &str) -> Result<()> {
-        let body = serde_json::json!({ "destinationId": dest_folder_id });
-        self.post_json(&format!("/me/messages/{}/move", message_id), &body)
-            .await?;
-        Ok(())
-    }
-
-    /// Delete a message (moves to Deleted Items).
-    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
-        self.delete(&format!("/me/messages/{}", message_id)).await
-    }
-
     /// Delete a mail folder.
     pub async fn delete_mail_folder(&self, folder_id: &str) -> Result<()> {
         self.delete(&format!("/me/mailFolders/{}", folder_id)).await
@@ -1283,16 +1160,6 @@ impl GraphClient {
         Ok(id)
     }
 
-    /// Update message properties (isRead, flag, etc).
-    pub async fn update_message(
-        &self,
-        message_id: &str,
-        updates: &serde_json::Value,
-    ) -> Result<()> {
-        self.patch_json(&format!("/me/messages/{}", message_id), updates)
-            .await
-    }
-
     /// Mark messages as read or unread and return one outcome per input id.
     pub async fn set_read_status_batch(
         &self,
@@ -1313,20 +1180,6 @@ impl GraphClient {
             })
             .collect();
         self.execute_batch_with_retry(requests, true).await
-    }
-
-    /// Mark messages as read or unread.
-    pub async fn set_read_status(&self, message_ids: &[String], is_read: bool) -> Result<()> {
-        let outcomes = self.set_read_status_batch(message_ids, is_read).await?;
-        for outcome in outcomes {
-            if let Err(e) = outcome {
-                return Err(Error::Other(format!(
-                    "Graph set-read-status batch item failed: {}",
-                    e
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Set supported mail flags through Graph JSON batching.
@@ -1637,13 +1490,8 @@ impl GraphClient {
             .await
     }
 
-    /// Fetch events in a time range via calendarView.
-    /// Uses `Prefer: outlook.timezone="UTC"` so all times come back in UTC.
     /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
-    /// Same query semantics as `list_events`, just scoped to one
-    /// calendar so multi-calendar accounts (#47) can keep events
-    /// separated. Pagination follows `@odata.nextLink` exactly like
-    /// `list_events`.
+    /// Uses `Prefer: outlook.timezone="UTC"` and follows `@odata.nextLink`.
     pub async fn list_events_for_calendar(
         &self,
         calendar_id: &str,
@@ -1687,7 +1535,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -1718,80 +1566,6 @@ impl GraphClient {
                 .map(|s: &str| s.to_string());
             match next_link {
                 Some(next) => next_path = Some(next),
-                None => break,
-            }
-        }
-        Ok(events)
-    }
-
-    pub async fn list_events(&self, start: &str, end: &str) -> Result<Vec<GraphCalendarEvent>> {
-        let mut events = Vec::new();
-        let mut next_path: Option<String> = None;
-        loop {
-            let resp: serde_json::Value = match next_path.take() {
-                Some(path) => {
-                    // Pagination: next link is a full URL, fetch directly with UTC preference
-                    let resp = self
-                        .http
-                        .get(&path)
-                        .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\"")
-                        .send()
-                        .await
-                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    if !status.is_success() {
-                        return Err(Error::Other(format!(
-                            "Graph GET returned {}: {}",
-                            status,
-                            truncate(&body, 500)
-                        )));
-                    }
-                    serde_json::from_str(&body)
-                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
-                }
-                None => {
-                    let url = self.endpoints.v1_url("/me/calendarView");
-                    let resp = self.http
-                        .get(&url)
-                        .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\"")
-                        .query(&[
-                            ("startDateTime", start),
-                            ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,recurrence,responseStatus"),
-                            ("$top", "100"),
-                            ("$orderby", "start/dateTime"),
-                        ])
-                        .send()
-                        .await
-                        .map_err(|e| Error::Other(format!("Graph GET /me/calendarView failed: {}", e)))?;
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    if !status.is_success() {
-                        return Err(Error::Other(format!(
-                            "Graph GET /me/calendarView returned {}: {}",
-                            status,
-                            truncate(&body, 500)
-                        )));
-                    }
-                    serde_json::from_str(&body)
-                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
-                }
-            };
-            if let Some(items) = resp["value"].as_array() {
-                for e in items {
-                    events.push(parse_graph_event(e));
-                }
-            }
-            let next_link = resp["@odata.nextLink"]
-                .as_str()
-                .map(|s: &str| s.to_string());
-            match next_link {
-                Some(next) => {
-                    next_path = Some(next);
-                }
                 None => break,
             }
         }
@@ -1885,7 +1659,7 @@ impl GraphClient {
                     self.get(
                         "/me/contacts",
                         &[
-                            ("$select", "id,displayName,givenName,surname,middleName,emailAddresses,mobilePhone,businessPhones,homePhones,companyName,jobTitle"),
+                            ("$select", "id,displayName,emailAddresses,mobilePhone,businessPhones,homePhones,companyName,jobTitle"),
                             ("$top", "500"),
                             ("$orderby", "displayName"),
                         ],
@@ -1932,7 +1706,7 @@ impl GraphClient {
     }
 }
 
-fn graph_draft_json(message: &GraphSendMessage) -> serde_json::Value {
+fn graph_draft_json(message: &GraphDraftMessage) -> serde_json::Value {
     serde_json::json!({
         "subject": message.subject,
         "body": {
@@ -1953,11 +1727,11 @@ fn graph_draft_json(message: &GraphSendMessage) -> serde_json::Value {
 
 #[cfg(test)]
 mod draft_tests {
-    use super::{graph_draft_json, GraphSendMessage};
+    use super::{graph_draft_json, GraphDraftMessage};
 
     #[test]
     fn structured_draft_preserves_all_fields() {
-        let message = GraphSendMessage {
+        let message = GraphDraftMessage {
             to: vec!["to@example.com".into()],
             cc: vec!["cc@example.com".into()],
             bcc: vec!["bcc@example.com".into()],
@@ -2057,8 +1831,6 @@ mod flag_update_tests {
 pub struct GraphContact {
     pub id: String,
     pub display_name: String,
-    pub given_name: Option<String>,
-    pub surname: Option<String>,
     pub emails_json: String,
     pub phones_json: String,
     pub organization: Option<String>,
@@ -2191,21 +1963,9 @@ pub struct GraphMessage {
     pub internet_message_id: Option<String>,
     pub conversation_id: Option<String>,
     pub preview: Option<String>,
-    /// Pulled from internetMessageHeaders (In-Reply-To). Wrapped in
-    /// angle brackets to match how IMAP/JMAP store it.
-    pub in_reply_to: Option<String>,
-    /// Pulled from internetMessageHeaders (References), root first,
-    /// each id wrapped in angle brackets.
-    pub references: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct GraphMessageBody {
-    pub content_type: String,
-    pub content: String,
-}
-
-pub struct GraphSendMessage {
+pub struct GraphDraftMessage {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
@@ -2238,7 +1998,6 @@ pub struct GraphCalendarEvent {
     /// organized, or invites not yet responded to).
     pub my_status: Option<String>,
     pub ical_uid: Option<String>,
-    pub is_recurring: bool,
 }
 
 fn parse_graph_rooms(value: &serde_json::Value) -> Vec<GraphRoom> {
@@ -2475,8 +2234,6 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
         .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
         .unwrap_or_default();
 
-    let (in_reply_to, references) = parse_message_headers(&m["internetMessageHeaders"]);
-
     GraphMessage {
         id: m["id"].as_str().unwrap_or("").to_string(),
         subject: m["subject"].as_str().map(|s| s.to_string()),
@@ -2493,58 +2250,7 @@ fn parse_graph_message(m: &serde_json::Value) -> GraphMessage {
             .and_then(normalize_message_id),
         conversation_id: m["conversationId"].as_str().map(|s| s.to_string()),
         preview: m["bodyPreview"].as_str().map(|s| s.to_string()),
-        in_reply_to,
-        references,
     }
-}
-
-/// Walk Graph's `internetMessageHeaders` array (each entry is
-/// `{ "name": "...", "value": "..." }`) and pull out In-Reply-To and
-/// References as the wrapped Message-IDs the rest of chithi expects.
-fn parse_message_headers(arr: &serde_json::Value) -> (Option<String>, Vec<String>) {
-    let Some(items) = arr.as_array() else {
-        return (None, Vec::new());
-    };
-    let mut in_reply_to: Option<String> = None;
-    let mut references: Vec<String> = Vec::new();
-    for item in items {
-        let name = item["name"].as_str().unwrap_or("");
-        let value = item["value"].as_str().unwrap_or("");
-        if value.is_empty() {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("In-Reply-To") && in_reply_to.is_none() {
-            in_reply_to = extract_message_ids(value).into_iter().next();
-        } else if name.eq_ignore_ascii_case("References") {
-            references = extract_message_ids(value);
-        }
-    }
-    (in_reply_to, references)
-}
-
-/// Pull every `<message-id>` token from a header value.
-fn extract_message_ids(s: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let mut inside = false;
-    for c in s.chars() {
-        match c {
-            '<' => {
-                inside = true;
-                buf.clear();
-            }
-            '>' if inside => {
-                if let Some(id) = normalize_message_id(&buf) {
-                    out.push(id);
-                }
-                inside = false;
-                buf.clear();
-            }
-            _ if inside => buf.push(c),
-            _ => {}
-        }
-    }
-    out
 }
 
 fn parse_recipients(arr: &serde_json::Value) -> String {
@@ -2696,14 +2402,11 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
             e["responseStatus"]["response"].as_str().unwrap_or("none"),
         ),
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
-        is_recurring: e["recurrence"].is_object(),
     }
 }
 
 fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
     let display_name = c["displayName"].as_str().unwrap_or("").to_string();
-    let given_name = c["givenName"].as_str().map(|s| s.to_string());
-    let surname = c["surname"].as_str().map(|s| s.to_string());
     let organization = c["companyName"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -2757,8 +2460,6 @@ fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
     GraphContact {
         id: c["id"].as_str().unwrap_or("").to_string(),
         display_name,
-        given_name,
-        surname,
         emails_json,
         phones_json,
         organization,

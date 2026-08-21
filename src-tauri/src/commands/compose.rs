@@ -326,11 +326,10 @@ pub async fn send_message(
 
                 // Best-effort: APPEND the sent message to the IMAP Sent
                 // folder (#189). SMTP submission alone never writes to
-                // Sent for plain IMAP+SMTP or Exchange-via-SMTP-AUTH;
-                // JMAP / Graph send APIs are unaffected because they
-                // populate Sent server-side. Failures here MUST NOT
-                // propagate — the message has been delivered, and a
-                // retried send would duplicate it for the recipient.
+                // Sent for plain IMAP+SMTP or O365 SMTP+XOAUTH2. The JMAP
+                // branch below handles Sent server-side and skips this
+                // hook. Failures here MUST NOT propagate — the message has
+                // been delivered, and a retried send would duplicate it.
                 // Read-only lookup — use the pool's reader so we don't
                 // serialize on the single-writer mutex.
                 let sent_folder_path = {

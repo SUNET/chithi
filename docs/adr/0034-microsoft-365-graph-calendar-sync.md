@@ -9,6 +9,15 @@ O365 accounts use IMAP/SMTP for mail (with XOAUTH2), but calendar sync requires 
 ## Decision
 Implement full calendar CRUD via Microsoft Graph API for O365 accounts, following the same patterns as existing Google Calendar and JMAP calendar integrations.
 
+### Current-state amendment (2026-08-21)
+
+- Sync lists every Graph calendar, preserves each local subscription setting, and fetches each subscribed calendar through `list_events_for_calendar()` at `GET /me/calendars/{id}/calendarView` with UTC preference and pagination.
+- Events retain their remote-to-local calendar mapping and are reconciled per calendar. Multi-calendar sync is therefore supported; new events are still created on the account's default calendar.
+- The account-wide `list_events()` client API has been removed. Recurrence metadata is not requested or persisted, and synced events continue to use `recurrence_rule = None`.
+- Calendar sync still re-fetches the bounded six-month window rather than using calendar delta queries.
+
+This amendment supersedes the earlier method table, flow, and limitations where they conflict, while preserving their historical context.
+
 ### Token management
 O365 uses a single refresh token for two resource servers (IMAP and Graph). The stored access token is IMAP-scoped, so `get_graph_token()` always refreshes with Graph-specific scopes (`User.Read Calendars.ReadWrite Contacts.ReadWrite offline_access`) rather than checking expiry on the cached token. The refresh may rotate the refresh token — only the refreshed token is saved back, preserving the stored IMAP access token.
 

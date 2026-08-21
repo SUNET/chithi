@@ -1,7 +1,6 @@
 use mail_parser::{Address as MailAddress, HeaderValue, MessageParser, MimeHeaders};
 
-use crate::db::messages::NewMessage;
-use crate::message::{Address, Attachment, BackendMessageRef, MessageBody};
+use crate::message::{Address, Attachment, MessageBody};
 
 fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
     match addr {
@@ -30,92 +29,6 @@ fn mail_address_to_list(addr: &MailAddress<'_>) -> Vec<Address> {
             })
             .collect(),
     }
-}
-
-/// Parse a raw RFC 5322 message into metadata for indexing.
-pub fn parse_envelope(
-    account_id: &str,
-    folder_path: &str,
-    uid: u32,
-    raw: &[u8],
-    maildir_path: &str,
-) -> Option<NewMessage> {
-    let parsed = MessageParser::default().parse(raw)?;
-
-    let from_list = parsed
-        .from()
-        .map(|a| mail_address_to_list(a))
-        .unwrap_or_default();
-    let from_name = from_list.first().and_then(|a| a.name.clone());
-    let from_email = from_list
-        .first()
-        .map(|a| a.email.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let message_id = parsed.message_id().map(|s| s.to_string());
-    let in_reply_to = match parsed.in_reply_to() {
-        HeaderValue::Text(t) => Some(t.to_string()),
-        HeaderValue::TextList(list) => list.first().map(|s| s.to_string()),
-        _ => None,
-    };
-
-    let subject = parsed.subject().map(|s| s.to_string());
-
-    let to_list = parsed
-        .to()
-        .map(|a| mail_address_to_list(a))
-        .unwrap_or_default();
-    let cc_list = parsed
-        .cc()
-        .map(|a| mail_address_to_list(a))
-        .unwrap_or_default();
-
-    let date = parsed
-        .date()
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-    let body_text = parsed.body_text(0).map(|s| s.to_string());
-    let snippet = body_text
-        .as_ref()
-        .map(|t| t.chars().take(200).collect::<String>());
-
-    let has_attachments = parsed.attachment_count() > 0;
-    let is_encrypted = parsed
-        .content_type()
-        .map(|ct| {
-            ct.ctype() == "multipart" && ct.subtype().map(|s| s == "encrypted").unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let is_signed = parsed
-        .content_type()
-        .map(|ct| ct.ctype() == "multipart" && ct.subtype().map(|s| s == "signed").unwrap_or(false))
-        .unwrap_or(false);
-
-    let id = BackendMessageRef::imap(folder_path, uid).to_db_id(account_id);
-
-    Some(NewMessage {
-        id,
-        account_id: account_id.to_string(),
-        folder_path: folder_path.to_string(),
-        uid,
-        message_id,
-        in_reply_to,
-        thread_id: None, // Thread ID is computed separately during sync
-        subject,
-        from_name,
-        from_email,
-        to_addresses: serde_json::to_string(&to_list).unwrap_or_default(),
-        cc_addresses: serde_json::to_string(&cc_list).unwrap_or_default(),
-        date,
-        size: raw.len() as u64,
-        has_attachments,
-        is_encrypted,
-        is_signed,
-        flags: "[]".to_string(),
-        maildir_path: maildir_path.to_string(),
-        snippet,
-    })
 }
 
 /// Parse a raw message into a full MessageBody for the reader view.
@@ -245,9 +158,9 @@ pub fn parse_html_with_images(raw: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_envelope, parse_html_with_images, parse_message_body};
-    use crate::db::messages::NewMessage;
-    use crate::message::{Address, MessageBody};
+    use super::{mail_address_to_list, parse_html_with_images, parse_message_body};
+    use crate::message::MessageBody;
+    use mail_parser::MessageParser;
 
     const ADDRESSES: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/addresses");
     const ATTACHMENT: &[u8] =
@@ -257,27 +170,18 @@ mod tests {
     const NOT_EMOJI: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/not-emoji");
     const PUNYCODE: &[u8] = include_bytes!("../../../tests/fixtures/eai-test-messages/punycode");
 
-    fn envelope(raw: &[u8]) -> NewMessage {
-        parse_envelope("account", "INBOX", 1, raw, "message.eml").expect("EAI message should parse")
-    }
-
     fn body(raw: &[u8]) -> MessageBody {
-        let envelope = envelope(raw);
         parse_message_body(
-            &envelope.id,
+            "test-message",
             raw,
-            &envelope.from_email,
-            &envelope.to_addresses,
-            &envelope.cc_addresses,
-            &envelope.flags,
-            envelope.is_encrypted,
-            envelope.is_signed,
+            "fallback@example.invalid",
+            "[]",
+            "[]",
+            "[]",
+            false,
+            false,
         )
         .expect("EAI message body should parse")
-    }
-
-    fn addresses(json: &str) -> Vec<Address> {
-        serde_json::from_str(json).expect("parser should emit valid address JSON")
     }
 
     fn html_message(html: &str) -> Vec<u8> {
@@ -307,11 +211,14 @@ mod tests {
 
     #[test]
     fn parses_unicode_addresses_in_structured_headers() {
-        let message = envelope(ADDRESSES);
+        let message = MessageParser::default()
+            .parse(ADDRESSES)
+            .expect("EAI message should parse");
+        let from = mail_address_to_list(message.from().expect("From header should parse"));
+        let cc = mail_address_to_list(message.cc().expect("Cc header should parse"));
 
-        assert_eq!(message.from_name.as_deref(), Some("Jøran Øygårdvær"));
-        assert_eq!(message.from_email, "jøran@example.com");
-        let cc = addresses(&message.cc_addresses);
+        assert_eq!(from[0].name.as_deref(), Some("Jøran Øygårdvær"));
+        assert_eq!(from[0].email, "jøran@example.com");
         assert_eq!(cc.len(), 1);
         assert_eq!(cc[0].name.as_deref(), Some("Jøran Øygårdvær"));
         assert_eq!(cc[0].email, "jøran@example.com");
@@ -331,18 +238,24 @@ mod tests {
 
     #[test]
     fn preserves_punycode_domains_and_unicode_local_parts() {
-        let message = envelope(PUNYCODE);
-        let to = addresses(&message.to_addresses);
+        let message = MessageParser::default()
+            .parse(PUNYCODE)
+            .expect("EAI message should parse");
+        let from = mail_address_to_list(message.from().expect("From header should parse"));
+        let to = mail_address_to_list(message.to().expect("To header should parse"));
 
-        assert_eq!(message.from_email, "info@xn--dmi-0na.fo");
+        assert_eq!(from[0].email, "info@xn--dmi-0na.fo");
         assert_eq!(to[0].email, "dømi@xn--dmi-0na.fo");
     }
 
     #[test]
     fn does_not_decode_punycode_like_local_part() {
-        let message = envelope(NOT_EMOJI);
+        let message = MessageParser::default()
+            .parse(NOT_EMOJI)
+            .expect("EAI message should parse");
+        let from = mail_address_to_list(message.from().expect("From header should parse"));
 
-        assert_eq!(message.from_email, "xn--ls8ha@outlook.com");
+        assert_eq!(from[0].email, "xn--ls8ha@outlook.com");
     }
 
     #[test]

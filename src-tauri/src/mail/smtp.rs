@@ -71,121 +71,6 @@ fn sender_message_id(from: &Mailbox) -> String {
     )
 }
 
-/// Send an email message via SMTP.
-///
-/// `in_reply_to` and `references` carry RFC 5322 threading headers,
-/// already wrapped in angle brackets. Without these the receiving
-/// client cannot link the new message to its parent.
-#[allow(clippy::too_many_arguments)]
-pub async fn send_message(
-    smtp_host: &str,
-    smtp_port: u16,
-    username: &str,
-    password: &str,
-    use_tls: bool,
-    use_xoauth2: bool,
-    from: &str,
-    to: &[String],
-    cc: &[String],
-    bcc: &[String],
-    subject: &str,
-    body_text: &str,
-    body_html: Option<&str>,
-    attachments: &[AttachmentData],
-    in_reply_to: Option<&str>,
-    references: &[String],
-) -> Result<()> {
-    log::info!(
-        "SMTP sending message from {} to {:?} via {}:{} ({} attachments, threading={})",
-        from,
-        to,
-        smtp_host,
-        smtp_port,
-        attachments.len(),
-        in_reply_to.is_some(),
-    );
-
-    let from_mailbox: Mailbox = from
-        .parse()
-        .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
-
-    // Emit a Message-ID explicitly: lettre's `build()` adds none on its
-    // own, and the next reply needs one to point In-Reply-To at. The
-    // domain is the sender's (see `sender_message_id`), not lettre's
-    // local-hostname default.
-    let message_id = sender_message_id(&from_mailbox);
-    let mut builder = Message::builder()
-        .from(from_mailbox)
-        .subject(subject)
-        .message_id(Some(message_id));
-
-    for addr in to {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'to' address '{}': {}", addr, e)))?;
-        builder = builder.to(mailbox);
-    }
-    for addr in cc {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'cc' address '{}': {}", addr, e)))?;
-        builder = builder.cc(mailbox);
-    }
-    for addr in bcc {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'bcc' address '{}': {}", addr, e)))?;
-        builder = builder.bcc(mailbox);
-    }
-
-    if let Some(irt) = in_reply_to {
-        let trimmed = irt.trim();
-        if !trimmed.is_empty() {
-            builder = builder.in_reply_to(trimmed.to_string());
-        }
-    }
-    if !references.is_empty() {
-        let joined = references
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !joined.is_empty() {
-            builder = builder.references(joined);
-        }
-    }
-
-    let body = build_body(body_text, body_html, attachments)
-        .map_err(|e| Error::Other(format!("Failed to build body: {}", e)))?;
-
-    let message = builder
-        .multipart(body)
-        .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
-
-    let transport = build_transport(
-        smtp_host,
-        smtp_port,
-        username,
-        password,
-        use_tls,
-        use_xoauth2,
-    )?;
-
-    let response = transport.send(message).await.map_err(|e| {
-        log::error!("SMTP send failed: {}", e);
-        Error::Other(format!("SMTP send failed: {}", e))
-    })?;
-
-    log::info!(
-        "SMTP message sent successfully: {} (code {})",
-        response.message().collect::<Vec<_>>().join(", "),
-        response.code()
-    );
-
-    Ok(())
-}
-
 /// Build an SMTP transport from connection parameters.
 ///
 /// Port 587 forces STARTTLS regardless of `use_tls`; port 465 (or
@@ -256,10 +141,11 @@ fn parse_address(addr: &str) -> Result<Address> {
 
 /// Send a previously-built RFC 5322 message via SMTP.
 ///
-/// Used for retries: `compose::send_message` already built and persisted
-/// the bytes, so on replay we don't reconstruct them. The envelope is
-/// stored separately because the bytes alone may not carry the full
-/// recipient list (Bcc is sometimes stripped before transmission).
+/// `commands::compose::send_message` and outbox retries pass the final
+/// persisted bytes here, so SMTP never reconstructs structured fields.
+/// The envelope is stored separately because the bytes alone may not
+/// carry the full recipient list (Bcc is sometimes stripped before
+/// transmission).
 #[allow(clippy::too_many_arguments)]
 pub async fn send_raw(
     smtp_host: &str,
@@ -320,7 +206,11 @@ pub async fn send_raw(
     Ok(())
 }
 
-/// Build a raw RFC5322 message (for JMAP submission).
+/// Build a raw RFC 5322 message for outbound submission.
+///
+/// `commands::compose::send_message` builds these bytes before optional
+/// wrapping and outbox persistence. The final bytes are then submitted
+/// unchanged through JMAP or `send_raw`.
 ///
 /// `in_reply_to` and `references` carry the threading headers. The id
 /// strings should arrive WITH their angle brackets — lettre stores them
@@ -918,13 +808,13 @@ mod pgp_wrap_tests {
         assert!(s.contains("Hello, world."));
     }
 
-    /// Regression: when send_message routes a PGP-wrapped raw via SMTP it
-    /// must transmit the wrapped bytes verbatim through `send_raw`. The
-    /// previous code path rebuilt the message from the structured
-    /// ComposeMessage fields, silently dropping the wrapping and leaking
-    /// the cleartext body on the wire. This test pins the data flow:
-    /// once `wrap_pgp_mime_encrypted` runs, the original plaintext body
-    /// must NOT appear anywhere in the wire bytes.
+    /// Regression: when `commands::compose::send_message` routes a
+    /// PGP-wrapped raw message via SMTP, it must transmit the wrapped
+    /// bytes verbatim through `send_raw`. The previous code path rebuilt
+    /// the message from the structured ComposeMessage fields, silently
+    /// dropping the wrapping and leaking the cleartext body on the wire.
+    /// This test pins the data flow: once `wrap_pgp_mime_encrypted` runs,
+    /// the original plaintext body must NOT appear in the wire bytes.
     #[test]
     fn encrypted_wrapped_bytes_do_not_leak_plaintext_body() {
         let secret = "ULTRA_SECRET_PAYLOAD_42";

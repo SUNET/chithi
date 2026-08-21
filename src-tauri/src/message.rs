@@ -208,13 +208,6 @@ impl BackendMessageRef {
         }
     }
 
-    pub fn jmap_email_id(&self) -> Option<&str> {
-        match self {
-            Self::Jmap { email_id, .. } => Some(email_id),
-            _ => None,
-        }
-    }
-
     pub fn into_jmap_email_id(self) -> Option<String> {
         match self {
             Self::Jmap { email_id, .. } => Some(email_id),
@@ -557,7 +550,10 @@ mod tests {
             "acc_1_parent_child_email_with_underscores",
         )
         .unwrap();
-        assert_eq!(parsed.jmap_email_id(), Some("email_with_underscores"));
+        assert_eq!(
+            parsed.into_jmap_email_id().as_deref(),
+            Some("email_with_underscores")
+        );
     }
 
     #[test]
