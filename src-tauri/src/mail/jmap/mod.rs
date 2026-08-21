@@ -18,6 +18,9 @@
 use crate::error::{Error, Result};
 use serde::Deserialize;
 
+const MAIL_CAPABILITY: &str = "urn:ietf:params:jmap:mail";
+const SUBMISSION_CAPABILITY: &str = "urn:ietf:params:jmap:submission";
+
 mod calendar;
 mod contacts;
 mod identities;
@@ -25,7 +28,7 @@ mod mail;
 mod mailboxes;
 
 pub use calendar::JmapCalendarEvent;
-pub use mail::{JmapEmail, JmapFetchResult};
+pub use mail::{JmapEmail, JmapFetchResult, JmapSubmissionEnvelope};
 
 #[derive(Clone)]
 pub struct JmapConfig {
@@ -62,7 +65,17 @@ mod connect_tests {
             "apiUrl": "http://127.0.0.1:9/jmap/api",
             "downloadUrl": "http://127.0.0.1:9/jmap/download/{blobId}",
             "uploadUrl": "http://127.0.0.1:9/jmap/upload/{accountId}",
-            "primaryAccounts": { "urn:ietf:params:jmap:mail": "account-1" }
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "account-1" },
+            "accounts": {
+                "account-1": {
+                    "accountCapabilities": {
+                        "urn:ietf:params:jmap:submission": {
+                            "maxDelayedSend": 0,
+                            "submissionExtensions": { "SMTPUTF8": [] }
+                        }
+                    }
+                }
+            }
         })
         .to_string();
 
@@ -115,13 +128,16 @@ mod connect_tests {
             oidc_client_id: String::new(),
         };
         let discovery_http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-injected-client", HeaderValue::from_static("jmap-test"));
         let api_http = reqwest::Client::builder()
             .default_headers(headers)
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
 
@@ -131,6 +147,7 @@ mod connect_tests {
         let request = request_rx.await.unwrap();
         assert_eq!(connection.account_id, "account-1");
         assert_eq!(connection.api_url, format!("{}/jmap/api", base_url));
+        assert!(connection.supports_submission_extension("SMTPUTF8"));
         assert!(request.starts_with("GET /.well-known/jmap HTTP/1.1\r\n"));
         assert_eq!(header(&request, "x-injected-client"), Some("jmap-test"));
         (connection, request)
@@ -415,6 +432,7 @@ pub struct JmapConnection {
     event_source_url_template: Option<String>,
     account_id: String,
     max_objects_in_set: usize,
+    submission_extensions: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -431,12 +449,26 @@ struct JmapSession {
     primary_accounts: std::collections::HashMap<String, String>,
     #[serde(default)]
     capabilities: std::collections::HashMap<String, JmapCoreCapability>,
+    #[serde(default)]
+    accounts: std::collections::HashMap<String, JmapAccount>,
 }
 
 #[derive(Deserialize, Default)]
 struct JmapCoreCapability {
     #[serde(rename = "maxObjectsInSet")]
     max_objects_in_set: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct JmapAccount {
+    #[serde(rename = "accountCapabilities", default)]
+    account_capabilities: std::collections::HashMap<String, JmapSubmissionAccountCapability>,
+}
+
+#[derive(Deserialize, Default)]
+struct JmapSubmissionAccountCapability {
+    #[serde(rename = "submissionExtensions", default)]
+    submission_extensions: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl JmapSession {
@@ -448,38 +480,96 @@ impl JmapSession {
             .filter(|limit| *limit > 0)
             .unwrap_or(DEFAULT_MAX_OBJECTS_IN_SET)
     }
+
+    fn submission_extensions(
+        &self,
+        account_id: &str,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        self.accounts
+            .get(account_id)
+            .and_then(|account| account.account_capabilities.get(SUBMISSION_CAPABILITY))
+            .map(|capability| capability.submission_extensions.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
 mod session_limit_tests {
     use super::JmapSession;
 
-    fn session(capabilities: serde_json::Value) -> JmapSession {
+    fn session(
+        capabilities: serde_json::Value,
+        account_capabilities: serde_json::Value,
+    ) -> JmapSession {
         serde_json::from_value(serde_json::json!({
             "apiUrl": "https://example.test/api",
             "downloadUrl": "https://example.test/download/{blobId}",
             "uploadUrl": "https://example.test/upload/{accountId}",
             "primaryAccounts": { "urn:ietf:params:jmap:mail": "account" },
-            "capabilities": capabilities
+            "capabilities": capabilities,
+            "accounts": {
+                "account": { "accountCapabilities": account_capabilities },
+                "other": {
+                    "accountCapabilities": {
+                        "urn:ietf:params:jmap:submission": {
+                            "submissionExtensions": { "OTHER": [] }
+                        }
+                    }
+                }
+            }
         }))
         .unwrap()
     }
 
     #[test]
     fn reads_max_objects_in_set_from_core_capability() {
-        let session = session(serde_json::json!({
-            "urn:ietf:params:jmap:core": { "maxObjectsInSet": 37 }
-        }));
+        let session = session(
+            serde_json::json!({
+                "urn:ietf:params:jmap:core": { "maxObjectsInSet": 37 }
+            }),
+            serde_json::json!({}),
+        );
         assert_eq!(session.max_objects_in_set(), 37);
     }
 
     #[test]
     fn defaults_invalid_or_missing_set_limits() {
-        assert_eq!(session(serde_json::json!({})).max_objects_in_set(), 500);
-        let zero = session(serde_json::json!({
-            "urn:ietf:params:jmap:core": { "maxObjectsInSet": 0 }
-        }));
+        assert_eq!(
+            session(serde_json::json!({}), serde_json::json!({})).max_objects_in_set(),
+            500
+        );
+        let zero = session(
+            serde_json::json!({
+                "urn:ietf:params:jmap:core": { "maxObjectsInSet": 0 }
+            }),
+            serde_json::json!({}),
+        );
         assert_eq!(zero.max_objects_in_set(), 500);
+    }
+
+    #[test]
+    fn reads_submission_extensions_from_selected_account_capability() {
+        let session = session(
+            serde_json::json!({
+                "urn:ietf:params:jmap:submission": {
+                    "submissionExtensions": { "TOP_LEVEL_IS_WRONG": [] }
+                }
+            }),
+            serde_json::json!({
+                "urn:ietf:params:jmap:submission": {
+                    "submissionExtensions": {
+                        "SMTPUTF8": [],
+                        "SIZE": ["52428800"]
+                    }
+                }
+            }),
+        );
+
+        let extensions = session.submission_extensions("account");
+        assert_eq!(extensions.get("SMTPUTF8"), Some(&Vec::new()));
+        assert_eq!(extensions.get("SIZE"), Some(&vec!["52428800".into()]));
+        assert!(!extensions.contains_key("TOP_LEVEL_IS_WRONG"));
+        assert!(!extensions.contains_key("OTHER"));
     }
 }
 
@@ -548,8 +638,7 @@ impl JmapConnection {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP session: {} {}", status, body)));
+            return Err(Error::Other(format!("JMAP session error: {}", status)));
         }
 
         let session: JmapSession = resp
@@ -557,15 +646,14 @@ impl JmapConnection {
             .await
             .map_err(|e| Error::Other(format!("JMAP session parse failed: {}", e)))?;
 
-        let max_objects_in_set = session.max_objects_in_set();
-
         // Get the default account ID
         let account_id = session
             .primary_accounts
-            .values()
-            .next()
+            .get(MAIL_CAPABILITY)
             .cloned()
             .ok_or_else(|| Error::Other("No primary account in JMAP session".into()))?;
+        let max_objects_in_set = session.max_objects_in_set();
+        let submission_extensions = session.submission_extensions(&account_id);
 
         // Rewrite URLs to go through the HTTPS proxy instead of internal URLs.
         // e.g., "http://mail.example.com:8080/jmap/" → "https://mail.example.com/jmap/"
@@ -592,6 +680,7 @@ impl JmapConnection {
             event_source_url_template: event_source_url,
             account_id,
             max_objects_in_set,
+            submission_extensions,
         })
     }
 
@@ -643,6 +732,12 @@ impl JmapConnection {
         })
     }
 
+    fn supports_submission_extension(&self, extension: &str) -> bool {
+        self.submission_extensions
+            .keys()
+            .any(|advertised| advertised.eq_ignore_ascii_case(extension))
+    }
+
     /// Send a JMAP API request and return the response JSON.
     async fn api_request(
         &self,
@@ -658,14 +753,32 @@ impl JmapConnection {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("JMAP API error {}: {}", status, body)));
+            return Err(Error::Other(format!("JMAP API error: {}", status)));
         }
 
         resp.json()
             .await
             .map_err(|e| Error::Other(format!("JMAP response parse error: {}", e)))
     }
+}
+
+fn safe_jmap_error_type(value: &serde_json::Value) -> String {
+    bounded_jmap_error_type(value)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn bounded_jmap_error_type(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|error_type| {
+            !error_type.is_empty()
+                && error_type.len() <= 64
+                && error_type
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
 }
 
 /// Rewrite an internal URL to go through the HTTPS proxy.

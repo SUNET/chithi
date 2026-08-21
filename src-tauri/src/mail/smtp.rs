@@ -1,7 +1,9 @@
 use lettre::address::Envelope;
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
+use lettre::transport::smtp::extension::ClientId;
+use lettre::{Address, Message};
 
 use crate::error::{Error, Result};
 
@@ -71,72 +73,215 @@ fn sender_message_id(from: &Mailbox) -> String {
     )
 }
 
-/// Build an SMTP transport from connection parameters.
+/// Establish and authenticate the exact SMTP connection used for submission.
 ///
 /// Port 587 forces STARTTLS regardless of `use_tls`; port 465 (or
 /// `use_tls=true` on any other port) uses implicit TLS; everything else
 /// falls back to STARTTLS on the requested port.
-fn build_transport(
+async fn connect_smtp(
     smtp_host: &str,
     smtp_port: u16,
     username: &str,
     password: &str,
     use_tls: bool,
     use_xoauth2: bool,
-) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+) -> Result<AsyncSmtpConnection> {
     let creds = Credentials::new(username.to_string(), password.to_string());
     let auth_mechanisms = if use_xoauth2 {
         vec![Mechanism::Xoauth2]
     } else {
         vec![Mechanism::Plain, Mechanism::Login]
     };
-
-    let transport = if smtp_port == 587 {
-        log::debug!("SMTP using STARTTLS on port 587 (xoauth2={})", use_xoauth2);
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-            .map_err(|e| Error::Other(format!("SMTP STARTTLS relay setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
-    } else if use_tls || smtp_port == 465 {
+    let hello_name = ClientId::default();
+    let tls_parameters = TlsParameters::new(smtp_host.to_string())
+        .map_err(|_| Error::Other("SMTP TLS configuration failed before submission".into()))?;
+    let implicit_tls = uses_implicit_tls(smtp_port, use_tls);
+    if implicit_tls {
         log::debug!("SMTP using implicit TLS on port {}", smtp_port);
-        AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
-            .map_err(|e| Error::Other(format!("SMTP TLS relay setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
     } else {
-        log::debug!("SMTP using STARTTLS (default) on port {}", smtp_port);
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-            .map_err(|e| Error::Other(format!("SMTP relay setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
-    };
-    Ok(transport)
+        log::debug!("SMTP using STARTTLS on port {}", smtp_port);
+    }
+
+    let mut connection = AsyncSmtpConnection::connect_tokio1(
+        (smtp_host, smtp_port),
+        Some(std::time::Duration::from_secs(60)),
+        &hello_name,
+        implicit_tls.then_some(tls_parameters.clone()),
+        None,
+    )
+    .await
+    .map_err(|error| definite_smtp_setup_error("connection", &error))?;
+
+    if !implicit_tls {
+        connection
+            .starttls(tls_parameters, &hello_name)
+            .await
+            .map_err(|error| definite_smtp_setup_error("STARTTLS", &error))?;
+    }
+    connection
+        .auth(&auth_mechanisms, &creds)
+        .await
+        .map_err(|error| definite_smtp_setup_error("authentication", &error))?;
+    Ok(connection)
 }
 
-/// Parse an address string ("user@host" or "Name <user@host>") into a
-/// lettre `Address` (just the addr-spec; display name is dropped because
-/// the envelope is only the addr-spec per RFC 5321 §3.6.1).
-fn parse_address(addr: &str) -> Result<Address> {
-    let trimmed = addr.trim();
-    // If it's in `Name <user@host>` form, extract the bracketed addr-spec.
-    let addr_spec = if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>')) {
-        if lt < gt {
-            trimmed[lt + 1..gt].trim()
-        } else {
-            trimmed
+fn uses_implicit_tls(smtp_port: u16, use_tls: bool) -> bool {
+    smtp_port != 587 && (use_tls || smtp_port == 465)
+}
+
+fn definite_smtp_setup_error(stage: &str, error: &lettre::transport::smtp::Error) -> Error {
+    match error.status().map(u16::from) {
+        Some(code) => Error::Other(format!(
+            "SMTP {stage} rejected with status {code} before submission"
+        )),
+        None => Error::Other(format!("SMTP {stage} failed before submission")),
+    }
+}
+
+/// Parse one RFC 5322 mailbox. lettre's mailbox parser rejects some valid
+/// quoted local-parts, so mailparse provides the standards-aware fallback and
+/// lettre still performs final addr-spec validation.
+pub(crate) fn parse_mailbox(value: &str) -> Result<Mailbox> {
+    if let Ok(mailbox) = value.trim().parse::<Mailbox>() {
+        return Ok(mailbox);
+    }
+
+    if let Some((name, addr_spec)) = quoted_angle_mailbox(value) {
+        let email = validated_address(addr_spec)?;
+        return Ok(Mailbox::new(name, email));
+    }
+
+    if let Ok(email) = validated_address(value.trim()) {
+        return Ok(Mailbox::new(None, email));
+    }
+
+    let mailbox = mailparse::addrparse(value)
+        .ok()
+        .and_then(|addresses| addresses.extract_single_info())
+        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
+    let email = validated_address(&mailbox.addr)?;
+    Ok(Mailbox::new(mailbox.display_name, email))
+}
+
+fn validated_address(addr_spec: &str) -> Result<Address> {
+    if let Ok(address) = addr_spec.parse::<Address>() {
+        let domain = address.domain();
+        let untagged_ipv6 = domain
+            .strip_prefix('[')
+            .and_then(|domain| domain.strip_suffix(']'))
+            .is_some_and(|domain| domain.parse::<std::net::Ipv6Addr>().is_ok());
+        if !untagged_ipv6 {
+            return Ok(address);
         }
+        return Err(Error::Other("Invalid mail address".into()));
+    }
+
+    let (local, domain) = addr_spec
+        .rsplit_once('@')
+        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
+    let literal = domain
+        .strip_prefix('[')
+        .and_then(|domain| domain.strip_suffix(']'))
+        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
+    let (tag, address) = literal
+        .split_once(':')
+        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
+    if !tag.eq_ignore_ascii_case("IPv6") {
+        return Err(Error::Other("Invalid mail address".into()));
+    }
+    let address = address
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| Error::Other("Invalid mail address".into()))?;
+
+    // lettre can validate the same local part only with its non-standard
+    // untagged IPv6 spelling. After that validation, retain the RFC 5321/5322
+    // `IPv6:` tag in the safely constructed address.
+    Address::new(local, format!("[{address}]"))
+        .map_err(|_| Error::Other("Invalid mail address".into()))?;
+    Ok(Address::new_dangerous(local, domain))
+}
+
+fn quoted_angle_mailbox(value: &str) -> Option<(Option<String>, &str)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut left = None;
+    let mut right = None;
+
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match (ch, left) {
+            ('<', None) => left = Some(index),
+            ('>', Some(_)) => {
+                right = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let (left, right) = (left?, right?);
+    if quoted || !value[right + 1..].trim().is_empty() {
+        return None;
+    }
+    let addr_spec = value[left + 1..right].trim();
+    if addr_spec.is_empty() {
+        return None;
+    }
+    let raw_name = value[..left].trim();
+    if raw_name.chars().any(char::is_control) {
+        return None;
+    }
+    let name = if raw_name.is_empty() {
+        None
+    } else if let Some(inner) = raw_name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    {
+        let mut name = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            name.push(if ch == '\\' { chars.next()? } else { ch });
+        }
+        Some(name)
     } else {
-        trimmed
+        Some(raw_name.to_string())
     };
-    addr_spec
-        .parse::<Address>()
-        .map_err(|e| Error::Other(format!("Invalid SMTP address '{}': {}", addr, e)))
+    Some((name, addr_spec))
+}
+
+/// Parse a mailbox into the addr-spec used by the SMTP envelope.
+fn parse_address(value: &str) -> Result<Address> {
+    parse_mailbox(value)
+        .map(|mailbox| mailbox.email)
+        .map_err(|error| Error::Other(format!("Invalid SMTP address '{value}': {error}")))
+}
+
+/// Lettre exposes an SMTP status only for a 4xx/5xx negative reply. Such a
+/// reply definitively rejects the attempt; any other error after entering
+/// `send_raw` can race with server acceptance and is therefore indeterminate.
+fn classify_send_error(status: Option<u16>, client_error: bool) -> Error {
+    match status.filter(|code| (400..600).contains(code)) {
+        Some(code) => Error::Other(format!(
+            "SMTP server rejected the message with status {}",
+            code
+        )),
+        None if client_error => Error::Other("SMTP rejected the message before submission".into()),
+        None => Error::IndeterminateDelivery,
+    }
 }
 
 /// Send a previously-built RFC 5322 message via SMTP.
@@ -162,8 +307,13 @@ pub async fn send_raw(
 ) -> Result<()> {
     let from_addr = parse_address(from)?;
     let mut recipients: Vec<Address> = Vec::with_capacity(to.len() + cc.len() + bcc.len());
-    for addr in to.iter().chain(cc.iter()).chain(bcc.iter()) {
-        recipients.push(parse_address(addr)?);
+    for (position, addr) in to.iter().chain(cc.iter()).chain(bcc.iter()).enumerate() {
+        recipients.push(parse_address(addr).map_err(|_| {
+            Error::Other(format!(
+                "Invalid SMTP envelope recipient at position {}",
+                position + 1
+            ))
+        })?);
     }
     if recipients.is_empty() {
         return Err(Error::Other(
@@ -182,27 +332,31 @@ pub async fn send_raw(
         smtp_port
     );
 
-    let transport = build_transport(
+    let mut connection = connect_smtp(
         smtp_host,
         smtp_port,
         username,
         password,
         use_tls,
         use_xoauth2,
-    )?;
-    let response = transport
-        .send_raw(&envelope, raw_message)
-        .await
-        .map_err(|e| {
-            log::error!("SMTP send_raw failed: {}", e);
-            Error::Other(format!("SMTP send_raw failed: {}", e))
-        })?;
+    )
+    .await?;
+    let response = connection.send(&envelope, raw_message).await.map_err(|e| {
+        let status = e.status().map(u16::from);
+        if let Some(code) = status {
+            log::error!("SMTP send_raw rejected with status {}", code);
+        } else if e.is_client() {
+            log::error!("SMTP send_raw rejected locally before submission");
+        } else {
+            log::error!(
+                "SMTP send_raw failed without a negative reply; delivery outcome is unknown"
+            );
+        }
+        classify_send_error(status, e.is_client())
+    })?;
 
-    log::info!(
-        "SMTP send_raw success: {} (code {})",
-        response.message().collect::<Vec<_>>().join(", "),
-        response.code()
-    );
+    let _ = connection.quit().await;
+    log::info!("SMTP send_raw success (code {})", response.code());
     Ok(())
 }
 
@@ -229,9 +383,8 @@ pub fn build_raw_message(
     in_reply_to: Option<&str>,
     references: &[String],
 ) -> Result<Vec<u8>> {
-    let from_mailbox: Mailbox = from
-        .parse()
-        .map_err(|e| Error::Other(format!("Invalid 'from' address '{}': {}", from, e)))?;
+    let from_mailbox =
+        parse_mailbox(from).map_err(|_| Error::Other("Invalid message From address".into()))?;
 
     // Always emit a Message-ID. Lettre's `build()` does NOT add one
     // automatically, so without this our outgoing replies have no
@@ -244,22 +397,31 @@ pub fn build_raw_message(
         .subject(subject)
         .message_id(Some(message_id));
 
-    for addr in to {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'to' address '{}': {}", addr, e)))?;
+    for (index, addr) in to.iter().enumerate() {
+        let mailbox = parse_mailbox(addr).map_err(|_| {
+            Error::Other(format!(
+                "Invalid message To address at position {}",
+                index + 1
+            ))
+        })?;
         builder = builder.to(mailbox);
     }
-    for addr in cc {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'cc' address '{}': {}", addr, e)))?;
+    for (index, addr) in cc.iter().enumerate() {
+        let mailbox = parse_mailbox(addr).map_err(|_| {
+            Error::Other(format!(
+                "Invalid message Cc address at position {}",
+                index + 1
+            ))
+        })?;
         builder = builder.cc(mailbox);
     }
-    for addr in bcc {
-        let mailbox: Mailbox = addr
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid 'bcc' address '{}': {}", addr, e)))?;
+    for (index, addr) in bcc.iter().enumerate() {
+        let mailbox = parse_mailbox(addr).map_err(|_| {
+            Error::Other(format!(
+                "Invalid message Bcc address at position {}",
+                index + 1
+            ))
+        })?;
         builder = builder.bcc(mailbox);
     }
 
@@ -682,6 +844,63 @@ pub fn insert_header_before_body(raw: &[u8], header_line: &str) -> Vec<u8> {
             out
         }
         None => raw.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    #[test]
+    fn negative_replies_are_definite_and_missing_status_is_indeterminate() {
+        for code in [421, 450, 500, 550] {
+            let error = classify_send_error(Some(code), false);
+            assert!(matches!(error, Error::Other(_)));
+            assert!(!error.is_indeterminate_delivery());
+            assert_eq!(
+                error.to_string(),
+                format!("SMTP server rejected the message with status {code}")
+            );
+        }
+
+        for status in [None, Some(250), Some(600)] {
+            let error = classify_send_error(status, false);
+            assert!(error.is_indeterminate_delivery());
+            assert_eq!(error.to_string(), "Delivery outcome is unknown");
+        }
+
+        let client_error = classify_send_error(None, true);
+        assert!(!client_error.is_indeterminate_delivery());
+        assert_eq!(
+            client_error.to_string(),
+            "SMTP rejected the message before submission"
+        );
+    }
+
+    #[test]
+    fn port_587_always_uses_starttls() {
+        assert!(!uses_implicit_tls(587, false));
+        assert!(!uses_implicit_tls(587, true));
+        assert!(uses_implicit_tls(465, false));
+        assert!(uses_implicit_tls(465, true));
+        assert!(!uses_implicit_tls(25, false));
+        assert!(uses_implicit_tls(2525, true));
+    }
+
+    #[test]
+    fn mailbox_parser_accepts_quoted_local_parts_and_address_literals() {
+        for value in [
+            r#""Recipient, Bob" <bob@example.com>"#,
+            r#"Quoted Local <"quoted local"@example.com>"#,
+            r#"Angle <"a>b"@example.com>"#,
+            "literal@[192.0.2.1]",
+            "ipv6@[IPv6:2001:db8::1]",
+        ] {
+            parse_mailbox(value)
+                .unwrap_or_else(|error| panic!("valid mailbox {value:?} was rejected: {error}"));
+        }
+
+        assert!(parse_mailbox("ipv6@[2001:db8::1]").is_err());
     }
 }
 

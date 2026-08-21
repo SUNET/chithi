@@ -1339,7 +1339,16 @@ async fn apply_invite_response(
                     &reply_ical,
                 )?;
 
-                jmap_conn.send_email(&jmap_config, &raw_message).await?;
+                let envelope = crate::mail::jmap::JmapSubmissionEnvelope::new(
+                    &account.email,
+                    std::slice::from_ref(organizer_email),
+                    &[],
+                    &[],
+                )?;
+
+                jmap_conn
+                    .send_email(&jmap_config, &raw_message, &envelope)
+                    .await?;
             }
             InviteReplyDelivery::Provider => {
                 // O365/Graph accounts have no SMTP host configured. The reply
@@ -1699,15 +1708,13 @@ fn build_calendar_reply_message(
     body_text: &str,
     ical_reply: &str,
 ) -> Result<Vec<u8>> {
-    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+    use lettre::message::{header::ContentType, MultiPart, SinglePart};
     use lettre::Message;
 
-    let from_mailbox: Mailbox = from.parse().map_err(|e| {
-        crate::error::Error::Other(format!("Invalid 'from' address '{}': {}", from, e))
-    })?;
-    let to_mailbox: Mailbox = to
-        .parse()
-        .map_err(|e| crate::error::Error::Other(format!("Invalid 'to' address '{}': {}", to, e)))?;
+    let from_mailbox = crate::mail::smtp::parse_mailbox(from)
+        .map_err(|_| crate::error::Error::Other("Invalid calendar reply sender".into()))?;
+    let to_mailbox = crate::mail::smtp::parse_mailbox(to)
+        .map_err(|_| crate::error::Error::Other("Invalid calendar reply recipient".into()))?;
 
     let message = Message::builder()
         .from(from_mailbox)
@@ -1748,69 +1755,21 @@ async fn send_raw_smtp(
     to: &str,
     raw_message: &[u8],
 ) -> Result<()> {
-    use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-
-    log::info!(
-        "send_raw_smtp: from={} to={} via {}:{} (xoauth2={})",
-        from,
-        to,
+    let recipients = [to.to_string()];
+    crate::mail::smtp::send_raw(
         smtp_host,
         smtp_port,
+        username,
+        password,
+        use_tls,
         use_xoauth2,
-    );
-
-    let creds = Credentials::new(username.to_string(), password.to_string());
-    let auth_mechanisms = if use_xoauth2 {
-        vec![Mechanism::Xoauth2]
-    } else {
-        vec![Mechanism::Plain, Mechanism::Login]
-    };
-
-    let transport = if smtp_port == 587 {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
-    } else if use_tls || smtp_port == 465 {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(smtp_host)
-            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-            .map_err(|e| crate::error::Error::Other(format!("SMTP setup failed: {}", e)))?
-            .port(smtp_port)
-            .credentials(creds)
-            .authentication(auth_mechanisms)
-            .build()
-    };
-
-    // Build an envelope from the from/to addresses
-    let from_addr: lettre::Address = from
-        .parse()
-        .map_err(|e| crate::error::Error::Other(format!("Invalid from address: {}", e)))?;
-    let to_addr: lettre::Address = to
-        .parse()
-        .map_err(|e| crate::error::Error::Other(format!("Invalid to address: {}", e)))?;
-
-    let envelope = lettre::address::Envelope::new(Some(from_addr), vec![to_addr])
-        .map_err(|e| crate::error::Error::Other(format!("Failed to create envelope: {}", e)))?;
-
-    transport
-        .send_raw(&envelope, raw_message)
-        .await
-        .map_err(|e| {
-            log::error!("SMTP send failed: {}", e);
-            crate::error::Error::Other(format!("SMTP send failed: {}", e))
-        })?;
-
-    log::info!("send_raw_smtp: message sent successfully");
-    Ok(())
+        from,
+        &recipients,
+        &[],
+        &[],
+        raw_message,
+    )
+    .await
 }
 
 /// Send meeting invite emails to attendees for a calendar event.
@@ -1917,8 +1876,14 @@ pub async fn send_invites(
         }
 
         if account.calendar_protocol_str() == "jmap" {
+            let envelope = crate::mail::jmap::JmapSubmissionEnvelope::new(
+                &account.email,
+                std::slice::from_ref(attendee_email),
+                &[],
+                &[],
+            )?;
             let (jmap_config, conn_jmap) = state.providers.jmap_client(&account).await?;
-            conn_jmap.send_email(&jmap_config, &raw).await?;
+            conn_jmap.send_email(&jmap_config, &raw, &envelope).await?;
         } else {
             let credentials = state
                 .providers
@@ -2168,20 +2133,20 @@ fn build_invite_message(
     body_text: &str,
     ical_data: &str,
 ) -> Vec<u8> {
-    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+    use lettre::message::{header::ContentType, MultiPart, SinglePart};
     use lettre::Message;
 
-    let from_mailbox: Mailbox = match from.parse() {
+    let from_mailbox = match crate::mail::smtp::parse_mailbox(from) {
         Ok(m) => m,
-        Err(e) => {
-            log::error!("build_invite_message: invalid from '{}': {}", from, e);
+        Err(_) => {
+            log::error!("build_invite_message: invalid sender");
             return Vec::new();
         }
     };
-    let to_mailbox: Mailbox = match to.parse() {
+    let to_mailbox = match crate::mail::smtp::parse_mailbox(to) {
         Ok(m) => m,
-        Err(e) => {
-            log::error!("build_invite_message: invalid to '{}': {}", to, e);
+        Err(_) => {
+            log::error!("build_invite_message: invalid recipient");
             return Vec::new();
         }
     };

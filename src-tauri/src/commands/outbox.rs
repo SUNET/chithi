@@ -20,6 +20,7 @@ pub struct OutboxRow {
     pub status: String,
     pub retry_count: i32,
     pub error_message: Option<String>,
+    pub delivery_outcome_unknown: bool,
     pub subject: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -56,6 +57,9 @@ fn row_from_payload(
     let to = parse_string_array(&payload, "to");
     let cc = parse_string_array(&payload, "cc");
     let bcc = parse_string_array(&payload, "bcc");
+    let delivery_outcome_unknown = error_message
+        .as_deref()
+        .is_some_and(crate::ops::offline::is_indeterminate_delivery_error_message);
     OutboxRow {
         id,
         account_id,
@@ -63,11 +67,48 @@ fn row_from_payload(
         status,
         retry_count,
         error_message,
+        delivery_outcome_unknown,
         subject,
         to,
         cc,
         bcc,
     }
+}
+
+fn retry_dead_row(conn: &rusqlite::Connection, outbox_id: i64) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE outbox
+             SET status = 'pending', retry_count = 0, error_message = NULL
+             WHERE id = ?1 AND action_type = 'send' AND status = 'dead'",
+            rusqlite::params![outbox_id],
+        )
+        .map_err(Error::Database)?;
+    if changed != 1 {
+        return Err(Error::Other(format!(
+            "Outbox row {} is not eligible for manual retry",
+            outbox_id
+        )));
+    }
+    Ok(())
+}
+
+fn discard_inactive_row(conn: &rusqlite::Connection, outbox_id: i64) -> Result<()> {
+    let changed = conn
+        .execute(
+            "DELETE FROM outbox
+             WHERE id = ?1 AND action_type = 'send'
+               AND status IN ('pending', 'dead')",
+            rusqlite::params![outbox_id],
+        )
+        .map_err(Error::Database)?;
+    if changed != 1 {
+        return Err(Error::Other(format!(
+            "Outbox row {} is not eligible for discard",
+            outbox_id
+        )));
+    }
+    Ok(())
 }
 
 /// List all outbox rows for an account that are visible to the user:
@@ -80,7 +121,8 @@ pub async fn list_outbox(state: State<'_, AppState>, account_id: String) -> Resu
         .prepare(
             "SELECT id, account_id, action_type, status, retry_count, error_message, payload_json
              FROM outbox
-             WHERE account_id = ?1 AND status IN ('pending', 'sending', 'dead')
+             WHERE account_id = ?1 AND action_type = 'send'
+               AND status IN ('pending', 'sending', 'dead')
              ORDER BY id DESC",
         )
         .map_err(Error::Database)?;
@@ -103,30 +145,120 @@ pub async fn list_outbox(state: State<'_, AppState>, account_id: String) -> Resu
     Ok(rows)
 }
 
-/// Flip a dead or pending row back to 'pending' with retry_count reset
-/// so the next sync drain will replay it.
+/// Flip a dead row back to 'pending' with retry_count reset so the next sync
+/// drain will replay it. Pending and actively sending rows are not mutable.
 #[tauri::command]
 pub async fn retry_outbox_op(state: State<'_, AppState>, outbox_id: i64) -> Result<()> {
     let conn = state.db.writer().await;
-    conn.execute(
-        "UPDATE outbox SET status = 'pending', retry_count = 0, error_message = NULL
-         WHERE id = ?1",
-        rusqlite::params![outbox_id],
-    )
-    .map_err(Error::Database)?;
+    retry_dead_row(&conn, outbox_id)?;
     log::info!("Outbox row {} requeued for retry", outbox_id);
     Ok(())
 }
 
-/// Permanently delete an outbox row.
+/// Permanently delete an inactive outbox row. A sending row retains its claim.
 #[tauri::command]
 pub async fn discard_outbox_op(state: State<'_, AppState>, outbox_id: i64) -> Result<()> {
     let conn = state.db.writer().await;
-    conn.execute(
-        "DELETE FROM outbox WHERE id = ?1",
-        rusqlite::params![outbox_id],
-    )
-    .map_err(Error::Database)?;
+    discard_inactive_row(&conn, outbox_id)?;
     log::info!("Outbox row {} discarded", outbox_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                retry_count INTEGER NOT NULL,
+                error_message TEXT
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_row(conn: &rusqlite::Connection, status: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO outbox
+             (account_id, action_type, payload_json, status, retry_count, error_message)
+             VALUES ('acc1', 'send', '{}', ?1, 3, 'old error')",
+            rusqlite::params![status],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn row_state(conn: &rusqlite::Connection, id: i64) -> Option<(String, i32, Option<String>)> {
+        conn.query_row(
+            "SELECT status, retry_count, error_message FROM outbox WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn manual_retry_only_transitions_dead_to_pending() {
+        let conn = setup_db();
+        let dead = insert_row(&conn, "dead");
+        let pending = insert_row(&conn, "pending");
+        let sending = insert_row(&conn, "sending");
+
+        retry_dead_row(&conn, dead).unwrap();
+        assert_eq!(row_state(&conn, dead), Some(("pending".into(), 0, None)));
+        assert!(retry_dead_row(&conn, dead).is_err());
+        assert!(retry_dead_row(&conn, pending).is_err());
+        assert!(retry_dead_row(&conn, sending).is_err());
+        assert!(retry_dead_row(&conn, i64::MAX).is_err());
+        assert_eq!(row_state(&conn, sending).unwrap().0, "sending");
+    }
+
+    #[test]
+    fn discard_only_deletes_pending_or_dead_rows() {
+        let conn = setup_db();
+        let dead = insert_row(&conn, "dead");
+        let pending = insert_row(&conn, "pending");
+        let sending = insert_row(&conn, "sending");
+
+        discard_inactive_row(&conn, dead).unwrap();
+        discard_inactive_row(&conn, pending).unwrap();
+        assert!(row_state(&conn, dead).is_none());
+        assert!(row_state(&conn, pending).is_none());
+        assert!(discard_inactive_row(&conn, sending).is_err());
+        assert!(discard_inactive_row(&conn, i64::MAX).is_err());
+        assert_eq!(row_state(&conn, sending).unwrap().0, "sending");
+    }
+
+    #[test]
+    fn renderer_row_distinguishes_unknown_delivery_from_failure() {
+        let unknown = row_from_payload(
+            1,
+            "acc1".into(),
+            "send".into(),
+            "dead".into(),
+            0,
+            Some(crate::ops::offline::INDETERMINATE_DELIVERY_ERROR_MESSAGE.into()),
+            r#"{"subject":"test"}"#,
+        );
+        assert!(unknown.delivery_outcome_unknown);
+
+        let failed = row_from_payload(
+            2,
+            "acc1".into(),
+            "send".into(),
+            "dead".into(),
+            5,
+            Some("SMTP server rejected the message".into()),
+            "{}",
+        );
+        assert!(!failed.delivery_outcome_unknown);
+    }
 }

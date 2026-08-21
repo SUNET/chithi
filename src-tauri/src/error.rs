@@ -44,8 +44,20 @@ pub enum Error {
         capability: &'static str,
     },
 
+    /// A delivery attempt ended without a definitive rejection or success.
+    /// Keep this variant payload-free so user-facing formatting cannot leak
+    /// envelope recipients or transport internals.
+    #[error("Delivery outcome is unknown")]
+    IndeterminateDelivery,
+
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    pub fn is_indeterminate_delivery(&self) -> bool {
+        matches!(self, Self::IndeterminateDelivery)
+    }
 }
 
 impl Serialize for Error {
@@ -58,3 +70,21 @@ impl Serialize for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn indeterminate_delivery_has_safe_typed_classification() {
+        let error = Error::IndeterminateDelivery;
+
+        assert!(error.is_indeterminate_delivery());
+        assert_eq!(error.to_string(), "Delivery outcome is unknown");
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#""Delivery outcome is unknown""#
+        );
+        assert!(!Error::Other("ordinary failure".into()).is_indeterminate_delivery());
+    }
+}

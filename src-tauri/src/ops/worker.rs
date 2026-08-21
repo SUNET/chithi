@@ -6,11 +6,41 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::mail::{MailBackend, MailOpExecutor, MailSyncCtx};
 use crate::db::pool::DbPool;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::coalesce::coalesce;
 use super::lifecycle::{SpawnedWorker, WorkerTaskExit};
 use super::queue::{MailOp, OpEntry};
+
+const AMBIGUOUS_OPERATION_ERROR_MESSAGE: &str =
+    "Operation outcome may be ambiguous; automatic retry disabled to avoid duplicate effects. Verify remote state before retrying manually.";
+
+const SEND_RETRY_LIMIT_ERROR_MESSAGE: &str =
+    "Automatic send retry limit reached; retry manually after reviewing the last failure.";
+
+fn automatic_retry_allowed(statically_retry_safe: bool, error: &Error) -> bool {
+    statically_retry_safe && !error.is_indeterminate_delivery()
+}
+
+fn automatic_retry_disabled_message(error: &Error) -> &'static str {
+    if error.is_indeterminate_delivery() {
+        super::offline::INDETERMINATE_DELIVERY_ERROR_MESSAGE
+    } else {
+        AMBIGUOUS_OPERATION_ERROR_MESSAGE
+    }
+}
+
+fn outbox_subject(payload_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("subject")
+                .and_then(|subject| subject.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerExit {
@@ -260,9 +290,36 @@ impl AccountWorker {
         );
 
         for entry in &pending {
+            let is_send = entry.action_type == "send";
             if super::offline::is_dead(entry) {
-                let conn = self.db.writer().await;
-                let _ = super::offline::mark_dead(&conn, entry.id);
+                if is_send {
+                    let transition = {
+                        let conn = self.db.writer().await;
+                        super::offline::quarantine_pending_send(
+                            &conn,
+                            entry.id,
+                            SEND_RETRY_LIMIT_ERROR_MESSAGE,
+                        )
+                    };
+                    match transition {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::info!("Skipping stale exhausted send snapshot {}", entry.id);
+                            continue;
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Failed to quarantine exhausted send {}: {}",
+                                entry.id,
+                                error
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    let conn = self.db.writer().await;
+                    let _ = super::offline::mark_dead(&conn, entry.id);
+                }
                 log::warn!(
                     "Offline op {} ({}) exceeded max retries, marking dead",
                     entry.id,
@@ -291,16 +348,39 @@ impl AccountWorker {
                     entry.id,
                     entry.action_type
                 );
-                let conn = self.db.writer().await;
-                if let Err(mark_error) = super::offline::mark_invalid(&conn, entry.id, &error) {
-                    log::error!(
-                        "Failed to mark invalid offline op {} dead: {}",
-                        entry.id,
-                        mark_error
-                    );
-                    break;
+                if is_send {
+                    let transition = {
+                        let conn = self.db.writer().await;
+                        super::offline::quarantine_pending_send(&conn, entry.id, &error)
+                    };
+                    match transition {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::info!("Skipping stale invalid send snapshot {}", entry.id);
+                            continue;
+                        }
+                        Err(mark_error) => {
+                            log::error!(
+                                "Failed to mark invalid send {} dead: {}",
+                                entry.id,
+                                mark_error
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    let conn = self.db.writer().await;
+                    if let Err(mark_error) =
+                        super::offline::mark_dead_with_error(&conn, entry.id, &error)
+                    {
+                        log::error!(
+                            "Failed to mark invalid offline op {} dead: {}",
+                            entry.id,
+                            mark_error
+                        );
+                        break;
+                    }
                 }
-                drop(conn);
                 self.app
                     .emit(
                         "offline-queue-changed",
@@ -313,7 +393,46 @@ impl AccountWorker {
                     .ok();
                 continue;
             };
-            let retry_safe = op.can_retry_after_execution_failure();
+            let statically_retry_safe = op.can_retry_after_execution_failure();
+
+            if is_send {
+                let claim = {
+                    let conn = self.db.writer().await;
+                    super::offline::claim_pending_send(&conn, entry.id, entry.retry_count)
+                };
+                match claim {
+                    Ok(true) => {
+                        self.app
+                            .emit(
+                                "send-started",
+                                serde_json::json!({
+                                    "account_id": self.account_id,
+                                    "subject": outbox_subject(&entry.payload_json),
+                                    "outbox_id": entry.id,
+                                    "via": "outbox-replay",
+                                }),
+                            )
+                            .ok();
+                    }
+                    Ok(false) => {
+                        log::info!(
+                            "Skipping stale send replay snapshot {} for account {}",
+                            entry.id,
+                            self.account_id
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to claim send {} for account {}; replay stopped before transport: {}",
+                            entry.id,
+                            self.account_id,
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
 
             // Execute the replayed op directly (not through execute() to avoid
             // re-queuing to outbox on failure — we handle retries here)
@@ -321,6 +440,49 @@ impl AccountWorker {
 
             match result {
                 Ok(()) => {
+                    if is_send {
+                        let completion = {
+                            let conn = self.db.writer().await;
+                            super::offline::complete_sending_send(&conn, entry.id)
+                        };
+                        let completed = match completion {
+                            Ok(true) => {
+                                log::info!("Replayed offline send {} successfully", entry.id);
+                                true
+                            }
+                            Ok(false) => {
+                                log::error!(
+                                    "Send {} succeeded but its sending claim was missing; replay stopped",
+                                    entry.id
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "Send {} succeeded but completion persistence failed; row remains sending: {}",
+                                    entry.id,
+                                    error
+                                );
+                                false
+                            }
+                        };
+                        self.app
+                            .emit(
+                                "send-complete",
+                                serde_json::json!({
+                                    "account_id": self.account_id,
+                                    "subject": outbox_subject(&entry.payload_json),
+                                    "outbox_id": entry.id,
+                                    "via": "outbox-replay",
+                                }),
+                            )
+                            .ok();
+                        if completed {
+                            continue;
+                        }
+                        break;
+                    }
+
                     let conn = self.db.writer().await;
                     let _ = super::offline::mark_completed(&conn, entry.id);
                     log::info!(
@@ -329,38 +491,72 @@ impl AccountWorker {
                         entry.action_type
                     );
                     drop(conn);
-                    if entry.action_type == "send" {
-                        let subject =
-                            serde_json::from_str::<serde_json::Value>(&entry.payload_json)
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("subject").and_then(|s| s.as_str()).map(String::from)
-                                })
-                                .unwrap_or_default();
-                        self.app
-                            .emit(
-                                "send-complete",
-                                serde_json::json!({
-                                    "account_id": self.account_id,
-                                    "subject": subject,
-                                    "via": "outbox-replay",
-                                }),
-                            )
-                            .ok();
-                    }
                 }
                 Err(e) => {
-                    if !retry_safe {
-                        let error = format!(
-                            "Copy outcome may be ambiguous; automatic retry disabled to avoid duplicates: {}",
-                            e
-                        );
+                    if !automatic_retry_allowed(statically_retry_safe, &e) {
+                        let error = automatic_retry_disabled_message(&e);
+
+                        if is_send {
+                            let quarantine = {
+                                let conn = self.db.writer().await;
+                                super::offline::quarantine_sending_send(&conn, entry.id, error)
+                            };
+                            let quarantined = match quarantine {
+                                Ok(true) => true,
+                                Ok(false) => {
+                                    log::error!(
+                                        "Indeterminate send {} lost its sending claim; replay stopped",
+                                        entry.id
+                                    );
+                                    false
+                                }
+                                Err(mark_error) => {
+                                    log::error!(
+                                        "Failed to quarantine indeterminate send {}; row remains sending: {}",
+                                        entry.id,
+                                        mark_error
+                                    );
+                                    false
+                                }
+                            };
+                            self.app
+                                .emit(
+                                    "send-unknown",
+                                    serde_json::json!({
+                                        "account_id": self.account_id,
+                                        "subject": outbox_subject(&entry.payload_json),
+                                        "outbox_id": entry.id,
+                                        "error": error,
+                                    }),
+                                )
+                                .ok();
+                            if !quarantined {
+                                break;
+                            }
+                            log::warn!(
+                                "Replay of send {} has an unknown outcome; marked dead without automatic retry: {}",
+                                entry.id,
+                                e
+                            );
+                            self.app
+                                .emit(
+                                    "offline-queue-changed",
+                                    serde_json::json!({
+                                        "account_id": self.account_id,
+                                        "dead_op_id": entry.id,
+                                        "action_type": entry.action_type,
+                                    }),
+                                )
+                                .ok();
+                            continue;
+                        }
+
                         let conn = self.db.writer().await;
                         if let Err(mark_error) =
-                            super::offline::mark_invalid(&conn, entry.id, &error)
+                            super::offline::mark_dead_with_error(&conn, entry.id, error)
                         {
                             log::error!(
-                                "Failed to mark ambiguous copy op {} dead: {}",
+                                "Failed to mark ambiguous offline op {} dead: {}",
                                 entry.id,
                                 mark_error
                             );
@@ -368,7 +564,8 @@ impl AccountWorker {
                         }
                         drop(conn);
                         log::warn!(
-                            "Replay of copy op {} failed; marked dead without automatic retry: {}",
+                            "Replay of {} op {} failed; marked dead without automatic retry: {}",
+                            entry.action_type,
                             entry.id,
                             e
                         );
@@ -384,6 +581,56 @@ impl AccountWorker {
                             .ok();
                         continue;
                     }
+
+                    if is_send {
+                        let retry = {
+                            let conn = self.db.writer().await;
+                            super::offline::retry_sending_send(&conn, entry.id, &e.to_string())
+                        };
+                        let persisted = match retry {
+                            Ok(true) => {
+                                log::warn!(
+                                    "Replay of send {} failed definitely (attempt {}): {}",
+                                    entry.id,
+                                    entry.retry_count + 1,
+                                    e
+                                );
+                                true
+                            }
+                            Ok(false) => {
+                                log::error!(
+                                    "Failed send {} lost its sending claim; replay stopped",
+                                    entry.id
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "Failed to persist retry for send {}; row remains sending: {}",
+                                    entry.id,
+                                    error
+                                );
+                                false
+                            }
+                        };
+                        self.app
+                            .emit(
+                                "send-failed",
+                                serde_json::json!({
+                                    "account_id": self.account_id,
+                                    "subject": outbox_subject(&entry.payload_json),
+                                    "outbox_id": entry.id,
+                                    "error": e.to_string(),
+                                    "via": "outbox-replay",
+                                }),
+                            )
+                            .ok();
+                        if persisted {
+                            continue;
+                        }
+                        break;
+                    }
+
                     let conn = self.db.writer().await;
                     let _ = super::offline::mark_failed(&conn, entry.id, &e.to_string());
                     log::warn!(
@@ -393,14 +640,9 @@ impl AccountWorker {
                         entry.retry_count + 1,
                         e
                     );
-                    // For send ops we keep going: a retryable transient
-                    // (timeout, transient SMTP 4xx, etc.) on one message
-                    // shouldn't stall the other replays in this drain.
-                    // For other ops a failure usually indicates the
-                    // connection is broken, so break as before.
-                    if entry.action_type != "send" {
-                        break;
-                    }
+                    // A non-send failure usually indicates the connection is
+                    // broken, so stop this drain as before.
+                    break;
                 }
             }
         }
@@ -422,12 +664,13 @@ impl AccountWorker {
         }
     }
 
-    /// Run a user op through the executor; on failure, queue it to the
-    /// offline outbox for replay after the next successful sync.
+    /// Run a user op through the executor. Retryable failures become pending
+    /// outbox rows; ambiguous outcomes are retained as dead rows for manual
+    /// review rather than automatic replay.
     async fn execute_user_op(&mut self, op: MailOp) -> Result<()> {
         // Serialize the op for outbox before executing (we move op into the executor)
         let outbox_data = super::offline::mail_op_to_outbox(&op).map(|(t, p)| (t.to_string(), p));
-        let retry_safe = op.can_retry_after_execution_failure();
+        let statically_retry_safe = op.can_retry_after_execution_failure();
 
         let preflight = match &op {
             MailOp::SetFlags { mutations } => {
@@ -453,13 +696,11 @@ impl AccountWorker {
         if let Err(ref e) = result {
             if let Some((action_type, payload)) = outbox_data {
                 let conn = self.db.writer().await;
+                let retry_safe = automatic_retry_allowed(statically_retry_safe, e);
                 let error = if retry_safe {
                     format!("{} (will retry)", e)
                 } else {
-                    format!(
-                        "Copy outcome may be ambiguous; automatic retry disabled to avoid duplicates: {}",
-                        e
-                    )
+                    automatic_retry_disabled_message(e).to_string()
                 };
                 let queued = if retry_safe {
                     super::offline::queue_offline_op(
@@ -571,4 +812,21 @@ pub(crate) fn emit_op_failed(app: &AppHandle, account_id: &str, op_type: &str, e
         }),
     )
     .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::automatic_retry_allowed;
+    use crate::error::Error;
+
+    #[test]
+    fn retry_decision_combines_static_safety_and_dynamic_outcome() {
+        let ordinary = Error::Other("definite failure".into());
+        let indeterminate = Error::IndeterminateDelivery;
+
+        assert!(automatic_retry_allowed(true, &ordinary));
+        assert!(!automatic_retry_allowed(false, &ordinary));
+        assert!(!automatic_retry_allowed(true, &indeterminate));
+        assert!(!automatic_retry_allowed(false, &indeterminate));
+    }
 }

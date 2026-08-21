@@ -70,14 +70,7 @@ impl JmapConnection {
             ]
         });
         let resp = self.api_request(&request, config).await?;
-        if let Some(mailboxes) = resp["methodResponses"][0][1]["list"].as_array() {
-            for mb in mailboxes {
-                if mb["role"].as_str() == Some(role) {
-                    return Ok(mb["id"].as_str().map(|s| s.to_string()));
-                }
-            }
-        }
-        Ok(None)
+        mailbox_id_by_role(&resp, role)
     }
 
     /// Create a new mailbox on the JMAP server.
@@ -171,5 +164,123 @@ impl JmapConnection {
         }
         log::info!("JMAP mailbox destroyed: {}", mailbox_id);
         Ok(())
+    }
+}
+
+fn mailbox_id_by_role(response: &serde_json::Value, role: &str) -> Result<Option<String>> {
+    let responses = response
+        .get("methodResponses")
+        .and_then(serde_json::Value::as_array)
+        .filter(|responses| responses.len() == 1)
+        .ok_or_else(|| Error::Other("Malformed JMAP Mailbox/get response count".into()))?;
+    let tuple = responses[0]
+        .as_array()
+        .filter(|tuple| tuple.len() == 3)
+        .ok_or_else(|| Error::Other("Malformed JMAP Mailbox/get response tuple".into()))?;
+    if tuple[2].as_str() != Some("r1") {
+        return Err(Error::Other(
+            "JMAP Mailbox/get returned an unexpected call id".into(),
+        ));
+    }
+
+    let method = tuple[0]
+        .as_str()
+        .ok_or_else(|| Error::Other("Malformed JMAP Mailbox/get method".into()))?;
+    if method == "error" {
+        return Err(Error::Other(format!(
+            "JMAP Mailbox/get failed (type={})",
+            super::safe_jmap_error_type(&tuple[1])
+        )));
+    }
+    if method != "Mailbox/get" {
+        return Err(Error::Other(
+            "JMAP Mailbox/get returned an unexpected method".into(),
+        ));
+    }
+
+    let mailboxes = tuple[1]
+        .get("list")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Other("JMAP Mailbox/get returned no mailbox list".into()))?;
+    for mailbox in mailboxes {
+        let mailbox = mailbox
+            .as_object()
+            .ok_or_else(|| Error::Other("JMAP Mailbox/get returned a malformed mailbox".into()))?;
+        let id = mailbox
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                Error::Other("JMAP Mailbox/get returned a mailbox without an id".into())
+            })?;
+        let mailbox_role = mailbox
+            .get("role")
+            .ok_or_else(|| Error::Other("JMAP Mailbox/get omitted a requested role".into()))?;
+        if !mailbox_role.is_null() && !mailbox_role.is_string() {
+            return Err(Error::Other(
+                "JMAP Mailbox/get returned a malformed role".into(),
+            ));
+        }
+        if mailbox_role.as_str() == Some(role) {
+            return Ok(Some(id.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mailbox_id_by_role;
+
+    #[test]
+    fn role_lookup_requires_a_correlated_mailbox_get_result() {
+        let valid = serde_json::json!({
+            "methodResponses": [["Mailbox/get", {
+                "list": [
+                    { "id": "archive-id", "role": null },
+                    { "id": "sent-id", "role": "sent" }
+                ]
+            }, "r1"]]
+        });
+        assert_eq!(
+            mailbox_id_by_role(&valid, "sent").unwrap().as_deref(),
+            Some("sent-id")
+        );
+
+        for invalid in [
+            serde_json::json!({
+                "methodResponses": [["error", { "type": "serverFail" }, "r1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Mailbox/get", { "list": [] }, "wrong"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Mailbox/get", {}, "r1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Mailbox/get", {
+                    "list": [{ "id": "sent-id" }]
+                }, "r1"]]
+            }),
+        ] {
+            assert!(mailbox_id_by_role(&invalid, "sent").is_err());
+        }
+    }
+
+    #[test]
+    fn role_lookup_redacts_method_error_descriptions() {
+        let secret = "private mailbox detail";
+        let response = serde_json::json!({
+            "methodResponses": [["error", {
+                "type": "serverFail",
+                "description": secret
+            }, "r1"]]
+        });
+
+        let error = mailbox_id_by_role(&response, "sent")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("serverFail"));
+        assert!(!error.contains(secret));
     }
 }

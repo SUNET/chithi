@@ -34,21 +34,30 @@ Restructure `send_message` in `compose.rs` to split into synchronous and asynchr
 2. Read attachment files from disk
 3. Build RFC5322 message using `lettre`
 4. Refresh OAuth token for O365 accounts
-5. Emit `send-started` event
-6. Return `Ok(())` to the frontend
+5. Persist the complete message and envelope in the outbox with status
+   `sending`
+6. Emit a correlated `send-started` event
+7. Return `Ok(())` to the frontend
 
 **Asynchronous phase** (runs in `tokio::spawn` after command returns):
 1. Connect to SMTP server or JMAP
 2. Transmit the message
 3. On success: emit `send-complete`, auto-collect recipient contacts
-4. On failure: emit `send-failed` with error details
+4. On definite failure: atomically return the outbox row to `pending` and emit
+   `send-failed`
+5. When completion is unknown: atomically quarantine the row as `dead` and
+   emit `send-unknown`
 
 This means the compose window closes almost instantly (only waits for local I/O), while the actual network send happens in the background.
 
 **Events emitted:**
-- `send-started` — `{account_id, subject}` — triggers toast "Sending..."
-- `send-complete` — `{account_id, subject}` — triggers toast "Sent"
-- `send-failed` — `{account_id, subject, error}` — triggers error toast (10s)
+- `send-started` — `{account_id, subject, outbox_id}` — triggers toast
+  "Sending..."
+- `send-complete` — `{account_id, subject, outbox_id}` — triggers toast "Sent"
+- `send-failed` — `{account_id, subject, outbox_id, error}` — reports a
+  definite failure
+- `send-unknown` — `{account_id, subject, outbox_id, error}` — warns that
+  delivery may already have occurred
 
 The activity store listens for these events and tracks send operations alongside sync operations.
 
@@ -92,16 +101,29 @@ A collapsible panel between the main content area and the status bar, showing al
 - Failed sends are clearly surfaced with error details
 
 ### Negative
-- If the background send fails, the compose window is already closed. The user sees an error toast but cannot retry from the compose window. The failed message is persisted in the outbox table for future retry, but no automatic retry mechanism is implemented yet.
+- If the background send fails, the compose window is already closed. The user
+  sees an error toast and must use the outbox controls to inspect or manually
+  retry an indeterminate delivery.
 - The operations panel adds visual complexity to the UI
 - Toast notifications from the main window may not be visible if the user has switched to another application
 
 ### Send persistence
 
 The built `raw_message` is base64-encoded and saved to the `outbox` table (action_type = "send") **before** the background task is spawned. This ensures the message survives an app crash during sending:
-- On success: the outbox entry is deleted via `mark_completed()`
-- On failure: the outbox entry is marked failed via `mark_failed()` and the `send-failed` event is emitted
-- On crash: the outbox entry remains with status "pending" for future replay
+- On success: the claimed outbox entry is deleted.
+- On a definite failure: the outbox entry becomes `pending` for automatic
+  replay and the `send-failed` event is emitted.
+- When SMTP or JMAP does not provide trustworthy completion evidence: the
+  outbox entry becomes `dead`, remains visible, and requires a deliberate
+  manual retry because delivery may already have occurred.
+- On a crash: an entry stranded in `sending` is quarantined as `dead` on the
+  next startup for the same duplicate-prevention reason.
+- Before replay transport begins, the worker atomically claims the exact
+  pending row as `sending`. Stale snapshots cannot submit, and retry/discard
+  commands cannot mutate an in-flight row.
+- Unknown rows are labeled "Delivery status unknown". Manual retry requires
+  confirmation that it may duplicate delivery; discard explains that removing
+  the local record cannot cancel a message already accepted remotely.
 
 ### Files modified
 

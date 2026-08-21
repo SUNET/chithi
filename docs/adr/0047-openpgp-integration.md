@@ -151,11 +151,20 @@ XOAUTH2 with the Microsoft IMAP/SMTP scope), while JMAP retains native
 JMAP Submission. The PGP-wrapped raw bytes are persisted for every
 backend and replayed unchanged. SMTP replay also passes the separately
 persisted sender and recipient envelope unchanged. Native JMAP
-Submission receives only the raw MIME, with no explicit JMAP envelope;
-this leaves a known Bcc-delivery limitation when Bcc recipients are not
-present in those bytes, queued for a separate fix. Graph replay never
-converts the MIME to a Graph `sendMail` payload or invokes IMAP
-Sent-folder handling.
+Submission now receives a mandatory explicit RFC 8621 envelope built
+from the separately persisted sender and To/Cc/Bcc fields; Bcc is
+therefore delivered through `rcptTo` without being added to the raw MIME.
+Envelope addresses always include RFC 8621 `parameters`; SMTPUTF8 is
+advertised only on `mailFrom` and is gated by the selected account's JMAP
+Submission capability before upload. The submission identity must match the
+sender exactly (or authorize its domain with `*@domain`), and successful
+delivery requires positively correlated import and submission creation
+responses. Errors and logs omit server descriptions and bodies that could
+echo Bcc data.
+The earlier implementation passed only the MIME and could lose Bcc on
+JMAP sends; that limitation was resolved on 2026-08-21 while retaining
+the byte-exact MIME path. Graph replay never converts the MIME to a Graph
+`sendMail` payload or invokes IMAP Sent-folder handling.
 
 ### Receive path
 `pgp_decrypt_message` extracts the ciphertext, then tries a **software**
