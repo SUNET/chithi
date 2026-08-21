@@ -415,6 +415,7 @@ pub struct ProviderTransports {
     pub google_endpoints: crate::mail::google::GoogleEndpoints,
     pub jmap_discovery_http: reqwest::Client,
     pub jmap_api_http: reqwest::Client,
+    pub jmap_submission_http: reqwest::Client,
     pub jmap_sse_http: reqwest::Client,
     pub oidc_http: reqwest::Client,
     pub oidc_poll_http: reqwest::Client,
@@ -435,6 +436,11 @@ impl ProviderTransports {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| Error::Other(error.to_string()))?;
+        let jmap_submission_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| Error::Other(error.to_string()))?;
 
         Ok(Self {
             graph_http: reqwest::Client::new(),
@@ -443,6 +449,7 @@ impl ProviderTransports {
             google_endpoints: crate::mail::google::GoogleEndpoints::default(),
             jmap_discovery_http,
             jmap_api_http,
+            jmap_submission_http,
             // No overall timeout: EventSource responses are long-lived and
             // enforce a per-chunk read timeout in the push loop.
             jmap_sse_http: reqwest::Client::builder()
@@ -592,6 +599,7 @@ impl ProviderServices {
             &config,
             self.transports.jmap_discovery_http.clone(),
             self.transports.jmap_api_http.clone(),
+            self.transports.jmap_submission_http.clone(),
         )
         .await?;
         Ok((config, connection))

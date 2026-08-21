@@ -12,6 +12,7 @@ const STUCK_SENDING_ERROR_MESSAGE: &str =
     "Delivery outcome is unknown after app restart; automatic retry disabled to avoid duplicate delivery. Verify delivery before retrying manually.";
 
 const MAX_SEND_ERROR_MESSAGE_BYTES: usize = 256;
+const MAX_RETRIES: i32 = 5;
 
 pub fn is_indeterminate_delivery_error_message(message: &str) -> bool {
     message == INDETERMINATE_DELIVERY_ERROR_MESSAGE || message == STUCK_SENDING_ERROR_MESSAGE
@@ -125,19 +126,65 @@ pub fn complete_sending_send(conn: &Connection, outbox_id: i64) -> Result<bool> 
     Ok(changed == 1)
 }
 
-/// Record a definite send failure and atomically release its claim for replay.
-pub fn retry_sending_send(conn: &Connection, outbox_id: i64, error: &str) -> Result<bool> {
+/// Complete a delivered send before running any best-effort follow-up work.
+pub async fn complete_send_before<T, F, Fut>(
+    db: &crate::db::pool::DbPool,
+    outbox_id: i64,
+    after_completion: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let completed = {
+        let conn = db.writer().await;
+        complete_sending_send(&conn, outbox_id)?
+    };
+    if completed {
+        let _ = after_completion().await;
+    }
+    Ok(completed)
+}
+
+/// Durable disposition after recording a definite send failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendRetryDisposition {
+    Pending,
+    Dead,
+    MissingClaim,
+}
+
+/// Record a definite send failure and atomically release or exhaust its claim.
+pub fn retry_sending_send(
+    conn: &Connection,
+    outbox_id: i64,
+    error: &str,
+) -> Result<SendRetryDisposition> {
     let error = bounded_send_error(error);
-    let changed = conn
-        .execute(
-            "UPDATE outbox
-             SET status = 'pending', retry_count = retry_count + 1,
-                 error_message = ?1
-             WHERE id = ?2 AND action_type = 'send' AND status = 'sending'",
-            rusqlite::params![error, outbox_id],
-        )
-        .map_err(Error::Database)?;
-    Ok(changed == 1)
+    let status = match conn.query_row(
+        "UPDATE outbox
+             SET retry_count = retry_count + 1,
+                 status = CASE
+                     WHEN retry_count + 1 >= ?1 THEN 'dead'
+                     ELSE 'pending'
+                 END,
+                 error_message = ?2
+             WHERE id = ?3 AND action_type = 'send' AND status = 'sending'
+             RETURNING status",
+        rusqlite::params![MAX_RETRIES, error, outbox_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(status) => status,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SendRetryDisposition::MissingClaim),
+        Err(error) => return Err(Error::Database(error)),
+    };
+    match status.as_str() {
+        "pending" => Ok(SendRetryDisposition::Pending),
+        "dead" => Ok(SendRetryDisposition::Dead),
+        _ => Err(Error::Other(format!(
+            "Unexpected send retry disposition '{status}'"
+        ))),
+    }
 }
 
 /// Quarantine a claimed send after an ambiguous outcome. The explanation is
@@ -150,6 +197,26 @@ pub fn quarantine_sending_send(conn: &Connection, outbox_id: i64, error: &str) -
 /// row. Used for retry exhaustion and invalid persisted payloads.
 pub fn quarantine_pending_send(conn: &Connection, outbox_id: i64, error: &str) -> Result<bool> {
     quarantine_send_from_status(conn, outbox_id, "pending", error)
+}
+
+/// Mark a legacy pending send at the retry limit dead without replacing its
+/// last transport error. The fallback is used only if no error was persisted.
+pub fn exhaust_pending_send(
+    conn: &Connection,
+    outbox_id: i64,
+    fallback_error: &str,
+) -> Result<bool> {
+    let fallback_error = bounded_send_error(fallback_error);
+    let changed = conn
+        .execute(
+            "UPDATE outbox
+             SET status = 'dead', error_message = COALESCE(error_message, ?1)
+             WHERE id = ?2 AND action_type = 'send' AND status = 'pending'
+               AND retry_count >= ?3",
+            rusqlite::params![fallback_error, outbox_id, MAX_RETRIES],
+        )
+        .map_err(Error::Database)?;
+    Ok(changed == 1)
 }
 
 fn quarantine_send_from_status(
@@ -946,8 +1013,6 @@ pub fn outbox_to_mail_op(entry: &OutboxEntry) -> Option<MailOp> {
     }
 }
 
-const MAX_RETRIES: i32 = 5;
-
 /// Check if an entry has exceeded the retry limit.
 pub fn is_dead(entry: &OutboxEntry) -> bool {
     entry.retry_count >= MAX_RETRIES
@@ -957,6 +1022,7 @@ pub fn is_dead(entry: &OutboxEntry) -> bool {
 mod tests {
     use super::*;
     use crate::message::BackendMessageRef;
+    use std::sync::atomic::{AtomicBool, Ordering};
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1159,20 +1225,131 @@ mod tests {
         assert_eq!(row_state(&conn, non_send_id).unwrap().0, "sending");
     }
 
+    #[tokio::test]
+    async fn completion_precedes_and_survives_failed_postprocess() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = crate::db::pool::DbPool::new(&temp.path().join("outbox.db"), 1).unwrap();
+        {
+            let conn = pool.writer().await;
+            conn.execute_batch(
+                "CREATE TABLE outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL,
+                    error_message TEXT
+                );",
+            )
+            .unwrap();
+        }
+        let id = {
+            let conn = pool.writer().await;
+            queue_offline_op_with_status(&conn, "acc1", "send", &serde_json::json!({}), "sending")
+                .unwrap()
+        };
+        let postprocess_ran = AtomicBool::new(false);
+
+        let completed = complete_send_before(&pool, id, || async {
+            let conn = pool.reader();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "delivery must complete before postprocess");
+            postprocess_ran.store(true, Ordering::SeqCst);
+            Err::<(), &str>("injected Sent append failure")
+        })
+        .await
+        .unwrap();
+
+        assert!(completed);
+        assert!(postprocess_ran.load(Ordering::SeqCst));
+        let conn = pool.reader();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn definite_send_failure_atomically_releases_claim_and_increments_retry() {
         let conn = setup_db();
         let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
 
-        assert!(!retry_sending_send(&conn, id, "definite rejection").unwrap());
+        assert_eq!(
+            retry_sending_send(&conn, id, "definite rejection").unwrap(),
+            SendRetryDisposition::MissingClaim
+        );
         assert!(claim_pending_send(&conn, id, 0).unwrap());
-        assert!(retry_sending_send(&conn, id, "definite rejection").unwrap());
+        assert_eq!(
+            retry_sending_send(&conn, id, "definite rejection").unwrap(),
+            SendRetryDisposition::Pending
+        );
         assert_eq!(
             row_state(&conn, id),
             Some(("pending".into(), 1, Some("definite rejection".into())))
         );
-        assert!(!retry_sending_send(&conn, id, "second failure").unwrap());
+        assert_eq!(
+            retry_sending_send(&conn, id, "second failure").unwrap(),
+            SendRetryDisposition::MissingClaim
+        );
         assert_eq!(row_state(&conn, id).unwrap().1, 1);
+    }
+
+    #[test]
+    fn definite_send_failure_at_limit_is_dead_with_last_bounded_error() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        conn.execute(
+            "UPDATE outbox SET retry_count = ?1 WHERE id = ?2",
+            rusqlite::params![MAX_RETRIES - 1, id],
+        )
+        .unwrap();
+        assert!(claim_pending_send(&conn, id, MAX_RETRIES - 1).unwrap());
+
+        let error = format!("last transport error: {}", "é".repeat(512));
+        assert_eq!(
+            retry_sending_send(&conn, id, &error).unwrap(),
+            SendRetryDisposition::Dead
+        );
+        let state = row_state(&conn, id).unwrap();
+        assert_eq!(state.0, "dead");
+        assert_eq!(state.1, MAX_RETRIES);
+        let stored = state.2.unwrap();
+        assert!(stored.starts_with("last transport error:"));
+        assert!(stored.len() <= MAX_SEND_ERROR_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn legacy_pending_send_at_limit_preserves_existing_error() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        conn.execute(
+            "UPDATE outbox SET retry_count = ?1, error_message = 'last SMTP rejection'
+             WHERE id = ?2",
+            rusqlite::params![MAX_RETRIES, id],
+        )
+        .unwrap();
+
+        assert!(exhaust_pending_send(&conn, id, "retry limit reached").unwrap());
+        assert_eq!(
+            row_state(&conn, id),
+            Some((
+                "dead".into(),
+                MAX_RETRIES,
+                Some("last SMTP rejection".into())
+            ))
+        );
     }
 
     #[test]

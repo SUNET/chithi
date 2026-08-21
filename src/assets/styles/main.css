@@ -51,6 +51,7 @@
   --color-danger-text: #e7000b;
   --color-success: #00a63e;
   --color-warning: #e17100;
+  --color-warning-text: #9a3c06;
   --color-email-body-bg: #ffffff;
   --color-email-body-text: #1a1a1a;
   --color-status-dot: #6ca04f;      /* sync green */
@@ -117,6 +118,7 @@
   --color-danger-text: #e7000b;
   --color-success: #00a63e;
   --color-warning: #e17100;
+  --color-warning-text: #f59e0b;
   --color-email-body-bg: #171717;
   --color-email-body-text: #e5e5e5;
   --color-status-dot: #00c950;

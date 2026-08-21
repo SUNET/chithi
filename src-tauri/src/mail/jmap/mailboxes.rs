@@ -21,9 +21,10 @@ impl JmapConnection {
         });
 
         let resp = self.api_request(&request, config).await?;
-
-        let mailboxes = resp["methodResponses"][0][1]["list"]
-            .as_array()
+        let body = mailbox_get_body(&resp, "m1", &self.account_id)?;
+        let mailboxes = body
+            .get("list")
+            .and_then(serde_json::Value::as_array)
             .ok_or_else(|| Error::Other("Invalid Mailbox/get response".into()))?;
 
         let mut folders = Vec::new();
@@ -70,7 +71,7 @@ impl JmapConnection {
             ]
         });
         let resp = self.api_request(&request, config).await?;
-        mailbox_id_by_role(&resp, role)
+        mailbox_id_by_role(&resp, role, &self.account_id)
     }
 
     /// Create a new mailbox on the JMAP server.
@@ -167,7 +168,11 @@ impl JmapConnection {
     }
 }
 
-fn mailbox_id_by_role(response: &serde_json::Value, role: &str) -> Result<Option<String>> {
+fn mailbox_get_body<'a>(
+    response: &'a serde_json::Value,
+    call_id: &str,
+    expected_account_id: &str,
+) -> Result<&'a serde_json::Value> {
     let responses = response
         .get("methodResponses")
         .and_then(serde_json::Value::as_array)
@@ -177,7 +182,7 @@ fn mailbox_id_by_role(response: &serde_json::Value, role: &str) -> Result<Option
         .as_array()
         .filter(|tuple| tuple.len() == 3)
         .ok_or_else(|| Error::Other("Malformed JMAP Mailbox/get response tuple".into()))?;
-    if tuple[2].as_str() != Some("r1") {
+    if tuple[2].as_str() != Some(call_id) {
         return Err(Error::Other(
             "JMAP Mailbox/get returned an unexpected call id".into(),
         ));
@@ -197,8 +202,22 @@ fn mailbox_id_by_role(response: &serde_json::Value, role: &str) -> Result<Option
             "JMAP Mailbox/get returned an unexpected method".into(),
         ));
     }
+    let body = &tuple[1];
+    if body.get("accountId").and_then(serde_json::Value::as_str) != Some(expected_account_id) {
+        return Err(Error::Other(
+            "JMAP Mailbox/get returned an unexpected account id".into(),
+        ));
+    }
+    Ok(body)
+}
 
-    let mailboxes = tuple[1]
+fn mailbox_id_by_role(
+    response: &serde_json::Value,
+    role: &str,
+    expected_account_id: &str,
+) -> Result<Option<String>> {
+    let body = mailbox_get_body(response, "r1", expected_account_id)?;
+    let mailboxes = body
         .get("list")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| Error::Other("JMAP Mailbox/get returned no mailbox list".into()))?;
@@ -236,6 +255,7 @@ mod tests {
     fn role_lookup_requires_a_correlated_mailbox_get_result() {
         let valid = serde_json::json!({
             "methodResponses": [["Mailbox/get", {
+                "accountId": "account-1",
                 "list": [
                     { "id": "archive-id", "role": null },
                     { "id": "sent-id", "role": "sent" }
@@ -243,7 +263,9 @@ mod tests {
             }, "r1"]]
         });
         assert_eq!(
-            mailbox_id_by_role(&valid, "sent").unwrap().as_deref(),
+            mailbox_id_by_role(&valid, "sent", "account-1")
+                .unwrap()
+                .as_deref(),
             Some("sent-id")
         );
 
@@ -255,15 +277,40 @@ mod tests {
                 "methodResponses": [["Mailbox/get", { "list": [] }, "wrong"]]
             }),
             serde_json::json!({
-                "methodResponses": [["Mailbox/get", {}, "r1"]]
+                "methodResponses": [["Mailbox/get", {
+                    "accountId": "account-1"
+                }, "r1"]]
             }),
             serde_json::json!({
                 "methodResponses": [["Mailbox/get", {
+                    "accountId": "account-1",
                     "list": [{ "id": "sent-id" }]
                 }, "r1"]]
             }),
         ] {
-            assert!(mailbox_id_by_role(&invalid, "sent").is_err());
+            assert!(mailbox_id_by_role(&invalid, "sent", "account-1").is_err());
+        }
+    }
+
+    #[test]
+    fn role_lookup_requires_the_expected_account_id() {
+        for account_id in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(7)),
+            Some(serde_json::json!("other-account")),
+        ] {
+            let mut body = serde_json::json!({
+                "list": [{ "id": "sent-id", "role": "sent" }]
+            });
+            if let Some(account_id) = account_id {
+                body["accountId"] = account_id;
+            }
+            let response = serde_json::json!({
+                "methodResponses": [["Mailbox/get", body, "r1"]]
+            });
+
+            assert!(mailbox_id_by_role(&response, "sent", "account-1").is_err());
         }
     }
 
@@ -277,7 +324,7 @@ mod tests {
             }, "r1"]]
         });
 
-        let error = mailbox_id_by_role(&response, "sent")
+        let error = mailbox_id_by_role(&response, "sent", "account-1")
             .unwrap_err()
             .to_string();
         assert!(error.contains("serverFail"));

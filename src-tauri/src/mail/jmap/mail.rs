@@ -996,13 +996,17 @@ impl JmapConnection {
         request: &serde_json::Value,
         config: &JmapConfig,
     ) -> Result<serde_json::Value> {
-        let response = config
-            .apply_auth(self.http.post(&self.api_url))
+        let request = config
+            .apply_auth(self.submission_http.post(&self.api_url))
             .json(request)
-            .send()
+            .build()
+            .map_err(|_| Error::Other("JMAP submission request failed before execution".into()))?;
+        let response = self
+            .submission_http
+            .execute(request)
             .await
             .map_err(|error| {
-                if error.is_builder() || error.is_connect() || error.is_redirect() {
+                if error.is_connect() {
                     Error::Other("JMAP submission request failed before execution".into())
                 } else {
                     Error::IndeterminateDelivery
@@ -1016,8 +1020,9 @@ impl JmapConnection {
                     "JMAP submission request rejected with HTTP status {status}"
                 )));
             }
-            // A gateway/server error can be generated after an upstream JMAP
-            // server accepted the request, so it cannot prove non-delivery.
+            // A redirect proves the original endpoint received the POST, and
+            // a gateway/server error can follow upstream acceptance. Neither
+            // response class proves non-delivery.
             return Err(Error::IndeterminateDelivery);
         }
 
@@ -1080,10 +1085,7 @@ impl JmapConnection {
             .json()
             .await
             .map_err(|e| Error::Other(format!("JMAP upload response parse error: {}", e)))?;
-        let blob_id = upload_resp["blobId"]
-            .as_str()
-            .ok_or_else(|| Error::Other("No blobId in upload response".into()))?
-            .to_string();
+        let blob_id = submission_upload_blob_id(&upload_resp, &self.account_id)?;
         log::debug!("JMAP blob uploaded: {}", blob_id);
 
         // Import the email into the Sent folder and submit it.
@@ -1118,7 +1120,7 @@ impl JmapConnection {
         });
 
         let resp = self.submission_api_request(&request, config).await?;
-        if let Err(failure) = validate_submission_response(&resp) {
+        if let Err(failure) = validate_submission_response(&resp, &self.account_id) {
             if let Some(email_id) = failure.imported_email_id {
                 log::warn!("JMAP cleaning up imported email after explicit submission rejection");
                 let cleanup = serde_json::json!({
@@ -1165,10 +1167,7 @@ impl JmapConnection {
             .json()
             .await
             .map_err(|e| Error::Other(format!("JMAP draft upload parse error: {}", e)))?;
-        let blob_id = upload_resp["blobId"]
-            .as_str()
-            .ok_or_else(|| Error::Other("No blobId in draft upload response".into()))?
-            .to_string();
+        let blob_id = submission_upload_blob_id(&upload_resp, &self.account_id)?;
 
         // Find the Drafts mailbox
         let drafts_mailbox_id = self
@@ -1194,16 +1193,44 @@ impl JmapConnection {
         });
 
         let resp = self.api_request(&request, config).await?;
-
-        if let Some(error) = resp["methodResponses"][0][1]["notImported"].get("draft") {
-            return Err(Error::Other(format!(
-                "JMAP draft import failed (type={})",
-                super::safe_jmap_error_type(error)
-            )));
-        }
+        validate_draft_import_response(&resp, &self.account_id)?;
 
         log::info!("JMAP draft saved successfully");
         Ok(())
+    }
+}
+
+fn submission_upload_blob_id(
+    response: &serde_json::Value,
+    expected_account_id: &str,
+) -> Result<String> {
+    if response
+        .get("accountId")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_account_id)
+    {
+        return Err(Error::Other(
+            "JMAP upload response did not match the requested account".into(),
+        ));
+    }
+    response
+        .get("blobId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|blob_id| !blob_id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Other("No blobId in upload response".into()))
+}
+
+fn validate_draft_import_response(
+    response: &serde_json::Value,
+    expected_account_id: &str,
+) -> Result<()> {
+    match classify_import_response(response, expected_account_id) {
+        CreationOutcome::Created(_) => Ok(()),
+        CreationOutcome::Rejected(error) => Err(error),
+        CreationOutcome::Indeterminate => {
+            Err(Error::Other("Malformed JMAP draft import response".into()))
+        }
     }
 }
 
@@ -1220,9 +1247,10 @@ enum CreationOutcome<T> {
 
 fn validate_submission_response(
     response: &serde_json::Value,
+    expected_account_id: &str,
 ) -> std::result::Result<(), SubmissionResponseFailure> {
-    let imported = classify_import_response(response);
-    let submitted = classify_email_submission_response(response);
+    let imported = classify_import_response(response, expected_account_id);
+    let submitted = classify_email_submission_response(response, expected_account_id);
 
     match (imported, submitted) {
         (CreationOutcome::Created(_), CreationOutcome::Created(())) => Ok(()),
@@ -1258,7 +1286,10 @@ fn validate_submission_response(
     }
 }
 
-fn classify_import_response(response: &serde_json::Value) -> CreationOutcome<String> {
+fn classify_import_response(
+    response: &serde_json::Value,
+    expected_account_id: &str,
+) -> CreationOutcome<String> {
     let Some((method, body)) = matching_method_response(response, "i1") else {
         return CreationOutcome::Indeterminate;
     };
@@ -1266,6 +1297,9 @@ fn classify_import_response(response: &serde_json::Value) -> CreationOutcome<Str
         return classify_method_error("JMAP Email/import failed", body);
     }
     if method != "Email/import" {
+        return CreationOutcome::Indeterminate;
+    }
+    if !has_expected_account_id(body, expected_account_id) {
         return CreationOutcome::Indeterminate;
     }
     let created = body
@@ -1283,7 +1317,10 @@ fn classify_import_response(response: &serde_json::Value) -> CreationOutcome<Str
     }
 }
 
-fn classify_email_submission_response(response: &serde_json::Value) -> CreationOutcome<()> {
+fn classify_email_submission_response(
+    response: &serde_json::Value,
+    expected_account_id: &str,
+) -> CreationOutcome<()> {
     let Some((method, body)) = matching_method_response(response, "s1") else {
         return CreationOutcome::Indeterminate;
     };
@@ -1291,6 +1328,9 @@ fn classify_email_submission_response(response: &serde_json::Value) -> CreationO
         return classify_method_error("JMAP EmailSubmission/set failed", body);
     }
     if method != "EmailSubmission/set" {
+        return CreationOutcome::Indeterminate;
+    }
+    if !has_expected_account_id(body, expected_account_id) {
         return CreationOutcome::Indeterminate;
     }
     let created = body
@@ -1308,6 +1348,10 @@ fn classify_email_submission_response(response: &serde_json::Value) -> CreationO
         }
         _ => CreationOutcome::Indeterminate,
     }
+}
+
+fn has_expected_account_id(body: &serde_json::Value, expected_account_id: &str) -> bool {
+    body.get("accountId").and_then(serde_json::Value::as_str) == Some(expected_account_id)
 }
 
 fn bounded_rejection(context: &str, error: &serde_json::Value) -> Option<Error> {
@@ -1853,8 +1897,10 @@ mod submission_envelope_tests {
             .timeout(std::time::Duration::from_secs(1))
             .build()
             .unwrap();
+        let submission_http = http.clone();
         let connection = JmapConnection {
             http,
+            submission_http,
             api_url: format!("{base_url}/api"),
             download_url_template: format!("{base_url}/download/{{blobId}}"),
             upload_url_template: format!("{base_url}/upload/{{accountId}}"),
@@ -1900,13 +1946,17 @@ mod submission_envelope_tests {
 mod submission_response_tests {
     use super::validate_submission_response;
 
+    const ACCOUNT_ID: &str = "account-1";
+
     fn successful_response() -> serde_json::Value {
         serde_json::json!({
             "methodResponses": [
                 ["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "draft": { "id": "email-1" } }
                 }, "i1"],
                 ["EmailSubmission/set", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "sub1": { "id": "submission-1" } }
                 }, "s1"]
             ]
@@ -1915,20 +1965,23 @@ mod submission_response_tests {
 
     #[test]
     fn requires_positive_import_and_submission_creation() {
-        assert!(validate_submission_response(&successful_response()).is_ok());
+        assert!(validate_submission_response(&successful_response(), ACCOUNT_ID).is_ok());
 
         for response in [
             serde_json::json!({
                 "methodResponses": [["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "draft": { "id": "email-1" } }
                 }, "i1"]]
             }),
             serde_json::json!({
                 "methodResponses": [
                     ["Email/import", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "draft": { "id": "email-1" } }
                     }, "i1"],
                     ["EmailSubmission/set", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "sub1": {} }
                     }, "s1"]
                 ]
@@ -1936,9 +1989,11 @@ mod submission_response_tests {
             serde_json::json!({
                 "methodResponses": [
                     ["Email/import", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "draft": { "id": "email-1" } }
                     }, "i1"],
                     ["Email/set", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "sub1": { "id": "submission-1" } }
                     }, "s1"]
                 ]
@@ -1946,15 +2001,17 @@ mod submission_response_tests {
             serde_json::json!({
                 "methodResponses": [
                     ["Email/import", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "draft": { "id": "email-1" } }
                     }, "i1"],
                     ["EmailSubmission/set", {
+                        "accountId": ACCOUNT_ID,
                         "created": { "sub1": { "id": "submission-1" } }
                     }, "wrong-call-id"]
                 ]
             }),
         ] {
-            let failure = validate_submission_response(&response).unwrap_err();
+            let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
             assert!(failure.imported_email_id.is_none());
             assert!(failure.error.is_indeterminate_delivery());
         }
@@ -1968,7 +2025,33 @@ mod submission_response_tests {
             .unwrap()
             .push(serde_json::json!(["Core/echo", {}, "extra"]));
 
-        assert!(validate_submission_response(&response).is_ok());
+        assert!(validate_submission_response(&response, ACCOUNT_ID).is_ok());
+    }
+
+    #[test]
+    fn successful_responses_require_the_expected_account_id() {
+        for method_index in [0, 1] {
+            for account_id in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!(7)),
+                Some(serde_json::json!("other-account")),
+            ] {
+                let mut response = successful_response();
+                let body = response["methodResponses"][method_index][1]
+                    .as_object_mut()
+                    .unwrap();
+                if let Some(account_id) = account_id {
+                    body.insert("accountId".into(), account_id);
+                } else {
+                    body.remove("accountId");
+                }
+
+                let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
+                assert!(failure.imported_email_id.is_none());
+                assert!(failure.error.is_indeterminate_delivery());
+            }
+        }
     }
 
     #[test]
@@ -1976,9 +2059,11 @@ mod submission_response_tests {
         let response = serde_json::json!({
             "methodResponses": [
                 ["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "draft": { "id": "email-1" } }
                 }, "i1"],
                 ["EmailSubmission/set", {
+                    "accountId": ACCOUNT_ID,
                     "notCreated": {
                         "sub1": { "type": "forbiddenToSend" }
                     }
@@ -1986,9 +2071,31 @@ mod submission_response_tests {
             ]
         });
 
-        let failure = validate_submission_response(&response).unwrap_err();
+        let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
         assert_eq!(failure.imported_email_id.as_deref(), Some("email-1"));
         assert!(!failure.error.is_indeterminate_delivery());
+    }
+
+    #[test]
+    fn mismatched_rejection_account_is_indeterminate_without_cleanup() {
+        let response = serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "accountId": ACCOUNT_ID,
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"],
+                ["EmailSubmission/set", {
+                    "accountId": "other-account",
+                    "notCreated": {
+                        "sub1": { "type": "forbiddenToSend" }
+                    }
+                }, "s1"]
+            ]
+        });
+
+        let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
+        assert!(failure.imported_email_id.is_none());
+        assert!(failure.error.is_indeterminate_delivery());
     }
 
     #[test]
@@ -2000,7 +2107,7 @@ mod submission_response_tests {
             let mut response = successful_response();
             response["methodResponses"][1][1]["notCreated"]["sub1"] = rejected;
 
-            let failure = validate_submission_response(&response).unwrap_err();
+            let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
             assert!(failure.imported_email_id.is_none());
             assert!(failure.error.is_indeterminate_delivery());
         }
@@ -2011,13 +2118,14 @@ mod submission_response_tests {
         let response = serde_json::json!({
             "methodResponses": [
                 ["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "draft": { "id": "email-1" } }
                 }, "i1"],
                 ["error", { "type": "serverPartialFail" }, "s1"]
             ]
         });
 
-        let failure = validate_submission_response(&response).unwrap_err();
+        let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
         assert!(failure.imported_email_id.is_none());
         assert!(failure.error.is_indeterminate_delivery());
     }
@@ -2027,6 +2135,7 @@ mod submission_response_tests {
         let response = serde_json::json!({
             "methodResponses": [
                 ["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "notCreated": {
                         "draft": {
                             "type": "invalidEmail",
@@ -2034,11 +2143,11 @@ mod submission_response_tests {
                         }
                     }
                 }, "i1"],
-                ["EmailSubmission/set", {}, "s1"]
+                ["EmailSubmission/set", { "accountId": ACCOUNT_ID }, "s1"]
             ]
         });
 
-        let failure = validate_submission_response(&response).unwrap_err();
+        let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
         assert!(failure.imported_email_id.is_none());
         let error = failure.error.to_string();
         assert!(error.contains("invalidEmail"));
@@ -2051,9 +2160,11 @@ mod submission_response_tests {
         let response = serde_json::json!({
             "methodResponses": [
                 ["Email/import", {
+                    "accountId": ACCOUNT_ID,
                     "created": { "draft": { "id": "email-1" } }
                 }, "i1"],
                 ["EmailSubmission/set", {
+                    "accountId": ACCOUNT_ID,
                     "notCreated": {
                         "sub1": {
                             "type": "invalidRecipients",
@@ -2065,7 +2176,7 @@ mod submission_response_tests {
             ]
         });
 
-        let failure = validate_submission_response(&response).unwrap_err();
+        let failure = validate_submission_response(&response, ACCOUNT_ID).unwrap_err();
         assert_eq!(failure.imported_email_id.as_deref(), Some("email-1"));
         let error = failure.error.to_string();
         assert!(error.contains("type=invalidRecipients"));
@@ -2075,17 +2186,175 @@ mod submission_response_tests {
 }
 
 #[cfg(test)]
+mod upload_and_draft_response_tests {
+    use super::{submission_upload_blob_id, validate_draft_import_response};
+
+    const ACCOUNT_ID: &str = "account-1";
+
+    #[test]
+    fn submission_upload_requires_the_expected_account_id() {
+        let valid = serde_json::json!({
+            "accountId": ACCOUNT_ID,
+            "blobId": "blob-1"
+        });
+        assert_eq!(
+            submission_upload_blob_id(&valid, ACCOUNT_ID).unwrap(),
+            "blob-1"
+        );
+
+        for response in [
+            serde_json::json!({ "blobId": "private-blob" }),
+            serde_json::json!({ "accountId": null, "blobId": "private-blob" }),
+            serde_json::json!({ "accountId": 7, "blobId": "private-blob" }),
+            serde_json::json!({
+                "accountId": "other-account",
+                "blobId": "private-blob"
+            }),
+        ] {
+            let error = submission_upload_blob_id(&response, ACCOUNT_ID)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("private-blob"));
+            assert!(error.len() < 160);
+        }
+    }
+
+    #[test]
+    fn submission_upload_requires_a_nonempty_blob_id() {
+        for response in [
+            serde_json::json!({ "accountId": ACCOUNT_ID }),
+            serde_json::json!({ "accountId": ACCOUNT_ID, "blobId": null }),
+            serde_json::json!({ "accountId": ACCOUNT_ID, "blobId": "" }),
+        ] {
+            assert!(submission_upload_blob_id(&response, ACCOUNT_ID).is_err());
+        }
+    }
+
+    #[test]
+    fn draft_import_requires_correlated_creation_for_the_expected_account() {
+        let valid = serde_json::json!({
+            "methodResponses": [["Email/import", {
+                "accountId": ACCOUNT_ID,
+                "created": { "draft": { "id": "email-1" } }
+            }, "i1"]]
+        });
+        assert!(validate_draft_import_response(&valid, ACCOUNT_ID).is_ok());
+
+        let secret = "private draft response";
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": ACCOUNT_ID,
+                    "created": { "draft": { "id": "email-1" } }
+                }, "wrong"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/get", {
+                    "accountId": ACCOUNT_ID,
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": null,
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": "other-account",
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": ACCOUNT_ID,
+                    "created": { "draft": {} }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": ACCOUNT_ID,
+                    "notImported": {
+                        "draft": {
+                            "type": "invalidEmail",
+                            "description": secret
+                        }
+                    }
+                }, "i1"]]
+            }),
+        ] {
+            let error = validate_draft_import_response(&response, ACCOUNT_ID)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains(secret));
+            assert!(error.len() < 160);
+        }
+    }
+
+    #[test]
+    fn draft_import_rejection_and_method_error_are_bounded_and_redacted() {
+        let secret = "private draft response";
+        for response in [
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "accountId": ACCOUNT_ID,
+                    "notCreated": {
+                        "draft": {
+                            "type": "invalidEmail",
+                            "description": secret
+                        }
+                    }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [["error", {
+                    "type": "serverFail",
+                    "description": secret
+                }, "i1"]]
+            }),
+        ] {
+            let error = validate_draft_import_response(&response, ACCOUNT_ID)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains(secret));
+            assert!(error.len() < 160);
+        }
+    }
+}
+
+#[cfg(test)]
 mod submission_request_tests {
     use super::{JmapConfig, JmapConnection};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn connection(api_url: String) -> JmapConnection {
+        let submission_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        connection_with_submission_http(api_url, submission_http)
+    }
+
+    fn connection_with_submission_http(
+        api_url: String,
+        submission_http: reqwest::Client,
+    ) -> JmapConnection {
         JmapConnection {
             http: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
+            submission_http,
             api_url,
             download_url_template: String::new(),
             upload_url_template: String::new(),
@@ -2110,9 +2379,14 @@ mod submission_request_tests {
     }
 
     async fn serve_once(status: &str, body: &str) -> String {
+        serve_once_with_headers(status, "", body).await
+    }
+
+    async fn serve_once_with_headers(status: &str, headers: &str, body: &str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/api", listener.local_addr().unwrap());
         let status = status.to_string();
+        let headers = headers.to_string();
         let body = body.to_string();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2140,12 +2414,21 @@ mod submission_request_tests {
                 }
             }
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).await.unwrap();
         });
         url
+    }
+
+    async fn serve_redirect_once(status: u16, location: &str) -> String {
+        serve_once_with_headers(
+            &format!("{status} Redirect"),
+            &format!("Location: {location}\r\n"),
+            "",
+        )
+        .await
     }
 
     #[tokio::test]
@@ -2188,6 +2471,71 @@ mod submission_request_tests {
             .await
             .unwrap_err();
         assert!(!error.is_indeterminate_delivery());
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_definite() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api", listener.local_addr().unwrap());
+        drop(listener);
+
+        let error = connection(url)
+            .submission_api_request(&serde_json::json!({ "methodCalls": [] }), &config())
+            .await
+            .unwrap_err();
+        assert!(!error.is_indeterminate_delivery());
+    }
+
+    #[tokio::test]
+    async fn submission_redirects_are_indeterminate_and_not_followed() {
+        let request = serde_json::json!({ "methodCalls": [] });
+        for status in [301, 302, 303, 307, 308] {
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_url = format!("http://{}/redirected", target.local_addr().unwrap());
+            let origin_url = serve_redirect_once(status, &target_url).await;
+
+            let error = connection(origin_url)
+                .submission_api_request(&request, &config())
+                .await
+                .unwrap_err();
+            assert!(error.is_indeterminate_delivery(), "HTTP {status}");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+                    .await
+                    .is_err(),
+                "HTTP {status} submission redirect was followed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_http_3xx_submission_response_is_indeterminate() {
+        let request = serde_json::json!({ "methodCalls": [] });
+        for status in 300..=399 {
+            let url = serve_once(&format!("{status} Redirect"), "").await;
+            let error = connection(url)
+                .submission_api_request(&request, &config())
+                .await
+                .unwrap_err();
+            assert!(error.is_indeterminate_delivery(), "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_error_after_dispatch_is_indeterminate() {
+        let submission_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::limited(0))
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let url = serve_redirect_once(307, "http://127.0.0.1:9/redirected").await;
+
+        let error = connection_with_submission_http(url, submission_http)
+            .submission_api_request(&serde_json::json!({ "methodCalls": [] }), &config())
+            .await
+            .unwrap_err();
+        assert!(error.is_indeterminate_delivery());
     }
 }
 

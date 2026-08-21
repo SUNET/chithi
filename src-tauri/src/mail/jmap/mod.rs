@@ -104,6 +104,26 @@ mod connect_tests {
         (format!("http://{}", addr), request_rx)
     }
 
+    async fn session_redirect_server(location: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "redirect request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
         request.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -140,10 +160,21 @@ mod connect_tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-
-        let connection = JmapConnection::connect_with_clients(&config, discovery_http, api_http)
-            .await
+        let submission_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
             .unwrap();
+
+        let connection = JmapConnection::connect_with_clients(
+            &config,
+            discovery_http,
+            api_http,
+            submission_http,
+        )
+        .await
+        .unwrap();
         let request = request_rx.await.unwrap();
         assert_eq!(connection.account_id, "account-1");
         assert_eq!(connection.api_url, format!("{}/jmap/api", base_url));
@@ -170,6 +201,7 @@ mod connect_tests {
     async fn connect_rejects_http_url() {
         let msg = match JmapConnection::connect_with_clients(
             &http_config(),
+            reqwest::Client::new(),
             reqwest::Client::new(),
             reqwest::Client::new(),
         )
@@ -203,6 +235,7 @@ mod connect_tests {
         };
         let msg = match JmapConnection::connect_with_clients(
             &cfg,
+            reqwest::Client::new(),
             reqwest::Client::new(),
             reqwest::Client::new(),
         )
@@ -247,6 +280,47 @@ mod connect_tests {
     async fn configured_session_uses_injected_client_and_bearer_auth() {
         let (_, request) = connect_to_mock(Some("token-1")).await;
         assert_eq!(header(&request, "authorization"), Some("Bearer token-1"));
+    }
+
+    #[tokio::test]
+    async fn configured_session_still_follows_general_client_redirects() {
+        let (session_base, request_rx) = session_server().await;
+        let redirect_base =
+            session_redirect_server(format!("{session_base}/.well-known/jmap")).await;
+        let config = JmapConfig {
+            jmap_url: redirect_base,
+            email: "user@example.com".into(),
+            username: "user".into(),
+            password: "pass".into(),
+            access_token: None,
+            auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let general_http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let submission_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let connection = JmapConnection::connect_with_clients(
+            &config,
+            general_http.clone(),
+            general_http,
+            submission_http,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connection.account_id, "account-1");
+        let request = request_rx.await.unwrap();
+        assert!(request.starts_with("GET /.well-known/jmap HTTP/1.1\r\n"));
     }
 }
 
@@ -426,6 +500,7 @@ mod from_mail_account_tests {
 /// session that aren't accessible externally (e.g., http://host:8080).
 pub struct JmapConnection {
     http: reqwest::Client,
+    submission_http: reqwest::Client,
     api_url: String,
     download_url_template: String,
     upload_url_template: String,
@@ -574,11 +649,13 @@ mod session_limit_tests {
 }
 
 impl JmapConnection {
-    /// Connect using caller-provided clients for discovery and JMAP API traffic.
+    /// Connect using caller-provided clients for discovery, general API, and
+    /// final submission traffic.
     pub async fn connect_with_clients(
         config: &JmapConfig,
         discovery_http: reqwest::Client,
         api_http: reqwest::Client,
+        submission_http: reqwest::Client,
     ) -> Result<Self> {
         // Fail fast if bearer/OIDC was selected but no access token
         // resolved. Without this guard, apply_auth() would silently fall
@@ -674,6 +751,7 @@ impl JmapConnection {
 
         Ok(Self {
             http: api_http,
+            submission_http,
             api_url,
             download_url_template: download_url,
             upload_url_template: upload_url,

@@ -4,12 +4,13 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::mail::{MailBackend, MailOpExecutor, MailSyncCtx};
+use crate::backend::mail::{MailBackend, MailOpExecutor, MailSyncCtx, SendPostprocess};
 use crate::db::pool::DbPool;
 use crate::error::{Error, Result};
 
 use super::coalesce::coalesce;
 use super::lifecycle::{SpawnedWorker, WorkerTaskExit};
+use super::offline::SendRetryDisposition;
 use super::queue::{MailOp, OpEntry};
 
 const AMBIGUOUS_OPERATION_ERROR_MESSAGE: &str =
@@ -40,6 +41,14 @@ fn outbox_subject(payload_json: &str) -> String {
                 .map(String::from)
         })
         .unwrap_or_default()
+}
+
+fn missing_executor_error(account_id: &str) -> Error {
+    Error::Other(format!("Account {account_id} has no enabled mail binding"))
+}
+
+fn send_unknown_events_allowed(transition: &Result<bool>) -> bool {
+    matches!(transition, Ok(true))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,19 +259,24 @@ impl AccountWorker {
         Ok(())
     }
 
-    /// Run `op` through the account's executor. `Ok(())` when the
-    /// account has no mail backend (nothing to execute against).
+    /// Run `op` through the account's executor.
     async fn execute_op(&mut self, op: MailOp) -> Result<()> {
         let ctx = self.ctx.as_ref().expect("worker initialized");
         match self.executor.as_mut() {
             Some(executor) => executor.execute(ctx, &self.account_id, op).await,
-            None => {
-                log::warn!(
-                    "Worker: no mail backend for account {}, dropping op",
-                    self.account_id
-                );
-                Ok(())
+            None => Err(missing_executor_error(&self.account_id)),
+        }
+    }
+
+    async fn execute_replayed_send(&mut self, op: MailOp) -> Result<SendPostprocess> {
+        let ctx = self.ctx.as_ref().expect("worker initialized");
+        match self.executor.as_mut() {
+            Some(executor) => {
+                executor
+                    .execute_replayed_send(ctx, &self.account_id, op)
+                    .await
             }
+            None => Err(missing_executor_error(&self.account_id)),
         }
     }
 
@@ -295,7 +309,7 @@ impl AccountWorker {
                 if is_send {
                     let transition = {
                         let conn = self.db.writer().await;
-                        super::offline::quarantine_pending_send(
+                        super::offline::exhaust_pending_send(
                             &conn,
                             entry.id,
                             SEND_RETRY_LIMIT_ERROR_MESSAGE,
@@ -436,26 +450,47 @@ impl AccountWorker {
 
             // Execute the replayed op directly (not through execute() to avoid
             // re-queuing to outbox on failure — we handle retries here)
-            let result = self.execute_op(op).await;
+            let result = if is_send {
+                self.execute_replayed_send(op).await
+            } else {
+                self.execute_op(op).await.map(|_| SendPostprocess::None)
+            };
 
             match result {
-                Ok(()) => {
+                Ok(postprocess) => {
                     if is_send {
-                        let completion = {
-                            let conn = self.db.writer().await;
-                            super::offline::complete_sending_send(&conn, entry.id)
-                        };
-                        let completed = match completion {
+                        let app = self.app.clone();
+                        let account_id = self.account_id.clone();
+                        let subject = outbox_subject(&entry.payload_json);
+                        let ctx = self.ctx.as_ref().expect("worker initialized").clone();
+                        let completion = super::offline::complete_send_before(
+                            &self.db,
+                            entry.id,
+                            move || async move {
+                                app.emit(
+                                    "send-complete",
+                                    serde_json::json!({
+                                        "account_id": account_id,
+                                        "subject": subject,
+                                        "outbox_id": entry.id,
+                                        "via": "outbox-replay",
+                                    }),
+                                )
+                                .ok();
+                                postprocess.run_best_effort(&ctx, &account_id).await;
+                            },
+                        )
+                        .await;
+                        match completion {
                             Ok(true) => {
                                 log::info!("Replayed offline send {} successfully", entry.id);
-                                true
                             }
                             Ok(false) => {
                                 log::error!(
                                     "Send {} succeeded but its sending claim was missing; replay stopped",
                                     entry.id
                                 );
-                                false
+                                break;
                             }
                             Err(error) => {
                                 log::error!(
@@ -463,24 +498,10 @@ impl AccountWorker {
                                     entry.id,
                                     error
                                 );
-                                false
+                                break;
                             }
-                        };
-                        self.app
-                            .emit(
-                                "send-complete",
-                                serde_json::json!({
-                                    "account_id": self.account_id,
-                                    "subject": outbox_subject(&entry.payload_json),
-                                    "outbox_id": entry.id,
-                                    "via": "outbox-replay",
-                                }),
-                            )
-                            .ok();
-                        if completed {
-                            continue;
                         }
-                        break;
+                        continue;
                     }
 
                     let conn = self.db.writer().await;
@@ -501,14 +522,14 @@ impl AccountWorker {
                                 let conn = self.db.writer().await;
                                 super::offline::quarantine_sending_send(&conn, entry.id, error)
                             };
-                            let quarantined = match quarantine {
-                                Ok(true) => true,
+                            let quarantined = send_unknown_events_allowed(&quarantine);
+                            match quarantine {
+                                Ok(true) => {}
                                 Ok(false) => {
                                     log::error!(
                                         "Indeterminate send {} lost its sending claim; replay stopped",
                                         entry.id
                                     );
-                                    false
                                 }
                                 Err(mark_error) => {
                                     log::error!(
@@ -516,9 +537,11 @@ impl AccountWorker {
                                         entry.id,
                                         mark_error
                                     );
-                                    false
                                 }
-                            };
+                            }
+                            if !quarantined {
+                                break;
+                            }
                             self.app
                                 .emit(
                                     "send-unknown",
@@ -530,9 +553,6 @@ impl AccountWorker {
                                     }),
                                 )
                                 .ok();
-                            if !quarantined {
-                                break;
-                            }
                             log::warn!(
                                 "Replay of send {} has an unknown outcome; marked dead without automatic retry: {}",
                                 entry.id,
@@ -583,26 +603,70 @@ impl AccountWorker {
                     }
 
                     if is_send {
+                        let error_message = e.to_string();
                         let retry = {
                             let conn = self.db.writer().await;
-                            super::offline::retry_sending_send(&conn, entry.id, &e.to_string())
+                            super::offline::retry_sending_send(&conn, entry.id, &error_message)
                         };
-                        let persisted = match retry {
-                            Ok(true) => {
+                        match retry {
+                            Ok(SendRetryDisposition::Pending) => {
                                 log::warn!(
                                     "Replay of send {} failed definitely (attempt {}): {}",
                                     entry.id,
                                     entry.retry_count + 1,
                                     e
                                 );
-                                true
+                                self.app
+                                    .emit(
+                                        "send-failed",
+                                        serde_json::json!({
+                                            "account_id": self.account_id,
+                                            "subject": outbox_subject(&entry.payload_json),
+                                            "outbox_id": entry.id,
+                                            "error": error_message,
+                                            "via": "outbox-replay",
+                                        }),
+                                    )
+                                    .ok();
+                                continue;
                             }
-                            Ok(false) => {
+                            Ok(SendRetryDisposition::Dead) => {
+                                log::warn!(
+                                    "Replay of send {} failed definitely at retry limit (attempt {}): {}",
+                                    entry.id,
+                                    entry.retry_count + 1,
+                                    e
+                                );
+                                self.app
+                                    .emit(
+                                        "send-failed",
+                                        serde_json::json!({
+                                            "account_id": self.account_id,
+                                            "subject": outbox_subject(&entry.payload_json),
+                                            "outbox_id": entry.id,
+                                            "error": error_message,
+                                            "via": "outbox-replay",
+                                        }),
+                                    )
+                                    .ok();
+                                self.app
+                                    .emit(
+                                        "offline-queue-changed",
+                                        serde_json::json!({
+                                            "account_id": self.account_id,
+                                            "dead_op_id": entry.id,
+                                            "action_type": entry.action_type,
+                                        }),
+                                    )
+                                    .ok();
+                                continue;
+                            }
+                            Ok(SendRetryDisposition::MissingClaim) => {
                                 log::error!(
                                     "Failed send {} lost its sending claim; replay stopped",
                                     entry.id
                                 );
-                                false
+                                break;
                             }
                             Err(error) => {
                                 log::error!(
@@ -610,25 +674,9 @@ impl AccountWorker {
                                     entry.id,
                                     error
                                 );
-                                false
+                                break;
                             }
-                        };
-                        self.app
-                            .emit(
-                                "send-failed",
-                                serde_json::json!({
-                                    "account_id": self.account_id,
-                                    "subject": outbox_subject(&entry.payload_json),
-                                    "outbox_id": entry.id,
-                                    "error": e.to_string(),
-                                    "via": "outbox-replay",
-                                }),
-                            )
-                            .ok();
-                        if persisted {
-                            continue;
                         }
-                        break;
                     }
 
                     let conn = self.db.writer().await;
@@ -816,8 +864,8 @@ pub(crate) fn emit_op_failed(app: &AppHandle, account_id: &str, op_type: &str, e
 
 #[cfg(test)]
 mod tests {
-    use super::automatic_retry_allowed;
-    use crate::error::Error;
+    use super::{automatic_retry_allowed, missing_executor_error, send_unknown_events_allowed};
+    use crate::error::{Error, Result};
 
     #[test]
     fn retry_decision_combines_static_safety_and_dynamic_outcome() {
@@ -828,5 +876,24 @@ mod tests {
         assert!(!automatic_retry_allowed(false, &ordinary));
         assert!(!automatic_retry_allowed(true, &indeterminate));
         assert!(!automatic_retry_allowed(false, &indeterminate));
+    }
+
+    #[test]
+    fn missing_executor_is_a_definite_failure() {
+        let error = missing_executor_error("account");
+
+        assert!(!error.is_indeterminate_delivery());
+        assert_eq!(
+            error.to_string(),
+            "Account account has no enabled mail binding"
+        );
+    }
+
+    #[test]
+    fn send_unknown_events_require_a_persisted_quarantine() {
+        assert!(send_unknown_events_allowed(&Ok(true)));
+        assert!(!send_unknown_events_allowed(&Ok(false)));
+        let persistence_error: Result<bool> = Err(Error::Other("database".into()));
+        assert!(!send_unknown_events_allowed(&persistence_error));
     }
 }

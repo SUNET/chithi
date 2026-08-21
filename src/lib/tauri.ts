@@ -803,12 +803,18 @@ export async function listOutbox(
   return invoke("list_outbox", { accountId });
 }
 
-export async function retryOutboxOp(outboxId: number): Promise<void> {
-  return invoke("retry_outbox_op", { outboxId });
+export async function retryOutboxOp(
+  accountId: string,
+  outboxId: number,
+): Promise<void> {
+  return invoke("retry_outbox_op", { accountId, outboxId });
 }
 
-export async function discardOutboxOp(outboxId: number): Promise<void> {
-  return invoke("discard_outbox_op", { outboxId });
+export async function discardOutboxOp(
+  accountId: string,
+  outboxId: number,
+): Promise<void> {
+  return invoke("discard_outbox_op", { accountId, outboxId });
 }
 
 // OpenPGP

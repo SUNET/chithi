@@ -23,7 +23,7 @@ impl JmapConnection {
             ]
         });
         let resp = self.api_request(&request, config).await?;
-        let (method, body) = identity_method_response(&resp)?;
+        let (method, body) = identity_method_response(&resp, &self.account_id)?;
         if method == "error" {
             return Err(Error::Other(format!(
                 "JMAP Identity/get failed (type={})",
@@ -43,7 +43,10 @@ impl JmapConnection {
     }
 }
 
-fn identity_method_response(response: &serde_json::Value) -> Result<(&str, &serde_json::Value)> {
+fn identity_method_response<'a>(
+    response: &'a serde_json::Value,
+    expected_account_id: &str,
+) -> Result<(&'a str, &'a serde_json::Value)> {
     let responses = response
         .get("methodResponses")
         .and_then(serde_json::Value::as_array)
@@ -65,6 +68,16 @@ fn identity_method_response(response: &serde_json::Value) -> Result<(&str, &serd
     let method = tuple[0]
         .as_str()
         .ok_or_else(|| Error::Other("Malformed JMAP Identity/get method".into()))?;
+    if method == "Identity/get"
+        && tuple[1]
+            .get("accountId")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_account_id)
+    {
+        return Err(Error::Other(
+            "JMAP Identity/get returned an unexpected account id".into(),
+        ));
+    }
     Ok((method, &tuple[1]))
 }
 
@@ -170,6 +183,14 @@ mod tests {
 
     #[test]
     fn identity_response_requires_one_correctly_correlated_tuple() {
+        let valid = serde_json::json!({
+            "methodResponses": [["Identity/get", {
+                "accountId": "account-1",
+                "list": []
+            }, "id1"]]
+        });
+        assert!(identity_method_response(&valid, "account-1").is_ok());
+
         for response in [
             serde_json::json!({ "methodResponses": [] }),
             serde_json::json!({
@@ -182,7 +203,27 @@ mod tests {
                 ]
             }),
         ] {
-            assert!(identity_method_response(&response).is_err());
+            assert!(identity_method_response(&response, "account-1").is_err());
+        }
+    }
+
+    #[test]
+    fn identity_response_requires_the_expected_account_id() {
+        for account_id in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(7)),
+            Some(serde_json::json!("other-account")),
+        ] {
+            let mut body = serde_json::json!({ "list": [] });
+            if let Some(account_id) = account_id {
+                body["accountId"] = account_id;
+            }
+            let response = serde_json::json!({
+                "methodResponses": [["Identity/get", body, "id1"]]
+            });
+
+            assert!(identity_method_response(&response, "account-1").is_err());
         }
     }
 }

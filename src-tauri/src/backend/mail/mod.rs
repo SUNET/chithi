@@ -34,10 +34,27 @@ pub struct MailSyncCtx {
 
 /// State retained after SMTP accepts a replayed message. Only the IMAP
 /// executor consumes it for its best-effort APPEND-to-Sent hook.
-struct RawSmtpDelivery {
+pub struct RawSmtpDelivery {
     account: MailAccountConfig,
     credentials: MailCredentials,
     raw_message: Vec<u8>,
+}
+
+/// Work that is safe to run only after send completion is durable locally.
+pub enum SendPostprocess {
+    None,
+    ImapSent(Box<RawSmtpDelivery>),
+}
+
+impl SendPostprocess {
+    pub(crate) async fn run_best_effort(self, ctx: &MailSyncCtx, account_id: &str) {
+        match self {
+            Self::None => {}
+            Self::ImapSent(delivery) => {
+                imap::postprocess_smtp_delivery(ctx, account_id, *delivery).await;
+            }
+        }
+    }
 }
 
 /// Replay a persisted raw send through the account's current SMTP settings.
@@ -254,6 +271,18 @@ pub trait MailOpExecutor: Send {
     /// this; the worker handles them directly.
     async fn execute(&mut self, ctx: &MailSyncCtx, account_id: &str, op: MailOp) -> Result<()>;
 
+    /// Deliver a replayed send and return any best-effort work that must run
+    /// only after the worker has durably completed its outbox claim.
+    async fn execute_replayed_send(
+        &mut self,
+        ctx: &MailSyncCtx,
+        account_id: &str,
+        op: MailOp,
+    ) -> Result<SendPostprocess> {
+        self.execute(ctx, account_id, op).await?;
+        Ok(SendPostprocess::None)
+    }
+
     /// Called once when the worker shuts down; close connections.
     async fn shutdown(&mut self) {}
 }
@@ -418,7 +447,13 @@ mod registry_tests {
                         false,
                     )
                 } else if request.path == "/upload/account-1" {
-                    (serde_json::json!({ "blobId": "blob-1" }), false)
+                    (
+                        serde_json::json!({
+                            "accountId": "account-1",
+                            "blobId": "blob-1"
+                        }),
+                        false,
+                    )
                 } else {
                     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                     match body["methodCalls"][0][0].as_str().unwrap() {
