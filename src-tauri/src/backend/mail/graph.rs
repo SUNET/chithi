@@ -329,7 +329,7 @@ async fn sync_graph_folder_delta(
                             folder_path: gf.id.clone(),
                             uid: 0,
                             message_id: msg.internet_message_id.clone(),
-                            in_reply_to: msg.in_reply_to.clone(),
+                            in_reply_to: None,
                             thread_id: msg.conversation_id.clone(),
                             subject: msg.subject.clone(),
                             from_name: msg.from_name.clone(),
@@ -685,7 +685,7 @@ impl MailBackend for GraphMailBackend {
             .graph_client(&account.id, crate::provider::GraphTokenPurpose::Baseline)
             .await?;
         client
-            .save_draft(&crate::mail::graph::GraphSendMessage {
+            .save_draft(&crate::mail::graph::GraphDraftMessage {
                 to: request.to.clone(),
                 cc: request.cc.clone(),
                 bcc: request.bcc.clone(),
@@ -852,14 +852,10 @@ impl MailOpExecutor for GraphOpExecutor {
                 }
             }
             MailOp::SendRaw { .. } => {
-                // Graph's server-side `/me/mailFolders/outbox` already holds
-                // messages that were accepted by `sendMail`. Client-side
-                // replay would require re-parsing the raw MIME back into
-                // Graph's structured payload, which is error-prone. Fail
-                // here so the row eventually marks dead and the user can
-                // surface it via the Outbox view.
+                // O365 delivery belongs to SMTP+XOAUTH2. Never reinterpret
+                // raw MIME as a Graph sendMail payload.
                 return Err(Error::Other(
-                    "Graph send replay is not implemented; the server-side Outbox folder owns delivery from this point. Discard or recompose this message.".into(),
+                    "Graph cannot send raw mail; O365 delivery must use SMTP+XOAUTH2.".into(),
                 ));
             }
             _ => {}

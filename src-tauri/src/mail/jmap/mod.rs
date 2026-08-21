@@ -35,10 +35,10 @@ pub struct JmapConfig {
     pub password: String,
     pub access_token: Option<String>,
     /// One of `"basic"`, `"bearer"`, or `"oidc"`. Carried explicitly
-    /// (not just inferred from `access_token.is_some()`) so `connect()`
-    /// can fail fast when bearer mode is selected but no token is
-    /// available — otherwise the request silently downgrades to HTTP
-    /// Basic with an empty password and the user sees a generic 401
+    /// (not just inferred from `access_token.is_some()`) so
+    /// `connect_with_clients()` can fail fast when bearer mode is selected
+    /// but no token is available — otherwise the request silently downgrades
+    /// to HTTP Basic with an empty password and the user sees a generic 401
     /// instead of "your API token is missing".
     pub auth_method: String,
     /// OIDC metadata for token refresh (used by push loop on reconnect)
@@ -129,7 +129,7 @@ mod connect_tests {
             .await
             .unwrap();
         let request = request_rx.await.unwrap();
-        assert_eq!(connection.account_id(), "account-1");
+        assert_eq!(connection.account_id, "account-1");
         assert_eq!(connection.api_url, format!("{}/jmap/api", base_url));
         assert!(request.starts_with("GET /.well-known/jmap HTTP/1.1\r\n"));
         assert_eq!(header(&request, "x-injected-client"), Some("jmap-test"));
@@ -151,7 +151,13 @@ mod connect_tests {
 
     #[tokio::test]
     async fn connect_rejects_http_url() {
-        let msg = match JmapConnection::connect(&http_config()).await {
+        let msg = match JmapConnection::connect_with_clients(
+            &http_config(),
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+        )
+        .await
+        {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
         };
@@ -164,7 +170,8 @@ mod connect_tests {
     /// to silently fall through to HTTP Basic with an empty password.
     /// Stalwart and Fastmail both reject that with a generic 401, so
     /// the user saw a confusing auth failure instead of "your token is
-    /// missing". connect() now fails fast with an explicit error.
+    /// missing". `connect_with_clients` now fails fast with an explicit
+    /// error.
     #[tokio::test]
     async fn connect_rejects_bearer_without_token() {
         let cfg = JmapConfig {
@@ -177,7 +184,13 @@ mod connect_tests {
             oidc_token_endpoint: String::new(),
             oidc_client_id: String::new(),
         };
-        let msg = match JmapConnection::connect(&cfg).await {
+        let msg = match JmapConnection::connect_with_clients(
+            &cfg,
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+        )
+        .await
+        {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
         };
@@ -471,19 +484,6 @@ mod session_limit_tests {
 }
 
 impl JmapConnection {
-    pub async fn connect(config: &JmapConfig) -> Result<Self> {
-        let discovery_http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        let api_http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(e.to_string()))?;
-
-        Self::connect_with_clients(config, discovery_http, api_http).await
-    }
-
     /// Connect using caller-provided clients for discovery and JMAP API traffic.
     pub async fn connect_with_clients(
         config: &JmapConfig,
@@ -630,10 +630,6 @@ impl JmapConnection {
             }
             found.ok_or_else(|| Error::Other(format!("JMAP auto-discovery failed for {}", domain)))
         }
-    }
-
-    pub fn account_id(&self) -> &str {
-        &self.account_id
     }
 
     /// Build the EventSource URL for push notifications.

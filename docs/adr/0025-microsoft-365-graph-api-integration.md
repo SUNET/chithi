@@ -12,6 +12,15 @@ Added Microsoft 365 / Outlook as an account type. Three approaches were evaluate
 ## Decision
 Use **Graph API for mail sync/read, SMTP+XOAUTH2 for sending, Graph for calendar/contacts** (Option 3).
 
+### Current-state amendment (2026-08-21)
+
+- Mail sync is envelope-first and incremental: each folder uses Graph message delta pages and persists its `nextLink`/`deltaLink` checkpoint.
+- Bodies are streamed as raw RFC 5322 MIME from `GET /me/messages/{id}/$value` on demand or during prefetch, then read from Maildir. The obsolete Graph JSON body and attachment paths are no longer exposed.
+- Move, copy, delete, read, and flag mutations use Graph JSON batching; drafts remain structured Graph messages.
+- Sending remains exclusively SMTP+XOAUTH2. Graph `sendMail` is deliberately not exposed and must not be reintroduced because of the personal-account DMARC failure described below.
+
+This amendment supersedes the older implementation details retained below as rollout history.
+
 ### Why Graph for mail sync (not IMAP)
 - Outlook IMAP aggressively throttles connections — `SELECT INBOX` fails with `Command Error. 12`, TCP connections reset with `os error 104` (see "What we tried and failed" below)
 - IMAP IDLE reconnection loops make throttling worse, not better

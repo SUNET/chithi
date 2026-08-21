@@ -199,8 +199,8 @@ pub trait CalendarBackend: Send + Sync {
     ) -> Result<Option<PushedEvent>>;
 
     /// Push field updates for an event. Default no-op: JMAP and CalDAV
-    /// do not push event updates today (ADR 0050) — preserving that is
-    /// deliberate; their updates reach the server via other paths.
+    /// do not push event updates today (ADR 0050). Their edits remain
+    /// local and may be overwritten by a subsequent server sync.
     async fn push_updated_event(
         &self,
         _ctx: &CalendarBackendCtx<'_>,

@@ -53,3 +53,6 @@ Implement a generic OAuth2 authorization code flow with local redirect, initiall
 - OAuth tokens are secure in the OS keyring, auto-refreshed
 - The OAuth module is provider-agnostic — adding Microsoft O365 requires only a new `OAuthProvider` const and an Entra app registration
 - CalDAV client gained `DavAuth` enum and `connect_with_token()` for bearer auth, usable by any OAuth-based CalDAV server in the future
+
+## Current-state amendment (2026-08-21)
+Bearer-authenticated CalDAV/CardDAV is not currently configured or supported, so the unused DAV bearer entry points have been removed. If OAuth-backed DAV is implemented later, it must return through provider services that own credential acquisition and HTTP client construction.

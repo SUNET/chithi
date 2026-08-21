@@ -25,12 +25,7 @@ impl JmapConnection {
             for ab in list {
                 let id = ab["id"].as_str().unwrap_or_default().to_string();
                 let name = ab["name"].as_str().unwrap_or("Contacts").to_string();
-                let is_default = ab["isDefault"].as_bool().unwrap_or(false);
-                books.push(JmapAddressBook {
-                    id,
-                    name,
-                    is_default,
-                });
+                books.push(JmapAddressBook { id, name });
             }
         }
 
@@ -199,7 +194,6 @@ impl JmapConnection {
                     organization,
                     title,
                     notes,
-                    address_book_id: ab_id,
                 });
             }
         }
@@ -459,7 +453,6 @@ impl JmapConnection {
 pub struct JmapAddressBook {
     pub id: String,
     pub name: String,
-    pub is_default: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -472,5 +465,4 @@ pub struct JmapContact {
     pub organization: Option<String>,
     pub title: Option<String>,
     pub notes: Option<String>,
-    pub address_book_id: Option<String>,
 }

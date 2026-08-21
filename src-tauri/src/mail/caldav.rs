@@ -10,11 +10,11 @@ use crate::error::{Error, Result};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Authentication method for CalDAV/CardDAV.
+/// HTTP Basic authentication credentials for CalDAV/CardDAV.
 #[derive(Clone)]
-pub(crate) enum DavAuth {
-    Basic { username: String, password: String },
-    Bearer { token: String },
+pub(crate) struct DavAuth {
+    pub(crate) username: String,
+    pub(crate) password: String,
 }
 
 /// Configuration needed to connect to a CalDAV server.
@@ -95,7 +95,7 @@ mod connect_tests {
         CalDavClient {
             http: reqwest::Client::new(),
             base_url: base.to_string(),
-            auth: DavAuth::Basic {
+            auth: DavAuth {
                 username: "u".into(),
                 password: "p".into(),
             },
@@ -161,20 +161,14 @@ mod connect_tests {
     }
 
     #[tokio::test]
-    async fn connect_rejects_http_url() {
+    async fn connect_with_client_rejects_http_url() {
         let cfg = CalDavConfig {
             caldav_url: "http://example.com/dav/".into(),
             username: "u".into(),
             password: "p".into(),
             email: "u@example.com".into(),
         };
-        let msg = err_msg(CalDavClient::connect(&cfg).await);
-        assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
-    }
-
-    #[tokio::test]
-    async fn connect_with_token_rejects_http_url() {
-        let msg = err_msg(CalDavClient::connect_with_token("http://example.com/dav/", "tok").await);
+        let msg = err_msg(CalDavClient::connect_with_client(&cfg, reqwest::Client::new()).await);
         assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
     }
 
@@ -205,25 +199,6 @@ mod connect_tests {
             header(&request, "authorization"),
             Some("Basic dXNlcjpwYXNz")
         );
-    }
-
-    #[tokio::test]
-    async fn injected_client_sends_bearer_propfind_to_loopback() {
-        let body = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/principals/u/</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>"#;
-        let (url, request_rx) = dav_server(body).await;
-        let client =
-            CalDavClient::connect_with_token_and_client(&url, "oauth-token", injected_client())
-                .await
-                .unwrap();
-
-        client.discover_principal().await.unwrap();
-        let request = request_rx.await.unwrap();
-        assert!(request.starts_with("PROPFIND /dav/ HTTP/1.1\r\n"));
-        assert_eq!(
-            header(&request, "authorization"),
-            Some("Bearer oauth-token")
-        );
-        assert_eq!(header(&request, "x-injected-client"), Some("caldav-test"));
     }
 }
 
@@ -268,16 +243,9 @@ pub struct CalDavEvent {
 // ---------------------------------------------------------------------------
 
 impl CalDavClient {
-    /// Create a new CalDAV client. If `caldav_url` is empty, attempt
-    /// auto-discovery via `.well-known/caldav`.
-    pub async fn connect(config: &CalDavConfig) -> Result<Self> {
-        let http = crate::mail::dav_http::build_dav_client()?;
-        Self::connect_with_client(config, http).await
-    }
-
     /// Create a CalDAV client using the provided HTTP client.
     pub async fn connect_with_client(config: &CalDavConfig, http: reqwest::Client) -> Result<Self> {
-        let auth = DavAuth::Basic {
+        let auth = DavAuth {
             username: config.username.clone(),
             password: config.password.clone(),
         };
@@ -299,46 +267,13 @@ impl CalDavClient {
         })
     }
 
-    /// Create a CalDAV client with OAuth2 bearer token authentication.
-    pub async fn connect_with_token(caldav_url: &str, token: &str) -> Result<Self> {
-        let http = crate::mail::dav_http::build_dav_client()?;
-        Self::connect_with_token_and_client(caldav_url, token, http).await
-    }
-
-    /// Create an OAuth2 CalDAV client using the provided HTTP client.
-    pub async fn connect_with_token_and_client(
-        caldav_url: &str,
-        token: &str,
-        http: reqwest::Client,
-    ) -> Result<Self> {
-        crate::mail::url_validation::require_https(caldav_url)?;
-
-        let auth = DavAuth::Bearer {
-            token: token.to_string(),
-        };
-
-        log::info!("caldav: connected with OAuth to {}", caldav_url);
-
-        Ok(Self {
-            http,
-            base_url: caldav_url.to_string(),
-            auth,
-        })
-    }
-
     /// Apply authentication to a request builder.
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth {
-            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
-            DavAuth::Bearer { token } => req.bearer_auth(token),
-        }
+        req.basic_auth(&self.auth.username, Some(&self.auth.password))
     }
 
     fn apply_auth_static(req: reqwest::RequestBuilder, auth: &DavAuth) -> reqwest::RequestBuilder {
-        match auth {
-            DavAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
-            DavAuth::Bearer { token } => req.bearer_auth(token),
-        }
+        req.basic_auth(&auth.username, Some(&auth.password))
     }
 
     /// Auto-discover CalDAV URL by trying `.well-known/caldav` on the email domain.

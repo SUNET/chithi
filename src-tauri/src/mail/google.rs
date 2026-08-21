@@ -52,14 +52,6 @@ pub enum EventsPage {
 }
 
 impl GoogleClient {
-    pub fn new(access_token: &str) -> Self {
-        Self::with_client(
-            reqwest::Client::new(),
-            access_token,
-            GoogleEndpoints::default(),
-        )
-    }
-
     pub fn with_client(
         http: reqwest::Client,
         access_token: &str,
