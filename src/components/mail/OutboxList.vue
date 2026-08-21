@@ -29,6 +29,14 @@ async function reload() {
 }
 
 async function retry(row: OutboxRow) {
+  if (
+    row.delivery_outcome_unknown &&
+    !confirm(
+      `Delivery of "${row.subject ?? "(no subject)"}" may already have occurred. Retrying can duplicate this message. Retry anyway?`,
+    )
+  ) {
+    return;
+  }
   try {
     await api.retryOutboxOp(row.id);
     showToast(`Queued "${row.subject ?? "(no subject)"}" for retry`, "info");
@@ -39,7 +47,10 @@ async function retry(row: OutboxRow) {
 }
 
 async function discard(row: OutboxRow) {
-  if (!confirm(`Discard "${row.subject ?? "(no subject)"}"? This cannot be undone.`)) {
+  const message = row.delivery_outcome_unknown
+    ? `Discard "${row.subject ?? "(no subject)"}"? This only removes the local record and cannot cancel delivery.`
+    : `Discard "${row.subject ?? "(no subject)"}"? This cannot be undone.`;
+  if (!confirm(message)) {
     return;
   }
   try {
@@ -63,6 +74,13 @@ onMounted(async () => {
     }),
   );
   unlistenFns.push(
+    await listen<{ account_id: string }>("send-started", (event) => {
+      if (event.payload.account_id === accountsStore.activeAccountId) {
+        reload();
+      }
+    }),
+  );
+  unlistenFns.push(
     await listen<{ account_id: string }>("send-complete", (event) => {
       if (event.payload.account_id === accountsStore.activeAccountId) {
         reload();
@@ -71,6 +89,13 @@ onMounted(async () => {
   );
   unlistenFns.push(
     await listen<{ account_id: string }>("send-failed", (event) => {
+      if (event.payload.account_id === accountsStore.activeAccountId) {
+        reload();
+      }
+    }),
+  );
+  unlistenFns.push(
+    await listen<{ account_id: string }>("send-unknown", (event) => {
       if (event.payload.account_id === accountsStore.activeAccountId) {
         reload();
       }
@@ -100,6 +125,9 @@ function recipients(row: OutboxRow): string {
 
 function statusLabel(row: OutboxRow): string {
   if (row.status === "sending") return "Sending...";
+  if (row.status === "dead" && row.delivery_outcome_unknown) {
+    return "Delivery status unknown";
+  }
   if (row.status === "dead") return `Failed (${row.retry_count} attempts)`;
   if (row.retry_count > 0) return `Queued for retry (${row.retry_count} so far)`;
   return "Queued";
@@ -132,7 +160,11 @@ function statusLabel(row: OutboxRow): string {
         v-for="row in rows"
         :key="row.id"
         class="outbox-item"
-        :class="{ dead: row.status === 'dead', sending: row.status === 'sending' }"
+        :class="{
+          dead: row.status === 'dead',
+          sending: row.status === 'sending',
+          unknown: row.delivery_outcome_unknown,
+        }"
         :data-testid="`outbox-item-${row.id}`"
       >
         <div class="outbox-item-main">
@@ -150,7 +182,7 @@ function statusLabel(row: OutboxRow): string {
             type="button"
             class="outbox-btn outbox-btn-retry"
             :data-testid="`outbox-retry-${row.id}`"
-            :disabled="row.status === 'sending'"
+            :disabled="row.status !== 'dead'"
             @click="retry(row)"
           >
             Retry
@@ -159,6 +191,7 @@ function statusLabel(row: OutboxRow): string {
             type="button"
             class="outbox-btn outbox-btn-discard"
             :data-testid="`outbox-discard-${row.id}`"
+            :disabled="row.status === 'sending'"
             @click="discard(row)"
           >
             Discard
@@ -240,6 +273,10 @@ function statusLabel(row: OutboxRow): string {
   border-color: var(--color-danger);
 }
 
+.outbox-item.unknown {
+  border-color: var(--color-warning);
+}
+
 .outbox-item.sending {
   opacity: 0.7;
 }
@@ -284,6 +321,11 @@ function statusLabel(row: OutboxRow): string {
   color: var(--color-danger-text);
 }
 
+.outbox-item.unknown .outbox-status-label,
+.outbox-item.unknown .outbox-error-msg {
+  color: var(--color-warning);
+}
+
 .outbox-error-msg {
   color: var(--color-danger-text);
   font-family: monospace;
@@ -324,7 +366,7 @@ function statusLabel(row: OutboxRow): string {
   color: var(--color-danger-text);
 }
 
-.outbox-btn-discard:hover {
+.outbox-btn-discard:hover:not(:disabled) {
   background: var(--color-danger);
   color: #fff;
   border-color: var(--color-danger);

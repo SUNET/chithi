@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::mail::search::build_jmap_filter;
 use crate::message::{normalize_message_id, SearchHit, SearchQuery};
 use serde::Serialize;
+use std::collections::{BTreeMap, HashSet};
 
 use super::{JmapConfig, JmapConnection};
 
@@ -43,6 +44,253 @@ pub struct JmapEmail {
     /// sync path to filter `Email/changes` results, since that method
     /// returns changes for the whole account, not a single mailbox.
     pub mailbox_ids: Vec<String>,
+}
+
+/// Explicit RFC 8621 submission envelope built from authoritative send data.
+///
+/// The fields are private so every value passes through [`Self::new`]: there
+/// is always one valid RFC 5321 reverse-path and at least one valid forward-
+/// path. Display names are discarded because JMAP submission envelopes carry
+/// addr-specs only.
+#[derive(Serialize)]
+pub struct JmapSubmissionEnvelope {
+    #[serde(rename = "mailFrom")]
+    mail_from: JmapEnvelopeAddress,
+    #[serde(rename = "rcptTo")]
+    rcpt_to: Vec<JmapEnvelopeAddress>,
+    #[serde(skip)]
+    mail_from_mailbox: ParsedMailbox,
+}
+
+#[derive(Serialize)]
+struct JmapEnvelopeAddress {
+    email: String,
+    parameters: Option<BTreeMap<String, Option<String>>>,
+}
+
+pub(super) struct ParsedMailbox {
+    addr_spec: String,
+    key: MailboxKey,
+    unquoted_wildcard: bool,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct MailboxKey {
+    local: String,
+    domain: String,
+}
+
+impl ParsedMailbox {
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+
+    pub(super) fn is_wildcard_for(&self, other: &Self) -> bool {
+        self.unquoted_wildcard && self.key.domain == other.key.domain
+    }
+}
+
+impl JmapSubmissionEnvelope {
+    /// Build an envelope from one sender and the complete To + Cc + Bcc list.
+    ///
+    /// RFC 5321 section 2.4 requires local-part comparisons to preserve case,
+    /// while domains are case-insensitive. Duplicate recipients therefore use
+    /// a semantic quoted local-part and canonical IDNA domain key; the first
+    /// parsed addr-spec's spelling is retained in the emitted envelope.
+    pub fn new(mail_from: &str, to: &[String], cc: &[String], bcc: &[String]) -> Result<Self> {
+        let mail_from = parse_rfc5321_addr_spec(mail_from)
+            .ok_or_else(|| Error::Other("Invalid JMAP submission mail-from address".into()))?;
+
+        let mut requires_smtputf8 = !mail_from.addr_spec.is_ascii();
+        let mut seen = HashSet::new();
+        let mut rcpt_to = Vec::with_capacity(to.len() + cc.len() + bcc.len());
+        for (index, value) in to.iter().chain(cc).chain(bcc).enumerate() {
+            let address = parse_rfc5321_addr_spec(value).ok_or_else(|| {
+                // Do not include the value: errors are logged by callers and
+                // this position may belong to a confidential Bcc recipient.
+                Error::Other(format!(
+                    "Invalid JMAP submission recipient at position {}",
+                    index + 1
+                ))
+            })?;
+            if seen.insert(address.key) {
+                requires_smtputf8 |= !address.addr_spec.is_ascii();
+                rcpt_to.push(JmapEnvelopeAddress {
+                    email: address.addr_spec,
+                    parameters: None,
+                });
+            }
+        }
+
+        if rcpt_to.is_empty() {
+            return Err(Error::Other(
+                "JMAP submission envelope has no recipients".into(),
+            ));
+        }
+
+        let parameters = requires_smtputf8.then(|| {
+            let mut parameters = BTreeMap::new();
+            parameters.insert("SMTPUTF8".into(), None);
+            parameters
+        });
+        Ok(Self {
+            mail_from: JmapEnvelopeAddress {
+                email: mail_from.addr_spec.clone(),
+                parameters,
+            },
+            rcpt_to,
+            mail_from_mailbox: mail_from,
+        })
+    }
+
+    fn requires_smtputf8(&self) -> bool {
+        self.mail_from.parameters.is_some()
+    }
+
+    fn requires_smtputf8_for_message(&self, raw_message: &[u8]) -> bool {
+        self.requires_smtputf8() || raw_headers_contain_non_ascii(raw_message)
+    }
+
+    fn wire_value(&self, raw_message: &[u8]) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|_| Error::Other("Failed to serialize JMAP submission envelope".into()))?;
+        if self.requires_smtputf8_for_message(raw_message) {
+            value["mailFrom"]["parameters"] = serde_json::json!({ "SMTPUTF8": null });
+        }
+        Ok(value)
+    }
+
+    pub(super) fn mail_from_mailbox(&self) -> &ParsedMailbox {
+        &self.mail_from_mailbox
+    }
+}
+
+fn raw_headers_contain_non_ascii(raw_message: &[u8]) -> bool {
+    let header_end = raw_message
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .or_else(|| raw_message.windows(2).position(|window| window == b"\n\n"))
+        .unwrap_or(raw_message.len());
+    !raw_message[..header_end].is_ascii()
+}
+
+/// Parse either a bare addr-spec or one display-name mailbox into the exact
+/// addr-spec used for RFC 5321 submission. `mailparse` handles mailbox syntax
+/// (including quoted display names and quoted local parts inside angle
+/// brackets); lettre performs final addr-spec validation and exposes the
+/// parsed local/domain components used for standards-compliant deduplication.
+pub(super) fn parse_rfc5321_addr_spec(value: &str) -> Option<ParsedMailbox> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let addr_spec = match value.parse::<lettre::Address>() {
+        Ok(address) => address.to_string(),
+        Err(_) => mailparse::addrparse(value)
+            .ok()
+            .and_then(|addresses| addresses.extract_single_info())
+            .map(|mailbox| mailbox.addr.trim().to_string())
+            .unwrap_or_else(|| value.to_string()),
+    };
+    let (local, domain) = validated_addr_spec_parts(&addr_spec)?;
+    Some(ParsedMailbox {
+        addr_spec,
+        key: MailboxKey {
+            local: semantic_local_part(&local)?,
+            domain,
+        },
+        unquoted_wildcard: local == "*",
+    })
+}
+
+fn validated_addr_spec_parts(addr_spec: &str) -> Option<(String, String)> {
+    if let Ok(address) = addr_spec.parse::<lettre::Address>() {
+        return Some((
+            address.user().to_string(),
+            canonical_domain(address.domain())?,
+        ));
+    }
+
+    // lettre accepts IPv6 literals without RFC 5321's required `IPv6:` tag.
+    // Validate the tagged form by substituting lettre's accepted spelling,
+    // but retain the caller's RFC spelling in the serialized envelope.
+    let (local, domain) = addr_spec.rsplit_once('@')?;
+    let literal = domain.strip_prefix('[')?.strip_suffix(']')?;
+    let (tag, address) = literal.split_once(':')?;
+    if !tag.eq_ignore_ascii_case("IPv6") {
+        return None;
+    }
+    let address = address.parse::<std::net::Ipv6Addr>().ok()?;
+    lettre::Address::new(local, format!("[{address}]")).ok()?;
+    Some((local.to_string(), canonical_domain(domain)?))
+}
+
+fn semantic_local_part(local: &str) -> Option<String> {
+    let Some(inner) = local.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return Some(local.to_string());
+    };
+    let mut semantic = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            semantic.push(chars.next()?);
+        } else {
+            semantic.push(ch);
+        }
+    }
+    Some(semantic)
+}
+
+fn canonical_domain(domain: &str) -> Option<String> {
+    if domain.ends_with('.') {
+        return None;
+    }
+
+    if let Some(literal) = domain
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        if let Ok(address) = literal.parse::<std::net::Ipv4Addr>() {
+            return Some(format!("[{address}]"));
+        }
+        let (tag, address) = literal.split_once(':')?;
+        if tag.eq_ignore_ascii_case("IPv6") {
+            let address = address.parse::<std::net::Ipv6Addr>().ok()?;
+            return Some(format!("[ipv6:{address}]"));
+        }
+        return None;
+    }
+
+    match url::Host::parse(domain).ok()? {
+        url::Host::Domain(domain) if valid_ascii_dns_domain(&domain) => {
+            Some(domain.to_ascii_lowercase())
+        }
+        // A dotted-quad without brackets is a domain spelling, not an SMTP
+        // address literal, so keep its key distinct from `[192.0.2.1]`.
+        url::Host::Ipv4(address) => Some(address.to_string()),
+        _ => None,
+    }
+}
+
+fn valid_ascii_dns_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,11 +950,7 @@ impl JmapConnection {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!(
-                "JMAP upload error {}: {}",
-                status, body
-            )));
+            return Err(Error::Other(format!("JMAP upload error: {}", status)));
         }
 
         let upload_resp: serde_json::Value = resp
@@ -747,14 +991,77 @@ impl JmapConnection {
         Ok(())
     }
 
-    pub async fn send_email(&self, config: &JmapConfig, raw_message: &[u8]) -> Result<()> {
+    async fn submission_api_request(
+        &self,
+        request: &serde_json::Value,
+        config: &JmapConfig,
+    ) -> Result<serde_json::Value> {
+        let response = config
+            .apply_auth(self.http.post(&self.api_url))
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_builder() || error.is_connect() || error.is_redirect() {
+                    Error::Other("JMAP submission request failed before execution".into())
+                } else {
+                    Error::IndeterminateDelivery
+                }
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status.is_client_error() {
+                return Err(Error::Other(format!(
+                    "JMAP submission request rejected with HTTP status {status}"
+                )));
+            }
+            // A gateway/server error can be generated after an upstream JMAP
+            // server accepted the request, so it cannot prove non-delivery.
+            return Err(Error::IndeterminateDelivery);
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|_| Error::IndeterminateDelivery)
+    }
+
+    pub async fn send_email(
+        &self,
+        config: &JmapConfig,
+        raw_message: &[u8],
+        envelope: &JmapSubmissionEnvelope,
+    ) -> Result<()> {
         log::info!("JMAP sending email ({} bytes)", raw_message.len());
 
-        // Step 1: Upload the raw message as a blob
+        let wire_envelope = envelope.wire_value(raw_message)?;
+        if envelope.requires_smtputf8_for_message(raw_message)
+            && !self.supports_submission_extension("SMTPUTF8")
+        {
+            return Err(Error::Other(
+                "JMAP submission requires unsupported SMTPUTF8 extension".into(),
+            ));
+        }
+
+        // Resolve all server-side prerequisites before upload so an alias or
+        // mailbox configuration error cannot leave an orphaned blob.
+        let identity_id = self.find_identity_id(config, envelope).await?;
+        log::debug!("JMAP selected an identity for submission");
+
+        let sent_mailbox_id = match self.find_mailbox_by_role(config, "sent").await? {
+            Some(mailbox_id) => mailbox_id,
+            None => self
+                .find_mailbox_by_role(config, "inbox")
+                .await?
+                .ok_or_else(|| Error::Other("No Sent or Inbox mailbox found".into()))?,
+        };
+        log::debug!("JMAP selected a mailbox for sent email");
+
+        // Upload the raw message as a blob only after validation and lookup.
         let upload_url = self
             .upload_url_template
             .replace("{accountId}", &self.account_id);
-        log::debug!("JMAP uploading blob to {}", upload_url);
 
         let resp = config
             .apply_auth(self.http.post(&upload_url))
@@ -766,11 +1073,7 @@ impl JmapConnection {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!(
-                "JMAP upload error {}: {}",
-                status, body
-            )));
+            return Err(Error::Other(format!("JMAP upload error: {}", status)));
         }
 
         let upload_resp: serde_json::Value = resp
@@ -783,19 +1086,7 @@ impl JmapConnection {
             .to_string();
         log::debug!("JMAP blob uploaded: {}", blob_id);
 
-        // Step 2: Find the Sent mailbox (or Inbox as fallback) to store the email
-        let sent_mailbox_id = self
-            .find_mailbox_by_role(config, "sent")
-            .await?
-            .or(self.find_mailbox_by_role(config, "inbox").await?)
-            .ok_or_else(|| Error::Other("No Sent or Inbox mailbox found".into()))?;
-        log::debug!("JMAP using mailbox {} for sent email", sent_mailbox_id);
-
-        // Step 3: Get the identity ID for submission
-        let identity_id = self.find_identity_id(config).await?;
-        log::debug!("JMAP using identity {} for submission", identity_id);
-
-        // Step 4: Import the email into the Sent folder and submit it
+        // Import the email into the Sent folder and submit it.
         let request = serde_json::json!({
             "using": [
                 "urn:ietf:params:jmap:core",
@@ -818,73 +1109,18 @@ impl JmapConnection {
                     "create": {
                         "sub1": {
                             "emailId": "#draft",
-                            "identityId": identity_id
-                        }
-                    },
-                    "onSuccessUpdateEmail": {
-                        "#sub1": {
-                            "keywords/$draft": null,
-                            "keywords/$seen": true
+                            "identityId": identity_id,
+                            "envelope": wire_envelope
                         }
                     }
                 }, "s1"]
             ]
         });
 
-        let resp = self.api_request(&request, config).await?;
-        log::debug!(
-            "JMAP send response: {}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
-
-        // Check for import errors
-        if let Some(err) = resp["methodResponses"][0][1]["notCreated"]["draft"].as_object() {
-            let desc = err
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP email import failed: {}", desc)));
-        }
-
-        // Get the imported email ID for cleanup if submission fails
-        let imported_id = resp["methodResponses"][0][1]["created"]["draft"]["id"]
-            .as_str()
-            .map(|s| s.to_string());
-
-        // Check for submission errors — clean up imported email on failure
-        let submission_failed = if resp["methodResponses"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0)
-            > 1
-        {
-            if resp["methodResponses"][1][0].as_str() == Some("error") {
-                let desc = resp["methodResponses"][1][1]["description"]
-                    .as_str()
-                    .unwrap_or("Unknown error");
-                Some(format!("JMAP submission failed: {}", desc))
-            } else if let Some(err) =
-                resp["methodResponses"][1][1]["notCreated"]["sub1"].as_object()
-            {
-                let desc = err
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("Unknown error");
-                Some(format!("JMAP submission failed: {}", desc))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(error_msg) = submission_failed {
-            // Clean up the imported email that wasn't submitted
-            if let Some(ref email_id) = imported_id {
-                log::warn!(
-                    "JMAP cleaning up imported email {} after submission failure",
-                    email_id
-                );
+        let resp = self.submission_api_request(&request, config).await?;
+        if let Err(failure) = validate_submission_response(&resp) {
+            if let Some(email_id) = failure.imported_email_id {
+                log::warn!("JMAP cleaning up imported email after explicit submission rejection");
                 let cleanup = serde_json::json!({
                     "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
                     "methodCalls": [
@@ -896,7 +1132,7 @@ impl JmapConnection {
                 });
                 let _ = self.api_request(&cleanup, config).await;
             }
-            return Err(Error::Other(error_msg));
+            return Err(failure.error);
         }
 
         log::info!("JMAP email sent successfully");
@@ -922,11 +1158,7 @@ impl JmapConnection {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!(
-                "JMAP draft upload error {}: {}",
-                status, body
-            )));
+            return Err(Error::Other(format!("JMAP draft upload error: {}", status)));
         }
 
         let upload_resp: serde_json::Value = resp
@@ -963,17 +1195,160 @@ impl JmapConnection {
 
         let resp = self.api_request(&request, config).await?;
 
-        if let Some(err) = resp["methodResponses"][0][1]["notImported"]["draft"].as_object() {
-            let desc = err
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("Unknown error");
-            return Err(Error::Other(format!("JMAP draft import failed: {}", desc)));
+        if let Some(error) = resp["methodResponses"][0][1]["notImported"].get("draft") {
+            return Err(Error::Other(format!(
+                "JMAP draft import failed (type={})",
+                super::safe_jmap_error_type(error)
+            )));
         }
 
         log::info!("JMAP draft saved successfully");
         Ok(())
     }
+}
+
+struct SubmissionResponseFailure {
+    imported_email_id: Option<String>,
+    error: Error,
+}
+
+enum CreationOutcome<T> {
+    Created(T),
+    Rejected(Error),
+    Indeterminate,
+}
+
+fn validate_submission_response(
+    response: &serde_json::Value,
+) -> std::result::Result<(), SubmissionResponseFailure> {
+    let imported = classify_import_response(response);
+    let submitted = classify_email_submission_response(response);
+
+    match (imported, submitted) {
+        (CreationOutcome::Created(_), CreationOutcome::Created(())) => Ok(()),
+        (CreationOutcome::Created(email_id), CreationOutcome::Rejected(error)) => {
+            Err(SubmissionResponseFailure {
+                imported_email_id: Some(email_id),
+                error,
+            })
+        }
+        (CreationOutcome::Rejected(error), CreationOutcome::Rejected(_))
+        | (CreationOutcome::Rejected(error), CreationOutcome::Indeterminate) => {
+            // A submission using `#draft` cannot be created when the import
+            // creation itself was explicitly rejected.
+            Err(SubmissionResponseFailure {
+                imported_email_id: None,
+                error,
+            })
+        }
+        (CreationOutcome::Indeterminate, CreationOutcome::Rejected(error)) => {
+            // The submission was explicitly rejected, so delivery did not
+            // occur even though the import response cannot be trusted.
+            Err(SubmissionResponseFailure {
+                imported_email_id: None,
+                error,
+            })
+        }
+        _ => Err(SubmissionResponseFailure {
+            // Never destroy the imported Email unless submission rejection is
+            // positively known. Deleting it cannot cancel accepted delivery.
+            imported_email_id: None,
+            error: Error::IndeterminateDelivery,
+        }),
+    }
+}
+
+fn classify_import_response(response: &serde_json::Value) -> CreationOutcome<String> {
+    let Some((method, body)) = matching_method_response(response, "i1") else {
+        return CreationOutcome::Indeterminate;
+    };
+    if method == "error" {
+        return classify_method_error("JMAP Email/import failed", body);
+    }
+    if method != "Email/import" {
+        return CreationOutcome::Indeterminate;
+    }
+    let created = body
+        .pointer("/created/draft/id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let rejected = body.pointer("/notCreated/draft");
+    match (created, rejected) {
+        (Some(email_id), None) => CreationOutcome::Created(email_id),
+        (None, Some(error)) => bounded_rejection("JMAP Email/import rejected draft", error)
+            .map(CreationOutcome::Rejected)
+            .unwrap_or(CreationOutcome::Indeterminate),
+        _ => CreationOutcome::Indeterminate,
+    }
+}
+
+fn classify_email_submission_response(response: &serde_json::Value) -> CreationOutcome<()> {
+    let Some((method, body)) = matching_method_response(response, "s1") else {
+        return CreationOutcome::Indeterminate;
+    };
+    if method == "error" {
+        return classify_method_error("JMAP EmailSubmission/set failed", body);
+    }
+    if method != "EmailSubmission/set" {
+        return CreationOutcome::Indeterminate;
+    }
+    let created = body
+        .pointer("/created/sub1/id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .is_some();
+    let rejected = body.pointer("/notCreated/sub1");
+    match (created, rejected) {
+        (true, None) => CreationOutcome::Created(()),
+        (false, Some(error)) => {
+            bounded_rejection("JMAP EmailSubmission/set rejected submission", error)
+                .map(CreationOutcome::Rejected)
+                .unwrap_or(CreationOutcome::Indeterminate)
+        }
+        _ => CreationOutcome::Indeterminate,
+    }
+}
+
+fn bounded_rejection(context: &str, error: &serde_json::Value) -> Option<Error> {
+    let error_type = super::bounded_jmap_error_type(error)?;
+    Some(Error::Other(format!("{context} (type={error_type})")))
+}
+
+fn classify_method_error<T>(context: &str, error: &serde_json::Value) -> CreationOutcome<T> {
+    let Some(error_type) = super::bounded_jmap_error_type(error) else {
+        return CreationOutcome::Indeterminate;
+    };
+    // RFC 8620 section 3.6.2 permits a serverPartialFail response after
+    // some requested changes have occurred, so it never proves rejection.
+    if error_type == "serverPartialFail" {
+        return CreationOutcome::Indeterminate;
+    }
+    CreationOutcome::Rejected(Error::Other(format!("{context} (type={error_type})")))
+}
+
+fn matching_method_response<'a>(
+    response: &'a serde_json::Value,
+    call_id: &str,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    let responses = response
+        .get("methodResponses")
+        .and_then(serde_json::Value::as_array)?;
+    let mut matched = None;
+    for response in responses {
+        let Some(tuple) = response.as_array() else {
+            continue;
+        };
+        if tuple.get(2).and_then(serde_json::Value::as_str) != Some(call_id) {
+            continue;
+        }
+        if tuple.len() != 3 || matched.is_some() {
+            return None;
+        }
+        let method = tuple.first().and_then(serde_json::Value::as_str)?;
+        matched = Some((method, &tuple[1]));
+    }
+    matched
 }
 
 fn copy_updates(
@@ -1270,6 +1645,549 @@ fn parse_jmap_search_hit(account_id: &str, e: &serde_json::Value) -> SearchHit {
         from_email,
         date,
         snippet,
+    }
+}
+
+#[cfg(test)]
+mod submission_envelope_tests {
+    use super::{JmapConnection, JmapSubmissionEnvelope};
+    use crate::mail::jmap::JmapConfig;
+
+    fn envelope_json(
+        mail_from: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+    ) -> serde_json::Value {
+        serde_json::to_value(JmapSubmissionEnvelope::new(mail_from, to, cc, bcc).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn display_names_and_quoted_local_parts_become_addr_specs() {
+        let to = vec![r#""Recipient, Bob" <bob@example.com>"#.into()];
+        let cc = vec![r#"Quoted Local <"quoted local"@Example.COM>"#.into()];
+        let envelope = envelope_json(r#""Sender, Alice" <Sender@EXAMPLE.com>"#, &to, &cc, &[]);
+
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "mailFrom": {
+                    "email": "Sender@EXAMPLE.com",
+                    "parameters": null
+                },
+                "rcptTo": [
+                    { "email": "bob@example.com", "parameters": null },
+                    {
+                        "email": "\"quoted local\"@Example.COM",
+                        "parameters": null
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_domains_ignore_case_and_keep_first_spelling() {
+        let to = vec!["Alice <alice@EXAMPLE.com>".into()];
+        let cc = vec!["alice@example.com".into()];
+        let bcc = vec!["alice@Example.Com".into()];
+        let envelope = envelope_json("sender@example.com", &to, &cc, &bcc);
+
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([{
+                "email": "alice@EXAMPLE.com",
+                "parameters": null
+            }])
+        );
+    }
+
+    #[test]
+    fn quoted_and_escaped_equivalents_dedupe_without_rewriting_first() {
+        let to = vec![r#""ali\ce"@EXAMPLE.com"#.into()];
+        let cc = vec!["alice@example.com".into(), r#""alice"@example.com"#.into()];
+        let envelope = envelope_json("sender@example.com", &to, &cc, &[]);
+
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([{
+                "email": "\"ali\\ce\"@EXAMPLE.com",
+                "parameters": null
+            }])
+        );
+    }
+
+    #[test]
+    fn idna_equivalent_domains_dedupe_and_smtputf8_is_mail_from_only() {
+        let to = vec!["alice@bücher.example".into()];
+        let cc = vec!["alice@xn--bcher-kva.example".into()];
+        let envelope = envelope_json("sender@example.com", &to, &cc, &[]);
+
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "mailFrom": {
+                    "email": "sender@example.com",
+                    "parameters": { "SMTPUTF8": null }
+                },
+                "rcptTo": [{
+                    "email": "alice@bücher.example",
+                    "parameters": null
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn discarded_unicode_duplicate_does_not_require_smtputf8() {
+        let to = vec!["alice@xn--bcher-kva.example".into()];
+        let bcc = vec!["alice@bücher.example".into()];
+        let envelope = envelope_json("sender@example.com", &to, &[], &bcc);
+
+        assert_eq!(envelope["mailFrom"]["parameters"], serde_json::Value::Null);
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([{
+                "email": "alice@xn--bcher-kva.example",
+                "parameters": null
+            }])
+        );
+    }
+
+    #[test]
+    fn utf8_headers_require_smtputf8_but_utf8_body_does_not() {
+        let envelope = JmapSubmissionEnvelope::new(
+            "sender@example.com",
+            &["recipient@example.com".into()],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let utf8_header = envelope
+            .wire_value("To: álïce@example.com\r\n\r\nbody".as_bytes())
+            .unwrap();
+        assert_eq!(
+            utf8_header["mailFrom"]["parameters"],
+            serde_json::json!({ "SMTPUTF8": null })
+        );
+
+        let utf8_body = envelope
+            .wire_value("To: alice@example.com\r\n\r\nálïce".as_bytes())
+            .unwrap();
+        assert_eq!(utf8_body["mailFrom"]["parameters"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn rfc_address_literals_are_valid_and_untagged_ipv6_is_rejected() {
+        let to = vec!["ipv4@[192.0.2.1]".into(), "ipv6@[IPv6:2001:db8::1]".into()];
+        let envelope = envelope_json("sender@example.com", &to, &[], &[]);
+
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([
+                { "email": "ipv4@[192.0.2.1]", "parameters": null },
+                {
+                    "email": "ipv6@[IPv6:2001:db8::1]",
+                    "parameters": null
+                }
+            ])
+        );
+
+        assert!(JmapSubmissionEnvelope::new(
+            "sender@example.com",
+            &["ipv6@[2001:db8::1]".into()],
+            &[],
+            &[],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn local_part_case_variants_remain_distinct() {
+        let to = vec!["Alice@example.com".into(), "alice@EXAMPLE.com".into()];
+        let envelope = envelope_json("sender@example.com", &to, &[], &[]);
+
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([
+                { "email": "Alice@example.com", "parameters": null },
+                { "email": "alice@EXAMPLE.com", "parameters": null }
+            ])
+        );
+    }
+
+    #[test]
+    fn invalid_or_empty_envelopes_fail_before_upload_without_exposing_recipient() {
+        // `send_email` requires this private-field type, so a constructor
+        // failure occurs before its first operation (the blob upload).
+        assert!(JmapSubmissionEnvelope::new(
+            "invalid sender",
+            &["recipient@example.com".into()],
+            &[],
+            &[]
+        )
+        .is_err());
+
+        let confidential = "confidential bcc is invalid";
+        let error = match JmapSubmissionEnvelope::new(
+            "sender@example.com",
+            &[],
+            &[],
+            &[confidential.into()],
+        ) {
+            Ok(_) => panic!("invalid recipient must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(!error.contains(confidential));
+
+        assert!(JmapSubmissionEnvelope::new("sender@example.com", &[], &[], &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_smtputf8_fails_before_any_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let connection = JmapConnection {
+            http,
+            api_url: format!("{base_url}/api"),
+            download_url_template: format!("{base_url}/download/{{blobId}}"),
+            upload_url_template: format!("{base_url}/upload/{{accountId}}"),
+            event_source_url_template: None,
+            account_id: "account-1".into(),
+            max_objects_in_set: 500,
+            submission_extensions: std::collections::HashMap::new(),
+        };
+        let config = JmapConfig {
+            jmap_url: base_url,
+            email: "sender@example.com".into(),
+            username: "sender".into(),
+            password: "password".into(),
+            access_token: None,
+            auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        };
+        let envelope = JmapSubmissionEnvelope::new(
+            "sender@example.com",
+            &["recipient@bücher.example".into()],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let error = connection
+            .send_email(&config, b"opaque MIME bytes", &envelope)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SMTPUTF8"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "SMTPUTF8 rejection must occur before any network request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod submission_response_tests {
+    use super::validate_submission_response;
+
+    fn successful_response() -> serde_json::Value {
+        serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"],
+                ["EmailSubmission/set", {
+                    "created": { "sub1": { "id": "submission-1" } }
+                }, "s1"]
+            ]
+        })
+    }
+
+    #[test]
+    fn requires_positive_import_and_submission_creation() {
+        assert!(validate_submission_response(&successful_response()).is_ok());
+
+        for response in [
+            serde_json::json!({
+                "methodResponses": [["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"]]
+            }),
+            serde_json::json!({
+                "methodResponses": [
+                    ["Email/import", {
+                        "created": { "draft": { "id": "email-1" } }
+                    }, "i1"],
+                    ["EmailSubmission/set", {
+                        "created": { "sub1": {} }
+                    }, "s1"]
+                ]
+            }),
+            serde_json::json!({
+                "methodResponses": [
+                    ["Email/import", {
+                        "created": { "draft": { "id": "email-1" } }
+                    }, "i1"],
+                    ["Email/set", {
+                        "created": { "sub1": { "id": "submission-1" } }
+                    }, "s1"]
+                ]
+            }),
+            serde_json::json!({
+                "methodResponses": [
+                    ["Email/import", {
+                        "created": { "draft": { "id": "email-1" } }
+                    }, "i1"],
+                    ["EmailSubmission/set", {
+                        "created": { "sub1": { "id": "submission-1" } }
+                    }, "wrong-call-id"]
+                ]
+            }),
+        ] {
+            let failure = validate_submission_response(&response).unwrap_err();
+            assert!(failure.imported_email_id.is_none());
+            assert!(failure.error.is_indeterminate_delivery());
+        }
+    }
+
+    #[test]
+    fn unrelated_extra_response_does_not_erase_proven_success() {
+        let mut response = successful_response();
+        response["methodResponses"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(["Core/echo", {}, "extra"]));
+
+        assert!(validate_submission_response(&response).is_ok());
+    }
+
+    #[test]
+    fn explicit_submission_rejection_allows_import_cleanup() {
+        let response = serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"],
+                ["EmailSubmission/set", {
+                    "notCreated": {
+                        "sub1": { "type": "forbiddenToSend" }
+                    }
+                }, "s1"]
+            ]
+        });
+
+        let failure = validate_submission_response(&response).unwrap_err();
+        assert_eq!(failure.imported_email_id.as_deref(), Some("email-1"));
+        assert!(!failure.error.is_indeterminate_delivery());
+    }
+
+    #[test]
+    fn contradictory_or_malformed_rejection_is_indeterminate() {
+        for rejected in [
+            serde_json::json!({ "type": "forbiddenToSend" }),
+            serde_json::json!({ "description": "missing type" }),
+        ] {
+            let mut response = successful_response();
+            response["methodResponses"][1][1]["notCreated"]["sub1"] = rejected;
+
+            let failure = validate_submission_response(&response).unwrap_err();
+            assert!(failure.imported_email_id.is_none());
+            assert!(failure.error.is_indeterminate_delivery());
+        }
+    }
+
+    #[test]
+    fn server_partial_fail_never_permits_cleanup_or_retry() {
+        let response = serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"],
+                ["error", { "type": "serverPartialFail" }, "s1"]
+            ]
+        });
+
+        let failure = validate_submission_response(&response).unwrap_err();
+        assert!(failure.imported_email_id.is_none());
+        assert!(failure.error.is_indeterminate_delivery());
+    }
+
+    #[test]
+    fn import_failure_does_not_claim_an_email_for_cleanup() {
+        let response = serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "notCreated": {
+                        "draft": {
+                            "type": "invalidEmail",
+                            "description": "contains private message data"
+                        }
+                    }
+                }, "i1"],
+                ["EmailSubmission/set", {}, "s1"]
+            ]
+        });
+
+        let failure = validate_submission_response(&response).unwrap_err();
+        assert!(failure.imported_email_id.is_none());
+        let error = failure.error.to_string();
+        assert!(error.contains("invalidEmail"));
+        assert!(!error.contains("private message data"));
+    }
+
+    #[test]
+    fn invalid_recipients_error_is_bounded_and_redacted() {
+        let secret = "hidden-recipient@example.test";
+        let response = serde_json::json!({
+            "methodResponses": [
+                ["Email/import", {
+                    "created": { "draft": { "id": "email-1" } }
+                }, "i1"],
+                ["EmailSubmission/set", {
+                    "notCreated": {
+                        "sub1": {
+                            "type": "invalidRecipients",
+                            "description": format!("recipient rejected: {secret}"),
+                            "invalidRecipients": [secret]
+                        }
+                    }
+                }, "s1"]
+            ]
+        });
+
+        let failure = validate_submission_response(&response).unwrap_err();
+        assert_eq!(failure.imported_email_id.as_deref(), Some("email-1"));
+        let error = failure.error.to_string();
+        assert!(error.contains("type=invalidRecipients"));
+        assert!(!error.contains(secret));
+        assert!(error.len() < 160);
+    }
+}
+
+#[cfg(test)]
+mod submission_request_tests {
+    use super::{JmapConfig, JmapConnection};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn connection(api_url: String) -> JmapConnection {
+        JmapConnection {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            api_url,
+            download_url_template: String::new(),
+            upload_url_template: String::new(),
+            event_source_url_template: None,
+            account_id: "account-1".into(),
+            max_objects_in_set: 500,
+            submission_extensions: std::collections::HashMap::new(),
+        }
+    }
+
+    fn config() -> JmapConfig {
+        JmapConfig {
+            jmap_url: String::new(),
+            email: "sender@example.test".into(),
+            username: "sender".into(),
+            password: "password".into(),
+            access_token: None,
+            auth_method: "basic".into(),
+            oidc_token_endpoint: String::new(),
+            oidc_client_id: String::new(),
+        }
+    }
+
+    async fn serve_once(status: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api", listener.local_addr().unwrap());
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "request ended before its body was complete");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn http_rejection_is_definite_but_invalid_success_body_is_indeterminate() {
+        let request = serde_json::json!({ "methodCalls": [] });
+
+        let rejected_url = serve_once("401 Unauthorized", "private response").await;
+        let rejected = connection(rejected_url)
+            .submission_api_request(&request, &config())
+            .await
+            .unwrap_err();
+        assert!(!rejected.is_indeterminate_delivery());
+        assert_eq!(
+            rejected.to_string(),
+            "JMAP submission request rejected with HTTP status 401 Unauthorized"
+        );
+        assert!(!rejected.to_string().contains("private response"));
+
+        let malformed_url = serve_once("200 OK", "private non-json response").await;
+        let malformed = connection(malformed_url)
+            .submission_api_request(&request, &config())
+            .await
+            .unwrap_err();
+        assert!(malformed.is_indeterminate_delivery());
+        assert!(!malformed.to_string().contains("private non-json response"));
+
+        let gateway_url = serve_once("502 Bad Gateway", "private gateway response").await;
+        let gateway = connection(gateway_url)
+            .submission_api_request(&request, &config())
+            .await
+            .unwrap_err();
+        assert!(gateway.is_indeterminate_delivery());
+        assert!(!gateway.to_string().contains("private gateway response"));
+    }
+
+    #[tokio::test]
+    async fn request_builder_failure_is_definite() {
+        let error = connection("://invalid submission URL".into())
+            .submission_api_request(&serde_json::json!({ "methodCalls": [] }), &config())
+            .await
+            .unwrap_err();
+        assert!(!error.is_indeterminate_delivery());
     }
 }
 

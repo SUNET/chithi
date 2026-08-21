@@ -77,8 +77,8 @@ pub struct FileAttachment {
 
 /// Send an email. Validates and reads attachments synchronously, then spawns
 /// the actual network send in the background so the compose window can close
-/// immediately. Emits `send-started`, `send-complete`, or `send-failed` events
-/// to the main window for status tracking.
+/// immediately. Emits `send-started`, `send-complete`, `send-failed`, or
+/// `send-unknown` events to the main window for status tracking.
 #[tauri::command]
 pub async fn send_message(
     app: tauri::AppHandle,
@@ -221,26 +221,18 @@ pub async fn send_message(
         None
     };
 
-    // Notify main window that send is starting
     let subject_display = if message.subject.is_empty() {
         "(no subject)".to_string()
     } else {
         message.subject.clone()
     };
-    app.emit(
-        "send-started",
-        serde_json::json!({
-            "account_id": account_id,
-            "subject": subject_display,
-        }),
-    )
-    .ok();
 
     // --- Persist to outbox before spawning background send ---
     // The row is inserted with status 'sending' so the worker's replay
     // loop won't pick it up while the first attempt is still in flight.
-    // On success the row is deleted; on failure it flips to 'pending'
-    // and the next post-sync drain replays it via the worker.
+    // On success the row is deleted. A definite failure flips to
+    // 'pending' for worker replay; an indeterminate delivery is kept as
+    // 'dead' so only an explicit manual retry can resend it.
     let raw_message_b64 = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(&raw_message)
@@ -268,6 +260,15 @@ pub async fn send_message(
         outbox_id,
         account_id
     );
+    app.emit(
+        "send-started",
+        serde_json::json!({
+            "account_id": account_id,
+            "subject": subject_display,
+            "outbox_id": outbox_id,
+        }),
+    )
+    .ok();
 
     // From here on the outbox owns the payload — the attachment bytes
     // are already inlined in raw_message. Releasing tokens is safe even
@@ -408,8 +409,16 @@ pub async fn send_message(
                 }
             } else {
                 log::info!("Sending via JMAP for account {}", account.email);
+                let envelope = crate::mail::jmap::JmapSubmissionEnvelope::new(
+                    &account.email,
+                    &message.to,
+                    &message.cc,
+                    &message.bcc,
+                )?;
                 let (jmap_config, conn_jmap) = providers_bg.jmap_client(&account).await?;
-                conn_jmap.send_email(&jmap_config, &raw_message).await?;
+                conn_jmap
+                    .send_email(&jmap_config, &raw_message, &envelope)
+                    .await?;
             }
             Ok(())
         }
@@ -418,14 +427,21 @@ pub async fn send_message(
         match result {
             Ok(()) => {
                 log::info!("Message sent successfully for account {}", account_id_bg);
-                // Each writer acquire is scoped: shadowing the previous
-                // `conn` would NOT drop the old guard before the new
-                // `lock().await`, self-deadlocking on the same mutex.
-                {
+                let completion = {
                     let conn = db_bg.writer().await;
-                    if let Err(e) = crate::ops::offline::mark_completed(&conn, outbox_id) {
-                        log::warn!("Failed to remove sent message from outbox: {}", e);
-                    }
+                    crate::ops::offline::complete_sending_send(&conn, outbox_id)
+                };
+                match completion {
+                    Ok(true) => {}
+                    Ok(false) => log::error!(
+                        "Send {} succeeded but its sending claim was missing",
+                        outbox_id
+                    ),
+                    Err(error) => log::error!(
+                        "Send {} succeeded but completion persistence failed; row remains sending: {}",
+                        outbox_id,
+                        error
+                    ),
                 }
                 app_bg
                     .emit(
@@ -433,6 +449,7 @@ pub async fn send_message(
                         serde_json::json!({
                             "account_id": account_id_bg,
                             "subject": subject_bg,
+                            "outbox_id": outbox_id,
                         }),
                     )
                     .ok();
@@ -451,18 +468,54 @@ pub async fn send_message(
             }
             Err(e) => {
                 log::error!("Send failed for account {}: {}", account_id_bg, e);
-                // Flip the row from 'sending' back to 'pending' and record
-                // the error so the worker replays it on the next sync.
-                let conn = db_bg.writer().await;
-                let _ = crate::ops::offline::mark_failed(&conn, outbox_id, &e.to_string());
-                let _ = crate::ops::offline::mark_pending(&conn, outbox_id);
+                let indeterminate = e.is_indeterminate_delivery();
+                let error_message = if indeterminate {
+                    crate::ops::offline::INDETERMINATE_DELIVERY_ERROR_MESSAGE.to_string()
+                } else {
+                    e.to_string()
+                };
+                let transition = {
+                    let conn = db_bg.writer().await;
+                    if indeterminate {
+                        crate::ops::offline::quarantine_sending_send(
+                            &conn,
+                            outbox_id,
+                            &error_message,
+                        )
+                    } else {
+                        crate::ops::offline::retry_sending_send(&conn, outbox_id, &error_message)
+                    }
+                };
+                match transition {
+                    Ok(true) => {}
+                    Ok(false) => log::error!(
+                        "Send {} failed but its sending claim was missing",
+                        outbox_id
+                    ),
+                    Err(db_error) if indeterminate => log::error!(
+                        "Failed to quarantine indeterminate send {}; row remains sending: {}",
+                        outbox_id,
+                        db_error
+                    ),
+                    Err(db_error) => log::error!(
+                        "Failed to persist retry for send {}; row remains sending: {}",
+                        outbox_id,
+                        db_error
+                    ),
+                }
+                let event_name = if indeterminate {
+                    "send-unknown"
+                } else {
+                    "send-failed"
+                };
                 app_bg
                     .emit(
-                        "send-failed",
+                        event_name,
                         serde_json::json!({
                             "account_id": account_id_bg,
                             "subject": subject_bg,
-                            "error": e.to_string(),
+                            "outbox_id": outbox_id,
+                            "error": error_message,
                         }),
                     )
                     .ok();

@@ -293,6 +293,9 @@ mod registry_tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::db::accounts::AccountFull;
@@ -306,6 +309,179 @@ mod registry_tests {
     use crate::provider::{
         OAuthTokenStore, ProviderCredentialService, ProviderTransports, TokenEndpointClient,
     };
+
+    struct CapturedHttpRequest {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before headers were complete");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+
+        let (method, path, content_length) = {
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut request_line = headers.lines().next().unwrap().split_whitespace();
+            (
+                request_line.next().unwrap().to_string(),
+                request_line.next().unwrap().to_string(),
+                content_length,
+            )
+        };
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before its body was complete");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        CapturedHttpRequest {
+            method,
+            path,
+            body: bytes[header_end..header_end + content_length].to_vec(),
+        }
+    }
+
+    async fn write_json_response(stream: &mut TcpStream, body: serde_json::Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn loopback_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    async fn jmap_submission_server() -> (String, oneshot::Receiver<Vec<CapturedHttpRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server_base_url = base_url.clone();
+        let (requests_tx, requests_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let (response, is_final) = if request.method == "GET" {
+                    (
+                        serde_json::json!({
+                            "apiUrl": format!("{server_base_url}/api"),
+                            "downloadUrl": format!(
+                                "{server_base_url}/download/{{accountId}}/{{blobId}}/{{name}}"
+                            ),
+                            "uploadUrl": format!("{server_base_url}/upload/{{accountId}}"),
+                            "capabilities": {
+                                "urn:ietf:params:jmap:core": {},
+                                "urn:ietf:params:jmap:mail": {},
+                                "urn:ietf:params:jmap:submission": {}
+                            },
+                            "accounts": {
+                                "account-1": {
+                                    "accountCapabilities": {
+                                        "urn:ietf:params:jmap:mail": {},
+                                        "urn:ietf:params:jmap:submission": {
+                                            "maxDelayedSend": 0,
+                                            "submissionExtensions": {}
+                                        }
+                                    }
+                                }
+                            },
+                            "primaryAccounts": {
+                                "urn:ietf:params:jmap:mail": "account-1"
+                            }
+                        }),
+                        false,
+                    )
+                } else if request.path == "/upload/account-1" {
+                    (serde_json::json!({ "blobId": "blob-1" }), false)
+                } else {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    match body["methodCalls"][0][0].as_str().unwrap() {
+                        "Mailbox/get" => (
+                            serde_json::json!({
+                                "methodResponses": [["Mailbox/get", {
+                                    "accountId": "account-1",
+                                    "state": "mailbox-state",
+                                    "list": [{ "id": "sent-1", "role": "sent" }],
+                                    "notFound": []
+                                }, "r1"]]
+                            }),
+                            false,
+                        ),
+                        "Identity/get" => (
+                            serde_json::json!({
+                                "methodResponses": [["Identity/get", {
+                                    "accountId": "account-1",
+                                    "state": "identity-state",
+                                    "list": [{
+                                        "id": "identity-1",
+                                        "email": "Sender@example.test"
+                                    }],
+                                    "notFound": []
+                                }, "id1"]]
+                            }),
+                            false,
+                        ),
+                        "Email/import" => (
+                            serde_json::json!({
+                                "methodResponses": [
+                                    ["Email/import", {
+                                        "accountId": "account-1",
+                                        "oldState": "email-old",
+                                        "newState": "email-new",
+                                        "created": { "draft": { "id": "email-1" } }
+                                    }, "i1"],
+                                    ["EmailSubmission/set", {
+                                        "accountId": "account-1",
+                                        "oldState": "submission-old",
+                                        "newState": "submission-new",
+                                        "created": {
+                                            "sub1": { "id": "submission-1" }
+                                        }
+                                    }, "s1"]
+                                ]
+                            }),
+                            true,
+                        ),
+                        method => panic!("unexpected JMAP method: {method}"),
+                    }
+                };
+                write_json_response(&mut stream, response).await;
+                requests.push(request);
+                if is_final {
+                    break;
+                }
+            }
+            requests_tx.send(requests).ok();
+        });
+
+        (base_url, requests_rx)
+    }
 
     #[derive(Default)]
     struct MemoryTokenStore {
@@ -512,9 +688,7 @@ mod registry_tests {
             account_id: account_id.into(),
             action_type: action_type.into(),
             payload_json: payload.to_string(),
-            status: "pending".into(),
             retry_count: 0,
-            error_message: None,
         };
         let replayed = outbox_to_mail_op(&entry).expect("valid send must replay from outbox");
         assert_eq!(replayed, original);
@@ -766,12 +940,12 @@ mod registry_tests {
             .await
             .unwrap_err()
             .to_string();
-        // JMAP resolves this account's fresh in-memory OIDC token, then
-        // rejects the cleartext fixture URL before making a request. No
-        // password or persistent keyring secret participates in the test.
-        assert!(token_store.was_loaded(&jmap_id));
+        // JMAP validates its mandatory explicit envelope before resolving
+        // credentials or opening a connection. The distinct error proves the
+        // replay stayed on the native JMAP path rather than SMTP.
+        assert!(!token_store.was_loaded(&jmap_id));
         assert!(
-            jmap_error.contains("URL must use https://"),
+            jmap_error.contains("Invalid JMAP submission mail-from address"),
             "JMAP SendRaw must retain native JMAP submission: {jmap_error}"
         );
         assert!(!jmap_error.contains("SMTP send_raw"));
@@ -781,6 +955,163 @@ mod registry_tests {
                 crate::oauth::MICROSOFT_IMAP_SCOPES,
                 crate::oauth::MICROSOFT_IMAP_SCOPES,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_jmap_send_retains_bcc_in_explicit_envelope() {
+        let (jmap_url, requests_rx) = jmap_submission_server().await;
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DbPool::new(&temp.path().join("jmap-outbox.db"), 1).unwrap());
+        {
+            let conn = db.writer().await;
+            crate::db::schema::initialize(&conn).unwrap();
+        }
+
+        let account_id = format!("jmap-outbox-{}", uuid::Uuid::new_v4());
+        insert_executor_account(&db, &account_id, "jmap", "password").await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "UPDATE service_bindings SET config_json = ?1
+                 WHERE account_id = ?2 AND service = 'mail'",
+                rusqlite::params![
+                    serde_json::json!({
+                        "url": jmap_url,
+                        "auth_method": "basic",
+                    })
+                    .to_string(),
+                    account_id,
+                ],
+            )
+            .unwrap();
+        }
+
+        let token_store = Arc::new(MemoryTokenStore::default());
+        let endpoint = Arc::new(ScopeRecordingEndpoint::default());
+        let credentials = Arc::new(ProviderCredentialService::new(
+            token_store.clone(),
+            endpoint.clone(),
+        ));
+        let mut transports = ProviderTransports::production().unwrap();
+        transports.jmap_api_http = loopback_http_client();
+        transports.jmap_discovery_http = loopback_http_client();
+        let providers = Arc::new(ProviderServices::new(
+            credentials,
+            token_store,
+            endpoint,
+            transports,
+        ));
+        let ctx = MailSyncCtx {
+            events: Arc::new(NoopEventSink),
+            db: db.clone(),
+            data_dir: temp.path().to_path_buf(),
+            providers,
+        };
+
+        let bcc = "Hidden Recipient <hidden@example.test>";
+        let raw_message =
+            b"From: Sender <Sender@Example.test>\r\nTo: visible@example.test\r\nSubject: outbox\r\n\r\nbody\r\n"
+                .to_vec();
+        assert!(!String::from_utf8_lossy(&raw_message).contains("hidden@example.test"));
+        let original = MailOp::SendRaw {
+            raw_message: raw_message.clone(),
+            from: "Sender <Sender@Example.test>".into(),
+            to: vec!["Visible Recipient <visible@example.test>".into()],
+            cc: Vec::new(),
+            bcc: vec![bcc.into()],
+            subject: "outbox".into(),
+        };
+        let (action_type, payload) = mail_op_to_outbox(&original).unwrap();
+        let replayed = outbox_to_mail_op(&OutboxEntry {
+            id: 1,
+            account_id: account_id.clone(),
+            action_type: action_type.into(),
+            payload_json: payload.to_string(),
+            retry_count: 0,
+        })
+        .unwrap();
+        assert_eq!(replayed, original);
+
+        let account = {
+            let conn = db.reader();
+            crate::db::accounts::get_account_full(&conn, &account_id)
+                .unwrap()
+                .mail_config()
+        };
+        let mut executor = for_account(&account).unwrap().op_executor();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            executor.execute(&ctx, &account_id, replayed),
+        )
+        .await
+        .expect("JMAP outbox execution timed out")
+        .unwrap();
+
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(2), requests_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let upload = requests
+            .iter()
+            .find(|request| request.path == "/upload/account-1")
+            .unwrap();
+        assert_eq!(upload.body, raw_message);
+
+        let identity_index = requests
+            .iter()
+            .position(|request| request.body.windows(12).any(|part| part == b"Identity/get"))
+            .unwrap();
+        let upload_index = requests
+            .iter()
+            .position(|request| request.path == "/upload/account-1")
+            .unwrap();
+        assert!(
+            identity_index < upload_index,
+            "identity must resolve before upload"
+        );
+
+        let mailbox_requests = requests
+            .iter()
+            .filter(|request| request.body.windows(11).any(|part| part == b"Mailbox/get"))
+            .count();
+        assert_eq!(
+            mailbox_requests, 1,
+            "Inbox fallback must stay lazy when Sent exists"
+        );
+
+        let submission = requests
+            .iter()
+            .filter(|request| request.path == "/api")
+            .find_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                (body["methodCalls"][0][0] == "Email/import").then_some(body)
+            })
+            .unwrap();
+        let envelope = &submission["methodCalls"][1][1]["create"]["sub1"]["envelope"];
+        assert_eq!(
+            envelope,
+            &serde_json::json!({
+                "mailFrom": {
+                    "email": "Sender@Example.test",
+                    "parameters": null
+                },
+                "rcptTo": [
+                    { "email": "visible@example.test", "parameters": null },
+                    { "email": "hidden@example.test", "parameters": null }
+                ]
+            })
+        );
+        assert!(submission["methodCalls"][1][1]
+            .get("onSuccessUpdateEmail")
+            .is_none());
+        assert_eq!(
+            serde_json::to_string(&submission)
+                .unwrap()
+                .matches("hidden@example.test")
+                .count(),
+            1,
+            "Bcc must appear only in the explicit submission rcptTo"
         );
     }
 }

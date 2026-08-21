@@ -268,13 +268,13 @@ impl AppState {
         // Create pool: 1 writer + 4 readers (matches MAX_PARALLEL_CONNECTIONS)
         let pool = DbPool::new(&db_path, 4)?;
 
-        // Revive any outbox rows left in 'sending' from a previous run.
-        // The spawn task that owned them is dead; without this the rows
-        // would never be retried and would be invisible to the user.
+        // Quarantine outbox rows left in 'sending' by a previous run. Their
+        // delivery outcome is unknowable after the owning task disappears,
+        // so only a deliberate manual retry may send them again.
         {
-            let revive_conn = rusqlite::Connection::open(&db_path)?;
-            if let Err(e) = crate::ops::offline::revive_stuck_sending(&revive_conn) {
-                log::warn!("Failed to revive stuck 'sending' outbox rows: {}", e);
+            let quarantine_conn = rusqlite::Connection::open(&db_path)?;
+            if let Err(e) = crate::ops::offline::quarantine_stuck_sending(&quarantine_conn) {
+                log::warn!("Failed to quarantine stuck 'sending' outbox rows: {}", e);
             }
         }
 

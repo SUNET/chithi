@@ -233,13 +233,21 @@ export const useActivityStore = defineStore("activity", () => {
     // "Sending..." toast when the send completes or fails.
     const sendToastIds = new Map<string, number>();
 
+    function dismissSendToast(opId: string) {
+      const toastId = sendToastIds.get(opId);
+      if (toastId !== undefined) {
+        dismissToast(toastId);
+        sendToastIds.delete(opId);
+      }
+    }
+
     // --- Send events ---
     unlistenFns.push(
-      await listen<{ account_id: string; subject: string }>(
+      await listen<{ account_id: string; subject: string; outbox_id: number }>(
         "send-started",
         (event) => {
           const p = event.payload;
-          const opId = `send-${p.account_id}-${Date.now()}`;
+          const opId = `send-${p.outbox_id}`;
           startOperation(opId, "send", `Sending "${p.subject}"`, "Syncing...");
           const toastId = showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
           sendToastIds.set(opId, toastId);
@@ -248,45 +256,54 @@ export const useActivityStore = defineStore("activity", () => {
     );
 
     unlistenFns.push(
-      await listen<{ account_id: string; subject: string }>(
+      await listen<{ account_id: string; subject: string; outbox_id: number }>(
         "send-complete",
         (event) => {
           const p = event.payload;
-          // Complete all running send operations for this account
-          for (const [id, op] of operations.value) {
-            if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
-              completeOperation(id, "Sent");
-              const toastId = sendToastIds.get(id);
-              if (toastId !== undefined) {
-                dismissToast(toastId);
-                sendToastIds.delete(id);
-              }
-            }
-          }
+          const opId = `send-${p.outbox_id}`;
+          completeOperation(opId, "Sent");
+          dismissSendToast(opId);
           showToast(`"${p.subject}" sent`, "success");
         },
       ),
     );
 
     unlistenFns.push(
-      await listen<{ account_id: string; subject: string; error: string }>(
+      await listen<{
+        account_id: string;
+        subject: string;
+        outbox_id: number;
+        error: string;
+      }>(
         "send-failed",
         (event) => {
           const p = event.payload;
-          // Fail all running send operations for this account
-          for (const [id, op] of operations.value) {
-            if (op.type === "send" && op.status === "running" && id.startsWith(`send-${p.account_id}`)) {
-              failOperation(id, p.error);
-              const toastId = sendToastIds.get(id);
-              if (toastId !== undefined) {
-                dismissToast(toastId);
-                sendToastIds.delete(id);
-              }
-            }
-          }
+          const opId = `send-${p.outbox_id}`;
+          failOperation(opId, p.error);
+          dismissSendToast(opId);
           showToast(`Send failed: ${p.error}`, "error", 10000);
         },
       ),
+    );
+
+    unlistenFns.push(
+      await listen<{
+        account_id: string;
+        subject: string;
+        outbox_id: number;
+        error: string;
+      }>("send-unknown", (event) => {
+        const p = event.payload;
+        const opId = `send-${p.outbox_id}`;
+        const detail = `Delivery status unknown: ${p.error}`;
+        failOperation(opId, detail);
+        dismissSendToast(opId);
+        showToast(
+          `Delivery status unknown for "${p.subject}": ${p.error}`,
+          "error",
+          10000,
+        );
+      }),
     );
   }
 

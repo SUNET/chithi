@@ -5,6 +5,18 @@ use crate::message::BackendMessageRef;
 use crate::ops::flags::{remove_deleted_refs, subtract_flag_mutation, FlagMutation, FlagTarget};
 use crate::ops::queue::MailOp;
 
+pub const INDETERMINATE_DELIVERY_ERROR_MESSAGE: &str =
+    "Delivery outcome is unknown; automatic retry disabled to avoid duplicate delivery. Verify delivery before retrying manually.";
+
+const STUCK_SENDING_ERROR_MESSAGE: &str =
+    "Delivery outcome is unknown after app restart; automatic retry disabled to avoid duplicate delivery. Verify delivery before retrying manually.";
+
+const MAX_SEND_ERROR_MESSAGE_BYTES: usize = 256;
+
+pub fn is_indeterminate_delivery_error_message(message: &str) -> bool {
+    message == INDETERMINATE_DELIVERY_ERROR_MESSAGE || message == STUCK_SENDING_ERROR_MESSAGE
+}
+
 /// Replay order matching operation dependencies:
 /// flags (0) -> copies (1) -> moves (2) -> deletes (3).
 /// Copies precede moves because moving an IMAP message invalidates its source UID.
@@ -83,29 +95,101 @@ pub fn queue_dead_op(
     Ok(conn.last_insert_rowid())
 }
 
-/// Flip a 'sending' row back to 'pending' so the worker will retry it
-/// on the next sync.
-pub fn mark_pending(conn: &Connection, outbox_id: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE outbox SET status = 'pending' WHERE id = ?1",
-        rusqlite::params![outbox_id],
-    )
-    .map_err(Error::Database)?;
-    Ok(())
+/// Atomically claim a pending send before replaying it. A false result means
+/// the snapshot is stale or another actor already claimed or removed the row.
+pub fn claim_pending_send(
+    conn: &Connection,
+    outbox_id: i64,
+    expected_retry_count: i32,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE outbox SET status = 'sending'
+             WHERE id = ?1 AND action_type = 'send' AND status = 'pending'
+               AND retry_count = ?2",
+            rusqlite::params![outbox_id, expected_retry_count],
+        )
+        .map_err(Error::Database)?;
+    Ok(changed == 1)
 }
 
-/// On app startup, revive any rows left as 'sending' from a previous run.
-/// The owning task is gone, so the message would otherwise be invisible
-/// to both the user and the worker. Returns how many rows were revived.
-pub fn revive_stuck_sending(conn: &Connection) -> Result<usize> {
+/// Delete a successfully delivered send only while its claim is still held.
+pub fn complete_sending_send(conn: &Connection, outbox_id: i64) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "DELETE FROM outbox
+             WHERE id = ?1 AND action_type = 'send' AND status = 'sending'",
+            rusqlite::params![outbox_id],
+        )
+        .map_err(Error::Database)?;
+    Ok(changed == 1)
+}
+
+/// Record a definite send failure and atomically release its claim for replay.
+pub fn retry_sending_send(conn: &Connection, outbox_id: i64, error: &str) -> Result<bool> {
+    let error = bounded_send_error(error);
+    let changed = conn
+        .execute(
+            "UPDATE outbox
+             SET status = 'pending', retry_count = retry_count + 1,
+                 error_message = ?1
+             WHERE id = ?2 AND action_type = 'send' AND status = 'sending'",
+            rusqlite::params![error, outbox_id],
+        )
+        .map_err(Error::Database)?;
+    Ok(changed == 1)
+}
+
+/// Quarantine a claimed send after an ambiguous outcome. The explanation is
+/// byte-bounded before persistence and the row can only move from sending.
+pub fn quarantine_sending_send(conn: &Connection, outbox_id: i64, error: &str) -> Result<bool> {
+    quarantine_send_from_status(conn, outbox_id, "sending", error)
+}
+
+/// Quarantine an unclaimed send without disturbing a concurrently claimed
+/// row. Used for retry exhaustion and invalid persisted payloads.
+pub fn quarantine_pending_send(conn: &Connection, outbox_id: i64, error: &str) -> Result<bool> {
+    quarantine_send_from_status(conn, outbox_id, "pending", error)
+}
+
+fn quarantine_send_from_status(
+    conn: &Connection,
+    outbox_id: i64,
+    expected_status: &str,
+    error: &str,
+) -> Result<bool> {
+    let error = bounded_send_error(error);
+    let changed = conn
+        .execute(
+            "UPDATE outbox SET status = 'dead', error_message = ?1
+             WHERE id = ?2 AND action_type = 'send' AND status = ?3",
+            rusqlite::params![error, outbox_id, expected_status],
+        )
+        .map_err(Error::Database)?;
+    Ok(changed == 1)
+}
+
+fn bounded_send_error(error: &str) -> &str {
+    let mut end = error.len().min(MAX_SEND_ERROR_MESSAGE_BYTES);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    &error[..end]
+}
+
+/// On app startup, quarantine rows left as 'sending' by a previous run.
+/// The owning task is gone and delivery may already have occurred, so an
+/// automatic retry could create a duplicate. Returns the quarantined count.
+pub fn quarantine_stuck_sending(conn: &Connection) -> Result<usize> {
     let count = conn
         .execute(
-            "UPDATE outbox SET status = 'pending' WHERE status = 'sending'",
-            [],
+            "UPDATE outbox SET status = 'dead', error_message = ?1
+             WHERE action_type = 'send' AND status = 'sending'",
+            rusqlite::params![STUCK_SENDING_ERROR_MESSAGE],
         )
         .map_err(Error::Database)?;
     if count > 0 {
-        log::info!("Revived {} outbox row(s) stuck in 'sending'", count);
+        log::warn!("Quarantined {} outbox row(s) stuck in 'sending'", count);
     }
     Ok(count)
 }
@@ -145,41 +229,43 @@ pub fn get_pending_ops(conn: &Connection, account_id: &str) -> Result<Vec<Outbox
     Ok(entries)
 }
 
-/// Mark an outbox entry as completed (will be deleted).
+/// Mark a non-send outbox entry as completed (will be deleted).
 pub fn mark_completed(conn: &Connection, outbox_id: i64) -> Result<()> {
     conn.execute(
-        "DELETE FROM outbox WHERE id = ?1",
+        "DELETE FROM outbox WHERE id = ?1 AND action_type != 'send'",
         rusqlite::params![outbox_id],
     )
     .map_err(Error::Database)?;
     Ok(())
 }
 
-/// Mark an outbox entry as failed, incrementing retry count.
+/// Mark a non-send outbox entry as failed, incrementing retry count.
 pub fn mark_failed(conn: &Connection, outbox_id: i64, error: &str) -> Result<()> {
     conn.execute(
         "UPDATE outbox SET retry_count = retry_count + 1, error_message = ?1
-         WHERE id = ?2",
+         WHERE id = ?2 AND action_type != 'send'",
         rusqlite::params![error, outbox_id],
     )
     .map_err(Error::Database)?;
     Ok(())
 }
 
-/// Mark an outbox entry as dead (too many retries).
+/// Mark a non-send outbox entry as dead (too many retries).
 pub fn mark_dead(conn: &Connection, outbox_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE outbox SET status = 'dead' WHERE id = ?1",
+        "UPDATE outbox SET status = 'dead'
+         WHERE id = ?1 AND action_type != 'send'",
         rusqlite::params![outbox_id],
     )
     .map_err(Error::Database)?;
     Ok(())
 }
 
-/// Mark an operation with an unrecoverable payload as dead.
-pub fn mark_invalid(conn: &Connection, outbox_id: i64, error: &str) -> Result<()> {
+/// Mark a non-send operation dead with a user-visible explanation.
+pub fn mark_dead_with_error(conn: &Connection, outbox_id: i64, error: &str) -> Result<()> {
     conn.execute(
-        "UPDATE outbox SET status = 'dead', error_message = ?1 WHERE id = ?2",
+        "UPDATE outbox SET status = 'dead', error_message = ?1
+         WHERE id = ?2 AND action_type != 'send'",
         rusqlite::params![error, outbox_id],
     )
     .map_err(Error::Database)?;
@@ -889,13 +975,13 @@ mod tests {
         conn
     }
 
-    fn row_state(conn: &Connection, id: i64) -> (String, i32, Option<String>) {
+    fn row_state(conn: &Connection, id: i64) -> Option<(String, i32, Option<String>)> {
         conn.query_row(
             "SELECT status, retry_count, error_message FROM outbox WHERE id = ?1",
             rusqlite::params![id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap()
+        .ok()
     }
 
     #[test]
@@ -970,11 +1056,11 @@ mod tests {
     fn invalid_payload_is_marked_dead_with_an_error() {
         let conn = setup_db();
         let id = queue_offline_op(&conn, "acc1", "delete", &serde_json::json!({})).unwrap();
-        mark_invalid(&conn, id, "invalid delete payload").unwrap();
+        mark_dead_with_error(&conn, id, "invalid delete payload").unwrap();
 
         assert_eq!(
             row_state(&conn, id),
-            ("dead".into(), 0, Some("invalid delete payload".into()))
+            Some(("dead".into(), 0, Some("invalid delete payload".into())))
         );
     }
 
@@ -993,8 +1079,172 @@ mod tests {
         assert!(get_pending_ops(&conn, "acc1").unwrap().is_empty());
         assert_eq!(
             row_state(&conn, id),
-            ("dead".into(), 0, Some("ambiguous copy outcome".into()))
+            Some(("dead".into(), 0, Some("ambiguous copy outcome".into())))
         );
+    }
+
+    #[test]
+    fn send_claim_rejects_stale_and_non_send_rows() {
+        let conn = setup_db();
+        let send_id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        let dead_id =
+            queue_offline_op_with_status(&conn, "acc1", "send", &serde_json::json!({}), "dead")
+                .unwrap();
+        let non_send_id = queue_offline_op(&conn, "acc1", "move", &serde_json::json!({})).unwrap();
+        let discarded_id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        let changed_retry_id =
+            queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        mark_failed(&conn, changed_retry_id, "legacy helper cannot change send").unwrap();
+        conn.execute(
+            "UPDATE outbox SET retry_count = 1 WHERE id = ?1",
+            rusqlite::params![changed_retry_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM outbox WHERE id = ?1 AND status = 'pending'",
+            rusqlite::params![discarded_id],
+        )
+        .unwrap();
+
+        assert!(claim_pending_send(&conn, send_id, 0).unwrap());
+        assert_eq!(row_state(&conn, send_id).unwrap().0, "sending");
+        assert!(!claim_pending_send(&conn, send_id, 0).unwrap());
+        assert!(!claim_pending_send(&conn, dead_id, 0).unwrap());
+        assert!(!claim_pending_send(&conn, non_send_id, 0).unwrap());
+        assert!(!claim_pending_send(&conn, discarded_id, 0).unwrap());
+        assert!(!claim_pending_send(&conn, changed_retry_id, 0).unwrap());
+        assert!(claim_pending_send(&conn, changed_retry_id, 1).unwrap());
+    }
+
+    #[test]
+    fn legacy_non_send_transitions_cannot_mutate_send_rows() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+
+        mark_completed(&conn, id).unwrap();
+        mark_failed(&conn, id, "failure").unwrap();
+        mark_dead(&conn, id).unwrap();
+        mark_dead_with_error(&conn, id, "dead").unwrap();
+
+        assert_eq!(row_state(&conn, id), Some(("pending".into(), 0, None)));
+    }
+
+    #[test]
+    fn pending_send_quarantine_does_not_override_a_claim() {
+        let conn = setup_db();
+        let pending = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        let claimed = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        assert!(claim_pending_send(&conn, claimed, 0).unwrap());
+
+        assert!(quarantine_pending_send(&conn, pending, "invalid payload").unwrap());
+        assert!(!quarantine_pending_send(&conn, claimed, "stale snapshot").unwrap());
+        assert_eq!(row_state(&conn, pending).unwrap().0, "dead");
+        assert_eq!(row_state(&conn, claimed).unwrap().0, "sending");
+    }
+
+    #[test]
+    fn send_completion_deletes_only_a_claimed_send() {
+        let conn = setup_db();
+        let send_id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        let non_send_id =
+            queue_offline_op_with_status(&conn, "acc1", "move", &serde_json::json!({}), "sending")
+                .unwrap();
+
+        assert!(!complete_sending_send(&conn, send_id).unwrap());
+        assert!(claim_pending_send(&conn, send_id, 0).unwrap());
+        assert!(complete_sending_send(&conn, send_id).unwrap());
+        assert!(row_state(&conn, send_id).is_none());
+        assert!(!complete_sending_send(&conn, send_id).unwrap());
+        assert!(!complete_sending_send(&conn, non_send_id).unwrap());
+        assert_eq!(row_state(&conn, non_send_id).unwrap().0, "sending");
+    }
+
+    #[test]
+    fn definite_send_failure_atomically_releases_claim_and_increments_retry() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+
+        assert!(!retry_sending_send(&conn, id, "definite rejection").unwrap());
+        assert!(claim_pending_send(&conn, id, 0).unwrap());
+        assert!(retry_sending_send(&conn, id, "definite rejection").unwrap());
+        assert_eq!(
+            row_state(&conn, id),
+            Some(("pending".into(), 1, Some("definite rejection".into())))
+        );
+        assert!(!retry_sending_send(&conn, id, "second failure").unwrap());
+        assert_eq!(row_state(&conn, id).unwrap().1, 1);
+    }
+
+    #[test]
+    fn indeterminate_send_atomically_quarantines_with_bounded_error() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        assert!(claim_pending_send(&conn, id, 0).unwrap());
+
+        let long_error = format!("Delivery outcome is unknown: {}", "é".repeat(512));
+        assert!(quarantine_sending_send(&conn, id, &long_error).unwrap());
+        let state = row_state(&conn, id).unwrap();
+        assert_eq!(state.0, "dead");
+        let stored = state.2.unwrap();
+        assert!(stored.starts_with("Delivery outcome is unknown"));
+        assert!(stored.len() <= MAX_SEND_ERROR_MESSAGE_BYTES);
+        assert!(!quarantine_sending_send(&conn, id, "again").unwrap());
+    }
+
+    #[test]
+    fn failed_send_transition_leaves_the_claim_held() {
+        let conn = setup_db();
+        let id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+        assert!(claim_pending_send(&conn, id, 0).unwrap());
+        conn.execute_batch(
+            "CREATE TRIGGER reject_send_transition
+             BEFORE UPDATE OF status ON outbox
+             WHEN OLD.status = 'sending'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected transition failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(retry_sending_send(&conn, id, "definite rejection").is_err());
+        assert!(quarantine_sending_send(&conn, id, "unknown").is_err());
+        assert_eq!(row_state(&conn, id), Some(("sending".into(), 0, None)));
+
+        conn.execute_batch(
+            "DROP TRIGGER reject_send_transition;
+             CREATE TRIGGER reject_send_completion
+             BEFORE DELETE ON outbox
+             WHEN OLD.status = 'sending'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected completion failure');
+             END;",
+        )
+        .unwrap();
+        assert!(complete_sending_send(&conn, id).is_err());
+        assert_eq!(row_state(&conn, id), Some(("sending".into(), 0, None)));
+    }
+
+    #[test]
+    fn stuck_sending_rows_are_quarantined_as_dead() {
+        let conn = setup_db();
+        let sending_id =
+            queue_offline_op_with_status(&conn, "acc1", "send", &serde_json::json!({}), "sending")
+                .unwrap();
+        let pending_id = queue_offline_op(&conn, "acc1", "send", &serde_json::json!({})).unwrap();
+
+        assert_eq!(quarantine_stuck_sending(&conn).unwrap(), 1);
+        assert_eq!(quarantine_stuck_sending(&conn).unwrap(), 0);
+
+        assert_eq!(
+            row_state(&conn, sending_id),
+            Some(("dead".into(), 0, Some(STUCK_SENDING_ERROR_MESSAGE.into())))
+        );
+        assert!(STUCK_SENDING_ERROR_MESSAGE.len() <= 256);
+        assert!(INDETERMINATE_DELIVERY_ERROR_MESSAGE.len() <= 256);
+
+        let pending = get_pending_ops(&conn, "acc1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
     }
 
     #[test]
@@ -1006,7 +1256,7 @@ mod tests {
 
         assert_eq!(
             row_state(&conn, id),
-            ("pending".into(), 2, Some("network error".into()))
+            Some(("pending".into(), 2, Some("network error".into())))
         );
     }
 
@@ -1023,7 +1273,7 @@ mod tests {
         mark_dead(&conn, id).unwrap();
         assert_eq!(
             row_state(&conn, id),
-            ("dead".into(), 5, Some("timeout".into()))
+            Some(("dead".into(), 5, Some("timeout".into())))
         );
         // Should no longer be in pending
         let pending = get_pending_ops(&conn, "acc1").unwrap();

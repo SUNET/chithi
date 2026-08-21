@@ -270,14 +270,25 @@ impl MailOpExecutor for JmapOpExecutor {
                         .await?;
                 }
             }
-            MailOp::SendRaw { raw_message, .. } => {
+            MailOp::SendRaw {
+                raw_message,
+                from,
+                to,
+                cc,
+                bcc,
+                ..
+            } => {
+                let envelope =
+                    crate::mail::jmap::JmapSubmissionEnvelope::new(&from, &to, &cc, &bcc)?;
                 let account = {
                     let conn = ctx.db.reader();
                     crate::db::accounts::get_account_full(&conn, account_id)?
                 }
                 .mail_config();
                 let (jmap_config, conn_jmap) = connect(ctx, &account).await?;
-                conn_jmap.send_email(&jmap_config, &raw_message).await?;
+                conn_jmap
+                    .send_email(&jmap_config, &raw_message, &envelope)
+                    .await?;
             }
             _ => {}
         }

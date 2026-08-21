@@ -504,6 +504,7 @@ export interface OutboxRow {
   account_id: string;
   action_type: string;
   status: "pending" | "sending" | "dead";
+  delivery_outcome_unknown: boolean;
   retry_count: number;
   error_message: string | null;
   subject: string | null;
