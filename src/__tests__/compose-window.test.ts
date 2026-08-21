@@ -184,9 +184,9 @@ describe("Draft resume address formatting", () => {
 
 describe("Compose dirty tracking", () => {
   function attachmentBaselineValue(
-    items: Array<{ path: string; name: string }>,
+    items: Array<{ token: string; name: string }>,
   ): string {
-    return JSON.stringify(items.map(({ path, name }) => ({ path, name })));
+    return JSON.stringify(items.map(({ token, name }) => ({ token, name })));
   }
 
   function isDirtyState(
@@ -196,7 +196,7 @@ describe("Compose dirty tracking", () => {
       bcc: string;
       subject: string;
       body: string;
-      attachments: Array<{ path: string; name: string }>;
+      attachments: Array<{ token: string; name: string }>;
     },
     baseline: {
       to: string;
@@ -204,7 +204,7 @@ describe("Compose dirty tracking", () => {
       bcc: string;
       subject: string;
       body: string;
-      attachments: Array<{ path: string; name: string }>;
+      attachments: Array<{ token: string; name: string }>;
     },
   ): boolean {
     return current.to !== baseline.to ||
@@ -247,7 +247,7 @@ describe("Compose dirty tracking", () => {
   it("adding attachment makes it dirty", () => {
     const initial = { to: "", cc: "", bcc: "", subject: "", body: "", attachments: [] };
     const current = { to: "", cc: "", bcc: "", subject: "", body: "",
-      attachments: [{ path: "/tmp/file.pdf", name: "file.pdf" }] };
+      attachments: [{ token: "token-1", name: "file.pdf" }] };
     const dirty = isDirtyState(current, initial);
     expect(dirty).toBe(true);
   });
@@ -273,7 +273,7 @@ describe("Compose dirty tracking", () => {
       bcc: "",
       subject: "Draft subject",
       body: "Draft body",
-      attachments: [{ path: "/tmp/file.pdf", name: "file.pdf" }],
+      attachments: [{ token: "token-1", name: "file.pdf" }],
     };
 
     expect(isDirtyState(savedState, savedState)).toBe(false);

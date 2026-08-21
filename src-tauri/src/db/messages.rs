@@ -360,20 +360,6 @@ pub fn get_message_metadata(
     })
 }
 
-pub fn message_exists(
-    conn: &Connection,
-    account_id: &str,
-    folder_path: &str,
-    uid: u32,
-) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
-        params![account_id, folder_path, uid],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
 /// Load all UIDs for a folder into a HashSet for fast batch existence checks.
 pub fn get_existing_uids(
     conn: &Connection,

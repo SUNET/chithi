@@ -65,28 +65,6 @@ pub fn insert_contact_book(conn: &Connection, book: &ContactBook) -> Result<()> 
     Ok(())
 }
 
-pub fn get_or_create_collected_book(conn: &Connection, account_id: &str) -> Result<String> {
-    // Check if a "Collected Contacts" book already exists
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM contact_books WHERE account_id = ?1 AND sync_type = 'local' AND name = 'Collected Contacts'",
-            params![account_id],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO contact_books (id, account_id, name, sync_type) VALUES (?1, ?2, 'Collected Contacts', 'local')",
-        params![id, account_id],
-    )?;
-    Ok(id)
-}
-
 // ---------------------------------------------------------------------------
 // Contacts CRUD
 // ---------------------------------------------------------------------------
@@ -177,26 +155,6 @@ pub fn update_contact(conn: &Connection, contact: &Contact) -> Result<()> {
 pub fn delete_contact(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM contacts WHERE id = ?1", params![id])?;
     Ok(())
-}
-
-pub fn search_contacts(conn: &Connection, account_id: &str, query: &str) -> Result<Vec<Contact>> {
-    let pattern = format!("%{}%", query);
-    let mut stmt = conn.prepare(
-        "SELECT c.id, c.book_id, c.uid, c.display_name, c.emails_json, c.phones_json,
-                c.addresses_json, c.organization, c.title, c.notes, c.vcard_data,
-                c.remote_id, c.etag
-         FROM contacts c
-         JOIN contact_books cb ON c.book_id = cb.id
-         WHERE cb.account_id = ?1
-           AND (c.display_name LIKE ?2 OR c.emails_json LIKE ?2
-                OR c.phones_json LIKE ?2 OR c.organization LIKE ?2)
-         ORDER BY c.display_name
-         LIMIT 50",
-    )?;
-    let rows = stmt
-        .query_map(params![account_id, pattern], map_contact_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
 }
 
 /// Search contacts across ALL accounts for compose autocomplete.
@@ -396,14 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_create_collected_book() {
-        let conn = setup_db();
-        let id1 = get_or_create_collected_book(&conn, "acc1").unwrap();
-        let id2 = get_or_create_collected_book(&conn, "acc1").unwrap();
-        assert_eq!(id1, id2, "Should return same book on second call");
-    }
-
-    #[test]
     fn test_contact_crud() {
         let conn = setup_db();
         let book = ContactBook {
@@ -433,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_contacts() {
+    fn test_search_all_contacts() {
         let conn = setup_db();
         let book = ContactBook {
             id: "book1".to_string(),
@@ -447,9 +397,6 @@ mod tests {
         insert_contact(&conn, &make_contact("c1", "Alice Smith", "book1")).unwrap();
         insert_contact(&conn, &make_contact("c2", "Bob Jones", "book1")).unwrap();
         insert_contact(&conn, &make_contact("c3", "Carol Alice", "book1")).unwrap();
-
-        let results = search_contacts(&conn, "acc1", "alice").unwrap();
-        assert_eq!(results.len(), 2); // Alice Smith and Carol Alice
 
         let results = search_all_contacts(&conn, "bob").unwrap();
         assert_eq!(results.len(), 1);

@@ -30,11 +30,9 @@ pub struct ContactBackendCtx<'a> {
     pub providers: &'a ProviderServices,
 }
 
-/// The book coordinates a push needs: the local book id plus the
-/// book's remote handle (CardDAV collection href / JMAP address-book
-/// id). Providers with a single implicit book ignore it.
+/// The book's remote handle (CardDAV collection href / JMAP
+/// address-book id). Providers with a single implicit book ignore it.
 pub struct BookRef<'a> {
-    pub book_id: &'a str,
     pub remote_id: Option<&'a str>,
 }
 
@@ -168,7 +166,6 @@ mod contract_tests {
     #[tokio::test]
     async fn jmap_defers_contact_creation_to_sync() {
         let book = BookRef {
-            book_id: "b1",
             remote_id: Some("ab1"),
         };
         let (_dir, db) = temp_pool();
@@ -188,10 +185,7 @@ mod contract_tests {
     /// the create is deferred instead of erroring.
     #[tokio::test]
     async fn carddav_create_without_collection_href_is_deferred() {
-        let book = BookRef {
-            book_id: "b1",
-            remote_id: None,
-        };
+        let book = BookRef { remote_id: None };
         let (_dir, db) = temp_pool();
         let providers = providers();
         let ctx = ContactBackendCtx {

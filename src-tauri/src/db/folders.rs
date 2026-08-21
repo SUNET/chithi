@@ -275,20 +275,6 @@ pub fn update_uid_state(
     Ok(())
 }
 
-/// Update the stored uid_next after a successful folder sync.
-pub fn update_uid_next(
-    conn: &Connection,
-    account_id: &str,
-    path: &str,
-    uid_next: u32,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE folders SET uid_next = ?1 WHERE account_id = ?2 AND path = ?3",
-        params![uid_next, account_id, path],
-    )?;
-    Ok(())
-}
-
 pub fn get_last_seen_uid(conn: &Connection, account_id: &str, path: &str) -> Result<u32> {
     let uid: u32 = conn
         .query_row(

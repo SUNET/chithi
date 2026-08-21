@@ -105,7 +105,6 @@ pub async fn create_contact(
                 db::accounts::get_account_full(&conn, &account_id)?
             };
             let book_ref = crate::backend::contacts::BookRef {
-                book_id: &c.book_id,
                 remote_id: book_remote_id.as_deref(),
             };
             match backend
@@ -169,7 +168,6 @@ pub async fn update_contact(state: State<'_, AppState>, contact: Contact) -> Res
                         db::accounts::get_account_full(&conn, &account_id)?
                     };
                     let book_ref = crate::backend::contacts::BookRef {
-                        book_id: &contact.book_id,
                         remote_id: book_remote_id.as_deref(),
                     };
                     match backend

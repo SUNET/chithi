@@ -448,7 +448,6 @@ export interface DraftSaveOutcome {
 export interface ComposeAttachment {
   token: string;
   name: string;
-  size?: number;
 }
 
 // Contacts types

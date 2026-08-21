@@ -220,7 +220,7 @@ export async function saveDraft(
  * when composing a message.
  */
 export async function pickAttachments(): Promise<
-  Array<{ token: string; name: string; size: number }>
+  Array<{ token: string; name: string }>
 > {
   return invoke("pick_attachments");
 }

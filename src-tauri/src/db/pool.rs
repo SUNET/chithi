@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::Connection;
@@ -29,8 +29,6 @@ pub struct DbPool {
     writer: tokio::sync::Mutex<Connection>,
     readers: Vec<std::sync::Mutex<Connection>>,
     next_reader: AtomicUsize,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl DbPool {
@@ -45,7 +43,6 @@ impl DbPool {
             writer: tokio::sync::Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
-            db_path: db_path.to_path_buf(),
         })
     }
 
@@ -102,6 +99,7 @@ fn open_reader(db_path: &Path) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn temp_db_path() -> PathBuf {

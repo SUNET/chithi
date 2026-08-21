@@ -17,9 +17,6 @@ pub enum Error {
     #[error("Account not found: {0}")]
     AccountNotFound(String),
 
-    #[error("Folder not found: {0}")]
-    FolderNotFound(String),
-
     #[error("Message not found: {0}")]
     MessageNotFound(String),
 

@@ -96,6 +96,7 @@ for (uid, new_flags) in uid_flags {
 ### Files changed
 - `src-tauri/src/mail/imap.rs` — `select_folder` returns `(exists, uid_validity, uid_next)`
 - `src-tauri/src/mail/sync.rs` — preflight check in `sync_folder_envelopes`, store `uid_next` after sync
-- `src-tauri/src/db/folders.rs` — `get_folder_sync_state`, `update_uid_next` functions
+- `src-tauri/src/db/folders.rs` — `get_folder_sync_state`, `update_uid_next`
+  (later superseded by `update_uid_state` to update UIDVALIDITY atomically)
 - `src-tauri/src/db/messages.rs` — `sync_flags_by_uid` rewritten to bulk query + HashMap
 - `src-tauri/src/db/schema.rs` — `uid_next` column in CREATE TABLE + ALTER TABLE migration
