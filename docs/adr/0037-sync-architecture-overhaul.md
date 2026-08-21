@@ -62,7 +62,7 @@ JMAP and Graph operations continue to use ad-hoc async HTTP calls since they don
 
 Failed network operations are persisted to the existing `outbox` DB table and automatically replayed after the next successful sync.
 
-- **Replay order** (matching Thunderbird's `nsImapOfflineSync`): flags -> moves -> copies -> deletes
+- **Replay order** (matching operation dependencies): flags -> copies -> moves -> deletes -> sends
 - **Retry limit**: Operations that fail 5 times are marked `dead` and surfaced via `offline-queue-changed` event
 - **Serialization**: `MailOp` round-trips to/from JSON for DB storage
 
@@ -104,7 +104,6 @@ Contact sync was manual-only. Now runs on a 30-minute interval (matching Thunder
 
 - **Worker reconnect backoff**: Consecutive IMAP connection failures trigger exponential backoff (1s, 2s, 4s... max 60s) to avoid burning OAuth token refresh rate limits
 - **Worker init failure**: If a worker fails to initialize (e.g., account deleted), it emits an `op-failed` event before exiting so the UI can surface the error
-- **SyncAll coalescing**: When multiple sync requests are batched, the LAST `current_folder` value is kept (matching the user's most recent navigation)
 - **Background send persistence**: Outgoing emails are saved to the outbox table before the background SMTP/JMAP task runs, surviving app crashes during send
 
 ### Module structure

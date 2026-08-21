@@ -36,7 +36,7 @@ security.
 - [x] IMAP IDLE for near-instant INBOX push notifications (thread-per-account, exponential backoff reconnect)
 - [x] JMAP EventSource (SSE) for real-time push notifications (async task-per-account, anti-proxy-buffering headers)
 - [x] Sync progress and error events shown in status bar
-- [ ] Offline outbox queue (table exists, UI/logic not wired)
+- [x] Offline outbox queue with automatic replay and send-status UI
 
 ### Reading
 - [x] Plain text display by default (privacy-first)
@@ -97,7 +97,7 @@ security.
 - [x] CalDAV calendar discovery and event sync
 - [x] Meeting invite detection from email (`text/calendar` MIME parts)
 - [x] Accept / Maybe / Decline invite responses (sends iTIP REPLY via SMTP)
-- [x] Invite reply auto-processing (updates attendee status on organizer's calendar)
+- [x] Invite reply processing on email open (updates attendee status on organizer's calendar)
 - [x] Multi-day events display in all-day banner
 - [x] Local timezone display
 - [ ] CalDAV event push (only polling)

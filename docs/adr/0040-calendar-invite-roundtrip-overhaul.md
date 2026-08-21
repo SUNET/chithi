@@ -112,12 +112,12 @@ Event detail dialog shows the calendar name (with color dot) and account email, 
 - Overlapping events visible side-by-side
 
 ### Negative
-- `auto_process_calendar_emails` during sync requires body prefetch (not yet implemented — envelope-only sync doesn't fetch bodies). Currently invite processing happens on email open. The function batches all DB writes into a single writer acquisition to avoid blocking the async runtime.
+- Invite reply and cancellation processing currently happens when the corresponding email is opened; sync-time processing is not wired.
 - `respond_to_invite` timezone handling for the local event copy still uses the raw iCal DTSTART without full timezone normalization. The Google-synced copy has correct timezone; the local copy may show wrong time until sync replaces it.
-- Auto-processing CANCEL emails verifies that the CANCEL organizer email matches the event's organizer before deleting. Mismatches are logged and skipped to prevent spoofed cancellations.
+- CANCEL processing verifies that the CANCEL organizer email matches the event's organizer before deleting. Mismatches are logged and skipped to prevent spoofed cancellations.
 
 ### Files changed
-- `src-tauri/src/commands/calendar.rs` — bulk of changes (respond_to_invite, process_invite_reply, send_invites, create_event, sync_calendars_google, process_cancelled_invite, auto_process_calendar_emails, get_smtp_credentials)
+- `src-tauri/src/commands/calendar.rs` — bulk of changes (respond_to_invite, process_invite_reply, send_invites, create_event, sync_calendars_google, process_cancelled_invite, get_smtp_credentials)
 - `src-tauri/src/calendar/ical.rs` — CRLF + line folding normalization
 - `src-tauri/src/mail/graph.rs` — find_event_by_ical_uid, create_event returns iCalUId
 - `src-tauri/src/commands/compose.rs` — background send with events

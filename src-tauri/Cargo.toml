@@ -7,6 +7,9 @@ edition = "2021"
 name = "chithi_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[lints.rust]
+dead_code = "deny"
+
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-notification = "2"

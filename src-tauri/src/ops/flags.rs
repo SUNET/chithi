@@ -50,14 +50,8 @@ impl FlagTarget {
         }
     }
 
-    pub fn message_refs(&self) -> Option<&[BackendMessageRef]> {
-        match self {
-            Self::Messages(message_refs) => Some(message_refs),
-            Self::AllMessagesInFolders { .. } => None,
-        }
-    }
-
-    pub fn message_refs_mut(&mut self) -> Option<&mut Vec<BackendMessageRef>> {
+    #[cfg(test)]
+    pub(super) fn message_refs(&self) -> Option<&[BackendMessageRef]> {
         match self {
             Self::Messages(message_refs) => Some(message_refs),
             Self::AllMessagesInFolders { .. } => None,

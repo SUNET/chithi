@@ -5,8 +5,6 @@ use crate::message::BackendMessageRef;
 #[derive(Debug, PartialEq, Eq)]
 pub enum MailOp {
     // --- Sync (lower priority) ---
-    /// Full account sync. The worker delegates to the existing sync engine.
-    SyncAll { current_folder: Option<String> },
     /// Sync a single folder.
     SyncFolder { folder_path: String },
     /// Replay queued offline operations after a successful direct sync.
@@ -52,7 +50,7 @@ impl MailOp {
     /// this is the shared classification for callers that only need
     /// the boolean.
     pub fn is_sync(&self) -> bool {
-        matches!(self, MailOp::SyncAll { .. } | MailOp::SyncFolder { .. })
+        matches!(self, MailOp::SyncFolder { .. })
     }
 
     /// Whether replaying the complete operation after an execution failure is

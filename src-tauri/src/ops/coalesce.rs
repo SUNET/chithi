@@ -8,7 +8,6 @@ use super::queue::{MailOp, OpEntry};
 /// - Multiple `MoveMessages` to the same target are merged.
 /// - `CopyMessages` remain separate because copying is not idempotent.
 /// - Adjacent `SetFlags` with the same flags+add value are merged.
-/// - Sync operations are deduplicated (only one SyncAll kept).
 pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
     if ops.is_empty() {
         return ops;
@@ -100,13 +99,6 @@ pub fn coalesce(mut ops: Vec<OpEntry>) -> Vec<OpEntry> {
                 }
                 result.push(OpEntry {
                     op: MailOp::SetFlags { mutations },
-                    priority: entry.priority,
-                });
-            }
-            MailOp::SyncAll { current_folder } => {
-                result.retain(|pending| !matches!(pending.op, MailOp::SyncAll { .. }));
-                result.push(OpEntry {
-                    op: MailOp::SyncAll { current_folder },
                     priority: entry.priority,
                 });
             }
@@ -251,44 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_dedup_sync_all() {
+    fn user_ops_before_background_ops() {
         let ops = vec![
             OpEntry {
-                op: MailOp::SyncAll {
-                    current_folder: Some("INBOX".into()),
-                },
-                priority: OpPriority::Sync,
-            },
-            OpEntry {
-                op: MailOp::SyncAll {
-                    current_folder: Some("Sent".into()),
-                },
-                priority: OpPriority::Sync,
-            },
-        ];
-
-        let result = coalesce(ops);
-        let syncs: Vec<_> = result
-            .iter()
-            .filter(|e| matches!(e.op, MailOp::SyncAll { .. }))
-            .collect();
-        assert_eq!(syncs.len(), 1);
-        // Should keep the LAST current_folder value
-        match &syncs[0].op {
-            MailOp::SyncAll { current_folder } => {
-                assert_eq!(current_folder.as_deref(), Some("Sent"));
-            }
-            _ => panic!("Expected SyncAll"),
-        }
-    }
-
-    #[test]
-    fn user_ops_before_sync() {
-        let ops = vec![
-            OpEntry {
-                op: MailOp::SyncAll {
-                    current_folder: None,
-                },
+                op: MailOp::ReplayOffline,
                 priority: OpPriority::Sync,
             },
             OpEntry {
