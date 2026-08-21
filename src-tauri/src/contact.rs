@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod reconcile;
+
 /// Provider-neutral contact shared by persistence and backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {

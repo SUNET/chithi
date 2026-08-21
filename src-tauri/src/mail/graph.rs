@@ -136,7 +136,7 @@ fn join_url(root: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod endpoint_tests {
-    use super::{GraphClient, GraphEndpoints};
+    use super::{parse_graph_contact, GraphClient, GraphEndpoints};
     use reqwest::header::{HeaderMap, HeaderValue};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -166,6 +166,108 @@ mod endpoint_tests {
             String::from_utf8(bytes).unwrap()
         });
         (root, request)
+    }
+
+    struct TestResponse {
+        status: u16,
+        retry_after: Option<&'static str>,
+        body: String,
+    }
+
+    impl TestResponse {
+        fn ok(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                retry_after: None,
+                body: body.into(),
+            }
+        }
+    }
+
+    async fn serve_responses(
+        build_responses: impl FnOnce(&str) -> Vec<TestResponse>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/injected", listener.local_addr().unwrap());
+        let responses = build_responses(&root);
+        let requests = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let reason = match response.status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    429 => "Too Many Requests",
+                    503 => "Service Unavailable",
+                    504 => "Gateway Timeout",
+                    _ => "Test Response",
+                };
+                let retry_after = response
+                    .retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let wire_response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    reason,
+                    retry_after,
+                    response.body.len(),
+                    response.body
+                );
+                socket.write_all(wire_response.as_bytes()).await.unwrap();
+                requests.push(String::from_utf8(bytes).unwrap());
+            }
+            requests
+        });
+        (root, requests)
+    }
+
+    async fn serve_many(
+        build_bodies: impl FnOnce(&str) -> Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_responses(|root| {
+            build_bodies(root)
+                .into_iter()
+                .map(TestResponse::ok)
+                .collect()
+        })
+        .await
+    }
+
+    fn test_client(root: &str) -> GraphClient {
+        GraphClient::with_client(
+            reqwest::Client::new(),
+            "test-access-token",
+            GraphEndpoints::new(root, "http://127.0.0.1:1/unused-beta"),
+        )
+    }
+
+    fn complete_contact(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "displayName": format!("Contact {id}"),
+            "emailAddresses": [{
+                "address": format!("{id}@example.org"),
+                "name": format!("Email {id}"),
+            }],
+            "mobilePhone": "+46000000001",
+            "businessPhones": ["+46000000002"],
+            "homePhones": ["+46000000003"],
+            "companyName": "Example Org",
+            "jobTitle": "Engineer",
+        })
     }
 
     #[test]
@@ -238,6 +340,325 @@ mod endpoint_tests {
         assert!(headers.contains("authorization: bearer test-access-token\r\n"));
         assert!(headers.contains("x-injected-client: graph-test\r\n"));
         assert!(headers.contains("prefer: outlook.timezone=\"utc\"\r\n"));
+    }
+
+    #[tokio::test]
+    async fn contacts_reject_missing_or_non_array_value() {
+        for body in [r#"{}"#, r#"{"value":{}}"#] {
+            let (root, captured) = serve_once(body).await;
+            let error = test_client(&root).list_contacts().await.unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("contacts response `value` must be an array"));
+            captured.await.unwrap();
+        }
+
+        let (root, captured) = serve_many(|root| {
+            vec![
+                format!(r#"{{"value":[],"@odata.nextLink":"{root}/page-2"}}"#),
+                r#"{"notValue":[]}"#.into(),
+            ]
+        })
+        .await;
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("contacts response `value` must be an array"));
+        assert_eq!(captured.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn contacts_reject_non_string_next_link() {
+        let (root, captured) = serve_once(r#"{"value":[],"@odata.nextLink":42}"#).await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("contacts response `@odata.nextLink` must be a string"));
+        captured.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contacts_accept_null_next_link() {
+        let (root, captured) = serve_once(r#"{"value":[],"@odata.nextLink":null}"#).await;
+
+        let contacts = test_client(&root).list_contacts().await.unwrap();
+
+        assert!(contacts.is_empty());
+        captured.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_contact_rejects_missing_or_blank_id() {
+        for body in [r#"{}"#, r#"{"id":null}"#, r#"{"id":"   "}"#] {
+            let (root, captured) = serve_once(body).await;
+
+            let error = test_client(&root)
+                .create_contact(&serde_json::json!({"displayName": "Ada"}))
+                .await
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("create-contact response `id` must be non-empty"));
+            let request = captured.await.unwrap();
+            assert!(request.starts_with("POST /injected/me/contacts "));
+        }
+    }
+
+    #[test]
+    fn contacts_reject_each_omitted_owned_field() {
+        for field in [
+            "id",
+            "displayName",
+            "emailAddresses",
+            "mobilePhone",
+            "businessPhones",
+            "homePhones",
+            "companyName",
+            "jobTitle",
+        ] {
+            let mut contact = complete_contact("one");
+            contact.as_object_mut().unwrap().remove(field);
+
+            let error = parse_graph_contact(&contact).unwrap_err();
+
+            assert!(
+                error.to_string().contains(&format!("`{field}` is missing")),
+                "unexpected error for omitted {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn contacts_reject_malformed_item_shapes() {
+        let mut malformed = vec![serde_json::json!(42)];
+        for (field, value) in [
+            ("id", serde_json::json!(42)),
+            ("displayName", serde_json::json!(42)),
+            ("mobilePhone", serde_json::json!({})),
+            ("companyName", serde_json::json!(false)),
+            ("jobTitle", serde_json::json!([])),
+            ("emailAddresses", serde_json::json!({})),
+            ("emailAddresses", serde_json::json!([42])),
+            ("emailAddresses", serde_json::json!([{}])),
+            ("emailAddresses", serde_json::json!([{"address": 42}])),
+            (
+                "emailAddresses",
+                serde_json::json!([{"address": "one@example.org", "name": 42}]),
+            ),
+            ("businessPhones", serde_json::json!({})),
+            ("businessPhones", serde_json::json!([42])),
+            ("homePhones", serde_json::json!([{}])),
+        ] {
+            let mut contact = complete_contact("one");
+            contact[field] = value;
+            malformed.push(contact);
+        }
+
+        for contact in malformed {
+            let error = parse_graph_contact(&contact).unwrap_err();
+            assert!(
+                error.to_string().contains("Graph contact"),
+                "unexpected error for {contact}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn contacts_reject_blank_ids() {
+        for id in ["", "   "] {
+            let mut contact = complete_contact("one");
+            contact["id"] = serde_json::json!(id);
+            let error = parse_graph_contact(&contact).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("`id` must be a non-empty string"));
+        }
+    }
+
+    #[test]
+    fn contacts_accept_null_owned_values() {
+        let contact = serde_json::json!({
+            "id": "one",
+            "displayName": null,
+            "emailAddresses": null,
+            "mobilePhone": null,
+            "businessPhones": null,
+            "homePhones": null,
+            "companyName": null,
+            "jobTitle": null,
+        });
+
+        let contact = parse_graph_contact(&contact).unwrap();
+
+        assert_eq!(contact.display_name, "");
+        assert_eq!(contact.emails_json, "[]");
+        assert_eq!(contact.phones_json, "[]");
+        assert!(contact.organization.is_none());
+        assert!(contact.title.is_none());
+    }
+
+    #[tokio::test]
+    async fn contacts_fail_the_fetch_when_any_item_is_incomplete() {
+        let (root, captured) = serve_many(|_| {
+            let mut incomplete = complete_contact("two");
+            incomplete.as_object_mut().unwrap().remove("jobTitle");
+            vec![serde_json::json!({
+                "value": [complete_contact("one"), incomplete],
+            })
+            .to_string()]
+        })
+        .await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error.to_string().contains("`jobTitle` is missing"));
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn contacts_follow_all_pages_with_authentication() {
+        let (root, captured) = serve_many(|root| {
+            vec![
+                serde_json::json!({
+                    "value": [complete_contact("one")],
+                    "@odata.nextLink": format!("{root}/page-2"),
+                })
+                .to_string(),
+                serde_json::json!({"value": [complete_contact("two")] }).to_string(),
+            ]
+        })
+        .await;
+
+        let contacts = test_client(&root).list_contacts().await.unwrap();
+
+        assert_eq!(
+            contacts
+                .iter()
+                .map(|contact| contact.id.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /injected/me/contacts?"));
+        assert!(requests[1].starts_with("GET /injected/page-2 "));
+        assert!(requests.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-access-token\r\n")));
+    }
+
+    #[tokio::test]
+    async fn contacts_reject_cross_origin_next_link_without_requesting_it() {
+        let (foreign_root, mut foreign_request) = serve_once(r#"{"value":[]}"#).await;
+        let (root, captured) = serve_many(move |_| {
+            vec![serde_json::json!({
+                "value": [],
+                "@odata.nextLink": format!("{foreign_root}/contacts"),
+            })
+            .to_string()]
+        })
+        .await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error.to_string().contains("untrusted origin"));
+        assert_eq!(captured.await.unwrap().len(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut foreign_request)
+                .await
+                .is_err(),
+            "cross-origin server received a request"
+        );
+        foreign_request.abort();
+    }
+
+    #[tokio::test]
+    async fn contacts_reject_credentialed_next_link() {
+        let (root, captured) = serve_many(|root| {
+            let credentialed = root.replacen("http://", "http://user:pass@", 1);
+            vec![serde_json::json!({
+                "value": [],
+                "@odata.nextLink": format!("{credentialed}/contacts"),
+            })
+            .to_string()]
+        })
+        .await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error.to_string().contains("must not contain credentials"));
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn contacts_retry_later_page_throttles_and_transient_errors() {
+        for status in [429, 503, 504] {
+            let (root, captured) = serve_responses(|root| {
+                vec![
+                    TestResponse::ok(
+                        serde_json::json!({
+                            "value": [complete_contact("one")],
+                            "@odata.nextLink": format!("{root}/page-2"),
+                        })
+                        .to_string(),
+                    ),
+                    TestResponse {
+                        status,
+                        retry_after: Some("0"),
+                        body: r#"{"error":"retry later"}"#.into(),
+                    },
+                    TestResponse::ok(
+                        serde_json::json!({"value": [complete_contact("two")] }).to_string(),
+                    ),
+                ]
+            })
+            .await;
+
+            let contacts = test_client(&root).list_contacts().await.unwrap();
+
+            assert_eq!(contacts.len(), 2, "status {status}");
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 3, "status {status}");
+            assert!(requests[1].starts_with("GET /injected/page-2 "));
+            assert!(requests[2].starts_with("GET /injected/page-2 "));
+            assert!(requests.iter().all(|request| request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-access-token\r\n")));
+        }
+    }
+
+    #[tokio::test]
+    async fn contacts_keep_later_page_status_and_body_errors() {
+        let (root, captured) = serve_responses(|root| {
+            vec![
+                TestResponse::ok(
+                    serde_json::json!({
+                        "value": [],
+                        "@odata.nextLink": format!("{root}/page-2"),
+                    })
+                    .to_string(),
+                ),
+                TestResponse {
+                    status: 400,
+                    retry_after: None,
+                    body: r#"{"error":"bad continuation"}"#.into(),
+                },
+            ]
+        })
+        .await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("400 Bad Request"));
+        assert!(message.contains("bad continuation"));
+        assert_eq!(captured.await.unwrap().len(), 2);
     }
 }
 
@@ -441,9 +862,36 @@ impl GraphClient {
     /// GET an absolute Graph URL (used to follow `@odata.nextLink`,
     /// which Graph returns as a fully-qualified URL rather than a path).
     async fn get_absolute(&self, url: &str) -> Result<serde_json::Value> {
+        let url = reqwest::Url::parse(url)
+            .map_err(|error| Error::Other(format!("Invalid Graph continuation URL: {error}")))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::Other(
+                "Graph continuation URL must not contain credentials".into(),
+            ));
+        }
+
+        let mut trusted_origin = false;
+        for root in [&self.endpoints.v1_api_root, &self.endpoints.beta_api_root] {
+            let root = reqwest::Url::parse(root).map_err(|error| {
+                Error::Other(format!("Invalid configured Graph API root: {error}"))
+            })?;
+            if url.scheme() == root.scheme()
+                && url.host_str() == root.host_str()
+                && url.port_or_known_default() == root.port_or_known_default()
+            {
+                trusted_origin = true;
+                break;
+            }
+        }
+        if !trusted_origin {
+            return Err(Error::Other(format!(
+                "Refusing Graph continuation URL with untrusted origin: {url}"
+            )));
+        }
+
         let resp = self
             .send_with_retry(
-                || self.http.get(url).bearer_auth(&self.access_token),
+                || self.http.get(url.clone()).bearer_auth(&self.access_token),
                 "GET (absolute)",
                 true,
             )
@@ -1640,21 +2088,7 @@ impl GraphClient {
         let mut next_path: Option<String> = None;
         loop {
             let resp: serde_json::Value = match next_path.take() {
-                Some(path) => {
-                    let r = self.http
-                        .get(&path)
-                        .bearer_auth(&self.access_token)
-                        .send()
-                        .await
-                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
-                    let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
-                    if !status.is_success() {
-                        return Err(Error::Other(format!("Graph contacts returned {}: {}", status, truncate(&body, 500))));
-                    }
-                    serde_json::from_str(&body)
-                        .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
-                }
+                Some(path) => self.get_absolute(&path).await?,
                 None => {
                     self.get(
                         "/me/contacts",
@@ -1666,19 +2100,30 @@ impl GraphClient {
                     ).await?
                 }
             };
-            if let Some(items) = resp["value"].as_array() {
-                for c in items {
-                    contacts.push(parse_graph_contact(c));
-                }
+            let items = resp
+                .get("value")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Other("Graph contacts response `value` must be an array".into())
+                })?;
+            for contact in items {
+                contacts.push(parse_graph_contact(contact)?);
             }
-            let next_link = resp["@odata.nextLink"]
-                .as_str()
-                .map(|s: &str| s.to_string());
-            match next_link {
-                Some(next) => {
-                    next_path = Some(next);
+            match resp.get("@odata.nextLink") {
+                None | Some(serde_json::Value::Null) => break,
+                Some(serde_json::Value::String(next)) if !next.trim().is_empty() => {
+                    next_path = Some(next.clone());
                 }
-                None => break,
+                Some(serde_json::Value::String(_)) => {
+                    return Err(Error::Other(
+                        "Graph contacts response `@odata.nextLink` must not be empty".into(),
+                    ));
+                }
+                Some(_) => {
+                    return Err(Error::Other(
+                        "Graph contacts response `@odata.nextLink` must be a string or null".into(),
+                    ));
+                }
             }
         }
         Ok(contacts)
@@ -1687,7 +2132,14 @@ impl GraphClient {
     /// Create a contact.
     pub async fn create_contact(&self, contact: &serde_json::Value) -> Result<String> {
         let resp = self.post_json("/me/contacts", contact).await?;
-        Ok(resp["id"].as_str().unwrap_or("").to_string())
+        let id = resp
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Other("Graph create-contact response `id` must be non-empty".into())
+            })?;
+        Ok(id.to_string())
     }
 
     /// Update a contact.
@@ -2405,66 +2857,132 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
     }
 }
 
-fn parse_graph_contact(c: &serde_json::Value) -> GraphContact {
-    let display_name = c["displayName"].as_str().unwrap_or("").to_string();
-    let organization = c["companyName"]
-        .as_str()
+fn graph_contact_string<'a>(
+    contact: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<&'a str>> {
+    match contact.get(field) {
+        None => Err(Error::Other(format!(
+            "Graph contact field `{field}` is missing"
+        ))),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(Error::Other(format!(
+            "Graph contact field `{field}` must be a string or null"
+        ))),
+    }
+}
+
+fn graph_contact_array<'a>(
+    contact: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a [serde_json::Value]> {
+    match contact.get(field) {
+        None => Err(Error::Other(format!(
+            "Graph contact field `{field}` is missing"
+        ))),
+        Some(serde_json::Value::Null) => Ok(&[]),
+        Some(serde_json::Value::Array(values)) => Ok(values),
+        Some(_) => Err(Error::Other(format!(
+            "Graph contact field `{field}` must be an array or null"
+        ))),
+    }
+}
+
+fn parse_graph_contact(c: &serde_json::Value) -> Result<GraphContact> {
+    let contact = c
+        .as_object()
+        .ok_or_else(|| Error::Other("Graph contact item must be an object".into()))?;
+    let id = match contact.get("id") {
+        None => {
+            return Err(Error::Other("Graph contact field `id` is missing".into()));
+        }
+        Some(serde_json::Value::String(id)) if !id.trim().is_empty() => id.clone(),
+        _ => {
+            return Err(Error::Other(
+                "Graph contact field `id` must be a non-empty string".into(),
+            ));
+        }
+    };
+    let display_name = graph_contact_string(contact, "displayName")?
+        .unwrap_or("")
+        .to_string();
+    let organization = graph_contact_string(contact, "companyName")?
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let title = c["jobTitle"]
-        .as_str()
+    let title = graph_contact_string(contact, "jobTitle")?
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     // Parse emails — Graph's "name" field is a display label, not work/home.
     // Use index-based labeling: first = "work", rest = "other".
-    let emails: Vec<serde_json::Value> = c["emailAddresses"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .enumerate()
-                .filter_map(|(i, e)| {
-                    let addr = e["address"].as_str()?;
-                    if addr.is_empty() {
-                        return None;
-                    }
-                    let label = if i == 0 { "work" } else { "other" };
-                    Some(serde_json::json!({"email": addr, "label": label}))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".to_string());
+    let mut emails = Vec::new();
+    for (index, entry) in graph_contact_array(contact, "emailAddresses")?
+        .iter()
+        .enumerate()
+    {
+        let email = entry.as_object().ok_or_else(|| {
+            Error::Other(format!(
+                "Graph contact field `emailAddresses[{index}]` must be an object"
+            ))
+        })?;
+        let address = email
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Graph contact field `emailAddresses[{index}].address` must be a string"
+                ))
+            })?;
+        let name = match email.get("name") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(name)) => Some(name),
+            Some(_) => {
+                return Err(Error::Other(format!(
+                    "Graph contact field `emailAddresses[{index}].name` must be a string or null"
+                )));
+            }
+        };
+        if !address.is_empty() {
+            let label = if index == 0 { "work" } else { "other" };
+            let mut local_email = serde_json::json!({"email": address, "label": label});
+            if let Some(name) = name {
+                local_email["name"] = serde_json::json!(name);
+            }
+            emails.push(local_email);
+        }
+    }
+    let emails_json = serde_json::to_string(&emails)
+        .map_err(|error| Error::Other(format!("Graph contact email encoding failed: {error}")))?;
 
     // Parse phones: Graph has mobilePhone (string), businessPhones (array), homePhones (array)
     let mut phones: Vec<serde_json::Value> = Vec::new();
-    if let Some(mobile) = c["mobilePhone"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(mobile) = graph_contact_string(contact, "mobilePhone")?.filter(|s| !s.is_empty()) {
         phones.push(serde_json::json!({"number": mobile, "label": "mobile"}));
     }
-    if let Some(biz) = c["businessPhones"].as_array() {
-        for p in biz {
-            if let Some(num) = p.as_str().filter(|s| !s.is_empty()) {
-                phones.push(serde_json::json!({"number": num, "label": "work"}));
+    for (field, label) in [("businessPhones", "work"), ("homePhones", "home")] {
+        for (index, entry) in graph_contact_array(contact, field)?.iter().enumerate() {
+            let number = entry.as_str().ok_or_else(|| {
+                Error::Other(format!(
+                    "Graph contact field `{field}[{index}]` must be a string"
+                ))
+            })?;
+            if !number.is_empty() {
+                phones.push(serde_json::json!({"number": number, "label": label}));
             }
         }
     }
-    if let Some(home) = c["homePhones"].as_array() {
-        for p in home {
-            if let Some(num) = p.as_str().filter(|s| !s.is_empty()) {
-                phones.push(serde_json::json!({"number": num, "label": "home"}));
-            }
-        }
-    }
-    let phones_json = serde_json::to_string(&phones).unwrap_or_else(|_| "[]".to_string());
+    let phones_json = serde_json::to_string(&phones)
+        .map_err(|error| Error::Other(format!("Graph contact phone encoding failed: {error}")))?;
 
-    GraphContact {
-        id: c["id"].as_str().unwrap_or("").to_string(),
+    Ok(GraphContact {
+        id,
         display_name,
         emails_json,
         phones_json,
         organization,
         title,
-    }
+    })
 }
 
 /// Anchor hexes for the Microsoft `calendarColor` enum. Picked to
@@ -2614,54 +3132,93 @@ pub fn event_patch_to_graph_json(event: &crate::calendar::CalendarEvent) -> serd
 }
 
 /// Graph `contact` payload from our contact fields. Phones split into
-/// `mobilePhone` (first mobile-labelled number) and `businessPhones`
-/// (work-labelled numbers) because that is how Outlook models them.
+/// `mobilePhone` (first mobile-labelled number), `businessPhones`, and
+/// `homePhones` because that is how Outlook models them. Every owned field is
+/// emitted so an update can explicitly clear remote values.
 pub fn contact_to_graph_json(
     display_name: &str,
     emails_json: &str,
     phones_json: &str,
     organization: Option<&str>,
     title: Option<&str>,
-) -> serde_json::Value {
-    let mut gc = serde_json::json!({
+) -> Result<serde_json::Value> {
+    let emails: Vec<serde_json::Value> = serde_json::from_str(emails_json)
+        .map_err(|error| Error::Other(format!("Invalid local contact emails_json: {error}")))?;
+    let mut graph_emails = Vec::with_capacity(emails.len());
+    for (index, entry) in emails.iter().enumerate() {
+        let email = entry.as_object().ok_or_else(|| {
+            Error::Other(format!(
+                "Invalid local contact emails_json entry {index}: expected an object"
+            ))
+        })?;
+        let address = email
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Invalid local contact emails_json entry {index}: `email` must be a string"
+                ))
+            })?;
+        let mut graph_email = serde_json::json!({"address": address});
+        match email.get("name") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(name)) => {
+                graph_email["name"] = serde_json::json!(name);
+            }
+            Some(_) => {
+                return Err(Error::Other(format!(
+                    "Invalid local contact emails_json entry {index}: `name` must be a string or null"
+                )));
+            }
+        }
+        graph_emails.push(graph_email);
+    }
+
+    let phones: Vec<serde_json::Value> = serde_json::from_str(phones_json)
+        .map_err(|error| Error::Other(format!("Invalid local contact phones_json: {error}")))?;
+    let mut mobile_phone = None;
+    let mut business_phones = Vec::new();
+    let mut home_phones = Vec::new();
+    for (index, entry) in phones.iter().enumerate() {
+        let phone = entry.as_object().ok_or_else(|| {
+            Error::Other(format!(
+                "Invalid local contact phones_json entry {index}: expected an object"
+            ))
+        })?;
+        let number = phone
+            .get("number")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "Invalid local contact phones_json entry {index}: `number` must be a string"
+                ))
+            })?;
+        let label = match phone.get("label") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(label)) => Some(label.as_str()),
+            Some(_) => {
+                return Err(Error::Other(format!(
+                    "Invalid local contact phones_json entry {index}: `label` must be a string or null"
+                )));
+            }
+        };
+        match label {
+            Some("mobile") if mobile_phone.is_none() => mobile_phone = Some(number),
+            Some("work") => business_phones.push(number),
+            Some("home") => home_phones.push(number),
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::json!({
         "displayName": display_name,
-    });
-    if let Ok(emails) = serde_json::from_str::<Vec<serde_json::Value>>(emails_json) {
-        let ge: Vec<_> = emails
-            .iter()
-            .filter_map(|e| {
-                e["email"]
-                    .as_str()
-                    .map(|addr| serde_json::json!({"address": addr, "name": ""}))
-            })
-            .collect();
-        if !ge.is_empty() {
-            gc["emailAddresses"] = serde_json::json!(ge);
-        }
-    }
-    if let Ok(phones) = serde_json::from_str::<Vec<serde_json::Value>>(phones_json) {
-        let mobile = phones
-            .iter()
-            .find(|p| p["label"].as_str() == Some("mobile"));
-        if let Some(m) = mobile.and_then(|p| p["number"].as_str()) {
-            gc["mobilePhone"] = serde_json::json!(m);
-        }
-        let biz: Vec<&str> = phones
-            .iter()
-            .filter(|p| p["label"].as_str() == Some("work"))
-            .filter_map(|p| p["number"].as_str())
-            .collect();
-        if !biz.is_empty() {
-            gc["businessPhones"] = serde_json::json!(biz);
-        }
-    }
-    if let Some(org) = organization {
-        gc["companyName"] = serde_json::json!(org);
-    }
-    if let Some(t) = title {
-        gc["jobTitle"] = serde_json::json!(t);
-    }
-    gc
+        "emailAddresses": graph_emails,
+        "mobilePhone": mobile_phone,
+        "businessPhones": business_phones,
+        "homePhones": home_phones,
+        "companyName": organization,
+        "jobTitle": title,
+    }))
 }
 
 #[cfg(test)]
@@ -3215,7 +3772,9 @@ mod color_tests {
 
 #[cfg(test)]
 mod builder_tests {
-    use super::{contact_to_graph_json, event_patch_to_graph_json, event_to_graph_json};
+    use super::{
+        contact_to_graph_json, event_patch_to_graph_json, event_to_graph_json, parse_graph_contact,
+    };
     use crate::calendar::CalendarEvent;
 
     fn event(all_day: bool, attendees_json: Option<&str>) -> CalendarEvent {
@@ -3275,7 +3834,8 @@ mod builder_tests {
             r#"[{"number":"+4670","label":"mobile"},{"number":"+4608","label":"work"}]"#,
             Some("Analytical Engines"),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(v["mobilePhone"], "+4670");
         assert_eq!(v["businessPhones"][0], "+4608");
         assert_eq!(v["companyName"], "Analytical Engines");
@@ -3285,10 +3845,112 @@ mod builder_tests {
 
     #[test]
     fn contact_handles_malformed_json() {
-        let v = contact_to_graph_json("X", "not json", "not json", None, None);
-        assert!(v["emailAddresses"].is_null());
-        assert!(v["mobilePhone"].is_null());
-        assert!(v["businessPhones"].is_null());
+        for (emails, phones, field) in [
+            ("not json", "[]", "emails_json"),
+            ("[]", "not json", "phones_json"),
+            (r#"[{"email":42}]"#, "[]", "emails_json"),
+            (
+                r#"[{"email":"x@example.org","name":42}]"#,
+                "[]",
+                "emails_json",
+            ),
+            ("[]", r#"[{"number":42,"label":"work"}]"#, "phones_json"),
+        ] {
+            let error = contact_to_graph_json("X", emails, phones, None, None).unwrap_err();
+            assert!(
+                error.to_string().contains(field),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn contact_includes_explicit_clears() {
+        let value = contact_to_graph_json("X", "[]", "[]", None, None).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "displayName": "X",
+                "emailAddresses": [],
+                "mobilePhone": null,
+                "businessPhones": [],
+                "homePhones": [],
+                "companyName": null,
+                "jobTitle": null,
+            })
+        );
+    }
+
+    #[test]
+    fn contact_emits_home_phones() {
+        let value = contact_to_graph_json(
+            "X",
+            "[]",
+            r#"[{"number":"+4611","label":"home"},{"number":"+4622","label":"home"}]"#,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(value["homePhones"], serde_json::json!(["+4611", "+4622"]));
+    }
+
+    #[test]
+    fn contact_email_name_round_trips() {
+        let graph_contact = serde_json::json!({
+            "id": "one",
+            "displayName": "Ada",
+            "emailAddresses": [
+                {
+                    "address": "ada@example.org",
+                    "name": "Ada Lovelace",
+                },
+                {
+                    "address": "ada.null@example.org",
+                    "name": null,
+                },
+                {
+                    "address": "ada.missing@example.org",
+                },
+            ],
+            "mobilePhone": null,
+            "businessPhones": [],
+            "homePhones": [],
+            "companyName": null,
+            "jobTitle": null,
+        });
+
+        let local = parse_graph_contact(&graph_contact).unwrap();
+        let local_emails: serde_json::Value = serde_json::from_str(&local.emails_json).unwrap();
+        let rebuilt = contact_to_graph_json(
+            &local.display_name,
+            &local.emails_json,
+            &local.phones_json,
+            local.organization.as_deref(),
+            local.title.as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(local_emails[0]["name"], "Ada Lovelace");
+        assert_eq!(rebuilt["emailAddresses"][0]["name"], "Ada Lovelace");
+        for index in [1, 2] {
+            assert!(local_emails[index].get("name").is_none());
+            assert!(rebuilt["emailAddresses"][index].get("name").is_none());
+        }
+    }
+
+    #[test]
+    fn contact_omits_email_name_when_absent() {
+        for emails_json in [
+            r#"[{"email":"ada@example.org"}]"#,
+            r#"[{"email":"ada@example.org","name":null}]"#,
+        ] {
+            let value = contact_to_graph_json("Ada", emails_json, "[]", None, None).unwrap();
+            let email = value["emailAddresses"][0].as_object().unwrap();
+
+            assert!(!email.contains_key("name"));
+        }
     }
 }
 
