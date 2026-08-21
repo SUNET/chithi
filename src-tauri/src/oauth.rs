@@ -18,7 +18,7 @@ pub struct OAuthProvider {
     pub token_url: &'static str,
     pub scopes: &'static [&'static str],
     /// Scope sent in the `authorization_code` -> token exchange request
-    /// (`exchange_code`), when the provider requires one.
+    /// ([`exchange_code_with_client`]), when the provider requires one.
     ///
     /// Microsoft's v2.0 token endpoint rejects a code redemption that
     /// omits `scope` with AADSTS70011 ("must include a 'scope' input
@@ -528,18 +528,11 @@ pub fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<
     Ok(CallbackResult { code, state })
 }
 
-/// Exchange an authorization code for access + refresh tokens.
-pub async fn exchange_code(
-    provider: &OAuthProvider,
-    code: &str,
-    port: u16,
-    code_verifier: Option<&str>,
-) -> Result<OAuthTokens> {
-    let client = reqwest::Client::new();
-    exchange_code_with_client(provider, code, port, code_verifier, &client).await
-}
-
-/// Exchange an authorization code using the provided HTTP client.
+/// Exchange an authorization code for access and refresh tokens using the
+/// provided HTTP client.
+///
+/// `code_verifier` must be the verifier paired with the authorization request.
+/// A non-empty provider client secret is sent in addition to the verifier.
 pub async fn exchange_code_with_client(
     provider: &OAuthProvider,
     code: &str,
@@ -654,16 +647,8 @@ pub async fn exchange_code_with_client(
     })
 }
 
-/// Refresh an expired access token using a refresh token.
-pub async fn refresh_access_token(
-    provider: &OAuthProvider,
-    refresh_token: &str,
-) -> Result<OAuthTokens> {
-    let client = reqwest::Client::new();
-    refresh_access_token_with_client(provider, refresh_token, &client).await
-}
-
-/// Refresh an expired access token using the provided HTTP client.
+/// Refresh an expired access token using a refresh token and the provided HTTP
+/// client.
 pub async fn refresh_access_token_with_client(
     provider: &OAuthProvider,
     refresh_token: &str,
@@ -754,18 +739,10 @@ pub async fn refresh_access_token_with_client(
     })
 }
 
-/// Refresh an access token with specific scopes (for multi-resource tokens like Microsoft).
-/// The same refresh token can get tokens for different resources by specifying different scopes.
-pub async fn refresh_with_scopes(
-    provider: &OAuthProvider,
-    refresh_token: &str,
-    scopes: &str,
-) -> Result<OAuthTokens> {
-    let client = reqwest::Client::new();
-    refresh_with_scopes_with_client(provider, refresh_token, scopes, &client).await
-}
-
 /// Refresh an access token with specific scopes using the provided HTTP client.
+///
+/// The same refresh token can obtain tokens for different resources by
+/// specifying different scopes, as required by providers such as Microsoft.
 pub async fn refresh_with_scopes_with_client(
     provider: &OAuthProvider,
     refresh_token: &str,
@@ -836,17 +813,11 @@ pub struct OidcEndpoints {
     pub registration_endpoint: Option<String>,
 }
 
-/// Discover OIDC endpoints from a JMAP server's .well-known/openid-configuration.
-/// `base_url` should be like "https://mail.example.com".
-pub async fn discover_oidc(base_url: &str) -> Result<OidcEndpoints> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client build error: {}", e)))?;
-    discover_oidc_with_client(base_url, &client).await
-}
-
-/// Discover OIDC endpoints using the provided HTTP client.
+/// Discover OIDC endpoints from a JMAP server's
+/// `.well-known/openid-configuration` using the provided HTTP client.
+///
+/// `base_url` should be like `https://mail.example.com`. Discovered token,
+/// device-authorization, and registration endpoints must use HTTPS.
 pub async fn discover_oidc_with_client(
     base_url: &str,
     client: &reqwest::Client,
@@ -928,17 +899,11 @@ pub async fn discover_oidc_with_client(
     })
 }
 
-/// Register a client dynamically via RFC 7591.
-/// Returns the assigned `client_id`.
-pub async fn register_oidc_client(registration_endpoint: &str) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
-    register_oidc_client_with_client(registration_endpoint, &client).await
-}
-
-/// Register an OIDC client using the provided HTTP client.
+/// Register a public OIDC client dynamically via RFC 7591 using the provided
+/// HTTP client.
+///
+/// Returns the assigned `client_id`. The registration requests device-code and
+/// refresh-token grants with no token-endpoint client authentication.
 pub async fn register_oidc_client_with_client(
     registration_endpoint: &str,
     client: &reqwest::Client,
@@ -1011,20 +976,10 @@ fn default_expires_in() -> u64 {
     600
 }
 
-/// Start the device authorization flow — POST to the device authorization endpoint.
-/// Returns the device code, user code, and verification URL to show to the user.
-pub async fn device_auth_start(
-    device_auth_endpoint: &str,
-    client_id: &str,
-) -> Result<DeviceAuthResponse> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
-    device_auth_start_with_client(device_auth_endpoint, client_id, &client).await
-}
-
-/// Start device authorization using the provided HTTP client.
+/// Start the RFC 8628 device authorization flow using the provided HTTP client.
+///
+/// Posts to the device authorization endpoint and returns the device code, user
+/// code, and verification URL to show to the user.
 pub async fn device_auth_start_with_client(
     device_auth_endpoint: &str,
     client_id: &str,
@@ -1082,31 +1037,12 @@ pub async fn device_auth_start_with_client(
     Ok(auth_resp)
 }
 
-/// Poll the token endpoint until the user completes device authorization.
-/// Returns tokens on success, or errors on expiry/denial.
-pub async fn device_auth_poll(
-    token_endpoint: &str,
-    device_code: &str,
-    interval: u64,
-    expires_in: u64,
-    client_id: &str,
-) -> Result<OAuthTokens> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
-    device_auth_poll_with_client(
-        token_endpoint,
-        device_code,
-        interval,
-        expires_in,
-        client_id,
-        &client,
-    )
-    .await
-}
-
-/// Poll for device authorization using the provided HTTP client.
+/// Poll the token endpoint with the provided HTTP client until the user
+/// completes RFC 8628 device authorization.
+///
+/// Returns tokens on success and errors on expiry or denial. Transient transport
+/// errors are retried until the device-code deadline, and `slow_down` responses
+/// increase the polling interval as required by RFC 8628.
 pub async fn device_auth_poll_with_client(
     token_endpoint: &str,
     device_code: &str,
@@ -1232,21 +1168,10 @@ pub async fn device_auth_poll_with_client(
     }
 }
 
-/// Refresh an access token using a dynamically discovered token endpoint.
-/// Used for JMAP OIDC where there is no static OAuthProvider.
-pub async fn refresh_token_dynamic(
-    token_url: &str,
-    refresh_token: &str,
-    client_id: &str,
-) -> Result<OAuthTokens> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Other(format!("HTTP client error: {}", e)))?;
-    refresh_token_dynamic_with_client(token_url, refresh_token, client_id, &client).await
-}
-
-/// Refresh a dynamic token endpoint using the provided HTTP client.
+/// Refresh an access token at a dynamically discovered token endpoint using the
+/// provided HTTP client.
+///
+/// Used for JMAP OIDC, where there is no static [`OAuthProvider`].
 pub async fn refresh_token_dynamic_with_client(
     token_url: &str,
     refresh_token: &str,

@@ -386,10 +386,6 @@ impl ZoomTokenLifecycleGuard<'_> {
             .delete_zoom_and_commit(self.account_id, commit)
     }
 
-    pub fn replace(&self, tokens: &OAuthTokens) -> Result<()> {
-        self.replace_and_commit(tokens, || Ok(()))
-    }
-
     pub fn replace_and_commit<F>(&self, tokens: &OAuthTokens, commit: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,
@@ -579,13 +575,6 @@ impl ProviderServices {
         ))
     }
 
-    pub async fn jmap_connection(
-        &self,
-        account: &AccountFull,
-    ) -> Result<crate::mail::jmap::JmapConnection> {
-        Ok(self.jmap_client(account).await?.1)
-    }
-
     pub async fn jmap_client(
         &self,
         account: &AccountFull,
@@ -644,13 +633,6 @@ impl ProviderCredentialService {
             endpoint,
             account_locks: Arc::new(ProviderAccountCoordinator::default()),
         }
-    }
-
-    pub fn production() -> Result<Self> {
-        Ok(Self::new(
-            Arc::new(SystemOAuthTokenStore),
-            Arc::new(ReqwestTokenEndpointClient::production()?),
-        ))
     }
 
     fn required_tokens(&self, account_id: &str, missing_message: &str) -> Result<OAuthTokens> {

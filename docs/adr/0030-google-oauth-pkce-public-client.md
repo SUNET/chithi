@@ -3,6 +3,9 @@
 ## Status
 Superseded — Google Desktop apps require `client_secret` even with PKCE
 
+## Current implementation note
+Historical references below to `exchange_code()`, `refresh_access_token()`, and `refresh_with_scopes()` now correspond to `exchange_code_with_client()`, `refresh_access_token_with_client()`, and `refresh_with_scopes_with_client()`. The client-constructing forwarding functions were removed; callers inject centrally configured HTTP clients.
+
 ## Context
 The Google OAuth client secret was hardcoded in the source code (`oauth.rs`). Anyone who reads the binary or source could impersonate the app's OAuth identity. This was item 5 in the pre-public-preview security audit (security0.md).
 

@@ -25,27 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-const HTTP_TIMEOUT_SECS: u64 = 30;
 const MATRIX_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
 const SSO_CALLBACK_TIMEOUT_SECS: u64 = 300;
-
-/// Single shared `reqwest::Client` for the Matrix module — same
-/// rationale as in `talk.rs`. Lazily initialised on first call.
-fn http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .user_agent(USER_AGENT)
-                .build()
-                .map_err(|e| format!("matrix http client: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| Error::Other(e.clone()))
-}
 
 /// Result of `m.login.token` exchange. Only carries fields the rest
 /// of the app needs to keep around.
@@ -189,15 +171,10 @@ pub fn await_login_token(listener: TcpListener, expected_state: &str) -> Result<
 }
 
 /// Exchange the SSO `loginToken` for a long-lived `access_token` via
-/// `m.login.token`. The homeserver returned in the response (or the
-/// user-supplied URL if the server didn't echo it) is what we keep
-/// in the account row — that's the authority for subsequent API
-/// calls.
-pub async fn exchange_login_token(homeserver_url: &str, login_token: &str) -> Result<LoginResult> {
-    exchange_login_token_with_client(homeserver_url, login_token, http_client()?).await
-}
-
-/// Exchange an SSO login token using an explicit HTTP client.
+/// `m.login.token` using an explicit HTTP client. The homeserver
+/// returned in the response (or the user-supplied URL if the server
+/// didn't echo it) is what we keep in the account row — that's the
+/// authority for subsequent API calls.
 pub async fn exchange_login_token_with_client(
     homeserver_url: &str,
     login_token: &str,
@@ -278,24 +255,9 @@ pub async fn exchange_login_token_with_client(
 /// Call instances can be passed here later via a per-account
 /// override if/when we add that setting.
 ///
+/// The request uses the explicit HTTP client supplied by the caller.
+///
 /// [rtc-foci]: https://github.com/matrix-org/matrix-spec-proposals/pull/4143
-pub async fn create_call(
-    homeserver: &str,
-    access_token: &str,
-    room_name: &str,
-    element_call_url: Option<&str>,
-) -> Result<crate::meet::MeetCreateResult> {
-    create_call_with_client(
-        homeserver,
-        access_token,
-        room_name,
-        element_call_url,
-        http_client()?,
-    )
-    .await
-}
-
-/// Create a Matrix room and widget using an explicit HTTP client.
 pub async fn create_call_with_client(
     homeserver: &str,
     access_token: &str,
@@ -397,17 +359,8 @@ pub async fn create_call_with_client(
 /// Update the room's display name. Matrix tracks the title as the
 /// `m.room.name` state event, so renaming = PUT a new state event
 /// with the new name. 403 (no power level) and 404 (room gone) are
-/// treated as success: the rename is best-effort.
-pub async fn rename_room(
-    homeserver: &str,
-    access_token: &str,
-    room_id: &str,
-    new_name: &str,
-) -> Result<()> {
-    rename_room_with_client(homeserver, access_token, room_id, new_name, http_client()?).await
-}
-
-/// Rename a Matrix room using an explicit HTTP client.
+/// treated as success: the rename is best-effort. The request uses
+/// the explicit HTTP client supplied by the caller.
 pub async fn rename_room_with_client(
     homeserver: &str,
     access_token: &str,
@@ -446,15 +399,14 @@ pub async fn rename_room_with_client(
     )))
 }
 
-/// Leave a Matrix room the app created via `create_call`. Matrix
+/// Leave a Matrix room the app created via `create_call_with_client`. Matrix
 /// has no "delete room" API (rooms outlive everyone in them), but
 /// leaving drops the room from this user's room list — which is
-/// the closest analogue to "cancelled this call."
-pub async fn leave_room(homeserver: &str, access_token: &str, room_id: &str) -> Result<()> {
-    leave_room_with_client(homeserver, access_token, room_id, http_client()?).await
-}
-
-/// Leave a Matrix room using an explicit HTTP client.
+/// the closest analogue to "cancelled this call." Repeated leaves
+/// are accepted only when the Matrix error explicitly proves absent
+/// membership; ambiguous authorization failures remain errors so
+/// durable ownership can be retried. The request uses the explicit
+/// HTTP client supplied by the caller.
 pub async fn leave_room_with_client(
     homeserver: &str,
     access_token: &str,
@@ -604,9 +556,6 @@ pub struct MatrixProvider;
 impl crate::meet::MeetProvider for MatrixProvider {
     fn protocol(&self) -> &'static str {
         "matrix"
-    }
-    fn label(&self) -> &'static str {
-        "Matrix"
     }
     async fn create_url(
         &self,

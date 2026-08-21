@@ -3,10 +3,10 @@
 //! OAuth apps registered on Zoom Marketplace.
 //!
 //! Auth: standard OAuth 2.0 Authorization Code + PKCE. The Tauri
-//! commands in `commands/meet.rs` drive `oauth::get_auth_url` /
-//! `wait_for_callback` / `exchange_code` against `oauth::ZOOM`,
-//! storing the resulting tokens in the keyring under the new
-//! account id.
+//! commands in `commands/meet.rs` drive `oauth::get_auth_url`,
+//! `oauth::wait_for_callback`, and the injected token endpoint
+//! client's code exchange against `oauth::ZOOM`, storing the
+//! resulting tokens in the keyring under the new account id.
 //!
 //! Refresh: Zoom access tokens expire after 60 minutes. The injected
 //! provider credential service serializes refresh and persistence per account.
@@ -16,28 +16,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-
-const HTTP_TIMEOUT_SECS: u64 = 30;
-const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
-const ZOOM_API_ROOT: &str = "https://api.zoom.us/v2";
-
-/// Single shared `reqwest::Client` for the Zoom module — same
-/// pattern as in `talk.rs` / `matrix.rs`. Lazily initialised on
-/// first call.
-fn http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .user_agent(USER_AGENT)
-                .build()
-                .map_err(|e| format!("zoom http client: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| Error::Other(e.clone()))
-}
 
 /// Subset of the create-meeting response we care about.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,25 +77,8 @@ pub async fn current_user_identity_with_client(
 /// schedule on the right day. Without it, Zoom treats the meeting
 /// as joinable any time today, which is what made every meeting
 /// show up as scheduled for today regardless of the calendar
-/// event's date.
-pub async fn create_meeting(
-    access_token: &str,
-    topic: &str,
-    start_time: Option<&str>,
-    duration_minutes: Option<u32>,
-) -> Result<crate::meet::MeetCreateResult> {
-    create_meeting_with_client(
-        access_token,
-        topic,
-        start_time,
-        duration_minutes,
-        http_client()?,
-        ZOOM_API_ROOT,
-    )
-    .await
-}
-
-/// Create a Zoom meeting using an explicit HTTP client and API root.
+/// event's date. Uses the explicit HTTP client and API root supplied
+/// by the caller.
 pub async fn create_meeting_with_client(
     access_token: &str,
     topic: &str,
@@ -187,10 +148,7 @@ pub async fn create_meeting_with_client(
 /// Delete a Zoom meeting. The 404-OK fallthrough handles the case
 /// where the user (or another client) already removed the meeting
 /// in Zoom's own UI: we still want the local cleanup to succeed.
-async fn api_delete_meeting(access_token: &str, meeting_id: &str) -> Result<()> {
-    api_delete_meeting_with_client(access_token, meeting_id, http_client()?, ZOOM_API_ROOT).await
-}
-
+/// Uses the explicit HTTP client and API root supplied by the caller.
 async fn api_delete_meeting_with_client(
     access_token: &str,
     meeting_id: &str,
@@ -221,17 +179,7 @@ async fn api_delete_meeting_with_client(
 
 /// Rename a Zoom meeting. Same endpoint as the schedule PATCH but
 /// with only the `topic` field set. Needs `meeting:update:meeting`.
-async fn api_update_meeting_topic(access_token: &str, meeting_id: &str, topic: &str) -> Result<()> {
-    api_update_meeting_topic_with_client(
-        access_token,
-        meeting_id,
-        topic,
-        http_client()?,
-        ZOOM_API_ROOT,
-    )
-    .await
-}
-
+/// Uses the explicit HTTP client and API root supplied by the caller.
 async fn api_update_meeting_topic_with_client(
     access_token: &str,
     meeting_id: &str,
@@ -264,26 +212,10 @@ async fn api_update_meeting_topic_with_client(
 }
 
 /// Patch a Zoom meeting's start time + duration. Pinned to UTC for
-/// the same reason as `create_meeting` (the caller hands us an ISO
-/// UTC timestamp). Returns Ok on 204 No Content, which is what
-/// Zoom emits on a successful PATCH.
-async fn api_update_meeting_schedule(
-    access_token: &str,
-    meeting_id: &str,
-    start_time: &str,
-    duration_minutes: u32,
-) -> Result<()> {
-    api_update_meeting_schedule_with_client(
-        access_token,
-        meeting_id,
-        start_time,
-        duration_minutes,
-        http_client()?,
-        ZOOM_API_ROOT,
-    )
-    .await
-}
-
+/// the same reason as `create_meeting_with_client` (the caller hands
+/// us an ISO UTC timestamp). Returns Ok on 204 No Content, which is
+/// what Zoom emits on a successful PATCH. Uses the explicit HTTP
+/// client and API root supplied by the caller.
 async fn api_update_meeting_schedule_with_client(
     access_token: &str,
     meeting_id: &str,
@@ -336,9 +268,6 @@ pub struct ZoomProvider;
 impl crate::meet::MeetProvider for ZoomProvider {
     fn protocol(&self) -> &'static str {
         "zoom"
-    }
-    fn label(&self) -> &'static str {
-        "Zoom"
     }
     async fn create_url(
         &self,

@@ -1,19 +1,20 @@
 //! Nextcloud Talk integration (#148).
 //!
 //! Two flows:
-//! - `login_flow_v2_start` / `login_flow_v2_poll` implement the
+//! - `login_flow_v2_start_with_client` / `login_flow_v2_poll_with_client`
+//!   implement the
 //!   [Nextcloud Login Flow v2 spec][lf2]. The server hands us a
 //!   browser-facing `login` URL plus a `poll` endpoint+token; we
 //!   open the URL in the user's browser, then poll until the user
 //!   finishes the in-browser flow. The poll response carries a
 //!   long-lived **app password** tied to the user — never the
 //!   real account password — which is what we keep in the keyring.
-//! - `create_room` posts to the OCS Spreed v4 conversation endpoint
-//!   to create a fresh group room and returns the join URL.
+//! - `create_room_with_client` posts to the OCS Spreed v4 conversation
+//!   endpoint to create a fresh group room and returns the join URL.
 //!
-//! All HTTP calls go through one configured `reqwest::Client` with
-//! a 30-second timeout so a wedged Nextcloud instance can't hang
-//! the UI indefinitely.
+//! All HTTP calls use the caller's injected `reqwest::Client`. The
+//! production provider transport shares its connection pool across
+//! the poll loop and applies a 30-second request timeout.
 //!
 //! [lf2]: https://docs.nextcloud.com/server/latest/developer_manual/client_apis/LoginFlow/index.html
 
@@ -21,32 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-const HTTP_TIMEOUT_SECS: u64 = 30;
-const USER_AGENT: &str = concat!("Chithi/", env!("CARGO_PKG_VERSION"));
 const DELETE_RESPONSE_LIMIT: usize = 64 * 1024;
 const DELETE_DIAGNOSTIC_LIMIT: usize = 500;
-
-/// Single shared `reqwest::Client` for the whole Talk module so
-/// the connection pool persists across the Login Flow v2 poll
-/// loop (every 2s for up to five minutes per login). Building a
-/// new `Client` for every call would discard the keep-alive
-/// pool and re-do TLS setup each time. Initialised lazily on
-/// first use; if it ever fails to build (TLS init catastrophe)
-/// every call returns the same error.
-fn http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .user_agent(USER_AGENT)
-                .build()
-                .map_err(|e| format!("talk http client: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| Error::Other(e.clone()))
-}
 
 /// Result of `POST /index.php/login/v2`. The `login` URL is what the
 /// user opens in their browser; `poll.token` is what we send back to
@@ -77,12 +54,8 @@ pub struct LoginFlowResult {
 /// Kick off Nextcloud Login Flow v2 against `server_url`. The trailing
 /// slash is normalized; the function works for both bare-host
 /// (`https://cloud.example.com`) and path-prefixed installs
-/// (`https://example.com/cloud`).
-pub async fn login_flow_v2_start(server_url: &str) -> Result<LoginFlowStart> {
-    login_flow_v2_start_with_client(server_url, http_client()?).await
-}
-
-/// Start Login Flow v2 using an explicit HTTP client.
+/// (`https://example.com/cloud`). Uses the explicit HTTP client
+/// supplied by the caller.
 pub async fn login_flow_v2_start_with_client(
     server_url: &str,
     client: &reqwest::Client,
@@ -117,14 +90,8 @@ pub async fn login_flow_v2_start_with_client(
 /// - `Ok(None)` while the flow is still pending (HTTP 404 per the
 ///   spec — Nextcloud uses 404 to mean "not yet").
 /// - `Err(_)` on any other failure.
-pub async fn login_flow_v2_poll(
-    poll_endpoint: &str,
-    poll_token: &str,
-) -> Result<Option<LoginFlowResult>> {
-    login_flow_v2_poll_with_client(poll_endpoint, poll_token, http_client()?).await
-}
-
-/// Poll Login Flow v2 once using an explicit HTTP client.
+///
+/// Uses the explicit HTTP client supplied by the caller.
 pub async fn login_flow_v2_poll_with_client(
     poll_endpoint: &str,
     poll_token: &str,
@@ -159,15 +126,9 @@ pub async fn login_flow_v2_poll_with_client(
 /// Drive the full Login Flow v2 to completion. Polls every 2 seconds
 /// up to a configurable timeout (default 5 minutes) — long enough
 /// for the user to finish a browser-based SSO redirect, short enough
-/// not to leave the UI hung if they walk away.
-pub async fn login_flow_v2_complete(
-    flow: &LoginFlowStart,
-    timeout_secs: u64,
-) -> Result<LoginFlowResult> {
-    login_flow_v2_complete_with_client(flow, timeout_secs, http_client()?).await
-}
-
-/// Complete Login Flow v2 using an explicit HTTP client for every poll.
+/// not to leave the UI hung if they walk away. The same explicit
+/// HTTP client is reused for every poll so its connection pool is
+/// retained.
 pub async fn login_flow_v2_complete_with_client(
     flow: &LoginFlowStart,
     timeout_secs: u64,
@@ -194,17 +155,8 @@ pub async fn login_flow_v2_complete_with_client(
 /// identifier — what `DELETE /room/{token}` expects later when the
 /// event is cancelled). `room_name` becomes the conversation title
 /// in Nextcloud Talk; we pick a sensible default if the caller hands
-/// us an empty string.
-pub async fn create_room(
-    server: &str,
-    login_name: &str,
-    app_password: &str,
-    room_name: &str,
-) -> Result<crate::meet::MeetCreateResult> {
-    create_room_with_client(server, login_name, app_password, room_name, http_client()?).await
-}
-
-/// Create a Talk room using an explicit HTTP client.
+/// us an empty string. Uses the explicit HTTP client supplied by
+/// the caller.
 pub async fn create_room_with_client(
     server: &str,
     login_name: &str,
@@ -263,25 +215,7 @@ pub async fn create_room_with_client(
 /// OCS Spreed v4 rename endpoint (PUT /room/{token}), which takes
 /// a single `roomName` form field. 404 means the room is already
 /// gone, in which case the rename is a no-op from our perspective.
-pub async fn rename_room(
-    server: &str,
-    login_name: &str,
-    app_password: &str,
-    token: &str,
-    new_name: &str,
-) -> Result<()> {
-    rename_room_with_client(
-        server,
-        login_name,
-        app_password,
-        token,
-        new_name,
-        http_client()?,
-    )
-    .await
-}
-
-/// Rename a Talk room using an explicit HTTP client.
+/// Uses the explicit HTTP client supplied by the caller.
 pub async fn rename_room_with_client(
     server: &str,
     login_name: &str,
@@ -321,19 +255,6 @@ pub async fn rename_room_with_client(
         status,
         body.chars().take(500).collect::<String>(),
     )))
-}
-
-/// Delete a Talk conversation by token. Same auth pair as
-/// `create_room`. Treats 404 as success: the conversation was
-/// already gone (deleted from a Talk web client, etc.), and the
-/// caller wants idempotent cleanup.
-pub async fn delete_room(
-    server: &str,
-    login_name: &str,
-    app_password: &str,
-    token: &str,
-) -> Result<()> {
-    delete_room_with_client(server, login_name, app_password, token, http_client()?).await
 }
 
 #[derive(Deserialize)]
@@ -384,7 +305,11 @@ fn classify_ocs_delete_message(message: &str) -> OcsDeleteMessageKind {
     OcsDeleteMessageKind::Unknown
 }
 
-/// Delete a Talk room using an explicit HTTP client.
+/// Delete a Talk conversation by token using the same auth pair as
+/// `create_room_with_client` and an explicit HTTP client. Cleanup is
+/// idempotent only when the OCS response positively reports success;
+/// HTTP 404 or missing metadata alone is not enough evidence to drop
+/// durable ownership, so those responses remain retryable errors.
 pub async fn delete_room_with_client(
     server: &str,
     login_name: &str,
@@ -521,9 +446,6 @@ pub struct TalkProvider;
 impl crate::meet::MeetProvider for TalkProvider {
     fn protocol(&self) -> &'static str {
         "talk"
-    }
-    fn label(&self) -> &'static str {
-        "Nextcloud Talk"
     }
     async fn create_url(
         &self,
