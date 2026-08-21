@@ -270,13 +270,17 @@ REST calls Chithi makes. To confirm, the reviewer can:
 - Read the Zoom-touching source. API request and response handling lives
   in
   [`src-tauri/src/meet/zoom.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/meet/zoom.rs),
-  containing the identity check (`GET /v2/users/me`), `create_meeting`
-  (`POST /v2/users/me/meetings`),
-  `api_update_meeting_topic` and `api_update_meeting_schedule` (both
-  `PATCH /v2/meetings/{id}`), `api_delete_meeting`
-  (`DELETE /v2/meetings/{id}`), and the `get_access_token` helper that
-  drives the OAuth refresh. Sign-in orchestration, identity binding, and
-  account persistence live in
+  containing the injected request functions
+  `current_user_identity_with_client` (`GET /v2/users/me`),
+  `create_meeting_with_client` (`POST /v2/users/me/meetings`),
+  `api_update_meeting_topic_with_client` and
+  `api_update_meeting_schedule_with_client` (both
+  `PATCH /v2/meetings/{id}`), and `api_delete_meeting_with_client`
+  (`DELETE /v2/meetings/{id}`). `ZoomProvider` obtains credentials from
+  the injected provider service and calls the meeting-operation functions
+  with the shared production transport and API root. Sign-in orchestration,
+  identity verification through `current_user_identity_with_client`,
+  binding, and account persistence live in
   [`src-tauri/src/commands/meet.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/commands/meet.rs).
   The provider scopes and generic PKCE / code-exchange / keychain
   plumbing live in

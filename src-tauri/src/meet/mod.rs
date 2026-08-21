@@ -70,11 +70,6 @@ pub trait MeetProvider: Send + Sync {
     /// (`service_bindings.protocol`).
     fn protocol(&self) -> &'static str;
 
-    /// Human-readable label for log lines + error messages. Not
-    /// shown directly in the UI today; the frontend has its own
-    /// localized labels.
-    fn label(&self) -> &'static str;
-
     /// Create a fresh meeting room / call and return the join URL
     /// the user should put on their calendar event. The caller
     /// supplies a hint name (often the event title) plus optional
