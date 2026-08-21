@@ -1906,6 +1906,8 @@ mod submission_envelope_tests {
             upload_url_template: format!("{base_url}/upload/{{accountId}}"),
             event_source_url_template: None,
             account_id: "account-1".into(),
+            contacts_account_id: None,
+            max_objects_in_get: 500,
             max_objects_in_set: 500,
             submission_extensions: std::collections::HashMap::new(),
         };
@@ -2360,6 +2362,8 @@ mod submission_request_tests {
             upload_url_template: String::new(),
             event_source_url_template: None,
             account_id: "account-1".into(),
+            contacts_account_id: None,
+            max_objects_in_get: 500,
             max_objects_in_set: 500,
             submission_extensions: std::collections::HashMap::new(),
         }

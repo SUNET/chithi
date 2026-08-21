@@ -10,7 +10,8 @@
 //! - [`mailboxes`]: `Mailbox/*` — folder listing, create/destroy, role lookup
 //! - [`identities`]: `Identity/*` — sending-identity lookup
 //! - [`calendar`]: `Calendar/*` + `CalendarEvent/*` (RFC 8984 JSCalendar)
-//! - [`contacts`]: `AddressBook/*` + `ContactCard/*` (RFC 9553 JSContact)
+//! - [`contacts`]: `AddressBook/*` + `ContactCard/*` (RFC 9610 JMAP Contacts,
+//!   with RFC 9553 JSContact cards)
 //!
 //! `api_request` and `JmapConfig::apply_auth` are private to this tree;
 //! callers outside `mail::jmap` always go through the typed domain methods.
@@ -18,8 +19,11 @@
 use crate::error::{Error, Result};
 use serde::Deserialize;
 
+const CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
 const MAIL_CAPABILITY: &str = "urn:ietf:params:jmap:mail";
 const SUBMISSION_CAPABILITY: &str = "urn:ietf:params:jmap:submission";
+const CONTACTS_CAPABILITY: &str = "urn:ietf:params:jmap:contacts";
+const DEFAULT_MAX_OBJECTS: usize = 500;
 
 mod calendar;
 mod contacts;
@@ -28,6 +32,7 @@ mod mail;
 mod mailboxes;
 
 pub use calendar::JmapCalendarEvent;
+pub(crate) use contacts::{JmapAddressBook, JmapContact};
 pub use mail::{JmapEmail, JmapFetchResult, JmapSubmissionEnvelope};
 
 #[derive(Clone)]
@@ -506,6 +511,8 @@ pub struct JmapConnection {
     upload_url_template: String,
     event_source_url_template: Option<String>,
     account_id: String,
+    contacts_account_id: Option<String>,
+    max_objects_in_get: usize,
     max_objects_in_set: usize,
     submission_extensions: std::collections::HashMap<String, Vec<String>>,
 }
@@ -530,6 +537,8 @@ struct JmapSession {
 
 #[derive(Deserialize, Default)]
 struct JmapCoreCapability {
+    #[serde(rename = "maxObjectsInGet")]
+    max_objects_in_get: Option<usize>,
     #[serde(rename = "maxObjectsInSet")]
     max_objects_in_set: Option<usize>,
 }
@@ -537,23 +546,62 @@ struct JmapCoreCapability {
 #[derive(Deserialize, Default)]
 struct JmapAccount {
     #[serde(rename = "accountCapabilities", default)]
-    account_capabilities: std::collections::HashMap<String, JmapSubmissionAccountCapability>,
+    account_capabilities: std::collections::HashMap<String, JmapAccountCapability>,
 }
 
 #[derive(Deserialize, Default)]
-struct JmapSubmissionAccountCapability {
+struct JmapAccountCapability {
     #[serde(rename = "submissionExtensions", default)]
     submission_extensions: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl JmapSession {
-    fn max_objects_in_set(&self) -> usize {
-        const DEFAULT_MAX_OBJECTS_IN_SET: usize = 500;
+    fn max_objects_in_get(&self) -> usize {
         self.capabilities
-            .get("urn:ietf:params:jmap:core")
+            .get(CORE_CAPABILITY)
+            .and_then(|capability| capability.max_objects_in_get)
+            .unwrap_or(DEFAULT_MAX_OBJECTS)
+    }
+
+    fn max_objects_in_set(&self) -> usize {
+        self.capabilities
+            .get(CORE_CAPABILITY)
             .and_then(|capability| capability.max_objects_in_set)
             .filter(|limit| *limit > 0)
-            .unwrap_or(DEFAULT_MAX_OBJECTS_IN_SET)
+            .unwrap_or(DEFAULT_MAX_OBJECTS)
+    }
+
+    fn contacts_account_id(&self, mail_account_id: &str) -> Option<String> {
+        let advertises_contacts = |account_id: &str| {
+            self.accounts.get(account_id).is_some_and(|account| {
+                account
+                    .account_capabilities
+                    .contains_key(CONTACTS_CAPABILITY)
+            })
+        };
+
+        let selected = self
+            .primary_accounts
+            .get(CONTACTS_CAPABILITY)
+            .filter(|account_id| advertises_contacts(account_id))
+            .cloned()
+            .or_else(|| advertises_contacts(mail_account_id).then(|| mail_account_id.to_string()));
+        if selected.is_some() {
+            return selected;
+        }
+
+        let mut candidates: Vec<&String> = self
+            .accounts
+            .iter()
+            .filter_map(|(account_id, account)| {
+                account
+                    .account_capabilities
+                    .contains_key(CONTACTS_CAPABILITY)
+                    .then_some(account_id)
+            })
+            .collect();
+        candidates.sort();
+        (candidates.len() == 1).then(|| candidates[0].clone())
     }
 
     fn submission_extensions(
@@ -608,6 +656,32 @@ mod session_limit_tests {
     }
 
     #[test]
+    fn reads_max_objects_in_get_from_core_capability() {
+        let with_limits = session(
+            serde_json::json!({
+                "urn:ietf:params:jmap:core": {
+                    "maxObjectsInGet": 23,
+                    "maxObjectsInSet": 37
+                }
+            }),
+            serde_json::json!({}),
+        );
+        assert_eq!(with_limits.max_objects_in_get(), 23);
+
+        let zero = session(
+            serde_json::json!({
+                "urn:ietf:params:jmap:core": { "maxObjectsInGet": 0 }
+            }),
+            serde_json::json!({}),
+        );
+        assert_eq!(zero.max_objects_in_get(), 0);
+        assert_eq!(
+            session(serde_json::json!({}), serde_json::json!({})).max_objects_in_get(),
+            500
+        );
+    }
+
+    #[test]
     fn defaults_invalid_or_missing_set_limits() {
         assert_eq!(
             session(serde_json::json!({}), serde_json::json!({})).max_objects_in_set(),
@@ -645,6 +719,126 @@ mod session_limit_tests {
         assert_eq!(extensions.get("SIZE"), Some(&vec!["52428800".into()]));
         assert!(!extensions.contains_key("TOP_LEVEL_IS_WRONG"));
         assert!(!extensions.contains_key("OTHER"));
+    }
+
+    #[test]
+    fn selects_separate_contacts_primary_when_capable() {
+        let session: JmapSession = serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/download/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:mail": "mail-account",
+                "urn:ietf:params:jmap:contacts": "contacts-account"
+            },
+            "accounts": {
+                "mail-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {}
+                } },
+                "contacts-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:contacts": {}
+                } }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            session.contacts_account_id("mail-account").as_deref(),
+            Some("contacts-account")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_contacts_capable_mail_primary() {
+        let session: JmapSession = serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/download/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:mail": "mail-account",
+                "urn:ietf:params:jmap:contacts": "wrong-account"
+            },
+            "accounts": {
+                "mail-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {},
+                    "urn:ietf:params:jmap:contacts": {}
+                } },
+                "wrong-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {}
+                } }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            session.contacts_account_id("mail-account").as_deref(),
+            Some("mail-account")
+        );
+    }
+
+    #[test]
+    fn missing_contacts_capability_keeps_mail_session_usable() {
+        let session = session(
+            serde_json::json!({}),
+            serde_json::json!({ "urn:ietf:params:jmap:mail": {} }),
+        );
+
+        assert_eq!(
+            session
+                .primary_accounts
+                .get(super::MAIL_CAPABILITY)
+                .map(String::as_str),
+            Some("account")
+        );
+        assert!(session.contacts_account_id("account").is_none());
+    }
+
+    #[test]
+    fn selects_an_unambiguous_sole_contacts_capable_account() {
+        let session: JmapSession = serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/download/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "mail-account" },
+            "accounts": {
+                "mail-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {}
+                } },
+                "contacts-only": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:contacts": {}
+                } }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            session.contacts_account_id("mail-account").as_deref(),
+            Some("contacts-only")
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_unrelated_contacts_accounts() {
+        let session: JmapSession = serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/download/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "mail-account" },
+            "accounts": {
+                "mail-account": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {}
+                } },
+                "contacts-b": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:contacts": {}
+                } },
+                "contacts-a": { "accountCapabilities": {
+                    "urn:ietf:params:jmap:contacts": {}
+                } }
+            }
+        }))
+        .unwrap();
+
+        assert!(session.contacts_account_id("mail-account").is_none());
     }
 }
 
@@ -729,6 +923,8 @@ impl JmapConnection {
             .get(MAIL_CAPABILITY)
             .cloned()
             .ok_or_else(|| Error::Other("No primary account in JMAP session".into()))?;
+        let contacts_account_id = session.contacts_account_id(&account_id);
+        let max_objects_in_get = session.max_objects_in_get();
         let max_objects_in_set = session.max_objects_in_set();
         let submission_extensions = session.submission_extensions(&account_id);
 
@@ -757,6 +953,8 @@ impl JmapConnection {
             upload_url_template: upload_url,
             event_source_url_template: event_source_url,
             account_id,
+            contacts_account_id,
+            max_objects_in_get,
             max_objects_in_set,
             submission_extensions,
         })
