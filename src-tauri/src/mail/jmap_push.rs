@@ -189,6 +189,7 @@ async fn connect_and_get_url(
         config,
         providers.transports.jmap_discovery_http.clone(),
         providers.transports.jmap_api_http.clone(),
+        providers.transports.jmap_submission_http.clone(),
     )
     .await
     .map_err(|e| format!("JMAP connect failed: {}", e))?;

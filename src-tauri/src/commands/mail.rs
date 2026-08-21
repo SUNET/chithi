@@ -707,6 +707,7 @@ pub async fn create_folder(
             &jmap_config,
             state.providers.transports.jmap_discovery_http.clone(),
             state.providers.transports.jmap_api_http.clone(),
+            state.providers.transports.jmap_submission_http.clone(),
         )
         .await?;
         // For JMAP, folder_path is "parentId/name" (built by the frontend).
@@ -828,6 +829,7 @@ pub async fn delete_folder(
             &jmap_config,
             state.providers.transports.jmap_discovery_http.clone(),
             state.providers.transports.jmap_api_http.clone(),
+            state.providers.transports.jmap_submission_http.clone(),
         )
         .await?;
         conn_jmap

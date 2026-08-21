@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db;
 use crate::db::pool::DbPool;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ops::lifecycle::WorkerRegistry;
 use crate::ops::queue::OpEntry;
 use crate::ops::worker::AccountWorker;
@@ -176,6 +177,7 @@ pub struct AppState {
     /// join handles. Workers are spawned lazily on first use.
     op_workers: WorkerRegistry<OpEntry>,
     pub data_dir: PathBuf,
+    _data_dir_lock: File,
     /// Token -> canonical file path for attachments picked via the native
     /// dialog. The renderer only ever sees the token, so a compromised
     /// renderer cannot ask the backend to read arbitrary files.
@@ -258,6 +260,24 @@ pub struct ZoomOAuthSession {
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
+        let lock_path = data_dir.join(".chithi.lock");
+        let data_dir_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match data_dir_lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Other(format!(
+                    "Cannot start Chithi: data directory '{}' is already in use by another Chithi instance (lock file '{}')",
+                    data_dir.display(),
+                    lock_path.display()
+                )));
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
         let db_path = data_dir.join("chithi.db");
 
         // Initialize schema on a temporary connection
@@ -293,6 +313,7 @@ impl AppState {
             calendar_sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             op_workers: WorkerRegistry::new(256),
             data_dir,
+            _data_dir_lock: data_dir_lock,
             attachments: std::sync::Mutex::new(HashMap::new()),
             talk_login_sessions: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
@@ -381,11 +402,84 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountLifecycleCoordinator, IdleControl, MeetLifecycleCoordinator};
+    use super::{AccountLifecycleCoordinator, AppState, IdleControl, MeetLifecycleCoordinator};
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn second_app_state_cannot_run_startup_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let first_state = AppState::new(data_dir.clone()).unwrap();
+        let db_path = data_dir.join("chithi.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('lock-test', 'Lock Test', 'lock@example.com', 'lock-test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outbox (account_id, action_type, payload_json, status)
+             VALUES ('lock-test', 'send', '{}', 'sending')",
+            [],
+        )
+        .unwrap();
+        let outbox_id = conn.last_insert_rowid();
+        drop(conn);
+
+        let error = match AppState::new(data_dir.clone()) {
+            Ok(state) => {
+                drop(state);
+                panic!("a second AppState acquired the same data directory lock");
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("already in use by another Chithi instance"),
+            "unexpected startup error: {message}"
+        );
+        assert!(message.contains(".chithi.lock"));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM outbox WHERE id = ?1",
+                [outbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "sending");
+        drop(conn);
+        drop(first_state);
+    }
+
+    #[test]
+    fn dropping_app_state_releases_data_dir_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let first_state = AppState::new(data_dir.clone()).unwrap();
+        drop(first_state);
+
+        let later_state = AppState::new(data_dir.clone()).unwrap();
+        assert_eq!(later_state.data_dir, data_dir);
+        drop(later_state);
+    }
+
+    #[test]
+    fn app_states_for_different_data_dirs_can_coexist() {
+        let first_temp = tempfile::tempdir().unwrap();
+        let second_temp = tempfile::tempdir().unwrap();
+        let first_state = AppState::new(first_temp.path().to_path_buf()).unwrap();
+        let second_state = AppState::new(second_temp.path().to_path_buf()).unwrap();
+
+        assert_ne!(first_state.data_dir, second_state.data_dir);
+        drop(second_state);
+        drop(first_state);
+    }
 
     #[test]
     fn idle_control_interrupts_registered_socket() {

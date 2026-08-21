@@ -1,8 +1,60 @@
 import { defineStore } from "pinia";
 import { ref, computed, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { Event, UnlistenFn } from "@tauri-apps/api/event";
 import { showToast, dismissToast } from "@/lib/toast";
+
+async function wait(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function initializeWithTimeout(
+  initialize: (signal: AbortSignal) => Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
+  const controller = new AbortController();
+  if (timeoutMs <= 0) {
+    await initialize(controller.signal);
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      initialize(controller.signal),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          const error = new Error("Activity listener initialization timed out");
+          controller.abort(error);
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+export async function initializeActivityListenersWithRetry(
+  initialize: (signal: AbortSignal) => Promise<void>,
+  attempts = 2,
+  retryDelayMs = 50,
+  attemptTimeoutMs = 1000,
+): Promise<unknown | null> {
+  const attemptCount = Math.max(1, Math.floor(attempts));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attemptCount; attempt += 1) {
+    try {
+      await initializeWithTimeout(initialize, attemptTimeoutMs);
+      return null;
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attemptCount) await wait(retryDelayMs);
+    }
+  }
+  return lastError;
+}
 
 export interface Operation {
   id: string;
@@ -111,46 +163,95 @@ export const useActivityStore = defineStore("activity", () => {
   }
 
   const unlistenFns: UnlistenFn[] = [];
+  const sendToastIds = new Map<string, number>();
+  const pendingRegistrationCleanups = new Set<() => void>();
+  let initializationAttempt: { id: number; promise: Promise<void> } | null = null;
+  let nextInitializationAttemptId = 0;
+  let disposed = false;
 
-  async function initEventListeners() {
-    if (initialized.value) return;
-    initialized.value = true;
+  function dismissSendToast(opId: string) {
+    const toastId = sendToastIds.get(opId);
+    if (toastId !== undefined) {
+      dismissToast(toastId);
+      sendToastIds.delete(opId);
+    }
+  }
+
+  async function registerEventListeners(signal?: AbortSignal) {
+    const registrations: Promise<UnlistenFn>[] = [];
+    const attemptListeners = new Set<UnlistenFn>();
+    let acceptingListeners = true;
+    let committed = false;
+
+    const cleanupAttempt = () => {
+      acceptingListeners = false;
+      for (const unlisten of attemptListeners) unlisten();
+      attemptListeners.clear();
+      pendingRegistrationCleanups.delete(cleanupAttempt);
+    };
+    pendingRegistrationCleanups.add(cleanupAttempt);
+
+    let rejectCancellation!: (reason: unknown) => void;
+    const cancellation = new Promise<never>((_, reject) => {
+      rejectCancellation = reject;
+    });
+    const cancelAttempt = () => {
+      if (!acceptingListeners || committed) return;
+      const reason = signal?.reason ?? new Error("Activity listener initialization cancelled");
+      cleanupAttempt();
+      rejectCancellation(reason);
+    };
+    if (signal?.aborted) {
+      cancelAttempt();
+    } else {
+      signal?.addEventListener("abort", cancelAttempt, { once: true });
+    }
+
+    function whenCommitted<T>(handler: (event: Event<T>) => void) {
+      return (event: Event<T>) => {
+        if (!committed || disposed) return;
+        handler(event);
+      };
+    }
 
     // --- Mail sync events ---
-    unlistenFns.push(
-      await listen<{ account_id: string; account_name: string }>(
+    registrations.push(
+      listen<{ account_id: string; account_name: string }>(
         "sync-started",
-        (event) => {
+        whenCommitted((event) => {
           startOperation(
             `sync-${event.payload.account_id}`,
             "sync",
             `Syncing ${event.payload.account_name}`,
             "Syncing...",
           );
-        },
+        }),
       ),
     );
 
-    unlistenFns.push(
-      await listen<{
+    registrations.push(
+      listen<{
         account_id: string;
         folder: string;
         synced: number;
         total_folders: number;
         current_folder: number;
-      }>("sync-progress", (event) => {
-        const p = event.payload;
-        updateOperation(
-          `sync-${p.account_id}`,
-          `${p.folder} (${p.current_folder}/${p.total_folders})${p.synced > 0 ? ` - ${p.synced} new` : ""}`,
-        );
-      }),
+      }>(
+        "sync-progress",
+        whenCommitted((event) => {
+          const p = event.payload;
+          updateOperation(
+            `sync-${p.account_id}`,
+            `${p.folder} (${p.current_folder}/${p.total_folders})${p.synced > 0 ? ` - ${p.synced} new` : ""}`,
+          );
+        }),
+      ),
     );
 
-    unlistenFns.push(
-      await listen<{ account_id: string; total_synced: number }>(
+    registrations.push(
+      listen<{ account_id: string; total_synced: number }>(
         "sync-complete",
-        (event) => {
+        whenCommitted((event) => {
           const p = event.payload;
           completeOperation(
             `sync-${p.account_id}`,
@@ -158,16 +259,16 @@ export const useActivityStore = defineStore("activity", () => {
               ? `Done - ${p.total_synced} new messages`
               : "Up to date",
           );
-        },
+        }),
       ),
     );
 
-    unlistenFns.push(
-      await listen<{ account_id: string; error: string }>(
+    registrations.push(
+      listen<{ account_id: string; error: string }>(
         "sync-error",
-        (event) => {
+        whenCommitted((event) => {
           failOperation(`sync-${event.payload.account_id}`, event.payload.error);
-        },
+        }),
       ),
     );
 
@@ -177,140 +278,195 @@ export const useActivityStore = defineStore("activity", () => {
     // NOT listen for `calendar-changed`: that event also fires from invite
     // responses, push processing, and other non-sync mutations, so coupling
     // it to the spinner would complete the indicator prematurely.
-    unlistenFns.push(
-      await listen<string>("calendar-sync-started", (event) => {
-        startOperation(
-          `cal-sync-${event.payload}`,
-          "sync",
-          "Syncing calendars",
-          "Syncing...",
-        );
-      }),
+    registrations.push(
+      listen<string>(
+        "calendar-sync-started",
+        whenCommitted((event) => {
+          startOperation(
+            `cal-sync-${event.payload}`,
+            "sync",
+            "Syncing calendars",
+            "Syncing...",
+          );
+        }),
+      ),
     );
-    unlistenFns.push(
-      await listen<string>("calendar-sync-complete", (event) => {
-        completeOperation(`cal-sync-${event.payload}`, "Calendars updated");
-      }),
+    registrations.push(
+      listen<string>(
+        "calendar-sync-complete",
+        whenCommitted((event) => {
+          completeOperation(`cal-sync-${event.payload}`, "Calendars updated");
+        }),
+      ),
     );
-    unlistenFns.push(
-      await listen<{ account_id: string; error: string }>(
+    registrations.push(
+      listen<{ account_id: string; error: string }>(
         "calendar-sync-error",
-        (event) => {
+        whenCommitted((event) => {
           failOperation(
             `cal-sync-${event.payload.account_id}`,
             event.payload.error,
           );
-        },
+        }),
       ),
     );
 
     // --- Contacts sync events ---
-    unlistenFns.push(
-      await listen<string>("contacts-changed", (event) => {
-        completeOperation(
-          `contacts-sync-${event.payload}`,
-          "Contacts updated",
-        );
-      }),
+    registrations.push(
+      listen<string>(
+        "contacts-changed",
+        whenCommitted((event) => {
+          completeOperation(
+            `contacts-sync-${event.payload}`,
+            "Contacts updated",
+          );
+        }),
+      ),
     );
 
     // --- Background operation failures ---
-    unlistenFns.push(
-      await listen<{ account_id: string; op_type: string; error: string }>(
+    registrations.push(
+      listen<{ account_id: string; op_type: string; error: string }>(
         "op-failed",
-        (event) => {
+        whenCommitted((event) => {
           const p = event.payload;
           // Create and immediately fail an operation entry so it shows up in the
           // operations panel (failOperation is a no-op for unknown ids).
           const opId = `op-${p.account_id}-${Date.now()}`;
           startOperation(opId, "general", `${p.op_type} failed`, p.error);
           failOperation(opId, `${p.op_type}: ${p.error}`);
-        },
+        }),
       ),
     );
 
-    // Maps an operation id → toast id so we can dismiss the persistent
-    // "Sending..." toast when the send completes or fails.
-    const sendToastIds = new Map<string, number>();
-
-    function dismissSendToast(opId: string) {
-      const toastId = sendToastIds.get(opId);
-      if (toastId !== undefined) {
-        dismissToast(toastId);
-        sendToastIds.delete(opId);
-      }
-    }
-
     // --- Send events ---
-    unlistenFns.push(
-      await listen<{ account_id: string; subject: string; outbox_id: number }>(
+    registrations.push(
+      listen<{ account_id: string; subject: string; outbox_id: number }>(
         "send-started",
-        (event) => {
+        whenCommitted((event) => {
           const p = event.payload;
           const opId = `send-${p.outbox_id}`;
           startOperation(opId, "send", `Sending "${p.subject}"`, "Syncing...");
           const toastId = showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
           sendToastIds.set(opId, toastId);
-        },
+        }),
       ),
     );
 
-    unlistenFns.push(
-      await listen<{ account_id: string; subject: string; outbox_id: number }>(
+    registrations.push(
+      listen<{ account_id: string; subject: string; outbox_id: number }>(
         "send-complete",
-        (event) => {
+        whenCommitted((event) => {
           const p = event.payload;
           const opId = `send-${p.outbox_id}`;
           completeOperation(opId, "Sent");
           dismissSendToast(opId);
           showToast(`"${p.subject}" sent`, "success");
-        },
+        }),
       ),
     );
 
-    unlistenFns.push(
-      await listen<{
+    registrations.push(
+      listen<{
         account_id: string;
         subject: string;
         outbox_id: number;
         error: string;
       }>(
         "send-failed",
-        (event) => {
+        whenCommitted((event) => {
           const p = event.payload;
           const opId = `send-${p.outbox_id}`;
           failOperation(opId, p.error);
           dismissSendToast(opId);
           showToast(`Send failed: ${p.error}`, "error", 10000);
-        },
+        }),
       ),
     );
 
-    unlistenFns.push(
-      await listen<{
+    registrations.push(
+      listen<{
         account_id: string;
         subject: string;
         outbox_id: number;
         error: string;
-      }>("send-unknown", (event) => {
-        const p = event.payload;
-        const opId = `send-${p.outbox_id}`;
-        const detail = `Delivery status unknown: ${p.error}`;
-        failOperation(opId, detail);
-        dismissSendToast(opId);
-        showToast(
-          `Delivery status unknown for "${p.subject}": ${p.error}`,
-          "error",
-          10000,
-        );
-      }),
+      }>(
+        "send-unknown",
+        whenCommitted((event) => {
+          const p = event.payload;
+          const opId = `send-${p.outbox_id}`;
+          const detail = `Delivery status unknown: ${p.error}`;
+          failOperation(opId, detail);
+          dismissSendToast(opId);
+          showToast(
+            `Delivery status unknown for "${p.subject}": ${p.error}`,
+            "error",
+            10000,
+          );
+        }),
+      ),
     );
+
+    let listeners: UnlistenFn[];
+    try {
+      listeners = await Promise.race([
+        Promise.all(
+          registrations.map((registration) =>
+            registration.then((unlisten) => {
+              if (!acceptingListeners || disposed) {
+                unlisten();
+              } else {
+                attemptListeners.add(unlisten);
+              }
+              return unlisten;
+            }),
+          ),
+        ),
+        cancellation,
+      ]);
+    } catch (error) {
+      cleanupAttempt();
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", cancelAttempt);
+    }
+
+    if (disposed) {
+      cleanupAttempt();
+      return;
+    }
+
+    pendingRegistrationCleanups.delete(cleanupAttempt);
+    acceptingListeners = false;
+    attemptListeners.clear();
+    unlistenFns.push(...listeners);
+    committed = true;
+    initialized.value = true;
+  }
+
+  function initEventListeners(signal?: AbortSignal): Promise<void> {
+    if (initialized.value) return Promise.resolve();
+    if (initializationAttempt) return initializationAttempt.promise;
+
+    const attemptId = ++nextInitializationAttemptId;
+    const promise = registerEventListeners(signal).finally(() => {
+      if (initializationAttempt?.id === attemptId) {
+        initializationAttempt = null;
+      }
+    });
+    initializationAttempt = { id: attemptId, promise };
+    return promise;
   }
 
   onScopeDispose(() => {
+    disposed = true;
     for (const unlisten of unlistenFns) {
       unlisten();
     }
+    unlistenFns.length = 0;
+    for (const cleanup of [...pendingRegistrationCleanups]) cleanup();
+    for (const toastId of sendToastIds.values()) dismissToast(toastId);
+    sendToastIds.clear();
     // Cancel any pending removal timers so they don't fire on a disposed
     // store and mutate state (or leak the handle).
     for (const handle of pendingRemovals.values()) {

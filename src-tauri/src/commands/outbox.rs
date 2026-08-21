@@ -75,13 +75,14 @@ fn row_from_payload(
     }
 }
 
-fn retry_dead_row(conn: &rusqlite::Connection, outbox_id: i64) -> Result<()> {
+fn retry_dead_row(conn: &rusqlite::Connection, account_id: &str, outbox_id: i64) -> Result<()> {
     let changed = conn
         .execute(
             "UPDATE outbox
              SET status = 'pending', retry_count = 0, error_message = NULL
-             WHERE id = ?1 AND action_type = 'send' AND status = 'dead'",
-            rusqlite::params![outbox_id],
+             WHERE id = ?1 AND account_id = ?2
+               AND action_type = 'send' AND status = 'dead'",
+            rusqlite::params![outbox_id, account_id],
         )
         .map_err(Error::Database)?;
     if changed != 1 {
@@ -93,13 +94,17 @@ fn retry_dead_row(conn: &rusqlite::Connection, outbox_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn discard_inactive_row(conn: &rusqlite::Connection, outbox_id: i64) -> Result<()> {
+fn discard_inactive_row(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    outbox_id: i64,
+) -> Result<()> {
     let changed = conn
         .execute(
             "DELETE FROM outbox
-             WHERE id = ?1 AND action_type = 'send'
+             WHERE id = ?1 AND account_id = ?2 AND action_type = 'send'
                AND status IN ('pending', 'dead')",
-            rusqlite::params![outbox_id],
+            rusqlite::params![outbox_id, account_id],
         )
         .map_err(Error::Database)?;
     if changed != 1 {
@@ -148,18 +153,26 @@ pub async fn list_outbox(state: State<'_, AppState>, account_id: String) -> Resu
 /// Flip a dead row back to 'pending' with retry_count reset so the next sync
 /// drain will replay it. Pending and actively sending rows are not mutable.
 #[tauri::command]
-pub async fn retry_outbox_op(state: State<'_, AppState>, outbox_id: i64) -> Result<()> {
+pub async fn retry_outbox_op(
+    state: State<'_, AppState>,
+    account_id: String,
+    outbox_id: i64,
+) -> Result<()> {
     let conn = state.db.writer().await;
-    retry_dead_row(&conn, outbox_id)?;
+    retry_dead_row(&conn, &account_id, outbox_id)?;
     log::info!("Outbox row {} requeued for retry", outbox_id);
     Ok(())
 }
 
 /// Permanently delete an inactive outbox row. A sending row retains its claim.
 #[tauri::command]
-pub async fn discard_outbox_op(state: State<'_, AppState>, outbox_id: i64) -> Result<()> {
+pub async fn discard_outbox_op(
+    state: State<'_, AppState>,
+    account_id: String,
+    outbox_id: i64,
+) -> Result<()> {
     let conn = state.db.writer().await;
-    discard_inactive_row(&conn, outbox_id)?;
+    discard_inactive_row(&conn, &account_id, outbox_id)?;
     log::info!("Outbox row {} discarded", outbox_id);
     Ok(())
 }
@@ -185,12 +198,12 @@ mod tests {
         conn
     }
 
-    fn insert_row(conn: &rusqlite::Connection, status: &str) -> i64 {
+    fn insert_row(conn: &rusqlite::Connection, account_id: &str, status: &str) -> i64 {
         conn.execute(
             "INSERT INTO outbox
              (account_id, action_type, payload_json, status, retry_count, error_message)
-             VALUES ('acc1', 'send', '{}', ?1, 3, 'old error')",
-            rusqlite::params![status],
+             VALUES (?1, 'send', '{}', ?2, 3, 'old error')",
+            rusqlite::params![account_id, status],
         )
         .unwrap();
         conn.last_insert_rowid()
@@ -208,33 +221,45 @@ mod tests {
     #[test]
     fn manual_retry_only_transitions_dead_to_pending() {
         let conn = setup_db();
-        let dead = insert_row(&conn, "dead");
-        let pending = insert_row(&conn, "pending");
-        let sending = insert_row(&conn, "sending");
+        let dead = insert_row(&conn, "acc1", "dead");
+        let pending = insert_row(&conn, "acc1", "pending");
+        let sending = insert_row(&conn, "acc1", "sending");
 
-        retry_dead_row(&conn, dead).unwrap();
+        retry_dead_row(&conn, "acc1", dead).unwrap();
         assert_eq!(row_state(&conn, dead), Some(("pending".into(), 0, None)));
-        assert!(retry_dead_row(&conn, dead).is_err());
-        assert!(retry_dead_row(&conn, pending).is_err());
-        assert!(retry_dead_row(&conn, sending).is_err());
-        assert!(retry_dead_row(&conn, i64::MAX).is_err());
+        assert!(retry_dead_row(&conn, "acc1", dead).is_err());
+        assert!(retry_dead_row(&conn, "acc1", pending).is_err());
+        assert!(retry_dead_row(&conn, "acc1", sending).is_err());
+        assert!(retry_dead_row(&conn, "acc1", i64::MAX).is_err());
         assert_eq!(row_state(&conn, sending).unwrap().0, "sending");
     }
 
     #[test]
     fn discard_only_deletes_pending_or_dead_rows() {
         let conn = setup_db();
-        let dead = insert_row(&conn, "dead");
-        let pending = insert_row(&conn, "pending");
-        let sending = insert_row(&conn, "sending");
+        let dead = insert_row(&conn, "acc1", "dead");
+        let pending = insert_row(&conn, "acc1", "pending");
+        let sending = insert_row(&conn, "acc1", "sending");
 
-        discard_inactive_row(&conn, dead).unwrap();
-        discard_inactive_row(&conn, pending).unwrap();
+        discard_inactive_row(&conn, "acc1", dead).unwrap();
+        discard_inactive_row(&conn, "acc1", pending).unwrap();
         assert!(row_state(&conn, dead).is_none());
         assert!(row_state(&conn, pending).is_none());
-        assert!(discard_inactive_row(&conn, sending).is_err());
-        assert!(discard_inactive_row(&conn, i64::MAX).is_err());
+        assert!(discard_inactive_row(&conn, "acc1", sending).is_err());
+        assert!(discard_inactive_row(&conn, "acc1", i64::MAX).is_err());
         assert_eq!(row_state(&conn, sending).unwrap().0, "sending");
+    }
+
+    #[test]
+    fn manual_actions_reject_rows_from_another_account() {
+        let conn = setup_db();
+        let retry_row = insert_row(&conn, "acc1", "dead");
+        let discard_row = insert_row(&conn, "acc1", "pending");
+
+        assert!(retry_dead_row(&conn, "acc2", retry_row).is_err());
+        assert!(discard_inactive_row(&conn, "acc2", discard_row).is_err());
+        assert_eq!(row_state(&conn, retry_row).unwrap().0, "dead");
+        assert_eq!(row_state(&conn, discard_row).unwrap().0, "pending");
     }
 
     #[test]

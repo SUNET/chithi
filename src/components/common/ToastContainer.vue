@@ -13,8 +13,10 @@ const toasts = useToasts();
           :key="toast.id"
           class="toast"
           :class="toast.type"
+          :role="toast.type === 'error' ? 'alert' : 'status'"
+          aria-atomic="true"
         >
-          <span class="toast-icon">
+          <span class="toast-icon" aria-hidden="true">
             <svg v-if="toast.type === 'info'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" />
             </svg>
@@ -56,7 +58,9 @@ const toasts = useToasts();
   font-weight: 500;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
   pointer-events: auto;
-  white-space: nowrap;
+  max-width: min(640px, calc(100vw - 32px));
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .toast.info {

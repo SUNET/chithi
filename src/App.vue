@@ -6,13 +6,11 @@ import MobileShell from "@/components/shell/MobileShell.vue";
 import ToastContainer from "@/components/common/ToastContainer.vue";
 import PassphraseDialog from "@/components/pgp/PassphraseDialog.vue";
 import PinDialog from "@/components/pgp/PinDialog.vue";
-import { useActivityStore } from "@/stores/activity";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { usePlatformStore } from "@/stores/platform";
 import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 
-const activityStore = useActivityStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 const platformStore = usePlatformStore();
@@ -25,7 +23,6 @@ onMounted(async () => {
   uiStore.initTheme();
   uiStore.initDecorations();
   await uiStore.initTimezone();
-  activityStore.initEventListeners();
   await accountsStore.fetchAccounts();
   // Subscribe globally so any view that triggers a sign/decrypt can
   // receive its prompt.

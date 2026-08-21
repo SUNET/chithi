@@ -593,85 +593,88 @@ impl ImapOpExecutor {
     /// not the persistent IMAP connection, so a stalled mail server
     /// doesn't gate retries of a queued send. SMTP delivery is shared
     /// with Graph; only IMAP runs the post-delivery Sent hook below.
-    async fn execute_smtp_send(
+    async fn deliver_smtp_send(
         &mut self,
         ctx: &MailSyncCtx,
         account_id: &str,
         op: MailOp,
-    ) -> Result<()> {
-        let super::RawSmtpDelivery {
-            account,
-            credentials,
-            raw_message,
-        } = super::replay_send_raw_via_smtp(ctx, account_id, op).await?;
+    ) -> Result<super::SendPostprocess> {
+        let delivery = super::replay_send_raw_via_smtp(ctx, account_id, op).await?;
+        Ok(super::SendPostprocess::ImapSent(Box::new(delivery)))
+    }
+}
 
-        // Best-effort APPEND to Sent (#189). Same rule as the live-send
-        // path in `commands::compose`: a failure here MUST NOT propagate,
-        // because the message has been delivered and the outbox would
-        // otherwise retry the send and duplicate it for the recipient.
-        let sent_folder_path = {
-            let conn = ctx.db.reader();
-            crate::db::folders::folder_path_by_type(&conn, account_id, "sent")
-                .ok()
-                .flatten()
-        };
-        let imap_config = ImapConfig {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            username: account.username.clone(),
-            password: credentials.secret,
-            use_tls: account.use_tls,
-            use_xoauth2: credentials.use_xoauth2,
-        };
-        let account_id_append = account_id.to_string();
-        let append_result = tokio::task::spawn_blocking(move || {
-            crate::mail::imap::append_message_to_sent(
-                &imap_config,
-                sent_folder_path.as_deref(),
-                &raw_message,
-            )
-        })
-        .await;
-        match append_result {
-            Ok(Ok(sent_folder)) => {
-                log::info!(
-                    "Outbox replay: APPENDed sent message to '{}' for account {}",
-                    sent_folder,
-                    account_id_append
-                );
-                // Nudge a targeted sync of the Sent folder so the
-                // freshly-APPENDed message surfaces in the UI without
-                // waiting for the next scheduled sync.
-                if let Err(e) = sync_folder_quiet(ctx, &account, &sent_folder).await {
-                    log::warn!(
-                        "Outbox replay: Sent-folder sync nudge failed for account {}: {}",
-                        account_id_append,
-                        e
-                    );
-                }
-            }
-            Ok(Err(e)) => log::warn!(
-                "Outbox replay: delivered but APPEND to Sent failed for account {}: {}",
-                account_id_append,
-                e
-            ),
-            Err(e) => {
-                let kind = if e.is_panic() {
-                    "panicked"
-                } else if e.is_cancelled() {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
+pub(super) async fn postprocess_smtp_delivery(
+    ctx: &MailSyncCtx,
+    account_id: &str,
+    delivery: super::RawSmtpDelivery,
+) {
+    let super::RawSmtpDelivery {
+        account,
+        credentials,
+        raw_message,
+    } = delivery;
+
+    // Delivery is already complete in the outbox. APPEND and the resulting
+    // sync are best-effort only and must never cause recipient resubmission.
+    let sent_folder_path = {
+        let conn = ctx.db.reader();
+        crate::db::folders::folder_path_by_type(&conn, account_id, "sent")
+            .ok()
+            .flatten()
+    };
+    let imap_config = ImapConfig {
+        host: account.imap_host.clone(),
+        port: account.imap_port,
+        username: account.username.clone(),
+        password: credentials.secret,
+        use_tls: account.use_tls,
+        use_xoauth2: credentials.use_xoauth2,
+    };
+    let account_id_append = account_id.to_string();
+    let append_result = tokio::task::spawn_blocking(move || {
+        crate::mail::imap::append_message_to_sent(
+            &imap_config,
+            sent_folder_path.as_deref(),
+            &raw_message,
+        )
+    })
+    .await;
+    match append_result {
+        Ok(Ok(sent_folder)) => {
+            log::info!(
+                "Outbox replay: APPENDed sent message to '{}' for account {}",
+                sent_folder,
+                account_id_append
+            );
+            if let Err(e) = sync_folder_quiet(ctx, &account, &sent_folder).await {
                 log::warn!(
-                    "Outbox replay: APPEND-to-Sent task {} for account {}: {}",
-                    kind,
+                    "Outbox replay: Sent-folder sync nudge failed for account {}: {}",
                     account_id_append,
                     e
                 );
             }
         }
-        Ok(())
+        Ok(Err(e)) => log::warn!(
+            "Outbox replay: delivered but APPEND to Sent failed for account {}: {}",
+            account_id_append,
+            e
+        ),
+        Err(e) => {
+            let kind = if e.is_panic() {
+                "panicked"
+            } else if e.is_cancelled() {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            log::warn!(
+                "Outbox replay: APPEND-to-Sent task {} for account {}: {}",
+                kind,
+                account_id_append,
+                e
+            );
+        }
     }
 }
 
@@ -682,7 +685,9 @@ impl MailOpExecutor for ImapOpExecutor {
         // IMAP connection. Branch before we touch IMAP state so a stalled
         // mail server doesn't gate retries of a queued send.
         if let MailOp::SendRaw { .. } = op {
-            return self.execute_smtp_send(ctx, account_id, op).await;
+            let postprocess = self.deliver_smtp_send(ctx, account_id, op).await?;
+            postprocess.run_best_effort(ctx, account_id).await;
+            return Ok(());
         }
 
         // Ensure we have a live connection
@@ -710,6 +715,15 @@ impl MailOpExecutor for ImapOpExecutor {
         }
 
         result
+    }
+
+    async fn execute_replayed_send(
+        &mut self,
+        ctx: &MailSyncCtx,
+        account_id: &str,
+        op: MailOp,
+    ) -> Result<super::SendPostprocess> {
+        self.deliver_smtp_send(ctx, account_id, op).await
     }
 
     async fn shutdown(&mut self) {

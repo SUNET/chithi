@@ -10,25 +10,63 @@ const accountsStore = useAccountsStore();
 const rows = ref<OutboxRow[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
+const listenerError = ref<string | null>(null);
+const actingRowId = ref<number | null>(null);
+let reloadGeneration = 0;
+let disposed = false;
+
+function isCurrentReload(generation: number, accountId: string): boolean {
+  return (
+    !disposed &&
+    generation === reloadGeneration &&
+    accountsStore.activeAccountId === accountId
+  );
+}
 
 async function reload() {
+  const generation = ++reloadGeneration;
+  if (disposed) return;
+
   const accountId = accountsStore.activeAccountId;
   if (!accountId) {
     rows.value = [];
+    error.value = null;
+    loading.value = false;
     return;
   }
   loading.value = true;
   error.value = null;
   try {
-    rows.value = await api.listOutbox(accountId);
+    const nextRows = await api.listOutbox(accountId);
+    if (isCurrentReload(generation, accountId)) {
+      rows.value = nextRows;
+    }
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    if (isCurrentReload(generation, accountId)) {
+      error.value = e instanceof Error ? e.message : String(e);
+    }
   } finally {
-    loading.value = false;
+    if (isCurrentReload(generation, accountId)) {
+      loading.value = false;
+    }
   }
 }
 
+function activeAccountFor(row: OutboxRow): string | null {
+  const accountId = accountsStore.activeAccountId;
+  if (!accountId || row.account_id !== accountId) {
+    showToast("The Outbox account changed. Refresh and try again.", "error", 5000);
+    void reload();
+    return null;
+  }
+  return accountId;
+}
+
 async function retry(row: OutboxRow) {
+  if (actingRowId.value !== null) return;
+  const accountId = activeAccountFor(row);
+  if (!accountId) return;
+
   if (
     row.delivery_outcome_unknown &&
     !confirm(
@@ -37,82 +75,144 @@ async function retry(row: OutboxRow) {
   ) {
     return;
   }
+  actingRowId.value = row.id;
   try {
-    await api.retryOutboxOp(row.id);
+    await api.retryOutboxOp(accountId, row.id);
     showToast(`Queued "${row.subject ?? "(no subject)"}" for retry`, "info");
-    await reload();
   } catch (e) {
     showToast(`Retry failed: ${e instanceof Error ? e.message : String(e)}`, "error", 5000);
+  } finally {
+    await reload();
+    if (!disposed && actingRowId.value === row.id) {
+      actingRowId.value = null;
+    }
   }
 }
 
 async function discard(row: OutboxRow) {
+  if (actingRowId.value !== null) return;
+  const accountId = activeAccountFor(row);
+  if (!accountId) return;
+
   const message = row.delivery_outcome_unknown
     ? `Discard "${row.subject ?? "(no subject)"}"? This only removes the local record and cannot cancel delivery.`
     : `Discard "${row.subject ?? "(no subject)"}"? This cannot be undone.`;
   if (!confirm(message)) {
     return;
   }
+  actingRowId.value = row.id;
   try {
-    await api.discardOutboxOp(row.id);
-    rows.value = rows.value.filter((r) => r.id !== row.id);
+    await api.discardOutboxOp(accountId, row.id);
   } catch (e) {
     showToast(`Discard failed: ${e instanceof Error ? e.message : String(e)}`, "error", 5000);
+  } finally {
+    await reload();
+    if (!disposed && actingRowId.value === row.id) {
+      actingRowId.value = null;
+    }
   }
 }
 
 const unlistenFns: UnlistenFn[] = [];
+const pendingListenerCleanups = new Set<() => void>();
+const refreshEvents = [
+  "offline-queue-changed",
+  "send-started",
+  "send-complete",
+  "send-failed",
+  "send-unknown",
+] as const;
 
 onMounted(async () => {
+  let listenersCommitted = false;
+  let acceptingListeners = true;
+  const setupListeners = new Set<UnlistenFn>();
+  const cleanupSetup = () => {
+    acceptingListeners = false;
+    for (const unlisten of setupListeners) unlisten();
+    setupListeners.clear();
+    pendingListenerCleanups.delete(cleanupSetup);
+  };
+  pendingListenerCleanups.add(cleanupSetup);
+
+  const registrations = refreshEvents.map((name) => {
+    let registration: Promise<UnlistenFn>;
+    try {
+      registration = listen<{ account_id: string }>(name, (event) => {
+        if (
+          listenersCommitted &&
+          !disposed &&
+          event.payload.account_id === accountsStore.activeAccountId
+        ) {
+          void reload();
+        }
+      });
+    } catch (setupError) {
+      return Promise.reject(setupError);
+    }
+    return registration.then((unlisten) => {
+      if (!acceptingListeners || disposed) {
+        unlisten();
+      } else {
+        setupListeners.add(unlisten);
+      }
+      return unlisten;
+    });
+  });
+
+  // Do not make initial data visibility depend on event subscription. A
+  // second load after a successful commit reconciles transitions that occur
+  // while listeners are still gated.
+  const initialLoad = reload();
+  const results = await Promise.allSettled(registrations);
+  const listeners: UnlistenFn[] = [];
+  let setupFailed = false;
+  let setupFailure: unknown;
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      listeners.push(result.value);
+    } else if (!setupFailed) {
+      setupFailed = true;
+      setupFailure = result.reason;
+    }
+  }
+
+  if (disposed || setupFailed) {
+    cleanupSetup();
+    if (!disposed && setupFailed) {
+      const detail =
+        setupFailure instanceof Error ? setupFailure.message : String(setupFailure);
+      listenerError.value = `Automatic Outbox updates are unavailable: ${detail}. Use Refresh to update the list.`;
+    }
+    await initialLoad;
+    return;
+  }
+
+  pendingListenerCleanups.delete(cleanupSetup);
+  acceptingListeners = false;
+  setupListeners.clear();
+  unlistenFns.push(...listeners);
+  listenersCommitted = true;
+  await initialLoad;
   await reload();
-  // Refresh when the worker drains the outbox or marks something dead.
-  unlistenFns.push(
-    await listen<{ account_id: string }>("offline-queue-changed", (event) => {
-      if (event.payload.account_id === accountsStore.activeAccountId) {
-        reload();
-      }
-    }),
-  );
-  unlistenFns.push(
-    await listen<{ account_id: string }>("send-started", (event) => {
-      if (event.payload.account_id === accountsStore.activeAccountId) {
-        reload();
-      }
-    }),
-  );
-  unlistenFns.push(
-    await listen<{ account_id: string }>("send-complete", (event) => {
-      if (event.payload.account_id === accountsStore.activeAccountId) {
-        reload();
-      }
-    }),
-  );
-  unlistenFns.push(
-    await listen<{ account_id: string }>("send-failed", (event) => {
-      if (event.payload.account_id === accountsStore.activeAccountId) {
-        reload();
-      }
-    }),
-  );
-  unlistenFns.push(
-    await listen<{ account_id: string }>("send-unknown", (event) => {
-      if (event.payload.account_id === accountsStore.activeAccountId) {
-        reload();
-      }
-    }),
-  );
 });
 
 onUnmounted(() => {
+  disposed = true;
+  reloadGeneration += 1;
   for (const u of unlistenFns) {
     u();
   }
+  unlistenFns.length = 0;
+  for (const cleanup of [...pendingListenerCleanups]) cleanup();
 });
 
 watch(
   () => accountsStore.activeAccountId,
   () => {
-    reload();
+    rows.value = [];
+    error.value = null;
+    void reload();
   },
 );
 
@@ -135,23 +235,42 @@ function statusLabel(row: OutboxRow): string {
 </script>
 
 <template>
-  <div class="outbox-list" data-testid="outbox-list">
+  <div
+    class="outbox-list"
+    data-testid="outbox-list"
+    role="region"
+    aria-labelledby="outbox-heading"
+    :aria-busy="loading"
+  >
     <div class="outbox-header">
-      <h2>Outbox</h2>
+      <h2 id="outbox-heading">Outbox</h2>
       <button
         type="button"
         class="outbox-refresh"
         data-testid="outbox-refresh-btn"
-        :disabled="loading"
+        :disabled="loading || actingRowId !== null"
         @click="reload"
       >
         Refresh
       </button>
     </div>
 
-    <div v-if="loading && rows.length === 0" class="outbox-empty">Loading...</div>
-    <div v-else-if="error" class="outbox-error" data-testid="outbox-error">{{ error }}</div>
-    <div v-else-if="rows.length === 0" class="outbox-empty" data-testid="outbox-empty">
+    <div
+      v-if="listenerError"
+      class="outbox-listener-error"
+      data-testid="outbox-listener-error"
+      role="alert"
+    >
+      {{ listenerError }}
+    </div>
+
+    <div v-if="loading && rows.length === 0" class="outbox-empty" role="status">
+      Loading...
+    </div>
+    <div v-else-if="error" class="outbox-error" data-testid="outbox-error" role="alert">
+      {{ error }}
+    </div>
+    <div v-else-if="rows.length === 0" class="outbox-empty" data-testid="outbox-empty" role="status">
       No queued or failed sends.
     </div>
 
@@ -170,7 +289,11 @@ function statusLabel(row: OutboxRow): string {
         <div class="outbox-item-main">
           <div class="outbox-subject">{{ row.subject || "(no subject)" }}</div>
           <div class="outbox-recipients">{{ recipients(row) }}</div>
-          <div class="outbox-status">
+          <div
+            class="outbox-status"
+            :role="row.delivery_outcome_unknown ? 'alert' : 'status'"
+            aria-atomic="true"
+          >
             <span class="outbox-status-label">{{ statusLabel(row) }}</span>
             <span v-if="row.error_message" class="outbox-error-msg" :title="row.error_message">
               {{ row.error_message }}
@@ -182,7 +305,13 @@ function statusLabel(row: OutboxRow): string {
             type="button"
             class="outbox-btn outbox-btn-retry"
             :data-testid="`outbox-retry-${row.id}`"
-            :disabled="row.status !== 'dead'"
+            :aria-label="`Retry message: ${row.subject || '(no subject)'}`"
+            :disabled="
+              loading ||
+              actingRowId !== null ||
+              row.account_id !== accountsStore.activeAccountId ||
+              row.status !== 'dead'
+            "
             @click="retry(row)"
           >
             Retry
@@ -191,7 +320,13 @@ function statusLabel(row: OutboxRow): string {
             type="button"
             class="outbox-btn outbox-btn-discard"
             :data-testid="`outbox-discard-${row.id}`"
-            :disabled="row.status === 'sending'"
+            :aria-label="`Discard message: ${row.subject || '(no subject)'}`"
+            :disabled="
+              loading ||
+              actingRowId !== null ||
+              row.account_id !== accountsStore.activeAccountId ||
+              row.status === 'sending'
+            "
             @click="discard(row)"
           >
             Discard
@@ -250,6 +385,12 @@ function statusLabel(row: OutboxRow): string {
 
 .outbox-error {
   color: var(--color-danger-text);
+}
+
+.outbox-listener-error {
+  color: var(--color-warning-text);
+  font-size: 11px;
+  margin-bottom: 8px;
 }
 
 .outbox-items {
@@ -323,7 +464,7 @@ function statusLabel(row: OutboxRow): string {
 
 .outbox-item.unknown .outbox-status-label,
 .outbox-item.unknown .outbox-error-msg {
-  color: var(--color-warning);
+  color: var(--color-warning-text);
 }
 
 .outbox-error-msg {

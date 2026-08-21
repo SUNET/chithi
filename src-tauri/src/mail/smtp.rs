@@ -1,11 +1,18 @@
+use std::time::Duration;
+
 use lettre::address::Envelope;
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
+use lettre::transport::smtp::response::{Code, Response, Severity};
+use lettre::transport::smtp::Error as SmtpError;
 use lettre::{Address, Message};
 
 use crate::error::{Error, Result};
+
+const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SMTP_QUIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Attachment data ready to embed in a message.
 pub struct AttachmentData {
@@ -284,6 +291,68 @@ fn classify_send_error(status: Option<u16>, client_error: bool) -> Error {
     }
 }
 
+async fn await_smtp_send(
+    send: impl std::future::Future<Output = std::result::Result<Response, SmtpError>>,
+    max_wait: Duration,
+) -> Result<Response> {
+    match tokio::time::timeout(max_wait, send).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => {
+            let status = error.status().map(u16::from);
+            if let Some(code) = status {
+                log::error!("SMTP send_raw rejected with status {}", code);
+            } else if error.is_client() {
+                log::error!("SMTP send_raw rejected locally before submission");
+            } else {
+                log::error!(
+                    "SMTP send_raw failed without a negative reply; delivery outcome is unknown"
+                );
+            }
+            Err(classify_send_error(status, error.is_client()))
+        }
+        Err(_) => {
+            log::error!(
+                "SMTP send_raw timed out after {} ms; delivery outcome is unknown",
+                max_wait.as_millis()
+            );
+            Err(Error::IndeterminateDelivery)
+        }
+    }
+}
+
+fn validate_smtp_completion(code: Code) -> Result<u16> {
+    let status = u16::from(code);
+    if code.severity != Severity::PositiveCompletion {
+        log::error!(
+            "SMTP send_raw returned status {}; delivery outcome is unknown",
+            status
+        );
+        return Err(Error::IndeterminateDelivery);
+    }
+    Ok(status)
+}
+
+async fn await_smtp_quit<F, T, E>(quit: F, max_wait: Duration) -> bool
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(max_wait, quit).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            log::warn!("SMTP QUIT failed after accepted delivery: {}", error);
+            false
+        }
+        Err(_) => {
+            log::warn!(
+                "SMTP QUIT timed out after accepted delivery ({} ms)",
+                max_wait.as_millis()
+            );
+            false
+        }
+    }
+}
+
 /// Send a previously-built RFC 5322 message via SMTP.
 ///
 /// `commands::compose::send_message` and outbox retries pass the final
@@ -341,22 +410,12 @@ pub async fn send_raw(
         use_xoauth2,
     )
     .await?;
-    let response = connection.send(&envelope, raw_message).await.map_err(|e| {
-        let status = e.status().map(u16::from);
-        if let Some(code) = status {
-            log::error!("SMTP send_raw rejected with status {}", code);
-        } else if e.is_client() {
-            log::error!("SMTP send_raw rejected locally before submission");
-        } else {
-            log::error!(
-                "SMTP send_raw failed without a negative reply; delivery outcome is unknown"
-            );
-        }
-        classify_send_error(status, e.is_client())
-    })?;
+    let response =
+        await_smtp_send(connection.send(&envelope, raw_message), SMTP_SEND_TIMEOUT).await?;
 
-    let _ = connection.quit().await;
-    log::info!("SMTP send_raw success (code {})", response.code());
+    let status = validate_smtp_completion(response.code())?;
+    await_smtp_quit(connection.quit(), SMTP_QUIT_TIMEOUT).await;
+    log::info!("SMTP send_raw success (code {})", status);
     Ok(())
 }
 
@@ -850,6 +909,7 @@ pub fn insert_header_before_body(raw: &[u8], header_line: &str) -> Vec<u8> {
 #[cfg(test)]
 mod send_error_tests {
     use super::*;
+    use lettre::transport::smtp::response::{Category, Detail};
 
     #[test]
     fn negative_replies_are_definite_and_missing_status_is_indeterminate() {
@@ -875,6 +935,60 @@ mod send_error_tests {
             client_error.to_string(),
             "SMTP rejected the message before submission"
         );
+    }
+
+    #[test]
+    fn positive_completion_is_accepted() {
+        let code = Code::new(
+            Severity::PositiveCompletion,
+            Category::MailSystem,
+            Detail::Zero,
+        );
+
+        assert_eq!(validate_smtp_completion(code).unwrap(), 250);
+    }
+
+    #[test]
+    fn positive_intermediate_is_indeterminate() {
+        let code = Code::new(
+            Severity::PositiveIntermediate,
+            Category::MailSystem,
+            Detail::Four,
+        );
+
+        let error = validate_smtp_completion(code).unwrap_err();
+        assert!(error.is_indeterminate_delivery());
+    }
+
+    #[tokio::test]
+    async fn smtp_send_is_bounded_and_timeout_is_indeterminate() {
+        assert_eq!(SMTP_SEND_TIMEOUT, Duration::from_secs(5 * 60));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_smtp_send(
+                std::future::pending::<std::result::Result<Response, SmtpError>>(),
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("SMTP send timeout helper did not return within its bound");
+
+        let error = result.unwrap_err();
+        assert!(error.is_indeterminate_delivery());
+    }
+
+    #[tokio::test]
+    async fn smtp_quit_is_bounded() {
+        assert_eq!(SMTP_QUIT_TIMEOUT, Duration::from_secs(1));
+
+        let completed = await_smtp_quit(
+            std::future::pending::<std::result::Result<(), &'static str>>(),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(!completed);
     }
 
     #[test]

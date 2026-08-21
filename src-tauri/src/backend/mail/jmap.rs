@@ -30,6 +30,7 @@ async fn connect(
         &config,
         ctx.providers.transports.jmap_discovery_http.clone(),
         ctx.providers.transports.jmap_api_http.clone(),
+        ctx.providers.transports.jmap_submission_http.clone(),
     )
     .await?;
     Ok((config, connection))
