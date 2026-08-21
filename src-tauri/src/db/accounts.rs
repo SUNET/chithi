@@ -394,13 +394,6 @@ impl AccountFull {
         self.contacts_carddav_config().map(|c| c.url)
     }
 
-    /// Whether the calendar binding is enabled (replaces `calendar_sync_enabled`
-    /// on the legacy schema). Returns `false` if the account has no calendar
-    /// binding at all.
-    pub fn calendar_enabled(&self) -> bool {
-        self.calendar_binding().is_some_and(|b| b.enabled)
-    }
-
     /// Populate the legacy per-protocol fields (`provider`, `mail_protocol`,
     /// `imap_host`, ...) from the loaded `bindings` and `auth_method`.
     /// Phase 3 dropped these columns from the database, but the fields are

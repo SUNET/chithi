@@ -7,9 +7,10 @@
 //!
 //! The backend now owns the dialog: `pick_attachments` opens the native
 //! dialog, canonicalises each chosen path, stores the mapping in an
-//! in-memory token registry, and returns opaque tokens. The renderer
-//! can only refer to files it actually picked; unknown tokens are
-//! rejected at send time.
+//! in-memory token registry, and returns opaque tokens. Send and draft
+//! flows use `peek_tokens` to validate tokens before building attachment
+//! data. A send releases its tokens only after the message is persisted
+//! to the outbox, preserving retries while rejecting unknown tokens.
 
 use serde::Serialize;
 use tauri::State;
@@ -19,13 +20,12 @@ use crate::error::{Error, Result};
 use crate::state::AppState;
 
 /// Opaque handle returned to the renderer after a successful pick.
-/// Contains no path information; the file metadata is included so the
-/// compose UI can render a chip without needing the raw path.
+/// Contains no path information; the name lets the compose UI render a
+/// chip without needing the raw path.
 #[derive(Debug, Serialize)]
 pub struct AttachmentHandle {
     pub token: String,
     pub name: String,
-    pub size: u64,
 }
 
 /// Open a native file-picker dialog, register each selected file under
@@ -33,7 +33,7 @@ pub struct AttachmentHandle {
 ///
 /// The token is a v4 UUID. The backend stores `token -> canonical_path`
 /// in `AppState::attachments`. Later send/save flows resolve tokens via
-/// `consume_tokens` / `peek_tokens` and pass the resulting paths into
+/// `peek_tokens` and pass the resulting paths into
 /// `build_attachment_data`; tokens the renderer invents will not match
 /// and are rejected.
 ///
@@ -63,7 +63,7 @@ pub async fn pick_attachments(
 
     // Resolve + stat every picked file before touching the registry so a
     // bad pick doesn't leave a half-populated state.
-    let mut resolved: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(paths.len());
+    let mut resolved = Vec::with_capacity(paths.len());
     for file_path in paths {
         let path = file_path
             .as_path()
@@ -92,12 +92,12 @@ pub async fn pick_attachments(
             )));
         }
 
-        resolved.push((canonical, metadata.len()));
+        resolved.push(canonical);
     }
 
     let mut handles = Vec::with_capacity(resolved.len());
     let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
-    for (canonical, size) in resolved {
+    for canonical in resolved {
         // Dedup by canonical path: if the same file was already registered
         // in this session, hand back the existing token. The renderer then
         // sees the same token and its dedup-by-token check keeps the
@@ -120,7 +120,7 @@ pub async fn pick_attachments(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "attachment".to_string());
 
-        handles.push(AttachmentHandle { token, name, size });
+        handles.push(AttachmentHandle { token, name });
     }
 
     Ok(handles)
@@ -138,33 +138,10 @@ pub fn release_attachment(state: State<'_, AppState>, token: String) -> Result<(
     Ok(())
 }
 
-/// Remove the given tokens from the registry and return the canonical
-/// paths in the same order. Unknown tokens produce an error so a
-/// compromised renderer cannot inject bogus handles into a send.
-///
-/// Atomic under the registry lock: either every token is validated and
-/// removed, or the call errors out and the registry is unchanged. This
-/// keeps retries viable when the caller mixes a valid bunch with one
-/// stale token.
-pub fn consume_tokens(state: &AppState, tokens: &[String]) -> Result<Vec<std::path::PathBuf>> {
-    let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
-    for t in tokens {
-        if !reg.contains_key(t) {
-            return Err(Error::Other(
-                "Unknown or expired attachment token".to_string(),
-            ));
-        }
-    }
-    Ok(tokens
-        .iter()
-        .map(|t| reg.remove(t).expect("contains_key checked above"))
-        .collect())
-}
-
-/// Release the given tokens, ignoring any that are unknown. Useful for
-/// best-effort cleanup (e.g. after a successful send has persisted the
-/// message bytes elsewhere). Unlike `consume_tokens`, this does not
-/// fail on stale tokens.
+/// Release the given tokens, ignoring any that are unknown. This is
+/// cleanup only: send flows validate with `peek_tokens`, build the
+/// attachment data, and call this only after successful outbox
+/// persistence so earlier failures remain retryable.
 pub fn release_tokens(state: &AppState, tokens: &[String]) {
     let mut reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
     for t in tokens {
@@ -172,9 +149,10 @@ pub fn release_tokens(state: &AppState, tokens: &[String]) {
     }
 }
 
-/// Look up the given tokens *without* removing them. Used by drafts:
-/// the user may save a draft and keep editing, so we must not consume
-/// the registry entry on every save.
+/// Validate and resolve the given tokens *without* removing them.
+/// Unknown tokens are rejected so the renderer cannot request arbitrary
+/// paths. Send and draft flows use the returned paths to build attachment
+/// data while retaining the registry entries through any fallible work.
 pub fn peek_tokens(state: &AppState, tokens: &[String]) -> Result<Vec<std::path::PathBuf>> {
     let reg = state.attachments.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::with_capacity(tokens.len());
@@ -186,4 +164,63 @@ pub fn peek_tokens(state: &AppState, tokens: &[String]) -> Result<Vec<std::path:
         out.push(path);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{peek_tokens, release_tokens};
+    use crate::state::AppState;
+
+    fn attachment_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temporary app directory");
+        let state = AppState::new(dir.path().to_path_buf()).expect("app state");
+        (dir, state)
+    }
+
+    #[test]
+    fn peek_rejects_unknown_tokens_without_consuming_valid_ones() {
+        let (_dir, state) = attachment_state();
+        let token = "known-token".to_string();
+        let path = state.data_dir.join("picked-file");
+        state
+            .attachments
+            .lock()
+            .unwrap()
+            .insert(token.clone(), path.clone());
+
+        let error = peek_tokens(&state, &[token.clone(), "forged-token".to_string()])
+            .expect_err("forged token must be rejected");
+
+        assert_eq!(error.to_string(), "Unknown or expired attachment token");
+        assert_eq!(peek_tokens(&state, &[token]).unwrap(), vec![path]);
+    }
+
+    #[test]
+    fn release_cleans_up_peeked_tokens_only() {
+        let (_dir, state) = attachment_state();
+        let released_token = "released-token".to_string();
+        let retained_token = "retained-token".to_string();
+        let released_path = state.data_dir.join("released-file");
+        let retained_path = state.data_dir.join("retained-file");
+        {
+            let mut registry = state.attachments.lock().unwrap();
+            registry.insert(released_token.clone(), released_path.clone());
+            registry.insert(retained_token.clone(), retained_path.clone());
+        }
+
+        assert_eq!(
+            peek_tokens(&state, std::slice::from_ref(&released_token)).unwrap(),
+            vec![released_path]
+        );
+        release_tokens(
+            &state,
+            &[released_token.clone(), "unknown-token".to_string()],
+        );
+
+        assert!(peek_tokens(&state, &[released_token]).is_err());
+        assert_eq!(
+            peek_tokens(&state, &[retained_token]).unwrap(),
+            vec![retained_path]
+        );
+    }
 }

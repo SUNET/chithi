@@ -61,15 +61,6 @@ pub fn get(conn: &Connection, event_id: &str) -> Result<Option<MeetMeeting>> {
     Ok(row)
 }
 
-/// Drop the binding row after ownership has moved elsewhere.
-pub fn delete(conn: &Connection, event_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM meet_meetings WHERE event_id = ?1",
-        params![event_id],
-    )?;
-    Ok(())
-}
-
 pub fn account_has_lifecycle_references(conn: &Connection, account_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(

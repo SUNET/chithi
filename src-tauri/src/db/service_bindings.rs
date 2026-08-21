@@ -162,28 +162,6 @@ pub fn list_for_account(conn: &Connection, account_id: &str) -> Result<Vec<Servi
     Ok(rows)
 }
 
-pub fn list_all(conn: &Connection) -> Result<Vec<ServiceBinding>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, account_id, service, protocol, enabled, sync_interval_seconds, config_json
-         FROM service_bindings
-         ORDER BY account_id, service, protocol",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(ServiceBinding {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                service: row.get(2)?,
-                protocol: row.get(3)?,
-                enabled: row.get(4)?,
-                sync_interval_seconds: row.get(5)?,
-                config_json: row.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
 pub fn insert(conn: &Connection, b: &ServiceBinding) -> Result<()> {
     conn.execute(
         "INSERT INTO service_bindings
@@ -199,28 +177,6 @@ pub fn insert(conn: &Connection, b: &ServiceBinding) -> Result<()> {
             b.config_json,
         ],
     )?;
-    Ok(())
-}
-
-pub fn update(conn: &Connection, b: &ServiceBinding) -> Result<()> {
-    let rows = conn.execute(
-        "UPDATE service_bindings
-         SET enabled = ?1, sync_interval_seconds = ?2, config_json = ?3,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?4",
-        params![b.enabled, b.sync_interval_seconds, b.config_json, b.id],
-    )?;
-    if rows == 0 {
-        return Err(crate::error::Error::Other(format!(
-            "service_binding {} not found",
-            b.id
-        )));
-    }
-    Ok(())
-}
-
-pub fn delete(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM service_bindings WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -1097,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn crud_round_trip() {
+    fn insert_and_list_round_trip() {
         let conn = setup_db();
         conn.execute(
             "INSERT INTO accounts (id, display_name, email, provider, username) VALUES ('a1', 'A', 'a@e', 'generic', 'u')",
@@ -1116,17 +1072,6 @@ mod tests {
         let listed = list_for_account(&conn, "a1").unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].sync_interval_seconds, Some(120));
-
-        let mut updated = listed[0].clone();
-        updated.enabled = false;
-        updated.sync_interval_seconds = None;
-        update(&conn, &updated).unwrap();
-        let after = list_for_account(&conn, "a1").unwrap();
-        assert!(!after[0].enabled);
-        assert_eq!(after[0].sync_interval_seconds, None);
-
-        delete(&conn, "a1-mail").unwrap();
-        assert!(list_for_account(&conn, "a1").unwrap().is_empty());
     }
 
     #[test]

@@ -258,17 +258,10 @@ pub struct CalDavEvent {
     pub ical_data: String,
 }
 
-// ---------------------------------------------------------------------------
-// XML namespace constants
-// ---------------------------------------------------------------------------
-
-// XML namespace URIs used in CalDAV/WebDAV (kept for reference).
-#[allow(dead_code)]
-const NS_DAV: &str = "DAV:";
-#[allow(dead_code)]
-const NS_CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
-#[allow(dead_code)]
-const NS_APPLE_ICAL: &str = "http://apple.com/ns/ical/";
+// XML payloads below use these namespace URIs:
+// - WebDAV: `DAV:`
+// - CalDAV: `urn:ietf:params:xml:ns:caldav`
+// - Apple iCal: `http://apple.com/ns/ical/`
 
 // ---------------------------------------------------------------------------
 // CalDavClient implementation

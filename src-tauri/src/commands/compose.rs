@@ -69,18 +69,10 @@ fn resolve_body_html(message: &ComposeMessage) -> Option<String> {
 /// An attachment referenced by the renderer. `token` is the opaque handle
 /// returned by `commands::attachments::pick_attachments`; the backend
 /// resolves it to the real canonical path at send/save time.
-///
-/// `size` is accepted but ignored — the renderer carries it for UI
-/// purposes and Tauri IPC round-trips the ComposeAttachment structure
-/// verbatim. Declaring it here (instead of relying on serde's implicit
-/// unknown-field tolerance) makes the contract explicit.
 #[derive(Debug, Deserialize)]
 pub struct FileAttachment {
     pub token: String,
     pub name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub size: Option<u64>,
 }
 
 /// Send an email. Validates and reads attachments synchronously, then spawns

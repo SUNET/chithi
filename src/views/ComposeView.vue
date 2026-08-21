@@ -620,7 +620,6 @@ async function addAttachment() {
       attachments.value.push({
         token: handle.token,
         name: handle.name,
-        size: handle.size,
       });
     }
   }
