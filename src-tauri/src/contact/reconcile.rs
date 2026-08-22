@@ -156,6 +156,73 @@ impl CompleteRemoteIdSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct DeltaRecord {
+    current_remote_id: String,
+    previous_remote_ids: Vec<String>,
+    patch: RemoteContactPatch,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteIdDelta {
+    records: Vec<DeltaRecord>,
+    deleted_remote_ids: Vec<String>,
+}
+
+impl RemoteIdDelta {
+    pub(crate) fn new(
+        upserts: Vec<(RemoteContactPatch, Vec<String>)>,
+        deleted_remote_ids: Vec<String>,
+    ) -> Result<Self> {
+        let mut records = Vec::with_capacity(upserts.len());
+        let mut claimed_identities = HashSet::new();
+        for (patch, previous_remote_ids) in upserts {
+            let current_remote_id = patch.validated_remote_id()?.to_string();
+            if !claimed_identities.insert(current_remote_id.clone()) {
+                return Err(Error::Sync(
+                    "contact delta contains a duplicate current remote ID".into(),
+                ));
+            }
+            records.push(DeltaRecord {
+                current_remote_id,
+                previous_remote_ids,
+                patch,
+            });
+        }
+        for record in &records {
+            for previous_remote_id in &record.previous_remote_ids {
+                if previous_remote_id.trim().is_empty() {
+                    return Err(Error::Sync(
+                        "contact delta contains a blank previous remote ID".into(),
+                    ));
+                }
+                if !claimed_identities.insert(previous_remote_id.clone()) {
+                    return Err(Error::Sync(
+                        "contact delta contains crossed or duplicate remote-ID aliases".into(),
+                    ));
+                }
+            }
+        }
+        let mut deleted_seen = HashSet::with_capacity(deleted_remote_ids.len());
+        for remote_id in &deleted_remote_ids {
+            if remote_id.trim().is_empty() {
+                return Err(Error::Sync(
+                    "contact delta contains a blank deleted remote ID".into(),
+                ));
+            }
+            if !deleted_seen.insert(remote_id.clone()) || claimed_identities.contains(remote_id) {
+                return Err(Error::Sync(
+                    "contact delta contains crossed or duplicate deletion identities".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            records,
+            deleted_remote_ids,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct RemoteIdBaseline {
     account_id: String,
     book_id: String,
@@ -197,6 +264,14 @@ struct ReconcilePlan {
     report: ReconcileReport,
 }
 
+#[derive(Debug)]
+struct DeltaReconcilePlan {
+    book_id: String,
+    mutations: Vec<PlannedMutation>,
+    deletions: Vec<String>,
+    report: ReconcileReport,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContactValues {
     uid: Option<String>,
@@ -224,7 +299,7 @@ struct StoredContact {
 /// Detach ambiguous legacy identity assignments without deleting contact data.
 /// A nonblank UID wins, then the oldest creation timestamp and lowest ID. The
 /// repair commits independently before the caller captures its sync baseline;
-/// Graph is the first adopter, while duplicate detection remains fail-closed.
+/// Graph and Google adopt it, while duplicate detection remains fail-closed.
 pub(crate) fn repair_duplicate_managed_remote_ids(
     conn: &mut Connection,
     account_id: &str,
@@ -232,10 +307,26 @@ pub(crate) fn repair_duplicate_managed_remote_ids(
     expected_sync_type: &str,
 ) -> Result<DuplicateRemoteIdRepairReport> {
     let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_book_scope(&transaction, account_id, book_id, expected_sync_type)?;
+    let report = repair_duplicate_managed_remote_ids_in_transaction(
+        &transaction,
+        account_id,
+        book_id,
+        expected_sync_type,
+    )?;
+    transaction.commit()?;
+    Ok(report)
+}
+
+fn repair_duplicate_managed_remote_ids_in_transaction(
+    conn: &Connection,
+    account_id: &str,
+    book_id: &str,
+    expected_sync_type: &str,
+) -> Result<DuplicateRemoteIdRepairReport> {
+    verify_book_scope(conn, account_id, book_id, expected_sync_type)?;
 
     let contacts = {
-        let mut statement = transaction.prepare(
+        let mut statement = conn.prepare(
             "SELECT id, uid, remote_id, created_at
              FROM contacts
              WHERE book_id = ?1 AND remote_id IS NOT NULL",
@@ -281,7 +372,7 @@ pub(crate) fn repair_duplicate_managed_remote_ids(
 
         report.duplicate_remote_ids += 1;
         for (id, _, _) in candidates.iter().skip(1) {
-            let detached = transaction.execute(
+            let detached = conn.execute(
                 "UPDATE contacts
                  SET remote_id = NULL, updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?1 AND book_id = ?2 AND remote_id = ?3",
@@ -295,8 +386,6 @@ pub(crate) fn repair_duplicate_managed_remote_ids(
             report.detached += 1;
         }
     }
-
-    transaction.commit()?;
     Ok(report)
 }
 
@@ -402,6 +491,205 @@ pub(crate) fn reconcile_remote_id_snapshot_batch_with_postcheck<T>(
     let postcheck_result = postcheck(&transaction)?;
     transaction.commit()?;
     Ok((reports, postcheck_result))
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile_remote_id_delta_with_postcheck<T>(
+    conn: &mut Connection,
+    baseline: &RemoteIdBaseline,
+    delta: RemoteIdDelta,
+    postcheck: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(ReconcileReport, T)> {
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    verify_book_scope(
+        &transaction,
+        &baseline.account_id,
+        &baseline.book_id,
+        &baseline.sync_type,
+    )?;
+    let current_rows = load_contacts(&transaction, &baseline.book_id)?;
+    let plan = build_delta_reconcile_plan(baseline, current_rows, delta)?;
+    let report = apply_delta_reconcile_plan(&transaction, plan)?;
+    let postcheck_result = postcheck(&transaction)?;
+    transaction.commit()?;
+    Ok((report, postcheck_result))
+}
+
+pub(crate) fn reconcile_remote_id_delta_with_repair_and_postcheck<T>(
+    conn: &mut Connection,
+    account_id: &str,
+    book_id: &str,
+    expected_sync_type: &str,
+    delta: RemoteIdDelta,
+    postcheck: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(DuplicateRemoteIdRepairReport, ReconcileReport, T)> {
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let repair = repair_duplicate_managed_remote_ids_in_transaction(
+        &transaction,
+        account_id,
+        book_id,
+        expected_sync_type,
+    )?;
+    let rows = load_contacts(&transaction, book_id)?;
+    let baseline = RemoteIdBaseline {
+        account_id: account_id.into(),
+        book_id: book_id.into(),
+        sync_type: expected_sync_type.into(),
+        rows: rows.clone(),
+    };
+    let plan = build_delta_reconcile_plan(&baseline, rows, delta)?;
+    let report = apply_delta_reconcile_plan(&transaction, plan)?;
+    let postcheck_result = postcheck(&transaction)?;
+    transaction.commit()?;
+    Ok((repair, report, postcheck_result))
+}
+
+pub(crate) fn reconcile_remote_id_delta_into_new_book_with_postcheck<T>(
+    conn: &mut Connection,
+    account_id: &str,
+    book_id: &str,
+    book_name: &str,
+    sync_type: &str,
+    delta: RemoteIdDelta,
+    postcheck: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(ReconcileReport, T)> {
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let inserted = transaction.execute(
+        "INSERT INTO contact_books (id, account_id, name, sync_type)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![book_id, account_id, book_name, sync_type],
+    )?;
+    if inserted != 1 {
+        return Err(Error::Sync(
+            "contact book insert affected an unexpected number of rows".into(),
+        ));
+    }
+    let baseline = RemoteIdBaseline {
+        account_id: account_id.into(),
+        book_id: book_id.into(),
+        sync_type: sync_type.into(),
+        rows: Vec::new(),
+    };
+    let plan = build_delta_reconcile_plan(&baseline, Vec::new(), delta)?;
+    let report = apply_delta_reconcile_plan(&transaction, plan)?;
+    let postcheck_result = postcheck(&transaction)?;
+    transaction.commit()?;
+    Ok((report, postcheck_result))
+}
+
+fn apply_delta_reconcile_plan(
+    conn: &Connection,
+    plan: DeltaReconcilePlan,
+) -> Result<ReconcileReport> {
+    let DeltaReconcilePlan {
+        book_id,
+        mutations,
+        deletions,
+        report,
+    } = plan;
+    for mutation in mutations {
+        match mutation {
+            PlannedMutation::Update { contact_id, patch } => {
+                update_owned_fields(conn, &book_id, &contact_id, &patch)?;
+            }
+            PlannedMutation::Insert { patch } => {
+                insert_contact(conn, &book_id, &patch.insert_values())?;
+            }
+        }
+    }
+    for contact_id in deletions {
+        let deleted = conn.execute(
+            "DELETE FROM contacts WHERE id = ?1 AND book_id = ?2",
+            params![contact_id, book_id],
+        )?;
+        if deleted != 1 {
+            return Err(Error::Sync(format!(
+                "contact {contact_id:?} changed while applying a remote delta deletion"
+            )));
+        }
+    }
+    Ok(report)
+}
+
+fn build_delta_reconcile_plan(
+    baseline: &RemoteIdBaseline,
+    current_rows: Vec<StoredContact>,
+    delta: RemoteIdDelta,
+) -> Result<DeltaReconcilePlan> {
+    let baseline_matches = match_delta_rows(&delta.records, &baseline.rows, "baseline")?;
+    let current_matches = match_delta_rows(&delta.records, &current_rows, "current")?;
+    let baseline_by_remote = index_managed_row_indices(&baseline.rows, "baseline")?;
+    let current_by_remote = index_managed_row_indices(&current_rows, "current")?;
+    let mut report = ReconcileReport::default();
+    let mut mutations = Vec::with_capacity(delta.records.len());
+
+    for ((record, baseline_index), current_index) in delta
+        .records
+        .into_iter()
+        .zip(baseline_matches)
+        .zip(current_matches)
+    {
+        let baseline_row = baseline_index.map(|index| &baseline.rows[index]);
+        let current_row = current_index.map(|index| &current_rows[index]);
+        match (baseline_row, current_row) {
+            (Some(baseline_row), Some(current_row))
+                if baseline_row.id == current_row.id && baseline_row == current_row =>
+            {
+                if record.patch.apply(&current_row.values) == current_row.values {
+                    report.unchanged_or_stale += 1;
+                } else {
+                    mutations.push(PlannedMutation::Update {
+                        contact_id: current_row.id.clone(),
+                        patch: record.patch,
+                    });
+                    report.updated += 1;
+                }
+            }
+            (None, None) => {
+                mutations.push(PlannedMutation::Insert {
+                    patch: record.patch,
+                });
+                report.inserted += 1;
+            }
+            _ => {
+                return Err(Error::Sync(format!(
+                    "contact delta identity {:?} changed after baseline capture",
+                    record.current_remote_id
+                )));
+            }
+        }
+    }
+
+    let mut deletions = Vec::with_capacity(delta.deleted_remote_ids.len());
+    for remote_id in delta.deleted_remote_ids {
+        let baseline_row = baseline_by_remote
+            .get(remote_id.as_str())
+            .map(|index| &baseline.rows[*index]);
+        let current_row = current_by_remote
+            .get(remote_id.as_str())
+            .map(|index| &current_rows[*index]);
+        match (baseline_row, current_row) {
+            (Some(baseline_row), Some(current_row))
+                if baseline_row.id == current_row.id && baseline_row == current_row =>
+            {
+                deletions.push(current_row.id.clone());
+                report.deleted += 1;
+            }
+            (None, None) => report.unchanged_or_stale += 1,
+            _ => {
+                return Err(Error::Sync(format!(
+                    "contact delta deletion identity {remote_id:?} changed after baseline capture"
+                )));
+            }
+        }
+    }
+
+    Ok(DeltaReconcilePlan {
+        book_id: baseline.book_id.clone(),
+        mutations,
+        deletions,
+        report,
+    })
 }
 
 fn build_reconcile_plan(
@@ -557,22 +845,7 @@ fn match_snapshot_rows(
     match_policy: SnapshotMatchPolicy,
     state: &str,
 ) -> Result<Vec<Option<usize>>> {
-    let mut by_remote_id = HashMap::new();
-    for (index, row) in rows.iter().enumerate() {
-        let Some(remote_id) = row
-            .values
-            .remote_id
-            .as_deref()
-            .filter(|remote_id| !remote_id.trim().is_empty())
-        else {
-            continue;
-        };
-        if by_remote_id.insert(remote_id, index).is_some() {
-            return Err(Error::Sync(format!(
-                "duplicate local managed remote ID {remote_id:?} in {state} contact rows"
-            )));
-        }
-    }
+    let by_remote_id = index_managed_row_indices(rows, state)?;
 
     let mut matches = vec![None; records.len()];
     let mut claimed_rows = HashMap::with_capacity(records.len());
@@ -625,6 +898,78 @@ fn match_snapshot_rows(
                 if claimed_rows.insert(row_index, record_index).is_some() {
                     return Err(Error::Sync(format!(
                         "multiple remote contacts claim one {state} contact row"
+                    )));
+                }
+                matches[record_index] = Some(row_index);
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn index_managed_row_indices<'a>(
+    rows: &'a [StoredContact],
+    state: &str,
+) -> Result<HashMap<&'a str, usize>> {
+    let mut by_remote_id = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Some(remote_id) = row
+            .values
+            .remote_id
+            .as_deref()
+            .filter(|remote_id| !remote_id.trim().is_empty())
+        else {
+            continue;
+        };
+        if by_remote_id.insert(remote_id, index).is_some() {
+            return Err(Error::Sync(format!(
+                "duplicate local managed remote ID {remote_id:?} in {state} contact rows"
+            )));
+        }
+    }
+    Ok(by_remote_id)
+}
+
+fn match_delta_rows(
+    records: &[DeltaRecord],
+    rows: &[StoredContact],
+    state: &str,
+) -> Result<Vec<Option<usize>>> {
+    let by_remote_id = index_managed_row_indices(rows, state)?;
+    let mut matches = vec![None; records.len()];
+    let mut claimed_rows = HashMap::with_capacity(records.len());
+
+    for (record_index, record) in records.iter().enumerate() {
+        let Some(row_index) = by_remote_id.get(record.current_remote_id.as_str()).copied() else {
+            continue;
+        };
+        matches[record_index] = Some(row_index);
+        claimed_rows.insert(row_index, record_index);
+    }
+
+    for (record_index, record) in records.iter().enumerate() {
+        let alias_matches: HashSet<usize> = record
+            .previous_remote_ids
+            .iter()
+            .filter_map(|remote_id| by_remote_id.get(remote_id.as_str()).copied())
+            .collect();
+        if alias_matches.len() > 1 {
+            return Err(Error::Sync(format!(
+                "contact delta aliases identify multiple {state} rows"
+            )));
+        }
+        let alias_match = alias_matches.into_iter().next();
+        match (matches[record_index], alias_match) {
+            (Some(current_match), Some(alias_match)) if current_match != alias_match => {
+                return Err(Error::Sync(format!(
+                    "contact delta current ID and aliases identify different {state} rows"
+                )));
+            }
+            (Some(_), _) | (None, None) => {}
+            (None, Some(row_index)) => {
+                if claimed_rows.insert(row_index, record_index).is_some() {
+                    return Err(Error::Sync(format!(
+                        "multiple contact delta records claim one {state} row"
                     )));
                 }
                 matches[record_index] = Some(row_index);
@@ -1884,5 +2229,309 @@ mod tests {
         );
         assert!(contact_by_remote(&connection, "book-a", "inserted-first").is_none());
         assert!(contact_by_remote(&connection, "book-a", "boom").is_none());
+    }
+
+    #[test]
+    fn remote_delta_rejects_crossed_duplicate_and_blank_identities() {
+        let valid = graph_patch("current", "Current");
+        assert!(RemoteIdDelta::new(
+            vec![(valid.clone(), vec!["previous".into()])],
+            vec!["deleted".into()],
+        )
+        .is_ok());
+        for delta in [
+            RemoteIdDelta::new(
+                vec![(valid.clone(), vec!["previous".into(), "previous".into()])],
+                Vec::new(),
+            ),
+            RemoteIdDelta::new(vec![(valid.clone(), vec!["current".into()])], Vec::new()),
+            RemoteIdDelta::new(
+                vec![(valid.clone(), vec!["previous".into()])],
+                vec!["previous".into()],
+            ),
+            RemoteIdDelta::new(vec![(valid.clone(), vec![" ".into()])], Vec::new()),
+            RemoteIdDelta::new(
+                vec![(valid.clone(), Vec::new()), (valid.clone(), Vec::new())],
+                Vec::new(),
+            ),
+            RemoteIdDelta::new(vec![(valid.clone(), Vec::new())], vec!["".into()]),
+            RemoteIdDelta::new(
+                vec![(valid.clone(), Vec::new())],
+                vec!["deleted".into(), "deleted".into()],
+            ),
+        ] {
+            assert!(delta.is_err());
+        }
+    }
+
+    #[test]
+    fn remote_delta_migrates_aliases_and_only_deletes_explicit_rows() {
+        let mut connection = setup_db();
+        add_contact(&connection, "migrated", "book-a", Some("old-id"), "Old");
+        add_contact(
+            &connection,
+            "deleted",
+            "book-a",
+            Some("delete-id"),
+            "Delete",
+        );
+        add_contact(
+            &connection,
+            "untouched",
+            "book-a",
+            Some("untouched-id"),
+            "Untouched",
+        );
+        add_contact(&connection, "local", "book-a", None, "Local");
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let delta = RemoteIdDelta::new(
+            vec![
+                (graph_patch("new-id", "Migrated"), vec!["old-id".into()]),
+                (graph_patch("inserted-id", "Inserted"), Vec::new()),
+            ],
+            vec!["delete-id".into(), "already-absent".into()],
+        )
+        .unwrap();
+        let callback_ran = std::cell::Cell::new(false);
+
+        let (report, ()) =
+            reconcile_remote_id_delta_with_postcheck(&mut connection, &baseline, delta, |_| {
+                callback_ran.set(true);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(callback_ran.get());
+        assert_eq!(report.inserted, 1);
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.unchanged_or_stale, 1);
+        let migrated = contact(&connection, "book-a", "migrated").unwrap();
+        assert_eq!(migrated.values.remote_id.as_deref(), Some("new-id"));
+        assert_eq!(migrated.values.display_name, "Migrated");
+        assert!(contact(&connection, "book-a", "deleted").is_none());
+        assert!(contact(&connection, "book-a", "untouched").is_some());
+        assert!(contact(&connection, "book-a", "local").is_some());
+    }
+
+    #[test]
+    fn remote_delta_stale_state_prevents_mutation_and_token_advancement() {
+        let mut connection = setup_db();
+        add_contact(
+            &connection,
+            "managed",
+            "book-a",
+            Some("remote-id"),
+            "Before",
+        );
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        connection
+            .execute(
+                "UPDATE contacts SET display_name = 'Local edit' WHERE id = 'managed'",
+                [],
+            )
+            .unwrap();
+        let delta = RemoteIdDelta::new(
+            vec![(graph_patch("remote-id", "Remote edit"), Vec::new())],
+            Vec::new(),
+        )
+        .unwrap();
+        let callback_ran = std::cell::Cell::new(false);
+
+        assert!(reconcile_remote_id_delta_with_postcheck(
+            &mut connection,
+            &baseline,
+            delta,
+            |_| {
+                callback_ran.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+
+        assert!(!callback_ran.get());
+        assert_eq!(
+            contact(&connection, "book-a", "managed")
+                .unwrap()
+                .values
+                .display_name,
+            "Local edit"
+        );
+    }
+
+    #[test]
+    fn remote_delta_postcheck_failure_rolls_back_and_empty_delta_still_runs_it() {
+        let mut connection = setup_db();
+        add_contact(
+            &connection,
+            "managed",
+            "book-a",
+            Some("remote-id"),
+            "Before",
+        );
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let delta = RemoteIdDelta::new(
+            vec![(graph_patch("remote-id", "Updated"), Vec::new())],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(reconcile_remote_id_delta_with_postcheck(
+            &mut connection,
+            &baseline,
+            delta,
+            |_| Err::<(), _>(Error::Sync("token write failed".into())),
+        )
+        .is_err());
+        assert_eq!(
+            contact(&connection, "book-a", "managed")
+                .unwrap()
+                .values
+                .display_name,
+            "Before"
+        );
+
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let callback_ran = std::cell::Cell::new(false);
+        let (report, ()) = reconcile_remote_id_delta_with_postcheck(
+            &mut connection,
+            &baseline,
+            RemoteIdDelta::new(Vec::new(), Vec::new()).unwrap(),
+            |_| {
+                callback_ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(report, ReconcileReport::default());
+        assert!(callback_ran.get());
+    }
+
+    #[test]
+    fn delta_repair_and_postcheck_share_one_transaction() {
+        let mut connection = setup_db();
+        add_repair_contact(
+            &connection,
+            "winner",
+            "book-a",
+            Some("uid"),
+            Some("remote-id"),
+            "2020-01-01 00:00:00",
+        );
+        add_repair_contact(
+            &connection,
+            "duplicate",
+            "book-a",
+            None,
+            Some("remote-id"),
+            "2021-01-01 00:00:00",
+        );
+        let delta = || {
+            RemoteIdDelta::new(
+                vec![(graph_patch("remote-id", "Remote"), Vec::new())],
+                Vec::new(),
+            )
+            .unwrap()
+        };
+
+        assert!(reconcile_remote_id_delta_with_repair_and_postcheck(
+            &mut connection,
+            "account-a",
+            "book-a",
+            "o365",
+            delta(),
+            |_| Err::<(), _>(Error::Sync("token write failed".into())),
+        )
+        .is_err());
+        assert_eq!(
+            contact(&connection, "book-a", "winner")
+                .unwrap()
+                .values
+                .remote_id
+                .as_deref(),
+            Some("remote-id")
+        );
+        assert_eq!(
+            contact(&connection, "book-a", "duplicate")
+                .unwrap()
+                .values
+                .remote_id
+                .as_deref(),
+            Some("remote-id")
+        );
+
+        let (repair, report, ()) = reconcile_remote_id_delta_with_repair_and_postcheck(
+            &mut connection,
+            "account-a",
+            "book-a",
+            "o365",
+            delta(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(repair.detached, 1);
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            contact(&connection, "book-a", "winner")
+                .unwrap()
+                .values
+                .display_name,
+            "Remote"
+        );
+        assert_eq!(
+            contact(&connection, "book-a", "duplicate")
+                .unwrap()
+                .values
+                .remote_id,
+            None
+        );
+    }
+
+    #[test]
+    fn new_book_delta_and_postcheck_are_atomic() {
+        let mut connection = setup_db();
+        let delta = || {
+            RemoteIdDelta::new(
+                vec![(graph_patch("remote-id", "Remote"), Vec::new())],
+                Vec::new(),
+            )
+            .unwrap()
+        };
+
+        assert!(reconcile_remote_id_delta_into_new_book_with_postcheck(
+            &mut connection,
+            "account-a",
+            "new-book",
+            "New Book",
+            "o365",
+            delta(),
+            |_| Err::<(), _>(Error::Sync("token write failed".into())),
+        )
+        .is_err());
+        let books: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM contact_books WHERE id = 'new-book'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(books, 0);
+        assert!(contact_by_remote(&connection, "new-book", "remote-id").is_none());
+
+        let (report, ()) = reconcile_remote_id_delta_into_new_book_with_postcheck(
+            &mut connection,
+            "account-a",
+            "new-book",
+            "New Book",
+            "o365",
+            delta(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(report.inserted, 1);
+        assert!(contact_by_remote(&connection, "new-book", "remote-id").is_some());
     }
 }

@@ -37,8 +37,8 @@ pub struct BookRef<'a> {
 }
 
 /// What to persist on the local contact row after a successful push.
-/// `None` fields are left untouched (etag/vcard are CardDAV-only;
-/// updates usually return no new remote_id).
+/// `None` fields are left untouched. CardDAV uses ETag/vCard metadata;
+/// Google uses the CONTACT-source ETag and may canonicalize a resource name.
 pub struct PushedContact {
     pub remote_id: Option<String>,
     pub etag: Option<String>,
@@ -50,6 +50,29 @@ pub trait ContactBackend: Send + Sync {
     /// Protocol discriminator stored on the contacts service binding
     /// (`service_bindings.protocol`).
     fn protocol(&self) -> &'static str;
+
+    /// Persist provider recovery state in the same transaction as an
+    /// optimistic local mutation. Most providers need no marker; Google uses
+    /// it to force a safe full reconciliation if the subsequent push does not
+    /// complete. Returning an error aborts the local mutation.
+    fn prepare_local_mutation(
+        &self,
+        _conn: &rusqlite::Connection,
+        _account: &AccountFull,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear provider recovery state after the remote push and any returned
+    /// metadata have been persisted. Commands call this in the metadata
+    /// transaction; providers without recovery markers use the default no-op.
+    fn complete_local_mutation(
+        &self,
+        _conn: &rusqlite::Connection,
+        _account: &AccountFull,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Full account contact sync: fetch remote books/contacts and
     /// reconcile the local DB (including pushing local unpushed rows

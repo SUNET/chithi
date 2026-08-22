@@ -149,7 +149,12 @@ async fn push_created_contact_best_effort(
 
             let persistence = {
                 let conn = state.db.writer().await;
-                persist_pushed_metadata(&conn, &contact.id, &pushed)
+                (|| {
+                    let transaction = conn.unchecked_transaction()?;
+                    persist_pushed_metadata(&transaction, &contact.id, &pushed)?;
+                    backend.complete_local_mutation(&transaction, account)?;
+                    transaction.commit().map_err(Error::Database)
+                })()
             };
             if let Err(error) = persistence {
                 log::error!(
@@ -298,7 +303,12 @@ pub async fn create_contact(
     };
     {
         let conn = state.db.writer().await;
-        db::contacts::insert_contact(&conn, &c)?;
+        let transaction = conn.unchecked_transaction()?;
+        if let (Some(backend), Some(account)) = (backend, account.as_ref()) {
+            backend.prepare_local_mutation(&transaction, account)?;
+        }
+        db::contacts::insert_contact(&transaction, &c)?;
+        transaction.commit()?;
     }
     log::info!("Created contact {} '{}'", id, c.display_name);
 
@@ -374,7 +384,12 @@ pub async fn update_contact(state: State<'_, AppState>, contact: Contact) -> Res
 
     {
         let conn = state.db.writer().await;
-        db::contacts::update_contact(&conn, &updated)?;
+        let transaction = conn.unchecked_transaction()?;
+        if let (Some(backend), Some(account)) = (backend, account.as_ref()) {
+            backend.prepare_local_mutation(&transaction, account)?;
+        }
+        db::contacts::update_contact(&transaction, &updated)?;
+        transaction.commit()?;
     }
     log::info!("Updated contact {}", updated.id);
 
@@ -396,13 +411,16 @@ pub async fn update_contact(state: State<'_, AppState>, contact: Contact) -> Res
                 .await
             {
                 Ok(pushed) => {
-                    if let Some(pushed) = pushed {
-                        let persistence = {
-                            let conn = state.db.writer().await;
-                            persist_pushed_metadata(&conn, &updated.id, &pushed)
-                        };
-                        persistence?;
-                    }
+                    let persistence = {
+                        let conn = state.db.writer().await;
+                        let transaction = conn.unchecked_transaction()?;
+                        if let Some(pushed) = pushed.as_ref() {
+                            persist_pushed_metadata(&transaction, &updated.id, pushed)?;
+                        }
+                        backend.complete_local_mutation(&transaction, account)?;
+                        transaction.commit().map_err(Error::Database)
+                    };
+                    persistence?;
                     log::info!(
                         "update_contact: pushed via {}: {}",
                         backend.protocol(),
@@ -486,7 +504,12 @@ pub async fn delete_contact(state: State<'_, AppState>, contact_id: String) -> R
 
     {
         let conn = state.db.writer().await;
-        db::contacts::delete_contact(&conn, &contact_id)?;
+        let transaction = conn.unchecked_transaction()?;
+        if let (Some(backend), Some(account)) = (backend, account.as_ref()) {
+            backend.prepare_local_mutation(&transaction, account)?;
+        }
+        db::contacts::delete_contact(&transaction, &contact_id)?;
+        transaction.commit()?;
     }
     log::info!("Deleted contact {}", contact_id);
 
@@ -507,11 +530,29 @@ pub async fn delete_contact(state: State<'_, AppState>, contact_id: String) -> R
             .push_deleted_contact(&backend_ctx(&state), account, remote_id)
             .await
         {
-            Ok(()) => log::info!(
-                "delete_contact: deleted from {}: {}",
-                backend.protocol(),
-                remote_id
-            ),
+            Ok(()) => {
+                let completion = {
+                    let conn = state.db.writer().await;
+                    (|| {
+                        let transaction = conn.unchecked_transaction()?;
+                        backend.complete_local_mutation(&transaction, account)?;
+                        transaction.commit().map_err(Error::Database)
+                    })()
+                };
+                match completion {
+                    Ok(()) => log::info!(
+                        "delete_contact: deleted from {}: {}",
+                        backend.protocol(),
+                        remote_id
+                    ),
+                    Err(error) => log::error!(
+                        "delete_contact: {} remote delete succeeded but recovery-state cleanup \
+                         failed: {}",
+                        backend.protocol(),
+                        error
+                    ),
+                }
+            }
             Err(e) => log::warn!(
                 "delete_contact: {} delete failed: {}",
                 backend.protocol(),

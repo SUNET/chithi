@@ -218,11 +218,11 @@ describe("Google Calendar: color mapping (#12)", () => {
 describe("Google Contacts: People API (#13, #14)", () => {
   it("create contact builds Person resource", () => {
     const person = {
-      names: [{ givenName: "Alice Smith" }],
+      names: [{ unstructuredName: "Alice Smith" }],
       emailAddresses: [{ value: "alice@example.com" }],
       phoneNumbers: [{ value: "+1 555 0123" }],
     };
-    expect(person.names[0].givenName).toBe("Alice Smith");
+    expect(person.names[0].unstructuredName).toBe("Alice Smith");
     expect(person.emailAddresses[0].value).toBe("alice@example.com");
   });
 
@@ -232,11 +232,12 @@ describe("Google Contacts: People API (#13, #14)", () => {
     expect(url).toBe("https://people.googleapis.com/v1/people/c12345:deleteContact");
   });
 
-  it("update contact URL includes updatePersonFields", () => {
+  it("update contact URL includes only changed Person fields", () => {
     const resourceName = "people/c12345";
-    const url = `https://people.googleapis.com/v1/${resourceName}:updateContact?updatePersonFields=names,emailAddresses,phoneNumbers`;
-    expect(url).toContain("updatePersonFields=");
-    expect(url).toContain("names");
+    const changedFields = ["phoneNumbers"];
+    const url = `https://people.googleapis.com/v1/${resourceName}:updateContact?updatePersonFields=${changedFields.join(",")}`;
+    expect(url).toContain("updatePersonFields=phoneNumbers");
+    expect(url).not.toContain("names,");
   });
 
   it("sync_type must be 'google' to push to People API", () => {
