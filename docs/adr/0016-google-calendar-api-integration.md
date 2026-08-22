@@ -34,9 +34,14 @@ When a Gmail attendee responds to an invite in Chithi:
 
 | Operation | API Call |
 |-----------|----------|
-| List contacts | `GET /v1/people/me/connections?personFields=names,emailAddresses,phoneNumbers,organizations` |
+| List contact changes | `GET /v1/people/me/connections?personFields=metadata&requestSyncToken=true` |
+| Read complete contacts | `GET /v1/people:batchGet` |
 | Create contact | `POST /v1/people:createContact` |
+| Update contact | `PATCH /v1/{resourceName}:updateContact` |
 | Delete contact | `DELETE /v1/{resourceName}:deleteContact` |
+
+ADR 0017 defines the later sync-token, contact-only source, batch-detail,
+alias/tombstone reconciliation and update-ETag requirements.
 
 ### Routing Logic
 Account operations check `provider` before `mail_protocol`:
@@ -57,7 +62,6 @@ See `docs/google_calendar_todo.md` for the full TODO list. Key remaining items:
 - Incremental sync with syncToken (#7)
 - Recurring event handling (#9)
 - Calendar ID mapping (currently uses "primary") (#3)
-- Contact update via People API (#14)
 
 ## Consequences
 - Gmail calendar events sync two-way: create, update, delete all reflected on Google

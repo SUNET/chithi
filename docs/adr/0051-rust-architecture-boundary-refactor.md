@@ -507,9 +507,10 @@ Use small PRs in approximately this order:
     currently inverted.
 19. Contact reconciliation shared across providers without merging protocol
     clients/discovery.
-    The Graph remote-ID and JMAP remote-ID-then-UID checkpoints use the shared
-    reconciler as of 2026-08-22. Google and CardDAV still require complete,
-    fail-closed snapshot adapters before this sequence item is complete.
+    The Graph remote-ID snapshot, JMAP remote-ID-then-UID snapshot and Google
+    alias-aware remote-ID delta checkpoints use the shared reconciler as of
+    2026-08-22. CardDAV still requires a complete, fail-closed snapshot adapter
+    before this sequence item is complete.
 20. Unknown-provider IMAP fallback removed after compatibility audit.
 21. Legacy provider aliases normalized at lookup boundaries only.
 

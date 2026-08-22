@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::backend::contacts::google::google_contact_state_key;
 use crate::commands::calendar::random_calendar_color;
 use crate::db;
 use crate::db::calendar::NewCalendar;
@@ -8,6 +9,14 @@ use crate::error::Result;
 use crate::oauth::OAuthTokens;
 use crate::provider::ZoomTokenLifecycleGuard;
 use crate::state::AppState;
+
+fn delete_account_metadata(conn: &rusqlite::Connection, account_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM app_metadata WHERE key = ?1",
+        [google_contact_state_key(account_id)],
+    )?;
+    Ok(())
+}
 
 pub(crate) fn insert_zoom_account(
     conn: &rusqlite::Connection,
@@ -53,6 +62,7 @@ fn delete_account_data(
     // transaction rolls the event transfer back together with the deletion.
     let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
         .cleanup_lifecycle_ids;
+    delete_account_metadata(&transaction, account_id)?;
     db::accounts::delete_account(&transaction, account_id)?;
 
     if is_standalone_zoom {
@@ -96,6 +106,7 @@ fn abandon_zoom_account_data(
     )?;
     let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
         .cleanup_lifecycle_ids;
+    delete_account_metadata(&transaction, account_id)?;
     db::accounts::delete_account(&transaction, account_id)?;
     token_guard.delete_and_commit(move || {
         transaction.commit()?;
@@ -585,6 +596,10 @@ mod tests {
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL
             );
+            CREATE TABLE app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )
         .unwrap();
@@ -717,10 +732,25 @@ mod tests {
         let identity = binding.meet_config().unwrap();
         assert_eq!(identity.zoom_user_id, "zoom-user");
         assert_eq!(identity.zoom_account_id, "zoom-account");
+        let contact_state_key = google_contact_state_key("zoom");
+        conn.execute(
+            "INSERT INTO app_metadata (key, value) VALUES (?1, '{}')",
+            [&contact_state_key],
+        )
+        .unwrap();
 
         delete_account_data(&conn, "zoom", &token_guard).unwrap();
         assert!(!account_exists(&conn, "zoom"));
         assert!(store.load("zoom").unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM app_metadata WHERE key = ?1",
+                [&contact_state_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -758,6 +788,12 @@ mod tests {
             &token_guard,
         )
         .unwrap();
+        let contact_state_key = google_contact_state_key("zoom");
+        conn.execute(
+            "INSERT INTO app_metadata (key, value) VALUES (?1, '{}')",
+            [&contact_state_key],
+        )
+        .unwrap();
         store.fail_delete.store(true, Ordering::SeqCst);
 
         assert!(delete_account_data(&conn, "zoom", &token_guard).is_err());
@@ -769,6 +805,15 @@ mod tests {
             1
         );
         assert!(store.load("zoom").unwrap().is_some());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM app_metadata WHERE key = ?1",
+                [&contact_state_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -859,6 +904,12 @@ mod tests {
             [],
         )
         .unwrap();
+        let contact_state_key = google_contact_state_key("zoom");
+        conn.execute(
+            "INSERT INTO app_metadata (key, value) VALUES (?1, '{}')",
+            [&contact_state_key],
+        )
+        .unwrap();
 
         abandon_zoom_account_data(&conn, "zoom", &token_guard).unwrap();
 
@@ -875,6 +926,15 @@ mod tests {
                 .get::<_, i64>(
                 0
             ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM app_metadata WHERE key = ?1",
+                [&contact_state_key],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap(),
             0
         );
