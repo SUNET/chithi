@@ -82,19 +82,38 @@ impl RemoteContactPatch {
 #[derive(Debug, Clone)]
 struct SnapshotRecord {
     remote_id: String,
+    uid: Option<String>,
     patch: RemoteContactPatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotMatchPolicy {
+    RemoteIdOnly,
+    RemoteIdThenUid,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompleteRemoteIdSnapshot {
     records: Vec<SnapshotRecord>,
-    remote_ids: HashSet<String>,
+    match_policy: SnapshotMatchPolicy,
 }
 
 impl CompleteRemoteIdSnapshot {
     pub(crate) fn new(patches: Vec<RemoteContactPatch>) -> Result<Self> {
+        Self::with_match_policy(patches, SnapshotMatchPolicy::RemoteIdOnly)
+    }
+
+    pub(crate) fn new_with_uid_fallback(patches: Vec<RemoteContactPatch>) -> Result<Self> {
+        Self::with_match_policy(patches, SnapshotMatchPolicy::RemoteIdThenUid)
+    }
+
+    fn with_match_policy(
+        patches: Vec<RemoteContactPatch>,
+        match_policy: SnapshotMatchPolicy,
+    ) -> Result<Self> {
         let mut records = Vec::with_capacity(patches.len());
         let mut remote_ids = HashSet::with_capacity(patches.len());
+        let mut remote_uids = HashSet::with_capacity(patches.len());
 
         for patch in patches {
             let remote_id = patch.validated_remote_id()?.to_string();
@@ -103,12 +122,35 @@ impl CompleteRemoteIdSnapshot {
                     "complete contact snapshot contains duplicate remote ID {remote_id:?}"
                 )));
             }
-            records.push(SnapshotRecord { remote_id, patch });
+            let uid = match match_policy {
+                SnapshotMatchPolicy::RemoteIdOnly => None,
+                SnapshotMatchPolicy::RemoteIdThenUid => {
+                    let uid = match &patch.uid {
+                        RemoteField::Set(Some(uid)) if !uid.trim().is_empty() => uid.clone(),
+                        _ => {
+                            return Err(Error::Sync(
+                                "UID-aware contact snapshot contains a missing UID".into(),
+                            ));
+                        }
+                    };
+                    if !remote_uids.insert(uid.clone()) {
+                        return Err(Error::Sync(
+                            "UID-aware contact snapshot contains a duplicate UID".into(),
+                        ));
+                    }
+                    Some(uid)
+                }
+            };
+            records.push(SnapshotRecord {
+                remote_id,
+                uid,
+                patch,
+            });
         }
 
         Ok(Self {
             records,
-            remote_ids,
+            match_policy,
         })
     }
 }
@@ -133,6 +175,26 @@ pub(crate) struct ReconcileReport {
 pub(crate) struct DuplicateRemoteIdRepairReport {
     pub duplicate_remote_ids: usize,
     pub detached: usize,
+}
+
+#[derive(Debug)]
+enum PlannedMutation {
+    Update {
+        contact_id: String,
+        patch: RemoteContactPatch,
+    },
+    Insert {
+        patch: RemoteContactPatch,
+    },
+}
+
+#[derive(Debug)]
+struct ReconcilePlan {
+    book_id: String,
+    match_policy: SnapshotMatchPolicy,
+    mutations: Vec<PlannedMutation>,
+    deletions: Vec<String>,
+    report: ReconcileReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,32 +324,116 @@ pub(crate) fn reconcile_remote_id_snapshot(
     baseline: &RemoteIdBaseline,
     snapshot: CompleteRemoteIdSnapshot,
 ) -> Result<ReconcileReport> {
-    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    verify_book_scope(
-        &transaction,
-        &baseline.account_id,
-        &baseline.book_id,
-        &baseline.sync_type,
-    )?;
+    let reports = reconcile_remote_id_snapshot_batch(conn, vec![(baseline.clone(), snapshot)])?;
+    reports
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Sync("contact reconciliation produced no report".into()))
+}
 
-    let current_rows = load_contacts(&transaction, &baseline.book_id)?;
-    let current_by_remote = index_managed_rows(&current_rows, "current")?;
-    let baseline_by_remote = index_managed_rows(&baseline.rows, "baseline")?;
+pub(crate) fn reconcile_remote_id_snapshot_batch(
+    conn: &mut Connection,
+    reconciliations: Vec<(RemoteIdBaseline, CompleteRemoteIdSnapshot)>,
+) -> Result<Vec<ReconcileReport>> {
+    let (reports, ()) =
+        reconcile_remote_id_snapshot_batch_with_postcheck(conn, reconciliations, |_| Ok(()))?;
+    Ok(reports)
+}
+
+pub(crate) fn reconcile_remote_id_snapshot_batch_with_postcheck<T>(
+    conn: &mut Connection,
+    reconciliations: Vec<(RemoteIdBaseline, CompleteRemoteIdSnapshot)>,
+    postcheck: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<(Vec<ReconcileReport>, T)> {
+    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut seen_books = HashSet::with_capacity(reconciliations.len());
+    let mut plans = Vec::with_capacity(reconciliations.len());
+    for (baseline, snapshot) in reconciliations {
+        if !seen_books.insert(baseline.book_id.clone()) {
+            return Err(Error::Sync(
+                "contact reconciliation batch contains a duplicate book".into(),
+            ));
+        }
+        verify_book_scope(
+            &transaction,
+            &baseline.account_id,
+            &baseline.book_id,
+            &baseline.sync_type,
+        )?;
+        let current_rows = load_contacts(&transaction, &baseline.book_id)?;
+        plans.push(build_reconcile_plan(baseline, current_rows, snapshot)?);
+    }
+
+    let mut reports = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let ReconcilePlan {
+            book_id,
+            match_policy,
+            mutations,
+            deletions,
+            report,
+        } = plan;
+        for mutation in mutations {
+            match mutation {
+                PlannedMutation::Update { contact_id, patch } => {
+                    update_owned_fields(&transaction, &book_id, &contact_id, &patch)?;
+                }
+                PlannedMutation::Insert { patch } => {
+                    insert_contact(&transaction, &book_id, &patch.insert_values())?;
+                }
+            }
+        }
+        for contact_id in deletions {
+            let deleted = transaction.execute(
+                "DELETE FROM contacts WHERE id = ?1 AND book_id = ?2",
+                params![contact_id, book_id],
+            )?;
+            if deleted != 1 {
+                return Err(Error::Sync(format!(
+                    "contact {contact_id:?} changed while deleting"
+                )));
+            }
+        }
+        if match_policy == SnapshotMatchPolicy::RemoteIdThenUid {
+            verify_unique_nonblank_uids(&transaction, &book_id)?;
+        }
+        reports.push(report);
+    }
+    let postcheck_result = postcheck(&transaction)?;
+    transaction.commit()?;
+    Ok((reports, postcheck_result))
+}
+
+fn build_reconcile_plan(
+    baseline: RemoteIdBaseline,
+    current_rows: Vec<StoredContact>,
+    snapshot: CompleteRemoteIdSnapshot,
+) -> Result<ReconcilePlan> {
+    let CompleteRemoteIdSnapshot {
+        records,
+        match_policy,
+    } = snapshot;
+    let baseline_matches = match_snapshot_rows(&records, &baseline.rows, match_policy, "baseline")?;
+    let current_matches = match_snapshot_rows(&records, &current_rows, match_policy, "current")?;
+    let claimed_baseline_ids: HashSet<&str> = baseline_matches
+        .iter()
+        .flatten()
+        .map(|index| baseline.rows[*index].id.as_str())
+        .collect();
     let current_by_id: HashMap<&str, &StoredContact> = current_rows
         .iter()
         .map(|contact| (contact.id.as_str(), contact))
         .collect();
 
-    let CompleteRemoteIdSnapshot {
-        records,
-        remote_ids,
-    } = snapshot;
     let mut report = ReconcileReport::default();
-
-    for record in records {
-        let baseline_row = baseline_by_remote.get(record.remote_id.as_str()).copied();
-        let current_row = current_by_remote.get(record.remote_id.as_str()).copied();
-
+    let mut mutations = Vec::new();
+    for ((record, baseline_index), current_index) in records
+        .into_iter()
+        .zip(baseline_matches)
+        .zip(current_matches)
+    {
+        let baseline_row = baseline_index.map(|index| &baseline.rows[index]);
+        let current_row = current_index.map(|index| &current_rows[index]);
         match (baseline_row, current_row) {
             (Some(baseline_row), Some(current_row))
                 if baseline_row.id == current_row.id && baseline_row == current_row =>
@@ -296,54 +442,50 @@ pub(crate) fn reconcile_remote_id_snapshot(
                 if updated_values == current_row.values {
                     report.unchanged_or_stale += 1;
                 } else {
-                    update_owned_fields(
-                        &transaction,
-                        &baseline.book_id,
-                        &current_row.id,
-                        &record.patch,
-                    )?;
+                    mutations.push(PlannedMutation::Update {
+                        contact_id: current_row.id.clone(),
+                        patch: record.patch,
+                    });
                     report.updated += 1;
                 }
             }
             (None, None) => {
-                insert_contact(
-                    &transaction,
-                    &baseline.book_id,
-                    &record.patch.insert_values(),
-                )?;
+                mutations.push(PlannedMutation::Insert {
+                    patch: record.patch,
+                });
                 report.inserted += 1;
             }
-            _ => {
-                report.unchanged_or_stale += 1;
-            }
+            _ => report.unchanged_or_stale += 1,
         }
     }
 
-    for (remote_id, baseline_row) in baseline_by_remote {
-        if remote_ids.contains(remote_id) {
+    let mut deletions = Vec::new();
+    for baseline_row in &baseline.rows {
+        if baseline_row
+            .values
+            .remote_id
+            .as_deref()
+            .is_none_or(|remote_id| remote_id.trim().is_empty())
+            || claimed_baseline_ids.contains(baseline_row.id.as_str())
+        {
             continue;
         }
-
         match current_by_id.get(baseline_row.id.as_str()).copied() {
             Some(current_row) if current_row == baseline_row => {
-                let deleted = transaction.execute(
-                    "DELETE FROM contacts WHERE id = ?1 AND book_id = ?2",
-                    params![baseline_row.id, baseline.book_id],
-                )?;
-                if deleted != 1 {
-                    return Err(Error::Sync(format!(
-                        "contact {} changed while deleting",
-                        baseline_row.id
-                    )));
-                }
+                deletions.push(baseline_row.id.clone());
                 report.deleted += 1;
             }
             _ => report.unchanged_or_stale += 1,
         }
     }
 
-    transaction.commit()?;
-    Ok(report)
+    Ok(ReconcilePlan {
+        book_id: baseline.book_id,
+        match_policy,
+        mutations,
+        deletions,
+        report,
+    })
 }
 
 fn verify_book_scope(
@@ -409,12 +551,14 @@ fn load_contacts(conn: &Connection, book_id: &str) -> Result<Vec<StoredContact>>
     Ok(contacts)
 }
 
-fn index_managed_rows<'a>(
-    rows: &'a [StoredContact],
+fn match_snapshot_rows(
+    records: &[SnapshotRecord],
+    rows: &[StoredContact],
+    match_policy: SnapshotMatchPolicy,
     state: &str,
-) -> Result<HashMap<&'a str, &'a StoredContact>> {
+) -> Result<Vec<Option<usize>>> {
     let mut by_remote_id = HashMap::new();
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let Some(remote_id) = row
             .values
             .remote_id
@@ -423,13 +567,87 @@ fn index_managed_rows<'a>(
         else {
             continue;
         };
-        if by_remote_id.insert(remote_id, row).is_some() {
+        if by_remote_id.insert(remote_id, index).is_some() {
             return Err(Error::Sync(format!(
                 "duplicate local managed remote ID {remote_id:?} in {state} contact rows"
             )));
         }
     }
-    Ok(by_remote_id)
+
+    let mut matches = vec![None; records.len()];
+    let mut claimed_rows = HashMap::with_capacity(records.len());
+    for (record_index, record) in records.iter().enumerate() {
+        let Some(row_index) = by_remote_id.get(record.remote_id.as_str()).copied() else {
+            continue;
+        };
+        matches[record_index] = Some(row_index);
+        if claimed_rows.insert(row_index, record_index).is_some() {
+            return Err(Error::Sync(format!(
+                "multiple remote contacts claim one {state} contact row"
+            )));
+        }
+    }
+
+    if match_policy == SnapshotMatchPolicy::RemoteIdOnly {
+        return Ok(matches);
+    }
+
+    let mut by_uid = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Some(uid) = row
+            .values
+            .uid
+            .as_deref()
+            .filter(|uid| !uid.trim().is_empty())
+        else {
+            continue;
+        };
+        if by_uid.insert(uid, index).is_some() {
+            return Err(Error::Sync(format!(
+                "duplicate local UID in {state} contact rows"
+            )));
+        }
+    }
+
+    for (record_index, record) in records.iter().enumerate() {
+        let uid = record.uid.as_deref().ok_or_else(|| {
+            Error::Sync("UID-aware contact snapshot lost its validated UID".into())
+        })?;
+        let uid_match = by_uid.get(uid).copied();
+        match (matches[record_index], uid_match) {
+            (Some(remote_match), Some(uid_match)) if remote_match != uid_match => {
+                return Err(Error::Sync(format!(
+                    "remote ID and UID identify different {state} contact rows"
+                )));
+            }
+            (Some(_), _) | (None, None) => {}
+            (None, Some(row_index)) => {
+                if claimed_rows.insert(row_index, record_index).is_some() {
+                    return Err(Error::Sync(format!(
+                        "multiple remote contacts claim one {state} contact row"
+                    )));
+                }
+                matches[record_index] = Some(row_index);
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn verify_unique_nonblank_uids(conn: &Connection, book_id: &str) -> Result<()> {
+    let mut statement = conn.prepare("SELECT uid FROM contacts WHERE book_id = ?1")?;
+    let uids = statement
+        .query_map(params![book_id], |row| row.get::<_, Option<String>>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    for uid in uids.into_iter().flatten() {
+        if !uid.trim().is_empty() && !seen.insert(uid) {
+            return Err(Error::Sync(
+                "UID-aware reconciliation produced duplicate local UIDs".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn update_owned_fields(
@@ -669,6 +887,31 @@ mod tests {
         }
     }
 
+    fn uid_patch(remote_id: &str, uid: &str, display_name: &str) -> RemoteContactPatch {
+        RemoteContactPatch {
+            uid: RemoteField::Set(Some(uid.into())),
+            display_name: RemoteField::Set(display_name.into()),
+            emails_json: RemoteField::Set("[]".into()),
+            phones_json: RemoteField::Set("[]".into()),
+            addresses_json: RemoteField::Preserve,
+            organization: RemoteField::Set(None),
+            title: RemoteField::Set(None),
+            notes: RemoteField::Set(None),
+            vcard_data: RemoteField::Preserve,
+            remote_id: RemoteField::Set(Some(remote_id.into())),
+            etag: RemoteField::Preserve,
+        }
+    }
+
+    fn set_uid(connection: &Connection, contact_id: &str, uid: &str) {
+        connection
+            .execute(
+                "UPDATE contacts SET uid = ?1 WHERE id = ?2",
+                params![uid, contact_id],
+            )
+            .unwrap();
+    }
+
     fn contact(connection: &Connection, book_id: &str, id: &str) -> Option<StoredContact> {
         load_contacts(connection, book_id)
             .unwrap()
@@ -830,6 +1073,289 @@ mod tests {
                 .values
                 .display_name,
             "Before"
+        );
+    }
+
+    #[test]
+    fn uid_aware_snapshot_requires_unique_nonblank_set_uids() {
+        for uid in ["", "   ", "\u{2003}"] {
+            let mut patch = uid_patch("remote", "uid", "Remote");
+            patch.uid = RemoteField::Set(Some(uid.into()));
+            assert!(CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![patch]).is_err());
+        }
+
+        let mut preserved = uid_patch("remote", "uid", "Remote");
+        preserved.uid = RemoteField::Preserve;
+        assert!(CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![preserved]).is_err());
+        let mut missing = uid_patch("remote", "uid", "Remote");
+        missing.uid = RemoteField::Set(None);
+        assert!(CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![missing]).is_err());
+        assert!(CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![
+            uid_patch("one", "same", "One"),
+            uid_patch("two", "same", "Two"),
+        ])
+        .is_err());
+        assert!(CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![
+            uid_patch("one", "uid", "One"),
+            uid_patch("two", " uid ", "Two"),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn uid_fallback_adopts_local_row_and_changed_remote_id_without_deletion() {
+        let mut connection = setup_db();
+        add_contact(&connection, "draft", "book-a", None, "Local draft");
+        set_uid(&connection, "draft", "stable-uid");
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+            "remote-1",
+            "stable-uid",
+            "Remote",
+        )])
+        .unwrap();
+
+        let report = reconcile_remote_id_snapshot(&mut connection, &baseline, snapshot).unwrap();
+
+        assert_eq!(report.updated, 1);
+        assert_eq!(load_contacts(&connection, "book-a").unwrap().len(), 1);
+        let adopted = contact(&connection, "book-a", "draft").unwrap();
+        assert_eq!(adopted.values.remote_id.as_deref(), Some("remote-1"));
+        assert_eq!(adopted.values.uid.as_deref(), Some("stable-uid"));
+        assert_eq!(adopted.values.display_name, "Remote");
+
+        let next_baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let moved_snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+            "remote-2",
+            "stable-uid",
+            "Remote moved",
+        )])
+        .unwrap();
+        let moved =
+            reconcile_remote_id_snapshot(&mut connection, &next_baseline, moved_snapshot).unwrap();
+        assert_eq!(moved.updated, 1);
+        assert_eq!(moved.deleted, 0);
+        assert_eq!(load_contacts(&connection, "book-a").unwrap().len(), 1);
+        let adopted = contact(&connection, "book-a", "draft").unwrap();
+        assert_eq!(adopted.values.remote_id.as_deref(), Some("remote-2"));
+        assert_eq!(adopted.values.display_name, "Remote moved");
+    }
+
+    #[test]
+    fn uid_fallback_fails_closed_on_crossed_or_duplicate_local_identity() {
+        let mut connection = setup_db();
+        add_contact(
+            &connection,
+            "remote-row",
+            "book-a",
+            Some("remote"),
+            "Managed",
+        );
+        set_uid(&connection, "remote-row", "other-uid");
+        add_contact(&connection, "uid-row", "book-a", None, "Draft");
+        set_uid(&connection, "uid-row", "remote-uid");
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+            "remote",
+            "remote-uid",
+            "Remote",
+        )])
+        .unwrap();
+
+        let error = reconcile_remote_id_snapshot(&mut connection, &baseline, snapshot).unwrap_err();
+
+        assert!(error.to_string().contains("identify different"));
+        assert_eq!(
+            contact(&connection, "book-a", "remote-row")
+                .unwrap()
+                .values
+                .display_name,
+            "Managed"
+        );
+        assert_eq!(
+            contact(&connection, "book-a", "uid-row")
+                .unwrap()
+                .values
+                .remote_id,
+            None
+        );
+
+        connection
+            .execute("UPDATE contacts SET uid = 'same'", [])
+            .unwrap();
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+            "remote", "same", "Remote",
+        )])
+        .unwrap();
+        let error = reconcile_remote_id_snapshot(&mut connection, &baseline, snapshot).unwrap_err();
+        assert!(error.to_string().contains("duplicate local UID"));
+    }
+
+    #[test]
+    fn uid_fallback_respects_stale_baseline_without_inserting_a_duplicate() {
+        let mut connection = setup_db();
+        add_contact(&connection, "draft", "book-a", None, "Before");
+        set_uid(&connection, "draft", "stable-uid");
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        connection
+            .execute(
+                "UPDATE contacts SET display_name = 'Local edit' WHERE id = 'draft'",
+                [],
+            )
+            .unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+            "remote",
+            "stable-uid",
+            "Remote edit",
+        )])
+        .unwrap();
+
+        let report = reconcile_remote_id_snapshot(&mut connection, &baseline, snapshot).unwrap();
+
+        assert_eq!(report.unchanged_or_stale, 1);
+        assert_eq!(report.inserted + report.updated + report.deleted, 0);
+        assert_eq!(load_contacts(&connection, "book-a").unwrap().len(), 1);
+        let draft = contact(&connection, "book-a", "draft").unwrap();
+        assert_eq!(draft.values.display_name, "Local edit");
+        assert_eq!(draft.values.remote_id, None);
+    }
+
+    #[test]
+    fn remote_id_only_mode_does_not_adopt_or_validate_uids() {
+        let mut connection = setup_db();
+        add_contact(&connection, "draft-a", "book-a", None, "Draft A");
+        add_contact(&connection, "draft-b", "book-a", None, "Draft B");
+        set_uid(&connection, "draft-a", "duplicate-uid");
+        set_uid(&connection, "draft-b", "duplicate-uid");
+        let baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let snapshot =
+            CompleteRemoteIdSnapshot::new(vec![graph_patch("remote", "Remote")]).unwrap();
+
+        let report = reconcile_remote_id_snapshot(&mut connection, &baseline, snapshot).unwrap();
+
+        assert_eq!(report.inserted, 1);
+        assert_eq!(load_contacts(&connection, "book-a").unwrap().len(), 3);
+        assert_eq!(
+            contact_by_remote(&connection, "book-a", "remote")
+                .unwrap()
+                .values
+                .uid,
+            None
+        );
+    }
+
+    #[test]
+    fn multi_book_batch_and_postcheck_failures_roll_back_every_book() {
+        let mut connection = setup_db();
+        add_contact(&connection, "first", "book-a", Some("remote-a"), "Before A");
+        add_contact(
+            &connection,
+            "second",
+            "book-a-other",
+            Some("remote-b"),
+            "Before B",
+        );
+        set_uid(&connection, "first", "uid-a");
+        set_uid(&connection, "second", "uid-b");
+        let first_baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a", "o365").unwrap();
+        let second_baseline =
+            capture_remote_id_baseline(&connection, "account-a", "book-a-other", "o365").unwrap();
+        let reconciliations = vec![
+            (
+                first_baseline.clone(),
+                CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+                    "remote-a",
+                    "uid-a",
+                    "Updated A",
+                )])
+                .unwrap(),
+            ),
+            (
+                second_baseline.clone(),
+                CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+                    "remote-b",
+                    "uid-b",
+                    "Updated B",
+                )])
+                .unwrap(),
+            ),
+        ];
+
+        let error = reconcile_remote_id_snapshot_batch_with_postcheck(
+            &mut connection,
+            reconciliations,
+            |_| Err::<(), _>(Error::Sync("injected postcheck failure".into())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("postcheck"));
+        assert_eq!(
+            contact(&connection, "book-a", "first")
+                .unwrap()
+                .values
+                .display_name,
+            "Before A"
+        );
+        assert_eq!(
+            contact(&connection, "book-a-other", "second")
+                .unwrap()
+                .values
+                .display_name,
+            "Before B"
+        );
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_second_book_update
+                 BEFORE UPDATE ON contacts
+                 WHEN OLD.id = 'second'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected second book failure');
+                 END;",
+            )
+            .unwrap();
+        let reconciliations = vec![
+            (
+                first_baseline,
+                CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+                    "remote-a",
+                    "uid-a",
+                    "Updated A",
+                )])
+                .unwrap(),
+            ),
+            (
+                second_baseline,
+                CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![uid_patch(
+                    "remote-b",
+                    "uid-b",
+                    "Updated B",
+                )])
+                .unwrap(),
+            ),
+        ];
+        assert!(reconcile_remote_id_snapshot_batch(&mut connection, reconciliations).is_err());
+        assert_eq!(
+            contact(&connection, "book-a", "first")
+                .unwrap()
+                .values
+                .display_name,
+            "Before A"
+        );
+        assert_eq!(
+            contact(&connection, "book-a-other", "second")
+                .unwrap()
+                .values
+                .display_name,
+            "Before B"
         );
     }
 
