@@ -554,6 +554,33 @@ mod endpoint_tests {
     }
 
     #[tokio::test]
+    async fn contacts_reject_a_repeated_next_link_before_requesting_it_again() {
+        let (root, captured) = serve_many(|root| {
+            let next_link = format!("{root}/page-2");
+            vec![
+                serde_json::json!({
+                    "value": [complete_contact("one")],
+                    "@odata.nextLink": next_link,
+                })
+                .to_string(),
+                serde_json::json!({
+                    "value": [complete_contact("two")],
+                    "@odata.nextLink": next_link,
+                })
+                .to_string(),
+            ]
+        })
+        .await;
+
+        let error = test_client(&root).list_contacts().await.unwrap_err();
+
+        assert!(error.to_string().contains("repeated a continuation URL"));
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /injected/page-2 "));
+    }
+
+    #[tokio::test]
     async fn contacts_reject_cross_origin_next_link_without_requesting_it() {
         let (foreign_root, mut foreign_request) = serve_once(r#"{"value":[]}"#).await;
         let (root, captured) = serve_many(move |_| {
@@ -2086,6 +2113,7 @@ impl GraphClient {
     pub async fn list_contacts(&self) -> Result<Vec<GraphContact>> {
         let mut contacts = Vec::new();
         let mut next_path: Option<String> = None;
+        let mut seen_continuations = std::collections::HashSet::new();
         loop {
             let resp: serde_json::Value = match next_path.take() {
                 Some(path) => self.get_absolute(&path).await?,
@@ -2112,6 +2140,11 @@ impl GraphClient {
             match resp.get("@odata.nextLink") {
                 None | Some(serde_json::Value::Null) => break,
                 Some(serde_json::Value::String(next)) if !next.trim().is_empty() => {
+                    if !seen_continuations.insert(next.clone()) {
+                        return Err(Error::Other(
+                            "Graph contacts pagination repeated a continuation URL".into(),
+                        ));
+                    }
                     next_path = Some(next.clone());
                 }
                 Some(serde_json::Value::String(_)) => {
