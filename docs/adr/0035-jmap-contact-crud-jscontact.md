@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted; amended for contact migration checkpoint 1 on 2026-08-21.
+Accepted; amended for contact migration checkpoint 2 on 2026-08-22.
 
 ## Context
 
@@ -130,10 +130,34 @@ same still-unpushed local row in the same book, with collision and one-row
 checks. If attachment fails, the backend attempts a strict compensating remote
 delete and reports the sync failure.
 
-Checkpoint 1 deliberately retains the handwritten remote-ID-based per-book
-reconciliation loop. It does not match by UID and does not provide shared
-interrupted-sync recovery. Checkpoint 2 will adopt the UID-aware shared
-reconciler and its recovery semantics.
+Checkpoint 2 uses the shared contact reconciler with an explicit JMAP identity
+policy. Every snapshot record is matched by remote ID first, then by its exact
+nonblank UID only when no remote-ID match exists. All remote-ID matches are
+reserved before UID fallback, so record order cannot steal a directly matched
+row. Duplicate local managed remote IDs or UIDs, duplicate snapshot identities,
+and a remote ID and UID that identify different local rows fail closed rather
+than choosing an arbitrary row. Graph retains its separate remote-ID-only
+policy.
+
+UID fallback recovers an interrupted create: if the server committed a card
+but Chithi did not attach its returned ID, the next complete fetch reuses the
+unchanged local row with the same UID and attaches the remote ID. A changed
+remote ID with the same UID likewise reuses the row and is not pruned under its
+old ID. Full-row baselines still protect local changes made after capture.
+
+All mapped JMAP contact books are planned before writes and their contact-row
+changes, UID uniqueness checks, and pending-create validation commit in one
+SQLite transaction. Validated address-book row inserts and name updates happen
+before that transaction and may remain after a later contact identity error;
+they contain no contact data and the next sync reuses them.
+
+Before any remote create, pending nonblank UIDs must be unique and absent from
+the complete account-wide remote UID set. Missing legacy UIDs receive a fresh
+`<UUID>@chithi` value that avoids every known remote or pending UID. The
+post-create attachment requires the same local row, book, exact UID, and blank
+remote ID that were used for creation. Ambiguous duplicate managed remote IDs
+are not automatically detached in JMAP because detached rows would become
+eligible for an unintended remote create.
 
 Remote address books absent from a later AddressBook/get result are not deleted
 locally in this checkpoint. Duplicate and stale local book rows are likewise
@@ -153,6 +177,8 @@ operation for removing only one membership.
   IDs where available.
 - JMAP contact sync and deferred-create failures propagate according to ADR
   0050; no partial remote snapshot is treated as authoritative.
-- UID-aware shared reconciliation, raw rich-card preservation, stale remote
-  address-book deletion, CardDAV push-back, and single-membership removal remain
-  separate concerns.
+- UID-aware recovery prevents a committed remote create from being repeated
+  merely because its local remote-ID attachment was interrupted.
+- Raw rich-card preservation, stale remote address-book deletion, CardDAV and
+  Google adoption of shared reconciliation, and single-membership removal
+  remain separate concerns.

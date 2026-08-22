@@ -5,6 +5,10 @@ use std::collections::{BTreeMap, HashSet};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+use crate::contact::reconcile::{
+    capture_remote_id_baseline, reconcile_remote_id_snapshot_batch_with_postcheck,
+    CompleteRemoteIdSnapshot, RemoteContactPatch, RemoteField,
+};
 use crate::contact::Contact;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
@@ -42,31 +46,73 @@ impl ContactBackend for JmapContactBackend {
         // fetched and their cross-references form one valid complete snapshot.
         let address_books = jmap_conn.list_address_books(&jmap_config).await?;
         let contacts = jmap_conn.fetch_contacts(&jmap_config).await?;
-        let contacts_by_book = partition_contacts(&address_books, contacts)?;
+        let remote_uids: HashSet<String> =
+            contacts.iter().map(|contact| contact.uid.clone()).collect();
+        let remote_ids: HashSet<&str> =
+            contacts.iter().map(|contact| contact.id.as_str()).collect();
+        if remote_uids.len() != contacts.len() || remote_ids.len() != contacts.len() {
+            return Err(Error::Sync(
+                "validated JMAP snapshot contains duplicate account-wide identities".into(),
+            ));
+        }
+        let mut contacts_by_book = partition_contacts(&address_books, contacts)?;
+        let membership_rows = contacts_by_book.values().map(Vec::len).sum::<usize>();
+        let mut snapshots = BTreeMap::new();
+        for address_book in &address_books {
+            let contacts = contacts_by_book.remove(&address_book.id).ok_or_else(|| {
+                Error::Sync("validated JMAP address book has no partition".into())
+            })?;
+            let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(
+                contacts.into_iter().map(contact_patch).collect(),
+            )?;
+            snapshots.insert(address_book.id.clone(), snapshot);
+        }
         log::info!(
             "sync_contacts: validated {} JMAP books and {} membership rows",
             address_books.len(),
-            contacts_by_book.values().map(Vec::len).sum::<usize>()
+            membership_rows
         );
 
-        let pending = {
-            let conn = ctx.db.writer().await;
+        let (pending, reports, mut unavailable_uids) = {
+            let mut conn = ctx.db.writer().await;
             let remote_to_local = upsert_address_books(&conn, account_id, &address_books)?;
-
+            let mut reconciliations = Vec::with_capacity(address_books.len());
             for address_book in &address_books {
                 let local_book_id = remote_to_local.get(&address_book.id).ok_or_else(|| {
                     Error::Sync("validated JMAP address book was not mapped locally".into())
                 })?;
-                let remote_contacts = contacts_by_book.get(&address_book.id).ok_or_else(|| {
-                    Error::Sync("validated JMAP address book has no partition".into())
+                let snapshot = snapshots.remove(&address_book.id).ok_or_else(|| {
+                    Error::Sync("validated JMAP address book has no snapshot".into())
                 })?;
-                reconcile_book(&conn, local_book_id, remote_contacts)?;
+                let baseline =
+                    capture_remote_id_baseline(&conn, account_id, local_book_id, "jmap")?;
+                reconciliations.push((baseline, snapshot));
             }
-
-            // Checkpoint 1 intentionally remains remote-id-only. UID matching
-            // and interrupted-sync recovery belong to checkpoint 2.
-            load_pending_creates(&conn, &address_books, &remote_to_local)?
+            let (reports, (pending, unavailable_uids)) =
+                reconcile_remote_id_snapshot_batch_with_postcheck(
+                    &mut conn,
+                    reconciliations,
+                    |transaction| {
+                        let pending =
+                            load_pending_creates(transaction, &address_books, &remote_to_local)?;
+                        let unavailable_uids =
+                            validate_pending_create_uids(&pending, &remote_uids)?;
+                        Ok((pending, unavailable_uids))
+                    },
+                )?;
+            (pending, reports, unavailable_uids)
         };
+        for (address_book, report) in address_books.iter().zip(reports) {
+            log::info!(
+                "sync_contacts: reconciled JMAP book {:?}: inserted={}, updated={}, deleted={}, \
+                 unchanged_or_stale={}",
+                address_book.id,
+                report.inserted,
+                report.updated,
+                report.deleted,
+                report.unchanged_or_stale
+            );
+        }
 
         if !pending.is_empty() {
             log::info!(
@@ -82,8 +128,10 @@ impl ContactBackend for JmapContactBackend {
                     &pending.local_book_id,
                     &pending.local_id,
                     pending.uid.as_deref(),
+                    &unavailable_uids,
                 )?
             };
+            unavailable_uids.insert(uid.clone());
 
             let remote_id = jmap_conn
                 .create_contact_card(
@@ -105,6 +153,7 @@ impl ContactBackend for JmapContactBackend {
                     &mut conn,
                     &pending.local_book_id,
                     &pending.local_id,
+                    &uid,
                     &remote_id,
                 )
             };
@@ -248,102 +297,20 @@ fn upsert_address_books(
     Ok(remote_to_local)
 }
 
-fn reconcile_book(
-    conn: &Connection,
-    local_book_id: &str,
-    remote_contacts: &[JmapContact],
-) -> Result<()> {
-    for contact in remote_contacts {
-        let existing = conn
-            .query_row(
-                "SELECT id FROM contacts
-                 WHERE book_id = ?1 AND remote_id = ?2
-                 ORDER BY created_at, id LIMIT 1",
-                rusqlite::params![local_book_id, contact.id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(local_id) = existing {
-            let updated = conn.execute(
-                "UPDATE contacts
-                 SET display_name = ?1, emails_json = ?2, phones_json = ?3,
-                     organization = ?4, title = ?5, notes = ?6, uid = ?7,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?8 AND book_id = ?9 AND remote_id = ?10",
-                rusqlite::params![
-                    contact.display_name,
-                    contact.emails_json,
-                    contact.phones_json,
-                    contact.organization,
-                    contact.title,
-                    contact.notes,
-                    contact.uid,
-                    local_id,
-                    local_book_id,
-                    contact.id
-                ],
-            )?;
-            if updated != 1 {
-                return Err(Error::Sync(
-                    "JMAP contact changed during deterministic upsert".into(),
-                ));
-            }
-        } else {
-            conn.execute(
-                "INSERT INTO contacts
-                     (id, book_id, uid, display_name, emails_json, phones_json,
-                      addresses_json, organization, title, notes, remote_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    local_book_id,
-                    contact.uid,
-                    contact.display_name,
-                    contact.emails_json,
-                    contact.phones_json,
-                    contact.organization,
-                    contact.title,
-                    contact.notes,
-                    contact.id
-                ],
-            )?;
-        }
+fn contact_patch(contact: JmapContact) -> RemoteContactPatch {
+    RemoteContactPatch {
+        uid: RemoteField::Set(Some(contact.uid)),
+        display_name: RemoteField::Set(contact.display_name),
+        emails_json: RemoteField::Set(contact.emails_json),
+        phones_json: RemoteField::Set(contact.phones_json),
+        addresses_json: RemoteField::Preserve,
+        organization: RemoteField::Set(contact.organization),
+        title: RemoteField::Set(contact.title),
+        notes: RemoteField::Set(contact.notes),
+        vcard_data: RemoteField::Preserve,
+        remote_id: RemoteField::Set(Some(contact.id)),
+        etag: RemoteField::Preserve,
     }
-
-    let server_ids: HashSet<&str> = remote_contacts
-        .iter()
-        .map(|contact| contact.id.as_str())
-        .collect();
-    let local_synced = {
-        let mut statement = conn.prepare(
-            "SELECT id, remote_id FROM contacts
-             WHERE book_id = ?1
-             ORDER BY created_at, id",
-        )?;
-        let rows = statement
-            .query_map(rusqlite::params![local_book_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-    for (local_id, remote_id) in local_synced {
-        let Some(remote_id) = remote_id.filter(|remote_id| !is_blank(remote_id)) else {
-            continue;
-        };
-        if !server_ids.contains(remote_id.as_str()) {
-            let deleted = conn.execute(
-                "DELETE FROM contacts WHERE id = ?1 AND book_id = ?2",
-                rusqlite::params![local_id, local_book_id],
-            )?;
-            if deleted != 1 {
-                return Err(Error::Sync(
-                    "JMAP contact changed while pruning a complete snapshot".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn load_pending_creates(
@@ -391,11 +358,37 @@ fn load_pending_creates(
     Ok(pending)
 }
 
+fn validate_pending_create_uids(
+    pending: &[PendingCreate],
+    remote_uids: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut unavailable = remote_uids.clone();
+    let mut pending_uids = HashSet::new();
+    for contact in pending {
+        let Some(uid) = contact.uid.as_deref().filter(|uid| !is_blank(uid)) else {
+            continue;
+        };
+        if remote_uids.contains(uid) {
+            return Err(Error::Sync(
+                "deferred JMAP contact UID already exists remotely".into(),
+            ));
+        }
+        if !pending_uids.insert(uid) {
+            return Err(Error::Sync(
+                "deferred JMAP contacts contain a duplicate UID".into(),
+            ));
+        }
+        unavailable.insert(uid.to_string());
+    }
+    Ok(unavailable)
+}
+
 fn ensure_contact_uid(
     conn: &mut Connection,
     local_book_id: &str,
     local_id: &str,
     snapshot_uid: Option<&str>,
+    unavailable_uids: &HashSet<String>,
 ) -> Result<String> {
     let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = transaction
@@ -421,27 +414,34 @@ fn ensure_contact_uid(
         ));
     }
 
-    let snapshot_had_uid = snapshot_uid.is_some_and(|uid| !uid.trim().is_empty());
-    let uid = if let Some(uid) = current.0.filter(|uid| !uid.trim().is_empty()) {
-        uid
-    } else {
-        if snapshot_had_uid {
+    let snapshot_uid = snapshot_uid.filter(|uid| !is_blank(uid));
+    let current_uid = current.0.as_deref().filter(|uid| !is_blank(uid));
+    let uid = match (snapshot_uid, current_uid) {
+        (Some(expected), Some(current)) if expected == current => current.to_string(),
+        (None, None) => {
+            let uid = loop {
+                let candidate = format!("{}@chithi", uuid::Uuid::new_v4());
+                if !unavailable_uids.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            let updated = transaction.execute(
+                "UPDATE contacts SET uid = ?1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2 AND book_id = ?3",
+                rusqlite::params![uid, local_id, local_book_id],
+            )?;
+            if updated != 1 {
+                return Err(Error::Sync(
+                    "deferred JMAP contact changed before uid assignment".into(),
+                ));
+            }
+            uid
+        }
+        _ => {
             return Err(Error::Sync(
                 "deferred JMAP contact uid changed before assignment".into(),
             ));
         }
-        let uid = format!("{}@chithi", uuid::Uuid::new_v4());
-        let updated = transaction.execute(
-            "UPDATE contacts SET uid = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2 AND book_id = ?3",
-            rusqlite::params![uid, local_id, local_book_id],
-        )?;
-        if updated != 1 {
-            return Err(Error::Sync(
-                "deferred JMAP contact changed before uid assignment".into(),
-            ));
-        }
-        uid
     };
     transaction.commit()?;
     Ok(uid)
@@ -451,17 +451,28 @@ fn attach_remote_id(
     conn: &mut Connection,
     local_book_id: &str,
     local_id: &str,
+    expected_uid: &str,
     remote_id: &str,
 ) -> Result<()> {
     let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current_remote_id = transaction
+    let (current_uid, current_remote_id) = transaction
         .query_row(
-            "SELECT remote_id FROM contacts WHERE id = ?1 AND book_id = ?2",
+            "SELECT uid, remote_id FROM contacts WHERE id = ?1 AND book_id = ?2",
             rusqlite::params![local_id, local_book_id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .optional()?
         .ok_or_else(|| Error::Sync("deferred JMAP contact no longer exists".into()))?;
+    if current_uid.as_deref() != Some(expected_uid) {
+        return Err(Error::Sync(
+            "deferred JMAP contact uid changed before remote-id attachment".into(),
+        ));
+    }
     if current_remote_id
         .as_deref()
         .is_some_and(|current| !is_blank(current))
@@ -482,7 +493,7 @@ fn attach_remote_id(
         remote_ids
             .into_iter()
             .flatten()
-            .any(|stored| !is_blank(&stored) && stored.trim() == remote_id)
+            .any(|stored| !is_blank(&stored) && stored == remote_id)
     };
     if collision {
         return Err(Error::Sync(
@@ -491,8 +502,8 @@ fn attach_remote_id(
     }
     let updated = transaction.execute(
         "UPDATE contacts SET remote_id = ?1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?2 AND book_id = ?3",
-        rusqlite::params![remote_id, local_id, local_book_id],
+         WHERE id = ?2 AND book_id = ?3 AND uid = ?4",
+        rusqlite::params![remote_id, local_id, local_book_id, expected_uid],
     )?;
     if updated != 1 {
         return Err(Error::Sync(
@@ -516,6 +527,21 @@ mod tests {
             id: id.into(),
             uid: format!("uid-{id}"),
             address_book_ids: memberships.iter().map(|id| (*id).into()).collect(),
+            display_name: id.into(),
+            emails_json: "[]".into(),
+            phones_json: "[]".into(),
+            organization: None,
+            title: None,
+            notes: None,
+        }
+    }
+
+    fn pending(id: &str, uid: Option<&str>) -> PendingCreate {
+        PendingCreate {
+            local_id: id.into(),
+            local_book_id: "local-book".into(),
+            remote_book_id: "remote-book".into(),
+            uid: uid.map(str::to_string),
             display_name: id.into(),
             emails_json: "[]".into(),
             phones_json: "[]".into(),
@@ -565,10 +591,10 @@ mod tests {
                      remote_id TEXT,
                      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                  );
-                 INSERT INTO contacts (id, book_id, remote_id) VALUES
-                     ('target', 'book-a', NULL),
-                     ('same-book', 'book-a', 'taken'),
-                     ('other-book', 'book-b', 'shared');",
+                 INSERT INTO contacts (id, book_id, uid, remote_id) VALUES
+                     ('target', 'book-a', 'uid-target', NULL),
+                     ('same-book', 'book-a', 'uid-taken', 'taken'),
+                     ('other-book', 'book-b', 'uid-other', 'shared');",
             )
             .unwrap();
         connection
@@ -577,7 +603,10 @@ mod tests {
     #[test]
     fn remote_id_attachment_is_conditional_and_book_scoped() {
         let mut connection = attachment_db();
-        attach_remote_id(&mut connection, "book-a", "target", "shared").unwrap();
+        assert!(
+            attach_remote_id(&mut connection, "book-a", "target", "wrong-uid", "shared").is_err()
+        );
+        attach_remote_id(&mut connection, "book-a", "target", "uid-target", "shared").unwrap();
         let attached: String = connection
             .query_row(
                 "SELECT remote_id FROM contacts WHERE id = 'target'",
@@ -586,14 +615,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attached, "shared");
-        assert!(attach_remote_id(&mut connection, "book-a", "target", "later").is_err());
-        assert!(attach_remote_id(&mut connection, "book-a", "missing", "later").is_err());
+        assert!(
+            attach_remote_id(&mut connection, "book-a", "target", "uid-target", "later").is_err()
+        );
+        assert!(
+            attach_remote_id(&mut connection, "book-a", "missing", "uid-target", "later").is_err()
+        );
+    }
+
+    #[test]
+    fn pending_uid_validation_is_account_wide_and_fail_closed() {
+        let remote_uids = HashSet::from(["remote-uid".to_string()]);
+        assert!(
+            validate_pending_create_uids(&[pending("one", Some("remote-uid"))], &remote_uids)
+                .is_err()
+        );
+        assert!(validate_pending_create_uids(
+            &[
+                pending("one", Some("duplicate")),
+                pending("two", Some("duplicate")),
+            ],
+            &remote_uids,
+        )
+        .is_err());
+
+        let unavailable = validate_pending_create_uids(
+            &[
+                pending("one", Some("local-uid")),
+                pending("two", None),
+                pending("three", Some("\u{2003}")),
+            ],
+            &remote_uids,
+        )
+        .unwrap();
+        assert!(unavailable.contains("remote-uid"));
+        assert!(unavailable.contains("local-uid"));
+        assert!(!unavailable.contains("\u{2003}"));
     }
 
     #[test]
     fn remote_id_attachment_rejects_same_book_collision() {
         let mut connection = attachment_db();
-        assert!(attach_remote_id(&mut connection, "book-a", "target", "taken").is_err());
+        assert!(
+            attach_remote_id(&mut connection, "book-a", "target", "uid-target", "taken").is_err()
+        );
         let remote_id: Option<String> = connection
             .query_row(
                 "SELECT remote_id FROM contacts WHERE id = 'target'",
@@ -614,7 +679,7 @@ mod tests {
             )
             .unwrap();
 
-        attach_remote_id(&mut connection, "book-a", "target", "shared").unwrap();
+        attach_remote_id(&mut connection, "book-a", "target", "uid-target", "shared").unwrap();
         let attached: String = connection
             .query_row(
                 "SELECT remote_id FROM contacts WHERE id = 'target'",
@@ -635,7 +700,8 @@ mod tests {
             )
             .unwrap();
 
-        let uid = ensure_contact_uid(&mut connection, "book-a", "target", None).unwrap();
+        let uid =
+            ensure_contact_uid(&mut connection, "book-a", "target", None, &HashSet::new()).unwrap();
         assert!(uid.ends_with("@chithi"));
         let stored: String = connection
             .query_row("SELECT uid FROM contacts WHERE id = 'target'", [], |row| {
@@ -650,14 +716,57 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(ensure_contact_uid(&mut connection, "book-a", "target", None).is_err());
+        assert!(
+            ensure_contact_uid(&mut connection, "book-a", "target", None, &HashSet::new()).is_err()
+        );
+    }
+
+    #[test]
+    fn uid_assignment_requires_the_captured_nonblank_uid() {
+        let mut connection = attachment_db();
+        assert!(ensure_contact_uid(
+            &mut connection,
+            "book-a",
+            "target",
+            Some("different"),
+            &HashSet::new(),
+        )
+        .is_err());
+        assert!(
+            ensure_contact_uid(&mut connection, "book-a", "target", None, &HashSet::new(),)
+                .is_err()
+        );
+        assert_eq!(
+            ensure_contact_uid(
+                &mut connection,
+                "book-a",
+                "target",
+                Some("uid-target"),
+                &HashSet::new(),
+            )
+            .unwrap(),
+            "uid-target"
+        );
     }
 
     fn reconciliation_db() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE contacts (
+                "CREATE TABLE accounts (id TEXT PRIMARY KEY);
+                 INSERT INTO accounts (id) VALUES ('account');
+                 CREATE TABLE contact_books (
+                     id TEXT PRIMARY KEY,
+                     account_id TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     remote_id TEXT,
+                     sync_type TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO contact_books
+                     (id, account_id, name, remote_id, sync_type)
+                 VALUES ('local-book', 'account', 'Book', 'remote-book', 'jmap');
+                 CREATE TABLE contacts (
                      id TEXT PRIMARY KEY,
                      book_id TEXT NOT NULL,
                      uid TEXT,
@@ -668,7 +777,9 @@ mod tests {
                      organization TEXT,
                      title TEXT,
                      notes TEXT,
+                     vcard_data TEXT,
                      remote_id TEXT,
+                     etag TEXT,
                      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                  );",
@@ -695,8 +806,15 @@ mod tests {
 
     #[test]
     fn pruning_and_deferred_selection_use_rust_blank_classification() {
-        let connection = reconciliation_db();
-        reconcile_book(&connection, "local-book", &[]).unwrap();
+        let mut connection = reconciliation_db();
+        let baseline =
+            capture_remote_id_baseline(&connection, "account", "local-book", "jmap").unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(Vec::new()).unwrap();
+        crate::contact::reconcile::reconcile_remote_id_snapshot_batch(
+            &mut connection,
+            vec![(baseline, snapshot)],
+        )
+        .unwrap();
 
         let remaining = {
             let mut statement = connection
@@ -723,5 +841,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ascii-space", "null", "unicode-space"]
         );
+    }
+
+    #[test]
+    fn shared_uid_reconciliation_recovers_an_interrupted_create() {
+        let mut connection = reconciliation_db();
+        connection.execute("DELETE FROM contacts", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO contacts (
+                     id, book_id, uid, display_name, emails_json, phones_json, addresses_json
+                 ) VALUES ('draft', 'local-book', 'uid-card', 'Local', '[]', '[]', '[]')",
+                [],
+            )
+            .unwrap();
+        let baseline =
+            capture_remote_id_baseline(&connection, "account", "local-book", "jmap").unwrap();
+        let snapshot = CompleteRemoteIdSnapshot::new_with_uid_fallback(vec![contact_patch(
+            contact("card", &["remote-book"]),
+        )])
+        .unwrap();
+        let books = vec![JmapAddressBook {
+            id: "remote-book".into(),
+            name: "Book".into(),
+        }];
+        let mapping = BTreeMap::from([("remote-book".into(), "local-book".into())]);
+
+        let (reports, pending) = reconcile_remote_id_snapshot_batch_with_postcheck(
+            &mut connection,
+            vec![(baseline, snapshot)],
+            |transaction| load_pending_creates(transaction, &books, &mapping),
+        )
+        .unwrap();
+
+        assert_eq!(reports[0].updated, 1);
+        assert!(pending.is_empty());
+        let stored = connection
+            .query_row(
+                "SELECT uid, remote_id, display_name FROM contacts WHERE id = 'draft'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored, ("uid-card".into(), "card".into(), "card".into()));
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
