@@ -47,7 +47,7 @@ img-src https: data:;
 The iframe cannot touch the parent, but it contains a small inline script that forwards events via `postMessage`:
 
 1. **Link clicks** — intercepts all `<a>` clicks, sends `{ type: 'link-click', href }` to the parent. The parent copies the href to the clipboard and shows a toast (preserving existing behavior).
-2. **Auto-resize** — a `ResizeObserver` watches `document.documentElement.scrollHeight` and sends `{ type: 'resize', height }` so the parent can size the iframe to fit the email content.
+2. **Auto-resize** — a height reporter measures the body and document scroll/offset heights and sends `{ type: 'resize', height }` so the parent can size the iframe to fit the email content. A `ResizeObserver` watches the body, with additional reports after initial rendering, window load, and each image load/error so delayed remote content is included.
 3. **Context menu** — `contextmenu` is suppressed inside the iframe.
 
 ### Sender verification

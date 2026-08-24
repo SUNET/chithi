@@ -194,9 +194,34 @@ build-arch base_image="archlinux:latest":
     echo "Arch package(s) for $BASE_IMAGE available in $OUTPUT_DIR/"
     ls -la "$OUTPUT_DIR/"*.pkg.tar.zst 2>/dev/null || echo "No Arch packages found"
 
-# Build AppImage
-build-appimage:
-    pnpm tauri build --bundles appimage
+# Build a portable AppImage on Debian 12. Building directly on rolling Arch
+# pulls in new ELF/glibc features that linuxdeploy and older target systems
+# cannot reliably consume.
+build-appimage base_image="debian:12":
+    #!/usr/bin/env bash
+    set -e
+    BASE_IMAGE="{{base_image}}"
+    DISTRO_NAME=$(echo "$BASE_IMAGE" | tr ':' '-')
+    OUTPUT_DIR="dist/appimage"
+    VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+
+    echo "Building portable AppImage for $BASE_IMAGE..."
+    mkdir -p "$OUTPUT_DIR"
+
+    docker build \
+        --build-arg BASE_IMAGE="$BASE_IMAGE" \
+        --build-arg PKG_VERSION="$VERSION" \
+        -f Dockerfile.appimage \
+        -t "chithi-appimage-$DISTRO_NAME" \
+        .
+
+    CONTAINER_ID=$(docker create "chithi-appimage-$DISTRO_NAME")
+    docker cp "$CONTAINER_ID:/app/src-tauri/target/release/bundle/appimage/." "$OUTPUT_DIR/"
+    docker rm "$CONTAINER_ID"
+
+    echo ""
+    echo "AppImage available in $OUTPUT_DIR/:"
+    ls -la "$OUTPUT_DIR/"*.AppImage
 
 # Build all packages for multiple distributions
 build-all-rpm:
@@ -212,14 +237,14 @@ build-all-deb:
 build-all-arch:
     just build-arch
 
-build-all: build-all-deb build-all-rpm build-all-arch
+build-all: build-all-deb build-all-rpm build-all-arch build-appimage
 
 # Collect all built packages into dist/release/ for GitHub upload
 collect-release:
     #!/usr/bin/env bash
     set -e
     mkdir -p dist/release
-    find dist -maxdepth 2 -path 'dist/release' -prune -o \( -name '*.rpm' -o -name '*.deb' -o -name '*.pkg.tar.zst' \) -print | while read f; do
+    find dist -maxdepth 2 -path 'dist/release' -prune -o \( -name '*.rpm' -o -name '*.deb' -o -name '*.pkg.tar.zst' -o -name '*.AppImage' \) -print | while read f; do
         cp "$f" dist/release/
     done
     echo "Release packages collected in dist/release/:"
@@ -229,7 +254,7 @@ collect-release:
 sign:
     #!/usr/bin/env bash
     set -e
-    for f in dist/release/*.rpm dist/release/*.deb dist/release/*.pkg.tar.zst; do
+    for f in dist/release/*.rpm dist/release/*.deb dist/release/*.pkg.tar.zst dist/release/*.AppImage; do
         [ -f "$f" ] || continue
         echo "Signing $f ..."
         gpg --armor --detach-sign "$f"
@@ -286,3 +311,6 @@ list-targets:
     @echo ""
     @echo "Arch Linux targets:"
     @echo "  just build-arch          (archlinux:latest)"
+    @echo ""
+    @echo "AppImage target:"
+    @echo "  just build-appimage      (debian:12 portable baseline)"

@@ -73,6 +73,17 @@ const displayedBody = computed<MessageBodyT | null>(
   () => decryptedOverlay.value ?? messagesStore.activeMessage,
 );
 const pgpKind = computed(() => messagesStore.activeMessage?.pgp_kind);
+// Recreate the iframe when its document source changes materially. In
+// particular, loading remote images must start with a fresh viewport and a
+// fresh height-reporting lifecycle instead of inheriting the old inline
+// height from the image-free document.
+const iframeRenderKey = computed(() =>
+  [
+    messagesStore.activeMessageId ?? "",
+    decryptedOverlay.value ? "decrypted" : "original",
+    imagesHtml.value === null ? "images-blocked" : "images-loaded",
+  ].join(":"),
+);
 
 async function decryptOpenPGP() {
   const acct = accountsStore.activeAccountId;
@@ -260,11 +271,31 @@ function iframeSrcdoc(): string {
   document.addEventListener('contextmenu', function(e) {
     e.preventDefault();
   });
-  // Report content height to parent so iframe can auto-size
-  var ro = new ResizeObserver(function() {
-    parent.postMessage({ type: 'resize', height: document.documentElement.scrollHeight }, '*');
+  // Report content height to the parent so the iframe can auto-size. The
+  // documentElement's own box follows the iframe viewport, so observing only
+  // that element misses later body growth (notably when images finish
+  // loading). Observe the body and also report at lifecycle boundaries.
+  function reportHeight() {
+    var body = document.body;
+    var root = document.documentElement;
+    var height = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      root ? root.scrollHeight : 0,
+      root ? root.offsetHeight : 0
+    );
+    parent.postMessage({ type: 'resize', height: Math.ceil(height) }, '*');
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    var ro = new ResizeObserver(reportHeight);
+    ro.observe(document.body);
+  }
+  Array.prototype.forEach.call(document.images, function(img) {
+    img.addEventListener('load', reportHeight);
+    img.addEventListener('error', reportHeight);
   });
-  ro.observe(document.documentElement);
+  window.addEventListener('load', reportHeight);
+  reportHeight();
 <\/script></body>
 </html>`;
 }
@@ -305,9 +336,11 @@ function handleIframeMessage(event: MessageEvent) {
     uiStore.setHoverUrl(null);
   } else if (event.data.type === 'resize' && typeof event.data.height === 'number') {
     // Auto-resize the specific iframe that sent the message
+    const height = Math.ceil(event.data.height);
+    if (!Number.isFinite(height) || height <= 0) return;
     for (const iframe of iframes) {
       if (event.source === iframe.contentWindow) {
-        iframe.style.height = event.data.height + 'px';
+        iframe.style.height = Math.max(100, height) + 'px';
       }
     }
   }
@@ -798,6 +831,7 @@ async function markSpam() {
             </button>
           </div>
           <iframe
+            :key="iframeRenderKey"
             class="email-sandbox"
             data-testid="reader-body-iframe"
             :srcdoc="iframeSrcdoc()"
@@ -821,6 +855,7 @@ async function markSpam() {
             </button>
           </div>
           <iframe
+            :key="iframeRenderKey"
             class="email-sandbox"
             data-testid="reader-body-iframe"
             :srcdoc="iframeSrcdoc()"
@@ -867,6 +902,8 @@ async function markSpam() {
   overflow-y: auto;
   background: var(--color-reader-bg);
   position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .reader-toolbar {
@@ -902,6 +939,9 @@ async function markSpam() {
 
 .message-content {
   padding: 0;
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .message-actions {
@@ -1095,6 +1135,9 @@ async function markSpam() {
 .message-body {
   padding: 16px;
   line-height: 1.5;
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .no-remote-notice {
@@ -1134,11 +1177,15 @@ async function markSpam() {
   border-radius: 6px;
   padding: 16px;
   border: 1px solid var(--color-border);
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .email-sandbox {
   width: 100%;
   min-height: 100px;
+  flex: 1 0 auto;
   border: none;
   display: block;
   background: transparent;
