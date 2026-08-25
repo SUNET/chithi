@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { ref, computed, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
-import { expandRRule, masterEventId, occurrenceId } from "@/lib/rrule";
+import { expandRRule, masterEventId, occurrenceId, parseRRule } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
@@ -70,6 +70,13 @@ export const useCalendarStore = defineStore("calendar", () => {
       if (hiddenCalendarIds.value.includes(e.calendar_id)) continue;
 
       if (e.recurrence_rule) {
+        // Keep unsupported JSCalendar rules in their raw form for a lossless
+        // JMAP round-trip. Show their master once rather than inventing
+        // incorrect occurrences from constraints this expander cannot honour.
+        if (!parseRRule(e.recurrence_rule)) {
+          result.push(e);
+          continue;
+        }
         // Expand RRULE into occurrences
         const occurrences = expandRRule(
           e.recurrence_rule,

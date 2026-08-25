@@ -268,17 +268,27 @@ impl JmapConnection {
             let event_tz_opt = if event_tz.is_empty() {
                 None
             } else {
-                Some(event_tz)
+                Some(event_tz.clone())
             };
 
             // Recurrence: JSCalendar carries an array of RecurrenceRule
             // objects — convert to the app's canonical iCal RRULE string
             // so the local DB, the frontend expander and the other
             // backends all agree on one format.
-            let recurrence_rule = ev["recurrenceRules"]
+            let recurrence_rules = ev["recurrenceRules"]
                 .as_array()
-                .filter(|a| !a.is_empty())
-                .and_then(|a| crate::calendar::recurrence::jscalendar_to_rrule(a));
+                .filter(|rules| !rules.is_empty());
+            let recurrence_rule = recurrence_rules
+                .and_then(|rules| {
+                    crate::calendar::recurrence::jscalendar_to_rrule(rules, Some(&event_tz))
+                        .or_else(|| {
+                            log::warn!(
+                                "JMAP event {} has a recurrence rule not supported by the local expander",
+                                id
+                            );
+                            serde_json::to_string(rules).ok()
+                        })
+                });
 
             // Participants: supports both JSCalendar-bis (calendarAddress) and old format (sendTo.imip)
             let mut organizer_email = None;
@@ -411,7 +421,9 @@ impl JmapConnection {
             // recurrence was silently dropped here unless the string
             // happened to be raw JSON.) Rows synced before the format fix
             // may still hold a JSON array; pass those through unchanged.
-            if let Some(rules) = crate::calendar::recurrence::rrule_to_jscalendar(rrule) {
+            if let Some(rules) =
+                crate::calendar::recurrence::rrule_to_jscalendar(rrule, event.timezone.as_deref())
+            {
                 event_obj["recurrenceRules"] = rules;
             } else if let Ok(rules @ serde_json::Value::Array(_)) =
                 serde_json::from_str::<serde_json::Value>(rrule)

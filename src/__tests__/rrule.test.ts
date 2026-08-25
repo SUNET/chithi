@@ -4,6 +4,7 @@ import {
   isOccurrenceId,
   masterEventId,
   occurrenceId,
+  parseRRule,
 } from "@/lib/rrule";
 
 describe("occurrence id helpers", () => {
@@ -101,5 +102,9 @@ describe("expandRRule", () => {
       new Date("2026-07-31T23:59:59Z"),
     );
     expect(occ.length).toBe(3); // May, Jun, Jul 2026
+  });
+
+  it("does not parse raw JSCalendar rules as iCal RRULEs", () => {
+    expect(parseRRule('[{"frequency":"monthly","byMonth":["10"]}]')).toBeNull();
   });
 });
