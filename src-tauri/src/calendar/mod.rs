@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod ical;
+pub mod recurrence;
 pub mod timezone;
 
 /// Provider-neutral calendar event shared by persistence and backends.
