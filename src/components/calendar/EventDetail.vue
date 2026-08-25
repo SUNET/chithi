@@ -20,6 +20,12 @@ const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 const event = calendarStore.selectedEvent!;
+// The selected event may be a display-only occurrence with its own dates.
+// Edits apply to the series master because per-occurrence exceptions are not
+// supported, so initialize the form from that master instead.
+const masterEvent = calendarStore.events.find(
+  (candidate) => candidate.id === masterEventId(event.id),
+) ?? event;
 
 const editing = ref(false);
 const saving = ref(false);
@@ -55,15 +61,15 @@ const calendarInfo = computed(() => {
 });
 
 // Edit form state — convert UTC to display timezone
-const editTitle = ref(event.title);
-const editStartDate = ref(getDateInTimezone(event.start_time, uiStore.displayTimezone));
-const editStartTime = ref(toTimeInTimezone(new Date(event.start_time), uiStore.displayTimezone));
-const editEndDate = ref(getDateInTimezone(event.end_time, uiStore.displayTimezone));
-const editEndTime = ref(toTimeInTimezone(new Date(event.end_time), uiStore.displayTimezone));
-const editAllDay = ref(event.all_day);
-const editLocation = ref(event.location || "");
-const editDescription = ref(event.description || "");
-const editCalendarId = ref(event.calendar_id);
+const editTitle = ref(masterEvent.title);
+const editStartDate = ref(getDateInTimezone(masterEvent.start_time, uiStore.displayTimezone));
+const editStartTime = ref(toTimeInTimezone(new Date(masterEvent.start_time), uiStore.displayTimezone));
+const editEndDate = ref(getDateInTimezone(masterEvent.end_time, uiStore.displayTimezone));
+const editEndTime = ref(toTimeInTimezone(new Date(masterEvent.end_time), uiStore.displayTimezone));
+const editAllDay = ref(masterEvent.all_day);
+const editLocation = ref(masterEvent.location || "");
+const editDescription = ref(masterEvent.description || "");
+const editCalendarId = ref(masterEvent.calendar_id);
 
 function calendarLabel(cal: Calendar): string {
   // Same label format as EventForm's calendar picker.
@@ -118,28 +124,27 @@ async function saveEdit() {
       ? `${editEndDate.value}T23:59:59Z`
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
 
-    // Use the real event ID (strip occurrence suffix for recurring events)
-    const realId = masterEventId(event.id);
+    const realId = masterEvent.id;
 
     await api.updateEvent(realId, {
-      account_id: event.account_id,
-      calendar_id: event.calendar_id,
+      account_id: masterEvent.account_id,
+      calendar_id: masterEvent.calendar_id,
       title: editTitle.value,
       description: editDescription.value || null,
       location: editLocation.value || null,
       start_time: startISO,
       end_time: endISO,
       all_day: editAllDay.value,
-      timezone: event.timezone,
-      recurrence_rule: event.recurrence_rule,
-      attendees: [],
+      timezone: masterEvent.timezone,
+      recurrence_rule: masterEvent.recurrence_rule,
+      attendees: getAttendees(),
     });
 
     // Move to another calendar if the picker changed. A cross-account
     // move recreates the event on the destination and changes its id.
-    let notifyAccountId = event.account_id;
+    let notifyAccountId = masterEvent.account_id;
     let notifyEventId = realId;
-    if (editCalendarId.value !== event.calendar_id) {
+    if (editCalendarId.value !== masterEvent.calendar_id) {
       const target = calendarStore.calendars.find(
         (c) => c.id === editCalendarId.value,
       );

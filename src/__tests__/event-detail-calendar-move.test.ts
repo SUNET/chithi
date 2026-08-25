@@ -146,6 +146,34 @@ describe("EventDetail calendar picker", () => {
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
+  it("saves a later occurrence's edits against the master dates and attendees", async () => {
+    setupStores();
+    const calendarStore = useCalendarStore();
+    calendarStore.events = [{
+      ...masterEvent,
+      attendees_json: JSON.stringify([{ email: "guest@example.test", name: "Guest", status: "accepted" }]),
+    }];
+    calendarStore.selectedEvent = {
+      ...calendarStore.events[0],
+      id: occurrenceId("evt-r", new Date("2026-09-08T09:00:00.000Z")),
+      start_time: "2026-09-08T09:00:00.000Z",
+      end_time: "2026-09-08T10:00:00.000Z",
+    };
+    const wrapper = mountDetail();
+
+    await wrapper.get(".btn-edit").trigger("click");
+    await wrapper.get('[data-testid="event-form-title"]').setValue("Renamed series");
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+
+    expect(api.updateEvent).toHaveBeenCalledWith("evt-r", expect.objectContaining({
+      title: "Renamed series",
+      start_time: "2026-08-25T09:00:00.000Z",
+      end_time: "2026-08-25T10:00:00.000Z",
+      attendees: [{ email: "guest@example.test", name: "Guest", status: "accepted" }],
+    }));
+  });
+
   it("recreates the series on the destination for cross-account moves", async () => {
     setupStores();
     const wrapper = mountDetail();
@@ -160,6 +188,7 @@ describe("EventDetail calendar picker", () => {
         account_id: "acc2",
         calendar_id: "cal3",
         recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
+        attendees: [],
         // Master times — the clicked occurrence's dates must not leak in.
         start_time: "2026-08-25T09:00:00.000Z",
         end_time: "2026-08-25T10:00:00.000Z",
