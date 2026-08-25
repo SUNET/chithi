@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { ref, computed, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
-import { expandRRule } from "@/lib/rrule";
+import { expandRRule, masterEventId, occurrenceId } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
@@ -81,7 +81,9 @@ export const useCalendarStore = defineStore("calendar", () => {
         for (const occ of occurrences) {
           result.push({
             ...e,
-            id: `${e.id}_${occ.start.toISOString()}`, // Unique ID per occurrence
+            // Synthetic per-occurrence id; resolve back with
+            // masterEventId() before any DB operation.
+            id: occurrenceId(e.id, occ.start),
             start_time: occ.start.toISOString(),
             end_time: occ.end.toISOString(),
           });
@@ -284,7 +286,12 @@ export const useCalendarStore = defineStore("calendar", () => {
 
   async function deleteEvent(eventId: string) {
     await api.deleteEvent(eventId);
-    if (selectedEvent.value?.id === eventId) {
+    // The selected event may be a synthetic recurring occurrence of the
+    // deleted master — compare via master id so the panel closes too.
+    if (
+      selectedEvent.value &&
+      masterEventId(selectedEvent.value.id) === masterEventId(eventId)
+    ) {
       selectedEvent.value = null;
     }
     await fetchEvents();

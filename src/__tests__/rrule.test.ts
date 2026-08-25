@@ -1,5 +1,37 @@
 import { describe, it, expect } from "vitest";
-import { expandRRule } from "@/lib/rrule";
+import {
+  expandRRule,
+  isOccurrenceId,
+  masterEventId,
+  occurrenceId,
+} from "@/lib/rrule";
+
+describe("occurrence id helpers", () => {
+  const masterId = "4484f3cd-4641-41db-a4ca-1c35e49aa191";
+  const start = new Date("2026-08-25T09:00:00.000Z");
+
+  it("mints and resolves round-trip", () => {
+    const id = occurrenceId(masterId, start);
+    expect(id).toBe(`${masterId}_2026-08-25T09:00:00.000Z`);
+    expect(isOccurrenceId(id)).toBe(true);
+    expect(masterEventId(id)).toBe(masterId);
+  });
+
+  it("leaves plain DB ids untouched", () => {
+    expect(isOccurrenceId(masterId)).toBe(false);
+    expect(masterEventId(masterId)).toBe(masterId);
+  });
+
+  it("supports master ids that themselves contain underscores", () => {
+    const weird = "remote_id_with_underscores";
+    const id = occurrenceId(weird, start);
+    expect(masterEventId(id)).toBe(weird);
+  });
+
+  it("handles second-precision ISO suffixes (no milliseconds)", () => {
+    expect(masterEventId(`${masterId}_2026-08-25T09:00:00Z`)).toBe(masterId);
+  });
+});
 
 describe("expandRRule", () => {
   it("expands a normal in-window weekly series", () => {

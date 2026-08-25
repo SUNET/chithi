@@ -4,6 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
+import { masterEventId } from "@/lib/rrule";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import TimeInput from "@/components/common/TimeInput.vue";
@@ -110,9 +111,7 @@ async function saveEdit() {
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
 
     // Use the real event ID (strip occurrence suffix for recurring events)
-    const realId = event.id.includes("_2") && event.recurrence_rule
-      ? event.id.split("_").slice(0, -1).join("_")
-      : event.id;
+    const realId = masterEventId(event.id);
 
     await api.updateEvent(realId, {
       account_id: event.account_id,
@@ -164,6 +163,10 @@ async function saveEdit() {
 }
 
 async function handleDelete() {
+  // Selected recurring occurrences carry a synthetic id; the DB only
+  // knows the series master. Deleting an occurrence deletes the series
+  // (per-occurrence exceptions are not supported yet).
+  const realId = masterEventId(event.id);
   if (hasAttendees.value && isOrganizer.value) {
     const result = await tauriMessage(
       "This event has attendees. Send a cancellation notification?",
@@ -180,14 +183,14 @@ async function handleDelete() {
       const accountId = event.account_id || accountsStore.activeAccountId || "";
       const emails = attendees.value.map(a => a.email);
       try {
-        await api.sendInvites(accountId, event.id, emails);
+        await api.sendInvites(accountId, realId, emails);
       } catch (e) {
         console.error("Failed to send cancellation:", e);
       }
     }
   }
 
-  await calendarStore.deleteEvent(event.id);
+  await calendarStore.deleteEvent(realId);
   emit("close");
 }
 </script>
