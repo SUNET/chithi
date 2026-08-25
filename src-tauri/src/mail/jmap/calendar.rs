@@ -271,11 +271,14 @@ impl JmapConnection {
                 Some(event_tz)
             };
 
-            // Recurrence rules: JSCalendar uses an array of recurrence rule objects
+            // Recurrence: JSCalendar carries an array of RecurrenceRule
+            // objects — convert to the app's canonical iCal RRULE string
+            // so the local DB, the frontend expander and the other
+            // backends all agree on one format.
             let recurrence_rule = ev["recurrenceRules"]
                 .as_array()
                 .filter(|a| !a.is_empty())
-                .map(|a| serde_json::to_string(a).unwrap_or_default());
+                .and_then(|a| crate::calendar::recurrence::jscalendar_to_rrule(a));
 
             // Participants: supports both JSCalendar-bis (calendarAddress) and old format (sendTo.imip)
             let mut organizer_email = None;
@@ -403,8 +406,22 @@ impl JmapConnection {
             });
         }
         if let Some(ref rrule) = event.recurrence_rule {
-            if let Ok(rules) = serde_json::from_str::<serde_json::Value>(rrule) {
+            // Local rows canonically hold iCal RRULE strings — convert to
+            // JSCalendar recurrenceRules for the wire. (Previously the
+            // recurrence was silently dropped here unless the string
+            // happened to be raw JSON.) Rows synced before the format fix
+            // may still hold a JSON array; pass those through unchanged.
+            if let Some(rules) = crate::calendar::recurrence::rrule_to_jscalendar(rrule) {
                 event_obj["recurrenceRules"] = rules;
+            } else if let Ok(rules @ serde_json::Value::Array(_)) =
+                serde_json::from_str::<serde_json::Value>(rrule)
+            {
+                event_obj["recurrenceRules"] = rules;
+            } else {
+                log::warn!(
+                    "JMAP create: unsupported recurrence_rule format, sending event without recurrence: {}",
+                    rrule
+                );
             }
         }
 
