@@ -28,8 +28,7 @@ import {
   endOfDayUTC,
 } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
-import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
-import { isOccurrenceId } from "@/lib/rrule";
+import { dragCalendarEvent, isCalendarDragging, isDraggingSeriesOccurrence } from "@/lib/calendar-drag-state";
 
 const props = defineProps<{
   singleDay?: boolean;
@@ -340,9 +339,9 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
   if (event.button !== 0) return;
   const ev = seg.event;
 
-  // Recurring occurrences can't be drag-rescheduled: moving one occurrence
-  // would rewrite the whole series (no per-occurrence exceptions yet).
-  if (isOccurrenceId(ev.id) && ev.recurrence_rule) return;
+  // Recurring occurrences may be dragged onto a sidebar calendar (moves
+  // the whole series); grid drops are suppressed via
+  // isDraggingSeriesOccurrence in onColumnMove/onColumnDrop.
   if (ev.all_day) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };
@@ -358,7 +357,9 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
       dragCalendarEvent.value = sourceEvent;
       isCalendarDragging.value = true;
       const ghost = document.createElement("div");
-      ghost.textContent = sourceEvent.title;
+      ghost.textContent = isDraggingSeriesOccurrence.value
+        ? `${sourceEvent.title} — drop on a calendar to move the series`
+        : sourceEvent.title;
       ghost.dataset.testid = "cal-drag-ghost";
       ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
       document.body.appendChild(ghost);
@@ -398,6 +399,8 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
 
 function onColumnMove(day: Date, e: MouseEvent) {
   if (!isCalendarDragging.value) return;
+  // Series occurrences can't be rescheduled — don't show a grid drop hint.
+  if (isDraggingSeriesOccurrence.value) return;
   const hour = hourFromEvent(e);
   const dayStr = day.toISOString().split("T")[0];
   if (dragOverCell.value?.day !== dayStr || dragOverCell.value?.hour !== hour) {
@@ -427,6 +430,8 @@ const dragHintStyle = computed(() => {
 
 function onColumnDrop(day: Date, e: MouseEvent) {
   if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  // Series occurrences only accept sidebar (calendar) drops.
+  if (isDraggingSeriesOccurrence.value) return;
   const hour = hourFromEvent(e);
   dragOverCell.value = null;
 
