@@ -314,6 +314,41 @@ describe("Calendar store", () => {
       expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
       expect(store.selectedEvent).toBeNull();
     });
+
+    it("moveEventToCalendar accepts a synthetic id (same-account move)", async () => {
+      const store = setupRecurring();
+      store.calendars.push({
+        id: "cal2", account_id: "acc1", name: "Two", color: "#000",
+        is_default: false, remote_id: "b", is_subscribed: true,
+      });
+      const occ = store.visibleEvents[0];
+
+      const id = await store.moveEventToCalendar(occ.id, "cal2", "acc1");
+
+      expect(id).toBe("evt-r");
+      expect(api.updateEvent).toHaveBeenCalledWith("evt-r", { calendar_id: "cal2" });
+    });
+
+    it("moveEventToCalendar accepts a synthetic id (cross-account move keeps series)", async () => {
+      const store = setupRecurring();
+      const occ = store.visibleEvents[0];
+
+      const newId = await store.moveEventToCalendar(occ.id, "cal-x", "acc2");
+
+      // The recreated event must carry the MASTER's times and RRULE —
+      // never the clicked occurrence's times.
+      expect(api.createEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          account_id: "acc2",
+          calendar_id: "cal-x",
+          start_time: "2026-08-25T09:00:00.000Z",
+          end_time: "2026-08-25T10:00:00.000Z",
+          recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
+        }),
+      );
+      expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
+      expect(newId).toBe("evt-1");
+    });
   });
 
   describe("navigation", () => {

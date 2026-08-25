@@ -7,6 +7,7 @@ import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC 
 import { masterEventId } from "@/lib/rrule";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
+import type { Calendar } from "@/lib/types";
 import TimeInput from "@/components/common/TimeInput.vue";
 import DateInput from "@/components/common/DateInput.vue";
 import LinkifiedText from "@/components/common/LinkifiedText.vue";
@@ -62,6 +63,13 @@ const editEndTime = ref(toTimeInTimezone(new Date(event.end_time), uiStore.displ
 const editAllDay = ref(event.all_day);
 const editLocation = ref(event.location || "");
 const editDescription = ref(event.description || "");
+const editCalendarId = ref(event.calendar_id);
+
+function calendarLabel(cal: Calendar): string {
+  // Same label format as EventForm's calendar picker.
+  const account = accountsStore.accounts.find((a) => a.id === cal.account_id);
+  return `${cal.name} (${account?.display_name || cal.account_id})`;
+}
 
 function formatDateTime(iso: string): string {
   return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
@@ -127,6 +135,27 @@ async function saveEdit() {
       attendees: [],
     });
 
+    // Move to another calendar if the picker changed. A cross-account
+    // move recreates the event on the destination and changes its id.
+    let notifyAccountId = event.account_id;
+    let notifyEventId = realId;
+    if (editCalendarId.value !== event.calendar_id) {
+      const target = calendarStore.calendars.find(
+        (c) => c.id === editCalendarId.value,
+      );
+      if (target) {
+        // moveEventToCalendar reads the store's events array — refresh it
+        // first so a cross-account move copies the edits saved above.
+        await calendarStore.fetchEvents();
+        notifyEventId = await calendarStore.moveEventToCalendar(
+          realId,
+          target.id,
+          target.account_id,
+        );
+        notifyAccountId = target.account_id;
+      }
+    }
+
     // Notify attendees if organizer and event has attendees
     if (hasAttendees.value && isOrganizer.value) {
       const result = await tauriMessage(
@@ -142,10 +171,10 @@ async function saveEdit() {
         return;
       }
       if (result === "Send Update" || result === "Yes") {
-        const accountId = event.account_id || accountsStore.activeAccountId || "";
+        const accountId = notifyAccountId || accountsStore.activeAccountId || "";
         const emails = attendees.value.map(a => a.email);
         try {
-          await api.sendInvites(accountId, realId, emails);
+          await api.sendInvites(accountId, notifyEventId, emails);
         } catch (e) {
           console.error("Failed to notify attendees:", e);
         }
@@ -292,6 +321,14 @@ async function handleDelete() {
             <label>End time</label>
             <TimeInput v-model="editEndTime" testid="event-form-end-time" />
           </div>
+        </div>
+        <div class="edit-group">
+          <label>Calendar</label>
+          <select v-model="editCalendarId" data-testid="event-detail-calendar">
+            <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
+              {{ calendarLabel(cal) }}
+            </option>
+          </select>
         </div>
         <div class="edit-group">
           <label>Location</label>
@@ -450,6 +487,7 @@ async function handleDelete() {
 }
 
 .edit-group input,
+.edit-group select,
 .edit-group textarea {
   padding: var(--input-padding);
   border: var(--input-border);

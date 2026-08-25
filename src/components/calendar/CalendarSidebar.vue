@@ -4,6 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Calendar } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
+import { masterEventId } from "@/lib/rrule";
 import { showToast } from "@/lib/toast";
 import * as api from "@/lib/tauri";
 
@@ -111,7 +112,9 @@ function onCalendarItemDrop(cal: Calendar) {
   }
   dropTargetCalendarId.value = null;
   emit("calendarDrop", {
-    eventId: ev.id,
+    // Recurring occurrences carry a synthetic `<masterId>_<start ISO>` id;
+    // downstream lookups and the move itself operate on the master row.
+    eventId: masterEventId(ev.id),
     targetCalendarId: cal.id,
     targetAccountId: cal.account_id,
     attendeesJson: ev.attendees_json,

@@ -255,13 +255,17 @@ export const useCalendarStore = defineStore("calendar", () => {
     targetCalendarId: string,
     targetAccountId: string,
   ): Promise<string> {
-    const ev = events.value.find((e) => e.id === eventId);
-    if (!ev) return eventId;
+    // Callers may pass a synthetic recurring-occurrence id (sidebar drops,
+    // detail panel) — the DB only knows the series master. Moving always
+    // moves the whole series.
+    const id = masterEventId(eventId);
+    const ev = events.value.find((e) => e.id === id);
+    if (!ev) return id;
 
     if (ev.account_id === targetAccountId) {
       // Same account — just update the calendar_id
-      await updateEvent(eventId, { calendar_id: targetCalendarId });
-      return eventId;
+      await updateEvent(id, { calendar_id: targetCalendarId });
+      return id;
     } else {
       // Cross-account — create on destination, then delete source
       const attendees = safeParseAttendees(ev.attendees_json);
@@ -278,7 +282,7 @@ export const useCalendarStore = defineStore("calendar", () => {
         recurrence_rule: ev.recurrence_rule,
         attendees,
       });
-      await api.deleteEvent(eventId);
+      await api.deleteEvent(id);
       await fetchEvents();
       return newId;
     }
