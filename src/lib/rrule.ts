@@ -12,6 +12,30 @@ interface RRuleParts {
   byday?: string[];
 }
 
+/**
+ * Recurring events are stored as a single master row; the calendar store
+ * expands them into display occurrences whose ids are
+ * `<masterId>_<occurrence start ISO>`. These helpers are the single source
+ * of truth for that format — minting (occurrenceId) and resolving back
+ * (masterEventId / isOccurrenceId) must never drift apart, otherwise
+ * occurrences become unclickable or undeletable (see issue with recurring
+ * events not reacting to clicks).
+ */
+const OCCURRENCE_SUFFIX_RE = /_\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+export function occurrenceId(masterId: string, start: Date): string {
+  return `${masterId}_${start.toISOString()}`;
+}
+
+export function isOccurrenceId(id: string): boolean {
+  return OCCURRENCE_SUFFIX_RE.test(id);
+}
+
+/** Strip the occurrence suffix, returning the DB id of the series master. */
+export function masterEventId(id: string): string {
+  return id.replace(OCCURRENCE_SUFFIX_RE, "");
+}
+
 export function parseRRule(rrule: string): RRuleParts | null {
   if (!rrule.startsWith("FREQ=")) return null;
 

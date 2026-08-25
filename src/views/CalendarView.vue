@@ -248,7 +248,11 @@ function onTimeSlotClick(dateTime: string) {
 }
 
 function onEventClick(eventId: string) {
-  const event = calendarStore.events.find((e) => e.id === eventId);
+  // Views render calendarStore.visibleEvents, where recurring masters are
+  // expanded into occurrences with synthetic `<masterId>_<start ISO>` ids.
+  // Those ids don't exist in the raw `events` array, so resolve against
+  // visibleEvents — otherwise recurring occurrences are unclickable.
+  const event = calendarStore.visibleEvents.find((e) => e.id === eventId);
   if (event) calendarStore.selectEvent(event);
 }
 

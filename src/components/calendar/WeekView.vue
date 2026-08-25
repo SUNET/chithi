@@ -29,6 +29,7 @@ import {
 } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
+import { isOccurrenceId } from "@/lib/rrule";
 
 const props = defineProps<{
   singleDay?: boolean;
@@ -339,7 +340,9 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
   if (event.button !== 0) return;
   const ev = seg.event;
 
-  if (/_\d{4}-/.test(ev.id) && ev.recurrence_rule) return;
+  // Recurring occurrences can't be drag-rescheduled: moving one occurrence
+  // would rewrite the whole series (no per-occurrence exceptions yet).
+  if (isOccurrenceId(ev.id) && ev.recurrence_rule) return;
   if (ev.all_day) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };

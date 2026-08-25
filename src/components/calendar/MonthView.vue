@@ -5,6 +5,7 @@ import { useUiStore } from "@/stores/ui";
 import { getDateInTimezone } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
+import { isOccurrenceId } from "@/lib/rrule";
 
 const emit = defineEmits<{
   dateClick: [date: string];
@@ -106,7 +107,9 @@ let dragCleanup: (() => void) | null = null;
 
 function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
   if (event.button !== 0) return;
-  if (/_\d{4}-/.test(ev.id) && ev.recurrence_rule) return;
+  // Recurring occurrences can't be drag-rescheduled: moving one occurrence
+  // would rewrite the whole series (no per-occurrence exceptions yet).
+  if (isOccurrenceId(ev.id) && ev.recurrence_rule) return;
   if (ev.all_day) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };

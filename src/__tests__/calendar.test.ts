@@ -42,6 +42,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
+import { isOccurrenceId, masterEventId } from "@/lib/rrule";
 import * as api from "@/lib/tauri";
 
 function setupAccounts() {
@@ -260,6 +261,58 @@ describe("Calendar store", () => {
       setupAccounts();
       const store = useCalendarStore();
       expect(store.hiddenCalendarIds).toEqual(["cal2"]);
+    });
+  });
+
+  describe("recurring occurrences (unclickable-event regression)", () => {
+    // Recurring masters are expanded into synthetic-id occurrences for
+    // display. Clicking one must resolve back to something actionable:
+    // previously onEventClick looked the synthetic id up in the raw
+    // events array, silently no-oped, and recurring events could not be
+    // opened, edited, or deleted (repro: biweekly event, RRULE
+    // FREQ=WEEKLY;INTERVAL=2;BYDAY=TU).
+    function setupRecurring() {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [
+        { id: "cal1", account_id: "acc1", name: "One", color: "#000", is_default: true, remote_id: null, is_subscribed: true },
+      ];
+      store.events = [
+        makeEvent("evt-r", "OCM checkpoint meeting", "2026-08-25T09:00:00.000Z", "2026-08-25T10:00:00.000Z", {
+          recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
+        }),
+      ];
+      store.currentDate = "2026-08-25";
+      store.viewMode = "week";
+      return store;
+    }
+
+    it("expands masters into occurrences whose ids resolve to the master", () => {
+      const store = setupRecurring();
+
+      const occurrences = store.visibleEvents;
+      expect(occurrences.length).toBeGreaterThan(0);
+      for (const occ of occurrences) {
+        expect(isOccurrenceId(occ.id)).toBe(true);
+        expect(masterEventId(occ.id)).toBe("evt-r");
+        // The click handler resolves against visibleEvents; the raw
+        // events array must never be expected to contain synthetic ids.
+        expect(store.events.find((e) => e.id === occ.id)).toBeUndefined();
+        expect(
+          store.visibleEvents.find((e) => e.id === occ.id),
+        ).toBeDefined();
+      }
+    });
+
+    it("deleteEvent with the master id clears a selected synthetic occurrence", async () => {
+      const store = setupRecurring();
+      const occ = store.visibleEvents[0];
+      store.selectedEvent = occ;
+
+      await store.deleteEvent(masterEventId(occ.id));
+
+      expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
+      expect(store.selectedEvent).toBeNull();
     });
   });
 
