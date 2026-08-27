@@ -37,9 +37,26 @@ pub struct Attendee {
     pub status: String,
 }
 
+/// Return the RSVP status for `email` from a provider attendee list.
+pub(crate) fn attendee_status_for_email(attendees: &[Attendee], email: &str) -> Option<String> {
+    attendees
+        .iter()
+        .find(|attendee| attendee.email.eq_ignore_ascii_case(email))
+        .map(|attendee| attendee.status.clone())
+}
+
+/// Parse a persisted provider attendee list and return this account's RSVP.
+pub(crate) fn attendee_status_from_json(
+    attendees_json: Option<&str>,
+    email: &str,
+) -> Option<String> {
+    let attendees = serde_json::from_str::<Vec<Attendee>>(attendees_json?).ok()?;
+    attendee_status_for_email(&attendees, email)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Attendee, CalendarEvent};
+    use super::{attendee_status_for_email, attendee_status_from_json, Attendee, CalendarEvent};
 
     #[test]
     fn calendar_event_json_contract_is_stable() {
@@ -155,6 +172,31 @@ mod tests {
                 "name": null,
                 "status": "needs-action",
             })
+        );
+    }
+
+    #[test]
+    fn attendee_status_lookup_is_case_insensitive() {
+        let attendees = vec![Attendee {
+            email: "Me@Example.com".into(),
+            name: None,
+            status: "accepted".into(),
+        }];
+
+        assert_eq!(
+            attendee_status_for_email(&attendees, "me@example.com"),
+            Some("accepted".into())
+        );
+        assert_eq!(
+            attendee_status_from_json(
+                Some(r#"[{"email":"ME@example.com","name":null,"status":"tentative"}]"#),
+                "me@example.com",
+            ),
+            Some("tentative".into())
+        );
+        assert_eq!(
+            attendee_status_from_json(Some("invalid"), "me@example.com"),
+            None
         );
     }
 }

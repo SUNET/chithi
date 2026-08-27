@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::calendar::{Attendee, CalendarEvent};
@@ -36,6 +36,7 @@ pub struct NewCalendar {
 pub struct Invite {
     #[serde(flatten)]
     pub event: CalendarEvent,
+    pub manually_managed_at: Option<String>,
     pub created_at: Option<String>,
 }
 
@@ -182,27 +183,213 @@ pub fn upsert_calendar_by_remote_id(
     }
 }
 
-/// Upsert an event by remote_id. If an event with the same remote_id already exists,
-/// update it. Otherwise insert a new row.
+fn is_answered_status(status: Option<&str>) -> bool {
+    matches!(status, Some("accepted" | "tentative" | "declined"))
+}
+
+fn attendees_with_status(
+    attendees_json: Option<&str>,
+    account_email: &str,
+    status: &str,
+) -> Option<String> {
+    let json = attendees_json?;
+    let Ok(mut attendees) = serde_json::from_str::<Vec<Attendee>>(json) else {
+        return Some(json.to_string());
+    };
+    if let Some(attendee) = attendees
+        .iter_mut()
+        .find(|attendee| attendee.email.eq_ignore_ascii_case(account_email))
+    {
+        attendee.status = status.to_string();
+    }
+    serde_json::to_string(&attendees).ok()
+}
+
+struct ExistingEventForSync {
+    id: String,
+    my_status: Option<String>,
+    attendees_json: Option<String>,
+}
+
+fn single_unpushed_event_by_uid(
+    conn: &Connection,
+    account_id: &str,
+    uid: &str,
+) -> Result<Option<ExistingEventForSync>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, my_status, attendees_json
+         FROM calendar_events
+         WHERE account_id = ?1 AND uid = ?2
+           AND (remote_id IS NULL OR remote_id = '')
+         LIMIT 2",
+    )?;
+    let mut candidates = stmt
+        .query_map(params![account_id, uid], |row| {
+            Ok(ExistingEventForSync {
+                id: row.get(0)?,
+                my_status: row.get(1)?,
+                attendees_json: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if candidates.len() == 1 {
+        Ok(candidates.pop())
+    } else {
+        if candidates.len() > 1 {
+            log::warn!(
+                "Not reconciling remote event UID '{}' because multiple unpushed rows match",
+                uid
+            );
+        }
+        Ok(None)
+    }
+}
+
+fn reconcile_duplicate_invite_rows(
+    conn: &Connection,
+    remote: ExistingEventForSync,
+    local: ExistingEventForSync,
+) -> Result<ExistingEventForSync> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE calendar_events SET
+            my_status = CASE
+                WHEN (SELECT my_status FROM calendar_events WHERE id = ?1)
+                     IN ('accepted', 'tentative', 'declined')
+                THEN (SELECT my_status FROM calendar_events WHERE id = ?1)
+                ELSE my_status
+            END,
+            attendees_json = CASE
+                WHEN (SELECT my_status FROM calendar_events WHERE id = ?1)
+                     IN ('accepted', 'tentative', 'declined')
+                THEN COALESCE(
+                    (SELECT attendees_json FROM calendar_events WHERE id = ?1),
+                    attendees_json
+                )
+                ELSE attendees_json
+            END,
+            manually_managed_at = COALESCE(
+                manually_managed_at,
+                (SELECT manually_managed_at FROM calendar_events WHERE id = ?1)
+            ),
+            source_message_id = COALESCE(
+                source_message_id,
+                (SELECT source_message_id FROM calendar_events WHERE id = ?1)
+            ),
+            ical_data = COALESCE(
+                ical_data,
+                (SELECT ical_data FROM calendar_events WHERE id = ?1)
+            )
+         WHERE id = ?2",
+        params![local.id, remote.id],
+    )?;
+    let meeting_bindings: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM meet_meetings WHERE event_id IN (?1, ?2)",
+        params![remote.id, local.id],
+        |row| row.get(0),
+    )?;
+    if meeting_bindings < 2 {
+        transaction.execute(
+            "INSERT OR IGNORE INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             SELECT ?1, account_id, protocol, meeting_id, join_url
+             FROM meet_meetings WHERE event_id = ?2",
+            params![remote.id, local.id],
+        )?;
+        transaction.execute(
+            "DELETE FROM calendar_events WHERE id = ?1",
+            params![local.id],
+        )?;
+    } else {
+        log::warn!(
+            "Keeping duplicate invite row {} because both rows own meeting bindings",
+            local.id
+        );
+    }
+
+    let reconciled = transaction.query_row(
+        "SELECT id, my_status, attendees_json FROM calendar_events WHERE id = ?1",
+        params![remote.id],
+        |row| {
+            Ok(ExistingEventForSync {
+                id: row.get(0)?,
+                my_status: row.get(1)?,
+                attendees_json: row.get(2)?,
+            })
+        },
+    )?;
+    transaction.commit()?;
+    log::info!(
+        "Reconciled duplicate invite rows for remote event {}",
+        reconciled.id
+    );
+    Ok(reconciled)
+}
+
+/// Upsert an event by remote ID, falling back to a single unpushed UID match.
 pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Result<()> {
     if let Some(ref remote_id) = event.remote_id {
-        let existing: Option<String> = conn
+        let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
-                "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
+                "SELECT id, my_status, attendees_json
+                 FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
                 params![event.account_id, remote_id],
-                |row| row.get(0),
+                |row| {
+                    Ok(ExistingEventForSync {
+                        id: row.get(0)?,
+                        my_status: row.get(1)?,
+                        attendees_json: row.get(2)?,
+                    })
+                },
             )
-            .ok();
+            .optional()?;
 
-        if let Some(existing_id) = existing {
+        let unpushed_existing = if let Some(uid) = event.uid.as_deref() {
+            single_unpushed_event_by_uid(conn, &event.account_id, uid)?
+        } else {
+            None
+        };
+
+        let existing = match (remote_existing, unpushed_existing) {
+            (Some(remote), Some(local)) if remote.id != local.id => {
+                Some(reconcile_duplicate_invite_rows(conn, remote, local)?)
+            }
+            (Some(remote), _) => Some(remote),
+            (None, local) => local,
+        };
+
+        if let Some(existing) = existing {
+            let preserved_status = existing
+                .my_status
+                .filter(|_| !is_answered_status(event.my_status.as_deref()))
+                .filter(|status| is_answered_status(Some(status.as_str())));
+            let effective_status = preserved_status.clone().or_else(|| event.my_status.clone());
+            let mut effective_attendees = event.attendees_json.clone();
+            if let Some(status) = preserved_status.as_deref() {
+                let account_email: String = conn.query_row(
+                    "SELECT email FROM accounts WHERE id = ?1",
+                    params![event.account_id],
+                    |row| row.get(0),
+                )?;
+                effective_attendees = attendees_with_status(
+                    effective_attendees
+                        .as_deref()
+                        .or(existing.attendees_json.as_deref()),
+                    &account_email,
+                    status,
+                );
+            }
+
             // Update the existing event, keeping its local ID
             conn.execute(
                 "UPDATE calendar_events SET
                     calendar_id = ?1, uid = ?2, title = ?3, description = ?4,
                     location = ?5, start_time = ?6, end_time = ?7, all_day = ?8,
                     timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
-                    attendees_json = ?12, my_status = ?13, source_message_id = ?14,
-                    ical_data = ?15, remote_id = ?16, etag = ?17,
+                    attendees_json = ?12, my_status = ?13,
+                    source_message_id = COALESCE(?14, source_message_id),
+                    ical_data = COALESCE(?15, ical_data), remote_id = ?16, etag = ?17,
                     updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?18",
                 params![
@@ -217,13 +404,13 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     event.timezone,
                     event.recurrence_rule,
                     event.organizer_email,
-                    event.attendees_json,
-                    event.my_status,
+                    effective_attendees,
+                    effective_status,
                     event.source_message_id,
                     event.ical_data,
                     event.remote_id,
                     event.etag,
-                    existing_id,
+                    existing.id,
                 ],
             )?;
             return Ok(());
@@ -316,7 +503,7 @@ pub fn list_invites(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag, created_at
+                ical_data, remote_id, etag, manually_managed_at, created_at
          FROM calendar_events
          WHERE account_id = ?1
            AND organizer_email IS NOT NULL
@@ -330,25 +517,79 @@ pub fn list_invites(
         .query_map(params![account_id, account_email, since], |row| {
             Ok(Invite {
                 event: map_event_row(row)?,
-                created_at: row.get(19)?,
+                manually_managed_at: row.get(19)?,
+                created_at: row.get(20)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Keep only events where the account's own address is among the
-    // attendees (case-insensitive) — i.e. you were genuinely invited,
-    // not merely the owner of a calendar that holds the event.
+    // attendees (case-insensitive), or a provider supplied an explicit RSVP
+    // for this account (needed for Google invitations sent to an alias).
     let me = account_email.to_lowercase();
-    let filtered = rows
+    let filtered: Vec<Invite> = rows
         .into_iter()
-        .filter(|inv| match inv.event.attendees_json.as_deref() {
-            Some(json) => serde_json::from_str::<Vec<Attendee>>(json)
-                .map(|atts| atts.iter().any(|a| a.email.to_lowercase() == me))
-                .unwrap_or(false),
-            None => false,
+        .filter(|inv| {
+            let attendee_matches = match inv.event.attendees_json.as_deref() {
+                Some(json) => serde_json::from_str::<Vec<Attendee>>(json)
+                    .map(|atts| atts.iter().any(|a| a.email.to_lowercase() == me))
+                    .unwrap_or(false),
+                None => false,
+            };
+            attendee_matches || inv.event.my_status.is_some()
         })
         .collect();
-    Ok(filtered)
+
+    // Older sync versions could leave both the email-response row and a
+    // provider row for the same UID. Present one management item, preferring
+    // a real RSVP and then a manual acknowledgement over an unanswered copy.
+    let mut deduplicated = std::collections::HashMap::<String, Invite>::new();
+    for invite in filtered {
+        let key = invite
+            .event
+            .uid
+            .as_deref()
+            .filter(|uid| !uid.is_empty())
+            .map(|uid| format!("uid:{uid}"))
+            .unwrap_or_else(|| format!("id:{}", invite.event.id));
+        let candidate_rank = invite_management_rank(&invite);
+        match deduplicated.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(invite);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if candidate_rank > invite_management_rank(entry.get()) {
+                    entry.insert(invite);
+                }
+            }
+        }
+    }
+    Ok(deduplicated.into_values().collect())
+}
+
+fn invite_management_rank(invite: &Invite) -> (bool, bool, bool) {
+    (
+        is_answered_status(invite.event.my_status.as_deref()),
+        invite.manually_managed_at.is_some(),
+        invite.event.source_message_id.is_some(),
+    )
+}
+
+/// Mark an invite as handled locally without changing or sending its RSVP.
+pub fn mark_invite_managed(conn: &Connection, account_id: &str, event_id: &str) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE calendar_events
+         SET manually_managed_at = COALESCE(manually_managed_at, CURRENT_TIMESTAMP)
+         WHERE id = ?1 AND account_id = ?2",
+        params![event_id, account_id],
+    )?;
+    if rows == 0 {
+        return Err(crate::error::Error::Other(format!(
+            "Calendar invite not found: {}",
+            event_id
+        )));
+    }
+    Ok(())
 }
 
 pub fn get_event(conn: &Connection, id: &str) -> Result<CalendarEvent> {
@@ -454,6 +695,10 @@ pub fn get_event_by_uid(
                 ical_data, remote_id, etag
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2
+         ORDER BY
+            CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
+            CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
+            CASE WHEN source_message_id IS NOT NULL THEN 0 ELSE 1 END
          LIMIT 1",
         params![account_id, uid],
         map_event_row,
@@ -547,6 +792,7 @@ mod tests {
                 organizer_email TEXT,
                 attendees_json TEXT,
                 my_status TEXT,
+                manually_managed_at TEXT,
                 source_message_id TEXT,
                 ical_data TEXT,
                 remote_id TEXT,
@@ -736,6 +982,51 @@ mod tests {
         let invites = list_invites(&conn, "acc1", "test@example.com", since).unwrap();
         assert_eq!(invites.len(), 1);
         assert_eq!(invites[0].event.id, "inv1");
+        assert!(invites[0].manually_managed_at.is_none());
+    }
+
+    #[test]
+    fn test_mark_invite_managed_is_local_only_and_idempotent() {
+        let conn = setup_db();
+        let mut invite = make_event("inv1", "Team Sync", Some("remote-1"));
+        invite.organizer_email = Some("boss@example.com".to_string());
+        invite.attendees_json = Some(attendees_json(&["test@example.com"]));
+        invite.ical_data = Some("BEGIN:VCALENDAR".to_string());
+        insert_event(&conn, &invite).unwrap();
+
+        mark_invite_managed(&conn, "acc1", "inv1").unwrap();
+        mark_invite_managed(&conn, "acc1", "inv1").unwrap();
+
+        let managed_at: Option<String> = conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'inv1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted = get_event(&conn, "inv1").unwrap();
+
+        assert!(managed_at.is_some());
+        assert!(persisted.my_status.is_none());
+        assert_eq!(persisted.attendees_json, invite.attendees_json);
+        assert_eq!(persisted.remote_id.as_deref(), Some("remote-1"));
+        assert_eq!(persisted.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+    }
+
+    #[test]
+    fn test_mark_invite_managed_rejects_the_wrong_account() {
+        let conn = setup_db();
+        insert_event(&conn, &make_event("inv1", "Team Sync", None)).unwrap();
+
+        assert!(mark_invite_managed(&conn, "another-account", "inv1").is_err());
+        let managed_at: Option<String> = conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'inv1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(managed_at.is_none());
     }
 
     #[test]
@@ -752,6 +1043,51 @@ mod tests {
             invites.is_empty(),
             "self-organized event must be excluded regardless of email case"
         );
+    }
+
+    #[test]
+    fn test_list_invites_accepts_provider_status_for_an_account_alias() {
+        let conn = setup_db();
+        let mut invite = make_event("alias1", "Alias Invite", None);
+        invite.organizer_email = Some("boss@example.com".to_string());
+        invite.attendees_json = Some(attendees_json(&["alias@example.com"]));
+        invite.my_status = Some("accepted".to_string());
+        insert_event(&conn, &invite).unwrap();
+
+        let invites =
+            list_invites(&conn, "acc1", "test@example.com", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].event.id, "alias1");
+    }
+
+    #[test]
+    fn test_list_invites_prefers_answered_legacy_duplicate() {
+        let conn = setup_db();
+        let uid = "legacy-duplicate@example.com";
+
+        let mut unanswered = make_event("remote-row", "Invite", Some("remote-1"));
+        unanswered.uid = Some(uid.to_string());
+        unanswered.organizer_email = Some("boss@example.com".to_string());
+        unanswered.attendees_json = Some(attendees_json(&["test@example.com"]));
+        unanswered.my_status = Some("needs-action".to_string());
+        insert_event(&conn, &unanswered).unwrap();
+
+        let mut answered = make_event("response-row", "Invite", Some("remote-2"));
+        answered.uid = Some(uid.to_string());
+        answered.organizer_email = Some("boss@example.com".to_string());
+        answered.attendees_json = Some(attendees_json(&["test@example.com"]));
+        answered.my_status = Some("accepted".to_string());
+        answered.source_message_id = Some("message-1".to_string());
+        insert_event(&conn, &answered).unwrap();
+
+        let invites =
+            list_invites(&conn, "acc1", "test@example.com", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].event.id, "response-row");
+        assert_eq!(invites[0].event.my_status.as_deref(), Some("accepted"));
+
+        let status_row = get_event_by_uid(&conn, "acc1", uid).unwrap().unwrap();
+        assert_eq!(status_row.id, "response-row");
     }
 
     #[test]
@@ -813,6 +1149,142 @@ mod tests {
 
         // e2 should not exist as a separate row
         assert!(get_event(&conn, "e2").is_err());
+    }
+
+    #[test]
+    fn test_upsert_does_not_downgrade_an_answered_invite() {
+        let conn = setup_db();
+        let mut event = make_event("e1", "Remote Event", Some("remote-1"));
+        event.my_status = Some("accepted".to_string());
+        event.attendees_json = Some(
+            serde_json::to_string(&[Attendee {
+                email: "test@example.com".to_string(),
+                name: None,
+                status: "accepted".to_string(),
+            }])
+            .unwrap(),
+        );
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+
+        let mut stale_sync = make_event("e2", "Remote Event", Some("remote-1"));
+        stale_sync.my_status = Some("needs-action".to_string());
+        stale_sync.attendees_json = Some(attendees_json(&["test@example.com"]));
+        upsert_event_by_remote_id(&conn, &stale_sync).unwrap();
+        let preserved = get_event(&conn, "e1").unwrap();
+        assert_eq!(preserved.my_status.as_deref(), Some("accepted"));
+        let preserved_attendees: Vec<Attendee> =
+            serde_json::from_str(preserved.attendees_json.as_deref().unwrap()).unwrap();
+        assert_eq!(preserved_attendees[0].status, "accepted");
+
+        stale_sync.my_status = Some("declined".to_string());
+        upsert_event_by_remote_id(&conn, &stale_sync).unwrap();
+        assert_eq!(
+            get_event(&conn, "e1").unwrap().my_status.as_deref(),
+            Some("declined")
+        );
+    }
+
+    #[test]
+    fn test_upsert_reconciles_a_single_unpushed_uid_row() {
+        let conn = setup_db();
+        let mut local = make_event("local", "Invite", None);
+        local.uid = Some("shared-uid@example.com".to_string());
+        local.my_status = Some("accepted".to_string());
+        local.source_message_id = Some("message-1".to_string());
+        local.ical_data = Some("BEGIN:VCALENDAR".to_string());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &local).unwrap();
+        mark_invite_managed(&conn, "acc1", "local").unwrap();
+
+        let mut synced = make_event("remote", "Invite", Some("remote-1"));
+        synced.uid = local.uid.clone();
+        synced.my_status = Some("needs-action".to_string());
+        synced.attendees_json = Some(attendees_json(&["test@example.com"]));
+        upsert_event_by_remote_id(&conn, &synced).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND uid = ?1",
+                params![local.uid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let reconciled = get_event(&conn, "local").unwrap();
+        assert_eq!(reconciled.remote_id.as_deref(), Some("remote-1"));
+        assert_eq!(reconciled.my_status.as_deref(), Some("accepted"));
+        assert_eq!(reconciled.source_message_id.as_deref(), Some("message-1"));
+        assert_eq!(reconciled.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+        let managed_at: Option<String> = conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(managed_at.is_some());
+    }
+
+    #[test]
+    fn test_upsert_repairs_an_existing_remote_and_unpushed_duplicate_pair() {
+        let conn = setup_db();
+        let uid = "duplicate-uid@example.com";
+
+        let mut remote = make_event("remote-row", "Invite", Some("remote-1"));
+        remote.uid = Some(uid.to_string());
+        remote.my_status = Some("needs-action".to_string());
+        remote.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &remote).unwrap();
+
+        let mut local = make_event("local-row", "Invite", None);
+        local.uid = Some(uid.to_string());
+        local.my_status = Some("accepted".to_string());
+        local.source_message_id = Some("message-1".to_string());
+        local.ical_data = Some("BEGIN:VCALENDAR".to_string());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &local).unwrap();
+        mark_invite_managed(&conn, "acc1", "local-row").unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('local-row', 'acc1', 'zoom', 'meeting-1', 'https://meet.example.com')",
+            [],
+        )
+        .unwrap();
+
+        let mut synced = make_event("incoming", "Invite", Some("remote-1"));
+        synced.uid = Some(uid.to_string());
+        synced.my_status = Some("needs-action".to_string());
+        synced.attendees_json = Some(attendees_json(&["test@example.com"]));
+        upsert_event_by_remote_id(&conn, &synced).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(get_event(&conn, "local-row").is_err());
+
+        let repaired = get_event(&conn, "remote-row").unwrap();
+        assert_eq!(repaired.my_status.as_deref(), Some("accepted"));
+        assert_eq!(repaired.source_message_id.as_deref(), Some("message-1"));
+        assert_eq!(repaired.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+        let (managed_at, meeting_event_id): (Option<String>, String) = conn
+            .query_row(
+                "SELECT e.manually_managed_at, m.event_id
+                 FROM calendar_events e
+                 JOIN meet_meetings m ON m.event_id = e.id
+                 WHERE e.id = 'remote-row'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(managed_at.is_some());
+        assert_eq!(meeting_event_id, "remote-row");
     }
 
     #[test]

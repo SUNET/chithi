@@ -353,6 +353,7 @@ export interface Attendee {
  * `created_at` arrival timestamp used for the "recently received" sort.
  */
 export interface Invite extends CalendarEvent {
+  manually_managed_at: string | null;
   created_at: string | null;
 }
 

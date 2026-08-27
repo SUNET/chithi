@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use crate::calendar::CalendarEvent;
+use crate::calendar::{attendee_status_from_json, CalendarEvent};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::Result;
@@ -129,7 +129,10 @@ impl CalendarBackend for JmapCalendarBackend {
                     recurrence_rule: ev.recurrence_rule.clone(),
                     organizer_email: ev.organizer_email.clone(),
                     attendees_json: ev.attendees_json.clone(),
-                    my_status: None,
+                    my_status: attendee_status_from_json(
+                        ev.attendees_json.as_deref(),
+                        &account.email,
+                    ),
                     source_message_id: None,
                     ical_data: None,
                     remote_id: Some(ev.id.clone()),

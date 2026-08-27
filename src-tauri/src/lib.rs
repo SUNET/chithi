@@ -142,6 +142,7 @@ pub fn run() {
             commands::calendar::delete_calendar,
             commands::calendar::get_events,
             commands::calendar::list_invites,
+            commands::calendar::mark_invite_managed,
             commands::calendar::list_room_suggestions,
             commands::calendar::check_room_availability,
             commands::calendar::get_participant_schedules,

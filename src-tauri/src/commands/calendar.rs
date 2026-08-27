@@ -488,6 +488,17 @@ pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Res
     Ok(invites)
 }
 
+/// Mark a stored invitation as handled locally without sending an RSVP.
+#[tauri::command]
+pub async fn mark_invite_managed(
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::calendar::mark_invite_managed(&conn, &account_id, &event_id)
+}
+
 #[tauri::command]
 pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
     log::info!(

@@ -36,6 +36,16 @@ export function normalizeInviteStatus(
   }
 }
 
+/** Whether an invitation no longer needs attention in the management pane. */
+export function isInviteManaged(
+  invite: Pick<Invite, "my_status" | "manually_managed_at">,
+): boolean {
+  return (
+    invite.manually_managed_at != null ||
+    normalizeInviteStatus(invite.my_status) !== "needs-action"
+  );
+}
+
 /**
  * The occurrence of an invite to display/sort by. Non-recurring invites
  * use their own start. Recurring invites expand the RRULE and pick the
@@ -122,10 +132,7 @@ export const useInvitesStore = defineStore("invites", () => {
 
   /** Count of invites still awaiting a reply — backs the sidebar badge. */
   const needsActionCount = computed(
-    () =>
-      invites.value.filter(
-        (inv) => normalizeInviteStatus(inv.my_status) === "needs-action",
-      ).length,
+    () => invites.value.filter((invite) => !isInviteManaged(invite)).length,
   );
 
   /** Invites narrowed by `statusFilter` and ordered by `sortMode`. */
@@ -134,8 +141,10 @@ export const useInvitesStore = defineStore("invites", () => {
       statusFilter.value === "all"
         ? invites.value
         : invites.value.filter(
-            (inv) =>
-              normalizeInviteStatus(inv.my_status) === statusFilter.value,
+            (invite) =>
+              statusFilter.value === "needs-action"
+                ? !isInviteManaged(invite)
+                : normalizeInviteStatus(invite.my_status) === statusFilter.value,
           );
 
     // Precompute one sort key per invite, then sort on the cached value.
@@ -171,6 +180,12 @@ export const useInvitesStore = defineStore("invites", () => {
    */
   async function respond(invite: Invite, response: string) {
     await api.respondToEvent(invite.account_id, invite.id, response);
+    await fetchInvites();
+  }
+
+  /** Acknowledge an invite locally without sending or changing its RSVP. */
+  async function markManaged(invite: Invite) {
+    await api.markInviteManaged(invite.account_id, invite.id);
     await fetchInvites();
   }
 
@@ -238,5 +253,6 @@ export const useInvitesStore = defineStore("invites", () => {
     setSortMode,
     setViewActive,
     respond,
+    markManaged,
   };
 });

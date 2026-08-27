@@ -93,6 +93,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             organizer_email TEXT,
             attendees_json TEXT,
             my_status TEXT,
+            manually_managed_at TEXT,
             source_message_id TEXT,
             ical_data TEXT,
             remote_id TEXT,
@@ -101,6 +102,10 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_events_time ON calendar_events(start_time, end_time);
+        CREATE INDEX IF NOT EXISTS idx_events_account_uid
+            ON calendar_events(account_id, uid);
+        CREATE INDEX IF NOT EXISTS idx_events_account_remote
+            ON calendar_events(account_id, remote_id);
 
         CREATE TABLE IF NOT EXISTS calendars (
             id TEXT PRIMARY KEY,
@@ -379,6 +384,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
         )?;
+    }
+
+    // Manual invite acknowledgement is local workflow state, separate from
+    // the provider-controlled iCalendar RSVP in `my_status`.
+    let has_manually_managed_at = conn
+        .prepare("SELECT manually_managed_at FROM calendar_events LIMIT 0")
+        .is_ok();
+    if !has_manually_managed_at {
+        log::info!("Migration: adding manually_managed_at to calendar_events");
+        conn.execute_batch("ALTER TABLE calendar_events ADD COLUMN manually_managed_at TEXT;")?;
     }
 
     let has_cleanup_requested = conn
@@ -921,5 +936,38 @@ mod tests {
             )
             .unwrap();
         assert!(!cleanup_requested);
+    }
+
+    #[test]
+    fn invite_management_migration_preserves_existing_rsvp() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE calendar_events DROP COLUMN manually_managed_at;
+             INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
+             INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar', 'account', 'Calendar');
+             INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time, my_status)
+             VALUES
+                ('invite', 'account', 'calendar', 'Invite',
+                 '2026-08-27T10:00:00Z', '2026-08-27T11:00:00Z', 'accepted');",
+        )
+        .unwrap();
+
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+
+        let (status, managed_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT my_status, manually_managed_at
+                 FROM calendar_events WHERE id = 'invite'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+        assert!(managed_at.is_none());
     }
 }
