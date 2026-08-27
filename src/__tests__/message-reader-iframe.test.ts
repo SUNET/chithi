@@ -16,6 +16,7 @@ import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/tauri";
 import type { MessageBody } from "@/lib/types";
+import tauriConfig from "../../src-tauri/tauri.conf.json";
 
 const message: MessageBody = {
   id: "m1",
@@ -25,7 +26,7 @@ const message: MessageBody = {
   cc: [],
   date: "2026-08-24T10:00:00Z",
   flags: [],
-  body_html: '<table style="height: 900px"><tr><td>Newsletter</td></tr></table>',
+  body_html: '<table style="height: 900px"><tr><td><a href="https://example.org/story">Newsletter</a></td></tr></table>',
   body_text: null,
   attachments: [],
   is_encrypted: false,
@@ -66,6 +67,33 @@ function mountReader() {
   return wrapper;
 }
 
+function parseIframeDocument(reader: VueWrapper): Document {
+  const srcdoc = reader.get('[data-testid="reader-body-iframe"]').attributes("srcdoc");
+  if (srcdoc === undefined) throw new Error("iframe srcdoc is missing");
+  return new DOMParser().parseFromString(srcdoc, "text/html");
+}
+
+function runIframeBootstrap(doc: Document) {
+  const source = doc.querySelector("script")?.textContent;
+  if (!source) throw new Error("iframe bootstrap script is missing");
+
+  // Happy DOM's DOMParser omits Document.images; real browser documents
+  // expose an empty HTMLCollection when the message has no images.
+  Object.defineProperty(doc, "images", { value: [], configurable: true });
+  const postMessage = vi.fn();
+  const iframeWindow = { addEventListener: vi.fn() };
+  const execute = new Function("document", "parent", "ResizeObserver", "window", source);
+  execute(doc, { postMessage }, undefined, iframeWindow);
+  postMessage.mockClear();
+  return postMessage;
+}
+
+async function sha256Source(source: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
+  const binary = Array.from(new Uint8Array(digest), (byte) => String.fromCharCode(byte)).join("");
+  return `sha256-${btoa(binary)}`;
+}
+
 beforeEach(() => {
   localStorage.clear();
   setActivePinia(createPinia());
@@ -82,6 +110,62 @@ afterEach(() => {
 });
 
 describe("MessageReader HTML iframe sizing", () => {
+  it("allows only the exact trusted bootstrap in both inherited CSP policies", async () => {
+    const reader = mountReader();
+    const doc = parseIframeDocument(reader);
+    const source = doc.querySelector("script")?.textContent;
+    const iframeCsp = doc.querySelector<HTMLMetaElement>(
+      'meta[http-equiv="Content-Security-Policy"]',
+    )?.content;
+
+    expect(source).toBeTruthy();
+    const hash = await sha256Source(source!);
+    expect(iframeCsp).toContain(`script-src '${hash}'`);
+    expect(tauriConfig.app.security.csp).toContain(`script-src 'self' '${hash}'`);
+  });
+
+  it("handles WebKit text-node links and suppresses the context menu", () => {
+    const reader = mountReader();
+    const doc = parseIframeDocument(reader);
+    const postMessage = runIframeBootstrap(doc);
+    const anchor = doc.querySelector<HTMLAnchorElement>('a[href="https://example.org/story"]');
+    const text = anchor?.firstChild;
+
+    expect(text?.nodeType).toBe(Node.TEXT_NODE);
+
+    const hover = new MouseEvent("mouseover", { bubbles: true, cancelable: true });
+    text!.dispatchEvent(hover);
+    expect(postMessage).toHaveBeenLastCalledWith(
+      { type: "link-hover", href: "https://example.org/story" },
+      "*",
+    );
+
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+    text!.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
+    expect(postMessage).toHaveBeenLastCalledWith(
+      { type: "link-click", href: "https://example.org/story" },
+      "*",
+    );
+
+    const contextMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    text!.dispatchEvent(contextMenu);
+    expect(contextMenu.defaultPrevented).toBe(true);
+  });
+
+  it("routes link-click messages from its sandbox to the link popup", () => {
+    const reader = mountReader();
+    const iframe = reader.get('[data-testid="reader-body-iframe"]')
+      .element as HTMLIFrameElement;
+
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "link-click", href: "https://example.org/story" },
+      source: iframe.contentWindow,
+    }));
+
+    expect(useUiStore().linkPopupUrl).toBe("https://example.org/story");
+  });
+
   it("reports initial and delayed body and image height changes", () => {
     const reader = mountReader();
     const srcdoc = reader.get('[data-testid="reader-body-iframe"]').attributes("srcdoc");

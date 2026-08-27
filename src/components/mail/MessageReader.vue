@@ -190,26 +190,20 @@ watch(
 const hasHtml = () => !!(displayedBody.value?.body_html);
 const hasText = () => !!(displayedBody.value?.body_text);
 
-// Generate a random nonce for iframe CSP
-function generateNonce(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Memoize the nonce per active message to prevent iframe reloads on re-render
-const currentNonce = ref(generateNonce());
+// The app-level CSP is inherited by srcdoc documents. Both policies allow
+// this exact trusted bootstrap by hash while all email-provided scripts stay
+// blocked. The iframe regression test detects drift when the script changes.
+const IFRAME_BOOTSTRAP_HASH = "sha256-+vePiogHMK6Dv7W4Iq5+OZ1HRJzVYJFdrMV44DV/Bk4=";
 
 // Build a sandboxed iframe srcdoc that isolates HTML email from the main webview.
-// Uses a CSP nonce instead of 'unsafe-inline' so only our bootstrap script runs.
+// Uses a CSP hash instead of 'unsafe-inline' so only our bootstrap script runs.
 // Email HTML is embedded in srcdoc but sanitized by ammonia on the backend.
 function iframeSrcdoc(): string {
   const html = imagesHtml.value ?? displayedBody.value?.body_html ?? "";
-  const nonce = currentNonce.value;
   return `<!DOCTYPE html>
 <html>
 <head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src https: data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src '${IFRAME_BOOTSTRAP_HASH}'; style-src 'unsafe-inline'; img-src https: data:;">
 <style>
   body {
     margin: 0;
@@ -225,7 +219,14 @@ function iframeSrcdoc(): string {
   a { color: #1a73e8; cursor: pointer; }
 </style>
 </head>
-<body>${html}<script nonce="${nonce}">
+<body>${html}<script>
+  // WebKit may report a text node as the event target when the visible link
+  // text is clicked. Promote non-element targets before looking for an anchor.
+  function closestAnchor(target) {
+    if (!target) return null;
+    var element = target.nodeType === 1 ? target : target.parentElement;
+    return element && element.closest ? element.closest('a') : null;
+  }
   // Anchor's raw href attribute; null/empty for fragment-only or hrefless
   // anchors. Use getAttribute (not .href, which auto-resolves relatives
   // against the iframe location and would surface "about:srcdoc#foo").
@@ -238,7 +239,7 @@ function iframeSrcdoc(): string {
   }
   // Intercept all link clicks and forward to parent via postMessage
   document.addEventListener('click', function(e) {
-    var a = e.target.closest ? e.target.closest('a') : null;
+    var a = closestAnchor(e.target);
     var href = anchorHref(a);
     if (href) {
       e.preventDefault();
@@ -250,20 +251,20 @@ function iframeSrcdoc(): string {
   // status bar. mouseover/mouseout bubble (mouseenter/leave do not), so a
   // single document-level listener is enough.
   document.addEventListener('mouseover', function(e) {
-    var a = e.target.closest ? e.target.closest('a') : null;
+    var a = closestAnchor(e.target);
     var href = anchorHref(a);
     if (href) {
       parent.postMessage({ type: 'link-hover', href: href }, '*');
     }
   });
   document.addEventListener('mouseout', function(e) {
-    var a = e.target.closest ? e.target.closest('a') : null;
+    var a = closestAnchor(e.target);
     if (!anchorHref(a)) return;
     // mouseout also fires when the pointer moves between an anchor's own
     // child nodes; relatedTarget is where the pointer went next. Only
     // emit link-leave when the cursor actually left this <a>.
     var rel = e.relatedTarget;
-    var relAnchor = rel && rel.closest ? rel.closest('a') : null;
+    var relAnchor = closestAnchor(rel);
     if (relAnchor === a) return;
     parent.postMessage({ type: 'link-leave' }, '*');
   });
@@ -345,11 +346,6 @@ function handleIframeMessage(event: MessageEvent) {
     }
   }
 }
-
-// Reset nonce when active message changes so CSP stays unique per message
-watch(() => messagesStore.activeMessageId, () => {
-  currentNonce.value = generateNonce();
-});
 
 // Set up / tear down message listener
 onMounted(() => window.addEventListener('message', handleIframeMessage));
