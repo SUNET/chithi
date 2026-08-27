@@ -93,6 +93,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             organizer_email TEXT,
             attendees_json TEXT,
             my_status TEXT,
+            pending_rsvp_status TEXT,
             manually_managed_at TEXT,
             source_message_id TEXT,
             ical_data TEXT,
@@ -394,6 +395,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if !has_manually_managed_at {
         log::info!("Migration: adding manually_managed_at to calendar_events");
         conn.execute_batch("ALTER TABLE calendar_events ADD COLUMN manually_managed_at TEXT;")?;
+    }
+
+    // A locally sent response remains authoritative until provider sync
+    // echoes the same status, preventing stale answered states from winning.
+    let has_pending_rsvp_status = conn
+        .prepare("SELECT pending_rsvp_status FROM calendar_events LIMIT 0")
+        .is_ok();
+    if !has_pending_rsvp_status {
+        log::info!("Migration: adding pending_rsvp_status to calendar_events");
+        conn.execute_batch("ALTER TABLE calendar_events ADD COLUMN pending_rsvp_status TEXT;")?;
     }
 
     let has_cleanup_requested = conn
@@ -944,6 +955,7 @@ mod tests {
         initialize(&conn).unwrap();
         conn.execute_batch(
             "ALTER TABLE calendar_events DROP COLUMN manually_managed_at;
+             ALTER TABLE calendar_events DROP COLUMN pending_rsvp_status;
              INSERT INTO accounts (id, display_name, email, username)
              VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
              INSERT INTO calendars (id, account_id, name)
@@ -959,15 +971,16 @@ mod tests {
         initialize(&conn).unwrap();
         initialize(&conn).unwrap();
 
-        let (status, managed_at): (String, Option<String>) = conn
+        let (status, managed_at, pending_status): (String, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT my_status, manually_managed_at
+                "SELECT my_status, manually_managed_at, pending_rsvp_status
                  FROM calendar_events WHERE id = 'invite'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(status, "accepted");
         assert!(managed_at.is_none());
+        assert!(pending_status.is_none());
     }
 }

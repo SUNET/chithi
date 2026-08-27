@@ -345,6 +345,7 @@ export interface Attendee {
   email: string;
   name: string | null;
   status: string;
+  is_self?: boolean;
 }
 
 /**

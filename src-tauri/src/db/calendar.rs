@@ -196,10 +196,15 @@ fn attendees_with_status(
     let Ok(mut attendees) = serde_json::from_str::<Vec<Attendee>>(json) else {
         return Some(json.to_string());
     };
-    if let Some(attendee) = attendees
-        .iter_mut()
-        .find(|attendee| attendee.email.eq_ignore_ascii_case(account_email))
-    {
+    let account_attendee = attendees
+        .iter()
+        .position(|attendee| attendee.is_self == Some(true))
+        .or_else(|| {
+            attendees
+                .iter()
+                .position(|attendee| attendee.email.eq_ignore_ascii_case(account_email))
+        });
+    if let Some(attendee) = account_attendee.and_then(|index| attendees.get_mut(index)) {
         attendee.status = status.to_string();
     }
     serde_json::to_string(&attendees).ok()
@@ -209,26 +214,29 @@ struct ExistingEventForSync {
     id: String,
     my_status: Option<String>,
     attendees_json: Option<String>,
+    pending_rsvp_status: Option<String>,
 }
 
 fn single_unpushed_event_by_uid(
     conn: &Connection,
     account_id: &str,
     uid: &str,
+    start_time: &str,
 ) -> Result<Option<ExistingEventForSync>> {
     let mut stmt = conn.prepare(
-        "SELECT id, my_status, attendees_json
+        "SELECT id, my_status, attendees_json, pending_rsvp_status
          FROM calendar_events
-         WHERE account_id = ?1 AND uid = ?2
+         WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
            AND (remote_id IS NULL OR remote_id = '')
          LIMIT 2",
     )?;
     let mut candidates = stmt
-        .query_map(params![account_id, uid], |row| {
+        .query_map(params![account_id, uid, start_time], |row| {
             Ok(ExistingEventForSync {
                 id: row.get(0)?,
                 my_status: row.get(1)?,
                 attendees_json: row.get(2)?,
+                pending_rsvp_status: row.get(3)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -238,8 +246,9 @@ fn single_unpushed_event_by_uid(
     } else {
         if candidates.len() > 1 {
             log::warn!(
-                "Not reconciling remote event UID '{}' because multiple unpushed rows match",
-                uid
+                "Not reconciling remote event UID '{}' at '{}' because multiple unpushed rows match",
+                uid,
+                start_time
             );
         }
         Ok(None)
@@ -280,6 +289,10 @@ fn reconcile_duplicate_invite_rows(
             ical_data = COALESCE(
                 ical_data,
                 (SELECT ical_data FROM calendar_events WHERE id = ?1)
+            ),
+            pending_rsvp_status = COALESCE(
+                (SELECT pending_rsvp_status FROM calendar_events WHERE id = ?1),
+                pending_rsvp_status
             )
          WHERE id = ?2",
         params![local.id, remote.id],
@@ -309,13 +322,15 @@ fn reconcile_duplicate_invite_rows(
     }
 
     let reconciled = transaction.query_row(
-        "SELECT id, my_status, attendees_json FROM calendar_events WHERE id = ?1",
+        "SELECT id, my_status, attendees_json, pending_rsvp_status
+         FROM calendar_events WHERE id = ?1",
         params![remote.id],
         |row| {
             Ok(ExistingEventForSync {
                 id: row.get(0)?,
                 my_status: row.get(1)?,
                 attendees_json: row.get(2)?,
+                pending_rsvp_status: row.get(3)?,
             })
         },
     )?;
@@ -332,7 +347,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
     if let Some(ref remote_id) = event.remote_id {
         let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
-                "SELECT id, my_status, attendees_json
+                "SELECT id, my_status, attendees_json, pending_rsvp_status
                  FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
                 params![event.account_id, remote_id],
                 |row| {
@@ -340,13 +355,14 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                         id: row.get(0)?,
                         my_status: row.get(1)?,
                         attendees_json: row.get(2)?,
+                        pending_rsvp_status: row.get(3)?,
                     })
                 },
             )
             .optional()?;
 
         let unpushed_existing = if let Some(uid) = event.uid.as_deref() {
-            single_unpushed_event_by_uid(conn, &event.account_id, uid)?
+            single_unpushed_event_by_uid(conn, &event.account_id, uid, &event.start_time)?
         } else {
             None
         };
@@ -360,10 +376,25 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
         };
 
         if let Some(existing) = existing {
-            let preserved_status = existing
-                .my_status
-                .filter(|_| !is_answered_status(event.my_status.as_deref()))
-                .filter(|status| is_answered_status(Some(status.as_str())));
+            let provider_confirmed_pending = existing
+                .pending_rsvp_status
+                .as_deref()
+                .is_some_and(|pending| event.my_status.as_deref() == Some(pending));
+            let pending_rsvp_status = if provider_confirmed_pending {
+                None
+            } else {
+                existing.pending_rsvp_status.clone()
+            };
+            let preserved_status = if provider_confirmed_pending {
+                None
+            } else if existing.pending_rsvp_status.is_some() {
+                existing.pending_rsvp_status.clone()
+            } else {
+                existing
+                    .my_status
+                    .filter(|_| !is_answered_status(event.my_status.as_deref()))
+                    .filter(|status| is_answered_status(Some(status.as_str())))
+            };
             let effective_status = preserved_status.clone().or_else(|| event.my_status.clone());
             let mut effective_attendees = event.attendees_json.clone();
             if let Some(status) = preserved_status.as_deref() {
@@ -388,10 +419,11 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     location = ?5, start_time = ?6, end_time = ?7, all_day = ?8,
                     timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
                     attendees_json = ?12, my_status = ?13,
-                    source_message_id = COALESCE(?14, source_message_id),
-                    ical_data = COALESCE(?15, ical_data), remote_id = ?16, etag = ?17,
+                    pending_rsvp_status = ?14,
+                    source_message_id = COALESCE(?15, source_message_id),
+                    ical_data = COALESCE(?16, ical_data), remote_id = ?17, etag = ?18,
                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?18",
+                 WHERE id = ?19",
                 params![
                     event.calendar_id,
                     event.uid,
@@ -406,6 +438,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     event.organizer_email,
                     effective_attendees,
                     effective_status,
+                    pending_rsvp_status,
                     event.source_message_id,
                     event.ical_data,
                     event.remote_id,
@@ -550,7 +583,7 @@ pub fn list_invites(
             .uid
             .as_deref()
             .filter(|uid| !uid.is_empty())
-            .map(|uid| format!("uid:{uid}"))
+            .map(|uid| format!("uid:{uid}:start:{}", invite.event.start_time))
             .unwrap_or_else(|| format!("id:{}", invite.event.id));
         let candidate_rank = invite_management_rank(&invite);
         match deduplicated.entry(key) {
@@ -711,6 +744,36 @@ pub fn get_event_by_uid(
     }
 }
 
+/// Find the local row for one concrete occurrence in a recurring series.
+pub fn get_event_by_uid_and_start(
+    conn: &Connection,
+    account_id: &str,
+    uid: &str,
+    start_time: &str,
+) -> Result<Option<CalendarEvent>> {
+    let result = conn.query_row(
+        "SELECT id, account_id, calendar_id, uid, title, description, location,
+                start_time, end_time, all_day, timezone, recurrence_rule,
+                organizer_email, attendees_json, my_status, source_message_id,
+                ical_data, remote_id, etag
+         FROM calendar_events
+         WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
+         ORDER BY
+            CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
+            CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
+            CASE WHEN source_message_id IS NOT NULL THEN 0 ELSE 1 END
+         LIMIT 1",
+        params![account_id, uid, start_time],
+        map_event_row,
+    );
+
+    match result {
+        Ok(event) => Ok(Some(event)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(crate::error::Error::Database(e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -792,6 +855,7 @@ mod tests {
                 organizer_email TEXT,
                 attendees_json TEXT,
                 my_status TEXT,
+                pending_rsvp_status TEXT,
                 manually_managed_at TEXT,
                 source_message_id TEXT,
                 ical_data TEXT,
@@ -947,6 +1011,7 @@ mod tests {
                 email: e.to_string(),
                 name: None,
                 status: "needs-action".to_string(),
+                is_self: None,
             })
             .collect();
         serde_json::to_string(&atts).unwrap()
@@ -1091,6 +1156,38 @@ mod tests {
     }
 
     #[test]
+    fn test_list_invites_keeps_distinct_recurring_occurrences() {
+        let conn = setup_db();
+        let uid = "recurring@example.com";
+
+        for (id, start, end) in [
+            (
+                "occurrence-1",
+                "2026-04-07T17:00:00Z",
+                "2026-04-07T18:00:00Z",
+            ),
+            (
+                "occurrence-2",
+                "2026-04-14T17:00:00Z",
+                "2026-04-14T18:00:00Z",
+            ),
+        ] {
+            let mut occurrence = make_event(id, "Weekly Invite", Some(id));
+            occurrence.uid = Some(uid.to_string());
+            occurrence.start_time = start.to_string();
+            occurrence.end_time = end.to_string();
+            occurrence.organizer_email = Some("boss@example.com".to_string());
+            occurrence.attendees_json = Some(attendees_json(&["test@example.com"]));
+            occurrence.my_status = Some("accepted".to_string());
+            insert_event(&conn, &occurrence).unwrap();
+        }
+
+        let invites =
+            list_invites(&conn, "acc1", "test@example.com", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(invites.len(), 2);
+    }
+
+    #[test]
     fn test_list_invites_date_window() {
         let conn = setup_db();
         let since = "2026-04-01T00:00:00Z";
@@ -1161,6 +1258,7 @@ mod tests {
                 email: "test@example.com".to_string(),
                 name: None,
                 status: "accepted".to_string(),
+                is_self: None,
             }])
             .unwrap(),
         );
@@ -1182,6 +1280,71 @@ mod tests {
             get_event(&conn, "e1").unwrap().my_status.as_deref(),
             Some("declined")
         );
+    }
+
+    #[test]
+    fn test_upsert_keeps_pending_response_until_provider_confirmation() {
+        let conn = setup_db();
+        let mut event = make_event("e1", "Remote Event", Some("remote-1"));
+        event.my_status = Some("accepted".to_string());
+        event.attendees_json = Some(
+            serde_json::to_string(&[Attendee {
+                email: "alias@example.com".to_string(),
+                name: None,
+                status: "accepted".to_string(),
+                is_self: Some(true),
+            }])
+            .unwrap(),
+        );
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+        conn.execute(
+            "UPDATE calendar_events
+             SET my_status = 'declined', pending_rsvp_status = 'declined'
+             WHERE id = 'e1'",
+            [],
+        )
+        .unwrap();
+
+        let mut stale_sync = event.clone();
+        stale_sync.id = "stale".to_string();
+        stale_sync.my_status = Some("accepted".to_string());
+        upsert_event_by_remote_id(&conn, &stale_sync).unwrap();
+
+        let preserved = get_event(&conn, "e1").unwrap();
+        assert_eq!(preserved.my_status.as_deref(), Some("declined"));
+        let preserved_attendees: Vec<Attendee> =
+            serde_json::from_str(preserved.attendees_json.as_deref().unwrap()).unwrap();
+        assert_eq!(preserved_attendees[0].status, "declined");
+        let pending: Option<String> = conn
+            .query_row(
+                "SELECT pending_rsvp_status FROM calendar_events WHERE id = 'e1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending.as_deref(), Some("declined"));
+
+        let mut confirmed_sync = stale_sync;
+        confirmed_sync.my_status = Some("declined".to_string());
+        confirmed_sync.attendees_json = Some(
+            serde_json::to_string(&[Attendee {
+                email: "alias@example.com".to_string(),
+                name: None,
+                status: "declined".to_string(),
+                is_self: Some(true),
+            }])
+            .unwrap(),
+        );
+        upsert_event_by_remote_id(&conn, &confirmed_sync).unwrap();
+
+        let confirmed_pending: Option<String> = conn
+            .query_row(
+                "SELECT pending_rsvp_status FROM calendar_events WHERE id = 'e1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(confirmed_pending.is_none());
     }
 
     #[test]
@@ -1224,6 +1387,34 @@ mod tests {
             )
             .unwrap();
         assert!(managed_at.is_some());
+    }
+
+    #[test]
+    fn test_upsert_does_not_reconcile_a_different_occurrence() {
+        let conn = setup_db();
+        let mut local = make_event("local", "Weekly Invite", None);
+        local.uid = Some("shared-series@example.com".to_string());
+        insert_event(&conn, &local).unwrap();
+
+        let mut remote = make_event("remote", "Weekly Invite", Some("remote-1"));
+        remote.uid = local.uid.clone();
+        remote.start_time = "2026-04-14T17:00:00Z".to_string();
+        remote.end_time = "2026-04-14T18:00:00Z".to_string();
+        upsert_event_by_remote_id(&conn, &remote).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND uid = ?1",
+                params![local.uid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(get_event(&conn, "local").unwrap().remote_id.is_none());
+        assert_eq!(
+            get_event(&conn, "remote").unwrap().remote_id.as_deref(),
+            Some("remote-1")
+        );
     }
 
     #[test]

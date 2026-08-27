@@ -348,13 +348,13 @@ impl GoogleClient {
         )))
     }
 
-    /// Find an event's Google id by its iCalUID. `Ok(None)` when the
-    /// event is not on the calendar.
+    /// Find an event by its iCalUID. The complete event is returned because
+    /// attendee PATCHes must preserve every guest in Google's replacement array.
     pub async fn find_event_by_ical_uid(
         &self,
         calendar_id: &str,
         ical_uid: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<serde_json::Value>> {
         let url = self.calendar_url(&format!(
             "calendars/{}/events?iCalUID={}",
             urlencoding::encode(calendar_id),
@@ -374,8 +374,7 @@ impl GoogleClient {
         Ok(data["items"]
             .as_array()
             .and_then(|items| items.first())
-            .and_then(|e| e["id"].as_str())
-            .map(|s| s.to_string()))
+            .cloned())
     }
 
     /// Import an existing event (preserving its iCalUID) onto a
