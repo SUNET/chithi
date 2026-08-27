@@ -29,17 +29,42 @@ pub struct CalendarEvent {
 }
 
 /// Attendee serialized inside [`CalendarEvent::attendees_json`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attendee {
     pub email: String,
     pub name: Option<String>,
     /// `accepted`, `tentative`, `declined`, or `needs-action`.
     pub status: String,
+    /// Provider-confirmed account identity, used when the attendee address is an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_self: Option<bool>,
+}
+
+/// Return the RSVP status for `email` from a provider attendee list.
+pub(crate) fn attendee_status_for_email(attendees: &[Attendee], email: &str) -> Option<String> {
+    attendees
+        .iter()
+        .find(|attendee| attendee.is_self == Some(true))
+        .or_else(|| {
+            attendees
+                .iter()
+                .find(|attendee| attendee.email.eq_ignore_ascii_case(email))
+        })
+        .map(|attendee| attendee.status.clone())
+}
+
+/// Parse a persisted provider attendee list and return this account's RSVP.
+pub(crate) fn attendee_status_from_json(
+    attendees_json: Option<&str>,
+    email: &str,
+) -> Option<String> {
+    let attendees = serde_json::from_str::<Vec<Attendee>>(attendees_json?).ok()?;
+    attendee_status_for_email(&attendees, email)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Attendee, CalendarEvent};
+    use super::{attendee_status_for_email, attendee_status_from_json, Attendee, CalendarEvent};
 
     #[test]
     fn calendar_event_json_contract_is_stable() {
@@ -132,6 +157,7 @@ mod tests {
             email: "guest@example.com".into(),
             name: Some("Guest".into()),
             status: "tentative".into(),
+            is_self: None,
         };
         let expected = serde_json::json!({
             "email": "guest@example.com",
@@ -156,5 +182,56 @@ mod tests {
                 "status": "needs-action",
             })
         );
+    }
+
+    #[test]
+    fn attendee_status_lookup_is_case_insensitive() {
+        let attendees = vec![Attendee {
+            email: "Me@Example.com".into(),
+            name: None,
+            status: "accepted".into(),
+            is_self: None,
+        }];
+
+        assert_eq!(
+            attendee_status_for_email(&attendees, "me@example.com"),
+            Some("accepted".into())
+        );
+        assert_eq!(
+            attendee_status_from_json(
+                Some(r#"[{"email":"ME@example.com","name":null,"status":"tentative"}]"#),
+                "me@example.com",
+            ),
+            Some("tentative".into())
+        );
+        assert_eq!(
+            attendee_status_from_json(Some("invalid"), "me@example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn attendee_status_prefers_provider_self_marker_for_aliases() {
+        let attendees = vec![
+            Attendee {
+                email: "me@example.com".into(),
+                name: None,
+                status: "accepted".into(),
+                is_self: Some(false),
+            },
+            Attendee {
+                email: "alias@example.com".into(),
+                name: None,
+                status: "declined".into(),
+                is_self: Some(true),
+            },
+        ];
+
+        assert_eq!(
+            attendee_status_for_email(&attendees, "me@example.com"),
+            Some("declined".into())
+        );
+        let encoded = serde_json::to_value(&attendees[1]).unwrap();
+        assert_eq!(encoded["is_self"], true);
     }
 }

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::calendar::ical;
-use crate::calendar::CalendarEvent;
+use crate::calendar::{attendee_status_for_email, CalendarEvent};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::Result;
@@ -150,7 +150,7 @@ impl CalendarBackend for CalDavCalendarBackend {
                     recurrence_rule: invite.recurrence_rule.clone(),
                     organizer_email: invite.organizer_email.clone(),
                     attendees_json,
-                    my_status: None,
+                    my_status: attendee_status_for_email(&invite.attendees, &account.email),
                     source_message_id: None,
                     ical_data: Some(ev.ical_data.clone()),
                     remote_id: Some(ev.href.clone()),

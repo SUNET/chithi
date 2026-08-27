@@ -488,6 +488,17 @@ pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Res
     Ok(invites)
 }
 
+/// Mark a stored invitation as handled locally without sending an RSVP.
+#[tauri::command]
+pub async fn mark_invite_managed(
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::calendar::mark_invite_managed(&conn, &account_id, &event_id)
+}
+
 #[tauri::command]
 pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
     log::info!(
@@ -1294,6 +1305,9 @@ async fn apply_invite_response(
     let response = InviteResponse::try_from(response.as_str())?;
     let response_text = response.as_str();
     let backend = crate::backend::calendar::for_account(&account);
+    let track_pending_rsvp = backend
+        .map(|provider| provider.remote_rsvp_policy() != RemoteRsvpPolicy::RequiredBeforeLocal)
+        .unwrap_or(true);
     let remote_request = RemoteRsvpRequest {
         uid: invite_uid.clone(),
         response,
@@ -1304,6 +1318,7 @@ async fn apply_invite_response(
         description: invite.description.clone(),
         location: invite.location.clone(),
         organizer_email: invite.organizer_email.clone(),
+        attendees: invite.attendees.clone(),
     };
 
     // Step 2: Generate the iTIP REPLY
@@ -1462,16 +1477,24 @@ async fn apply_invite_response(
         None
     } else {
         let mut attendees = invite.attendees.clone();
-        for att in attendees.iter_mut() {
-            if att.email.eq_ignore_ascii_case(&account.email) {
-                att.status = my_status.clone();
-            }
+        let account_attendee = attendees
+            .iter()
+            .position(|attendee| attendee.is_self == Some(true))
+            .or_else(|| {
+                attendees
+                    .iter()
+                    .position(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))
+            });
+        if let Some(attendee) = account_attendee.and_then(|index| attendees.get_mut(index)) {
+            attendee.status = my_status.clone();
         }
         Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
     };
 
     // Check if we already have this event
-    if let Some(mut existing) = db::calendar::get_event_by_uid(&conn, &account_id, &invite_uid)? {
+    let responded_event_id = if let Some(mut existing) =
+        db::calendar::get_event_by_uid_and_start(&conn, &account_id, &invite_uid, &invite.dtstart)?
+    {
         existing.my_status = Some(my_status);
         existing.attendees_json = attendees_json;
         db::calendar::update_event(&conn, &existing)?;
@@ -1480,6 +1503,7 @@ async fn apply_invite_response(
             existing.id,
             response_text
         );
+        existing.id
     } else {
         let event_id = uuid::Uuid::new_v4().to_string();
         let cal_event = CalendarEvent {
@@ -1512,7 +1536,16 @@ async fn apply_invite_response(
             event_id,
             response_text
         );
-    }
+        event_id
+    };
+
+    conn.execute(
+        "UPDATE calendar_events SET pending_rsvp_status = ?1 WHERE id = ?2",
+        rusqlite::params![
+            track_pending_rsvp.then_some(response_text),
+            responded_event_id
+        ],
+    )?;
 
     // The DB write lock covers only the local update above. Release it before
     // any network I/O below, so calendar reads aren't blocked and so the
@@ -1552,8 +1585,9 @@ async fn apply_invite_response(
     if let Some(remote_id) = best_effort_remote_id {
         let conn = state.db.writer().await;
         conn.execute(
-            "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3 AND (remote_id IS NULL OR remote_id = '')",
-            rusqlite::params![remote_id, invite_uid, account_id],
+            "UPDATE calendar_events SET remote_id = ?1
+             WHERE id = ?2 AND (remote_id IS NULL OR remote_id = '')",
+            rusqlite::params![remote_id, responded_event_id],
         )
         .ok();
     }
@@ -1565,8 +1599,8 @@ async fn apply_invite_response(
     if let Some(remote_id) = required_remote_id {
         let conn = state.db.writer().await;
         conn.execute(
-            "UPDATE calendar_events SET remote_id = ?1 WHERE uid = ?2 AND account_id = ?3",
-            rusqlite::params![remote_id, invite_uid, account_id],
+            "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
+            rusqlite::params![remote_id, responded_event_id],
         )
         .ok();
     }
@@ -1811,6 +1845,7 @@ pub async fn send_invites(
                     email: e.clone(),
                     name: None,
                     status: "needs-action".to_string(),
+                    is_self: None,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -1829,6 +1864,7 @@ pub async fn send_invites(
             email: email.clone(),
             name: None,
             status: "needs-action".to_string(),
+            is_self: None,
         })
         .collect();
 

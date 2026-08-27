@@ -467,6 +467,14 @@ export async function listInvites(
   return invoke("list_invites", { accountId });
 }
 
+/** Mark a stored invitation as handled locally without sending an RSVP. */
+export async function markInviteManaged(
+  accountId: string,
+  eventId: string,
+): Promise<void> {
+  return invoke("mark_invite_managed", { accountId, eventId });
+}
+
 /**
  * Change the RSVP for a stored calendar event. Unlike `respondToInvite`,
  * this needs no original invite email — the iTIP REPLY is rebuilt from the

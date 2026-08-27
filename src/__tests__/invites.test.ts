@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { setActivePinia, createPinia } from "pinia";
+import { mount } from "@vue/test-utils";
 
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   listInvites: vi.fn().mockResolvedValue([]),
+  markInviteManaged: vi.fn().mockResolvedValue(undefined),
   respondToEvent: vi.fn().mockResolvedValue(undefined),
   triggerSync: vi.fn().mockResolvedValue(undefined),
 }));
@@ -14,6 +16,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   useInvitesStore,
+  isInviteManaged,
   nextOccurrence,
   parseInviteTimestamp,
 } from "@/stores/invites";
@@ -22,6 +25,7 @@ import { useUiStore } from "@/stores/ui";
 import type { Invite } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
+import InvitesView from "@/views/InvitesView.vue";
 
 function makeAccount(id: string, email: string) {
   return {
@@ -59,6 +63,7 @@ function makeInvite(id: string, opts: Partial<Invite> = {}): Invite {
     attendees_json: opts.attendees_json ?? null,
     my_status: opts.my_status ?? null,
     source_message_id: null,
+    manually_managed_at: opts.manually_managed_at ?? null,
     created_at: opts.created_at ?? "2026-05-01 09:00:00",
   };
 }
@@ -75,6 +80,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.mocked(api.listAccounts).mockResolvedValue([]);
   vi.mocked(api.listInvites).mockReset().mockResolvedValue([]);
+  vi.mocked(api.markInviteManaged).mockReset().mockResolvedValue(undefined);
   vi.mocked(api.respondToEvent).mockReset().mockResolvedValue(undefined);
   vi.mocked(listen).mockClear().mockResolvedValue(() => {});
 });
@@ -122,13 +128,14 @@ describe("invites store — filtering", () => {
   it("status filter narrows to the selected reply state", async () => {
     const store = await loadInvites([
       makeInvite("none", { my_status: null }),
+      makeInvite("managed", { manually_managed_at: "2026-05-02 10:00:00" }),
       makeInvite("acc", { my_status: "accepted" }),
       makeInvite("may", { my_status: "tentative" }),
       makeInvite("dec", { my_status: "declined" }),
     ]);
 
     store.setStatusFilter("all");
-    expect(store.filteredInvites).toHaveLength(4);
+    expect(store.filteredInvites).toHaveLength(5);
 
     store.setStatusFilter("needs-action");
     expect(store.filteredInvites.map((i) => i.id)).toEqual(["none"]);
@@ -147,9 +154,22 @@ describe("invites store — filtering", () => {
     const store = await loadInvites([
       makeInvite("none1", { my_status: null }),
       makeInvite("none2", { my_status: "needs-action" }),
+      makeInvite("managed", { manually_managed_at: "2026-05-02 10:00:00" }),
       makeInvite("acc", { my_status: "accepted" }),
     ]);
     expect(store.needsActionCount).toBe(2);
+  });
+
+  it("treats either a reply or manual acknowledgement as managed", () => {
+    expect(isInviteManaged(makeInvite("none"))).toBe(false);
+    expect(
+      isInviteManaged(
+        makeInvite("manual", { manually_managed_at: "2026-05-02 10:00:00" }),
+      ),
+    ).toBe(true);
+    expect(isInviteManaged(makeInvite("accepted", { my_status: "accepted" }))).toBe(
+      true,
+    );
   });
 
   it("sorts by event date ascending and descending", async () => {
@@ -210,6 +230,21 @@ describe("invites store — RSVP data flow", () => {
     );
   });
 
+  it("markManaged() uses the local-only API and never sends an RSVP", async () => {
+    vi.mocked(api.listInvites).mockResolvedValue([makeInvite("e1")]);
+    const store = useInvitesStore();
+    await store.fetchInvites();
+
+    const fetchesBefore = vi.mocked(api.listInvites).mock.calls.length;
+    await store.markManaged(store.invites[0]);
+
+    expect(api.markInviteManaged).toHaveBeenCalledWith("acc1", "e1");
+    expect(api.respondToEvent).not.toHaveBeenCalled();
+    expect(vi.mocked(api.listInvites).mock.calls.length).toBe(
+      fetchesBefore + 1,
+    );
+  });
+
   it("refetches invites when a calendar-changed event fires", async () => {
     vi.mocked(api.listInvites).mockResolvedValue([]);
     useInvitesStore();
@@ -228,6 +263,38 @@ describe("invites store — RSVP data flow", () => {
     expect(vi.mocked(api.listInvites).mock.calls.length).toBeGreaterThan(
       before,
     );
+  });
+});
+
+describe("Invites view — manual management", () => {
+  it("marks an unanswered invite without sending an RSVP", async () => {
+    const accounts = useAccountsStore();
+    accounts.accounts = [makeAccount("acc1", "me@example.com")];
+    vi.mocked(api.listInvites).mockResolvedValue([makeInvite("e1")]);
+
+    const wrapper = mount(InvitesView);
+    await flush();
+    await wrapper.get('[data-testid="invite-mark-managed-e1"]').trigger("click");
+    await flush();
+
+    expect(api.markInviteManaged).toHaveBeenCalledWith("acc1", "e1");
+    expect(api.respondToEvent).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("labels a manually acknowledged invite without calling it accepted", async () => {
+    const accounts = useAccountsStore();
+    accounts.accounts = [makeAccount("acc1", "me@example.com")];
+    vi.mocked(api.listInvites).mockResolvedValue([
+      makeInvite("e1", { manually_managed_at: "2026-05-02 10:00:00" }),
+    ]);
+
+    const wrapper = mount(InvitesView);
+    await flush();
+
+    expect(wrapper.get(".status-pill").text()).toBe("Managed manually");
+    expect(wrapper.find('[data-testid="invite-mark-managed-e1"]').exists()).toBe(false);
+    wrapper.unmount();
   });
 });
 

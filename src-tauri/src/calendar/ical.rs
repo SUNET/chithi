@@ -628,6 +628,7 @@ fn parse_attendees(component: &icalendar::parser::Component<'_>) -> Vec<Attendee
             email,
             name,
             status,
+            is_self: None,
         });
     }
 
@@ -1156,11 +1157,13 @@ END:VCALENDAR\r\n";
                 email: "bob@example.com".to_string(),
                 name: Some("Bob".to_string()),
                 status: "needs-action".to_string(),
+                is_self: None,
             },
             Attendee {
                 email: "carol@example.com".to_string(),
                 name: None,
                 status: "needs-action".to_string(),
+                is_self: None,
             },
         ];
 
@@ -1197,6 +1200,7 @@ END:VCALENDAR\r\n";
             email: "bob@example.com".to_string(),
             name: None,
             status: "needs-action".to_string(),
+            is_self: None,
         }];
 
         let ical = generate_invite(

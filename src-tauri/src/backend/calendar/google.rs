@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use crate::calendar::CalendarEvent;
+use crate::calendar::{Attendee, CalendarEvent};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
@@ -17,6 +17,70 @@ use super::{
 };
 
 pub struct GoogleCalendarBackend;
+
+fn google_response_status(status: Option<&str>) -> String {
+    match status {
+        Some("accepted") => "accepted",
+        Some("tentative") => "tentative",
+        Some("declined") => "declined",
+        _ => "needs-action",
+    }
+    .to_string()
+}
+
+/// Convert Google attendees to the provider-neutral representation and pick
+/// the signed-in account's authoritative response status.
+fn parse_google_attendees(
+    event: &serde_json::Value,
+    account_email: &str,
+    allow_self_fallback: bool,
+) -> (Option<String>, Option<String>) {
+    let mut attendees = Vec::new();
+    let mut self_status = None;
+    let mut email_status = None;
+
+    if let Some(values) = event["attendees"].as_array() {
+        for value in values {
+            let Some(email) = value["email"].as_str() else {
+                continue;
+            };
+            let status = google_response_status(value["responseStatus"].as_str());
+            let google_self = value["self"].as_bool().unwrap_or(false);
+            let is_self =
+                email.eq_ignore_ascii_case(account_email) || (allow_self_fallback && google_self);
+            if email.eq_ignore_ascii_case(account_email) && email_status.is_none() {
+                email_status = Some(status.clone());
+            } else if is_self && self_status.is_none() {
+                self_status = Some(status.clone());
+            }
+            attendees.push(Attendee {
+                email: email.to_string(),
+                name: value["displayName"].as_str().map(str::to_string),
+                status,
+                is_self: Some(is_self),
+            });
+        }
+    }
+
+    let attendees_json = if attendees.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&attendees).ok()
+    };
+    (attendees_json, email_status.or(self_status))
+}
+
+fn parse_google_organizer(
+    event: &serde_json::Value,
+    account_email: &str,
+    is_primary_calendar: bool,
+) -> Option<String> {
+    if is_primary_calendar && event["organizer"]["self"].as_bool().unwrap_or(false) {
+        Some(account_email.to_string())
+    } else {
+        event["organizer"]["email"].as_str().map(str::to_string)
+    }
+}
 
 /// Pick a readable foreground color for the given background hex.
 /// Used when pushing a color to Google Calendar — the API takes a
@@ -60,7 +124,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
         items.map(|i| i.len()).unwrap_or(0)
     );
 
-    let mut remote_to_local: std::collections::HashMap<String, String> =
+    let mut remote_to_local: std::collections::HashMap<String, (String, bool)> =
         std::collections::HashMap::new();
 
     {
@@ -75,13 +139,13 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                 let local_id = db::calendar::upsert_calendar_by_remote_id(
                     &conn, account_id, cal_id, name, color, is_primary,
                 )?;
-                remote_to_local.insert(cal_id.to_string(), local_id);
+                remote_to_local.insert(cal_id.to_string(), (local_id, is_primary));
             }
         }
     }
 
     // Step 2: Fetch events for each calendar (with syncToken for incremental sync)
-    for (remote_cal_id, local_cal_id) in &remote_to_local {
+    for (remote_cal_id, (local_cal_id, is_primary)) in &remote_to_local {
         let sync_key = format!("google_sync_token_{}_{}", account_id, remote_cal_id);
 
         // Check for existing syncToken
@@ -222,8 +286,10 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                     start_time.clone()
                 };
 
-                let organizer_email = ev["organizer"]["email"].as_str().map(|s| s.to_string());
+                let organizer_email = parse_google_organizer(ev, &account.email, *is_primary);
                 let uid = ev["iCalUID"].as_str().map(|s| s.to_string());
+                let (attendees_json, my_status) =
+                    parse_google_attendees(ev, &account.email, *is_primary);
 
                 let cal_event = CalendarEvent {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -239,8 +305,8 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                     timezone: start_tz,
                     recurrence_rule: None,
                     organizer_email,
-                    attendees_json: None,
-                    my_status: None,
+                    attendees_json,
+                    my_status,
                     source_message_id: None,
                     ical_data: None,
                     remote_id: Some(event_id_remote.to_string()),
@@ -368,34 +434,24 @@ impl CalendarBackend for GoogleCalendarBackend {
         request: &RemoteRsvpRequest,
     ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
         let client = ctx.services.google_client(&account.id).await?;
-        let mut event_id = client
+        let existing_event = client
             .find_event_by_ical_uid("primary", &request.uid)
             .await
             .ok()
             .flatten();
+        let mut event_id = existing_event
+            .as_ref()
+            .and_then(|event| event["id"].as_str())
+            .map(str::to_string);
 
-        if event_id.is_none() {
-            let import_event = google_rsvp_import_event(account, request);
-            match client.import_event("primary", &import_event).await {
-                Ok(imported_id) => {
-                    event_id = imported_id;
-                    log::info!("apply_invite_response: imported event to Google Calendar");
-                }
-                Err(error) => log::warn!(
-                    "apply_invite_response: Google Calendar import failed: {}",
-                    error
-                ),
-            }
-        }
-
-        if let Some(remote_id) = event_id.as_deref().filter(|id| !id.is_empty()) {
-            let attendees_patch = serde_json::json!({
-                "attendees": [{
-                    "email": account.email,
-                    "responseStatus": request.response.as_str(),
-                    "self": true,
-                }]
-            });
+        if let Some((event, remote_id)) = existing_event.as_ref().and_then(|event| {
+            event["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(|id| (event, id))
+        }) {
+            let attendees_patch =
+                google_rsvp_attendees_patch(event, &account.email, request.response.as_str());
             match client
                 .patch_event("primary", remote_id, &attendees_patch, "none")
                 .await
@@ -406,6 +462,18 @@ impl CalendarBackend for GoogleCalendarBackend {
                 ),
                 Err(error) => log::warn!(
                     "apply_invite_response: Google Calendar PATCH failed: {}",
+                    error
+                ),
+            }
+        } else {
+            let import_event = google_rsvp_import_event(account, request);
+            match client.import_event("primary", &import_event).await {
+                Ok(imported_id) => {
+                    event_id = imported_id;
+                    log::info!("apply_invite_response: imported event to Google Calendar");
+                }
+                Err(error) => log::warn!(
+                    "apply_invite_response: Google Calendar import failed: {}",
                     error
                 ),
             }
@@ -582,6 +650,44 @@ fn google_rsvp_import_event(
     account: &AccountFull,
     request: &RemoteRsvpRequest,
 ) -> serde_json::Value {
+    let mut attendees: Vec<serde_json::Value> = request
+        .attendees
+        .iter()
+        .map(|attendee| {
+            let is_account = attendee.is_self == Some(true)
+                || attendee.email.eq_ignore_ascii_case(&account.email);
+            let mut value = serde_json::json!({
+                "email": attendee.email,
+                "responseStatus": if is_account {
+                    request.response.as_str()
+                } else if attendee.status == "needs-action" {
+                    "needsAction"
+                } else {
+                    attendee.status.as_str()
+                },
+            });
+            if let Some(name) = attendee.name.as_deref() {
+                value["displayName"] = serde_json::json!(name);
+            }
+            if is_account {
+                value["self"] = serde_json::json!(true);
+            }
+            value
+        })
+        .collect();
+    if !attendees.iter().any(|attendee| {
+        attendee["self"].as_bool() == Some(true)
+            || attendee["email"]
+                .as_str()
+                .is_some_and(|email| email.eq_ignore_ascii_case(&account.email))
+    }) {
+        attendees.push(serde_json::json!({
+            "email": account.email,
+            "responseStatus": request.response.as_str(),
+            "self": true,
+        }));
+    }
+
     serde_json::json!({
         "iCalUID": request.uid,
         "summary": request.summary,
@@ -602,19 +708,49 @@ fn google_rsvp_import_event(
         "description": request.description,
         "location": request.location,
         "organizer": {"email": request.organizer_email},
-        "attendees": [{
-            "email": account.email,
-            "responseStatus": request.response.as_str(),
-            "self": true,
-        }],
+        "attendees": attendees,
     })
+}
+
+fn google_rsvp_attendees_patch(
+    event: &serde_json::Value,
+    account_email: &str,
+    response: &str,
+) -> serde_json::Value {
+    let mut attendees = event["attendees"].as_array().cloned().unwrap_or_default();
+    let account_attendee = attendees
+        .iter()
+        .position(|attendee| attendee["self"].as_bool() == Some(true))
+        .or_else(|| {
+            attendees.iter().position(|attendee| {
+                attendee["email"]
+                    .as_str()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(account_email))
+            })
+        });
+
+    if let Some(attendee) = account_attendee.and_then(|index| attendees.get_mut(index)) {
+        attendee["responseStatus"] = serde_json::json!(response);
+    } else {
+        attendees.push(serde_json::json!({
+            "email": account_email,
+            "responseStatus": response,
+            "self": true,
+        }));
+    }
+
+    serde_json::json!({"attendees": attendees})
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{google_rsvp_import_event, readable_foreground};
+    use super::{
+        google_rsvp_attendees_patch, google_rsvp_import_event, parse_google_attendees,
+        parse_google_organizer, readable_foreground,
+    };
     use crate::backend::calendar::{InviteResponse, RemoteRsvpRequest};
     use crate::backend::testutil::account;
+    use crate::calendar::Attendee;
 
     #[test]
     fn light_background_gets_black_text() {
@@ -634,6 +770,80 @@ mod tests {
     }
 
     #[test]
+    fn synced_attendees_include_the_accounts_response() {
+        let event = serde_json::json!({
+            "attendees": [
+                {
+                    "email": "organizer@example.com",
+                    "displayName": "Organizer",
+                    "responseStatus": "accepted"
+                },
+                {
+                    "email": "alias@example.com",
+                    "responseStatus": "tentative",
+                    "self": true
+                }
+            ]
+        });
+
+        let (json, my_status) = parse_google_attendees(&event, "me@example.com", true);
+        let attendees: Vec<crate::calendar::Attendee> =
+            serde_json::from_str(json.as_deref().unwrap()).unwrap();
+
+        assert_eq!(my_status.as_deref(), Some("tentative"));
+        assert_eq!(attendees.len(), 2);
+        assert_eq!(attendees[1].email, "alias@example.com");
+        assert_eq!(attendees[1].status, "tentative");
+        assert_eq!(attendees[1].is_self, Some(true));
+    }
+
+    #[test]
+    fn google_needs_action_maps_to_the_canonical_status() {
+        let event = serde_json::json!({
+            "attendees": [{
+                "email": "me@example.com",
+                "responseStatus": "needsAction"
+            }]
+        });
+
+        let (_, my_status) = parse_google_attendees(&event, "ME@example.com", false);
+        assert_eq!(my_status.as_deref(), Some("needs-action"));
+    }
+
+    #[test]
+    fn shared_calendar_self_attendee_is_not_the_account() {
+        let event = serde_json::json!({
+            "attendees": [{
+                "email": "room@example.com",
+                "responseStatus": "accepted",
+                "self": true
+            }]
+        });
+
+        let (_, my_status) = parse_google_attendees(&event, "me@example.com", false);
+        assert!(my_status.is_none());
+    }
+
+    #[test]
+    fn primary_calendar_self_organizer_uses_the_account_identity() {
+        let event = serde_json::json!({
+            "organizer": {
+                "email": "alias@example.com",
+                "self": true
+            }
+        });
+
+        assert_eq!(
+            parse_google_organizer(&event, "me@example.com", true).as_deref(),
+            Some("me@example.com")
+        );
+        assert_eq!(
+            parse_google_organizer(&event, "me@example.com", false).as_deref(),
+            Some("alias@example.com")
+        );
+    }
+
+    #[test]
     fn rsvp_import_payload_preserves_event_and_response_fields() {
         let account = account("calendar", "google");
         let request = RemoteRsvpRequest {
@@ -646,6 +856,7 @@ mod tests {
             description: Some("Agenda".into()),
             location: Some("Room 1".into()),
             organizer_email: Some("organizer@example.com".into()),
+            attendees: Vec::new(),
         };
 
         assert_eq!(
@@ -665,5 +876,79 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn rsvp_patch_preserves_all_remote_attendees_and_alias_metadata() {
+        let event = serde_json::json!({
+            "attendees": [
+                {
+                    "email": "organizer@example.com",
+                    "responseStatus": "accepted",
+                    "organizer": true,
+                    "comment": "preserve me"
+                },
+                {
+                    "email": "alias@example.com",
+                    "responseStatus": "accepted",
+                    "self": true,
+                    "additionalGuests": 2
+                },
+                {
+                    "email": "guest@example.com",
+                    "responseStatus": "tentative"
+                }
+            ]
+        });
+
+        let patch = google_rsvp_attendees_patch(&event, "me@example.com", "declined");
+        let attendees = patch["attendees"].as_array().unwrap();
+
+        assert_eq!(attendees.len(), 3);
+        assert_eq!(attendees[0], event["attendees"][0]);
+        assert_eq!(attendees[2], event["attendees"][2]);
+        assert_eq!(attendees[1]["email"], "alias@example.com");
+        assert_eq!(attendees[1]["responseStatus"], "declined");
+        assert_eq!(attendees[1]["additionalGuests"], 2);
+    }
+
+    #[test]
+    fn rsvp_import_preserves_invite_guest_list() {
+        let account = account("calendar", "google");
+        let request = RemoteRsvpRequest {
+            uid: "event@example.com".into(),
+            response: InviteResponse::Declined,
+            summary: Some("Planning".into()),
+            start_time: "2026-08-10T09:00:00Z".into(),
+            end_time: "2026-08-10T10:00:00Z".into(),
+            all_day: false,
+            description: None,
+            location: None,
+            organizer_email: Some("organizer@example.com".into()),
+            attendees: vec![
+                Attendee {
+                    email: "guest@example.com".into(),
+                    name: Some("Guest".into()),
+                    status: "accepted".into(),
+                    is_self: None,
+                },
+                Attendee {
+                    email: "alias@example.com".into(),
+                    name: None,
+                    status: "accepted".into(),
+                    is_self: Some(true),
+                },
+            ],
+        };
+
+        let imported = google_rsvp_import_event(&account, &request);
+        let attendees = imported["attendees"].as_array().unwrap();
+        assert_eq!(attendees.len(), 2);
+        assert_eq!(attendees[0]["email"], "guest@example.com");
+        assert_eq!(attendees[0]["displayName"], "Guest");
+        assert_eq!(attendees[0]["responseStatus"], "accepted");
+        assert_eq!(attendees[1]["email"], "alias@example.com");
+        assert_eq!(attendees[1]["responseStatus"], "declined");
+        assert_eq!(attendees[1]["self"], true);
     }
 }

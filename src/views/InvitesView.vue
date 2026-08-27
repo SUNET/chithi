@@ -2,7 +2,11 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useInvitesStore } from "@/stores/invites";
 import type { InviteStatusFilter, InviteSortMode } from "@/stores/invites";
-import { normalizeInviteStatus, nextOccurrence } from "@/stores/invites";
+import {
+  isInviteManaged,
+  normalizeInviteStatus,
+  nextOccurrence,
+} from "@/stores/invites";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { useCalendarStore } from "@/stores/calendar";
@@ -31,8 +35,8 @@ const SORT_MODES: { value: InviteSortMode; label: string }[] = [
   { value: "received", label: "Recently received" },
 ];
 
-// Per-row RSVP in-flight + error state, keyed by event id.
-const respondingId = ref<string | null>(null);
+// Per-row action in-flight + error state, keyed by event id.
+const actingId = ref<string | null>(null);
 const errorById = ref<Record<string, string>>({});
 
 const detailOpen = ref(false);
@@ -53,8 +57,18 @@ function statusLabel(invite: Invite): string {
     case "declined":
       return "Declined";
     default:
-      return "Not replied";
+      return invite.manually_managed_at ? "Managed manually" : "Not replied";
   }
+}
+
+function statusClass(invite: Invite): string {
+  if (
+    invite.manually_managed_at &&
+    normalizeInviteStatus(invite.my_status) === "needs-action"
+  ) {
+    return "managed";
+  }
+  return normalizeInviteStatus(invite.my_status);
 }
 
 function whenLabel(invite: Invite): string {
@@ -101,14 +115,26 @@ function errorMessage(e: unknown): string {
 }
 
 async function respond(invite: Invite, response: string) {
-  respondingId.value = invite.id;
+  actingId.value = invite.id;
   delete errorById.value[invite.id];
   try {
     await invitesStore.respond(invite, response);
   } catch (e) {
     errorById.value = { ...errorById.value, [invite.id]: errorMessage(e) };
   } finally {
-    respondingId.value = null;
+    actingId.value = null;
+  }
+}
+
+async function markManaged(invite: Invite) {
+  actingId.value = invite.id;
+  delete errorById.value[invite.id];
+  try {
+    await invitesStore.markManaged(invite);
+  } catch (e) {
+    errorById.value = { ...errorById.value, [invite.id]: errorMessage(e) };
+  } finally {
+    actingId.value = null;
   }
 }
 
@@ -206,7 +232,7 @@ onUnmounted(() => invitesStore.setViewActive(false));
             </span>
             <span
               class="status-pill"
-              :class="`status-${normalizeInviteStatus(invite.my_status)}`"
+              :class="`status-${statusClass(invite)}`"
             >
               {{ statusLabel(invite) }}
             </span>
@@ -216,7 +242,7 @@ onUnmounted(() => invitesStore.setViewActive(false));
             <button
               class="btn-accept"
               :class="{ chosen: isCurrent(invite, 'accepted') }"
-              :disabled="respondingId === invite.id"
+              :disabled="actingId === invite.id"
               :data-testid="`invite-accept-${invite.id}`"
               @click="respond(invite, 'accepted')"
             >
@@ -225,7 +251,7 @@ onUnmounted(() => invitesStore.setViewActive(false));
             <button
               class="btn-maybe"
               :class="{ chosen: isCurrent(invite, 'tentative') }"
-              :disabled="respondingId === invite.id"
+              :disabled="actingId === invite.id"
               :data-testid="`invite-maybe-${invite.id}`"
               @click="respond(invite, 'tentative')"
             >
@@ -234,11 +260,22 @@ onUnmounted(() => invitesStore.setViewActive(false));
             <button
               class="btn-decline"
               :class="{ chosen: isCurrent(invite, 'declined') }"
-              :disabled="respondingId === invite.id"
+              :disabled="actingId === invite.id"
               :data-testid="`invite-decline-${invite.id}`"
               @click="respond(invite, 'declined')"
             >
               Decline
+            </button>
+            <button
+              v-if="!isInviteManaged(invite)"
+              type="button"
+              class="btn-managed"
+              :disabled="actingId === invite.id"
+              :data-testid="`invite-mark-managed-${invite.id}`"
+              title="Mark as handled without sending a response"
+              @click="markManaged(invite)"
+            >
+              Mark managed
             </button>
           </div>
 
@@ -438,6 +475,11 @@ onUnmounted(() => invitesStore.setViewActive(false));
 .status-declined {
   background: rgba(251, 44, 54, 0.14);
   color: #c20710;
+}
+
+.status-managed {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
 }
 
 .invite-actions {

@@ -133,6 +133,7 @@ pub struct RemoteRsvpRequest {
     pub description: Option<String>,
     pub location: Option<String>,
     pub organizer_email: Option<String>,
+    pub attendees: Vec<crate::calendar::Attendee>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,6 +638,7 @@ mod contract_tests {
             description: None,
             location: None,
             organizer_email: Some("organizer@example.com".into()),
+            attendees: Vec::new(),
         };
 
         assert!(graph::GraphCalendarBackend
