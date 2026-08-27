@@ -110,6 +110,18 @@ afterEach(() => {
 });
 
 describe("MessageReader HTML iframe sizing", () => {
+  it("constrains fixed-width email content to a narrow iframe", () => {
+    const reader = mountReader();
+    const doc = parseIframeDocument(reader);
+    const css = doc.querySelector("style")?.textContent;
+
+    expect(css).toContain("body *");
+    expect(css).toContain("max-width: 100% !important");
+    expect(css).toContain("img { height: auto !important; }");
+    expect(css).toContain("overflow-wrap: anywhere");
+    expect(css).toContain("overflow-x: auto");
+  });
+
   it("allows only the exact trusted bootstrap in both inherited CSP policies", async () => {
     const reader = mountReader();
     const doc = parseIframeDocument(reader);

@@ -524,7 +524,9 @@ onUnmounted(() => {
 .mail-panes {
   display: flex;
   flex: 1;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 /* Right side of the folder pane. Stacks the toolbar (with Compose)
@@ -541,6 +543,7 @@ onUnmounted(() => {
   display: flex;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .folder-pane {
@@ -549,7 +552,10 @@ onUnmounted(() => {
 }
 
 .message-list-pane {
-  flex-shrink: 0;
+  /* The configured width is preferred, not absolute. On narrow desktop
+     windows the list yields space to the reader until it reaches its
+     minimum, then returns to the configured width when space is available. */
+  flex-shrink: 1;
   min-width: 200px;
 }
 
@@ -579,16 +585,24 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .stacked-content .message-list-pane {
   flex: 1;
+  width: 100% !important;
+  min-width: 0;
   min-height: 150px;
+  box-sizing: border-box;
 }
 
 .tab-content-pane {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   display: flex;
@@ -596,7 +610,10 @@ onUnmounted(() => {
 
 .tab-content-pane > * {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
+  box-sizing: border-box;
   overflow: auto;
 }
 
@@ -696,7 +713,10 @@ onUnmounted(() => {
 
 .bottom-reader-pane {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 200px;
+  box-sizing: border-box;
   overflow: auto;
   border-top: 1px solid var(--color-border);
 }

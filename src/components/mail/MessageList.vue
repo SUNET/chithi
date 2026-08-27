@@ -850,9 +850,13 @@ function resolveFolderName(path: string): string {
 
 <style scoped>
 .message-list {
+  width: 100%;
+  min-width: 0;
   height: 100%;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
+  overflow-x: hidden;
   background: var(--color-bg);
   border-right: 1px solid var(--color-border);
 }
