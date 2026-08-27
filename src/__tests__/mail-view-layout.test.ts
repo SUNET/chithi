@@ -27,6 +27,5 @@ describe("MailView narrow Bottom layout", () => {
     expect(stacked).toContain("overflow: hidden");
     expect(bottomReader).toContain("box-sizing: border-box");
     expect(messageList).toContain("overflow-x: hidden");
-    expect(messageReader).toContain("overflow-x: hidden");
   });
 });

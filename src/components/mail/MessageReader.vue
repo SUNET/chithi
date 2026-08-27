@@ -917,7 +917,6 @@ async function markSpam() {
   min-width: 0;
   height: 100%;
   box-sizing: border-box;
-  overflow-x: hidden;
   overflow-y: auto;
   background: var(--color-reader-bg);
   position: relative;
