@@ -205,9 +205,18 @@ function iframeSrcdoc(): string {
 <head>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src '${IFRAME_BOOTSTRAP_HASH}'; style-src 'unsafe-inline'; img-src https: data:;">
 <style>
+  html {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+  }
   body {
     margin: 0;
     padding: 0;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     font-size: 14px;
     line-height: 1.5;
@@ -216,6 +225,16 @@ function iframeSrcdoc(): string {
     color: ${uiStore.theme === "dark" ? "#e5e5e5" : "#1a1a1a"};
     background: ${uiStore.theme === "dark" ? "#171717" : "#ffffff"};
   }
+  body * {
+    max-width: 100% !important;
+    box-sizing: border-box;
+  }
+  img { height: auto !important; }
+  td, th, pre {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  pre { white-space: pre-wrap; }
   a { color: #1a73e8; cursor: pointer; }
 </style>
 </head>
@@ -894,7 +913,11 @@ async function markSpam() {
 
 <style scoped>
 .message-reader {
+  width: 100%;
+  min-width: 0;
   height: 100%;
+  box-sizing: border-box;
+  overflow-x: hidden;
   overflow-y: auto;
   background: var(--color-reader-bg);
   position: relative;
@@ -938,12 +961,15 @@ async function markSpam() {
   flex: 1 0 auto;
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .message-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg);
@@ -952,18 +978,26 @@ async function markSpam() {
 .actions-left {
   display: flex;
   align-items: center;
+  flex: 1 1 240px;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 6px;
 }
 
 .actions-right {
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-left: auto;
   gap: 4px;
 }
 
 .pill-btn {
   display: flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 5px;
   padding: 5px 12px;
   border-radius: 4px;
@@ -973,6 +1007,7 @@ async function markSpam() {
   color: var(--color-text);
   background: var(--color-bg-tertiary);
   transition: all 0.12s;
+  white-space: nowrap;
 }
 
 .pill-btn:hover {
@@ -1047,6 +1082,7 @@ async function markSpam() {
 
 .header-row {
   display: flex;
+  min-width: 0;
   gap: 8px;
   margin-bottom: 4px;
   font-size: 13px;
@@ -1060,6 +1096,8 @@ async function markSpam() {
 
 .header-value {
   color: var(--color-text-secondary);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .list-id {
@@ -1176,6 +1214,8 @@ async function markSpam() {
   flex: 1 0 auto;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .email-sandbox {
