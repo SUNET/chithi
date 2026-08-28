@@ -22,6 +22,8 @@ Element Call**, and **Zoom** for accounts that have them.
   first account.
 - **[Account setup](user/accounts.md)** — mail, calendar, contacts, and
   video-conferencing providers.
+- **[Zoom integration](user/zoom.md)** — authorization, meeting management,
+  troubleshooting, and complete removal instructions.
 - **[Troubleshooting](user/troubleshooting.md)** — sign-in, sync, keyring,
   and privacy-related problems.
 - **[Admin guide](admin/index.md)** — organizational OAuth consent,

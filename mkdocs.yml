@@ -30,6 +30,7 @@ nav:
       - Install Chithi: user/install.md
       - First launch: user/getting-started.md
       - Account setup: user/accounts.md
+      - Zoom integration: user/zoom.md
       - Troubleshooting: user/troubleshooting.md
       - Privacy and local data: user/data-removal.md
   - Administration: admin/index.md

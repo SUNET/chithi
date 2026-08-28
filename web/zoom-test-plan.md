@@ -8,6 +8,11 @@ and exercise the four Zoom REST scopes that Chithi requests:
 manage meetings from the calendar event editor. The fourth verifies that
 reauthorization is for the same Zoom user and account.
 
+The complete end-user instructions are published separately in the
+[Zoom integration guide](user/zoom.md), including prerequisites,
+troubleshooting, disconnection, deauthorization, and user-impact notes.
+This page adds source-build and endpoint-verification steps for reviewers.
+
 Chithi is a community-driven, open-source desktop project hosted by
 SUNET (the Swedish University Computer Network) under the GPL-3.0
 license. There is no Chithi-operated backend and no hosted service, so
@@ -157,11 +162,12 @@ visible at
 
 Chithi exchanges the code for tokens directly with Zoom
 (`https://zoom.us/oauth/token`, PKCE verifier, no client secret), writes
-the tokens to the OS keychain, and returns to the **Accounts** screen.
+the tokens to the OS keychain, closes the account form, and returns to the
+main Chithi view.
 
-**Expected result:** the **Add Account** form closes and a new entry for
-the reviewer's Zoom account appears in the Settings accounts list, with
-edit and delete controls beside it.
+**Expected result:** the **Add Account** form closes. Reopening
+**Settings** shows a new entry for the reviewer's Zoom account in the
+accounts list, with edit and delete controls beside it.
 
 ## Step 4 — Create a Zoom meeting from a calendar event
 
@@ -177,12 +183,22 @@ This step exercises `meeting:write:meeting` /
 Chithi calls `POST https://api.zoom.us/v2/users/me/meetings` with the
 reviewer's access token. The request body contains a topic (the event
 title at the moment of the click, or "Meeting" if the title field was
-still empty), the event's start time as an ISO 8601 UTC string, the
-duration in minutes, and `timezone: "UTC"`, no other data. Chithi
-inserts the `join_url` from Zoom's response into the event's `LOCATION`
-and `DESCRIPTION` fields and stores the meeting's Zoom id in a local
-SQLite side-table keyed on the event so the rename / reschedule / delete
-steps below can act on it.
+still empty), `type: 2` for a scheduled meeting, the event's start time
+as an ISO 8601 UTC string, the duration in minutes, `timezone: "UTC"`,
+and these settings:
+
+```json
+{
+  "join_before_host": true,
+  "waiting_room": false
+}
+```
+
+Chithi inserts the `join_url` from Zoom's response into the event's
+`LOCATION` and `DESCRIPTION` fields. It first records the meeting as a
+durable pending meeting without an event id. Saving the event atomically
+transfers ownership to a local SQLite binding keyed on the event so the
+rename, reschedule, and deletion steps below can act on it.
 
 5. Save the event.
 
@@ -243,19 +259,25 @@ Chithi detects that `start_time` or `end_time` changed and issues
 This step exercises `meeting:delete:meeting` /
 `DELETE /v2/meetings/{id}`.
 
-1. Open the event from Step 4 (or right-click it in the calendar grid).
-2. Click **Delete event** and confirm.
+1. Open the event from Step 4.
+2. Click **Delete**.
+3. If the event has attendees, choose **Send Cancellation** or **Delete
+   Only**. **Cancel** leaves the event and meeting unchanged.
 
-Chithi looks up the event's Zoom meeting id in its local side table and
-issues `DELETE https://api.zoom.us/v2/meetings/{id}` _before_ removing
-the local event row. A 404 from Zoom is treated as success (the meeting
-was already gone, e.g. cancelled from web.zoom.us in another tab), so
-the local cleanup is idempotent.
+Chithi atomically queues durable meeting cleanup and removes the local
+event. After that transaction commits, it issues
+`DELETE https://api.zoom.us/v2/meetings/{id}`. A 404 from Zoom is treated
+as success (the meeting was already gone, e.g. cancelled from web.zoom.us
+in another tab). If the Zoom request fails, Chithi retains the cleanup
+record and retries it later, including after restart.
 
 **Expected result:**
 
 - The event disappears from Chithi's calendar.
-- The meeting disappears from **Meetings → Upcoming** on web.zoom.us.
+- After successful remote cleanup, the meeting disappears from
+  **Meetings → Upcoming** on web.zoom.us. If it remains, restart Chithi or
+  restore authorization before using normal account deletion in Step 9;
+  that deletion retries queued cleanup.
 
 ## Step 8 — Verify the endpoints exercised
 
@@ -285,17 +307,21 @@ REST calls Chithi makes. To confirm, the reviewer can:
   The provider scopes and generic PKCE / code-exchange / keychain
   plumbing live in
   [`src-tauri/src/oauth.rs`](https://github.com/SUNET/chithi/blob/main/src-tauri/src/oauth.rs)
-  and is shared with the Gmail and Microsoft 365 integrations.
+  and are shared with the Gmail and Microsoft 365 integrations.
 
 ## Step 9 — Disconnect
 
-Disconnection is done the same way as any other account in Chithi: by
-removing the Zoom account from the Settings accounts list.
+Perform normal disconnection only after Step 7 has removed the test event
+and its Zoom meeting. Chithi deliberately blocks account deletion while a
+meeting still requires its credentials.
 
 1. Open **Settings**.
 2. Locate the Zoom account in the accounts list.
-3. Click the trash icon next to it and confirm the deletion in the
-   **Delete Account** dialog.
+3. Click the trash icon next to it. In the **Delete Account** dialog,
+   leave **I understand that remote Zoom meetings may remain** unchecked
+   and click **Delete**.
+4. For full Zoom-side deauthorization, additionally uninstall Chithi from
+   [Zoom's installed-apps page](https://marketplace.zoom.us/user/installed).
 
 **Expected result:**
 
@@ -304,6 +330,8 @@ removing the Zoom account from the Settings accounts list.
   from the OS keychain.
 - The **Add _account name_ (Zoom)** button no longer appears in the
   calendar event editor (until a Zoom account is added again).
+- After step 4, Zoom no longer lists Chithi as an installed app for the
+  reviewer.
 
 Note: removing the account in Chithi clears the _local_ credentials only
 — it does not call Zoom's token revocation endpoint, because Chithi only
@@ -311,8 +339,14 @@ ever talks to `api.zoom.us/v2/users/me`,
 `api.zoom.us/v2/users/me/meetings`,
 `api.zoom.us/v2/meetings/{id}` (for PATCH and DELETE), and
 `zoom.us/oauth/token`. A reviewer who wants Zoom-side revocation as well
-should additionally uninstall Chithi from
-[Zoom's installed-apps page](https://marketplace.zoom.us/user/installed).
+must additionally uninstall Chithi from Zoom to revoke authorization.
+
+The dialog also offers an explicitly acknowledged **Delete locally**
+fallback. That action removes local credentials and associations without
+guaranteeing remote meeting deletion. Meetings can remain active in Zoom,
+calendar events and join URLs can remain, and Chithi can no longer update
+or delete them. The [end-user removal guide](user/zoom.md#remove-and-deauthorize-chithi)
+documents this fallback and the normal cleanup order in full.
 
 A reviewer who cloned Chithi solely to run this test plan can remove the
 build by deleting the cloned repository. Chithi's database, log, and
@@ -327,11 +361,14 @@ If the reviewer revokes Chithi from
 _without_ first removing the account in Chithi, the locally stored
 refresh token becomes invalid on Zoom's side. The next time Chithi tries
 to use it — either silently when refreshing the access token for a new
-"Add video conference → Zoom" click, or visibly on the next meeting
+**Add _account name_ (Zoom)** action, or visibly on the next meeting
 creation, reschedule, rename, or cancel — Zoom responds with
 `invalid_grant` and Chithi surfaces a sign-in error. The reviewer can
-clear the stale tokens by deleting the Zoom account in Chithi (Step 9)
-and, if desired, adding it again.
+reauthorize the existing account with **Sign in again with Zoom**, then
+follow Step 9. If meetings still reference the account, normal deletion
+can remain blocked until they are cleaned up. When authorization cannot be
+restored, delete the meetings directly in Zoom and use the acknowledged
+**Delete locally** fallback.
 
 ## Demo video
 

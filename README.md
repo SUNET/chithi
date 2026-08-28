@@ -25,6 +25,21 @@ Need a client with first class support for OpenPGP. Also allowing doing Calendar
 - Nextcloud Talk, Matrix / Element Call, and Zoom meeting integration
 - Dark and light themes
 
+### Zoom OAuth scopes
+
+Chithi requests these four Zoom scopes for its user-managed meeting
+integration:
+
+- `meeting:write:meeting`
+- `meeting:update:meeting`
+- `meeting:delete:meeting`
+- `user:read:user`
+
+See the complete [Zoom end-user guide](web/user/zoom.md) for setup, usage,
+troubleshooting, and removal. The [Zoom Marketplace test
+plan](web/zoom-test-plan.md) maps each scope to its user action and REST
+endpoint.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)

@@ -51,9 +51,20 @@ mail directory, and attempts to remove its normal password credential.
 Mail-directory deletion errors do not make account deletion fail, so
 verify the account's directory is gone when secure erasure matters.
 
-For Zoom, Chithi can require remote meeting cleanup before deletion. The
-**Delete locally** fallback can leave meetings active in Zoom; you must
-then manage them through Zoom.
+For Zoom, first delete related calendar events and verify that their
+meetings are gone in Zoom. Then delete the account in Chithi and finally
+remove Chithi from [Zoom's installed-apps
+page](https://marketplace.zoom.us/user/installed). Removing the
+Marketplace app first can invalidate the token Chithi needs for meeting
+cleanup. Normal local deletion does not itself revoke Zoom-side
+authorization.
+
+Chithi refuses normal Zoom account deletion while meetings still require
+the account. The **Delete locally** fallback removes local tokens and
+meeting associations but can leave remote meetings active, calendar
+events and join URLs in place, and Chithi unable to manage those meetings.
+Follow the [complete Zoom removal instructions](zoom.md#remove-and-deauthorize-chithi)
+before using this fallback.
 
 Account deletion should not be treated as proof that every non-Zoom
 OAuth entry has been erased. If complete credential removal is required,
