@@ -11,12 +11,13 @@ data, and diagnose common problems.
    account.
 3. Use [Account setup](accounts.md) for the fields and authorization flow
    required by your provider.
-4. If you use Zoom, follow the complete [Zoom integration guide](zoom.md)
-   to authorize the app, manage meetings, and disconnect it safely.
+4. For video meetings, follow the provider guide for [Nextcloud
+   Talk](nextcloud-talk.md), [Matrix / Element Call](matrix-element-call.md),
+   [Zoom](zoom.md), or [La Suite Visio](la-suite-visio.md).
 
 ## Keep Chithi working
 
-- [Troubleshooting](troubleshooting.md) covers browser sign-in, keyring,
+- [Troubleshooting](troubleshooting.md) covers provider sign-in, keyring,
   synchronization, remote images, and update behavior.
 - [Privacy and local data](data-removal.md) lists data, logs, credentials,
   and the steps needed to remove them.

@@ -66,8 +66,23 @@ events and join URLs in place, and Chithi unable to manage those meetings.
 Follow the [complete Zoom removal instructions](zoom.md#remove-and-deauthorize-chithi)
 before using this fallback.
 
-Account deletion should not be treated as proof that every non-Zoom
-OAuth entry has been erased. If complete credential removal is required,
+For Nextcloud Talk, delete related calendar events while Chithi still has
+its app password, verify the conversations are gone in Talk, delete the
+local account, and then revoke Chithi's app password in Nextcloud. See the
+[Nextcloud Talk removal guide](nextcloud-talk.md#remove-nextcloud-talk-from-chithi).
+
+For Matrix / Element Call, deleting an event makes Chithi leave the room;
+it does not globally delete the Matrix room or erase it for other members.
+After cleanup and local account deletion, revoke the Chithi Matrix session
+or device. See the [Matrix removal guide](matrix-element-call.md#remove-matrix-from-chithi).
+
+La Suite Visio's current external API cannot delete rooms. Remote rooms
+remain after event and account deletion, and must be managed directly in
+Visio. See the [La Suite Visio removal
+guide](la-suite-visio.md#remove-la-suite-visio-from-chithi).
+
+Account deletion should not be treated as proof that every provider
+credential has been erased. If complete credential removal is required,
 inspect the operating-system credential manager for both Chithi service
 names after deleting the account.
 

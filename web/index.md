@@ -5,7 +5,7 @@ Chithi is a desktop email, calendar, and contacts client built with
 (TypeScript frontend). It speaks the open protocols you already use —
 **IMAP**, **SMTP**, **JMAP**, **CalDAV**, **CardDAV** — and integrates
 with **Gmail**, **Microsoft 365**, **Nextcloud Talk**, **Matrix /
-Element Call**, and **Zoom** for accounts that have them.
+Element Call**, **Zoom**, and **La Suite Visio** for accounts that have them.
 
 !!! warning "Pre-1.0 software"
     Chithi is under active development. Packaging recipes exist for
@@ -22,8 +22,10 @@ Element Call**, and **Zoom** for accounts that have them.
   first account.
 - **[Account setup](user/accounts.md)** — mail, calendar, contacts, and
   video-conferencing providers.
-- **[Zoom integration](user/zoom.md)** — authorization, meeting management,
-  troubleshooting, and complete removal instructions.
+- **Meeting integrations** — setup, meeting management, troubleshooting,
+  and removal for [Nextcloud Talk](user/nextcloud-talk.md), [Matrix /
+  Element Call](user/matrix-element-call.md), [Zoom](user/zoom.md), and
+  [La Suite Visio](user/la-suite-visio.md).
 - **[Troubleshooting](user/troubleshooting.md)** — sign-in, sync, keyring,
   and privacy-related problems.
 - **[Admin guide](admin/index.md)** — organizational OAuth consent,

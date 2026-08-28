@@ -30,14 +30,19 @@ nav:
       - Install Chithi: user/install.md
       - First launch: user/getting-started.md
       - Account setup: user/accounts.md
-      - Zoom integration: user/zoom.md
+      - Meeting integrations:
+          - Nextcloud Talk: user/nextcloud-talk.md
+          - Matrix / Element Call: user/matrix-element-call.md
+          - Zoom: user/zoom.md
+          - La Suite Visio: user/la-suite-visio.md
       - Troubleshooting: user/troubleshooting.md
       - Privacy and local data: user/data-removal.md
   - Administration: admin/index.md
+  - Reviewer documentation:
+      - Zoom Marketplace test plan: zoom-test-plan.md
   - Project:
       - Privacy policy: privacy.md
       - Terms of use: terms.md
-      - Zoom Marketplace test plan: zoom-test-plan.md
 
 theme:
   name: material

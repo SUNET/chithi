@@ -10,7 +10,7 @@ You can begin with one of four account families:
 
 Selecting one opens the account form in **Settings**. Chithi supports
 additional account types there, including Fastmail, standalone CalDAV
-and CardDAV, Nextcloud Talk, Matrix, and Zoom.
+and CardDAV, Nextcloud Talk, Matrix, Zoom, and La Suite Visio.
 
 You can choose **Skip and add an account later** to inspect Chithi
 without an account. Open **Settings** when you are ready to add one.
@@ -21,10 +21,14 @@ without an account. Open **Settings** when you are ready to add one.
 2. If you skipped onboarding, open **Settings**, choose **Add account**,
    and select the account type.
 3. Enter the requested address, credentials, and server information.
-4. Complete browser authorization if the account type requires it.
+4. Complete browser or embedded-window authorization if the account type
+   requires it.
 5. Save the account.
 
-See [Account setup](accounts.md) for provider-specific requirements.
+See [Account setup](accounts.md) for provider-specific requirements. For
+video meetings, continue with the guide for [Nextcloud
+Talk](nextcloud-talk.md), [Matrix / Element Call](matrix-element-call.md),
+[Zoom](zoom.md), or [La Suite Visio](la-suite-visio.md).
 
 ## What happens after saving
 
@@ -35,7 +39,8 @@ when possible.
 
 Calendar-only, contacts-only, and video-conferencing accounts do not
 become the selected Mail account. Add them separately in Settings and
-open their corresponding part of Chithi.
+use calendar and contacts accounts in their corresponding views. Meeting
+accounts are used from the Calendar event editor.
 
 ## Credential storage
 
