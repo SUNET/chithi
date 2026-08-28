@@ -47,6 +47,7 @@ const MEET_PROTOCOL_LABELS: Record<string, string> = {
   talk: "Nextcloud Talk",
   matrix: "Matrix",
   zoom: "Zoom",
+  visio: "La Suite Visio",
 };
 
 const meetAccountOptions = computed(() =>

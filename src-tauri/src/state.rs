@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio_util::sync::CancellationToken;
@@ -198,6 +200,11 @@ pub struct AppState {
     /// (Zoom is a public OAuth client and uses PKCE rather than
     /// a client_secret). (#148)
     pub zoom_oauth_sessions: std::sync::Mutex<HashMap<u16, ZoomOAuthSession>>,
+    /// In-flight La Suite Visio add-on exchanges. The polling HTTP client owns
+    /// the HttpOnly add-on cookie; the dedicated webview owns the independent
+    /// Visio/OIDC browser session.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub visio_login_sessions: std::sync::Mutex<HashMap<String, Arc<VisioLoginSession>>>,
     /// Serializes claims and cleanup for each durable meeting lifecycle.
     pub meet_lifecycle: MeetLifecycleCoordinator,
     /// Serializes account mutation with remote meeting create/cleanup.
@@ -256,6 +263,29 @@ pub struct ZoomOAuthSession {
     /// Existing account being reauthenticated, fixed when OAuth starts so a
     /// renderer cannot redirect the completed authorization to another row.
     pub account_id: Option<String>,
+}
+
+/// State shared between a Visio login command and its restricted auth window.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub struct VisioAuthWindowState {
+    pub closed: AtomicBool,
+    pub success_loaded: AtomicBool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub struct VisioLoginSession {
+    pub created: std::time::Instant,
+    pub instance: crate::meet::visio::VisioInstance,
+    pub http: reqwest::Client,
+    pub csrf_token: String,
+    /// Existing account being reauthenticated, fixed when the flow starts.
+    pub account_id: Option<String>,
+    pub window_label: String,
+    pub window_state: Arc<VisioAuthWindowState>,
+    pub cancellation: CancellationToken,
+    /// ACTIVE -> CANCELLED or COMMITTING is a one-way claim. It prevents a
+    /// modal cancellation racing with account/token persistence.
+    pub phase: AtomicU8,
 }
 
 impl AppState {
@@ -319,6 +349,8 @@ impl AppState {
             talk_login_sessions: std::sync::Mutex::new(HashMap::new()),
             matrix_sso_listeners: std::sync::Mutex::new(HashMap::new()),
             zoom_oauth_sessions: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            visio_login_sessions: std::sync::Mutex::new(HashMap::new()),
             meet_lifecycle: MeetLifecycleCoordinator::default(),
             account_lifecycle: AccountLifecycleCoordinator::default(),
             pgp_store: OnceLock::new(),

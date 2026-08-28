@@ -1,14 +1,15 @@
 //! Video-conferencing integrations (#148).
 //!
-//! Three providers in this slice:
+//! Four providers in this slice:
 //! - `talk` — Nextcloud Talk via the OCS Spreed v4 API.
 //! - `matrix` — Matrix / Element Call.
 //! - `zoom` — Zoom Marketplace OAuth + Meeting API.
+//! - `visio` — La Suite Visio via its add-on token exchange and external API.
 //!
-//! All three bind to a new `meet` service on the existing
+//! All four bind to a new `meet` service on the existing
 //! service-binding plumbing (so accounts surface alongside
-//! CalDAV / CardDAV-only accounts), and all three use a
-//! browser-assisted login flow rather than ask the user for raw
+//! CalDAV / CardDAV-only accounts), and all four use a
+//! web-assisted login flow rather than ask the user for raw
 //! passwords:
 //! - Talk: Nextcloud "Login Flow v2" (poll-based, returns a
 //!   long-lived app password tied to the user).
@@ -18,6 +19,9 @@
 //! - Zoom: standard OAuth 2.0 Authorization Code + PKCE against
 //!   a Marketplace-registered app on a pinned loopback port.
 //!   Tokens auto-refresh on use (60-min access-token lifetime).
+//! - Visio: a restricted Chithi window loads the instance's Outlook
+//!   add-on, then exchanges its authenticated session for a
+//!   short-lived external-API token.
 //!
 //! ## Adding a new provider
 //!
@@ -44,6 +48,7 @@ use crate::provider::ProviderServices;
 
 pub mod matrix;
 pub mod talk;
+pub mod visio;
 pub mod zoom;
 
 pub struct MeetProviderCtx<'a> {
@@ -58,6 +63,15 @@ pub struct MeetProviderCtx<'a> {
 pub struct MeetCreateResult {
     pub join_url: String,
     pub meeting_id: String,
+}
+
+/// Result of a provider cleanup request. Some persistent-room providers do
+/// not expose deletion; callers must distinguish that supported behavior from
+/// a room that was actually removed, especially during creation compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetDeleteOutcome {
+    Deleted,
+    RetainedByDesign,
 }
 
 /// Common surface every meet provider exposes once an account has
@@ -97,7 +111,7 @@ pub trait MeetProvider: Send + Sync {
         ctx: &MeetProviderCtx<'_>,
         account: &AccountFull,
         meeting_id: &str,
-    ) -> Result<()>;
+    ) -> Result<MeetDeleteOutcome>;
 
     /// Rename the remote meeting's title / topic. Called after
     /// create_event / update_event because the user typically
@@ -138,6 +152,7 @@ pub fn registry() -> &'static [&'static dyn MeetProvider] {
         &talk::TalkProvider,
         &matrix::MatrixProvider,
         &zoom::ZoomProvider,
+        &visio::VisioProvider,
     ]
 }
 

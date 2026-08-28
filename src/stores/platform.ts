@@ -12,6 +12,7 @@ export const usePlatformStore = defineStore("platform", () => {
     typeof window !== "undefined" ? window.innerWidth : 1280,
   );
   const kind = ref<PlatformKind>("desktop");
+  const platformReady = ref(false);
 
   const isMobile = computed(() => width.value < MOBILE_MAX);
   const isTablet = computed(
@@ -41,6 +42,7 @@ export const usePlatformStore = defineStore("platform", () => {
     if (typeof document !== "undefined") {
       document.documentElement.dataset.platform = kind.value;
     }
+    platformReady.value = true;
   }
 
   function init() {
@@ -58,6 +60,7 @@ export const usePlatformStore = defineStore("platform", () => {
   return {
     width,
     kind,
+    platformReady,
     isMobile,
     isTablet,
     isDesktop,

@@ -1,6 +1,6 @@
 //! Tauri commands for the video-conferencing integrations (#148).
 //!
-//! Two browser-assisted auth flows live here, plus a single
+//! Provider-specific browser-assisted auth commands live here, plus a single
 //! protocol-agnostic `meet_create_url` that dispatches via the
 //! `MeetProvider` registry. Settings UI calls the auth pair to
 //! create / pair an account; the event editor calls
@@ -13,6 +13,8 @@ use crate::db;
 use crate::error::{Error, Result};
 use crate::meet;
 use crate::state::AppState;
+
+pub mod visio;
 
 /// Wire-format Tauri response for `meet_talk_login_start`. The
 /// The frontend opens `login_url` in the user's default browser, then hands
@@ -655,8 +657,12 @@ pub async fn meet_create_url(
             .delete_meeting(&ctx, &account, &res.meeting_id)
             .await;
         return match compensation {
-            Ok(()) => Err(Error::Other(format!(
+            Ok(meet::MeetDeleteOutcome::Deleted) => Err(Error::Other(format!(
                 "failed to track created meeting; remote meeting was removed: {persist_error}"
+            ))),
+            Ok(meet::MeetDeleteOutcome::RetainedByDesign) => Err(Error::Other(format!(
+                "failed to track created meeting ({persist_error}); the provider cannot delete the orphaned remote room at {}",
+                res.join_url
             ))),
             Err(delete_error) => Err(Error::Other(format!(
                 "failed to track created meeting ({persist_error}); compensation also failed ({delete_error})"
@@ -732,9 +738,14 @@ fn cleanup_provider_for(
 fn complete_pending_discard(
     conn: &rusqlite::Connection,
     lifecycle_id: &str,
-    provider_result: Result<()>,
+    provider_result: Result<meet::MeetDeleteOutcome>,
 ) -> Result<()> {
-    provider_result?;
+    match provider_result? {
+        meet::MeetDeleteOutcome::Deleted => {}
+        meet::MeetDeleteOutcome::RetainedByDesign => {
+            log::info!("Remote meeting {lifecycle_id} is retained by provider design");
+        }
+    }
     db::meet_pending_meetings::delete(conn, lifecycle_id)?;
     Ok(())
 }
@@ -837,6 +848,7 @@ mod tests {
     };
     use crate::db;
     use crate::error::Error;
+    use crate::meet::MeetDeleteOutcome;
 
     fn pending_connection() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -912,7 +924,18 @@ mod tests {
     #[test]
     fn provider_delete_success_removes_pending_ownership() {
         let conn = pending_connection();
-        complete_pending_discard(&conn, "lifecycle", Ok(())).unwrap();
+        complete_pending_discard(&conn, "lifecycle", Ok(MeetDeleteOutcome::Deleted)).unwrap();
+
+        assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn provider_retention_by_design_removes_pending_local_ownership() {
+        let conn = pending_connection();
+        complete_pending_discard(&conn, "lifecycle", Ok(MeetDeleteOutcome::RetainedByDesign))
+            .unwrap();
 
         assert!(db::meet_pending_meetings::get(&conn, "lifecycle")
             .unwrap()

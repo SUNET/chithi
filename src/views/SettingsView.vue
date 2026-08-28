@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, watch } from "vue";
 import { useRoute } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useAccountsStore } from "@/stores/accounts";
@@ -21,6 +21,8 @@ const accountsStore = useAccountsStore();
 const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
+const viewMounted = ref(false);
+onMounted(() => { viewMounted.value = true; });
 
 // Mobile toggles — persist to localStorage so they survive reloads.
 const blockRemoteImages = ref(localStorage.getItem("chithi-block-remote-images") !== "false");
@@ -46,6 +48,9 @@ const showDeleteConfirm = ref(false);
 const deletingAccountId = ref<string | null>(null);
 const abandonZoomAcknowledged = ref(false);
 const deletingZoomAccount = ref(false);
+const deletingVisioAccount = ref(false);
+const deleteProviderLoading = ref(false);
+const deleteProviderLookupFailed = ref(false);
 
 function getInitials(name: string): string {
   const words = name.split(/\s+/);
@@ -78,15 +83,29 @@ async function confirmDelete(id: string) {
   deletingZoomAccount.value = accountsStore.accounts.find(
     (account) => account.id === id,
   )?.meet_protocol === "zoom";
+  deletingVisioAccount.value = accountsStore.accounts.find(
+    (account) => account.id === id,
+  )?.meet_protocol === "visio";
+  deleteProviderLoading.value = true;
+  deleteProviderLookupFailed.value = false;
   showDeleteConfirm.value = true;
 
   try {
     const config = await api.getAccountConfig(id);
     if (showDeleteConfirm.value && deletingAccountId.value === id) {
       deletingZoomAccount.value = config.meet_protocol === "zoom";
+      deletingVisioAccount.value = config.meet_protocol === "visio";
     }
   } catch {
     // The account summary remains the fallback if config loading fails.
+    if (showDeleteConfirm.value && deletingAccountId.value === id) {
+      deleteProviderLookupFailed.value =
+        !deletingZoomAccount.value && !deletingVisioAccount.value;
+    }
+  } finally {
+    if (showDeleteConfirm.value && deletingAccountId.value === id) {
+      deleteProviderLoading.value = false;
+    }
   }
 }
 
@@ -95,9 +114,13 @@ function closeDeleteConfirm() {
   deletingAccountId.value = null;
   abandonZoomAcknowledged.value = false;
   deletingZoomAccount.value = false;
+  deletingVisioAccount.value = false;
+  deleteProviderLoading.value = false;
+  deleteProviderLookupFailed.value = false;
 }
 
 async function doDelete() {
+  if (deleteProviderLoading.value) return;
   if (deletingAccountId.value) {
     if (deletingZoomAccount.value && abandonZoomAcknowledged.value) {
       await accountsStore.abandonZoomAccount(
@@ -111,10 +134,15 @@ async function doDelete() {
   closeDeleteConfirm();
 }
 
-// Onboarding hands off via ?addAccount=<provider>. Auto-open the new-account
-// form with the matching provider preselected.
-onMounted(() => {
-  const want = route.query.addAccount;
+// Onboarding hands off via ?addAccount=<provider>. Wait for native platform
+// detection before honoring desktop-only providers; `kind` intentionally
+// defaults to desktop while detection is in flight.
+watch([
+  viewMounted,
+  () => platformStore.platformReady,
+  () => route.query.addAccount,
+], ([mounted, ready, want]) => {
+  if (!mounted || !ready) return;
   if (typeof want !== "string") return;
   const mapped: Record<string, AccountType> = {
     jmap: "jmap",
@@ -127,13 +155,15 @@ onMounted(() => {
     talk: "talk",
     matrix: "matrix",
     zoom: "zoom",
+    visio: "visio",
   };
   const type = mapped[want];
   if (!type) return;
+  if (type === "visio" && platformStore.kind !== "desktop") return;
   // Deep-link path skips the picker and lands directly on the
   // form for the requested type — onboarding has already chosen.
   pickAccountType(type);
-});
+}, { immediate: true });
 </script>
 
 <template>
@@ -309,7 +339,12 @@ onMounted(() => {
   </div>
 
   <!-- Step 1 of Add Account: pick a type. (#148 cleanup) -->
-  <AccountTypePicker :open="showPicker" @pick="pickAccountType" @cancel="cancelPicker" />
+  <AccountTypePicker
+    :open="showPicker"
+    :allow-visio="platformStore.platformReady && platformStore.kind === 'desktop'"
+    @pick="pickAccountType"
+    @cancel="cancelPicker"
+  />
 
   <!-- Add/Edit Account Modal (shared by mobile + desktop) -->
   <AccountFormModal ref="formModal" />
@@ -342,15 +377,40 @@ onMounted(() => {
                 I understand that remote Zoom meetings may remain
               </label>
             </div>
+            <div
+              v-if="deleteProviderLookupFailed"
+              class="zoom-abandon-warning"
+              data-testid="delete-provider-lookup-warning"
+            >
+              <strong>Remote resource status could not be checked.</strong>
+              <p>
+                The account configuration could not be loaded. Deleting the
+                local account may leave remote meetings or rooms behind.
+              </p>
+            </div>
+            <div
+              v-if="deletingVisioAccount"
+              class="zoom-abandon-warning"
+              data-testid="visio-delete-warning"
+            >
+              <strong>Remote Visio rooms will remain.</strong>
+              <p>
+                Deleting this local account does not delete rooms already
+                created in La Suite Visio. Chithi will forget its associations
+                with those rooms, so remove them from Visio separately if they
+                should no longer be available.
+              </p>
+            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-secondary" @click="closeDeleteConfirm">Cancel</button>
             <button
               class="btn-danger"
               data-testid="delete-account-confirm"
+              :disabled="deleteProviderLoading"
               @click="doDelete"
             >
-              {{ deletingZoomAccount && abandonZoomAcknowledged ? "Delete locally" : "Delete" }}
+              {{ deleteProviderLoading ? "Checking…" : deletingZoomAccount && abandonZoomAcknowledged ? "Delete locally" : "Delete" }}
             </button>
           </div>
         </div>

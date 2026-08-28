@@ -298,7 +298,7 @@ impl crate::meet::MeetProvider for ZoomProvider {
         ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::meet::MeetDeleteOutcome> {
         let access_token = ctx
             .services
             .credentials()
@@ -310,7 +310,8 @@ impl crate::meet::MeetProvider for ZoomProvider {
             &ctx.services.transports.zoom_http,
             &ctx.services.transports.zoom_api_root,
         )
-        .await
+        .await?;
+        Ok(crate::meet::MeetDeleteOutcome::Deleted)
     }
 
     async fn reschedule_meeting(

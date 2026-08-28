@@ -22,7 +22,7 @@ Need a client with first class support for OpenPGP. Also allowing doing Calendar
 - Client-side message filtering rules
 - HTML email sanitization (no scripts, no remote content by default)
 - OpenPGP signing and encryption, including smartcard support
-- Nextcloud Talk, Matrix / Element Call, and Zoom meeting integration
+- Nextcloud Talk, Matrix / Element Call, Zoom, and La Suite Visio meeting integration
 - Dark and light themes
 
 ### Zoom OAuth scopes
