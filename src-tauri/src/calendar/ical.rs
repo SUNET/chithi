@@ -189,7 +189,12 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
 /// Generate an iTIP REPLY iCalendar for responding to an invite.
 ///
 /// `response` should be one of: "ACCEPTED", "TENTATIVE", "DECLINED".
-pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -> String {
+pub fn generate_reply(
+    invite: &ParsedInvite,
+    user_email: &str,
+    user_name: Option<&str>,
+    response: &str,
+) -> String {
     let partstat = response.to_uppercase();
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
 
@@ -205,16 +210,24 @@ pub fn generate_reply(invite: &ParsedInvite, user_email: &str, response: &str) -
     // Preserve organizer from original invite
     if let Some(ref org_email) = invite.organizer_email {
         if let Some(ref org_name) = invite.organizer_name {
-            lines.push(format!("ORGANIZER;CN={}:mailto:{}", org_name, org_email));
+            lines.push(format!(
+                "ORGANIZER;CN={}:mailto:{}",
+                ical_parameter_value(org_name),
+                org_email
+            ));
         } else {
             lines.push(format!("ORGANIZER:mailto:{}", org_email));
         }
     }
 
     // Add the replying attendee with their response
+    let attendee_name = user_name
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!(";CN={}", ical_parameter_value(name.trim())))
+        .unwrap_or_default();
     lines.push(format!(
-        "ATTENDEE;PARTSTAT={};RSVP=FALSE:mailto:{}",
-        partstat, user_email
+        "ATTENDEE;PARTSTAT={};RSVP=FALSE{}:mailto:{}",
+        partstat, attendee_name, user_email
     ));
 
     lines.push(format!("UID:{}", invite.uid));
@@ -283,7 +296,11 @@ pub fn generate_invite(
 
     // Organizer
     if let Some(name) = organizer_name {
-        lines.push(format!("ORGANIZER;CN={}:mailto:{}", name, organizer_email));
+        lines.push(format!(
+            "ORGANIZER;CN={}:mailto:{}",
+            ical_parameter_value(name),
+            organizer_email
+        ));
     } else {
         lines.push(format!("ORGANIZER:mailto:{}", organizer_email));
     }
@@ -293,7 +310,7 @@ pub fn generate_invite(
         let cn = attendee
             .name
             .as_ref()
-            .map(|n| format!(";CN={}", n))
+            .map(|name| format!(";CN={}", ical_parameter_value(name)))
             .unwrap_or_default();
         lines.push(format!(
             "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE{}:mailto:{}",
@@ -343,6 +360,30 @@ pub fn generate_invite(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Encode an RFC 5545 parameter value as a quoted string. RFC 6868 caret
+/// encoding keeps quotes, carets, and newlines inside the value instead of
+/// allowing a user-provided display name to inject another iCalendar property.
+fn ical_parameter_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 2);
+    let mut chars = value.trim().chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '^' => encoded.push_str("^^"),
+            '"' => encoded.push_str("^'"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                encoded.push_str("^n");
+            }
+            '\n' => encoded.push_str("^n"),
+            ch if ch.is_control() => encoded.push(' '),
+            ch => encoded.push(ch),
+        }
+    }
+    format!("\"{encoded}\"")
+}
 
 /// Remove `;ALTREP=...` parameters from every property line.
 ///
@@ -1103,7 +1144,7 @@ END:VCALENDAR\r\n";
             ical_raw: String::new(),
         };
 
-        let reply = generate_reply(&invite, "bob@example.com", "accepted");
+        let reply = generate_reply(&invite, "bob@example.com", Some("Bob Builder"), "accepted");
 
         assert!(reply.contains("METHOD:REPLY"), "Should have METHOD:REPLY");
         assert!(
@@ -1114,9 +1155,10 @@ END:VCALENDAR\r\n";
             reply.contains("mailto:bob@example.com"),
             "Should contain attendee email"
         );
+        assert!(reply.contains("CN=\"Bob Builder\""));
         assert!(reply.contains("UID:test-uid-123"), "Should preserve UID");
         assert!(
-            reply.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"),
+            reply.contains("ORGANIZER;CN=\"Alice\":mailto:alice@example.com"),
             "Should preserve organizer"
         );
         assert!(
@@ -1145,7 +1187,7 @@ END:VCALENDAR\r\n";
             ical_raw: String::new(),
         };
 
-        let reply = generate_reply(&invite, "user@example.com", "declined");
+        let reply = generate_reply(&invite, "user@example.com", None, "declined");
         assert!(reply.contains("PARTSTAT=DECLINED"));
         assert!(reply.contains("SEQUENCE:1"));
     }
@@ -1186,9 +1228,9 @@ END:VCALENDAR\r\n";
         assert!(ical.contains("SUMMARY:Project Review"));
         assert!(ical.contains("LOCATION:Conference Room"));
         assert!(ical.contains("DESCRIPTION:Quarterly review"));
-        assert!(ical.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"));
+        assert!(ical.contains("ORGANIZER;CN=\"Alice\":mailto:alice@example.com"));
         assert!(ical.contains("mailto:bob@example.com"));
-        assert!(ical.contains(";CN=Bob"));
+        assert!(ical.contains(";CN=\"Bob\""));
         assert!(ical.contains("mailto:carol@example.com"));
         assert!(ical.contains("STATUS:CONFIRMED"));
     }
@@ -1271,7 +1313,23 @@ END:VCALENDAR\r\n";
             None,
             None,
         );
-        assert!(ical.contains("ORGANIZER;CN=Kushal Das:mailto:kushal@example.org"));
+        assert!(ical.contains("ORGANIZER;CN=\"Kushal Das\":mailto:kushal@example.org"));
+
+        let injected = generate_invite(
+            "uid-2",
+            "Meeting",
+            "2026-08-28T12:00:00Z",
+            "2026-08-28T13:00:00Z",
+            None,
+            None,
+            "mallory@example.org",
+            Some("Mallory\r\nATTENDEE:mailto:attacker@example.org;\"^^"),
+            &[],
+            None,
+            None,
+        );
+        assert!(injected.contains("CN=\"Mallory^nATTENDEE:mailto:attacker@example.org;^'^^^^\""));
+        assert!(!injected.contains("\r\nATTENDEE:mailto:attacker@example.org"));
     }
 
     #[test]

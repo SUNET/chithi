@@ -16,6 +16,7 @@ import type { AccountConfig } from "@/lib/types";
 function makeForm(overrides: Partial<AccountConfig> = {}): AccountConfig {
   return reactive({
     display_name: "",
+    sender_name: "",
     email: "",
     provider: "generic",
     mail_protocol: "imap",

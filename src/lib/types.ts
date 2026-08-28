@@ -203,6 +203,7 @@ export interface ThreadedPage {
 
 export interface AccountConfig {
   display_name: string;
+  sender_name: string;
   email: string;
   provider: "generic" | "gmail" | "microsoft365" | "o365" | "fastmail";
   /// Empty string means "no mail binding" (CalDAV-only / CardDAV-only).

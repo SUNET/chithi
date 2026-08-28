@@ -18,6 +18,7 @@ import type { AccountConfig } from "@/lib/types";
 function makeForm(meetUrl = "https://visio.example.org"): AccountConfig {
   return reactive({
     display_name: "Work Visio",
+    sender_name: "",
     email: "",
     provider: "generic",
     mail_protocol: "",

@@ -120,6 +120,8 @@ pub struct Account {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub display_name: String,
+    #[serde(default)]
+    pub sender_name: String,
     pub email: String,
     pub provider: String,
     /// Mail protocol. Empty string means "no mail binding" — used for
@@ -216,6 +218,7 @@ fn default_true() -> bool {
 pub struct AccountFull {
     pub id: String,
     pub display_name: String,
+    pub sender_name: String,
     pub email: String,
     pub provider: String,
     pub mail_protocol: String,
@@ -639,7 +642,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
 pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn
         .query_row(
-            "SELECT id, display_name, email, username, enabled, signature,
+            "SELECT id, display_name, sender_name, email, username, enabled, signature,
                 oidc_token_endpoint, oidc_client_id, auth_method,
                 pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
                 pgp_encrypt_subject, pgp_encrypt_drafts
@@ -649,17 +652,18 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
                 Ok(AccountFull {
                     id: row.get(0)?,
                     display_name: row.get(1)?,
-                    email: row.get(2)?,
-                    username: row.get(3)?,
-                    enabled: row.get(4)?,
-                    signature: row.get(5)?,
-                    oidc_token_endpoint: row.get(6)?,
-                    oidc_client_id: row.get(7)?,
-                    auth_method: row.get(8)?,
-                    pgp_attach_pubkey_on_sign: row.get(9)?,
-                    pgp_autocrypt_header: row.get(10)?,
-                    pgp_encrypt_subject: row.get(11)?,
-                    pgp_encrypt_drafts: row.get(12)?,
+                    sender_name: row.get(2)?,
+                    email: row.get(3)?,
+                    username: row.get(4)?,
+                    enabled: row.get(5)?,
+                    signature: row.get(6)?,
+                    oidc_token_endpoint: row.get(7)?,
+                    oidc_client_id: row.get(8)?,
+                    auth_method: row.get(9)?,
+                    pgp_attach_pubkey_on_sign: row.get(10)?,
+                    pgp_autocrypt_header: row.get(11)?,
+                    pgp_encrypt_subject: row.get(12)?,
+                    pgp_encrypt_drafts: row.get(13)?,
                     // Legacy fields populated below from bindings + auth_method.
                     provider: String::new(),
                     mail_protocol: String::new(),
@@ -742,14 +746,15 @@ pub fn insert_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
         crate::db::service_bindings::auth_method_for(&config.provider, &config.jmap_auth_method);
 
     conn.execute(
-        "INSERT INTO accounts (id, display_name, email, username, signature,
+        "INSERT INTO accounts (id, display_name, sender_name, email, username, signature,
                                oidc_token_endpoint, oidc_client_id, auth_method,
                                pgp_attach_pubkey_on_sign, pgp_autocrypt_header,
                                pgp_encrypt_subject, pgp_encrypt_drafts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             config.display_name,
+            config.sender_name,
             config.email,
             config.username,
             config.signature,
@@ -828,14 +833,15 @@ pub fn update_account(conn: &Connection, id: &str, config: &AccountConfig) -> Re
 
     let rows = conn.execute(
         "UPDATE accounts
-         SET display_name=?1, email=?2, username=?3, signature=?4,
-             oidc_token_endpoint=?5, oidc_client_id=?6, auth_method=?7,
-             pgp_attach_pubkey_on_sign=?8, pgp_autocrypt_header=?9,
-             pgp_encrypt_subject=?10, pgp_encrypt_drafts=?11,
+         SET display_name=?1, sender_name=?2, email=?3, username=?4, signature=?5,
+             oidc_token_endpoint=?6, oidc_client_id=?7, auth_method=?8,
+             pgp_attach_pubkey_on_sign=?9, pgp_autocrypt_header=?10,
+             pgp_encrypt_subject=?11, pgp_encrypt_drafts=?12,
              updated_at=CURRENT_TIMESTAMP
-         WHERE id=?12",
+         WHERE id=?13",
         params![
             config.display_name,
+            config.sender_name,
             config.email,
             config.username,
             config.signature,
@@ -898,6 +904,7 @@ mod tests {
             CREATE TABLE accounts (
                 id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
                 email TEXT NOT NULL,
                 username TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -953,6 +960,7 @@ mod tests {
     fn make_config(email: &str, name: &str) -> AccountConfig {
         AccountConfig {
             display_name: name.to_string(),
+            sender_name: "Alice Example".to_string(),
             email: email.to_string(),
             provider: "generic".to_string(),
             mail_protocol: "imap".to_string(),
@@ -1204,11 +1212,13 @@ mod tests {
 
         let mut updated = config.clone();
         updated.display_name = "Alice Updated".to_string();
+        updated.sender_name = "Alice Sender".to_string();
         updated.imap_host = "new-imap.example.com".to_string();
         update_account(&conn, &id, &updated).unwrap();
 
         let full = get_account_full(&conn, &id).unwrap();
         assert_eq!(full.display_name, "Alice Updated");
+        assert_eq!(full.sender_name, "Alice Sender");
         assert_eq!(full.imap_host, "new-imap.example.com");
         crate::keyring::delete_password(&id).ok();
     }

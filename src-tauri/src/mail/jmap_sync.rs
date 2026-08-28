@@ -625,6 +625,7 @@ mod tests {
         crate::db::accounts::AccountFull {
             id: "account-1".into(),
             display_name: "JMAP account".into(),
+            sender_name: "Test User".into(),
             email: "user@example.com".into(),
             provider: "generic".into(),
             mail_protocol: "jmap".into(),

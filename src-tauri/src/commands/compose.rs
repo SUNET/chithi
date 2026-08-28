@@ -209,6 +209,7 @@ pub async fn send_message(
     // deep-cloning the inlined attachment bytes each send.
     let plain_raw = smtp::build_raw_message(
         &account.email,
+        &account.sender_name,
         &message.to,
         &message.cc,
         &message.bcc,
@@ -688,6 +689,7 @@ pub async fn save_draft(
 
     let raw_message = smtp::build_raw_message(
         &account.email,
+        &account.sender_name,
         &draft_to,
         &message.cc,
         &message.bcc,
@@ -1760,6 +1762,7 @@ mod encrypt_draft_tests {
 
         let raw = smtp::build_raw_message(
             "alice@example.com",
+            "Alice Example",
             &["alice@example.com".into()],
             &[],
             &[],
@@ -1811,6 +1814,7 @@ mod encrypt_draft_tests {
         let store = KeyStore::open_in_memory().expect("keystore");
         let raw = smtp::build_raw_message(
             "nobody@example.com",
+            "",
             &["nobody@example.com".into()],
             &[],
             &[],
@@ -1855,6 +1859,7 @@ mod protected_headers_tests {
         let real_subject = "Quarterly numbers are confidential";
         let raw = smtp::build_raw_message(
             "alice@example.com",
+            "Alice Example",
             &["bob@example.com".into()],
             &[],
             &[],

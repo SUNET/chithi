@@ -147,6 +147,7 @@ const isMeetTab = computed(
 
 const defaultForm = (): AccountConfig => ({
   display_name: "",
+  sender_name: "",
   email: "",
   provider: "generic",
   mail_protocol: "imap",
@@ -929,6 +930,19 @@ async function signInWithVisio() {
          accounts get their login identity through provider sign-in. The mail
          tabs keep email as the default login (the saveAccount fallback fills
          username from email when blank). -->
+    <div
+      v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
+      class="form-group"
+    >
+      <label>Full Name</label>
+      <input
+        v-model="form.sender_name"
+        type="text"
+        placeholder="e.g., Ada Lovelace"
+        data-testid="account-sender-name"
+      />
+      <span class="field-hint">Shown to recipients as the sender of your messages.</span>
+    </div>
     <div
       v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
       class="form-group"

@@ -1322,7 +1322,12 @@ async fn apply_invite_response(
     };
 
     // Step 2: Generate the iTIP REPLY
-    let reply_ical = ical::generate_reply(invite, &account.email, response_text);
+    let reply_ical = ical::generate_reply(
+        invite,
+        &account.email,
+        (!account.sender_name.trim().is_empty()).then_some(account.sender_name.as_str()),
+        response_text,
+    );
 
     // Step 3: Send the reply to the organizer
     if let Some(ref organizer_email) = invite.organizer_email {
@@ -1348,6 +1353,7 @@ async fn apply_invite_response(
 
                 let raw_message = build_calendar_reply_message(
                     &account.email,
+                    &account.sender_name,
                     organizer_email,
                     &subject,
                     &body_text,
@@ -1377,6 +1383,7 @@ async fn apply_invite_response(
                 log::info!("apply_invite_response: sending reply via SMTP");
                 let raw_message = build_calendar_reply_message(
                     &account.email,
+                    &account.sender_name,
                     organizer_email,
                     &subject,
                     &body_text,
@@ -1737,6 +1744,7 @@ pub fn random_calendar_color() -> String {
 /// Build a raw RFC5322 message with a text/calendar MIME part for an iTIP REPLY.
 fn build_calendar_reply_message(
     from: &str,
+    sender_name: &str,
     to: &str,
     subject: &str,
     body_text: &str,
@@ -1745,7 +1753,7 @@ fn build_calendar_reply_message(
     use lettre::message::{header::ContentType, MultiPart, SinglePart};
     use lettre::Message;
 
-    let from_mailbox = crate::mail::smtp::parse_mailbox(from)
+    let from_mailbox = crate::mail::smtp::sender_mailbox(from, sender_name)
         .map_err(|_| crate::error::Error::Other("Invalid calendar reply sender".into()))?;
     let to_mailbox = crate::mail::smtp::parse_mailbox(to)
         .map_err(|_| crate::error::Error::Other("Invalid calendar reply recipient".into()))?;
@@ -1877,7 +1885,7 @@ pub async fn send_invites(
         event.location.as_deref(),
         event.description.as_deref(),
         &account.email,
-        None, // Use email as organizer name — display_name is the account label, not a person's name
+        (!account.sender_name.trim().is_empty()).then_some(account.sender_name.as_str()),
         &attendees,
         event.recurrence_rule.as_deref(),
         if event.all_day {
@@ -1901,7 +1909,14 @@ pub async fn send_invites(
     );
 
     for attendee_email in &attendee_emails {
-        let raw = build_invite_message(&account.email, attendee_email, &subject, &body_text, &ical);
+        let raw = build_invite_message(
+            &account.email,
+            &account.sender_name,
+            attendee_email,
+            &subject,
+            &body_text,
+            &ical,
+        );
 
         if raw.is_empty() {
             log::error!(
@@ -2164,6 +2179,7 @@ pub async fn process_cancelled_invite(
 
 fn build_invite_message(
     from: &str,
+    sender_name: &str,
     to: &str,
     subject: &str,
     body_text: &str,
@@ -2172,7 +2188,7 @@ fn build_invite_message(
     use lettre::message::{header::ContentType, MultiPart, SinglePart};
     use lettre::Message;
 
-    let from_mailbox = match crate::mail::smtp::parse_mailbox(from) {
+    let from_mailbox = match crate::mail::smtp::sender_mailbox(from, sender_name) {
         Ok(m) => m,
         Err(_) => {
             log::error!("build_invite_message: invalid sender");
@@ -2239,6 +2255,37 @@ pub fn get_default_timezone() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_messages_use_the_configured_sender_name() {
+        use mailparse::MailHeaderMap as _;
+
+        let reply = build_calendar_reply_message(
+            "asa@example.com",
+            "Åsa Österberg",
+            "organizer@example.com",
+            "Re: Planning",
+            "Accepted",
+            "BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        let invite = build_invite_message(
+            "asa@example.com",
+            "Åsa Österberg",
+            "guest@example.com",
+            "Planning",
+            "Please join",
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n",
+        );
+
+        for raw in [&reply, &invite] {
+            let parsed = mailparse::parse_mail(raw).expect("parse generated calendar message");
+            assert_eq!(
+                parsed.headers.get_first_value("From").as_deref(),
+                Some("Åsa Österberg <asa@example.com>")
+            );
+        }
+    }
 
     #[test]
     fn participant_schedule_request_normalizes_addresses() {

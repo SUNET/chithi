@@ -15,6 +15,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS accounts (
             id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
+            sender_name TEXT NOT NULL DEFAULT '',
             email TEXT NOT NULL,
             username TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -339,6 +340,18 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if !has_signature {
         log::info!("Migration: adding signature column to accounts table");
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT '';")?;
+    }
+
+    // The local account label is not necessarily the user's name. Keep a
+    // separate identity for outbound From headers and calendar messages.
+    let has_sender_name = conn
+        .prepare("SELECT sender_name FROM accounts LIMIT 0")
+        .is_ok();
+    if !has_sender_name {
+        log::info!("Migration: adding sender_name column to accounts table");
+        conn.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN sender_name TEXT NOT NULL DEFAULT '';",
+        )?;
     }
 
     if !phase3_done {
@@ -848,6 +861,7 @@ mod tests {
         initialize(&conn).unwrap();
 
         for probe in [
+            "SELECT sender_name FROM accounts LIMIT 0",
             "SELECT graph_delta_link FROM folders LIMIT 0",
             "SELECT graph_prune_pending FROM messages LIMIT 0",
             "SELECT graph_filters_pending FROM messages LIMIT 0",
@@ -882,6 +896,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!((prune, filters), (0, 0));
+    }
+
+    #[test]
+    fn sender_name_migration_preserves_accounts_and_defaults_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('a1', 'Personal', 'ada@example.com', 'ada@example.com')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("ALTER TABLE accounts DROP COLUMN sender_name;")
+            .unwrap();
+
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+
+        let account: (String, String) = conn
+            .query_row(
+                "SELECT display_name, sender_name FROM accounts WHERE id = 'a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(account, ("Personal".into(), String::new()));
     }
 
     #[test]

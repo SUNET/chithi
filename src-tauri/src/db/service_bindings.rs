@@ -814,6 +814,7 @@ mod tests {
         AccountFull {
             id: id.into(),
             display_name: "Test".into(),
+            sender_name: "Test User".into(),
             email: "test@example.com".into(),
             provider: "generic".into(),
             mail_protocol: "imap".into(),

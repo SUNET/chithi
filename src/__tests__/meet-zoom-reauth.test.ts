@@ -18,6 +18,7 @@ import type { AccountConfig } from "@/lib/types";
 function makeForm(): AccountConfig {
   return reactive({
     display_name: "Work Zoom",
+    sender_name: "",
     email: "",
     provider: "generic",
     mail_protocol: "",
