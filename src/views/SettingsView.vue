@@ -341,7 +341,7 @@ watch([
   <!-- Step 1 of Add Account: pick a type. (#148 cleanup) -->
   <AccountTypePicker
     :open="showPicker"
-    :allow-visio="platformStore.kind === 'desktop'"
+    :allow-visio="platformStore.platformReady && platformStore.kind === 'desktop'"
     @pick="pickAccountType"
     @cancel="cancelPicker"
   />
@@ -396,8 +396,9 @@ watch([
               <strong>Remote Visio rooms will remain.</strong>
               <p>
                 Deleting this local account does not delete rooms already
-                created in La Suite Visio. Remove them from Visio separately
-                if they should no longer be available.
+                created in La Suite Visio. Chithi will forget its associations
+                with those rooms, so remove them from Visio separately if they
+                should no longer be available.
               </p>
             </div>
           </div>

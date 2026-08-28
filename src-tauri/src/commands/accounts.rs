@@ -18,6 +18,18 @@ fn delete_account_metadata(conn: &rusqlite::Connection, account_id: &str) -> Res
     Ok(())
 }
 
+fn delete_local_meeting_ownership(conn: &rusqlite::Connection, account_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meet_meetings WHERE account_id = ?1",
+        [account_id],
+    )?;
+    conn.execute(
+        "DELETE FROM meet_pending_meetings WHERE account_id = ?1",
+        [account_id],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn insert_zoom_account(
     conn: &rusqlite::Connection,
     account_id: &str,
@@ -77,6 +89,12 @@ fn delete_account_data(
             "Cannot delete {provider} credentials: the account has additional service bindings"
         )));
     }
+    if managed_meet_protocol == Some("visio") {
+        // Visio's external API cannot delete rooms. The deletion UI warns that
+        // remote rooms will remain, so normal deletion intentionally abandons
+        // their local lifecycle ownership before the account guard runs.
+        delete_local_meeting_ownership(&transaction, account_id)?;
+    }
     // Account deletion cascades through calendars and events. Move any bound
     // meetings into durable cleanup ownership first. If this same account
     // owns one of those meetings, `delete_account` rejects below and the
@@ -117,14 +135,7 @@ fn abandon_zoom_account_data(
     // Explicitly relinquish remote ownership. This is intentionally separate
     // from normal deletion: the caller has confirmed these meetings may remain
     // active in Zoom and can no longer be managed by Chithi.
-    transaction.execute(
-        "DELETE FROM meet_meetings WHERE account_id = ?1",
-        [account_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM meet_pending_meetings WHERE account_id = ?1",
-        [account_id],
-    )?;
+    delete_local_meeting_ownership(&transaction, account_id)?;
     let cleanup_ids = db::calendar_event_deletion::delete_account_events(&transaction, account_id)?
         .cleanup_lifecycle_ids;
     delete_account_metadata(&transaction, account_id)?;
@@ -1023,6 +1034,121 @@ mod tests {
         assert!(account_exists(&conn, "zoom"));
         assert!(store.load("zoom").unwrap().is_some());
         assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn visio_deletion_abandons_linked_and_pending_rooms() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("visio").await;
+        insert_visio_account(
+            &conn,
+            "visio",
+            &account_config("visio"),
+            &tokens(),
+            "visio-user",
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'visio', 'visio', 'linked', 'https://example.test/linked')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('pending', 'visio', 'visio', 'pending', 'https://example.test/pending')",
+            [],
+        )
+        .unwrap();
+
+        delete_account_data(&conn, "visio", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "visio"));
+        assert!(store.load("visio").unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_meetings WHERE account_id = 'visio'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings WHERE account_id = 'visio'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_visio_token_deletion_restores_local_ownership() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("visio").await;
+        insert_visio_account(
+            &conn,
+            "visio",
+            &account_config("visio"),
+            &tokens(),
+            "visio-user",
+            &token_guard,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('event', 'visio', 'visio', 'linked', 'https://example.test/linked')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_pending_meetings
+                (lifecycle_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('pending', 'visio', 'visio', 'pending', 'https://example.test/pending')",
+            [],
+        )
+        .unwrap();
+        store.fail_delete.store(true, Ordering::SeqCst);
+
+        assert!(delete_account_data(&conn, "visio", &token_guard).is_err());
+
+        assert!(account_exists(&conn, "visio"));
+        assert_eq!(
+            db::service_bindings::list_for_account(&conn, "visio")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.load("visio").unwrap().is_some());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_meetings WHERE account_id = 'visio'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM meet_pending_meetings WHERE account_id = 'visio'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

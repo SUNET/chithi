@@ -8,8 +8,8 @@
 //!
 //! All four bind to a new `meet` service on the existing
 //! service-binding plumbing (so accounts surface alongside
-//! CalDAV / CardDAV-only accounts), and all three use a
-//! browser-assisted login flow rather than ask the user for raw
+//! CalDAV / CardDAV-only accounts), and all four use a
+//! web-assisted login flow rather than ask the user for raw
 //! passwords:
 //! - Talk: Nextcloud "Login Flow v2" (poll-based, returns a
 //!   long-lived app password tied to the user).
@@ -19,6 +19,9 @@
 //! - Zoom: standard OAuth 2.0 Authorization Code + PKCE against
 //!   a Marketplace-registered app on a pinned loopback port.
 //!   Tokens auto-refresh on use (60-min access-token lifetime).
+//! - Visio: a restricted Chithi window loads the instance's Outlook
+//!   add-on, then exchanges its authenticated session for a
+//!   short-lived external-API token.
 //!
 //! ## Adding a new provider
 //!

@@ -29,6 +29,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 
 import SettingsView from "@/views/SettingsView.vue";
+import AccountFormModal from "@/components/settings/AccountFormModal.vue";
 import { useAccountsStore } from "@/stores/accounts";
 import { usePlatformStore } from "@/stores/platform";
 import * as api from "@/lib/tauri";
@@ -256,6 +257,47 @@ describe("SettingsView", () => {
     expect(bodyEl('[data-testid="account-type-readonly"]')).toBeNull();
   });
 
+  it("does not offer Visio before platform detection completes", async () => {
+    const platform = usePlatformStore();
+    platform.kind = "desktop";
+    platform.platformReady = false;
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+
+    await wrapper.find(".btn-add").trigger("click");
+    expect(bodyEl('[data-testid="picker-visio"]')).toBeNull();
+
+    platform.platformReady = true;
+    await flushPromises();
+    expect(bodyEl('[data-testid="picker-visio"]')).not.toBeNull();
+  });
+
+  it("rejects an imperative Visio open until platform detection completes", async () => {
+    const platform = usePlatformStore();
+    platform.kind = "desktop";
+    platform.platformReady = false;
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    const modal = wrapper.findComponent(AccountFormModal);
+    const exposed = modal.vm as unknown as {
+      openNew: (type: "visio") => void;
+    };
+
+    exposed.openNew("visio");
+    await flushPromises();
+    expect(bodyEl('[data-testid="account-type-readonly"]')).toBeNull();
+
+    platform.platformReady = true;
+    exposed.openNew("visio");
+    await flushPromises();
+    expect(bodyEl('[data-testid="account-type-readonly"]')?.textContent)
+      .toContain("La Suite Visio");
+  });
+
   it("saves distinct JMAP email and username values", async () => {
     const wrapper = mount(SettingsView, {
       global: { plugins: [makeRouter()] },
@@ -383,7 +425,13 @@ describe("SettingsView", () => {
 
     expect(bodyEl('[data-testid="visio-delete-warning"]')?.textContent)
       .toContain("Remote Visio rooms will remain");
+    expect(bodyEl('[data-testid="visio-delete-warning"]')?.textContent)
+      .toContain("forget its associations");
     expect(bodyEl('[data-testid="zoom-abandon-checkbox"]')).toBeNull();
+
+    bodyEl('[data-testid="delete-account-confirm"]')!.click();
+    await flushPromises();
+    expect(api.deleteAccount).toHaveBeenCalledWith("visio-1");
   });
 
   it("keeps Visio reauthentication open so name edits use Save", async () => {
@@ -423,6 +471,34 @@ describe("SettingsView", () => {
       "visio-1",
       expect.objectContaining({ display_name: "Renamed Visio" }),
     );
+  });
+
+  it("completes Visio account creation when the account refresh fails", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(api.listAccounts).mockRejectedValueOnce(new Error("refresh failed"));
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    await wrapper.find(".btn-add").trigger("click");
+    bodyEl('[data-testid="picker-visio"]')!.click();
+    await flushPromises();
+    const url = bodyEl('[data-testid="visio-url"]') as HTMLInputElement;
+    url.value = "https://visio.example.org";
+    url.dispatchEvent(new Event("input"));
+    await wrapper.vm.$nextTick();
+
+    bodyEl('[data-testid="visio-signin-btn"]')!.click();
+    await flushPromises();
+
+    expect(api.meetVisioLoginComplete).toHaveBeenCalledTimes(1);
+    expect(bodyEl('[data-testid="account-type-readonly"]')).toBeNull();
+    expect(bodyEl(".form-error")).toBeNull();
+    expect(warning).toHaveBeenCalledWith(
+      "signInWithVisio: account persisted but list refresh failed",
+      expect.any(Error),
+    );
+    warning.mockRestore();
   });
 
   it("cancels an in-flight Visio login when the form closes", async () => {
@@ -497,6 +573,44 @@ describe("SettingsView", () => {
     await flushPromises();
     expect(bodyEl('[data-testid="visio-signin-btn"]')).toBeNull();
     expect(document.body.textContent).toContain("Visio sign-in is available in the desktop app");
+  });
+
+  it("hides Visio reauthentication until platform detection completes", async () => {
+    const store = useAccountsStore();
+    store.accounts = [visioAccount()];
+    usePlatformStore().kind = "desktop";
+    usePlatformStore().platformReady = false;
+    vi.mocked(api.getAccountConfig).mockResolvedValue(visioConfig);
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+
+    await wrapper.find('[title="Edit"]').trigger("click");
+    await flushPromises();
+    expect(bodyEl('[data-testid="visio-signin-btn"]')).toBeNull();
+    expect(document.body.textContent).toContain("Visio sign-in is available in the desktop app");
+  });
+
+  it("does not start Visio sign-in if platform readiness is lost before the click", async () => {
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    await wrapper.find(".btn-add").trigger("click");
+    bodyEl('[data-testid="picker-visio"]')!.click();
+    await flushPromises();
+    const url = bodyEl('[data-testid="visio-url"]') as HTMLInputElement;
+    url.value = "https://visio.example.org";
+    url.dispatchEvent(new Event("input"));
+    await wrapper.vm.$nextTick();
+    const signIn = bodyEl('[data-testid="visio-signin-btn"]')!;
+
+    usePlatformStore().platformReady = false;
+    signIn.click();
+    await flushPromises();
+
+    expect(api.meetVisioLoginStart).not.toHaveBeenCalled();
   });
 
   it("uses account config to detect Zoom when the summary binding is disabled", async () => {

@@ -35,6 +35,9 @@ import {
 const router = useRouter();
 const accountsStore = useAccountsStore();
 const platformStore = usePlatformStore();
+const visioAuthenticationSupported = computed(
+  () => platformStore.platformReady && platformStore.kind === "desktop",
+);
 
 const showForm = ref(false);
 const saving = ref(false);
@@ -343,7 +346,7 @@ function selectAccountType(type: AccountType) {
 /// a stale form would leak the previous type's fields (e.g. Fastmail's
 /// bearer jmap_auth_method into a generic JMAP form).
 function openNew(type: AccountType) {
-  if (type === "visio" && platformStore.kind !== "desktop") return;
+  if (type === "visio" && !visioAuthenticationSupported.value) return;
   invalidateVisioLogin();
   editingAccountId.value = null;
   resetDefaultBookState();
@@ -437,7 +440,7 @@ async function openEdit(id: string) {
       || config.meet_protocol === "zoom"
       || config.meet_protocol === "visio"
     ) {
-      // Meet-only accounts (Talk / Matrix / Zoom) come through
+      // Meet-only accounts (Talk / Matrix / Zoom / Visio) come through
       // the browser-assisted login and have no mail / calendar /
       // contacts bindings. Detected before the DAV branch
       // because all have `mail_protocol === ""` — without this
@@ -705,13 +708,10 @@ async function startJmapOidc() {
 
 // --- Video conferencing (#148) -------------------------------------------
 //
-// All meet providers (Talk, Matrix, Zoom, …) use a browser-assisted
-// login flow. The two-step pattern matches what we already do for
-// Gmail / O365 OAuth: start returns a URL, we open it via the
-// shell-opener, then a second call drives the flow to completion
-// and persists the account. Each provider has its own pair of
-// signInWith* functions because the shapes differ (Talk polls,
-// Matrix waits for an SSO redirect, Zoom is OAuth+PKCE).
+// All meet providers use a web-assisted login flow. Talk, Matrix, and Zoom
+// open the system browser; Visio uses a restricted Chithi window. Each
+// provider has its own pair of signInWith* functions because the completion
+// mechanisms differ.
 const meetSigningIn = ref(false);
 
 async function signInWithTalk() {
@@ -808,6 +808,7 @@ async function signInWithZoom() {
 
 async function signInWithVisio() {
   if (meetSigningIn.value) return;
+  if (!visioAuthenticationSupported.value) return;
   if (!form.value.meet_url.trim()) {
     error.value = "Enter your La Suite Visio instance URL first";
     return;
@@ -836,7 +837,14 @@ async function signInWithVisio() {
     );
     if (activeVisioLogin.value?.operationId !== operationId) return;
     activeVisioLogin.value = null;
-    await accountsStore.fetchAccounts();
+    try {
+      await accountsStore.fetchAccounts();
+    } catch (refreshError) {
+      console.warn(
+        "signInWithVisio: account persisted but list refresh failed",
+        refreshError,
+      );
+    }
     if (visioOperationId !== operationId) return;
     if (editingId) {
       meetAuthStatus.value = "Signed in again. Select Save to keep account name changes.";
@@ -894,11 +902,9 @@ async function signInWithVisio() {
       />
     </div>
 
-    <!-- Video-conferencing tabs (#148). One URL field + a
-         browser-assisted sign-in button replaces the rest
-         of the form, since neither account type has any
-         mail / calendar / contacts surface to configure
-         here. -->
+    <!-- Video-conferencing tabs (#148). Provider sign-in controls replace
+         the rest of the form because these account types have no mail,
+         calendar, or contacts surface to configure here. -->
     <MeetAccountSection
       v-if="accountType === 'talk' || accountType === 'matrix' || accountType === 'zoom' || accountType === 'visio'"
       :form="form"
@@ -906,7 +912,7 @@ async function signInWithVisio() {
       :editing="!!editingAccountId"
       :signing-in="meetSigningIn"
       :auth-status="meetAuthStatus"
-      :authentication-supported="accountType !== 'visio' || platformStore.kind === 'desktop'"
+      :authentication-supported="accountType !== 'visio' || visioAuthenticationSupported"
       @sign-in="
         accountType === 'talk'
           ? signInWithTalk()
@@ -918,13 +924,11 @@ async function signInWithVisio() {
       "
     />
 
-    <!-- DAV-only and meet-only accounts have no mail
-         identity, so they skip the email field. DAV uses an
-         explicit username for Basic auth; meet (Talk /
-         Matrix) gets the loginName / MXID via its
-         browser-assisted login. The mail tabs keep email
-         as the default login (the saveAccount fallback
-         fills username from email when blank). -->
+    <!-- DAV-only and meet-only accounts have no mail identity, so they skip
+         the email field. DAV uses an explicit username for Basic auth; meet
+         accounts get their login identity through provider sign-in. The mail
+         tabs keep email as the default login (the saveAccount fallback fills
+         username from email when blank). -->
     <div
       v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
       class="form-group"

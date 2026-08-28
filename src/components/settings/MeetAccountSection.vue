@@ -1,7 +1,7 @@
 <script setup lang="ts">
-/// Video-conferencing tabs (#148). One URL field + a browser-assisted
-/// sign-in button replaces the rest of the form, since these account
-/// type has any mail / calendar / contacts surface to configure here.
+/// Video-conferencing tabs (#148). Provider sign-in controls replace the
+/// rest of the form because these account types have no mail, calendar,
+/// or contacts surface to configure here.
 ///
 /// `form` is the modal's shared AccountConfig draft, passed by
 /// reference — inputs here bind straight into it (deliberate nested
