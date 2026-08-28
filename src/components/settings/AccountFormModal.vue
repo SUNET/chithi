@@ -934,12 +934,13 @@ async function signInWithVisio() {
       v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
       class="form-group"
     >
-      <label>Full Name</label>
-      <input
-        v-model="form.sender_name"
-        type="text"
-        placeholder="e.g., Ada Lovelace"
-        data-testid="account-sender-name"
+<label for="account-sender-name">Full Name</label>
+<input
+  id="account-sender-name"
+  v-model="form.sender_name"
+  type="text"
+  placeholder="e.g., Ada Lovelace"
+  data-testid="account-sender-name"
       />
       <span class="field-hint">Shown to recipients as the sender of your messages.</span>
     </div>
