@@ -94,6 +94,7 @@ pub async fn meet_talk_login_complete(
     // back to the username + "NEXTCLOUD TALK" label.
     let config = db::accounts::AccountConfig {
         display_name: display,
+        sender_name: String::new(),
         email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),
@@ -235,6 +236,7 @@ pub async fn meet_matrix_login_complete(
     // treatment as Talk: empty email, MXID lives in `username`.
     let config = db::accounts::AccountConfig {
         display_name: display,
+        sender_name: String::new(),
         email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),
@@ -506,6 +508,7 @@ pub async fn meet_zoom_login_complete(
     // the binding; `create_url` ignores it.
     let config = db::accounts::AccountConfig {
         display_name: display,
+        sender_name: String::new(),
         email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),

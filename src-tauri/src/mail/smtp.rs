@@ -170,6 +170,18 @@ pub(crate) fn parse_mailbox(value: &str) -> Result<Mailbox> {
     Ok(Mailbox::new(mailbox.display_name, email))
 }
 
+/// Build the sender mailbox from the account's bare address and optional
+/// user-facing name. SMTP and JMAP envelopes continue to use the address only.
+pub(crate) fn sender_mailbox(address: &str, sender_name: &str) -> Result<Mailbox> {
+    let mailbox = parse_mailbox(address)?;
+    let sender_name = sender_name.trim();
+    if sender_name.is_empty() {
+        Ok(mailbox)
+    } else {
+        Ok(Mailbox::new(Some(sender_name.to_string()), mailbox.email))
+    }
+}
+
 fn validated_address(addr_spec: &str) -> Result<Address> {
     if let Ok(address) = addr_spec.parse::<Address>() {
         let domain = address.domain();
@@ -432,6 +444,7 @@ pub async fn send_raw(
 #[allow(clippy::too_many_arguments)]
 pub fn build_raw_message(
     from: &str,
+    sender_name: &str,
     to: &[String],
     cc: &[String],
     bcc: &[String],
@@ -442,8 +455,8 @@ pub fn build_raw_message(
     in_reply_to: Option<&str>,
     references: &[String],
 ) -> Result<Vec<u8>> {
-    let from_mailbox =
-        parse_mailbox(from).map_err(|_| Error::Other("Invalid message From address".into()))?;
+    let from_mailbox = sender_mailbox(from, sender_name)
+        .map_err(|_| Error::Other("Invalid message From address".into()))?;
 
     // Always emit a Message-ID. Lettre's `build()` does NOT add one
     // automatically, so without this our outgoing replies have no
@@ -1025,6 +1038,7 @@ mod pgp_wrap_tests {
     fn build_simple() -> Vec<u8> {
         build_raw_message(
             "alice@example.com",
+            "Alice Example",
             &["bob@example.com".into()],
             &[],
             &[],
@@ -1047,6 +1061,7 @@ mod pgp_wrap_tests {
     fn message_id_domain_is_sender_domain_not_hostname() {
         let raw = build_raw_message(
             "alice@example.com",
+            "",
             &["bob@example.com".into()],
             &[],
             &[],
@@ -1070,6 +1085,31 @@ mod pgp_wrap_tests {
         assert!(
             !line.contains("@localhost"),
             "Message-ID must not fall back to lettre's hostname default: {line:?}"
+        );
+    }
+
+    #[test]
+    fn named_sender_is_encoded_as_a_unicode_from_mailbox() {
+        use mailparse::MailHeaderMap as _;
+
+        let raw = build_raw_message(
+            "asa@example.com",
+            "Åsa Österberg",
+            &["bob@example.com".into()],
+            &[],
+            &[],
+            "Subject",
+            "body",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build_raw_message");
+        let parsed = mailparse::parse_mail(&raw).expect("parse generated message");
+        assert_eq!(
+            parsed.headers.get_first_value("From").as_deref(),
+            Some("Åsa Österberg <asa@example.com>")
         );
     }
 
@@ -1153,6 +1193,7 @@ mod pgp_wrap_tests {
         let secret = "ULTRA_SECRET_PAYLOAD_42";
         let raw = build_raw_message(
             "alice@example.com",
+            "Alice Example",
             &["bob@example.com".into()],
             &[],
             &[],
@@ -1203,6 +1244,7 @@ mod pgp_wrap_tests {
     fn inner_part_preserves_blank_line_so_mail_parser_walks_multipart() {
         let raw = build_raw_message(
             "alice@example.com",
+            "Alice Example",
             &["bob@example.com".into()],
             &[],
             &[],

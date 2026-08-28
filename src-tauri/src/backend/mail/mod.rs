@@ -626,6 +626,7 @@ mod registry_tests {
         AccountFull {
             id: "acc1".into(),
             display_name: "Test".into(),
+            sender_name: "Test User".into(),
             email: "u@example.com".into(),
             provider: "generic".into(),
             mail_protocol: mail_protocol.into(),

@@ -68,6 +68,7 @@ afterEach(() => {
 
 const gmailConfig: AccountConfig = {
   display_name: "Work",
+  sender_name: "Ada Lovelace",
   email: "w@example.org",
   provider: "gmail",
   mail_protocol: "imap",
@@ -168,6 +169,7 @@ describe("SettingsView", () => {
 
     expect(bodyEl('[data-testid="account-type-picker"]')).toBeNull();
     expect(bodyEl('[data-testid="account-type-readonly"]')!.textContent).toContain("IMAP");
+    expect(bodyEl('[data-testid="account-sender-name"]')).toBeTruthy();
     expect(bodyEl('[data-testid="account-email"]')).toBeTruthy();
   });
 
@@ -308,7 +310,10 @@ describe("SettingsView", () => {
     await flushPromises();
 
     const email = bodyEl('[data-testid="account-email"]') as HTMLInputElement;
+    const senderName = bodyEl('[data-testid="account-sender-name"]') as HTMLInputElement;
     const username = bodyEl('[data-testid="jmap-username"]') as HTMLInputElement;
+    senderName.value = "Åsa Österberg";
+    senderName.dispatchEvent(new Event("input"));
     email.value = "user@example.org";
     email.dispatchEvent(new Event("input"));
     username.value = "user";
@@ -319,6 +324,7 @@ describe("SettingsView", () => {
     await flushPromises();
 
     expect(api.addAccount).toHaveBeenCalledWith(expect.objectContaining({
+      sender_name: "Åsa Österberg",
       email: "user@example.org",
       username: "user",
     }));

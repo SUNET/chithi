@@ -359,6 +359,7 @@ pub async fn get_account_config(
     // The edit form shows a placeholder; empty on save means "keep existing".
     Ok(db::accounts::AccountConfig {
         display_name: full.display_name,
+        sender_name: full.sender_name,
         email: full.email,
         provider: full.provider,
         mail_protocol: full.mail_protocol,
@@ -605,6 +606,7 @@ mod tests {
             CREATE TABLE accounts (
                 id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
                 email TEXT NOT NULL,
                 username TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -695,6 +697,7 @@ mod tests {
     fn account_config(protocol: &str) -> db::accounts::AccountConfig {
         db::accounts::AccountConfig {
             display_name: protocol.to_string(),
+            sender_name: String::new(),
             email: String::new(),
             provider: "generic".into(),
             mail_protocol: String::new(),

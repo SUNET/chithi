@@ -489,6 +489,7 @@ fn standalone_account_config(
 ) -> db::accounts::AccountConfig {
     db::accounts::AccountConfig {
         display_name,
+        sender_name: String::new(),
         email: String::new(),
         provider: "generic".into(),
         mail_protocol: String::new(),
