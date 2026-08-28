@@ -47,8 +47,10 @@ registration with PKCE. It requests:
 - `meeting:delete:meeting`
 - `user:read:user`
 
-See the [Zoom Marketplace test plan](../zoom-test-plan.md) for the user
-actions and API endpoints associated with each scope.
+See the end-user [Zoom integration guide](../user/zoom.md) for setup,
+usage, troubleshooting, and removal. The [Zoom Marketplace test
+plan](../zoom-test-plan.md) maps reviewer actions and API endpoints to
+each scope.
 
 Forks can select their own registration at build time with
 `CHITHI_ZOOM_CLIENT_ID`. Production Zoom OAuth uses an HTTPS redirect

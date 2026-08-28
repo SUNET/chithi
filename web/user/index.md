@@ -11,6 +11,8 @@ data, and diagnose common problems.
    account.
 3. Use [Account setup](accounts.md) for the fields and authorization flow
    required by your provider.
+4. If you use Zoom, follow the complete [Zoom integration guide](zoom.md)
+   to authorize the app, manage meetings, and disconnect it safely.
 
 ## Keep Chithi working
 

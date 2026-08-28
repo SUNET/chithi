@@ -95,13 +95,15 @@ Chithi can manage meetings for these providers:
   complete browser SSO. Chithi creates a private Matrix room using the
   Element Call widget at `call.element.io`.
 - **Zoom:** complete browser OAuth. Chithi's local callback requires TCP
-  port 47832 to be free.
+  port 47832 to be free. See the [Zoom integration guide](zoom.md) for
+  prerequisites, requested permissions, usage, troubleshooting, and
+  removal instructions.
 
 Meeting accounts do not provide mail or calendars themselves. After
-adding one, use its **Add** button in a calendar event. The remote room
-or meeting is created immediately, before the event is saved. Cancelling
-the form triggers a cleanup attempt.
+adding one, use **Add _account name_ (_provider_)** while creating a
+calendar event. The remote room or meeting is created immediately, before
+the event is saved. Cancelling the form triggers a cleanup attempt.
 
 Nextcloud Talk and Matrix sessions cannot currently be reauthenticated
-in place; remove and add the account again. Zoom has a **Sign in again**
-action.
+in place; remove and add the account again. Zoom has a **Sign in again
+with Zoom** action.

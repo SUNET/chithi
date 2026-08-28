@@ -21,6 +21,9 @@ server names, message metadata, and other personal information.
   **Sign in again** where available. Nextcloud Talk and Matrix currently
   require removing and adding the account again.
 
+For Zoom-specific callback, meeting-creation, reauthorization, cleanup,
+and disconnection problems, see [Zoom troubleshooting](zoom.md#troubleshooting).
+
 ## Gmail mail or calendar works, but not both
 
 Gmail mail and Google Calendar/Contacts use separate credentials. Mail
