@@ -593,7 +593,7 @@ impl crate::meet::MeetProvider for MatrixProvider {
         ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::meet::MeetDeleteOutcome> {
         let homeserver = account.meet_url.trim();
         if homeserver.is_empty() {
             return Err(Error::Other(
@@ -611,7 +611,8 @@ impl crate::meet::MeetProvider for MatrixProvider {
             meeting_id,
             &ctx.services.transports.matrix_http,
         )
-        .await
+        .await?;
+        Ok(crate::meet::MeetDeleteOutcome::Deleted)
     }
 
     async fn update_topic(

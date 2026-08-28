@@ -36,6 +36,27 @@ describe("AccountTypePicker", () => {
     expect(wrapper.emitted("pick")).toEqual([["fastmail"]]);
   });
 
+  it("offers La Suite Visio", async () => {
+    const wrapper = mount(AccountTypePicker, {
+      props: { open: true },
+      attachTo: document.body,
+    });
+    const card = bodyEl('[data-testid="picker-visio"]')!;
+    expect(card.textContent).toContain("La Suite Visio");
+    card.click();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.emitted("pick")).toEqual([["visio"]]);
+  });
+
+  it("can hide desktop-only Visio", () => {
+    mount(AccountTypePicker, {
+      props: { open: true, allowVisio: false },
+      attachTo: document.body,
+    });
+    expect(bodyEl('[data-testid="picker-visio"]')).toBeNull();
+    expect(bodyEl('[data-testid="picker-zoom"]')).toBeTruthy();
+  });
+
   it("emits cancel from the close and cancel buttons", async () => {
     const wrapper = mount(AccountTypePicker, {
       props: { open: true },

@@ -30,7 +30,7 @@ export interface Account {
   // in `meet::registry()` — empty when there is none. Lets the
   // calendar event editor populate its "Add video link"
   // dropdown without an extra round-trip per row.
-  meet_protocol: "" | "talk" | "matrix" | "zoom";
+  meet_protocol: "" | "talk" | "matrix" | "zoom" | "visio";
 }
 
 export interface QuickFilter {
@@ -224,7 +224,7 @@ export interface AccountConfig {
   /// signed in through. The set in this union is whatever the
   /// `meet::registry()` exposes today; empty when there's no
   /// meet binding.
-  meet_protocol: "" | "talk" | "matrix" | "zoom";
+  meet_protocol: "" | "talk" | "matrix" | "zoom" | "visio";
   username: string;
   password: string;
   use_tls: boolean;

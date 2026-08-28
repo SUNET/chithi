@@ -40,6 +40,23 @@ pub(crate) fn insert_zoom_account(
     })
 }
 
+pub(crate) fn insert_visio_account(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    config: &db::accounts::AccountConfig,
+    tokens: &OAuthTokens,
+    user_id: &str,
+    token_guard: &ZoomTokenLifecycleGuard<'_>,
+) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    db::accounts::insert_account(&transaction, account_id, config)?;
+    db::service_bindings::set_visio_identity(&transaction, account_id, user_id)?;
+    token_guard.store_and_commit(tokens, move || {
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
 fn delete_account_data(
     conn: &rusqlite::Connection,
     account_id: &str,
@@ -47,14 +64,18 @@ fn delete_account_data(
 ) -> Result<Vec<String>> {
     let transaction = conn.unchecked_transaction()?;
     let bindings = db::service_bindings::list_for_account(&transaction, account_id)?;
-    let has_zoom = bindings
+    let managed_meet_protocol = bindings
         .iter()
-        .any(|binding| binding.service == "meet" && binding.protocol == "zoom");
-    let is_standalone_zoom = bindings.len() == 1 && has_zoom;
-    if has_zoom && !is_standalone_zoom {
-        return Err(crate::error::Error::Other(
-            "Cannot delete Zoom credentials: the account has additional service bindings".into(),
-        ));
+        .find(|binding| {
+            binding.service == "meet" && matches!(binding.protocol.as_str(), "zoom" | "visio")
+        })
+        .map(|binding| binding.protocol.as_str());
+    let is_standalone_managed_meet = bindings.len() == 1 && managed_meet_protocol.is_some();
+    if let Some(protocol) = managed_meet_protocol.filter(|_| !is_standalone_managed_meet) {
+        let provider = if protocol == "zoom" { "Zoom" } else { "Visio" };
+        return Err(crate::error::Error::Other(format!(
+            "Cannot delete {provider} credentials: the account has additional service bindings"
+        )));
     }
     // Account deletion cascades through calendars and events. Move any bound
     // meetings into durable cleanup ownership first. If this same account
@@ -65,7 +86,7 @@ fn delete_account_data(
     delete_account_metadata(&transaction, account_id)?;
     db::accounts::delete_account(&transaction, account_id)?;
 
-    if is_standalone_zoom {
+    if is_standalone_managed_meet {
         token_guard.delete_and_commit(move || {
             transaction.commit()?;
             Ok(())
@@ -371,10 +392,42 @@ pub async fn update_account(
         .with_op_worker_stopped(&account_id, || async {
             let account_lock = state.account_lifecycle.acquire(&account_id);
             let _account_guard = account_lock.lock().await;
+            let existing = {
+                let conn = state.db.reader();
+                db::accounts::get_account_full(&conn, &account_id)?
+            };
+            validate_visio_account_update(&existing, &config)?;
             let conn = state.db.writer().await;
             db::accounts::update_account(&conn, &account_id, &config)
         })
         .await
+}
+
+fn validate_visio_account_update(
+    existing: &db::accounts::AccountFull,
+    replacement: &db::accounts::AccountConfig,
+) -> Result<()> {
+    let Some(existing_binding) = existing.meet_binding() else {
+        return Ok(());
+    };
+    if existing_binding.protocol != "visio" {
+        return Ok(());
+    }
+    if replacement.meet_protocol != "visio" {
+        return Err(crate::error::Error::Other(
+            "A Visio account cannot be changed to another provider; remove it and add a new account"
+                .into(),
+        ));
+    }
+    let existing_instance =
+        crate::meet::visio::VisioInstance::parse(&existing_binding.meet_config()?.url)?;
+    let replacement_instance = crate::meet::visio::VisioInstance::parse(&replacement.meet_url)?;
+    if existing_instance.origin() != replacement_instance.origin() {
+        return Err(crate::error::Error::Other(
+            "A Visio account's instance cannot be changed after authentication".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -677,6 +730,17 @@ mod tests {
         .unwrap()
     }
 
+    fn visio_user_id(conn: &Connection, account_id: &str) -> String {
+        db::service_bindings::list_for_account(conn, account_id)
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.service == "meet" && binding.protocol == "visio")
+            .unwrap()
+            .meet_config()
+            .unwrap()
+            .visio_user_id
+    }
+
     fn insert_zoom_account(
         conn: &rusqlite::Connection,
         account_id: &str,
@@ -751,6 +815,91 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn visio_deletion_removes_its_short_lived_token() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("visio").await;
+        db::accounts::insert_account(&conn, "visio", &account_config("visio")).unwrap();
+        store.store("visio", &tokens()).unwrap();
+
+        delete_account_data(&conn, "visio", &token_guard).unwrap();
+
+        assert!(!account_exists(&conn, "visio"));
+        assert!(store.load("visio").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn visio_creation_is_atomic_and_preserves_its_identity() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("visio").await;
+        let config = account_config("visio");
+
+        insert_visio_account(
+            &conn,
+            "visio",
+            &config,
+            &tokens(),
+            "visio-user",
+            &token_guard,
+        )
+        .unwrap();
+        assert!(account_exists(&conn, "visio"));
+        assert_eq!(visio_user_id(&conn, "visio"), "visio-user");
+
+        db::accounts::update_account(&conn, "visio", &config).unwrap();
+        assert_eq!(visio_user_id(&conn, "visio"), "visio-user");
+    }
+
+    #[tokio::test]
+    async fn partial_token_store_failure_rolls_back_visio_account_and_token() {
+        let conn = setup_db();
+        let store = Arc::new(FakeTokenStore::default());
+        store.fail_store_after_write.store(true, Ordering::SeqCst);
+        let providers = providers(store.clone());
+        let token_guard = providers.lock_zoom_tokens("visio").await;
+
+        let result = insert_visio_account(
+            &conn,
+            "visio",
+            &account_config("visio"),
+            &tokens(),
+            "visio-user",
+            &token_guard,
+        );
+
+        assert!(result.is_err());
+        assert!(!account_exists(&conn, "visio"));
+        assert!(store.load("visio").unwrap().is_none());
+    }
+
+    #[test]
+    fn visio_update_cannot_change_authenticated_instance_or_provider() {
+        let conn = setup_db();
+        let config = account_config("visio");
+        db::accounts::insert_account(&conn, "visio", &config).unwrap();
+        let existing = db::accounts::get_account_full(&conn, "visio").unwrap();
+
+        assert!(validate_visio_account_update(&existing, &config).is_ok());
+        let mut changed_instance = config.clone();
+        changed_instance.meet_url = "https://other.example.com".into();
+        assert!(validate_visio_account_update(&existing, &changed_instance).is_err());
+        let mut changed_provider = config;
+        changed_provider.meet_protocol = "zoom".into();
+        assert!(validate_visio_account_update(&existing, &changed_provider).is_err());
+
+        conn.execute(
+            "UPDATE service_bindings SET enabled = 0 WHERE account_id = 'visio'",
+            [],
+        )
+        .unwrap();
+        let disabled = db::accounts::get_account_full(&conn, "visio").unwrap();
+        assert!(validate_visio_account_update(&disabled, &changed_instance).is_err());
     }
 
     #[tokio::test]

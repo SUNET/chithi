@@ -5,7 +5,7 @@ The available types provide mail, calendar, contacts, or video meetings;
 one account does not necessarily provide all four.
 
 Release builds require HTTPS for JMAP, CalDAV, CardDAV, Nextcloud Talk,
-and Matrix server URLs. Debug builds additionally permit HTTP loopback
+Matrix, and La Suite Visio server URLs. Debug builds additionally permit HTTP loopback
 addresses for local development; public cleartext HTTP URLs are rejected.
 La Suite Visio always requires an HTTPS site-root URL, including in debug
 builds.

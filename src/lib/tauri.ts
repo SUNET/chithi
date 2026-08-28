@@ -676,6 +676,36 @@ export async function meetZoomLoginComplete(
   });
 }
 
+/// La Suite Visio add-on exchange. The backend opens a restricted auth
+/// webview itself so the one-time transit token never enters renderer IPC.
+export interface VisioLoginStart {
+  session_id: string;
+}
+
+export async function meetVisioLoginStart(
+  serverUrl: string,
+  accountId?: string,
+): Promise<VisioLoginStart> {
+  return invoke("meet_visio_login_start", {
+    serverUrl,
+    accountId: accountId ?? null,
+  });
+}
+
+export async function meetVisioLoginComplete(
+  sessionId: string,
+  displayName?: string,
+): Promise<string> {
+  return invoke("meet_visio_login_complete", {
+    sessionId,
+    displayName: displayName ?? null,
+  });
+}
+
+export async function meetVisioLoginCancel(sessionId: string): Promise<void> {
+  return invoke("meet_visio_login_cancel", { sessionId });
+}
+
 /// Provider-agnostic create — picks the registry entry matching
 /// the account's meet binding. Returns the join URL plus the
 /// provider-specific meeting id and the account/protocol used, so

@@ -424,6 +424,7 @@ pub struct ProviderTransports {
     pub zoom_api_root: String,
     pub matrix_http: reqwest::Client,
     pub talk_http: reqwest::Client,
+    pub visio_http: reqwest::Client,
 }
 
 impl ProviderTransports {
@@ -468,6 +469,7 @@ impl ProviderTransports {
             zoom_api_root: "https://api.zoom.us/v2".into(),
             matrix_http: build_meet_http_client("matrix")?,
             talk_http: build_meet_http_client("talk")?,
+            visio_http: build_visio_http_client()?,
         })
     }
 }
@@ -478,6 +480,17 @@ fn build_meet_http_client(provider: &str) -> Result<reqwest::Client> {
         .user_agent(USER_AGENT)
         .build()
         .map_err(|error| Error::Other(format!("{} http client: {}", provider, error)))
+}
+
+fn build_visio_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(PROVIDER_HTTP_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        // Never carry a short-lived room-creation bearer token across a
+        // provider-controlled redirect. The API paths are canonical.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| Error::Other(format!("visio http client: {error}")))
 }
 
 /// Focused provider dependencies shared by backend and meet contexts.

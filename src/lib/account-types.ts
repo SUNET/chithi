@@ -11,7 +11,8 @@ export type AccountType =
   | "o365"
   | "talk"
   | "matrix"
-  | "zoom";
+  | "zoom"
+  | "visio";
 
 /// Cross-account contact-book option for the default-book dropdowns.
 /// The label is "Account / Book" so the same book name on two
@@ -30,6 +31,7 @@ export const ADD_ACCOUNT_TYPES: AccountType[] = [
   "talk",
   "matrix",
   "zoom",
+  "visio",
 ];
 
 /// Strict Fastmail JMAP endpoint check. Mirrors the Rust
@@ -68,6 +70,8 @@ export function accountTypeLabelLong(t: AccountType): string {
       return "Matrix";
     case "zoom":
       return "Zoom";
+    case "visio":
+      return "La Suite Visio";
     default:
       return t.toUpperCase();
   }
@@ -101,6 +105,8 @@ export function accountTypeLabel(acc: {
       return "Matrix";
     case "zoom":
       return "Zoom";
+    case "visio":
+      return "La Suite Visio";
     default:
       return "";
   }
@@ -138,5 +144,7 @@ export function accountTypeDescription(t: AccountType): string {
       return "Video conferencing via Matrix / Element Call";
     case "zoom":
       return "Video conferencing via Zoom";
+    case "visio":
+      return "Video conferencing via a La Suite Visio instance";
   }
 }

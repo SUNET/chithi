@@ -1,10 +1,11 @@
 <script setup lang="ts">
 /// First step of "Add Account": pick a type. Replaces the cramped
 /// in-modal tab row with a dialog that lists every supported
-/// account type (currently ten — Gmail / O365 / Fastmail / IMAP /
-/// JMAP / CalDAV / CardDAV / Talk / Matrix / Zoom) as cards, and
+/// account type (currently eleven — Gmail / O365 / Fastmail / IMAP /
+/// JMAP / CalDAV / CardDAV / Talk / Matrix / Zoom / Visio) as cards, and
 /// on pick the parent opens the account form pre-set to that type.
 /// Edit-existing skips this step. (#148 cleanup)
+import { computed } from "vue";
 import ModalShell from "@/components/common/ModalShell.vue";
 import {
   ADD_ACCOUNT_TYPES,
@@ -13,8 +14,15 @@ import {
   type AccountType,
 } from "@/lib/account-types";
 
-defineProps<{ open: boolean }>();
+const props = withDefaults(defineProps<{ open: boolean; allowVisio?: boolean }>(), {
+  allowVisio: true,
+});
 const emit = defineEmits<{ pick: [type: AccountType]; cancel: [] }>();
+const availableAccountTypes = computed(() =>
+  props.allowVisio
+    ? ADD_ACCOUNT_TYPES
+    : ADD_ACCOUNT_TYPES.filter((type) => type !== "visio"),
+);
 </script>
 
 <template>
@@ -28,7 +36,7 @@ const emit = defineEmits<{ pick: [type: AccountType]; cancel: [] }>();
     <p class="picker-help">Pick the kind of account you want to add. You can add more later.</p>
     <div class="picker-grid">
       <button
-        v-for="t in ADD_ACCOUNT_TYPES"
+        v-for="t in availableAccountTypes"
         :key="t"
         class="picker-card"
         :data-testid="`picker-${t}`"

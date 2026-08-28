@@ -483,7 +483,7 @@ impl crate::meet::MeetProvider for TalkProvider {
         ctx: &crate::meet::MeetProviderCtx<'_>,
         account: &crate::db::accounts::AccountFull,
         meeting_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::meet::MeetDeleteOutcome> {
         let url = account.meet_url.trim();
         if url.is_empty() {
             return Err(Error::Other(
@@ -502,7 +502,8 @@ impl crate::meet::MeetProvider for TalkProvider {
             meeting_id,
             &ctx.services.transports.talk_http,
         )
-        .await
+        .await?;
+        Ok(crate::meet::MeetDeleteOutcome::Deleted)
     }
 
     async fn update_topic(

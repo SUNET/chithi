@@ -79,6 +79,10 @@ pub struct MeetBindingConfig {
     pub zoom_user_id: String,
     #[serde(default)]
     pub zoom_account_id: String,
+    /// Stable user UUID from La Suite Meet's add-on JWT. Empty for non-Visio
+    /// and legacy bindings created before identity-bound reauthentication.
+    #[serde(default)]
+    pub visio_user_id: String,
 }
 
 /// A per-service binding that says "this account talks to this protocol for
@@ -369,7 +373,7 @@ pub fn derive_bindings_from_account(account: &AccountFull) -> Vec<ServiceBinding
 /// wire-format `AccountConfig`).
 ///
 /// User-set and provider-owned fields stored in `config_json` that the legacy
-/// derivation doesn't know about (contact-book defaults and Zoom identity) are
+/// derivation doesn't know about (contact-book defaults and meet identities) are
 /// snapshotted before the wipe and re-applied after the re-insert so a
 /// trivial account-edit doesn't drop them.
 pub fn rebuild_for_account(
@@ -379,6 +383,7 @@ pub fn rebuild_for_account(
 ) -> Result<()> {
     let preserved = snapshot_user_set_config(conn, account_id)?;
     let zoom_identity = snapshot_zoom_identity(conn, account_id)?;
+    let visio_identity = snapshot_visio_identity(conn, account_id)?;
     delete_for_account(conn, account_id)?;
     for binding in derive_bindings(fields) {
         insert(conn, &binding)?;
@@ -404,6 +409,15 @@ pub fn rebuild_for_account(
         if let Err(error) = set_zoom_identity(conn, account_id, &user_id, &zoom_account_id) {
             log::debug!(
                 "rebuild_for_account: drop preserved Zoom identity for account {}: {}",
+                account_id,
+                error
+            );
+        }
+    }
+    if let Some(user_id) = visio_identity {
+        if let Err(error) = set_visio_identity(conn, account_id, &user_id) {
+            log::debug!(
+                "rebuild_for_account: drop preserved Visio identity for account {}: {}",
                 account_id,
                 error
             );
@@ -474,6 +488,63 @@ fn snapshot_zoom_identity(conn: &Connection, account_id: &str) -> Result<Option<
         return Ok(None);
     }
     Ok(Some((config.zoom_user_id, config.zoom_account_id)))
+}
+
+pub fn set_visio_identity(conn: &Connection, account_id: &str, user_id: &str) -> Result<()> {
+    if user_id.trim().is_empty() {
+        return Err(Error::Other("Visio identity must not be empty".into()));
+    }
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'meet' AND protocol = 'visio'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let config = config.ok_or_else(|| {
+        Error::Other(format!(
+            "no Visio meet binding for account {} — cannot store identity",
+            account_id
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&config)
+        .map_err(|error| Error::Other(format!("malformed Visio binding config: {error}")))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        Error::Other(format!(
+            "Visio binding for account {} has non-object config_json",
+            account_id
+        ))
+    })?;
+    object.insert("visio_user_id".into(), user_id.into());
+    let serialized = serde_json::to_string(&value)
+        .map_err(|error| Error::Other(format!("serialize Visio binding config: {error}")))?;
+    conn.execute(
+        "UPDATE service_bindings SET config_json = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = ?2 AND service = 'meet' AND protocol = 'visio'",
+        params![serialized, account_id],
+    )?;
+    Ok(())
+}
+
+fn snapshot_visio_identity(conn: &Connection, account_id: &str) -> Result<Option<String>> {
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'meet' AND protocol = 'visio'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let config: MeetBindingConfig = serde_json::from_str(&config)
+        .map_err(|error| Error::Other(format!("malformed Visio binding config: {error}")))?;
+    if config.visio_user_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(config.visio_user_id))
 }
 
 /// Field name in `config_json` that holds the default contact book

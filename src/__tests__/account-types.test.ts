@@ -26,6 +26,7 @@ describe("account type labels", () => {
   it("spells out branded providers and upper-cases protocols", () => {
     expect(accountTypeLabelLong("o365")).toBe("Microsoft 365");
     expect(accountTypeLabelLong("talk")).toBe("Nextcloud Talk");
+    expect(accountTypeLabelLong("visio")).toBe("La Suite Visio");
     expect(accountTypeLabelLong("imap")).toBe("IMAP");
   });
 
@@ -37,6 +38,7 @@ describe("account type labels", () => {
     ).toBe("Calendar and Contacts");
     expect(accountTypeLabel({ has_contacts_binding: true })).toBe("Contacts");
     expect(accountTypeLabel({ meet_protocol: "zoom" })).toBe("Zoom");
+    expect(accountTypeLabel({ meet_protocol: "visio" })).toBe("La Suite Visio");
     expect(accountTypeLabel({})).toBe("");
   });
 
@@ -47,6 +49,7 @@ describe("account type labels", () => {
   });
 
   it("has a description for every picker card", () => {
+    expect(ADD_ACCOUNT_TYPES).toContain("visio");
     for (const t of ADD_ACCOUNT_TYPES) {
       expect(accountTypeDescription(t)).toBeTruthy();
     }

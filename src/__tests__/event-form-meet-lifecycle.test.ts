@@ -111,6 +111,15 @@ describe("EventForm pending meeting lifecycle", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
   });
 
+  it("offers configured La Suite Visio accounts", () => {
+    useAccountsStore().accounts[1].meet_protocol = "visio";
+    const wrapper = mountForm();
+
+    expect(
+      wrapper.get('[data-testid="event-form-meet-meet-account"]').text(),
+    ).toContain("La Suite Visio");
+  });
+
   it("keeps a replacement and discards the previous meeting", async () => {
     vi.mocked(api.meetCreateUrl)
       .mockResolvedValueOnce(binding("one"))
