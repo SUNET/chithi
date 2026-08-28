@@ -7,6 +7,8 @@ one account does not necessarily provide all four.
 Release builds require HTTPS for JMAP, CalDAV, CardDAV, Nextcloud Talk,
 and Matrix server URLs. Debug builds additionally permit HTTP loopback
 addresses for local development; public cleartext HTTP URLs are rejected.
+La Suite Visio always requires an HTTPS site-root URL, including in debug
+builds.
 
 ## Gmail
 
@@ -90,20 +92,30 @@ one does not automatically add the other.
 Chithi can manage meetings for these providers:
 
 - **Nextcloud Talk:** enter the base URL of the Nextcloud server and
-  complete Login Flow v2 in the browser.
+  complete Login Flow v2 in the browser. See the [Nextcloud Talk
+  guide](nextcloud-talk.md).
 - **Matrix / Element Call:** enter the HTTPS Matrix homeserver URL and
   complete browser SSO. Chithi creates a private Matrix room using the
-  Element Call widget at `call.element.io`.
+  Element Call widget at `call.element.io`. See the [Matrix / Element
+  Call guide](matrix-element-call.md).
 - **Zoom:** complete browser OAuth. Chithi's local callback requires TCP
   port 47832 to be free. See the [Zoom integration guide](zoom.md) for
   prerequisites, requested permissions, usage, troubleshooting, and
   removal instructions.
+- **La Suite Visio (desktop):** enter the HTTPS site root and complete
+  sign-in in Chithi's restricted authentication window. See the [La Suite
+  Visio guide](la-suite-visio.md) for server compatibility, MFA, and
+  persistent-room limitations.
 
 Meeting accounts do not provide mail or calendars themselves. After
 adding one, use **Add _account name_ (_provider_)** while creating a
 calendar event. The remote room or meeting is created immediately, before
-the event is saved. Cancelling the form triggers a cleanup attempt.
+the event is saved. Cancelling the form triggers provider-specific local
+cleanup. Talk and Zoom also request remote deletion, Matrix makes Chithi
+leave the room, and Visio rooms remain remotely.
 
 Nextcloud Talk and Matrix sessions cannot currently be reauthenticated
-in place; remove and add the account again. Zoom has a **Sign in again
-with Zoom** action.
+in place; remove and add the account again. Zoom and Visio provide a
+**Sign in again** action. Deleting a Matrix event only makes Chithi leave
+the room, and Visio rooms cannot be deleted through the current API; read
+the provider guide before relying on event deletion for remote cleanup.

@@ -10,19 +10,25 @@ The log file can provide additional context; see
 Do not post logs publicly without checking them for email addresses,
 server names, message metadata, and other personal information.
 
-## Browser sign-in does not complete
+## Provider sign-in does not complete
 
-- Leave Chithi running while the browser flow is open.
-- Complete the flow within five minutes.
+- Leave Chithi running while the sign-in flow is open.
+- Complete Nextcloud Talk, Matrix, and Zoom browser sign-in within five
+  minutes. Complete Visio's embedded-window sign-in within three minutes.
 - Check whether a firewall or browser extension blocks loopback HTTP
-  callbacks.
+  callbacks used by Matrix and Zoom.
 - For Zoom, ensure another process is not using TCP port 47832.
+- For Visio on Linux, choose an alternative MFA method if the embedded
+  WebKit window does not support a security key or passkey.
 - If credentials were revoked by the provider, open Settings and use
   **Sign in again** where available. Nextcloud Talk and Matrix currently
   require removing and adding the account again.
 
-For Zoom-specific callback, meeting-creation, reauthorization, cleanup,
-and disconnection problems, see [Zoom troubleshooting](zoom.md#troubleshooting).
+For provider-specific sign-in, meeting-creation, cleanup, and removal
+problems, see [Nextcloud Talk troubleshooting](nextcloud-talk.md#troubleshooting),
+[Matrix / Element Call troubleshooting](matrix-element-call.md#troubleshooting),
+[Zoom troubleshooting](zoom.md#troubleshooting), or [La Suite Visio
+troubleshooting](la-suite-visio.md#troubleshooting).
 
 ## Gmail mail or calendar works, but not both
 

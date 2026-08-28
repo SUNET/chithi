@@ -1,6 +1,6 @@
 # Privacy policy
 
-Last updated: 2026-05-09.
+Last updated: 2026-08-28.
 
 Chithi is a desktop email, calendar, contacts, and video-conferencing
 client developed in the open at
@@ -22,7 +22,7 @@ calendar, contacts, or video-conferencing account, Chithi:
   local database under your user profile.
 - Sends and receives account data directly between your device and the
   providers you configure (your IMAP/SMTP/CalDAV/CardDAV server, Gmail,
-  Microsoft 365, Nextcloud Talk, Matrix, Zoom, and similar).
+  Microsoft 365, Nextcloud Talk, Matrix, Zoom, La Suite Visio, and similar).
 
 Supporting operations can contact other services: OAuth authorization
 and token endpoints, DNS and account auto-configuration sources, the
