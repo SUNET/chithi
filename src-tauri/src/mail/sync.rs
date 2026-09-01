@@ -135,7 +135,7 @@ fn sync_account_blocking(
             current_folder: i + 1,
         }));
 
-        match sync_folder_envelopes(&db, account_id, &mut conn_imap, folder) {
+        match sync_folder_envelopes(&db, account_id, &mut conn_imap, folder, imap_config) {
             Ok(count) => {
                 grand_total += count;
                 if count > 0 {
@@ -231,7 +231,8 @@ fn sync_account_blocking(
                                 total_folders,
                                 current_folder: folder_idx + 1,
                             }));
-                            match sync_folder_envelopes(&db, &account_id, &mut conn, folder) {
+                            match sync_folder_envelopes(&db, &account_id, &mut conn, folder, &imap_config)
+                            {
                                 Ok(count) => {
                                     thread_total += count;
                                     if count > 0 {
@@ -308,8 +309,9 @@ pub fn sync_folder_envelopes_public(
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
+    imap_config: &ImapConfig,
 ) -> Result<u32> {
-    sync_folder_envelopes(db, account_id, conn_imap, folder_path)
+    sync_folder_envelopes(db, account_id, conn_imap, folder_path, imap_config)
 }
 
 fn sync_folder_envelopes(
@@ -317,6 +319,7 @@ fn sync_folder_envelopes(
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
+    imap_config: &ImapConfig,
 ) -> Result<u32> {
     let (mut last_uid, stored_uid_validity, stored_uid_next, stored_total) = {
         let conn = db.reader();
@@ -451,6 +454,16 @@ fn sync_folder_envelopes(
             Err(e) => {
                 log::warn!("Failed to fetch flags for '{}': {}", folder_path, e);
             }
+        }
+        // fetch_all_flags's own error path already logged; a poisoned
+        // connection must not go on to fetch_uids below, or reads meant for
+        // that command drain whatever the previous, abandoned response left
+        // in the socket. Bail so the caller reconnects before the next folder.
+        if conn_imap.is_poisoned() {
+            return Err(Error::Imap(format!(
+                "connection desynchronized syncing flags for '{}'",
+                folder_path
+            )));
         }
     }
 
@@ -601,15 +614,35 @@ fn sync_folder_envelopes(
         db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
     }
 
-    // Run filter rules on newly synced messages. Filters move and flag mail
-    // over the same connection, so skip them if it is no longer trustworthy —
-    // the caller reconnects and the next cycle picks these messages up.
-    if conn_imap.is_poisoned() {
+    // Run filter rules on newly synced messages. These were fetched and
+    // inserted before any poisoning chunk, so they are safe to filter — but
+    // the DB's existing-row dedup means a message is only ever "new" once,
+    // so skipping them here would skip them forever, not just this cycle.
+    // Filters move and flag mail over the connection, so reconnect first if
+    // it's no longer trustworthy.
+    if conn_imap.is_poisoned() && !new_message_ids.is_empty() {
         log::warn!(
-            "Skipping filters for '{}': IMAP connection desynchronized",
+            "Reconnecting to run filters for '{}': IMAP connection desynchronized",
             folder_path
         );
-    } else if !new_message_ids.is_empty() {
+        match ImapConnection::connect(imap_config) {
+            Ok(fresh) => *conn_imap = fresh,
+            Err(e) => log::error!(
+                "Reconnect for filters in '{}' failed, {} messages will not be filtered: {}",
+                folder_path,
+                new_message_ids.len(),
+                e
+            ),
+        }
+    }
+    if new_message_ids.is_empty() {
+        // Nothing to filter.
+    } else if conn_imap.is_poisoned() {
+        log::warn!(
+            "Skipping filters for '{}': IMAP connection still desynchronized after reconnect attempt",
+            folder_path
+        );
+    } else {
         match run_filters_on_new_messages(db, account_id, folder_path, &new_message_ids, conn_imap)
         {
             Ok(filtered) => {

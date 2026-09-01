@@ -1399,24 +1399,30 @@ struct AddrJson {
 
 /// Split an address header value on the commas that actually separate
 /// mailboxes — not those inside a quoted display name (`"Delhage, Lars"`), an
-/// angle-bracketed address, or an RFC 5322 group (`friends: a@x, b@x;`).
+/// angle-bracketed address, an RFC 5322 group (`friends: a@x, b@x;`), or a
+/// parenthesized comment (`John Doe (Sales, West) <john@x.se>`). RFC 5322
+/// §3.2.2 comments nest and carry their own quoted-pair escapes, distinct from
+/// a quoted string's.
 fn split_address_list(value: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let (mut start, mut quoted, mut escaped, mut angle, mut group) =
         (0, false, false, false, false);
+    let mut comment_depth: u32 = 0;
     for (i, c) in value.char_indices() {
         if escaped {
             escaped = false;
             continue;
         }
         match c {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            '<' if !quoted => angle = true,
-            '>' if !quoted => angle = false,
-            ':' if !quoted && !angle => group = true,
-            ';' if !quoted && !angle => group = false,
-            ',' if !quoted && !angle && !group => {
+            '\\' if quoted || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => quoted = !quoted,
+            '(' if !quoted => comment_depth += 1,
+            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
+            '<' if !quoted && comment_depth == 0 => angle = true,
+            '>' if !quoted && comment_depth == 0 => angle = false,
+            ':' if !quoted && !angle && comment_depth == 0 => group = true,
+            ';' if !quoted && !angle && comment_depth == 0 => group = false,
+            ',' if !quoted && !angle && !group && comment_depth == 0 => {
                 items.push(&value[start..i]);
                 start = i + c.len_utf8();
             }
@@ -1591,5 +1597,40 @@ mod addr_edge_cases {
     fn a_sender_without_a_routable_address_yields_none() {
         let env = parse_envelope_headers(b"From: root\r\n\r\n");
         assert!(env.from_email.is_none());
+    }
+
+    #[test]
+    fn a_comma_inside_a_parenthesized_comment_is_not_a_separator() {
+        let env = parse_envelope_headers(
+            b"To: John Doe (Sales, West) <john@example.com>, jane@example.com\r\n\r\n",
+        );
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"John Doe","email":"john@example.com"},{"name":null,"email":"jane@example.com"}]"#
+        );
+    }
+
+    // The next two exercise `split_address_list` directly rather than through
+    // `parse_envelope_headers`: `mailparse::addrparse` doesn't itself nest
+    // comments or honor a quoted-pair escape inside one, so asserting a clean
+    // display name past that point would pin mailparse's behavior, not
+    // chithi's. What chithi controls is not splitting at the wrong comma.
+
+    #[test]
+    fn nested_comments_keep_the_address_as_one_item() {
+        let items = super::split_address_list("A (outer (inner) still outer) <a@x.se>, b@x.se");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trim(), "A (outer (inner) still outer) <a@x.se>");
+        assert_eq!(items[1].trim(), "b@x.se");
+    }
+
+    #[test]
+    fn an_escaped_paren_inside_a_comment_does_not_close_it_early() {
+        // "\)" is a quoted-pair, a literal ")" character, not the comment's
+        // real close -- which is the *next* ")".
+        let items = super::split_address_list("A (note: \\) still open) <a@x.se>, b@x.se");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trim(), "A (note: \\) still open) <a@x.se>");
+        assert_eq!(items[1].trim(), "b@x.se");
     }
 }
