@@ -135,7 +135,7 @@ fn sync_account_blocking(
             current_folder: i + 1,
         }));
 
-        match sync_folder_envelopes(&db, account_id, &mut conn_imap, folder) {
+        match sync_folder_envelopes(&db, account_id, &mut conn_imap, folder, imap_config) {
             Ok(count) => {
                 grand_total += count;
                 if count > 0 {
@@ -150,6 +150,29 @@ fn sync_account_blocking(
                 }));
             }
             Err(e) => log::error!("Error syncing {}: {}", folder, e),
+        }
+
+        // A desynchronized connection fails every folder after the first, so
+        // replace it rather than burning through the rest of the list.
+        if conn_imap.is_poisoned() {
+            log::warn!(
+                "Reconnecting after '{}' left the IMAP stream desynchronized",
+                folder
+            );
+            match ImapConnection::connect(imap_config) {
+                // Assigning drops the stale connection without a LOGOUT — its
+                // reply would arrive on a stream we already can't parse.
+                Ok(fresh) => conn_imap = fresh,
+                Err(e) => {
+                    // Phase 2 opens its own connections, so give up on the
+                    // priority folders only.
+                    log::error!(
+                        "Reconnect after desync failed, abandoning priority sync: {}",
+                        e
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -208,7 +231,8 @@ fn sync_account_blocking(
                                 total_folders,
                                 current_folder: folder_idx + 1,
                             }));
-                            match sync_folder_envelopes(&db, &account_id, &mut conn, folder) {
+                            match sync_folder_envelopes(&db, &account_id, &mut conn, folder, &imap_config)
+                            {
                                 Ok(count) => {
                                     thread_total += count;
                                     if count > 0 {
@@ -221,6 +245,32 @@ fn sync_account_blocking(
                                 }
                                 Err(e) => {
                                     log::warn!("Parallel sync: skipping folder '{}': {}", folder, e)
+                                }
+                            }
+
+                            // Every remaining folder on this thread would fail
+                            // on a desynchronized stream, so start over on a
+                            // fresh connection instead.
+                            if conn.is_poisoned() {
+                                log::warn!(
+                                    "Parallel sync thread {}: reconnecting after '{}' left the IMAP stream desynchronized",
+                                    thread_idx,
+                                    folder
+                                );
+                                match ImapConnection::connect(&imap_config) {
+                                    // Assigning drops the stale connection
+                                    // without a LOGOUT — its reply would
+                                    // arrive on a stream we can't parse.
+                                    Ok(fresh) => conn = fresh,
+                                    Err(e) => {
+                                        log::error!(
+                                            "Parallel sync thread {}: reconnect failed, {} folders left unsynced: {}",
+                                            thread_idx,
+                                            folders.len(),
+                                            e
+                                        );
+                                        return Ok(thread_total);
+                                    }
                                 }
                             }
                         }
@@ -259,8 +309,9 @@ pub fn sync_folder_envelopes_public(
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
+    imap_config: &ImapConfig,
 ) -> Result<u32> {
-    sync_folder_envelopes(db, account_id, conn_imap, folder_path)
+    sync_folder_envelopes(db, account_id, conn_imap, folder_path, imap_config)
 }
 
 fn sync_folder_envelopes(
@@ -268,6 +319,7 @@ fn sync_folder_envelopes(
     account_id: &str,
     conn_imap: &mut ImapConnection,
     folder_path: &str,
+    imap_config: &ImapConfig,
 ) -> Result<u32> {
     let (mut last_uid, stored_uid_validity, stored_uid_next, stored_total) = {
         let conn = db.reader();
@@ -403,6 +455,16 @@ fn sync_folder_envelopes(
                 log::warn!("Failed to fetch flags for '{}': {}", folder_path, e);
             }
         }
+        // fetch_all_flags's own error path already logged; a poisoned
+        // connection must not go on to fetch_uids below, or reads meant for
+        // that command drain whatever the previous, abandoned response left
+        // in the socket. Bail so the caller reconnects before the next folder.
+        if conn_imap.is_poisoned() {
+            return Err(Error::Imap(format!(
+                "connection desynchronized syncing flags for '{}'",
+                folder_path
+            )));
+        }
     }
 
     let mut new_uids = conn_imap.fetch_uids(last_uid)?;
@@ -446,9 +508,12 @@ fn sync_folder_envelopes(
 
     let mut total_synced = 0u32;
     let mut new_message_ids: Vec<String> = Vec::new();
+    let mut unread_uids: Vec<u32> = Vec::new();
 
     for chunk in new_uids.chunks(1000) {
-        let envelopes = conn_imap.fetch_envelopes_batch(chunk)?;
+        let batch = conn_imap.fetch_envelopes_batch(chunk)?;
+        unread_uids.extend_from_slice(&batch.failed_uids);
+        let envelopes = batch.envelopes;
 
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
@@ -519,15 +584,65 @@ fn sync_folder_envelopes(
             total_synced += 1;
         }
 
-        if let Some(&max_uid) = chunk.iter().max() {
-            db::folders::update_last_seen_uid(&tx, account_id, folder_path, max_uid)?;
-        }
-
         tx.commit()?;
     }
 
-    // Run filter rules on newly synced messages
-    if !new_message_ids.is_empty() {
+    // `last_seen_uid` asserts that every UID at or below it has been synced, so
+    // it may only advance past UIDs actually read off the server. A chunk the
+    // server or parser rejected pins the mark just below its lowest UID; the
+    // messages above it are re-fetched next cycle (inserts are keyed by UID, so
+    // re-reading them is a no-op).
+    let watermark = match unread_uids.iter().min() {
+        Some(&lowest_unread) => {
+            log::warn!(
+                "Folder '{}': {} messages could not be read; holding last_seen_uid below UID {}",
+                folder_path,
+                unread_uids.len(),
+                lowest_unread
+            );
+            new_uids
+                .iter()
+                .copied()
+                .filter(|&u| u < lowest_unread)
+                .max()
+        }
+        None => new_uids.iter().copied().max(),
+    };
+    if let Some(max_uid) = watermark.filter(|&u| u > last_uid) {
+        let rt = tokio::runtime::Handle::current();
+        let conn = rt.block_on(db.writer());
+        db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+    }
+
+    // Run filter rules on newly synced messages. These were fetched and
+    // inserted before any poisoning chunk, so they are safe to filter — but
+    // the DB's existing-row dedup means a message is only ever "new" once,
+    // so skipping them here would skip them forever, not just this cycle.
+    // Filters move and flag mail over the connection, so reconnect first if
+    // it's no longer trustworthy.
+    if conn_imap.is_poisoned() && !new_message_ids.is_empty() {
+        log::warn!(
+            "Reconnecting to run filters for '{}': IMAP connection desynchronized",
+            folder_path
+        );
+        match ImapConnection::connect(imap_config) {
+            Ok(fresh) => *conn_imap = fresh,
+            Err(e) => log::error!(
+                "Reconnect for filters in '{}' failed, {} messages will not be filtered: {}",
+                folder_path,
+                new_message_ids.len(),
+                e
+            ),
+        }
+    }
+    if new_message_ids.is_empty() {
+        // Nothing to filter.
+    } else if conn_imap.is_poisoned() {
+        log::warn!(
+            "Skipping filters for '{}': IMAP connection still desynchronized after reconnect attempt",
+            folder_path
+        );
+    } else {
         match run_filters_on_new_messages(db, account_id, folder_path, &new_message_ids, conn_imap)
         {
             Ok(filtered) => {

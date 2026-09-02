@@ -57,9 +57,22 @@ pub struct EnvelopeData {
     pub has_attachments: bool,
 }
 
+/// Outcome of [`ImapConnection::fetch_envelopes_batch`]. UIDs whose chunk the
+/// server or the parser rejected land in `failed_uids` instead of being
+/// silently dropped, so the caller can leave them outside its sync watermark
+/// and retry them later.
+#[derive(Default)]
+pub struct EnvelopeBatch {
+    pub envelopes: Vec<EnvelopeData>,
+    pub failed_uids: Vec<u32>,
+}
+
 pub struct ImapConnection {
     session: Session<TlsStream<TcpStream>>,
     idle_control: Option<std::sync::Arc<IdleControl>>,
+    /// Set once a failure has left unread bytes in the socket. See
+    /// [`ImapConnection::is_poisoned`].
+    poisoned: bool,
 }
 
 /// Keep comma-separated UID FETCH commands below conservative server argument
@@ -67,10 +80,162 @@ pub struct ImapConnection {
 /// database batch size used by sync.
 const IMAP_FETCH_UID_CHUNK_SIZE: usize = 100;
 
+/// What chithi asks for instead of `ENVELOPE`.
+///
+/// `imap-proto` 0.10.2 parses an ENVELOPE address list as `NIL` or
+/// `"(" 1*address ")"` (`opt_addresses`, using `many1!`), which is exactly RFC
+/// 3501 §9. Proton Mail Bridge emits `()` for an address field with no
+/// addresses — a message whose `To:` header is absent, empty, or a group with
+/// no members. That matches neither branch, and the failure surfaces from
+/// `imap`'s *reader* (`client.rs`, `ParseError::Invalid`), which abandons the
+/// response mid-stream and leaves the rest of it in the socket. The connection
+/// is desynchronized from that point on, so every later command on it fails
+/// too.
+///
+/// `imap` 2.4.1 pins `imap-proto ^0.10.0`, so there is no version to upgrade
+/// to. Reading the headers directly and parsing them with `mailparse` sidesteps
+/// the envelope parser altogether, and folds the References/In-Reply-To fetch
+/// that used to be a second round-trip into this one.
+const ENVELOPE_FETCH_SPEC: &str = "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS \
+    (SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])";
+
+/// How much of a rejected server response to put on one log line.
+const IMAP_PARSE_LOG_LIMIT: usize = 2048;
+
+/// Log the payload that `imap`'s parser rejected.
+///
+/// `imap::error::ParseError` carries the offending bytes, but its `Display`
+/// impl renders whole variants as one fixed string — every `ParseError::Invalid`
+/// prints "Unable to parse status response" regardless of content. Since
+/// `Error::Imap` keeps only `e.to_string()`, that payload is otherwise
+/// unrecoverable, and the log says nothing about what the server actually sent.
+///
+/// The payload is a slice of a live server response, so it can carry message
+/// subjects and addresses. That is the point — without it a parser failure is
+/// unattributable — but it does mean `chithi.log` holds mail data in the clear,
+/// so keep it capped and never log an authentication challenge. A `BODY[]`
+/// fetch (the one path that pulls a full message, not just headers) gets its
+/// payload text withheld entirely — the byte count is enough to see that a
+/// fetch failed, and full message content has no business sitting in a log
+/// file users may attach to bug reports.
+fn log_imap_parse_payload(context: &str, e: &imap::Error) {
+    use imap::error::ParseError;
+
+    let imap::Error::Parse(parse_err) = e else {
+        return;
+    };
+    let redacted = is_full_body_fetch(context);
+    match parse_err {
+        ParseError::Invalid(bytes) => log::error!(
+            "{}: parser rejected {} bytes of server response{}",
+            context,
+            bytes.len(),
+            payload_suffix(bytes, redacted),
+        ),
+        ParseError::DataNotUtf8(bytes, utf8_err) => log::error!(
+            "{}: server sent {} bytes of non-UTF-8 data ({}){}",
+            context,
+            bytes.len(),
+            utf8_err,
+            payload_suffix(bytes, redacted),
+        ),
+        ParseError::Unexpected(text) => log::error!(
+            "{}: unexpected response{}",
+            context,
+            payload_suffix(text.as_bytes(), redacted),
+        ),
+        // Authentication challenges can carry credentials — never log them.
+        ParseError::Authentication(_, _) => {}
+    }
+}
+
+/// Whether `context` names a `BODY[]` fetch — the only command that returns a
+/// full message rather than headers/addresses/flags.
+fn is_full_body_fetch(context: &str) -> bool {
+    context.contains("BODY[]")
+}
+
+/// The `": \"...\""` piece appended after the byte count, or a redaction
+/// notice in its place when `redact` is set.
+fn payload_suffix(bytes: &[u8], redact: bool) -> String {
+    if redact {
+        " (message body, payload redacted)".to_string()
+    } else {
+        format!(": \"{}\"", escape_for_log(bytes))
+    }
+}
+
+/// Escape a raw server response so it survives as a single readable log line,
+/// capped at [`IMAP_PARSE_LOG_LIMIT`]. Slicing can split a multi-byte
+/// character; the lossy conversion renders the fragment as U+FFFD, which is
+/// fine for diagnostics.
+fn escape_for_log(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(IMAP_PARSE_LOG_LIMIT)];
+    let mut out: String = String::from_utf8_lossy(head)
+        .chars()
+        .flat_map(|c| c.escape_debug())
+        .collect();
+    if bytes.len() > head.len() {
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+/// Whether a failure left the response stream in an unknown state.
+///
+/// `imap` 2.4.1 reads a response line by line and, when a line fails to parse
+/// outright, gives up with `ParseError::Invalid` without draining the rest of
+/// the response (`client.rs`, `read_response_onto`). The unread remainder is
+/// still in the socket, so the next command reads *its* predecessor's tail —
+/// which is how a single bad FETCH turns into every subsequent SELECT on that
+/// connection failing in microseconds.
+///
+/// `Error::No`/`Error::Bad` are clean: the server's tagged response was read in
+/// full, so the connection stays usable.
+fn leaves_stream_desynchronized(e: &imap::Error) -> bool {
+    matches!(
+        e,
+        imap::Error::Parse(imap::error::ParseError::Invalid(_))
+            | imap::Error::Io(_)
+            | imap::Error::ConnectionLost
+    )
+}
+
 impl ImapConnection {
     /// Connect and authenticate. Must be called from a blocking context.
     pub fn connect(config: &ImapConfig) -> Result<Self> {
         Self::connect_inner(config, None)
+    }
+
+    /// True once a failure has left unread bytes in the socket. Nothing read
+    /// from this connection afterwards can be trusted; callers holding one
+    /// across several folders must drop it and reconnect.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Log a failed IMAP command and mark the connection unusable if the
+    /// failure desynchronized the stream.
+    fn note_error(&mut self, context: &str, e: &imap::Error) {
+        log_imap_parse_payload(context, e);
+        if !self.poisoned && leaves_stream_desynchronized(e) {
+            self.poisoned = true;
+            log::error!(
+                "{}: response stream left desynchronized; connection must not be reused",
+                context
+            );
+        }
+    }
+
+    /// Convert an `imap` result into chithi's, logging it and poisoning the
+    /// connection where warranted. Bind the command's result to a local first —
+    /// `self.checked(ctx, self.session.foo())` borrows `self` twice.
+    fn checked<T>(&mut self, context: &str, r: std::result::Result<T, imap::Error>) -> Result<T> {
+        r.map_err(|e| {
+            self.note_error(context, &e);
+            log::error!("{} failed: {}", context, e);
+            Error::Imap(e.to_string())
+        })
     }
 
     /// Connect an IDLE session and expose its socket to the lifecycle owner so
@@ -162,15 +327,14 @@ impl ImapConnection {
         Ok(Self {
             session,
             idle_control,
+            poisoned: false,
         })
     }
 
     pub fn list_folders(&mut self) -> Result<Vec<(String, String)>> {
         log::debug!("IMAP listing folders");
-        let mailboxes = self.session.list(None, Some("*")).map_err(|e| {
-            log::error!("IMAP LIST failed: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let listed = self.session.list(None, Some("*"));
+        let mailboxes = self.checked("IMAP LIST", listed)?;
 
         let mut folders = Vec::new();
         for mb in mailboxes.iter() {
@@ -196,10 +360,8 @@ impl ImapConnection {
     /// LIST entries marked `\Noselect` remain visible to folder sync but must
     /// not be used by bulk mailbox operations.
     pub fn list_selectable_folder_paths(&mut self) -> Result<std::collections::HashSet<String>> {
-        let mailboxes = self.session.list(None, Some("*")).map_err(|e| {
-            log::error!("IMAP LIST failed while resolving selectable folders: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let listed = self.session.list(None, Some("*"));
+        let mailboxes = self.checked("IMAP LIST (selectable folders)", listed)?;
         Ok(mailboxes
             .iter()
             .filter(|mailbox| mailbox_is_selectable(mailbox.attributes()))
@@ -210,10 +372,8 @@ impl ImapConnection {
     /// SELECT a folder. Returns (exists, uid_validity, uid_next).
     pub fn select_folder(&mut self, folder: &str) -> Result<(u32, u32, u32)> {
         log::debug!("IMAP SELECT {}", folder);
-        let mailbox = self.session.select(folder).map_err(|e| {
-            log::error!("IMAP SELECT {} failed: {}", folder, e);
-            Error::Imap(e.to_string())
-        })?;
+        let selected = self.session.select(folder);
+        let mailbox = self.checked(&format!("IMAP SELECT {}", folder), selected)?;
         let exists = mailbox.exists;
         let uid_validity = mailbox.uid_validity.unwrap_or(0);
         let uid_next = mailbox.uid_next.unwrap_or(0);
@@ -236,10 +396,8 @@ impl ImapConnection {
         };
         log::debug!("IMAP UID FETCH {} (since_uid={})", range, since_uid);
 
-        let messages = self.session.uid_fetch(&range, "UID").map_err(|e| {
-            log::error!("IMAP UID FETCH failed: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let fetched = self.session.uid_fetch(&range, "UID");
+        let messages = self.checked(&format!("IMAP UID FETCH {} UID", range), fetched)?;
 
         let uids: Vec<u32> = messages
             .iter()
@@ -253,15 +411,26 @@ impl ImapConnection {
 
     /// Fetch lightweight envelopes (no body) for a batch of UIDs.
     /// This is ~100x faster than fetching full bodies.
-    pub fn fetch_envelopes_batch(&mut self, uids: &[u32]) -> Result<Vec<EnvelopeData>> {
+    ///
+    /// A chunk that the server or the response parser rejects is reported in
+    /// [`EnvelopeBatch::failed_uids`] rather than aborting the whole batch —
+    /// one unreadable message must not cost a folder. Once the connection is
+    /// poisoned no further chunk is attempted, since nothing read off a
+    /// desynchronized stream can be trusted.
+    pub fn fetch_envelopes_batch(&mut self, uids: &[u32]) -> Result<EnvelopeBatch> {
+        let mut batch = EnvelopeBatch::default();
         if uids.is_empty() {
-            return Ok(vec![]);
+            return Ok(batch);
         }
 
         log::debug!("IMAP fetching {} envelopes", uids.len());
 
-        let mut results = Vec::new();
         for chunk in uids.chunks(IMAP_FETCH_UID_CHUNK_SIZE) {
+            if self.poisoned {
+                batch.failed_uids.extend_from_slice(chunk);
+                continue;
+            }
+
             let uid_set = uid_set_string(chunk);
             log::debug!(
                 "IMAP fetching {} envelopes (UIDs: {}...)",
@@ -269,167 +438,57 @@ impl ImapConnection {
                 &uid_set[..uid_set.len().min(80)]
             );
 
-            let fetches = self
-                .session
-                .uid_fetch(&uid_set, "(UID ENVELOPE FLAGS RFC822.SIZE)")
-                .map_err(|e| {
-                    log::error!("IMAP FETCH envelopes failed: {}", e);
-                    Error::Imap(e.to_string())
-                })?;
+            let fetched = self.session.uid_fetch(&uid_set, ENVELOPE_FETCH_SPEC);
+            let fetches = match fetched {
+                Ok(f) => f,
+                Err(e) => {
+                    let context = format!("IMAP UID FETCH {} {}", uid_set, ENVELOPE_FETCH_SPEC);
+                    self.note_error(&context, &e);
+                    log::warn!(
+                        "IMAP FETCH envelopes failed for {} UIDs (skipping chunk): {}",
+                        chunk.len(),
+                        e
+                    );
+                    batch.failed_uids.extend_from_slice(chunk);
+                    continue;
+                }
+            };
 
-            let mut chunk_results = Vec::new();
             for fetch in fetches.iter() {
-                let uid = match fetch.uid {
-                    Some(u) => u,
-                    None => continue,
-                };
+                let Some(uid) = fetch.uid else { continue };
                 let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
                 let size = fetch.size.unwrap_or(0) as u64;
-
-                // Parse ENVELOPE
-                let envelope = fetch.envelope();
-                let (
-                    subject,
-                    from_name,
-                    from_email,
-                    to_json,
-                    cc_json,
-                    date_str,
-                    msg_id,
-                    in_reply_to,
-                ) = if let Some(env) = envelope {
-                    let subject = env.subject.as_ref().map(|s| decode_imap_str(s));
-
-                    let (fname, femail) = env
-                        .from
-                        .as_ref()
-                        .and_then(|addrs| addrs.first())
-                        .map(|a| {
-                            (
-                                a.name.as_ref().map(|n| decode_imap_str(n)),
-                                a.mailbox.as_ref().map(|m| {
-                                    let mb = decode_imap_str(m);
-                                    if let Some(host) = a.host.as_ref() {
-                                        format!("{}@{}", mb, decode_imap_str(host))
-                                    } else {
-                                        mb
-                                    }
-                                }),
-                            )
-                        })
-                        .unwrap_or((None, None));
-
-                    let to_list = addresses_to_json(env.to.as_deref());
-                    let cc_list = addresses_to_json(env.cc.as_deref());
-
-                    let date = env.date.as_ref().map(|d| decode_imap_str(d));
-                    // Some servers (notably Microsoft Exchange/M365) emit a
-                    // leading space inside the envelope's MessageId/InReplyTo
-                    // octet-string. Storing that verbatim breaks the exact-
-                    // match `WHERE message_id = ?` lookup in `compute_thread_id`,
-                    // so canonicalize at the seam.
-                    let mid = env
-                        .message_id
-                        .as_ref()
-                        .and_then(|m| normalize_message_id(&decode_imap_str(m)));
-                    let irt = env
-                        .in_reply_to
-                        .as_ref()
-                        .and_then(|r| normalize_message_id(&decode_imap_str(r)));
-
-                    (subject, fname, femail, to_list, cc_list, date, mid, irt)
-                } else {
-                    (
-                        None,
-                        None,
-                        None,
-                        "[]".to_string(),
-                        "[]".to_string(),
-                        None,
-                        None,
-                        None,
-                    )
-                };
+                let header = parse_envelope_headers(fetch.header().unwrap_or_default());
 
                 // Check for attachments from BODYSTRUCTURE
                 // Simple heuristic: if the response text mentions "attachment", it likely has one
                 // More accurate: check if it's multipart/mixed (indicates attachments)
                 let has_attachments = size > 10000; // rough heuristic; will improve later
 
-                chunk_results.push(EnvelopeData {
+                batch.envelopes.push(EnvelopeData {
                     uid,
-                    subject,
-                    from_name,
-                    from_email,
-                    to_addresses: to_json,
-                    cc_addresses: cc_json,
-                    date: date_str,
-                    message_id: msg_id,
-                    in_reply_to,
-                    references: Vec::new(),
+                    subject: header.subject,
+                    from_name: header.from_name,
+                    from_email: header.from_email,
+                    to_addresses: header.to_addresses,
+                    cc_addresses: header.cc_addresses,
+                    date: header.date,
+                    message_id: header.message_id,
+                    in_reply_to: header.in_reply_to,
+                    references: header.references,
                     flags,
                     size,
                     has_attachments,
                 });
             }
-
-            // References travels in a second, header-only fetch. Combining it
-            // with ENVELOPE in one FETCH triggers an imap-proto parse error on
-            // some servers (the literal-string framing of the body fetch leaks
-            // into the next command's response). A second pass is one extra
-            // round-trip per chunk but keeps the connection state clean.
-            if !chunk_results.is_empty() {
-                self.populate_references(&mut chunk_results, &uid_set);
-                results.extend(chunk_results);
-            }
         }
 
-        log::info!("IMAP envelope batch: {} envelopes fetched", results.len());
-        Ok(results)
-    }
-
-    /// Best-effort: fetch the References and In-Reply-To headers for every
-    /// envelope in `results` and write them back. References fills
-    /// `env.references`. In-Reply-To is used to backfill `env.in_reply_to`
-    /// only when the envelope itself didn't carry it (some servers return
-    /// NIL even when the header is in the body). Failures here do not abort
-    /// the sync.
-    fn populate_references(&mut self, results: &mut [EnvelopeData], uid_set: &str) {
-        let fetches = match self.session.uid_fetch(
-            uid_set,
-            "(UID BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("IMAP fetch References/In-Reply-To failed (skipping): {}", e);
-                return;
-            }
-        };
-        let mut refs_by_uid: std::collections::HashMap<u32, Vec<String>> =
-            std::collections::HashMap::new();
-        let mut irt_by_uid: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
-        for fetch in fetches.iter() {
-            if let (Some(uid), Some(bytes)) = (fetch.uid, fetch.header()) {
-                let (irt, refs) = parse_threading_headers(bytes);
-                if !refs.is_empty() {
-                    refs_by_uid.insert(uid, refs);
-                }
-                if let Some(irt) = irt {
-                    irt_by_uid.insert(uid, irt);
-                }
-            }
-        }
-        for env in results.iter_mut() {
-            if let Some(refs) = refs_by_uid.remove(&env.uid) {
-                env.references = refs;
-            }
-            if env.in_reply_to.is_none() {
-                if let Some(irt) = irt_by_uid.remove(&env.uid) {
-                    env.in_reply_to = Some(irt);
-                }
-            }
-        }
+        log::info!(
+            "IMAP envelope batch: {} envelopes fetched, {} UIDs unread",
+            batch.envelopes.len(),
+            batch.failed_uids.len()
+        );
+        Ok(batch)
     }
 
     /// Fetch the full body (RFC822) for a single message by UID.
@@ -437,13 +496,8 @@ impl ImapConnection {
     pub fn fetch_message_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
         log::debug!("IMAP fetching body for UID {}", uid);
 
-        let fetches = self
-            .session
-            .uid_fetch(uid.to_string(), "BODY[]")
-            .map_err(|e| {
-                log::error!("IMAP FETCH body for UID {} failed: {}", uid, e);
-                Error::Imap(e.to_string())
-            })?;
+        let fetched = self.session.uid_fetch(uid.to_string(), "BODY[]");
+        let fetches = self.checked(&format!("IMAP UID FETCH {} BODY[]", uid), fetched)?;
 
         if let Some(msg) = fetches.iter().next() {
             if let Some(body) = msg.body() {
@@ -473,10 +527,8 @@ impl ImapConnection {
 
         log::debug!("IMAP batch fetching {} bodies", uids.len());
 
-        let fetches = self.session.uid_fetch(&uid_set, "BODY[]").map_err(|e| {
-            log::error!("IMAP batch FETCH bodies failed: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let fetched = self.session.uid_fetch(&uid_set, "BODY[]");
+        let fetches = self.checked(&format!("IMAP UID FETCH {} BODY[]", uid_set), fetched)?;
 
         let mut results = std::collections::HashMap::new();
         for msg in fetches.iter() {
@@ -536,26 +588,18 @@ impl ImapConnection {
 
         // 1. Copy messages to destination
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
-            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-        })?;
+        let copied = self.session.uid_copy(&uid_set, &quoted_dest);
+        self.checked(&format!("IMAP UID COPY to '{}'", dest_folder), copied)?;
         log::debug!("IMAP COPY to '{}' succeeded", dest_folder);
 
         // 2. Mark originals as deleted
-        self.session
-            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-            .map_err(|e| {
-                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
-                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
-            })?;
+        let stored = self.session.uid_store(&uid_set, "+FLAGS (\\Deleted)");
+        self.checked("IMAP UID STORE +FLAGS \\Deleted", stored)?;
         log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
 
         // 3. Expunge to permanently remove
-        self.session.expunge().map_err(|e| {
-            log::error!("IMAP EXPUNGE failed: {}", e);
-            Error::Imap(format!("EXPUNGE failed: {}", e))
-        })?;
+        let expunged = self.session.expunge();
+        self.checked("IMAP EXPUNGE", expunged)?;
         log::info!(
             "IMAP move complete: {} messages moved to '{}'",
             uids.len(),
@@ -581,19 +625,13 @@ impl ImapConnection {
         );
 
         // Store \Deleted flag
-        self.session
-            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-            .map_err(|e| {
-                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
-                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
-            })?;
+        let stored = self.session.uid_store(&uid_set, "+FLAGS (\\Deleted)");
+        self.checked("IMAP UID STORE +FLAGS \\Deleted", stored)?;
         log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
 
         // Expunge
-        self.session.expunge().map_err(|e| {
-            log::error!("IMAP EXPUNGE failed: {}", e);
-            Error::Imap(format!("EXPUNGE failed: {}", e))
-        })?;
+        let expunged = self.session.expunge();
+        self.checked("IMAP EXPUNGE", expunged)?;
         log::info!("IMAP delete complete: {} messages expunged", uids.len());
 
         Ok(())
@@ -637,10 +675,8 @@ impl ImapConnection {
             &uid_set[..uid_set.len().min(80)]
         );
 
-        self.session.uid_store(&uid_set, &store_cmd).map_err(|e| {
-            log::error!("IMAP UID STORE {} failed: {}", store_cmd, e);
-            Error::Imap(format!("STORE {} failed: {}", store_cmd, e))
-        })?;
+        let stored = self.session.uid_store(&uid_set, &store_cmd);
+        self.checked(&format!("IMAP UID STORE {}", store_cmd), stored)?;
 
         log::info!(
             "IMAP flags updated: {} {} on {} messages",
@@ -656,19 +692,16 @@ impl ImapConnection {
     /// Uses .SILENT to suppress per-message FETCH responses, which can be
     /// very large on folders with many messages.
     pub fn mark_all_seen(&mut self) -> Result<()> {
-        self.session
-            .uid_store("1:*", "+FLAGS.SILENT (\\Seen)")
-            .map_err(|e| Error::Imap(format!("STORE +FLAGS.SILENT \\Seen failed: {}", e)))?;
+        let stored = self.session.uid_store("1:*", "+FLAGS.SILENT (\\Seen)");
+        self.checked("IMAP UID STORE +FLAGS.SILENT \\Seen", stored)?;
         Ok(())
     }
 
     /// Fetch current flags for all messages in the selected folder.
     /// Returns a map of UID → flags vec. Uses `1:*` to get everything.
     pub fn fetch_all_flags(&mut self) -> Result<Vec<(u32, Vec<String>)>> {
-        let fetches = self.session.uid_fetch("1:*", "(UID FLAGS)").map_err(|e| {
-            log::error!("IMAP UID FETCH FLAGS failed: {}", e);
-            Error::Imap(format!("FETCH FLAGS failed: {}", e))
-        })?;
+        let fetched = self.session.uid_fetch("1:*", "(UID FLAGS)");
+        let fetches = self.checked("IMAP UID FETCH 1:* (UID FLAGS)", fetched)?;
 
         let mut results = Vec::new();
         for fetch in fetches.iter() {
@@ -697,10 +730,8 @@ impl ImapConnection {
         );
 
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
-            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-        })?;
+        let copied = self.session.uid_copy(&uid_set, &quoted_dest);
+        self.checked(&format!("IMAP UID COPY to '{}'", dest_folder), copied)?;
 
         log::info!(
             "IMAP copy complete: {} messages copied to '{}'",
@@ -792,10 +823,8 @@ impl ImapConnection {
         // The query string carries user-provided search text; log only its
         // shape so debug output is safe to share.
         log::debug!("IMAP UID SEARCH (query_len={})", query.len());
-        let uids = self.session.uid_search(query).map_err(|e| {
-            log::error!("IMAP UID SEARCH failed: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let searched = self.session.uid_search(query);
+        let uids = self.checked("IMAP UID SEARCH", searched)?;
         Ok(uids.into_iter().collect())
     }
 
@@ -849,6 +878,12 @@ pub fn search_account_blocking(
         if hits.len() >= SEARCH_TOTAL_LIMIT {
             break;
         }
+        // Nothing read after a desync means anything, so stop rather than
+        // append garbage hits from the remaining folders.
+        if conn.is_poisoned() {
+            log::warn!("IMAP search: aborting, connection desynchronized");
+            break;
+        }
         if SEARCH_SKIP_FOLDERS
             .iter()
             .any(|skip| path.eq_ignore_ascii_case(skip))
@@ -878,15 +913,22 @@ pub fn search_account_blocking(
         // newest-first ordering used by the JMAP and Graph providers.
         let take_n = uids.len().min(SEARCH_PER_FOLDER_LIMIT);
         let recent_uids = &uids[uids.len() - take_n..];
-        let envelopes = match conn.fetch_envelopes_batch(recent_uids) {
-            Ok(e) => e,
+        let batch = match conn.fetch_envelopes_batch(recent_uids) {
+            Ok(b) => b,
             Err(e) => {
                 log::warn!("IMAP search: envelope fetch in {} failed: {}", path, e);
                 continue;
             }
         };
+        if !batch.failed_uids.is_empty() {
+            log::warn!(
+                "IMAP search: {} messages in {} could not be read",
+                batch.failed_uids.len(),
+                path
+            );
+        }
 
-        for env in envelopes {
+        for env in batch.envelopes {
             if hits.len() >= SEARCH_TOTAL_LIMIT {
                 break;
             }
@@ -1132,6 +1174,74 @@ mod mailbox_selectability_tests {
 }
 
 #[cfg(test)]
+mod bridge_envelope_regression {
+    use super::parse_envelope_headers;
+
+    /// The response shape that broke Proton Bridge sync: `()` where RFC 3501 §9
+    /// requires `NIL` for an address field with no addresses. Pinning it here
+    /// documents *why* [`super::ENVELOPE_FETCH_SPEC`] avoids `ENVELOPE` — if a
+    /// future `imap-proto` accepts this, the workaround can go.
+    #[test]
+    fn imap_proto_still_rejects_an_empty_address_list() {
+        const WITH_NIL: &[u8] = b"* 1 FETCH (UID 1 ENVELOPE (\"Mon, 17 Nov 2008 17:29:20 +0100\" \
+\"s\" ((\"A\" NIL \"a\" \"x.se\")) ((\"A\" NIL \"a\" \"x.se\")) ((\"A\" NIL \"a\" \"x.se\")) \
+NIL NIL NIL NIL \"<m@x.se>\") FLAGS (\\Seen) RFC822.SIZE 9236)\r\n";
+        const WITH_EMPTY_LIST: &[u8] =
+            b"* 1 FETCH (UID 1 ENVELOPE (\"Mon, 17 Nov 2008 17:29:20 +0100\" \
+\"s\" ((\"A\" NIL \"a\" \"x.se\")) ((\"A\" NIL \"a\" \"x.se\")) ((\"A\" NIL \"a\" \"x.se\")) \
+() NIL NIL NIL \"<m@x.se>\") FLAGS (\\Seen) RFC822.SIZE 9236)\r\n";
+
+        assert!(imap_proto::parse_response(WITH_NIL).is_ok());
+        assert!(
+            imap_proto::parse_response(WITH_EMPTY_LIST).is_err(),
+            "imap-proto now accepts `()`; ENVELOPE_FETCH_SPEC may be able to use ENVELOPE again"
+        );
+    }
+
+    /// The same message, read the way chithi reads it now.
+    #[test]
+    fn headers_survive_what_the_envelope_parser_could_not() {
+        let env = parse_envelope_headers(
+            b"Subject: =?utf-8?q?L=C3=A4rartr=C3=A4ff_hos_Informator?=\r\n\
+From: \"Ola Skoog\" <Ola.Skoog@informator.se>\r\n\
+To: undisclosed-recipients:;\r\n\
+Date: Mon, 17 Nov 2008 17:29:20 +0100\r\n\
+Message-ID: <AD0E2B98@se-exh01.informator.ad>\r\n\r\n",
+        );
+
+        assert_eq!(env.subject.as_deref(), Some("Lärarträff hos Informator"));
+        assert_eq!(env.from_name.as_deref(), Some("Ola Skoog"));
+        assert_eq!(env.from_email.as_deref(), Some("Ola.Skoog@informator.se"));
+        assert_eq!(env.date.as_deref(), Some("Mon, 17 Nov 2008 17:29:20 +0100"));
+        assert_eq!(
+            env.message_id.as_deref(),
+            Some("<AD0E2B98@se-exh01.informator.ad>")
+        );
+        // A group with no members contributes no recipients, which is exactly
+        // the case Bridge renders as `()`.
+        assert_eq!(env.to_addresses, "[]");
+        assert_eq!(env.cc_addresses, "[]");
+    }
+
+    #[test]
+    fn recipient_lists_keep_display_names_and_group_members() {
+        let env = parse_envelope_headers(
+            b"To: \"Lars Delhage\" <lasse@nohup.se>, bare@example.org\r\n\
+Cc: friends: a@x.se, \"B\" <b@x.se>;\r\n\r\n",
+        );
+
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Lars Delhage","email":"lasse@nohup.se"},{"name":null,"email":"bare@example.org"}]"#
+        );
+        assert_eq!(
+            env.cc_addresses,
+            r#"[{"name":null,"email":"a@x.se"},{"name":"B","email":"b@x.se"}]"#
+        );
+    }
+}
+
+#[cfg(test)]
 mod flag_to_wire_tests {
     use super::flag_to_wire;
 
@@ -1209,48 +1319,69 @@ fn extract_msgids(value: &str) -> Vec<String> {
     out
 }
 
-/// Split a `BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)]` block into
-/// `(in_reply_to, references)`, applying RFC 5322 §2.2.3 unfolding so
-/// folded continuation lines don't split a single id in half.
-fn parse_threading_headers(bytes: &[u8]) -> (Option<String>, Vec<String>) {
-    let raw = String::from_utf8_lossy(bytes);
-    // Unfold: a CRLF followed by WSP is part of the same header value.
-    let unfolded = raw
-        .replace("\r\n ", " ")
-        .replace("\r\n\t", " ")
-        .replace("\n ", " ")
-        .replace("\n\t", " ");
-
-    let mut in_reply_to: Option<String> = None;
-    let mut references: Vec<String> = Vec::new();
-    for line in unfolded.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name_lc = name.trim().to_ascii_lowercase();
-        if name_lc == "references" {
-            references = extract_msgids(value);
-        } else if name_lc == "in-reply-to" && in_reply_to.is_none() {
-            in_reply_to = extract_msgids(value).into_iter().next();
-        }
-    }
-    (in_reply_to, references)
+/// The envelope fields chithi stores, recovered from a message's headers
+/// rather than from the server's `ENVELOPE` structure. See
+/// [`ENVELOPE_FETCH_SPEC`] for why.
+#[derive(Default)]
+struct HeaderEnvelope {
+    subject: Option<String>,
+    from_name: Option<String>,
+    from_email: Option<String>,
+    to_addresses: String,
+    cc_addresses: String,
+    date: Option<String>,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Vec<String>,
 }
 
-/// Decode a potentially MIME-encoded IMAP string to a Rust String.
-/// Handles =?charset?encoding?text?= encoded words (RFC 2047).
-fn decode_imap_str(s: &[u8]) -> String {
-    let raw = String::from_utf8_lossy(s);
-    if raw.contains("=?") {
-        // Use mailparse to decode by wrapping in a fake header
-        let fake = format!("Subject: {}\r\n", raw);
-        match mailparse::parse_header(fake.as_bytes()) {
-            Ok((header, _)) => header.get_value(),
-            Err(_) => raw.to_string(),
+/// Parse a `BODY.PEEK[HEADER.FIELDS (...)]` block into the fields chithi
+/// stores. `mailparse::parse_headers` applies RFC 5322 §2.2.3 unfolding and
+/// RFC 2047 decoding, so folded continuation lines don't split a message id in
+/// half and encoded-words arrive already decoded.
+fn parse_envelope_headers(bytes: &[u8]) -> HeaderEnvelope {
+    let Ok((headers, _)) = mailparse::parse_headers(bytes) else {
+        return HeaderEnvelope {
+            to_addresses: "[]".to_string(),
+            cc_addresses: "[]".to_string(),
+            ..Default::default()
+        };
+    };
+
+    let mut env = HeaderEnvelope::default();
+    let mut from: Option<&mailparse::MailHeader<'_>> = None;
+    let mut to: Option<&mailparse::MailHeader<'_>> = None;
+    let mut cc: Option<&mailparse::MailHeader<'_>> = None;
+
+    for header in &headers {
+        // Only the first occurrence of each field counts (RFC 5322 §3.6
+        // allows at most one, but malformed mail does repeat them).
+        match header.get_key_ref().to_ascii_lowercase().as_str() {
+            "subject" if env.subject.is_none() => env.subject = Some(header.get_value()),
+            "date" if env.date.is_none() => env.date = Some(header.get_value()),
+            "message-id" if env.message_id.is_none() => {
+                env.message_id = extract_msgids(&header.get_value()).into_iter().next();
+            }
+            "in-reply-to" if env.in_reply_to.is_none() => {
+                env.in_reply_to = extract_msgids(&header.get_value()).into_iter().next();
+            }
+            "references" if env.references.is_empty() => {
+                env.references = extract_msgids(&header.get_value());
+            }
+            "from" if from.is_none() => from = Some(header),
+            "to" if to.is_none() => to = Some(header),
+            "cc" if cc.is_none() => cc = Some(header),
+            _ => {}
         }
-    } else {
-        raw.to_string()
     }
+
+    if let Some(first) = from.and_then(|h| header_addresses(h).into_iter().next()) {
+        env.from_name = first.name;
+        env.from_email = Some(first.email);
+    }
+    env.to_addresses = addresses_to_json(to);
+    env.cc_addresses = addresses_to_json(cc);
+    env
 }
 
 #[derive(serde::Serialize)]
@@ -1259,25 +1390,219 @@ struct AddrJson {
     email: String,
 }
 
-/// Convert IMAP address list to JSON string.
-fn addresses_to_json(addrs: Option<&[imap_proto::types::Address<'_>]>) -> String {
-    let list: Vec<AddrJson> = addrs
-        .unwrap_or(&[])
-        .iter()
-        .map(|a| {
-            let email = match (a.mailbox.as_ref(), a.host.as_ref()) {
-                (Some(mb), Some(host)) => {
-                    format!("{}@{}", decode_imap_str(mb), decode_imap_str(host))
-                }
-                (Some(mb), None) => decode_imap_str(mb),
-                _ => String::new(),
-            };
-            AddrJson {
-                name: a.name.as_ref().map(|n| decode_imap_str(n)),
-                email,
+/// Split an address header value on the commas that actually separate
+/// mailboxes — not those inside a quoted display name (`"Delhage, Lars"`), an
+/// angle-bracketed address, an RFC 5322 group (`friends: a@x, b@x;`), or a
+/// parenthesized comment (`John Doe (Sales, West) <john@x.se>`). RFC 5322
+/// §3.2.2 comments nest and carry their own quoted-pair escapes, distinct from
+/// a quoted string's.
+fn split_address_list(value: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut start, mut quoted, mut escaped, mut angle, mut group) =
+        (0, false, false, false, false);
+    let mut comment_depth: u32 = 0;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => quoted = !quoted,
+            '(' if !quoted => comment_depth += 1,
+            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
+            '<' if !quoted && comment_depth == 0 => angle = true,
+            '>' if !quoted && comment_depth == 0 => angle = false,
+            ':' if !quoted && !angle && comment_depth == 0 => group = true,
+            ';' if !quoted && !angle && comment_depth == 0 => group = false,
+            ',' if !quoted && !angle && !group && comment_depth == 0 => {
+                items.push(&value[start..i]);
+                start = i + c.len_utf8();
             }
-        })
-        .collect();
+            _ => {}
+        }
+    }
+    items.push(&value[start..]);
+    items
+}
+
+/// Flatten one address header into the `{name, email}` shape chithi stores.
+///
+/// Parsed one mailbox at a time on purpose: `mailparse::addrparse` rejects the
+/// *entire* list if any element lacks an `@`, which would drop every valid
+/// recipient alongside the bad one. The server-side `ENVELOPE` parse this
+/// replaced was per-address, so match that — a malformed element costs only
+/// itself.
+///
+/// RFC 5322 group syntax (`To: undisclosed-recipients:;`) contributes its
+/// members and nothing for the group name itself.
+fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
+    // The whole-header parser applies RFC 2047 decoding and RFC 5322 syntax
+    // (quoting, comments, groups) together, correctly -- it can't mistake a
+    // comma a decoded encoded-word legally contains
+    // (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) for a separator,
+    // because it decodes and splits in one pass. It fails outright on one
+    // malformed element (missing `@`), which the fallback below handles by
+    // parsing one address at a time so a bad element costs only itself -- but
+    // a stray empty element between two commas doesn't make it fail, it makes
+    // it fold the empty element into its neighbor's address (e.g. ", b@x.se"),
+    // so a plain `is_ok()` check isn't enough; the addresses it produced need
+    // to look sane too.
+    if let Ok(parsed) = mailparse::addrparse_header(header) {
+        let addrs = flatten_addrs(&parsed);
+        if addrs.iter().all(|a| is_clean_email(&a.email)) {
+            return addrs;
+        }
+    }
+
+    // The fallback must split *before* decoding: an encoded word never
+    // contains a literal comma (its `=2C`/base64 payload is plain ASCII
+    // text, not one), so splitting the raw value can't be fooled by a comma
+    // that only appears after RFC 2047 decoding -- unlike splitting
+    // `get_value()`, which already decoded it.
+    let raw = unfold_header_value(header.get_value_raw());
+    let mut out = Vec::new();
+    for item in split_address_list(&raw) {
+        if item.trim().is_empty() {
+            continue;
+        }
+        out.extend(parse_address_item(item));
+    }
+    out
+}
+
+/// Unfold a raw header value per RFC 5322 §2.2.3: a line break immediately
+/// followed by whitespace collapses (the whitespace itself remains and
+/// supplies the word boundary); a bare line break gets a space in its place
+/// so words on either side don't glue together. Runs before RFC 2047
+/// decoding, so it only ever sees plain structural bytes -- an encoded word
+/// is pure ASCII and contains no line breaks of its own.
+fn unfold_header_value(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            '\n' => {
+                if !matches!(chars.peek(), Some(' ') | Some('\t')) {
+                    out.push(' ');
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Parse one *raw, undecoded* address-list element (as isolated by
+/// [`split_address_list`] on the raw header value), recovering as much as
+/// possible on failure.
+///
+/// Goes through [`addrparse_raw_item`] rather than [`mailparse::addrparse`]
+/// directly so decoding and address-syntax parsing happen together, the same
+/// way [`mailparse::addrparse_header`] does it for the whole header: a
+/// decoded encoded word becomes one atomic token there, so a comma it
+/// introduces (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) can't be
+/// mistaken for a separator. Decoding the item to a plain `String` first and
+/// handing that to `addrparse` would lose that protection -- `addrparse`
+/// treats its input as literal text, so the now-literal comma would be
+/// re-split on exactly as if it had appeared in the original header.
+///
+/// A malformed group (`"friends: a@x.se, bogus;"`) is one element by
+/// `split_address_list`'s reckoning — it doesn't split on commas inside a
+/// group — so `addrparse_header` rejects the whole thing over the one bad
+/// member, the same all-or-nothing loss the per-item fallback exists to
+/// avoid, one level deeper. On that failure, split the group's own member
+/// list and recover members individually.
+fn parse_address_item(item: &str) -> Vec<AddrJson> {
+    if let Ok(parsed) = addrparse_raw_item(item) {
+        return flatten_addrs(&parsed);
+    }
+    let trimmed = item.trim();
+    let Some(colon) = find_group_colon(trimmed) else {
+        return Vec::new();
+    };
+    let inner = trimmed[colon + 1..].trim().trim_end_matches(';');
+    let mut out = Vec::new();
+    for member in split_address_list(inner) {
+        if member.trim().is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = addrparse_raw_item(member) {
+            out.extend(flatten_addrs(&parsed));
+        }
+    }
+    out
+}
+
+/// Decode and parse one raw (undecoded) address-list element as a mailbox.
+/// Wraps `item` as the value of a throwaway header so [`mailparse`]'s own
+/// `addrparse_header` — which decodes RFC 2047 encoded words and parses
+/// RFC 5322 address syntax in the same pass — does the work, instead of
+/// decoding and parsing as two separate steps.
+fn addrparse_raw_item(
+    item: &str,
+) -> std::result::Result<mailparse::MailAddrList, mailparse::MailParseError> {
+    let synthetic = format!("X-Item:{}\n", item);
+    let (header, _) = mailparse::parse_header(synthetic.as_bytes())?;
+    mailparse::addrparse_header(&header)
+}
+
+/// Index of the `:` that introduces a group's member list, ignoring any `:`
+/// inside quotes, comments, or an angle-addr — mirrors the state
+/// [`split_address_list`] tracks for the same character.
+fn find_group_colon(value: &str) -> Option<usize> {
+    let (mut quoted, mut escaped, mut angle) = (false, false, false);
+    let mut comment_depth: u32 = 0;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => quoted = !quoted,
+            '(' if !quoted => comment_depth += 1,
+            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
+            '<' if !quoted && comment_depth == 0 => angle = true,
+            '>' if !quoted && comment_depth == 0 => angle = false,
+            ':' if !quoted && !angle && comment_depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `email` looks like a real address rather than something
+/// `addrparse_header` swallowed a stray list element into.
+fn is_clean_email(email: &str) -> bool {
+    !email.is_empty() && email == email.trim() && !email.contains(',') && !email.contains(';')
+}
+
+fn flatten_addrs(list: &mailparse::MailAddrList) -> Vec<AddrJson> {
+    use mailparse::MailAddr;
+
+    let mut out = Vec::new();
+    for addr in list.iter() {
+        match addr {
+            MailAddr::Single(s) => out.push(AddrJson {
+                name: s.display_name.clone(),
+                email: s.addr.clone(),
+            }),
+            MailAddr::Group(g) => out.extend(g.addrs.iter().map(|s| AddrJson {
+                name: s.display_name.clone(),
+                email: s.addr.clone(),
+            })),
+        }
+    }
+    out
+}
+
+/// Serialize one address header to the JSON array stored in
+/// `messages.to_addresses` / `messages.cc_addresses`.
+fn addresses_to_json(header: Option<&mailparse::MailHeader<'_>>) -> String {
+    let list = header.map(header_addresses).unwrap_or_default();
     serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -1316,38 +1641,164 @@ mod tests {
     #[test]
     fn parse_threading_headers_extracts_both() {
         let bytes = b"References: <root@h> <mid@h>\r\nIn-Reply-To: <mid@h>\r\n\r\n";
-        let (irt, refs) = super::parse_threading_headers(bytes);
-        assert_eq!(irt.as_deref(), Some("<mid@h>"));
-        assert_eq!(refs, vec!["<root@h>".to_string(), "<mid@h>".to_string()]);
+        let env = super::parse_envelope_headers(bytes);
+        assert_eq!(env.in_reply_to.as_deref(), Some("<mid@h>"));
+        assert_eq!(
+            env.references,
+            vec!["<root@h>".to_string(), "<mid@h>".to_string()]
+        );
     }
 
     #[test]
     fn parse_threading_headers_unfolds_continuations() {
         let bytes = b"References: <root@h>\r\n <mid@h>\r\n\r\n";
-        let (_, refs) = super::parse_threading_headers(bytes);
-        assert_eq!(refs, vec!["<root@h>".to_string(), "<mid@h>".to_string()]);
+        let env = super::parse_envelope_headers(bytes);
+        assert_eq!(
+            env.references,
+            vec!["<root@h>".to_string(), "<mid@h>".to_string()]
+        );
     }
 
     #[test]
     fn parse_threading_headers_handles_only_references() {
         let bytes = b"References: <root@h>\r\n\r\n";
-        let (irt, refs) = super::parse_threading_headers(bytes);
-        assert!(irt.is_none());
-        assert_eq!(refs, vec!["<root@h>".to_string()]);
+        let env = super::parse_envelope_headers(bytes);
+        assert!(env.in_reply_to.is_none());
+        assert_eq!(env.references, vec!["<root@h>".to_string()]);
     }
 
     #[test]
     fn parse_threading_headers_normalizes_whitespace() {
         // Server emits a leading space inside the bracketed id.
         let bytes = b"In-Reply-To:  < mid@h >\r\n\r\n";
-        let (irt, _) = super::parse_threading_headers(bytes);
-        assert_eq!(irt.as_deref(), Some("<mid@h>"));
+        let env = super::parse_envelope_headers(bytes);
+        assert_eq!(env.in_reply_to.as_deref(), Some("<mid@h>"));
     }
 
     #[test]
     fn parse_threading_headers_empty_block() {
-        let (irt, refs) = super::parse_threading_headers(b"");
-        assert!(irt.is_none());
-        assert!(refs.is_empty());
+        let env = super::parse_envelope_headers(b"");
+        assert!(env.in_reply_to.is_none());
+        assert!(env.references.is_empty());
+        assert_eq!(env.to_addresses, "[]");
+        assert_eq!(env.cc_addresses, "[]");
+    }
+}
+
+#[cfg(test)]
+mod addr_edge_cases {
+    use super::parse_envelope_headers;
+
+    #[test]
+    fn one_malformed_recipient_does_not_drop_the_rest() {
+        let env = parse_envelope_headers(b"To: valid@x.se, bogus\r\n\r\n");
+        assert_eq!(env.to_addresses, r#"[{"name":null,"email":"valid@x.se"}]"#);
+    }
+
+    #[test]
+    fn empty_list_elements_are_skipped() {
+        let env = parse_envelope_headers(b"To: \"A\" <a@x.se>, , b@x.se\r\n\r\n");
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"A","email":"a@x.se"},{"name":null,"email":"b@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_comma_inside_a_quoted_display_name_is_not_a_separator() {
+        let env = parse_envelope_headers(b"To: \"Delhage, Lars\" <lasse@nohup.se>, b@x.se\r\n\r\n");
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Delhage, Lars","email":"lasse@nohup.se"},{"name":null,"email":"b@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_group_stays_one_element() {
+        let env = parse_envelope_headers(b"Cc: friends: a@x.se, \"B\" <b@x.se>;, c@x.se\r\n\r\n");
+        assert_eq!(
+            env.cc_addresses,
+            r#"[{"name":null,"email":"a@x.se"},{"name":"B","email":"b@x.se"},{"name":null,"email":"c@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_member_costs_only_itself_inside_a_group() {
+        let env = parse_envelope_headers(b"Cc: friends: a@x.se, bogus;, c@x.se\r\n\r\n");
+        assert_eq!(
+            env.cc_addresses,
+            r#"[{"name":null,"email":"a@x.se"},{"name":null,"email":"c@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_sibling_does_not_corrupt_an_encoded_display_name() {
+        // "bogus" forces the fallback path. Before it split the *decoded*
+        // header value, the comma inside "Doe, John" (only present after
+        // decoding "=?UTF-8?Q?Doe=2C_John?=") would be mistaken for a list
+        // separator, truncating the name to "John".
+        let env = parse_envelope_headers(
+            b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, bogus, jane@x.se\r\n\r\n",
+        );
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_sender_without_a_routable_address_yields_none() {
+        let env = parse_envelope_headers(b"From: root\r\n\r\n");
+        assert!(env.from_email.is_none());
+    }
+
+    #[test]
+    fn a_comma_inside_a_parenthesized_comment_is_not_a_separator() {
+        let env = parse_envelope_headers(
+            b"To: John Doe (Sales, West) <john@example.com>, jane@example.com\r\n\r\n",
+        );
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"John Doe","email":"john@example.com"},{"name":null,"email":"jane@example.com"}]"#
+        );
+    }
+
+    // The next two exercise `split_address_list` directly rather than through
+    // `parse_envelope_headers`: `mailparse::addrparse` doesn't itself nest
+    // comments or honor a quoted-pair escape inside one, so asserting a clean
+    // display name past that point would pin mailparse's behavior, not
+    // chithi's. What chithi controls is not splitting at the wrong comma.
+
+    #[test]
+    fn nested_comments_keep_the_address_as_one_item() {
+        let items = super::split_address_list("A (outer (inner) still outer) <a@x.se>, b@x.se");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trim(), "A (outer (inner) still outer) <a@x.se>");
+        assert_eq!(items[1].trim(), "b@x.se");
+    }
+
+    #[test]
+    fn an_escaped_paren_inside_a_comment_does_not_close_it_early() {
+        // "\)" is a quoted-pair, a literal ")" character, not the comment's
+        // real close -- which is the *next* ")".
+        let items = super::split_address_list("A (note: \\) still open) <a@x.se>, b@x.se");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trim(), "A (note: \\) still open) <a@x.se>");
+        assert_eq!(items[1].trim(), "b@x.se");
+    }
+
+    #[test]
+    fn an_encoded_word_that_decodes_to_a_comma_keeps_its_whole_display_name() {
+        // Decoded, "=?UTF-8?Q?Doe=2C_John?=" is "Doe, John" -- an unquoted
+        // comma that only exists after RFC 2047 decoding. Splitting on the
+        // already-decoded value would mistake it for a separator and
+        // truncate the name to "John"; the whole-header parser decodes and
+        // parses together, so it isn't fooled.
+        let env =
+            parse_envelope_headers(b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, jane@x.se\r\n\r\n");
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#
+        );
     }
 }

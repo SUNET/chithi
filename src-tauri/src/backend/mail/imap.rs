@@ -186,6 +186,18 @@ pub(super) async fn prefetch_pipeline(
                                     folder_path,
                                     e
                                 );
+                                // A poisoned connection would fail every
+                                // remaining folder too. Bail rather than
+                                // reconnect -- prefetch is best-effort and
+                                // unfetched messages are picked up again next
+                                // cycle, so nothing here is lost.
+                                if conn.is_poisoned() {
+                                    log::warn!(
+                                        "Prefetch[{}]: stopping, IMAP stream desynchronized",
+                                        thread_idx
+                                    );
+                                    return Ok(count);
+                                }
                                 continue;
                             }
 
@@ -207,6 +219,17 @@ pub(super) async fn prefetch_pipeline(
                                             thread_idx,
                                             e
                                         );
+                                        // See the select_folder poison check
+                                        // above: bail rather than reconnect,
+                                        // prefetch retries unfetched messages
+                                        // next cycle.
+                                        if conn.is_poisoned() {
+                                            log::warn!(
+                                                "Prefetch[{}]: stopping, IMAP stream desynchronized",
+                                                thread_idx
+                                            );
+                                            return Ok(count);
+                                        }
                                         continue;
                                     }
                                 };
@@ -366,6 +389,7 @@ impl MailBackend for ImapMailBackend {
                 &account_id,
                 &mut conn_imap,
                 &folder_clone,
+                &imap_config,
             )?;
             conn_imap.logout();
             Ok::<u32, Error>(count)
@@ -485,7 +509,13 @@ pub(crate) async fn sync_folder_quiet(
     let folder_path = folder_path.to_string();
     tokio::task::spawn_blocking(move || {
         let mut conn = ImapConnection::connect(&imap_config)?;
-        crate::mail::sync::sync_folder_envelopes_public(&db, &account_id, &mut conn, &folder_path)?;
+        crate::mail::sync::sync_folder_envelopes_public(
+            &db,
+            &account_id,
+            &mut conn,
+            &folder_path,
+            &imap_config,
+        )?;
         conn.logout();
         events.publish(ApplicationEvent::FoldersChanged(account_id.clone()));
         events.publish(ApplicationEvent::MessagesChanged(account_id));
