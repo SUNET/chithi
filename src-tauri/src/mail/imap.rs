@@ -113,36 +113,55 @@ const IMAP_PARSE_LOG_LIMIT: usize = 2048;
 /// The payload is a slice of a live server response, so it can carry message
 /// subjects and addresses. That is the point — without it a parser failure is
 /// unattributable — but it does mean `chithi.log` holds mail data in the clear,
-/// so keep it capped and never log an authentication challenge.
+/// so keep it capped and never log an authentication challenge. A `BODY[]`
+/// fetch (the one path that pulls a full message, not just headers) gets its
+/// payload text withheld entirely — the byte count is enough to see that a
+/// fetch failed, and full message content has no business sitting in a log
+/// file users may attach to bug reports.
 fn log_imap_parse_payload(context: &str, e: &imap::Error) {
     use imap::error::ParseError;
 
     let imap::Error::Parse(parse_err) = e else {
         return;
     };
+    let redacted = is_full_body_fetch(context);
     match parse_err {
         ParseError::Invalid(bytes) => log::error!(
-            "{}: parser rejected {} bytes of server response: \"{}\"",
+            "{}: parser rejected {} bytes of server response{}",
             context,
             bytes.len(),
-            escape_for_log(bytes),
+            payload_suffix(bytes, redacted),
         ),
         ParseError::DataNotUtf8(bytes, utf8_err) => log::error!(
-            "{}: server sent {} bytes of non-UTF-8 data ({}): \"{}\"",
+            "{}: server sent {} bytes of non-UTF-8 data ({}){}",
             context,
             bytes.len(),
             utf8_err,
-            escape_for_log(bytes),
+            payload_suffix(bytes, redacted),
         ),
-        ParseError::Unexpected(text) => {
-            log::error!(
-                "{}: unexpected response: \"{}\"",
-                context,
-                text.escape_debug()
-            )
-        }
+        ParseError::Unexpected(text) => log::error!(
+            "{}: unexpected response{}",
+            context,
+            payload_suffix(text.as_bytes(), redacted),
+        ),
         // Authentication challenges can carry credentials — never log them.
         ParseError::Authentication(_, _) => {}
+    }
+}
+
+/// Whether `context` names a `BODY[]` fetch — the only command that returns a
+/// full message rather than headers/addresses/flags.
+fn is_full_body_fetch(context: &str) -> bool {
+    context.contains("BODY[]")
+}
+
+/// The `": \"...\""` piece appended after the byte count, or a redaction
+/// notice in its place when `redact` is set.
+fn payload_suffix(bytes: &[u8], redact: bool) -> String {
+    if redact {
+        " (message body, payload redacted)".to_string()
+    } else {
+        format!(": \"{}\"", escape_for_log(bytes))
     }
 }
 
@@ -1445,12 +1464,64 @@ fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
         if item.trim().is_empty() {
             continue;
         }
-        let Ok(parsed) = mailparse::addrparse(item) else {
-            continue;
-        };
-        out.extend(flatten_addrs(&parsed));
+        out.extend(parse_address_item(item));
     }
     out
+}
+
+/// Parse one address-list element (as isolated by [`split_address_list`]),
+/// recovering as much as possible on failure.
+///
+/// A malformed group (`"friends: a@x.se, bogus;"`) is one element by
+/// `split_address_list`'s reckoning — it doesn't split on commas inside a
+/// group — so `addrparse` rejects the whole thing over the one bad member,
+/// the same all-or-nothing loss the per-item fallback exists to avoid, one
+/// level deeper. On that failure, split the group's own member list and
+/// recover members individually.
+fn parse_address_item(item: &str) -> Vec<AddrJson> {
+    if let Ok(parsed) = mailparse::addrparse(item) {
+        return flatten_addrs(&parsed);
+    }
+    let trimmed = item.trim();
+    let Some(colon) = find_group_colon(trimmed) else {
+        return Vec::new();
+    };
+    let inner = trimmed[colon + 1..].trim().trim_end_matches(';');
+    let mut out = Vec::new();
+    for member in split_address_list(inner) {
+        if member.trim().is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = mailparse::addrparse(member) {
+            out.extend(flatten_addrs(&parsed));
+        }
+    }
+    out
+}
+
+/// Index of the `:` that introduces a group's member list, ignoring any `:`
+/// inside quotes, comments, or an angle-addr — mirrors the state
+/// [`split_address_list`] tracks for the same character.
+fn find_group_colon(value: &str) -> Option<usize> {
+    let (mut quoted, mut escaped, mut angle) = (false, false, false);
+    let mut comment_depth: u32 = 0;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => quoted = !quoted,
+            '(' if !quoted => comment_depth += 1,
+            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
+            '<' if !quoted && comment_depth == 0 => angle = true,
+            '>' if !quoted && comment_depth == 0 => angle = false,
+            ':' if !quoted && !angle && comment_depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether `email` looks like a real address rather than something
@@ -1598,6 +1669,15 @@ mod addr_edge_cases {
         assert_eq!(
             env.cc_addresses,
             r#"[{"name":null,"email":"a@x.se"},{"name":"B","email":"b@x.se"},{"name":null,"email":"c@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_member_costs_only_itself_inside_a_group() {
+        let env = parse_envelope_headers(b"Cc: friends: a@x.se, bogus;, c@x.se\r\n\r\n");
+        assert_eq!(
+            env.cc_addresses,
+            r#"[{"name":null,"email":"a@x.se"},{"name":null,"email":"c@x.se"}]"#
         );
     }
 
