@@ -574,26 +574,18 @@ impl ImapConnection {
 
         // 1. Copy messages to destination
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
-            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-        })?;
+        let copied = self.session.uid_copy(&uid_set, &quoted_dest);
+        self.checked(&format!("IMAP UID COPY to '{}'", dest_folder), copied)?;
         log::debug!("IMAP COPY to '{}' succeeded", dest_folder);
 
         // 2. Mark originals as deleted
-        self.session
-            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-            .map_err(|e| {
-                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
-                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
-            })?;
+        let stored = self.session.uid_store(&uid_set, "+FLAGS (\\Deleted)");
+        self.checked("IMAP UID STORE +FLAGS \\Deleted", stored)?;
         log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
 
         // 3. Expunge to permanently remove
-        self.session.expunge().map_err(|e| {
-            log::error!("IMAP EXPUNGE failed: {}", e);
-            Error::Imap(format!("EXPUNGE failed: {}", e))
-        })?;
+        let expunged = self.session.expunge();
+        self.checked("IMAP EXPUNGE", expunged)?;
         log::info!(
             "IMAP move complete: {} messages moved to '{}'",
             uids.len(),
@@ -619,19 +611,13 @@ impl ImapConnection {
         );
 
         // Store \Deleted flag
-        self.session
-            .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-            .map_err(|e| {
-                log::error!("IMAP UID STORE +FLAGS \\Deleted failed: {}", e);
-                Error::Imap(format!("STORE +FLAGS \\Deleted failed: {}", e))
-            })?;
+        let stored = self.session.uid_store(&uid_set, "+FLAGS (\\Deleted)");
+        self.checked("IMAP UID STORE +FLAGS \\Deleted", stored)?;
         log::debug!("IMAP marked {} messages as \\Deleted", uids.len());
 
         // Expunge
-        self.session.expunge().map_err(|e| {
-            log::error!("IMAP EXPUNGE failed: {}", e);
-            Error::Imap(format!("EXPUNGE failed: {}", e))
-        })?;
+        let expunged = self.session.expunge();
+        self.checked("IMAP EXPUNGE", expunged)?;
         log::info!("IMAP delete complete: {} messages expunged", uids.len());
 
         Ok(())
@@ -675,10 +661,8 @@ impl ImapConnection {
             &uid_set[..uid_set.len().min(80)]
         );
 
-        self.session.uid_store(&uid_set, &store_cmd).map_err(|e| {
-            log::error!("IMAP UID STORE {} failed: {}", store_cmd, e);
-            Error::Imap(format!("STORE {} failed: {}", store_cmd, e))
-        })?;
+        let stored = self.session.uid_store(&uid_set, &store_cmd);
+        self.checked(&format!("IMAP UID STORE {}", store_cmd), stored)?;
 
         log::info!(
             "IMAP flags updated: {} {} on {} messages",
@@ -694,9 +678,8 @@ impl ImapConnection {
     /// Uses .SILENT to suppress per-message FETCH responses, which can be
     /// very large on folders with many messages.
     pub fn mark_all_seen(&mut self) -> Result<()> {
-        self.session
-            .uid_store("1:*", "+FLAGS.SILENT (\\Seen)")
-            .map_err(|e| Error::Imap(format!("STORE +FLAGS.SILENT \\Seen failed: {}", e)))?;
+        let stored = self.session.uid_store("1:*", "+FLAGS.SILENT (\\Seen)");
+        self.checked("IMAP UID STORE +FLAGS.SILENT \\Seen", stored)?;
         Ok(())
     }
 
@@ -733,10 +716,8 @@ impl ImapConnection {
         );
 
         let quoted_dest = quote_mailbox_for_imap(dest_folder)?;
-        self.session.uid_copy(&uid_set, &quoted_dest).map_err(|e| {
-            log::error!("IMAP UID COPY to '{}' failed: {}", dest_folder, e);
-            Error::Imap(format!("COPY to '{}' failed: {}", dest_folder, e))
-        })?;
+        let copied = self.session.uid_copy(&uid_set, &quoted_dest);
+        self.checked(&format!("IMAP UID COPY to '{}'", dest_folder), copied)?;
 
         log::info!(
             "IMAP copy complete: {} messages copied to '{}'",
@@ -828,10 +809,8 @@ impl ImapConnection {
         // The query string carries user-provided search text; log only its
         // shape so debug output is safe to share.
         log::debug!("IMAP UID SEARCH (query_len={})", query.len());
-        let uids = self.session.uid_search(query).map_err(|e| {
-            log::error!("IMAP UID SEARCH failed: {}", e);
-            Error::Imap(e.to_string())
-        })?;
+        let searched = self.session.uid_search(query);
+        let uids = self.checked("IMAP UID SEARCH", searched)?;
         Ok(uids.into_iter().collect())
     }
 
@@ -1444,7 +1423,22 @@ fn split_address_list(value: &str) -> Vec<&str> {
 /// RFC 5322 group syntax (`To: undisclosed-recipients:;`) contributes its
 /// members and nothing for the group name itself.
 fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
-    use mailparse::MailAddr;
+    // The whole-header parser applies RFC 2047 decoding and RFC 5322 syntax
+    // (quoting, comments, groups) together, correctly -- unlike splitting on
+    // `get_value()` first, it can't mistake a comma a decoded encoded-word
+    // legally contains (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) for
+    // a separator. It fails outright on one malformed element (missing `@`),
+    // which the fallback below handles by parsing one address at a time so a
+    // bad element costs only itself -- but a stray empty element between two
+    // commas doesn't make it fail, it makes it fold the empty element into
+    // its neighbor's address (e.g. ", b@x.se"), so a plain `is_ok()` check
+    // isn't enough; the addresses it produced need to look sane too.
+    if let Ok(parsed) = mailparse::addrparse_header(header) {
+        let addrs = flatten_addrs(&parsed);
+        if addrs.iter().all(|a| is_clean_email(&a.email)) {
+            return addrs;
+        }
+    }
 
     let mut out = Vec::new();
     for item in split_address_list(&header.get_value()) {
@@ -1454,17 +1448,31 @@ fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
         let Ok(parsed) = mailparse::addrparse(item) else {
             continue;
         };
-        for addr in parsed.iter() {
-            match addr {
-                MailAddr::Single(s) => out.push(AddrJson {
-                    name: s.display_name.clone(),
-                    email: s.addr.clone(),
-                }),
-                MailAddr::Group(g) => out.extend(g.addrs.iter().map(|s| AddrJson {
-                    name: s.display_name.clone(),
-                    email: s.addr.clone(),
-                })),
-            }
+        out.extend(flatten_addrs(&parsed));
+    }
+    out
+}
+
+/// Whether `email` looks like a real address rather than something
+/// `addrparse_header` swallowed a stray list element into.
+fn is_clean_email(email: &str) -> bool {
+    !email.is_empty() && email == email.trim() && !email.contains(',') && !email.contains(';')
+}
+
+fn flatten_addrs(list: &mailparse::MailAddrList) -> Vec<AddrJson> {
+    use mailparse::MailAddr;
+
+    let mut out = Vec::new();
+    for addr in list.iter() {
+        match addr {
+            MailAddr::Single(s) => out.push(AddrJson {
+                name: s.display_name.clone(),
+                email: s.addr.clone(),
+            }),
+            MailAddr::Group(g) => out.extend(g.addrs.iter().map(|s| AddrJson {
+                name: s.display_name.clone(),
+                email: s.addr.clone(),
+            })),
         }
     }
     out
@@ -1632,5 +1640,20 @@ mod addr_edge_cases {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].trim(), "A (note: \\) still open) <a@x.se>");
         assert_eq!(items[1].trim(), "b@x.se");
+    }
+
+    #[test]
+    fn an_encoded_word_that_decodes_to_a_comma_keeps_its_whole_display_name() {
+        // Decoded, "=?UTF-8?Q?Doe=2C_John?=" is "Doe, John" -- an unquoted
+        // comma that only exists after RFC 2047 decoding. Splitting on the
+        // already-decoded value would mistake it for a separator and
+        // truncate the name to "John"; the whole-header parser decodes and
+        // parses together, so it isn't fooled.
+        let env =
+            parse_envelope_headers(b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, jane@x.se\r\n\r\n");
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#
+        );
     }
 }
