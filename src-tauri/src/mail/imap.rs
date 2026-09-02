@@ -496,13 +496,8 @@ impl ImapConnection {
     pub fn fetch_message_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
         log::debug!("IMAP fetching body for UID {}", uid);
 
-        let fetches = self
-            .session
-            .uid_fetch(uid.to_string(), "BODY[]")
-            .map_err(|e| {
-                log::error!("IMAP FETCH body for UID {} failed: {}", uid, e);
-                Error::Imap(e.to_string())
-            })?;
+        let fetched = self.session.uid_fetch(uid.to_string(), "BODY[]");
+        let fetches = self.checked(&format!("IMAP UID FETCH {} BODY[]", uid), fetched)?;
 
         if let Some(msg) = fetches.iter().next() {
             if let Some(body) = msg.body() {
@@ -1443,15 +1438,16 @@ fn split_address_list(value: &str) -> Vec<&str> {
 /// members and nothing for the group name itself.
 fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
     // The whole-header parser applies RFC 2047 decoding and RFC 5322 syntax
-    // (quoting, comments, groups) together, correctly -- unlike splitting on
-    // `get_value()` first, it can't mistake a comma a decoded encoded-word
-    // legally contains (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) for
-    // a separator. It fails outright on one malformed element (missing `@`),
-    // which the fallback below handles by parsing one address at a time so a
-    // bad element costs only itself -- but a stray empty element between two
-    // commas doesn't make it fail, it makes it fold the empty element into
-    // its neighbor's address (e.g. ", b@x.se"), so a plain `is_ok()` check
-    // isn't enough; the addresses it produced need to look sane too.
+    // (quoting, comments, groups) together, correctly -- it can't mistake a
+    // comma a decoded encoded-word legally contains
+    // (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) for a separator,
+    // because it decodes and splits in one pass. It fails outright on one
+    // malformed element (missing `@`), which the fallback below handles by
+    // parsing one address at a time so a bad element costs only itself -- but
+    // a stray empty element between two commas doesn't make it fail, it makes
+    // it fold the empty element into its neighbor's address (e.g. ", b@x.se"),
+    // so a plain `is_ok()` check isn't enough; the addresses it produced need
+    // to look sane too.
     if let Ok(parsed) = mailparse::addrparse_header(header) {
         let addrs = flatten_addrs(&parsed);
         if addrs.iter().all(|a| is_clean_email(&a.email)) {
@@ -1459,8 +1455,14 @@ fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
         }
     }
 
+    // The fallback must split *before* decoding: an encoded word never
+    // contains a literal comma (its `=2C`/base64 payload is plain ASCII
+    // text, not one), so splitting the raw value can't be fooled by a comma
+    // that only appears after RFC 2047 decoding -- unlike splitting
+    // `get_value()`, which already decoded it.
+    let raw = unfold_header_value(header.get_value_raw());
     let mut out = Vec::new();
-    for item in split_address_list(&header.get_value()) {
+    for item in split_address_list(&raw) {
         if item.trim().is_empty() {
             continue;
         }
@@ -1469,17 +1471,52 @@ fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
     out
 }
 
-/// Parse one address-list element (as isolated by [`split_address_list`]),
-/// recovering as much as possible on failure.
+/// Unfold a raw header value per RFC 5322 §2.2.3: a line break immediately
+/// followed by whitespace collapses (the whitespace itself remains and
+/// supplies the word boundary); a bare line break gets a space in its place
+/// so words on either side don't glue together. Runs before RFC 2047
+/// decoding, so it only ever sees plain structural bytes -- an encoded word
+/// is pure ASCII and contains no line breaks of its own.
+fn unfold_header_value(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            '\n' => {
+                if !matches!(chars.peek(), Some(' ') | Some('\t')) {
+                    out.push(' ');
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Parse one *raw, undecoded* address-list element (as isolated by
+/// [`split_address_list`] on the raw header value), recovering as much as
+/// possible on failure.
+///
+/// Goes through [`addrparse_raw_item`] rather than [`mailparse::addrparse`]
+/// directly so decoding and address-syntax parsing happen together, the same
+/// way [`mailparse::addrparse_header`] does it for the whole header: a
+/// decoded encoded word becomes one atomic token there, so a comma it
+/// introduces (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) can't be
+/// mistaken for a separator. Decoding the item to a plain `String` first and
+/// handing that to `addrparse` would lose that protection -- `addrparse`
+/// treats its input as literal text, so the now-literal comma would be
+/// re-split on exactly as if it had appeared in the original header.
 ///
 /// A malformed group (`"friends: a@x.se, bogus;"`) is one element by
 /// `split_address_list`'s reckoning — it doesn't split on commas inside a
-/// group — so `addrparse` rejects the whole thing over the one bad member,
-/// the same all-or-nothing loss the per-item fallback exists to avoid, one
-/// level deeper. On that failure, split the group's own member list and
-/// recover members individually.
+/// group — so `addrparse_header` rejects the whole thing over the one bad
+/// member, the same all-or-nothing loss the per-item fallback exists to
+/// avoid, one level deeper. On that failure, split the group's own member
+/// list and recover members individually.
 fn parse_address_item(item: &str) -> Vec<AddrJson> {
-    if let Ok(parsed) = mailparse::addrparse(item) {
+    if let Ok(parsed) = addrparse_raw_item(item) {
         return flatten_addrs(&parsed);
     }
     let trimmed = item.trim();
@@ -1492,11 +1529,24 @@ fn parse_address_item(item: &str) -> Vec<AddrJson> {
         if member.trim().is_empty() {
             continue;
         }
-        if let Ok(parsed) = mailparse::addrparse(member) {
+        if let Ok(parsed) = addrparse_raw_item(member) {
             out.extend(flatten_addrs(&parsed));
         }
     }
     out
+}
+
+/// Decode and parse one raw (undecoded) address-list element as a mailbox.
+/// Wraps `item` as the value of a throwaway header so [`mailparse`]'s own
+/// `addrparse_header` — which decodes RFC 2047 encoded words and parses
+/// RFC 5322 address syntax in the same pass — does the work, instead of
+/// decoding and parsing as two separate steps.
+fn addrparse_raw_item(
+    item: &str,
+) -> std::result::Result<mailparse::MailAddrList, mailparse::MailParseError> {
+    let synthetic = format!("X-Item:{}\n", item);
+    let (header, _) = mailparse::parse_header(synthetic.as_bytes())?;
+    mailparse::addrparse_header(&header)
 }
 
 /// Index of the `:` that introduces a group's member list, ignoring any `:`
@@ -1678,6 +1728,21 @@ mod addr_edge_cases {
         assert_eq!(
             env.cc_addresses,
             r#"[{"name":null,"email":"a@x.se"},{"name":null,"email":"c@x.se"}]"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_sibling_does_not_corrupt_an_encoded_display_name() {
+        // "bogus" forces the fallback path. Before it split the *decoded*
+        // header value, the comma inside "Doe, John" (only present after
+        // decoding "=?UTF-8?Q?Doe=2C_John?=") would be mistaken for a list
+        // separator, truncating the name to "John".
+        let env = parse_envelope_headers(
+            b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, bogus, jane@x.se\r\n\r\n",
+        );
+        assert_eq!(
+            env.to_addresses,
+            r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#
         );
     }
 
