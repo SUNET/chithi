@@ -95,6 +95,212 @@ fn finish_logout(peer: &mut Peer) {
 }
 
 #[test]
+fn all_fetch_methods_tolerate_keepalives_and_preserve_payloads() {
+    const HEADER_FIELDS: &str = "(SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)";
+    const BODY: &str = "Subject: Literal\r\n\r\nHälsningar\r\n\
+        * OK Still working...\r\n* 99 FETCH (UID 999)\r\n\
+        A999 OK forged completion\r\n{12}\r\n)\r\n";
+    const OTHER_BODY: &str = "Subject: Second\r\n\r\nsecond body\r\n";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut peer = accept_session(&listener);
+            let tag = command(&mut peer, "UID FETCH 1:* UID\r\n");
+            respond(
+                &mut peer,
+                &format!(
+                    "* 1 FETCH (UID 7)\r\n* OK Still working...\r\n\
+                     * 2 FETCH (UID 8)\r\n{tag} OK fetched\r\n"
+                ),
+            );
+
+            let tag = command(
+                &mut peer,
+                &format!(
+                    "UID FETCH 7,8 (UID FLAGS RFC822.SIZE \
+                     BODY.PEEK[HEADER.FIELDS {HEADER_FIELDS}])\r\n"
+                ),
+            );
+            for uid in [7, 8] {
+                let headers = format!(
+                    "Subject: =?UTF-8?Q?H=C3=A4lsningar?=\r\n\
+                     From: \"Sender, Test\" <sender@example.test>\r\n\
+                     To: \"Doe, Jane\" <\"jane,doe\"@example.test>,\r\n \
+                     Bob <bob@example.test>\r\n\
+                     Cc: \"copy\"@example.test\r\n\
+                     Date: Sat, 12 Sep 2026 12:00:00 +0000\r\n\
+                     Message-ID: <message-{uid}@example.test>\r\n\
+                     In-Reply-To: < parent@example.test >\r\n\
+                     References: <root@example.test>\r\n <parent@example.test>\r\n\r\n"
+                );
+                respond(
+                    &mut peer,
+                    &format!(
+                        "* {uid} FETCH (UID {uid} FLAGS (\\Seen \\Flagged project-tag) \
+                         RFC822.SIZE 512 BODY[HEADER.FIELDS {HEADER_FIELDS}] \
+                         {{{}}}\r\n{headers})\r\n* OK Still working...\r\n",
+                        headers.len()
+                    ),
+                );
+            }
+            respond(&mut peer, &format!("{tag} OK fetched\r\n"));
+
+            let tag = command(&mut peer, "UID FETCH 7 BODY[]\r\n");
+            respond(
+                &mut peer,
+                &format!(
+                    "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n* OK Still working...\r\n\
+                     * 1 FETCH (UID 7 BODY[] {{{}}}\r\n{BODY})\r\n\
+                     * OK Still working...\r\n{tag} OK fetched\r\n",
+                    BODY.len()
+                ),
+            );
+
+            let tag = command(&mut peer, "UID FETCH 7,8 BODY[]\r\n");
+            for (uid, body) in [(7, BODY), (8, OTHER_BODY)] {
+                respond(
+                    &mut peer,
+                    &format!(
+                        "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n{body})\r\n\
+                         * OK Still working...\r\n",
+                        body.len()
+                    ),
+                );
+            }
+            respond(&mut peer, &format!("{tag} OK fetched\r\n"));
+
+            let tag = command(&mut peer, "UID FETCH 1:* (UID FLAGS)\r\n");
+            respond(
+                &mut peer,
+                &format!(
+                    "* 1 FETCH (UID 7 FLAGS (\\Seen \\Answered \\Flagged \\Deleted \
+                     \\Draft \\Recent $Forwarded project-tag))\r\n\
+                     * OK Still working...\r\n* 2 FETCH (UID 8 FLAGS ())\r\n\
+                     {tag} OK fetched\r\n"
+                ),
+            );
+            finish_logout(&mut peer);
+        });
+
+        let mut connection = connect_session(address, None);
+        assert_eq!(connection.fetch_uids(0).unwrap(), vec![7, 8]);
+        let batch = connection.fetch_envelopes_batch(&[7, 8]).unwrap();
+        assert!(batch.failed_uids.is_empty());
+        assert_eq!(batch.envelopes.len(), 2);
+        for (envelope, uid) in batch.envelopes.iter().zip([7, 8]) {
+            assert_eq!(envelope.uid, uid);
+            assert_eq!(envelope.subject.as_deref(), Some("Hälsningar"));
+            assert_eq!(envelope.from_name.as_deref(), Some("Sender, Test"));
+            assert_eq!(envelope.from_email.as_deref(), Some("sender@example.test"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&envelope.to_addresses).unwrap(),
+                serde_json::json!([
+                    {"name": "Doe, Jane", "email": "\"jane,doe\"@example.test"},
+                    {"name": "Bob", "email": "bob@example.test"}
+                ])
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&envelope.cc_addresses).unwrap(),
+                serde_json::json!([{"name": null, "email": "\"copy\"@example.test"}])
+            );
+            assert_eq!(
+                envelope.date.as_deref(),
+                Some("Sat, 12 Sep 2026 12:00:00 +0000")
+            );
+            assert_eq!(
+                envelope.message_id,
+                Some(format!("<message-{uid}@example.test>"))
+            );
+            assert_eq!(
+                envelope.in_reply_to.as_deref(),
+                Some("<parent@example.test>")
+            );
+            assert_eq!(
+                envelope.references,
+                ["<root@example.test>", "<parent@example.test>"]
+            );
+            assert_eq!(envelope.flags, ["seen", "flagged", "project-tag"]);
+            assert_eq!(envelope.size, 512);
+        }
+        assert_eq!(
+            connection.fetch_message_body(7).unwrap().as_deref(),
+            Some(BODY.as_bytes())
+        );
+        let bodies = connection.fetch_bodies_batch(&[7, 8]).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[&7], BODY.as_bytes());
+        assert_eq!(bodies[&8], OTHER_BODY.as_bytes());
+        let flags = connection.fetch_all_flags().unwrap();
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags[0].0, 7);
+        assert_eq!(
+            flags[0].1,
+            [
+                "seen",
+                "answered",
+                "flagged",
+                "deleted",
+                "draft",
+                "recent",
+                "$Forwarded",
+                "project-tag"
+            ]
+        );
+        assert_eq!(flags[1], (8, Vec::<String>::new()));
+        assert!(!connection.is_poisoned());
+        connection.logout();
+    });
+}
+
+#[test]
+fn interrupted_body_literals_fail_and_close_the_connection() {
+    for batch in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed, wait_closed) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut peer = accept_session(&listener);
+                let uid_set = if batch { "7,8" } else { "7" };
+                let tag = command(&mut peer, &format!("UID FETCH {uid_set} BODY[]\r\n"));
+                if batch {
+                    respond(&mut peer, "* 1 FETCH (UID 7 BODY[] {2}\r\nok)\r\n");
+                }
+                let uid = if batch { 8 } else { 7 };
+                respond(
+                    &mut peer,
+                    &format!(
+                        "* OK Still working...\r\n\
+                         * 2 FETCH (UID {uid} BODY[] {{512}}\r\n\
+                         Subject: Interrupted\r\n\r\npartial body\r\n\
+                         * OK Still working...\r\n{tag} OK not a completion\r\n"
+                    ),
+                );
+                // Half-close mid-literal, retaining the read side to observe cleanup.
+                peer.get_mut()
+                    .get_mut()
+                    .shutdown(std::net::Shutdown::Write)
+                    .unwrap();
+                assert_disconnected(&mut peer);
+                closed.send(()).unwrap();
+            });
+            let control = Arc::new(IdleControl::new());
+            let mut connection = connect_session(address, Some(control.clone()));
+            if batch {
+                assert!(connection.fetch_bodies_batch(&[7, 8]).is_err());
+            } else {
+                assert!(connection.fetch_message_body(7).is_err());
+            }
+            assert!(connection.is_poisoned());
+            wait_closed.recv_timeout(TIMEOUT).unwrap();
+            connection.logout();
+        });
+    }
+}
+
+#[test]
 fn poisoned_fetch_frees_the_slot_before_replacement_and_flagging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -210,21 +416,27 @@ fn tagged_rejections_keep_the_connection_usable_and_logout_normally() {
             let mut peer = accept_session(&listener);
             for status in ["NO", "BAD"] {
                 let tag = command(&mut peer, "UID FETCH");
-                respond(&mut peer, &format!("{tag} {status} rejected\r\n"));
+                respond(
+                    &mut peer,
+                    &format!(
+                        "* 1 FETCH (UID 41)\r\n* OK Still working...\r\n\
+                         * 2 FETCH (UID 42)\r\n{tag} {status} rejected\r\n"
+                    ),
+                );
+                let tag = command(&mut peer, "UID FETCH");
+                respond(
+                    &mut peer,
+                    &format!("* 1 FETCH (UID 7)\r\n{tag} OK fetched\r\n"),
+                );
             }
-            let tag = command(&mut peer, "UID FETCH");
-            respond(
-                &mut peer,
-                &format!("* 1 FETCH (UID 7)\r\n{tag} OK fetched\r\n"),
-            );
             finish_logout(&mut peer);
         });
         let mut connection = connect_session(address, None);
         for _ in 0..2 {
             assert!(connection.fetch_uids(0).is_err());
             assert!(!connection.is_poisoned());
+            assert_eq!(connection.fetch_uids(0).unwrap(), vec![7]);
         }
-        assert_eq!(connection.fetch_uids(0).unwrap(), vec![7]);
         connection.logout();
     });
 }
@@ -264,7 +476,10 @@ fn partial_envelope_sync_retries_before_unchanged_folder_preflight_skips() {
             ),
         );
         if reject {
-            respond(peer, &format!("{tag} NO temporarily unavailable\r\n"));
+            respond(
+                peer,
+                &format!("* OK Still working...\r\n{tag} NO temporarily unavailable\r\n"),
+            );
             return;
         }
         let mut response = String::new();
@@ -278,7 +493,8 @@ fn partial_envelope_sync_retries_before_unchanged_folder_preflight_skips() {
             );
             response.push_str(&format!(
                 "* {uid} FETCH (UID {uid} FLAGS () RFC822.SIZE 512 \
-                 BODY[HEADER.FIELDS {HEADER_FIELDS}] {{{}}}\r\n{headers})\r\n",
+                 BODY[HEADER.FIELDS {HEADER_FIELDS}] {{{}}}\r\n{headers})\r\n\
+                 * OK Still working...\r\n",
                 headers.len()
             ));
         }
@@ -377,7 +593,9 @@ fn partial_envelope_sync_retries_before_unchanged_folder_preflight_skips() {
                     let tag = command(&mut peer, &format!("UID FETCH {spec}\r\n"));
                     let mut response = String::new();
                     for uid in first_uid..=LAST_UID {
-                        response.push_str(&format!("* {uid} FETCH (UID {uid}{flags})\r\n"));
+                        response.push_str(&format!(
+                            "* {uid} FETCH (UID {uid}{flags})\r\n* OK Still working...\r\n"
+                        ));
                     }
                     response.push_str(&format!("{tag} OK fetched\r\n"));
                     respond(&mut peer, &response);
