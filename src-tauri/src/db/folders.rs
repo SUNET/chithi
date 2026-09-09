@@ -225,6 +225,10 @@ pub fn update_folder_counts(
     Ok(())
 }
 
+/// Unconditionally set `last_seen_uid`, including backward — for an explicit
+/// reset (e.g. UIDVALIDITY changed and sync state must restart from 0).
+/// Never call this with a value derived from ongoing sync progress; use
+/// [`advance_last_seen_uid`] there instead.
 pub fn update_last_seen_uid(
     conn: &Connection,
     account_id: &str,
@@ -233,6 +237,28 @@ pub fn update_last_seen_uid(
 ) -> Result<()> {
     conn.execute(
         "UPDATE folders SET last_seen_uid = ?1 WHERE account_id = ?2 AND path = ?3",
+        params![uid, account_id, path],
+    )?;
+    Ok(())
+}
+
+/// Advance a completed pass's safe watermark if it is higher than the stored
+/// `last_seen_uid`, otherwise a no-op.
+///
+/// Within a UIDVALIDITY epoch, this watermark asserts that every UID at or
+/// below it has been synced. Callers must calculate it after processing all
+/// chunks and constrain it below failed UIDs; a newest-first chunk's maximum
+/// is not safe progress. The atomic comparison prevents overlapping completed
+/// passes from overwriting newer progress with an older, lower watermark.
+pub fn advance_last_seen_uid(
+    conn: &Connection,
+    account_id: &str,
+    path: &str,
+    uid: u32,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET last_seen_uid = ?1
+         WHERE account_id = ?2 AND path = ?3 AND ?1 > last_seen_uid",
         params![uid, account_id, path],
     )?;
     Ok(())
@@ -636,6 +662,65 @@ mod tests {
         // Clearing (used on HTTP 410 resync) resets to None.
         update_graph_delta_link(&conn, "acc1", "fid-1", None).unwrap();
         assert_eq!(get_graph_delta_link(&conn, "acc1", "fid-1").unwrap(), None);
+    }
+
+    fn create_last_seen_uid_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                last_seen_uid INTEGER DEFAULT 0,
+                UNIQUE(account_id, path)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (account_id, name, path, last_seen_uid) VALUES ('acc1', 'All Mail', 'All Mail', 62213)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn last_seen_uid(conn: &Connection) -> u32 {
+        conn.query_row(
+            "SELECT last_seen_uid FROM folders WHERE account_id = 'acc1' AND path = 'All Mail'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn advance_last_seen_uid_moves_forward() {
+        let conn = create_last_seen_uid_test_db();
+        advance_last_seen_uid(&conn, "acc1", "All Mail", 116228).unwrap();
+        assert_eq!(last_seen_uid(&conn), 116228);
+    }
+
+    #[test]
+    fn advance_last_seen_uid_ignores_a_lower_value() {
+        // A pass with an older UID snapshot finishes after another pass has
+        // already completed and recorded a higher safe watermark.
+        let conn = create_last_seen_uid_test_db();
+        advance_last_seen_uid(&conn, "acc1", "All Mail", 116228).unwrap();
+        advance_last_seen_uid(&conn, "acc1", "All Mail", 63000).unwrap();
+        assert_eq!(last_seen_uid(&conn), 116228);
+    }
+
+    #[test]
+    fn update_last_seen_uid_allows_an_explicit_reset_backward() {
+        // Unlike advance_last_seen_uid, update_last_seen_uid must still be
+        // able to move backward -- it's what implements the "UIDVALIDITY
+        // changed, restart from 0" reset path.
+        let conn = create_last_seen_uid_test_db();
+        update_last_seen_uid(&conn, "acc1", "All Mail", 0).unwrap();
+        assert_eq!(last_seen_uid(&conn), 0);
+        advance_last_seen_uid(&conn, "acc1", "All Mail", 100).unwrap();
+        assert_eq!(last_seen_uid(&conn), 100);
     }
 
     fn create_delete_test_db() -> Connection {
