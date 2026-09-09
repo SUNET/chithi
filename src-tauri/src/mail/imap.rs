@@ -353,6 +353,28 @@ impl ImapConnection {
         Ok((exists, uid_validity, uid_next))
     }
 
+    /// Run `UID FETCH <uid_set> <query>` and tolerantly walk the response,
+    /// handing each result's UID and attributes to `extract` — see
+    /// [`parse_tolerant_fetches`] for why this is used instead of
+    /// `Session::uid_fetch` directly.
+    ///
+    /// Bypassing `uid_fetch` also means skipping its private input
+    /// validation (rejecting embedded control characters in `uid_set`/
+    /// `query`) — fine here since every call site builds both from
+    /// internally-validated `u32` UIDs and hardcoded query literals, never
+    /// from unvalidated external input.
+    fn tolerant_uid_fetch<T>(
+        &mut self,
+        uid_set: &str,
+        query: &str,
+        extract: impl FnMut(u32, &[imap_proto::types::AttributeValue<'_>]) -> Option<T>,
+    ) -> Result<Vec<T>> {
+        let command = format!("UID FETCH {} {}", uid_set, query);
+        let fetched = self.session.run_command_and_read_response(&command);
+        let raw = self.checked(&format!("IMAP {command}"), fetched)?;
+        parse_tolerant_fetches(&command, &raw, extract)
+    }
+
     /// Fetch UIDs in folder. If since_uid > 0, only fetch UIDs after it.
     pub fn fetch_uids(&mut self, since_uid: u32) -> Result<Vec<u32>> {
         let range = if since_uid > 0 {
@@ -362,14 +384,8 @@ impl ImapConnection {
         };
         log::debug!("IMAP UID FETCH {} (since_uid={})", range, since_uid);
 
-        let fetched = self.session.uid_fetch(&range, "UID");
-        let messages = self.checked(&format!("IMAP UID FETCH {} UID", range), fetched)?;
-
-        let uids: Vec<u32> = messages
-            .iter()
-            .filter_map(|f| f.uid)
-            .filter(|&uid| uid > since_uid)
-            .collect();
+        let uids = self.tolerant_uid_fetch(&range, "UID", |uid, _attrs| Some(uid))?;
+        let uids: Vec<u32> = uids.into_iter().filter(|&uid| uid > since_uid).collect();
 
         log::debug!("IMAP fetched {} new UIDs", uids.len());
         Ok(uids)
@@ -404,34 +420,48 @@ impl ImapConnection {
                 &uid_set[..uid_set.len().min(80)]
             );
 
-            let fetched = self.session.uid_fetch(&uid_set, ENVELOPE_FETCH_SPEC);
-            let fetches = match fetched {
-                Ok(f) => f,
-                Err(e) => {
-                    let context = format!("IMAP UID FETCH {} {}", uid_set, ENVELOPE_FETCH_SPEC);
-                    self.note_error(&context, &e);
-                    log::warn!(
-                        "IMAP FETCH envelopes failed for {} UIDs (skipping chunk): {}",
-                        chunk.len(),
-                        e
-                    );
-                    batch.failed_uids.extend_from_slice(chunk);
-                    continue;
-                }
-            };
+            let fetched = self.tolerant_uid_fetch(&uid_set, ENVELOPE_FETCH_SPEC, |uid, attrs| {
+                let flags: Vec<String> = attrs
+                    .iter()
+                    .find_map(|a| match a {
+                        imap_proto::types::AttributeValue::Flags(fs) => Some(
+                            fs.iter()
+                                .map(|s| flag_to_string(&imap::types::Flag::from(*s)))
+                                .collect(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let size = attrs
+                    .iter()
+                    .find_map(|a| match a {
+                        imap_proto::types::AttributeValue::Rfc822Size(sz) => Some(*sz as u64),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
 
-            for fetch in fetches.iter() {
-                let Some(uid) = fetch.uid else { continue };
-                let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
-                let size = fetch.size.unwrap_or(0) as u64;
-                let header = parse_envelope_headers(fetch.header().unwrap_or_default());
+                let header_bytes = attrs.iter().find_map(|a| match a {
+                    imap_proto::types::AttributeValue::BodySection {
+                        section:
+                            Some(imap_proto::types::SectionPath::Full(
+                                imap_proto::types::MessageSection::Header,
+                            )),
+                        data: Some(header),
+                        ..
+                    }
+                    | imap_proto::types::AttributeValue::Rfc822Header(Some(header)) => {
+                        Some(*header)
+                    }
+                    _ => None,
+                });
+                let header = parse_envelope_headers(header_bytes.unwrap_or_default());
 
                 // Check for attachments from BODYSTRUCTURE
                 // Simple heuristic: if the response text mentions "attachment", it likely has one
                 // More accurate: check if it's multipart/mixed (indicates attachments)
                 let has_attachments = size > 10000; // rough heuristic; will improve later
 
-                batch.envelopes.push(EnvelopeData {
+                Some(EnvelopeData {
                     uid,
                     subject: header.subject,
                     from_name: header.from_name,
@@ -445,7 +475,18 @@ impl ImapConnection {
                     flags,
                     size,
                     has_attachments,
-                });
+                })
+            });
+            match fetched {
+                Ok(envelopes) => batch.envelopes.extend(envelopes),
+                Err(e) => {
+                    log::warn!(
+                        "IMAP FETCH envelopes failed for {} UIDs (skipping chunk): {}",
+                        chunk.len(),
+                        e
+                    );
+                    batch.failed_uids.extend_from_slice(chunk);
+                }
             }
         }
 
@@ -462,14 +503,22 @@ impl ImapConnection {
     pub fn fetch_message_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
         log::debug!("IMAP fetching body for UID {}", uid);
 
-        let fetched = self.session.uid_fetch(uid.to_string(), "BODY[]");
-        let fetches = self.checked(&format!("IMAP UID FETCH {} BODY[]", uid), fetched)?;
+        let bodies = self.tolerant_uid_fetch(&uid.to_string(), "BODY[]", |uid, attrs| {
+            let body = attrs.iter().find_map(|a| match a {
+                imap_proto::types::AttributeValue::BodySection {
+                    section: None,
+                    data: Some(body),
+                    ..
+                }
+                | imap_proto::types::AttributeValue::Rfc822(Some(body)) => Some(*body),
+                _ => None,
+            })?;
+            Some((uid, body.to_vec()))
+        })?;
 
-        if let Some(msg) = fetches.iter().next() {
-            if let Some(body) = msg.body() {
-                log::debug!("IMAP fetched body for UID {}: {} bytes", uid, body.len());
-                return Ok(Some(body.to_vec()));
-            }
+        if let Some((_, body)) = bodies.into_iter().next() {
+            log::debug!("IMAP fetched body for UID {}: {} bytes", uid, body.len());
+            return Ok(Some(body));
         }
         log::warn!("IMAP no body returned for UID {}", uid);
         Ok(None)
@@ -493,15 +542,20 @@ impl ImapConnection {
 
         log::debug!("IMAP batch fetching {} bodies", uids.len());
 
-        let fetched = self.session.uid_fetch(&uid_set, "BODY[]");
-        let fetches = self.checked(&format!("IMAP UID FETCH {} BODY[]", uid_set), fetched)?;
+        let fetched = self.tolerant_uid_fetch(&uid_set, "BODY[]", |uid, attrs| {
+            let body = attrs.iter().find_map(|a| match a {
+                imap_proto::types::AttributeValue::BodySection {
+                    section: None,
+                    data: Some(body),
+                    ..
+                }
+                | imap_proto::types::AttributeValue::Rfc822(Some(body)) => Some(*body),
+                _ => None,
+            })?;
+            Some((uid, body.to_vec()))
+        })?;
 
-        let mut results = std::collections::HashMap::new();
-        for msg in fetches.iter() {
-            if let (Some(uid), Some(body)) = (msg.uid, msg.body()) {
-                results.insert(uid, body.to_vec());
-            }
-        }
+        let results: std::collections::HashMap<u32, Vec<u8>> = fetched.into_iter().collect();
 
         log::debug!("IMAP batch fetched {} bodies", results.len());
         Ok(results)
@@ -666,19 +720,20 @@ impl ImapConnection {
     /// Fetch current flags for all messages in the selected folder.
     /// Returns a map of UID → flags vec. Uses `1:*` to get everything.
     pub fn fetch_all_flags(&mut self) -> Result<Vec<(u32, Vec<String>)>> {
-        let fetched = self.session.uid_fetch("1:*", "(UID FLAGS)");
-        let fetches = self.checked("IMAP UID FETCH 1:* (UID FLAGS)", fetched)?;
-
-        let mut results = Vec::new();
-        for fetch in fetches.iter() {
-            let uid = match fetch.uid {
-                Some(u) => u,
-                None => continue,
-            };
-            let flags: Vec<String> = fetch.flags().iter().map(|f| flag_to_string(f)).collect();
-            results.push((uid, flags));
-        }
-        Ok(results)
+        self.tolerant_uid_fetch("1:*", "(UID FLAGS)", |uid, attrs| {
+            let flags: Vec<String> = attrs
+                .iter()
+                .find_map(|a| match a {
+                    imap_proto::types::AttributeValue::Flags(fs) => Some(
+                        fs.iter()
+                            .map(|s| flag_to_string(&imap::types::Flag::from(*s)))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some((uid, flags))
+        })
     }
 
     /// Copy messages to a destination folder without removing originals.
@@ -1004,6 +1059,62 @@ fn uid_set_string(uids: &[u32]) -> String {
         .map(|u| u.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Walk a raw IMAP response byte stream, keeping only `Response::Fetch`
+/// lines and handing each one's UID and attributes to `extract`; everything
+/// else — status updates, a `* OK Still working ...` keep-alive, EXISTS/
+/// RECENT notices, the tagged completion line — is skipped rather than
+/// treated as a fatal parse error.
+///
+/// RFC 3501 §7 permits a server to send an untagged status response at any
+/// point in a command's output, to keep the connection alive during a slow
+/// scan. `imap` 2.4.1's own response parser only tolerates a fixed handful
+/// of unsolicited response kinds (`Status`, `Recent`, `Flags`, `Exists`,
+/// `Expunge`) and aborts the *whole command* on anything else — including
+/// this keep-alive — discarding every FETCH result the server already sent,
+/// even though the server went on to complete the command successfully.
+/// This is a lower-level, more tolerant replacement for `Session::uid_fetch`
+/// used together with [`ImapConnection::tolerant_uid_fetch`], which supplies
+/// `raw` via `Session::run_command_and_read_response`. On success that reader
+/// has consumed and validated the tagged completion, so this second parsing
+/// pass cannot leave unread response data. Reader failures still pass through
+/// the connection's poison detection and redacted diagnostics.
+fn parse_tolerant_fetches<T>(
+    command: &str,
+    raw: &[u8],
+    mut extract: impl FnMut(u32, &[imap_proto::types::AttributeValue<'_>]) -> Option<T>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        match imap_proto::parse_response(rest) {
+            Ok((remaining, imap_proto::types::Response::Fetch(_, attrs))) => {
+                rest = remaining;
+                let uid = attrs.iter().find_map(|a| match a {
+                    imap_proto::types::AttributeValue::Uid(uid) => Some(*uid),
+                    _ => None,
+                });
+                if let Some(uid) = uid {
+                    if let Some(item) = extract(uid, &attrs) {
+                        out.push(item);
+                    }
+                }
+            }
+            // Anything else the server sent (a keep-alive, a flag/exists
+            // notification, the tagged completion, ...) carries nothing
+            // `extract` needs — skip it and keep walking.
+            Ok((remaining, _other)) => rest = remaining,
+            Err(_) => {
+                return Err(Error::Imap(format!(
+                    "{}: unparseable response ({} bytes remaining)",
+                    command,
+                    rest.len()
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Quote a mailbox name as an IMAP RFC 3501 quoted-string.
@@ -1803,6 +1914,34 @@ fn addresses_to_json(header: Option<&mailparse::MailHeader<'_>>) -> String {
 #[cfg(test)]
 mod tests {
     use imap::extensions::idle::WaitOutcome;
+
+    #[test]
+    fn tolerant_fetch_survives_a_still_working_keepalive() {
+        // Proton Bridge sends an untagged `* OK Still working ...` line mid-FETCH
+        // to keep the connection alive during a slow scan (RFC 3501 §7 permits
+        // this at any time). `imap` 2.4.1's own parser treats it as a fatal
+        // "unexpected response" and discards the whole command's results;
+        // `parse_tolerant_fetches` must skip it and keep the FETCH data either
+        // side of it.
+        let raw = b"* 1 FETCH (UID 100 FLAGS (\\Seen))\r\n\
+* OK Still working...\r\n\
+* 2 FETCH (UID 101 FLAGS (\\Answered))\r\n\
+a1 OK UID FETCH completed\r\n";
+        let uids =
+            super::parse_tolerant_fetches("UID FETCH 1:* (UID FLAGS)", raw, |uid, _attrs| {
+                Some(uid)
+            })
+            .unwrap();
+        assert_eq!(uids, vec![100, 101]);
+    }
+
+    #[test]
+    fn tolerant_fetch_errors_on_truly_unparseable_bytes() {
+        let raw = b"this is not an IMAP response\r\n";
+        let result =
+            super::parse_tolerant_fetches("UID FETCH 1:* UID", raw, |uid, _attrs| Some(uid));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn idle_timeout_is_not_a_mailbox_notification() {
