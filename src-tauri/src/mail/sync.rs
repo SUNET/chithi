@@ -609,7 +609,7 @@ fn sync_folder_envelopes(
     if let Some(max_uid) = watermark.filter(|&u| u > last_uid) {
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
-        db::folders::update_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+        db::folders::advance_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
     }
 
     // Run filter rules on newly synced messages. These were fetched and
