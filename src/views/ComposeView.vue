@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
 import { useAccountsStore } from "@/stores/accounts";
 import { usePgpPromptsStore } from "@/stores/pgp-prompts";
@@ -7,15 +7,29 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as tauriAsk } from "@tauri-apps/plugin-dialog";
 import type {
   Account,
-  Address,
   ComposeAttachment,
   MessageBody,
   PgpRecipientStatus,
 } from "@/lib/types";
 import * as api from "@/lib/tauri";
 import { acctColor } from "@/lib/account-colors";
+import {
+  formatRecipient,
+  getLastRecipientTerm,
+  getRecipientSearch,
+  parseRecipients,
+  rankRecipientAddressMatch,
+  replaceLastRecipient,
+  type RecipientParseError,
+} from "@/lib/compose-recipients";
 import Select from "@/components/common/Select.vue";
 import ComposeMenuBar from "@/components/compose/ComposeMenuBar.vue";
+
+type RecipientField = "to" | "cc" | "bcc";
+type ComposeRecipients = Record<RecipientField, string[]>;
+type ParsedRecipientFields =
+  | { ok: true; recipients: ComposeRecipients }
+  | { ok: false; field: RecipientField; error: RecipientParseError };
 
 // Compose runs in its own window; start the shared PGP prompt listener
 // so a sign/decrypt triggered from here is served. The passphrase / PIN
@@ -179,10 +193,16 @@ const savingDraft = ref(false);
 // (Graph account / no usable public key). Drives a non-blocking notice.
 const draftPlaintextNotice = ref(false);
 const error = ref<string | null>(null);
+const recipientErrorField = ref<RecipientField | null>(null);
+const toInput = ref<HTMLInputElement | null>(null);
+const ccInput = ref<HTMLInputElement | null>(null);
+const bccInput = ref<HTMLInputElement | null>(null);
+const recipientInputs = { to: toInput, cc: ccInput, bcc: bccInput };
 const showCc = ref(!!cc.value);
-const showBcc = ref(false);
+const showBcc = ref(!!bcc.value);
 const attachments = ref<ComposeAttachment[]>([]);
 const sentSuccessfully = ref(false);
+let composeDisposed = false;
 
 // --- Autocomplete ---
 interface AutocompleteItem {
@@ -193,32 +213,35 @@ interface AutocompleteItem {
 
 const acResults = ref<AutocompleteItem[]>([]);
 const acVisible = ref(false);
-const acField = ref<"to" | "cc" | "bcc" | null>(null);
+const acField = ref<RecipientField | null>(null);
 const acSelected = ref(0);
 let acDebounce: ReturnType<typeof setTimeout> | null = null;
+let acBlurTimer: ReturnType<typeof setTimeout> | null = null;
+let acRequestSeq = 0;
 
-function getLastTerm(input: string): string {
-  // Get the text after the last comma/semicolon (the part being typed)
-  const parts = input.split(/[,;]/);
-  return (parts[parts.length - 1] || "").trim();
-}
-
-function onAddrInput(field: "to" | "cc" | "bcc") {
+function onAddrInput(field: RecipientField, fromFocus = false) {
+  const seq = ++acRequestSeq;
+  if (acDebounce) clearTimeout(acDebounce);
+  acDebounce = null;
   acField.value = field;
   const fieldRef = field === "to" ? to : field === "cc" ? cc : bcc;
-  const query = getLastTerm(fieldRef.value);
+  const { query, kind } = getRecipientSearch(fieldRef.value);
+  acVisible.value = false;
+  acResults.value = [];
 
-  if (query.length < 2) {
-    acVisible.value = false;
-    acResults.value = [];
-    return;
+  if (fromFocus) {
+    const existing = parseRecipients(getLastRecipientTerm(fieldRef.value));
+    if (existing.ok && existing.addresses.length === 1) return;
   }
+  if (query.length < 2) return;
 
-  if (acDebounce) clearTimeout(acDebounce);
-  acDebounce = setTimeout(() => searchAutocomplete(query), 150);
+  acDebounce = setTimeout(() => {
+    acDebounce = null;
+    void searchAutocomplete(query, field, seq, kind === "address");
+  }, 150);
 }
 
-async function searchAutocomplete(query: string) {
+async function searchAutocomplete(query: string, field: RecipientField, seq: number, addressQuery: boolean) {
   try {
     // Pass the active sender so the backend can rank matches from
     // that account's default contact book first (#137). When no
@@ -231,16 +254,20 @@ async function searchAutocomplete(query: string) {
         : api.searchContacts(query),
       api.searchCollectedContacts(query),
     ]);
+    if (seq !== acRequestSeq || acField.value !== field ||
+        accountId !== (selectedAccountId.value || null)) return;
 
     const items: AutocompleteItem[] = [];
     const seen = new Set<string>();
+    const lowerQuery = query.toLowerCase();
 
     // Contacts first (full contacts take priority)
     for (const c of contacts) {
       let emails: { email: string; label: string }[] = [];
       try { emails = JSON.parse(c.emails_json); } catch { continue; }
       for (const e of emails) {
-        const key = e.email.toLowerCase();
+        if (addressQuery && !e.email.toLowerCase().includes(lowerQuery)) continue;
+        const key = e.email;
         if (!seen.has(key)) {
           seen.add(key);
           items.push({
@@ -254,7 +281,8 @@ async function searchAutocomplete(query: string) {
 
     // Then collected contacts (recently used)
     for (const c of collected) {
-      const key = c.email.toLowerCase();
+      if (addressQuery && !c.email.toLowerCase().includes(lowerQuery)) continue;
+      const key = c.email;
       if (!seen.has(key)) {
         seen.add(key);
         items.push({
@@ -265,23 +293,35 @@ async function searchAutocomplete(query: string) {
       }
     }
 
+    if (addressQuery) {
+      // Never prefer a different address over the exact spelling being edited.
+      const rank = (email: string) => rankRecipientAddressMatch(email, query);
+      items.sort((a, b) => rank(a.email) - rank(b.email));
+    }
     acResults.value = items.slice(0, 8);
     acVisible.value = items.length > 0;
     acSelected.value = 0;
   } catch {
-    acVisible.value = false;
+    if (seq === acRequestSeq) acVisible.value = false;
   }
 }
 
 function selectAutocomplete(item: AutocompleteItem) {
   if (!acField.value) return;
-  const fieldRef = acField.value === "to" ? to : acField.value === "cc" ? cc : bcc;
-  const parts = fieldRef.value.split(/[,;]/);
-  // Replace the last (incomplete) part with the selected email
-  parts[parts.length - 1] = ` ${item.display} <${item.email}>`;
-  fieldRef.value = parts.join(",") + ", ";
+  ++acRequestSeq;
+  if (acDebounce) clearTimeout(acDebounce);
+  acDebounce = null;
   acVisible.value = false;
   acResults.value = [];
+  const mailbox = parseRecipients(item.email);
+  if (!mailbox.ok || mailbox.addresses.length !== 1 ||
+      mailbox.addresses[0] !== item.email.trim()) {
+    error.value = "Selected contact does not contain a single email address. Correct the contact or enter an address manually.";
+    recipientErrorField.value = acField.value;
+    return;
+  }
+  const fieldRef = acField.value === "to" ? to : acField.value === "cc" ? cc : bcc;
+  fieldRef.value = replaceLastRecipient(fieldRef.value, item.display, mailbox.addresses[0]);
 }
 
 function onAddrKeydown(event: KeyboardEvent) {
@@ -304,9 +344,14 @@ function onAddrKeydown(event: KeyboardEvent) {
 }
 
 function onAddrBlur() {
+  const seq = ++acRequestSeq;
+  if (acDebounce) clearTimeout(acDebounce);
+  acDebounce = null;
+  if (acBlurTimer) clearTimeout(acBlurTimer);
   // Delay to allow click on dropdown item
-  setTimeout(() => {
-    acVisible.value = false;
+  acBlurTimer = setTimeout(() => {
+    acBlurTimer = null;
+    if (seq === acRequestSeq) acVisible.value = false;
   }, 200);
 }
 
@@ -374,13 +419,24 @@ function attachmentBaselineValue(items: ComposeAttachment[]): string {
 
 const baselineAttachments = ref(attachmentBaselineValue([]));
 
-function markDraftStateAsClean() {
-  baselineTo.value = to.value;
-  baselineCc.value = cc.value;
-  baselineBcc.value = bcc.value;
-  baselineSubject.value = subject.value;
-  baselineBody.value = bodyText.value;
-  baselineAttachments.value = attachmentBaselineValue(attachments.value);
+function captureDraftState() {
+  return {
+    to: to.value,
+    cc: cc.value,
+    bcc: bcc.value,
+    subject: subject.value,
+    body: bodyText.value,
+    attachments: attachmentBaselineValue(attachments.value),
+  };
+}
+
+function markDraftStateAsClean(state = captureDraftState()) {
+  baselineTo.value = state.to;
+  baselineCc.value = state.cc;
+  baselineBcc.value = state.bcc;
+  baselineSubject.value = state.subject;
+  baselineBody.value = state.body;
+  baselineAttachments.value = state.attachments;
 }
 
 // --- Resuming a saved draft ----------------------------------------------
@@ -399,10 +455,6 @@ const isResumingDraft = !!draftId;
 const draftLoading = ref(false);
 const draftDecryptError = ref<string | null>(null);
 
-function formatAddress(a: Address): string {
-  return a.name ? `${a.name} <${a.email}>` : a.email;
-}
-
 // Pre-fill the form. `envelope` is the cleartext outer message (To / Cc /
 // Subject), `body` is the message text. For a plaintext draft the two
 // come from the same fetch; for an encrypted draft the envelope is the
@@ -410,8 +462,8 @@ function formatAddress(a: Address): string {
 // decrypted inner carries no Subject of its own, which is why the
 // envelope must be fetched separately.
 function prefillFromDraft(envelope: MessageBody, body: string) {
-  to.value = envelope.to.map(formatAddress).join(", ");
-  cc.value = envelope.cc.map(formatAddress).join(", ");
+  to.value = envelope.to.map(formatRecipient).join(", ");
+  cc.value = envelope.cc.map(formatRecipient).join(", ");
   if (cc.value) showCc.value = true;
   subject.value = envelope.subject ?? "";
   bodyText.value = body;
@@ -468,7 +520,7 @@ const canSend = computed(() => to.value.trim().length > 0 && !sending.value);
 // Intercept window close to prompt for draft save
 onMounted(() => {
   currentWindow.onCloseRequested(async (event) => {
-    if (sentSuccessfully.value || !isDirty.value) return; // Allow close
+    if (composeDisposed || sentSuccessfully.value || !isDirty.value) return; // Allow close
 
     event.preventDefault();
 
@@ -491,7 +543,7 @@ onMounted(() => {
 
       if (save) {
         const saved = await saveDraft();
-        if (saved) {
+        if (saved && !isDirty.value && !composeDisposed) {
           await currentWindow.destroy();
         }
         // If save failed, saveDraft() already surfaced an error; stay open.
@@ -527,29 +579,33 @@ onMounted(() => {
 // Each call captures a seq; only the most recent writes the result.
 let recipientCheckSeq = 0;
 
-async function refreshRecipientStatuses() {
-  if (!pgpEncrypt.value) {
-    recipientStatuses.value = [];
-    return;
-  }
-  const all = [
-    ...parseAddresses(to.value),
-    ...parseAddresses(cc.value),
-    ...parseAddresses(bcc.value),
-  ].filter((s) => s.trim().length > 0);
-  if (all.length === 0) {
-    recipientStatuses.value = [];
-    return;
-  }
+async function refreshRecipientStatuses(
+  recipients?: ComposeRecipients,
+): Promise<PgpRecipientStatus[] | null> {
   const seq = ++recipientCheckSeq;
+  recipientStatuses.value = [];
+  if (!pgpEncrypt.value) {
+    return [];
+  }
+  const parsed = recipients ? { ok: true as const, recipients } : readRecipientFields();
+  if (!parsed.ok) return null;
+  const all = [
+    ...parsed.recipients.to,
+    ...parsed.recipients.cc,
+    ...parsed.recipients.bcc,
+  ];
+  if (all.length === 0) {
+    return [];
+  }
   try {
     const result = await api.pgpCheckRecipients(all);
     // Drop a stale response: a newer call superseded this one in flight.
-    if (seq === recipientCheckSeq) {
-      recipientStatuses.value = result;
-    }
+    if (seq !== recipientCheckSeq) return null;
+    recipientStatuses.value = result;
+    return result;
   } catch (e) {
     console.error("PGP recipient check failed:", e);
+    return null;
   }
 }
 
@@ -559,7 +615,11 @@ async function refreshRecipientStatuses() {
 let recipientCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleRecipientRefresh() {
+  ++recipientCheckSeq;
+  recipientStatuses.value = [];
   if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
+  recipientCheckTimer = null;
+  if (!pgpEncrypt.value) return;
   recipientCheckTimer = setTimeout(() => {
     recipientCheckTimer = null;
     void refreshRecipientStatuses();
@@ -571,19 +631,39 @@ watch(
   () => {
     scheduleRecipientRefresh();
   },
+  { flush: "sync" },
 );
+
+watch([to, cc, bcc], () => {
+  if (recipientErrorField.value) {
+    recipientErrorField.value = null;
+    error.value = null;
+  }
+}, { flush: "sync" });
+
+onUnmounted(() => {
+  composeDisposed = true;
+  ++acRequestSeq;
+  ++recipientCheckSeq;
+  if (acDebounce) clearTimeout(acDebounce);
+  if (acBlurTimer) clearTimeout(acBlurTimer);
+  if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
+});
 
 async function saveDraft(): Promise<boolean> {
   const accountId = selectedAccountId.value;
-  if (!accountId) return false;
+  if (composeDisposed || !accountId || savingDraft.value) return false;
+  const recipients = validateRecipientFields();
+  if (!recipients) return false;
+  const savedState = captureDraftState();
 
   savingDraft.value = true;
   error.value = null;
   try {
     const outcome = await api.saveDraft(accountId, {
-      to: parseAddresses(to.value),
-      cc: parseAddresses(cc.value),
-      bcc: parseAddresses(bcc.value),
+      to: recipients.to,
+      cc: recipients.cc,
+      bcc: recipients.bcc,
       subject: subject.value,
       body_text: bodyText.value,
       body_html: null,
@@ -596,7 +676,7 @@ async function saveDraft(): Promise<boolean> {
     // key). Surface a non-blocking notice so the toggle isn't silently
     // misleading. `outcome` may be undefined under older test mocks.
     draftPlaintextNotice.value = outcome?.plaintext_fallback ?? false;
-    markDraftStateAsClean();
+    markDraftStateAsClean(savedState);
     // Trigger a sync so the draft appears in the local mailbox
     api.triggerSync(accountId).catch(() => {});
     return true;
@@ -633,16 +713,45 @@ function removeAttachment(index: number) {
 }
 
 
-function parseAddresses(input: string): string[] {
-  return input
-    .split(/[,;]/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-    .map((s) => {
-      // Extract email from "Name <email>" format
-      const match = s.match(/<([^>]+)>/);
-      return match ? match[1] : s;
-    });
+function readRecipientFields(): ParsedRecipientFields {
+  const inputs = { to: to.value, cc: cc.value, bcc: bcc.value };
+  const recipients: ComposeRecipients = { to: [], cc: [], bcc: [] };
+  for (const field of ["to", "cc", "bcc"] as const) {
+    const result = parseRecipients(inputs[field]);
+    if (!result.ok) return { ok: false, field, error: result.error };
+    recipients[field] = result.addresses;
+  }
+  return { ok: true, recipients };
+}
+
+function validateRecipientFields(): ComposeRecipients | null {
+  const result = readRecipientFields();
+  if (!result.ok) {
+    const labels = { to: "To", cc: "Cc", bcc: "Bcc" };
+    error.value = `${labels[result.field]} recipient ${result.error.index}: ${result.error.message}`;
+    recipientErrorField.value = result.field;
+    if (result.field === "cc") showCc.value = true;
+    if (result.field === "bcc") showBcc.value = true;
+    void nextTick(() => recipientInputs[result.field].value?.focus());
+    return null;
+  }
+  recipientErrorField.value = null;
+  return result.recipients;
+}
+
+function recipientSnapshot(): string {
+  return JSON.stringify([
+    selectedAccountId.value, to.value, cc.value, bcc.value, pgpEncrypt.value,
+  ]);
+}
+
+function recipientsStillMatch(snapshot: string): boolean {
+  if (composeDisposed) return false;
+  if (snapshot === recipientSnapshot()) return true;
+  if (validateRecipientFields()) {
+    error.value = "Sender, recipients, or encryption setting changed. Review them and send again.";
+  }
+  return false;
 }
 
 function mentionsAttachment(): boolean {
@@ -651,74 +760,73 @@ function mentionsAttachment(): boolean {
 }
 
 async function send() {
+  if (composeDisposed || sending.value) return;
   const accountId = selectedAccountId.value;
   if (!accountId) {
     error.value = "No account selected";
     return;
   }
 
-  const toAddrs = parseAddresses(to.value);
-  if (toAddrs.length === 0) {
+  const recipients = validateRecipientFields();
+  if (!recipients) return;
+  if (recipients.to.length === 0) {
     error.value = "At least one recipient is required";
     return;
   }
 
-  // Check for missing attachments. tauri-plugin-dialog does not expose a
-  // three-button native prompt, so the previous Send/Attach/Cancel dialog
-  // was silently broken. Two buttons: the user can still attach manually
-  // via the toolbar after Cancel. On dialog failure, cancel the send so a
-  // broken prompt cannot turn into an accidental send-without-attachment.
-  if (attachments.value.length === 0 && mentionsAttachment()) {
-    let sendAnyway: boolean;
-    try {
-      sendAnyway = await tauriAsk(
-        "Your message mentions an attachment, but no files are attached. Send anyway?",
-        {
-          title: "No Attachments",
-          kind: "warning",
-          okLabel: "Send Anyway",
-          cancelLabel: "Cancel",
-        },
-      );
-    } catch (e) {
-      console.error("No-attachment dialog error:", e);
-      error.value =
-        "Could not show the attachment warning. Please attach files or remove the mention and try again.";
-      return;
-    }
-    if (!sendAnyway) {
-      return;
-    }
-  }
-
-  // Hard-gate: refuse to send an encrypted message if any recipient has
-  // no public key in the keystore. The backend would fail-closed anyway
-  // (apply_pgp_envelope errors before the outbox row is persisted) but
-  // surfacing the specific missing recipients here is far more useful
-  // than the generic libtumpa error that would otherwise come back.
-  if (pgpEncrypt.value) {
-    // The recipient precheck behind the watch is debounced, so a pending
-    // edit may not have run yet — re-run it synchronously here so the
-    // gate below sees the current recipient list, not a stale one.
-    await refreshRecipientStatuses();
-    const missing = recipientStatuses.value.filter((s) => !s.hasKey);
-    if (missing.length > 0) {
-      error.value =
-        `Cannot encrypt — no public key in keystore for: ` +
-        missing.map((s) => s.email).join(", ") +
-        `. Fetch keys via WKD or import them, then try again.`;
-      return;
-    }
-  }
-
+  const snapshot = recipientSnapshot();
   sending.value = true;
   error.value = null;
 
   try {
+    // A failed dialog must not bypass the attachment warning.
+    if (attachments.value.length === 0 && mentionsAttachment()) {
+      let sendAnyway: boolean;
+      try {
+        sendAnyway = await tauriAsk(
+          "Your message mentions an attachment, but no files are attached. Send anyway?",
+          {
+            title: "No Attachments",
+            kind: "warning",
+            okLabel: "Send Anyway",
+            cancelLabel: "Cancel",
+          },
+        );
+      } catch (e) {
+        console.error("No-attachment dialog error:", e);
+        error.value =
+          "Could not show the attachment warning. Please attach files or remove the mention and try again.";
+        return;
+      }
+      if (!sendAnyway) return;
+    }
+
+    if (!recipientsStillMatch(snapshot)) return;
+    if (pgpEncrypt.value) {
+      // The explicit check owns this snapshot; a pending debounce must not
+      // supersede it without a new edit. The backend also validates keys.
+      if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
+      recipientCheckTimer = null;
+      const statuses = await refreshRecipientStatuses(recipients);
+      if (!recipientsStillMatch(snapshot)) return;
+      if (statuses === null) {
+        error.value = "Could not verify recipient encryption keys. Please try again.";
+        return;
+      }
+      const missing = statuses.filter((status) => !status.hasKey);
+      if (missing.length > 0) {
+        error.value =
+          `Cannot encrypt — no public key in keystore for: ` +
+          missing.map((s) => s.email).join(", ") +
+          `. Fetch keys via WKD or import them, then try again.`;
+        return;
+      }
+    }
+
     await api.sendMessage(accountId, {
-      to: toAddrs,
-      cc: parseAddresses(cc.value),
-      bcc: parseAddresses(bcc.value),
+      to: recipients.to,
+      cc: recipients.cc,
+      bcc: recipients.bcc,
       subject: subject.value,
       body_text: bodyText.value,
       body_html: null,
@@ -835,7 +943,7 @@ async function send() {
       </button>
     </div>
 
-    <div v-if="error" class="compose-error">{{ error }}</div>
+    <div v-if="error" id="compose-error" class="compose-error" role="alert" data-testid="compose-error">{{ error }}</div>
 
     <!-- Resuming a draft: in-progress / failed-decrypt banners. -->
     <div
@@ -893,24 +1001,29 @@ async function send() {
           />
         </div>
         <div class="field-row addr-field-row">
-          <label class="field-label">To</label>
+          <label class="field-label" for="compose-to">To</label>
           <div class="field-input-group">
             <div class="addr-input-wrap">
               <input
+                id="compose-to"
+                ref="toInput"
                 v-model="to"
                 type="text"
                 class="field-input"
                 data-testid="compose-to"
+                :aria-invalid="recipientErrorField === 'to'"
+                :aria-describedby="recipientErrorField === 'to' ? 'compose-error' : undefined"
                 @input="onAddrInput('to')"
                 @keydown="onAddrKeydown"
                 @blur="onAddrBlur"
-                @focus="onAddrInput('to')"
+                @focus="onAddrInput('to', true)"
               />
               <div v-if="acVisible && acField === 'to'" class="ac-dropdown">
                 <button
                   v-for="(item, i) in acResults"
                   :key="item.email"
                   class="ac-item"
+                  data-testid="compose-ac-item"
                   :class="{ selected: i === acSelected }"
                   @mousedown.prevent="selectAutocomplete(item)"
                 >
@@ -925,23 +1038,28 @@ async function send() {
           </div>
         </div>
         <div v-if="showCc" class="field-row addr-field-row">
-          <label class="field-label">Cc</label>
+          <label class="field-label" for="compose-cc">Cc</label>
           <div class="addr-input-wrap">
             <input
+              id="compose-cc"
+              ref="ccInput"
               v-model="cc"
               type="text"
               class="field-input"
               data-testid="compose-cc"
+              :aria-invalid="recipientErrorField === 'cc'"
+              :aria-describedby="recipientErrorField === 'cc' ? 'compose-error' : undefined"
               @input="onAddrInput('cc')"
               @keydown="onAddrKeydown"
               @blur="onAddrBlur"
-              @focus="onAddrInput('cc')"
+              @focus="onAddrInput('cc', true)"
             />
             <div v-if="acVisible && acField === 'cc'" class="ac-dropdown">
               <button
                 v-for="(item, i) in acResults"
                 :key="item.email"
                 class="ac-item"
+                data-testid="compose-ac-item"
                 :class="{ selected: i === acSelected }"
                 @mousedown.prevent="selectAutocomplete(item)"
               >
@@ -953,23 +1071,28 @@ async function send() {
           </div>
         </div>
         <div v-if="showBcc" class="field-row addr-field-row">
-          <label class="field-label">Bcc</label>
+          <label class="field-label" for="compose-bcc">Bcc</label>
           <div class="addr-input-wrap">
             <input
+              id="compose-bcc"
+              ref="bccInput"
               v-model="bcc"
               type="text"
               class="field-input"
               data-testid="compose-bcc"
+              :aria-invalid="recipientErrorField === 'bcc'"
+              :aria-describedby="recipientErrorField === 'bcc' ? 'compose-error' : undefined"
               @input="onAddrInput('bcc')"
               @keydown="onAddrKeydown"
               @blur="onAddrBlur"
-              @focus="onAddrInput('bcc')"
+              @focus="onAddrInput('bcc', true)"
             />
             <div v-if="acVisible && acField === 'bcc'" class="ac-dropdown">
               <button
                 v-for="(item, i) in acResults"
                 :key="item.email"
                 class="ac-item"
+                data-testid="compose-ac-item"
                 :class="{ selected: i === acSelected }"
                 @mousedown.prevent="selectAutocomplete(item)"
               >

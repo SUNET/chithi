@@ -155,33 +155,6 @@ describe("openComposeWindow", () => {
   });
 });
 
-describe("Draft resume address formatting", () => {
-  // Mirrors ComposeView's formatAddress: turns a parsed Address into the
-  // "Name <email>" string the compose To/Cc fields expect.
-  function formatAddress(a: { name: string | null; email: string }): string {
-    return a.name ? `${a.name} <${a.email}>` : a.email;
-  }
-
-  it("formats an address with a display name", () => {
-    expect(formatAddress({ name: "Alice Smith", email: "alice@example.com" }))
-      .toBe("Alice Smith <alice@example.com>");
-  });
-
-  it("formats a bare address with no display name", () => {
-    expect(formatAddress({ name: null, email: "bob@example.com" }))
-      .toBe("bob@example.com");
-  });
-
-  it("joins multiple recipients with comma-space", () => {
-    const addrs = [
-      { name: "Alice", email: "alice@a.com" },
-      { name: null, email: "bob@b.com" },
-    ];
-    expect(addrs.map(formatAddress).join(", "))
-      .toBe("Alice <alice@a.com>, bob@b.com");
-  });
-});
-
 describe("Compose dirty tracking", () => {
   function attachmentBaselineValue(
     items: Array<{ token: string; name: string }>,
@@ -467,49 +440,6 @@ describe("Signature management", () => {
   });
 });
 
-describe("Compose autocomplete", () => {
-  function getLastTerm(input: string): string {
-    const parts = input.split(/[,;]/);
-    return (parts[parts.length - 1] || "").trim();
-  }
-
-  function insertAutocomplete(fieldValue: string, display: string, email: string): string {
-    const parts = fieldValue.split(/[,;]/);
-    parts[parts.length - 1] = ` ${display} <${email}>`;
-    return parts.join(",") + ", ";
-  }
-
-  it("extracts last term from single address", () => {
-    expect(getLastTerm("ali")).toBe("ali");
-  });
-
-  it("extracts last term after comma", () => {
-    expect(getLastTerm("alice@example.com, bo")).toBe("bo");
-  });
-
-  it("extracts last term after semicolon", () => {
-    expect(getLastTerm("alice@example.com; ku")).toBe("ku");
-  });
-
-  it("returns empty for trailing comma", () => {
-    expect(getLastTerm("alice@example.com, ")).toBe("");
-  });
-
-  it("inserts selected contact into single field", () => {
-    const result = insertAutocomplete("ali", "Alice Smith", "alice@example.com");
-    expect(result).toBe(" Alice Smith <alice@example.com>, ");
-  });
-
-  it("inserts selected contact after existing address", () => {
-    const result = insertAutocomplete("bob@test.com, ali", "Alice Smith", "alice@example.com");
-    expect(result).toBe("bob@test.com, Alice Smith <alice@example.com>, ");
-  });
-
-  it("does not trigger for queries shorter than 2 chars", () => {
-    expect(getLastTerm("a").length < 2).toBe(true);
-  });
-});
-
 describe("Contact lookup from email address", () => {
   // Mirrors the exact-match logic in MessageReader.onAddrRightClick
   function findExactContact(
@@ -559,47 +489,6 @@ describe("Contact lookup from email address", () => {
   it("handles malformed emails_json gracefully", () => {
     const results = [{ emails_json: "not json" }];
     expect(findExactContact(results, "alice@example.com")).toBeUndefined();
-  });
-});
-
-describe("parseAddresses with Name <email> format", () => {
-  function parseAddresses(input: string): string[] {
-    return input
-      .split(/[,;]/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0)
-      .map((s) => {
-        const match = s.match(/<([^>]+)>/);
-        return match ? match[1] : s;
-      });
-  }
-
-  it("extracts email from Name <email> format", () => {
-    expect(parseAddresses("Alice Smith <alice@example.com>")).toEqual(["alice@example.com"]);
-  });
-
-  it("handles plain email address", () => {
-    expect(parseAddresses("alice@example.com")).toEqual(["alice@example.com"]);
-  });
-
-  it("handles autocomplete format with trailing comma", () => {
-    expect(parseAddresses("Alice Smith <alice@example.com>, ")).toEqual(["alice@example.com"]);
-  });
-
-  it("handles multiple Name <email> addresses", () => {
-    expect(parseAddresses("Alice <alice@a.com>, Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
-  });
-
-  it("handles mix of plain and Name <email>", () => {
-    expect(parseAddresses("alice@a.com, Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
-  });
-
-  it("handles same email in name and angle brackets", () => {
-    expect(parseAddresses("kushal@sunet.se <kushal@sunet.se>, ")).toEqual(["kushal@sunet.se"]);
-  });
-
-  it("handles semicolon separator", () => {
-    expect(parseAddresses("Alice <alice@a.com>; Bob <bob@b.com>")).toEqual(["alice@a.com", "bob@b.com"]);
   });
 });
 
