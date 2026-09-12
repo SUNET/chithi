@@ -58,8 +58,8 @@ pub struct EnvelopeData {
 }
 
 /// Outcome of [`ImapConnection::fetch_envelopes_batch`]. Rejected chunks and
-/// requested UIDs without a header literal land in `failed_uids`, so the
-/// caller can leave them outside its sync watermark and retry them later.
+/// requested UIDs with missing or unparseable headers land in `failed_uids`,
+/// so the caller can leave them outside its sync watermark and retry them later.
 #[derive(Default)]
 pub struct EnvelopeBatch {
     pub envelopes: Vec<EnvelopeData>,
@@ -1271,7 +1271,8 @@ From: \"Ola Skoog\" <Ola.Skoog@informator.se>\r\n\
 To: undisclosed-recipients:;\r\n\
 Date: Mon, 17 Nov 2008 17:29:20 +0100\r\n\
 Message-ID: <AD0E2B98@se-exh01.informator.ad>\r\n\r\n",
-        );
+        )
+        .unwrap();
 
         assert_eq!(env.subject.as_deref(), Some("Lärarträff hos Informator"));
         assert_eq!(env.from_name.as_deref(), Some("Ola Skoog"));
@@ -1292,7 +1293,8 @@ Message-ID: <AD0E2B98@se-exh01.informator.ad>\r\n\r\n",
         let env = parse_envelope_headers(
             b"To: \"Lars Delhage\" <lasse@nohup.se>, bare@example.org\r\n\
 Cc: friends: a@x.se, \"B\" <b@x.se>;\r\n\r\n",
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             env.to_addresses,
@@ -1403,7 +1405,9 @@ struct HeaderEnvelope {
 /// attributes leave previous values intact; explicit FLAGS () still clears flags.
 #[derive(Default)]
 struct EnvelopeAccumulator {
-    header: Option<HeaderEnvelope>,
+    /// None means no literal arrived. An error is terminal for this command,
+    /// preventing duplicate FETCHes from masking a header parse failure.
+    header: Option<std::result::Result<HeaderEnvelope, ()>>,
     flags: Vec<String>,
     size: u64,
 }
@@ -1426,8 +1430,10 @@ impl EnvelopeAccumulator {
                     data: Some(header),
                     ..
                 }
-                | AttributeValue::Rfc822Header(Some(header)) => {
-                    self.header = Some(parse_envelope_headers(header));
+                | AttributeValue::Rfc822Header(Some(header))
+                    if !matches!(&self.header, Some(Err(()))) =>
+                {
+                    self.header = Some(parse_envelope_headers(header).ok_or(()));
                 }
                 _ => {}
             }
@@ -1435,7 +1441,7 @@ impl EnvelopeAccumulator {
     }
 
     fn into_envelope(self, uid: u32) -> Option<EnvelopeData> {
-        let header = self.header?;
+        let header = self.header?.ok()?;
         Some(EnvelopeData {
             uid,
             subject: header.subject,
@@ -1459,14 +1465,9 @@ impl EnvelopeAccumulator {
 /// stores. `mailparse::parse_headers` applies RFC 5322 §2.2.3 unfolding and
 /// RFC 2047 decoding, so folded continuation lines don't split a message id in
 /// half and encoded-words arrive already decoded.
-fn parse_envelope_headers(bytes: &[u8]) -> HeaderEnvelope {
-    let Ok((headers, _)) = mailparse::parse_headers(bytes) else {
-        return HeaderEnvelope {
-            to_addresses: "[]".to_string(),
-            cc_addresses: "[]".to_string(),
-            ..Default::default()
-        };
-    };
+/// A structural parse error returns None; a valid empty block remains successful.
+fn parse_envelope_headers(bytes: &[u8]) -> Option<HeaderEnvelope> {
+    let (headers, _) = mailparse::parse_headers(bytes).ok()?;
 
     let mut env = HeaderEnvelope::default();
     let mut from: Option<&mailparse::MailHeader<'_>> = None;
@@ -1501,7 +1502,7 @@ fn parse_envelope_headers(bytes: &[u8]) -> HeaderEnvelope {
     }
     env.to_addresses = addresses_to_json(to);
     env.cc_addresses = addresses_to_json(cc);
-    env
+    Some(env)
 }
 
 #[derive(serde::Serialize)]
@@ -2009,7 +2010,7 @@ a1 OK UID FETCH completed\r\n";
     #[test]
     fn parse_threading_headers_extracts_both() {
         let bytes = b"References: <root@h> <mid@h>\r\nIn-Reply-To: <mid@h>\r\n\r\n";
-        let env = super::parse_envelope_headers(bytes);
+        let env = super::parse_envelope_headers(bytes).unwrap();
         assert_eq!(env.in_reply_to.as_deref(), Some("<mid@h>"));
         assert_eq!(
             env.references,
@@ -2020,7 +2021,7 @@ a1 OK UID FETCH completed\r\n";
     #[test]
     fn parse_threading_headers_unfolds_continuations() {
         let bytes = b"References: <root@h>\r\n <mid@h>\r\n\r\n";
-        let env = super::parse_envelope_headers(bytes);
+        let env = super::parse_envelope_headers(bytes).unwrap();
         assert_eq!(
             env.references,
             vec!["<root@h>".to_string(), "<mid@h>".to_string()]
@@ -2030,7 +2031,7 @@ a1 OK UID FETCH completed\r\n";
     #[test]
     fn parse_threading_headers_handles_only_references() {
         let bytes = b"References: <root@h>\r\n\r\n";
-        let env = super::parse_envelope_headers(bytes);
+        let env = super::parse_envelope_headers(bytes).unwrap();
         assert!(env.in_reply_to.is_none());
         assert_eq!(env.references, vec!["<root@h>".to_string()]);
     }
@@ -2039,17 +2040,37 @@ a1 OK UID FETCH completed\r\n";
     fn parse_threading_headers_normalizes_whitespace() {
         // Server emits a leading space inside the bracketed id.
         let bytes = b"In-Reply-To:  < mid@h >\r\n\r\n";
-        let env = super::parse_envelope_headers(bytes);
+        let env = super::parse_envelope_headers(bytes).unwrap();
         assert_eq!(env.in_reply_to.as_deref(), Some("<mid@h>"));
     }
 
     #[test]
     fn parse_threading_headers_empty_block() {
-        let env = super::parse_envelope_headers(b"");
+        let env = super::parse_envelope_headers(b"").unwrap();
         assert!(env.in_reply_to.is_none());
         assert!(env.references.is_empty());
         assert_eq!(env.to_addresses, "[]");
         assert_eq!(env.cc_addresses, "[]");
+    }
+
+    #[test]
+    fn envelope_header_parse_errors_are_distinct_from_empty_blocks() {
+        for bytes in [
+            b" orphaned continuation\r\n".as_slice(),
+            b"\r",
+            b"Subject: valid prefix\r\n\rbroken",
+        ] {
+            assert!(mailparse::parse_headers(bytes).is_err());
+            assert!(super::parse_envelope_headers(bytes).is_none());
+        }
+    }
+
+    #[test]
+    fn envelope_header_parsing_retains_mailparse_tolerance() {
+        let bytes = b"Colonless line\r\nSubject: Retained\r\n\r\n";
+        assert!(mailparse::parse_headers(bytes).is_ok());
+        let env = super::parse_envelope_headers(bytes).unwrap();
+        assert_eq!(env.subject.as_deref(), Some("Retained"));
     }
 }
 
@@ -2059,7 +2080,7 @@ mod addr_edge_cases {
 
     fn assert_address_headers(value: &str, expected: serde_json::Value) {
         let raw = format!("From: {value}\r\nTo: {value}\r\nCc: {value}\r\n\r\n");
-        let env = parse_envelope_headers(raw.as_bytes());
+        let env = parse_envelope_headers(raw.as_bytes()).unwrap();
         let expected_from = expected
             .as_array()
             .expect("expected address array")
@@ -2302,7 +2323,8 @@ mod addr_edge_cases {
             b"From: J\xf6rg <jorg@example.org>\r\n\
               To: J\xf6rg <jorg@example.org>\r\n\
               Cc: J\xf6rg <jorg@example.org>\r\n\r\n",
-        );
+        )
+        .unwrap();
         assert_eq!(env.from_name.as_deref(), Some("Jörg"));
         assert_eq!(env.from_email.as_deref(), Some("jorg@example.org"));
         let expected = r#"[{"name":"Jörg","email":"jorg@example.org"}]"#;
@@ -2381,13 +2403,13 @@ mod addr_edge_cases {
 
     #[test]
     fn one_malformed_recipient_does_not_drop_the_rest() {
-        let env = parse_envelope_headers(b"To: valid@x.se, bogus\r\n\r\n");
+        let env = parse_envelope_headers(b"To: valid@x.se, bogus\r\n\r\n").unwrap();
         assert_eq!(env.to_addresses, r#"[{"name":null,"email":"valid@x.se"}]"#);
     }
 
     #[test]
     fn empty_list_elements_are_skipped() {
-        let env = parse_envelope_headers(b"To: \"A\" <a@x.se>, , b@x.se\r\n\r\n");
+        let env = parse_envelope_headers(b"To: \"A\" <a@x.se>, , b@x.se\r\n\r\n").unwrap();
         assert_eq!(
             env.to_addresses,
             r#"[{"name":"A","email":"a@x.se"},{"name":null,"email":"b@x.se"}]"#
@@ -2396,7 +2418,8 @@ mod addr_edge_cases {
 
     #[test]
     fn a_comma_inside_a_quoted_display_name_is_not_a_separator() {
-        let env = parse_envelope_headers(b"To: \"Delhage, Lars\" <lasse@nohup.se>, b@x.se\r\n\r\n");
+        let env = parse_envelope_headers(b"To: \"Delhage, Lars\" <lasse@nohup.se>, b@x.se\r\n\r\n")
+            .unwrap();
         assert_eq!(
             env.to_addresses,
             r#"[{"name":"Delhage, Lars","email":"lasse@nohup.se"},{"name":null,"email":"b@x.se"}]"#
@@ -2405,7 +2428,8 @@ mod addr_edge_cases {
 
     #[test]
     fn a_group_stays_one_element() {
-        let env = parse_envelope_headers(b"Cc: friends: a@x.se, \"B\" <b@x.se>;, c@x.se\r\n\r\n");
+        let env = parse_envelope_headers(b"Cc: friends: a@x.se, \"B\" <b@x.se>;, c@x.se\r\n\r\n")
+            .unwrap();
         assert_eq!(
             env.cc_addresses,
             r#"[{"name":null,"email":"a@x.se"},{"name":"B","email":"b@x.se"},{"name":null,"email":"c@x.se"}]"#
@@ -2414,7 +2438,7 @@ mod addr_edge_cases {
 
     #[test]
     fn a_malformed_member_costs_only_itself_inside_a_group() {
-        let env = parse_envelope_headers(b"Cc: friends: a@x.se, bogus;, c@x.se\r\n\r\n");
+        let env = parse_envelope_headers(b"Cc: friends: a@x.se, bogus;, c@x.se\r\n\r\n").unwrap();
         assert_eq!(
             env.cc_addresses,
             r#"[{"name":null,"email":"a@x.se"},{"name":null,"email":"c@x.se"}]"#
@@ -2426,7 +2450,8 @@ mod addr_edge_cases {
         // The comma appears only after decoding; it is part of the name.
         let env = parse_envelope_headers(
             b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, bogus, jane@x.se\r\n\r\n",
-        );
+        )
+        .unwrap();
         assert_eq!(
             env.to_addresses,
             r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#
@@ -2435,7 +2460,7 @@ mod addr_edge_cases {
 
     #[test]
     fn a_sender_without_a_routable_address_yields_none() {
-        let env = parse_envelope_headers(b"From: root\r\n\r\n");
+        let env = parse_envelope_headers(b"From: root\r\n\r\n").unwrap();
         assert!(env.from_email.is_none());
     }
 
@@ -2443,7 +2468,8 @@ mod addr_edge_cases {
     fn a_comma_inside_a_parenthesized_comment_is_not_a_separator() {
         let env = parse_envelope_headers(
             b"To: John Doe (Sales, West) <john@example.com>, jane@example.com\r\n\r\n",
-        );
+        )
+        .unwrap();
         assert_eq!(
             env.to_addresses,
             r#"[{"name":"John Doe","email":"john@example.com"},{"name":null,"email":"jane@example.com"}]"#
@@ -2479,7 +2505,8 @@ mod addr_edge_cases {
         // Each isolated raw item is decoded and parsed together, keeping the
         // encoded comma inside the display-name token.
         let env =
-            parse_envelope_headers(b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, jane@x.se\r\n\r\n");
+            parse_envelope_headers(b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, jane@x.se\r\n\r\n")
+                .unwrap();
         assert_eq!(
             env.to_addresses,
             r#"[{"name":"Doe, John","email":"john@x.se"},{"name":null,"email":"jane@x.se"}]"#

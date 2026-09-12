@@ -112,9 +112,17 @@ clear earlier flags.
 
 After successful command completion, emit one envelope per UID in the
 order its first header arrived. Duplicate input UIDs are removed before
-chunking, and unrequested UIDs are ignored. A requested UID without a
-header literal is reported as failed for retry, rather than inserting a
-blank message. A present zero-byte header literal remains a valid result.
+chunking, and unrequested UIDs are ignored. A requested UID with a missing
+header literal or a header parse error is reported as failed for retry,
+rather than inserting a blank message. A present zero-byte header literal
+remains a valid result.
+
+A header parse error is terminal for that UID within the current command:
+duplicate FETCH responses cannot mask it. Other UIDs remain usable, and a
+later command starts with fresh parse state. Malformed message headers do
+not poison an otherwise synchronized IMAP connection. Header parsing retains
+the underlying library's existing tolerance; only actual parse failures
+trigger this retry behavior.
 
 ## Consequences
 
