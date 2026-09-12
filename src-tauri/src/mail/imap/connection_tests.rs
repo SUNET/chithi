@@ -255,6 +255,341 @@ fn all_fetch_methods_tolerate_keepalives_and_preserve_payloads() {
 }
 
 #[test]
+fn overlapping_folder_sync_rereads_checkpoint_after_waiting() {
+    assert_serialized_folder_sync(false);
+}
+
+#[test]
+fn uidvalidity_reset_waits_for_inflight_folder_sync() {
+    assert_serialized_folder_sync(true);
+}
+
+fn assert_serialized_folder_sync(epoch_change: bool) {
+    use crate::db::{self, pool::DbPool};
+    use crate::mail::sync::sync_folder_envelopes_public;
+    use std::time::Instant;
+
+    const ACCOUNT: &str = "serialized-sync-test";
+    const HEADER_FIELDS: &str = "(SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)";
+    const BODY_LINK: &str = "cached/body-must-survive.eml";
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        AFetchingEnvelope,
+        BEnteredSync,
+        BSelected,
+    }
+
+    // Release A before scoped threads are joined, including on assertion failure.
+    struct ReleaseA(mpsc::Sender<()>);
+
+    impl Drop for ReleaseA {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn selected(peer: &mut Peer, tag: &str, epoch: u32, uid_next: u32) {
+        respond(
+            peer,
+            &format!(
+                "* FLAGS (\\Seen)\r\n* 2 EXISTS\r\n* 0 RECENT\r\n\
+                 * OK [UIDVALIDITY {epoch}] valid\r\n* OK [UIDNEXT {uid_next}] next\r\n\
+                 {tag} OK [READ-WRITE] selected\r\n"
+            ),
+        );
+    }
+
+    fn envelope_command(peer: &mut Peer, uid_set: &str) -> String {
+        command(
+            peer,
+            &format!(
+                "UID FETCH {uid_set} (UID FLAGS RFC822.SIZE \
+                 BODY.PEEK[HEADER.FIELDS {HEADER_FIELDS}])\r\n"
+            ),
+        )
+    }
+
+    fn envelopes(peer: &mut Peer, tag: &str, entries: &[(u32, u32)]) {
+        for &(sequence, uid) in entries {
+            let headers = format!(
+                "Subject: Serialized {uid}\r\n\
+                 From: Sender <sender@example.test>\r\n\
+                 To: Recipient <recipient@example.test>\r\n\
+                 Date: Sat, 12 Sep 2026 12:00:00 +0000\r\n\
+                 Message-ID: <serialized-{uid}@example.test>\r\n\r\n"
+            );
+            respond(
+                peer,
+                &format!(
+                    "* {sequence} FETCH (UID {uid} FLAGS () RFC822.SIZE 512 \
+                     BODY[HEADER.FIELDS {HEADER_FIELDS}] {{{}}}\r\n{headers})\r\n",
+                    headers.len()
+                ),
+            );
+        }
+        respond(peer, &format!("{tag} OK fetched\r\n"));
+    }
+
+    fn config(address: SocketAddr) -> super::ImapConfig {
+        super::ImapConfig {
+            host: address.ip().to_string(),
+            port: address.port(),
+            username: "test".to_string(),
+            password: "test".to_string(),
+            use_tls: true,
+            use_xoauth2: false,
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DbPool::new(&temp.path().join("serialized-sync.db"), 2).unwrap());
+    {
+        let conn = runtime.block_on(db.writer());
+        db::schema::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES (?1, 'Test', 'recipient@example.test', 'test')",
+            [ACCOUNT],
+        )
+        .unwrap();
+        db::folders::upsert_folder(&conn, ACCOUNT, "INBOX", "INBOX", Some("inbox"), None).unwrap();
+        db::folders::update_uid_state(&conn, ACCOUNT, "INBOX", 1, 9001).unwrap();
+        db::folders::update_last_seen_uid(&conn, ACCOUNT, "INBOX", 9000).unwrap();
+        db::folders::update_folder_counts(&conn, ACCOUNT, "INBOX", 1, 1).unwrap();
+        conn.execute(
+            "INSERT INTO messages
+             (id, account_id, folder_path, uid, subject, from_email, date, maildir_path)
+             VALUES ('existing-uid-9000', ?1, 'INBOX', 9000, 'Serialized 9000',
+                     'sender@example.test', '2026-09-12T12:00:00+00:00', '')",
+            [ACCOUNT],
+        )
+        .unwrap();
+    }
+
+    let assert_state = |expected_uids: &[u32], epoch: u32, uid_next: u32| {
+        let conn = db.reader();
+        assert_eq!(
+            db::folders::get_last_seen_uid(&conn, ACCOUNT, "INBOX").unwrap(),
+            *expected_uids.last().unwrap()
+        );
+        assert_eq!(
+            db::folders::get_folder_sync_state(&conn, ACCOUNT, "INBOX").unwrap(),
+            (epoch, uid_next, expected_uids.len() as i64)
+        );
+        let mut stmt = conn
+            .prepare(
+                "SELECT uid, subject, from_email FROM messages
+                 WHERE account_id = ?1 AND folder_path = 'INBOX' ORDER BY uid",
+            )
+            .unwrap();
+        let messages: Vec<(u32, String, String)> = stmt
+            .query_map([ACCOUNT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let expected: Vec<_> = expected_uids
+            .iter()
+            .map(|&uid| {
+                (
+                    uid,
+                    format!("Serialized {uid}"),
+                    "sender@example.test".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(messages, expected);
+    };
+    assert_state(&[9000], 1, 9001);
+
+    let (epoch, uid_next, expected_uids): (u32, u32, &[u32]) = if epoch_change {
+        (2, 3, &[1, 2])
+    } else {
+        (1, 10001, &[9000, 10000])
+    };
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address_b = listener_b.local_addr().unwrap();
+    let (events, wait_event) = mpsc::channel();
+    let (release_a, wait_release_a) = mpsc::channel();
+    // The registry is weak: only this probe, A's owned guard and B's waiter
+    // contribute strong references while A is stopped before its final writes.
+    let lock = db.imap_folder_sync_lock(ACCOUNT, "INBOX");
+
+    std::thread::scope(|scope| {
+        let release_a = ReleaseA(release_a);
+        let events = &events;
+        let db = &db;
+        let runtime = &runtime;
+        let assert_state = &assert_state;
+        let server_a = scope.spawn(move || {
+            let mut peer = accept_session(&listener_a);
+            drop(listener_a);
+            let tag = command(&mut peer, "SELECT \"INBOX\"\r\n");
+            selected(&mut peer, &tag, 1, 10001);
+            for (spec, response) in [
+                (
+                    "1:* UID",
+                    "* 1 FETCH (UID 9000)\r\n* 2 FETCH (UID 10000)\r\n",
+                ),
+                (
+                    "1:* (UID FLAGS)",
+                    "* 1 FETCH (UID 9000 FLAGS ())\r\n* 2 FETCH (UID 10000 FLAGS ())\r\n",
+                ),
+                ("9001:* UID", "* 2 FETCH (UID 10000)\r\n"),
+            ] {
+                let tag = command(&mut peer, &format!("UID FETCH {spec}\r\n"));
+                respond(&mut peer, &format!("{response}{tag} OK fetched\r\n"));
+            }
+            let tag = envelope_command(&mut peer, "10000");
+            events.send(Event::AFetchingEnvelope).unwrap();
+            wait_release_a
+                .recv_timeout(TIMEOUT)
+                .expect("A was not released at its last envelope command");
+            envelopes(&mut peer, &tag, &[(2, 10000)]);
+            finish_logout(&mut peer);
+        });
+        let server_b = scope.spawn(move || {
+            let mut peer = accept_session(&listener_b);
+            drop(listener_b);
+            let tag = command(&mut peer, "SELECT \"INBOX\"\r\n");
+            events.send(Event::BSelected).unwrap();
+            // A's watermark, rows and final preflight metadata must all be
+            // committed before B can SELECT, let alone reset the UID epoch.
+            assert_state(&[9000, 10000], 1, 10001);
+            selected(&mut peer, &tag, epoch, uid_next);
+            if epoch_change {
+                let tag = command(&mut peer, "UID FETCH 1:* UID\r\n");
+                respond(
+                    &mut peer,
+                    &format!("* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2)\r\n{tag} OK fetched\r\n"),
+                );
+                let tag = envelope_command(&mut peer, "2,1");
+                envelopes(&mut peer, &tag, &[(2, 2), (1, 1)]);
+            }
+            // In the same epoch, B must use A's fresh checkpoint and issue
+            // no FETCH at all. The third pass is SELECT-only in both cases.
+            let tag = command(&mut peer, "SELECT \"INBOX\"\r\n");
+            selected(&mut peer, &tag, epoch, uid_next);
+            finish_logout(&mut peer);
+        });
+        let client_a = scope.spawn(move || {
+            // Enter a runtime without block_on: sync itself blocks on DB writes.
+            let _entered = runtime.enter();
+            let mut connection = connect_session(address_a, None);
+            let result = sync_folder_envelopes_public(
+                db,
+                ACCOUNT,
+                &mut connection,
+                "INBOX",
+                &config(address_a),
+            );
+            connection.logout();
+            result.unwrap()
+        });
+
+        assert_eq!(
+            wait_event.recv_timeout(TIMEOUT).unwrap(),
+            Event::AFetchingEnvelope
+        );
+        assert_state(&[9000], 1, 9001);
+        let client_b = scope.spawn(move || {
+            let _entered = runtime.enter();
+            let mut connection = connect_session(address_b, None);
+            let config = config(address_b);
+            events.send(Event::BEnteredSync).unwrap();
+            assert_eq!(
+                sync_folder_envelopes_public(db, ACCOUNT, &mut connection, "INBOX", &config)
+                    .unwrap(),
+                if epoch_change { 2 } else { 0 }
+            );
+            assert_state(expected_uids, epoch, uid_next);
+
+            let cached_uid = *expected_uids.last().unwrap();
+            {
+                let conn = runtime.block_on(db.writer());
+                assert_eq!(
+                    conn.execute(
+                        "UPDATE messages SET maildir_path = ?3
+                         WHERE account_id = ?1 AND folder_path = 'INBOX' AND uid = ?2",
+                        rusqlite::params![ACCOUNT, cached_uid, BODY_LINK],
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            let cached_row = || {
+                let conn = db.reader();
+                conn.query_row(
+                    "SELECT rowid, id, maildir_path FROM messages
+                     WHERE account_id = ?1 AND folder_path = 'INBOX' AND uid = ?2",
+                    rusqlite::params![ACCOUNT, cached_uid],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+            let before = cached_row();
+            assert_eq!(before.2, BODY_LINK);
+            assert_eq!(
+                sync_folder_envelopes_public(db, ACCOUNT, &mut connection, "INBOX", &config)
+                    .unwrap(),
+                0
+            );
+            assert_state(expected_uids, epoch, uid_next);
+            assert_eq!(
+                cached_row(),
+                before,
+                "unchanged sync rebuilt the cached row"
+            );
+            assert!(!connection.is_poisoned());
+            connection.logout();
+        });
+
+        assert_eq!(
+            wait_event.recv_timeout(TIMEOUT).unwrap(),
+            Event::BEnteredSync
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match wait_event.try_recv() {
+                Ok(event) => panic!("B reached SELECT while A was paused: {event:?}"),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => panic!("sync event channel closed"),
+            }
+            if Arc::strong_count(&lock) == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B neither waited on A's folder lock nor issued SELECT"
+            );
+            std::thread::yield_now();
+        }
+        assert!(lock.try_lock().is_err(), "A must still own the folder lock");
+        assert_state(&[9000], 1, 9001);
+        drop(release_a);
+        assert_eq!(wait_event.recv_timeout(TIMEOUT).unwrap(), Event::BSelected);
+
+        assert_eq!(client_a.join().unwrap(), 1);
+        client_b.join().unwrap();
+        server_a.join().unwrap();
+        server_b.join().unwrap();
+    });
+    assert_state(expected_uids, epoch, uid_next);
+}
+
+#[test]
 fn interrupted_body_literals_fail_and_close_the_connection() {
     for batch in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

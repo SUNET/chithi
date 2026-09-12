@@ -319,6 +319,12 @@ fn sync_folder_envelopes(
     folder_path: &str,
     imap_config: &ImapConfig,
 ) -> Result<u32> {
+    // The blocking pass owns this guard, including filters and final metadata.
+    // A queued sync must read its checkpoint only after the previous pass exits.
+    let _folder_sync = db
+        .imap_folder_sync_lock(account_id, folder_path)
+        .blocking_lock_owned();
+
     let (mut last_uid, stored_uid_validity, stored_uid_next, stored_total) = {
         let conn = db.reader();
         let last_uid = db::folders::get_last_seen_uid(&conn, account_id, folder_path)?;

@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use rusqlite::Connection;
 
@@ -29,7 +31,10 @@ pub struct DbPool {
     writer: tokio::sync::Mutex<Connection>,
     readers: Vec<std::sync::Mutex<Connection>>,
     next_reader: AtomicUsize,
+    imap_folder_sync_locks: std::sync::Mutex<FolderSyncLockMap>,
 }
+
+type FolderSyncLockMap = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
 
 impl DbPool {
     /// Create a new pool with one writer and `reader_count` reader connections.
@@ -43,6 +48,7 @@ impl DbPool {
             writer: tokio::sync::Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
+            imap_folder_sync_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -51,6 +57,30 @@ impl DbPool {
     /// Only one task can hold this at a time.  Prefer short transactions.
     pub async fn writer(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.writer.lock().await
+    }
+
+    /// Coordinate IMAP syncs sharing this pool by account and raw folder path.
+    /// Acquire the returned mutex before reading sync state, without holding a
+    /// database reader/writer guard, and retain it through the complete pass.
+    /// Holders and waiters keep the weak registry entry alive; unused entries
+    /// are pruned on the next lookup.
+    pub(crate) fn imap_folder_sync_lock(
+        &self,
+        account_id: &str,
+        folder_path: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .imap_folder_sync_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (account_id.to_string(), folder_path.to_string());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     /// Acquire a read-only connection (non-blocking round-robin).
@@ -95,6 +125,9 @@ fn open_reader(db_path: &Path) -> Result<Connection> {
     .map_err(Error::Database)?;
     Ok(conn)
 }
+
+#[cfg(test)]
+mod sync_lock_tests;
 
 #[cfg(test)]
 mod tests {

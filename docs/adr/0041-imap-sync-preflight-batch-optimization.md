@@ -79,6 +79,27 @@ for (uid, new_flags) in uid_flags {
 | Total queries per sync cycle | ~39,000 | ~10 |
 | Dormant folder cost | Full IMAP fetch + N queries | 1 SELECT (preflight) |
 
+### 4. Serialize sync passes for the same folder
+
+An atomic forward-only watermark update is meaningful only within one
+UIDVALIDITY epoch. The database writer mutex serializes transactions, but
+does not prevent an old sync pass from writing after another pass resets
+the folder's epoch.
+
+Each shared `DbPool` therefore owns a weak lock registry keyed by account
+ID and raw folder path. All IMAP envelope-sync paths use a common helper
+that acquires the lock before reading the checkpoint or issuing its
+SELECT, and holds it through reconciliation, filters, and final counts/UID
+metadata. Callers may establish connections before entering this helper.
+Database reader and writer guards remain short-lived and are acquired afterward.
+Different folders, accounts, and pool instances have independent locks;
+unused registry entries are pruned on subsequent lookups.
+
+The guard belongs to the synchronous pass itself. Errors and panics release
+it, but cancelling an async caller does not release it while its detached
+blocking work is still running. This coordinates envelope-sync passes,
+not every user operation or body-prefetch task.
+
 ## Consequences
 
 ### Positive
@@ -88,6 +109,8 @@ for (uid, new_flags) in uid_flags {
 - No behavioral change — preflight only triggers when folder is provably unchanged
 
 ### Negative
+- A same-folder refresh waits for an active pass to finish, which can delay
+  queued work during a long sync. Unrelated folders can still sync in parallel.
 - If a server doesn't report `UIDNEXT` (returns 0), the preflight is skipped and full sync runs (safe fallback)
 - The preflight check relies on `UIDNEXT` + `EXISTS` being sufficient indicators of change. Edge case: if a message is deleted and another added (EXISTS unchanged, UIDNEXT incremented), this is correctly detected because UIDNEXT changes
 - The `uid_next` column adds a small schema migration (ALTER TABLE on existing DBs)
@@ -100,3 +123,4 @@ for (uid, new_flags) in uid_flags {
   (later superseded by `update_uid_state` to update UIDVALIDITY atomically)
 - `src-tauri/src/db/messages.rs` — `sync_flags_by_uid` rewritten to bulk query + HashMap
 - `src-tauri/src/db/schema.rs` — `uid_next` column in CREATE TABLE + ALTER TABLE migration
+- `src-tauri/src/db/pool.rs` — per-account/folder IMAP sync lock registry
