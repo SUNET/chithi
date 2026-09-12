@@ -10,6 +10,10 @@ The log file can provide additional context; see
 Do not post logs publicly without checking them for email addresses,
 server names, message metadata, and other personal information.
 
+IMAP parser diagnostics retain command context, error categories, and
+byte counts, but redact raw response payloads. This does not anonymize
+other log entries or remove private data logged by earlier versions.
+
 ## Provider sign-in does not complete
 
 - Leave Chithi running while the sign-in flow is open.
