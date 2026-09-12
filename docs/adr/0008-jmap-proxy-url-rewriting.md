@@ -37,6 +37,7 @@ Replaced `jmap-client`'s HTTP layer with direct `reqwest` calls for all JMAP ope
 ## Consequences
 
 - Works reliably with Stalwart behind nginx reverse proxy without any server-side configuration changes.
-- The `jmap-client` crate is still in `Cargo.toml` but unused for HTTP operations — it could be removed in the future.
+- JMAP uses the project-owned `JmapConnection` and direct `reqwest`
+  calls; the external `jmap-client` crate is not a dependency.
 - Each JMAP API call includes explicit authentication, which is slightly more verbose but ensures credentials are always sent regardless of redirect behavior.
 - The URL rewriting is simple string manipulation (not URL parsing) to preserve template placeholders with curly braces that `url::Url` would percent-encode.
