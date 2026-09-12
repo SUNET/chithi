@@ -69,6 +69,8 @@ pub struct EnvelopeBatch {
 
 pub struct ImapConnection {
     session: Session<TlsStream<TcpStream>>,
+    /// A shutdown handle: imap::Session does not expose its underlying stream.
+    socket: TcpStream,
     idle_control: Option<std::sync::Arc<IdleControl>>,
     /// Set once a failure has left unread bytes in the socket. See
     /// [`ImapConnection::is_poisoned`].
@@ -207,9 +209,8 @@ impl ImapConnection {
         Self::connect_inner(config, None)
     }
 
-    /// True once a failure has left unread bytes in the socket. Nothing read
-    /// from this connection afterwards can be trusted; callers holding one
-    /// across several folders must drop it and reconnect.
+    /// True once a failure has desynchronized the stream and shut down its
+    /// socket. Callers holding one across several folders must replace it.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -220,6 +221,16 @@ impl ImapConnection {
         log_imap_parse_payload(context, e);
         if !self.poisoned && leaves_stream_desynchronized(e) {
             self.poisoned = true;
+            // Release the server's connection slot before any caller reconnects,
+            // even while the Session or an IDLE socket clone is still alive.
+            if let Err(error) = self.socket.shutdown(std::net::Shutdown::Both) {
+                if error.kind() != std::io::ErrorKind::NotConnected {
+                    log::warn!("Failed to shut down poisoned IMAP socket: {error}");
+                }
+            }
+            if let Some(control) = self.idle_control.take() {
+                control.clear_socket();
+            }
             log::error!(
                 "{}: response stream left desynchronized; connection must not be reused",
                 context
@@ -272,6 +283,9 @@ impl ImapConnection {
             );
             Error::Imap(e.to_string())
         })?;
+        let socket = stream
+            .try_clone()
+            .map_err(|e| Error::Imap(format!("Failed to retain IMAP shutdown handle: {e}")))?;
         if let Some(control) = &idle_control {
             control
                 .register_socket(&stream)
@@ -326,6 +340,7 @@ impl ImapConnection {
         log::info!("IMAP authenticated as {}", config.username);
         Ok(Self {
             session,
+            socket,
             idle_control,
             poisoned: false,
         })
@@ -829,13 +844,18 @@ impl ImapConnection {
     }
 
     pub fn logout(mut self) {
-        log::debug!("IMAP logging out");
-        self.session.logout().ok();
+        if !self.poisoned {
+            log::debug!("IMAP logging out");
+            self.session.logout().ok();
+        }
         if let Some(control) = &self.idle_control {
             control.clear_socket();
         }
     }
 }
+
+#[cfg(test)]
+mod connection_tests;
 
 fn idle_outcome_has_notification(outcome: imap::extensions::idle::WaitOutcome) -> bool {
     outcome == imap::extensions::idle::WaitOutcome::MailboxChanged
@@ -1390,6 +1410,127 @@ struct AddrJson {
     email: String,
 }
 
+/// Track the regions where address punctuation is literal, before RFC 2047
+/// decoding. Comments nest; quotes, comments and domain literals admit escapes.
+#[derive(Default)]
+struct AddressSyntax {
+    quoted: bool,
+    escaped: bool,
+    comment_depth: usize,
+    literal: bool,
+    invalid: bool,
+}
+
+impl AddressSyntax {
+    fn is_structural(&mut self, c: char) -> bool {
+        if c.is_control() && c != '\t' {
+            self.invalid = true;
+        }
+        if self.escaped {
+            self.escaped = false;
+        } else if self.comment_depth > 0 {
+            match c {
+                '\\' => self.escaped = true,
+                '(' => self.comment_depth += 1,
+                ')' => self.comment_depth -= 1,
+                _ => {}
+            }
+        } else if self.quoted {
+            match c {
+                '\\' => self.escaped = true,
+                '"' => self.quoted = false,
+                _ => {}
+            }
+        } else if self.literal {
+            match c {
+                '\\' => self.escaped = true,
+                ']' => self.literal = false,
+                '[' => self.invalid = true,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => self.quoted = true,
+                '(' => self.comment_depth = 1,
+                '[' => self.literal = true,
+                ')' | ']' => self.invalid = true,
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    fn is_balanced(&self) -> bool {
+        !self.invalid && !self.quoted && !self.escaped && !self.literal && self.comment_depth == 0
+    }
+}
+
+/// Encoded words are opaque to address delimiters, including the nonconforming
+/// raw Q punctuation that mailparse tolerates. Decoding still happens per name.
+fn address_syntax_chars(value: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut encoded_until = 0;
+    let mut syntax = AddressSyntax::default();
+    let mut angle = false;
+    value.char_indices().filter(move |&(index, c)| {
+        if index < encoded_until {
+            return false;
+        }
+        if !angle
+            && !syntax.quoted
+            && !syntax.literal
+            && !syntax.escaped
+            && value[..index]
+                .chars()
+                .next_back()
+                .is_none_or(is_encoded_address_boundary)
+        {
+            if let Some(length) = encoded_address_word_len(&value[index..]) {
+                if value[index + length..]
+                    .chars()
+                    .next()
+                    .is_none_or(is_encoded_address_boundary)
+                {
+                    encoded_until = index + length;
+                    return false;
+                }
+            }
+        }
+        if syntax.is_structural(c) {
+            match c {
+                '<' => angle = true,
+                '>' => angle = false,
+                _ => {}
+            }
+        }
+        true
+    })
+}
+
+fn is_encoded_address_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '(' | ')' | '<' | '>' | ',' | ':' | ';')
+}
+
+fn encoded_address_word_len(value: &str) -> Option<usize> {
+    let (charset, rest) = value.strip_prefix("=?")?.split_once('?')?;
+    if charset.is_empty() || charset.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let payload = rest
+        .strip_prefix("Q?")
+        .or_else(|| rest.strip_prefix("q?"))
+        .or_else(|| rest.strip_prefix("B?"))
+        .or_else(|| rest.strip_prefix("b?"))?;
+    let end = payload.find("?=")?;
+    if payload[..end].is_empty()
+        || payload[..end]
+            .chars()
+            .any(|c| c.is_whitespace() || c == '?')
+    {
+        return None;
+    }
+    Some(value.len() - payload.len() + end + 2)
+}
+
 /// Split an address header value on the commas that actually separate
 /// mailboxes — not those inside a quoted display name (`"Delhage, Lars"`), an
 /// angle-bracketed address, an RFC 5322 group (`friends: a@x, b@x;`), or a
@@ -1398,24 +1539,18 @@ struct AddrJson {
 /// a quoted string's.
 fn split_address_list(value: &str) -> Vec<&str> {
     let mut items = Vec::new();
-    let (mut start, mut quoted, mut escaped, mut angle, mut group) =
-        (0, false, false, false, false);
-    let mut comment_depth: u32 = 0;
-    for (i, c) in value.char_indices() {
-        if escaped {
-            escaped = false;
+    let (mut start, mut angle, mut group_depth) = (0, false, 0usize);
+    let mut syntax = AddressSyntax::default();
+    for (i, c) in address_syntax_chars(value) {
+        if !syntax.is_structural(c) {
             continue;
         }
         match c {
-            '\\' if quoted || comment_depth > 0 => escaped = true,
-            '"' if comment_depth == 0 => quoted = !quoted,
-            '(' if !quoted => comment_depth += 1,
-            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
-            '<' if !quoted && comment_depth == 0 => angle = true,
-            '>' if !quoted && comment_depth == 0 => angle = false,
-            ':' if !quoted && !angle && comment_depth == 0 => group = true,
-            ';' if !quoted && !angle && comment_depth == 0 => group = false,
-            ',' if !quoted && !angle && !group && comment_depth == 0 => {
+            '<' => angle = true,
+            '>' => angle = false,
+            ':' if !angle => group_depth += 1,
+            ';' if !angle => group_depth = group_depth.saturating_sub(1),
+            ',' if !angle && group_depth == 0 => {
                 items.push(&value[start..i]);
                 start = i + c.len_utf8();
             }
@@ -1437,29 +1572,9 @@ fn split_address_list(value: &str) -> Vec<&str> {
 /// RFC 5322 group syntax (`To: undisclosed-recipients:;`) contributes its
 /// members and nothing for the group name itself.
 fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
-    // The whole-header parser applies RFC 2047 decoding and RFC 5322 syntax
-    // (quoting, comments, groups) together, correctly -- it can't mistake a
-    // comma a decoded encoded-word legally contains
-    // (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) for a separator,
-    // because it decodes and splits in one pass. It fails outright on one
-    // malformed element (missing `@`), which the fallback below handles by
-    // parsing one address at a time so a bad element costs only itself -- but
-    // a stray empty element between two commas doesn't make it fail, it makes
-    // it fold the empty element into its neighbor's address (e.g. ", b@x.se"),
-    // so a plain `is_ok()` check isn't enough; the addresses it produced need
-    // to look sane too.
-    if let Ok(parsed) = mailparse::addrparse_header(header) {
-        let addrs = flatten_addrs(&parsed);
-        if addrs.iter().all(|a| is_clean_email(&a.email)) {
-            return addrs;
-        }
-    }
-
-    // The fallback must split *before* decoding: an encoded word never
-    // contains a literal comma (its `=2C`/base64 payload is plain ASCII
-    // text, not one), so splitting the raw value can't be fooled by a comma
-    // that only appears after RFC 2047 decoding -- unlike splitting
-    // `get_value()`, which already decoded it.
+    // Always split raw syntax first: mailparse can successfully swallow a
+    // bare quoted local part into the following mailbox's display name.
+    // Encoded commas must remain encoded until each item has been isolated.
     let raw = unfold_header_value(header.get_value_raw());
     let mut out = Vec::new();
     for item in split_address_list(&raw) {
@@ -1478,7 +1593,13 @@ fn header_addresses(header: &mailparse::MailHeader<'_>) -> Vec<AddrJson> {
 /// decoding, so it only ever sees plain structural bytes -- an encoded word
 /// is pure ASCII and contains no line breaks of its own.
 fn unfold_header_value(bytes: &[u8]) -> String {
-    let raw = String::from_utf8_lossy(bytes);
+    // Match mailparse's UTF-8/Latin-1 handling without decoding encoded words.
+    let raw = match std::str::from_utf8(bytes) {
+        Ok(raw) => std::borrow::Cow::Borrowed(raw),
+        Err(_) => {
+            std::borrow::Cow::Owned(bytes.iter().copied().map(char::from).collect::<String>())
+        }
+    };
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1495,45 +1616,101 @@ fn unfold_header_value(bytes: &[u8]) -> String {
     out
 }
 
-/// Parse one *raw, undecoded* address-list element (as isolated by
-/// [`split_address_list`] on the raw header value), recovering as much as
-/// possible on failure.
-///
-/// Goes through [`addrparse_raw_item`] rather than [`mailparse::addrparse`]
-/// directly so decoding and address-syntax parsing happen together, the same
-/// way [`mailparse::addrparse_header`] does it for the whole header: a
-/// decoded encoded word becomes one atomic token there, so a comma it
-/// introduces (`=?utf-8?q?Doe=2C_John?=` decodes to `Doe, John`) can't be
-/// mistaken for a separator. Decoding the item to a plain `String` first and
-/// handing that to `addrparse` would lose that protection -- `addrparse`
-/// treats its input as literal text, so the now-literal comma would be
-/// re-split on exactly as if it had appeared in the original header.
-///
-/// A malformed group (`"friends: a@x.se, bogus;"`) is one element by
-/// `split_address_list`'s reckoning — it doesn't split on commas inside a
-/// group — so `addrparse_header` rejects the whole thing over the one bad
-/// member, the same all-or-nothing loss the per-item fallback exists to
-/// avoid, one level deeper. On that failure, split the group's own member
-/// list and recover members individually.
+/// Parse a raw mailbox or a single, terminated group. Group members take the
+/// same mailbox path as top-level recipients, including empty/bad members.
 fn parse_address_item(item: &str) -> Vec<AddrJson> {
-    if let Ok(parsed) = addrparse_raw_item(item) {
-        return flatten_addrs(&parsed);
-    }
-    let trimmed = item.trim();
-    let Some(colon) = find_group_colon(trimmed) else {
-        return Vec::new();
-    };
-    let inner = trimmed[colon + 1..].trim().trim_end_matches(';');
-    let mut out = Vec::new();
-    for member in split_address_list(inner) {
-        if member.trim().is_empty() {
+    let mut syntax = AddressSyntax::default();
+    let (mut angle, mut colon, mut terminator) = (false, None, None);
+    for (i, c) in address_syntax_chars(item) {
+        if !syntax.is_structural(c) {
             continue;
         }
-        if let Ok(parsed) = addrparse_raw_item(member) {
-            out.extend(flatten_addrs(&parsed));
+        match c {
+            '<' => angle = true,
+            '>' => angle = false,
+            ':' if !angle => {
+                if colon.replace(i).is_some() {
+                    return Vec::new();
+                }
+            }
+            ';' if !angle => {
+                if colon.is_none() || terminator.replace(i).is_some() {
+                    return Vec::new();
+                }
+                // A member's stray closing delimiter must not reject siblings.
+                // The label and each member are validated independently below.
+                syntax.invalid = false;
+            }
+            _ => {}
         }
     }
-    out
+    if angle || !syntax.is_balanced() {
+        return Vec::new();
+    }
+    if let Some(colon) = colon {
+        let Some(end) = terminator else {
+            return Vec::new();
+        };
+        if !is_address_cfws(&item[end + 1..]) {
+            return Vec::new();
+        }
+        // Validate the raw display-name independently of malformed members.
+        let named = format!("{}<group@invalid>", &item[..colon]);
+        if is_address_cfws(&item[..colon]) || parse_address_mailbox(&named).is_none() {
+            return Vec::new();
+        }
+        return split_address_list(&item[colon + 1..end])
+            .into_iter()
+            .filter_map(parse_address_mailbox)
+            .collect();
+    }
+    parse_address_mailbox(item).into_iter().collect()
+}
+
+/// Preserve addr-spec spelling, especially quoted local parts. A placeholder
+/// angle address lets mailparse decode the original name without treating a
+/// quoted `>` in the real local part as the end of the address.
+fn parse_address_mailbox(item: &str) -> Option<AddrJson> {
+    let item = item.trim();
+    if let Some(bare) = without_address_comments(item) {
+        if is_clean_email(bare.trim()) {
+            return Some(AddrJson {
+                name: None,
+                email: bare.trim().to_string(),
+            });
+        }
+    }
+
+    let mut syntax = AddressSyntax::default();
+    let (mut left, mut right, mut bare_at) = (None, None, false);
+    for (i, c) in address_syntax_chars(item) {
+        if !syntax.is_structural(c) {
+            continue;
+        }
+        match c {
+            '<' if left.is_none() && !bare_at => left = Some(i),
+            '>' if left.is_some() && right.is_none() => right = Some(i),
+            '<' | '>' => return None,
+            '@' if left.is_none() => bare_at = true,
+            ',' | ':' | ';' if left.is_none() || right.is_some() => return None,
+            _ => {}
+        }
+    }
+    if !syntax.is_balanced() {
+        return None;
+    }
+    let (left, right) = (left?, right?);
+    let email = without_address_comments(&item[left + 1..right])?;
+    let email = email.trim();
+    if !is_clean_email(email) || !is_address_cfws(&item[right + 1..]) {
+        return None;
+    }
+    let named = format!("{}<mailbox@invalid>", &item[..left]);
+    let mailbox = addrparse_raw_item(&named).ok()?.extract_single_info()?;
+    Some(AddrJson {
+        name: mailbox.display_name,
+        email: email.to_string(),
+    })
 }
 
 /// Decode and parse one raw (undecoded) address-list element as a mailbox.
@@ -1549,54 +1726,117 @@ fn addrparse_raw_item(
     mailparse::addrparse_header(&header)
 }
 
-/// Index of the `:` that introduces a group's member list, ignoring any `:`
-/// inside quotes, comments, or an angle-addr — mirrors the state
-/// [`split_address_list`] tracks for the same character.
-fn find_group_colon(value: &str) -> Option<usize> {
-    let (mut quoted, mut escaped, mut angle) = (false, false, false);
-    let mut comment_depth: u32 = 0;
-    for (i, c) in value.char_indices() {
-        if escaped {
-            escaped = false;
+/// Only comments and folding whitespace may follow an angle address/group.
+fn is_address_cfws(value: &str) -> bool {
+    let mut syntax = AddressSyntax::default();
+    for c in value.chars() {
+        let comment = syntax.comment_depth > 0 || c == '(';
+        let structural = syntax.is_structural(c);
+        if !comment && !(structural && matches!(c, ' ' | '\t')) {
+            return false;
+        }
+    }
+    syntax.is_balanced()
+}
+
+/// Comments are CFWS, not part of the addr-spec. Leave quoted parentheses
+/// alone and retain a word boundary so comments cannot join invalid tokens.
+fn without_address_comments(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !value.contains('(') {
+        return Some(std::borrow::Cow::Borrowed(value));
+    }
+    let mut syntax = AddressSyntax::default();
+    let mut out = String::with_capacity(value.len());
+    let mut comment_boundary = false;
+    for c in value.chars() {
+        let comment = syntax.comment_depth > 0 || (c == '(' && !syntax.quoted && !syntax.literal);
+        syntax.is_structural(c);
+        if comment {
+            comment_boundary = true;
             continue;
         }
-        match c {
-            '\\' if quoted || comment_depth > 0 => escaped = true,
-            '"' if comment_depth == 0 => quoted = !quoted,
-            '(' if !quoted => comment_depth += 1,
-            ')' if !quoted && comment_depth > 0 => comment_depth -= 1,
-            '<' if !quoted && comment_depth == 0 => angle = true,
-            '>' if !quoted && comment_depth == 0 => angle = false,
-            ':' if !quoted && !angle && comment_depth == 0 => return Some(i),
-            _ => {}
+        if comment_boundary && !out.ends_with(char::is_whitespace) && !c.is_whitespace() {
+            out.push(' ');
         }
+        comment_boundary = false;
+        out.push(c);
     }
-    None
+    syntax.is_balanced().then_some(std::borrow::Cow::Owned(out))
 }
 
-/// Whether `email` looks like a real address rather than something
-/// `addrparse_header` swallowed a stray list element into.
+/// Check header addr-spec syntax, without SMTP's ASCII/length/routability
+/// restrictions. Quoted punctuation, quoted-pairs and EAI stay byte-for-byte.
 fn is_clean_email(email: &str) -> bool {
-    !email.is_empty() && email == email.trim() && !email.contains(',') && !email.contains(';')
-}
-
-fn flatten_addrs(list: &mailparse::MailAddrList) -> Vec<AddrJson> {
-    use mailparse::MailAddr;
-
-    let mut out = Vec::new();
-    for addr in list.iter() {
-        match addr {
-            MailAddr::Single(s) => out.push(AddrJson {
-                name: s.display_name.clone(),
-                email: s.addr.clone(),
-            }),
-            MailAddr::Group(g) => out.extend(g.addrs.iter().map(|s| AddrJson {
-                name: s.display_name.clone(),
-                email: s.addr.clone(),
-            })),
+    if email.is_empty() || email != email.trim() {
+        return false;
+    }
+    let mut syntax = AddressSyntax::default();
+    let mut at = None;
+    for (i, c) in email.char_indices() {
+        if syntax.is_structural(c) && c == '@' && at.replace(i).is_some() {
+            return false;
         }
     }
-    out
+    let Some(at) = at else {
+        return false;
+    };
+    let local = email[..at].trim();
+    let domain = email[at + 1..].trim();
+    syntax.is_balanced()
+        && is_address_local_part(local)
+        && (is_address_dot_atom(domain)
+            || (domain.len() > 2 && is_address_quoted(domain, '[', ']')))
+}
+
+/// RFC 5322 also admits dot-separated quoted words via obs-local-part.
+fn is_address_local_part(value: &str) -> bool {
+    let is_word = |word: &str| {
+        let word = word.trim();
+        is_address_dot_atom(word) || is_address_quoted(word, '"', '"')
+    };
+    let mut syntax = AddressSyntax::default();
+    let mut start = 0;
+    for (i, c) in value.char_indices() {
+        if syntax.is_structural(c) && c == '.' {
+            if !is_word(&value[start..i]) {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    syntax.is_balanced() && is_word(&value[start..])
+}
+
+fn is_address_dot_atom(value: &str) -> bool {
+    value.split('.').all(|atom| {
+        let atom = atom.trim();
+        !atom.is_empty()
+            && atom.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || "!#$%&'*+-/=?^_`{|}~".contains(c)
+                    || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+            })
+    })
+}
+
+fn is_address_quoted(value: &str, open: char, close: char) -> bool {
+    let Some(inner) = value.strip_prefix(open).and_then(|v| v.strip_suffix(close)) else {
+        return false;
+    };
+    let mut escaped = false;
+    for c in inner.chars() {
+        if c.is_control() && c != '\t' {
+            return false;
+        }
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == open || c == close {
+            return false;
+        }
+    }
+    !escaped
 }
 
 /// Serialize one address header to the JSON array stored in
@@ -1689,6 +1929,328 @@ mod tests {
 mod addr_edge_cases {
     use super::parse_envelope_headers;
 
+    fn assert_address_headers(value: &str, expected: serde_json::Value) {
+        let raw = format!("From: {value}\r\nTo: {value}\r\nCc: {value}\r\n\r\n");
+        let env = parse_envelope_headers(raw.as_bytes());
+        let expected_from = expected
+            .as_array()
+            .expect("expected address array")
+            .first()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"name": null, "email": null}));
+        assert_eq!(
+            serde_json::json!({"name": env.from_name, "email": env.from_email}),
+            expected_from,
+            "From: {value}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&env.to_addresses).unwrap(),
+            expected,
+            "To: {value}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&env.cc_addresses).unwrap(),
+            expected,
+            "Cc: {value}"
+        );
+    }
+
+    #[test]
+    fn a_bare_quoted_local_part_is_preserved() {
+        assert_address_headers(
+            r#""alice"@example.org"#,
+            serde_json::json!([{"name": null, "email": "\"alice\"@example.org"}]),
+        );
+    }
+
+    #[test]
+    fn a_bare_quoted_local_part_is_not_swallowed_by_a_named_sibling() {
+        assert_address_headers(
+            r#""alice"@example.org, Bob <bob@example.org>"#,
+            serde_json::json!([
+                {"name": null, "email": "\"alice\"@example.org"},
+                {"name": "Bob", "email": "bob@example.org"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_bare_quoted_local_part_survives_malformed_siblings() {
+        assert_address_headers(
+            r#"bogus, "alice"@example.org, missing@, bob@example.org"#,
+            serde_json::json!([
+                {"name": null, "email": "\"alice\"@example.org"},
+                {"name": null, "email": "bob@example.org"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn group_members_use_the_same_quoted_mailbox_parser() {
+        assert_address_headers(
+            r#"friends: bogus, "alice"@example.org, Bob <bob@example.org>;, c@x.se"#,
+            serde_json::json!([
+                {"name": null, "email": "\"alice\"@example.org"},
+                {"name": "Bob", "email": "bob@example.org"},
+                {"name": null, "email": "c@x.se"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn empty_group_members_do_not_become_part_of_an_address() {
+        assert_address_headers(
+            "friends: a@x.se, , b@x.se;",
+            serde_json::json!([
+                {"name": null, "email": "a@x.se"},
+                {"name": null, "email": "b@x.se"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn malformed_group_members_do_not_invalidate_healthy_members() {
+        for value in [
+            "friends: a@x.se, bogus], b@x.se;, c@x.se",
+            "friends: a@x.se, b@x.se, bogus];, c@x.se",
+        ] {
+            assert_address_headers(
+                value,
+                serde_json::json!([
+                    {"name": null, "email": "a@x.se"},
+                    {"name": null, "email": "b@x.se"},
+                    {"name": null, "email": "c@x.se"}
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_empty_group_names_still_have_members() {
+        for name in [r#""""#, r#"" ""#] {
+            assert_address_headers(
+                &format!("{name}: a@x.se, b@x.se;"),
+                serde_json::json!([
+                    {"name": null, "email": "a@x.se"},
+                    {"name": null, "email": "b@x.se"}
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn tolerated_encoded_word_punctuation_cannot_hide_sibling_recipients() {
+        // These raw Q payloads are nonconforming in a phrase, but mailparse
+        // accepts them. Their punctuation must not consume another recipient.
+        for name in ["A[B", "A,B", "A:B", "A;B", "A<B", "A\"B", "A(B"] {
+            for suffix in ["", " (note)"] {
+                assert_address_headers(
+                    &format!("=?UTF-8?Q?{name}?= <a@x.se>{suffix}, b@x.se"),
+                    serde_json::json!([
+                        {"name": name, "email": "a@x.se"},
+                        {"name": null, "email": "b@x.se"}
+                    ]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_word_shapes_inside_addresses_remain_literal() {
+        assert_address_headers(
+            r#"A <"\=?UTF-8?Q?x?="@x.se>, b@x.se"#,
+            serde_json::json!([
+                {"name": "A", "email": "\"\\=?UTF-8?Q?x?=\"@x.se"},
+                {"name": null, "email": "b@x.se"}
+            ]),
+        );
+        assert_address_headers(
+            "=?UTF-8?Q?a@x.se,b?=@x.se",
+            serde_json::json!([
+                {"name": null, "email": "=?UTF-8?Q?a@x.se"},
+                {"name": null, "email": "b?=@x.se"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn empty_group_members_preserve_encoded_display_names() {
+        assert_address_headers(
+            "=?UTF-8?Q?Friends=3A_West?=: , a@x.se, , \
+             =?UTF-8?Q?Doe=2C_John?= <john@x.se>, ;, b@x.se",
+            serde_json::json!([
+                {"name": null, "email": "a@x.se"},
+                {"name": "Doe, John", "email": "john@x.se"},
+                {"name": null, "email": "b@x.se"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn quoted_local_punctuation_and_escapes_keep_their_original_spelling() {
+        for address in [
+            r#""a,b;c"@example.org"#,
+            r#""a>b"@example.org"#,
+            r#""a@b"@example.org"#,
+            r#""a\"b"@example.org"#,
+            r#""a\\b"@example.org"#,
+            r#""a\\"@example.org"#,
+            r#""a\ b"@example.org"#,
+            r#""a\";b\\c,>d@e"@example.org"#,
+        ] {
+            let expected = serde_json::json!([
+                {"name": null, "email": address},
+                {"name": "Bob", "email": "bob@example.org"}
+            ]);
+            assert_address_headers(
+                &format!("{address}, Bob <bob@example.org>"),
+                expected.clone(),
+            );
+            assert_address_headers(
+                &format!("friends: {address}, Bob <bob@example.org>;"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_angle_addresses_preserve_the_encoded_name_and_local_part() {
+        assert_address_headers(
+            r#"=?UTF-8?Q?Doe=2C_John?= <"a>b"@example.org>, "B, C" <"a\";b\\c,>d@e"@example.org>"#,
+            serde_json::json!([
+                {"name": "Doe, John", "email": "\"a>b\"@example.org"},
+                {"name": "B, C", "email": "\"a\\\";b\\\\c,>d@e\"@example.org"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn ipv6_domain_literals_do_not_start_groups_or_hide_siblings() {
+        assert_address_headers(
+            r#"alice@[IPv6:2001:db8::1], "bob"@[IPv6:2001:db8::2], c@x.se"#,
+            serde_json::json!([
+                {"name": null, "email": "alice@[IPv6:2001:db8::1]"},
+                {"name": null, "email": "\"bob\"@[IPv6:2001:db8::2]"},
+                {"name": null, "email": "c@x.se"}
+            ]),
+        );
+        assert_address_headers(
+            "friends: alice@[IPv6:2001:db8::1], , b@x.se;, c@x.se",
+            serde_json::json!([
+                {"name": null, "email": "alice@[IPv6:2001:db8::1]"},
+                {"name": null, "email": "b@x.se"},
+                {"name": null, "email": "c@x.se"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn internationalized_addresses_and_display_names_are_preserved() {
+        assert_address_headers(
+            r#"用户@例子.公司, Jörg <jörg@bücher.example>, "雪\ 花"@例子.公司"#,
+            serde_json::json!([
+                {"name": null, "email": "用户@例子.公司"},
+                {"name": "Jörg", "email": "jörg@bücher.example"},
+                {"name": null, "email": "\"雪\\ 花\"@例子.公司"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn received_header_local_parts_allow_quoted_words_and_cfws() {
+        assert_address_headers(
+            r#"alice."b,c"@example.org, "snow(雪)"@例子.公司 (note), Bob <"bob"@example.org (note)>"#,
+            serde_json::json!([
+                {"name": null, "email": "alice.\"b,c\"@example.org"},
+                {"name": null, "email": "\"snow(雪)\"@例子.公司"},
+                {"name": "Bob", "email": "\"bob\"@example.org"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn raw_legacy_display_names_keep_mailparses_latin1_fallback() {
+        let env = parse_envelope_headers(
+            b"From: J\xf6rg <jorg@example.org>\r\n\
+              To: J\xf6rg <jorg@example.org>\r\n\
+              Cc: J\xf6rg <jorg@example.org>\r\n\r\n",
+        );
+        assert_eq!(env.from_name.as_deref(), Some("Jörg"));
+        assert_eq!(env.from_email.as_deref(), Some("jorg@example.org"));
+        let expected = r#"[{"name":"Jörg","email":"jorg@example.org"}]"#;
+        assert_eq!(env.to_addresses, expected);
+        assert_eq!(env.cc_addresses, expected);
+    }
+
+    #[test]
+    fn folded_encoded_names_are_decoded_after_splitting() {
+        assert_address_headers(
+            "=?UTF-8?Q?Doe=2C?=\r\n =?UTF-8?Q?_John?=\r\n \
+             <\"alice\"@example.org>,\r\n bob@example.org",
+            serde_json::json!([
+                {"name": "Doe, John", "email": "\"alice\"@example.org"},
+                {"name": null, "email": "bob@example.org"}
+            ]),
+        );
+    }
+
+    #[test]
+    fn comments_can_follow_angle_addresses_and_group_terminators() {
+        assert_address_headers(
+            "friends: Alice (Sales, West) <alice@example.org> \
+             (outer (inner) still outer); (note: \\) still open), \
+             bob@example.org (B, C)",
+            serde_json::json!([
+                {"name": "Alice", "email": "alice@example.org"},
+                {"name": null, "email": "bob@example.org"}
+            ]),
+        );
+        assert_address_headers("undisclosed-recipients:; (empty)", serde_json::json!([]));
+    }
+
+    #[test]
+    fn malformed_address_items_are_not_salvaged_as_mailbox_substrings() {
+        for value in [
+            "@example.org",
+            "alice@",
+            "alice@@example.org",
+            "alice bob@example.org",
+            "alice(note)bob@example.org",
+            "alice@example.org suffix",
+            "Alice <alice@example.org> suffix",
+            "alice@example.org <bob@example.org>",
+            "Alice <<alice@example.org>>",
+            "Alice <alice@example.org",
+            "Alice <alice@example.org> (unterminated",
+            r#""alice"junk@example.org"#,
+            r#""alice@example.org"#,
+            r#""alice"@example.org junk"#,
+            "alice@[IPv6:2001:db8::1",
+            "friends: alice@example.org, bob@example.org",
+            "friends: alice@example.org; suffix",
+            "friends: alice@example.org;;",
+            "outer: alice@example.org, inner: bob@example.org;;",
+            ": alice@example.org;",
+            "mailto:alice@example.org",
+        ] {
+            assert_address_headers(value, serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn invalid_terminated_groups_cost_only_their_own_list_item() {
+        for value in [
+            "friends: alice@example.org; suffix, bob@example.org",
+            "outer: alice@example.org, inner: c@x.se;;, bob@example.org",
+            "Alice <alice@example.org> suffix, bob@example.org",
+        ] {
+            assert_address_headers(
+                value,
+                serde_json::json!([{"name": null, "email": "bob@example.org"}]),
+            );
+        }
+    }
+
     #[test]
     fn one_malformed_recipient_does_not_drop_the_rest() {
         let env = parse_envelope_headers(b"To: valid@x.se, bogus\r\n\r\n");
@@ -1733,10 +2295,7 @@ mod addr_edge_cases {
 
     #[test]
     fn a_malformed_sibling_does_not_corrupt_an_encoded_display_name() {
-        // "bogus" forces the fallback path. Before it split the *decoded*
-        // header value, the comma inside "Doe, John" (only present after
-        // decoding "=?UTF-8?Q?Doe=2C_John?=") would be mistaken for a list
-        // separator, truncating the name to "John".
+        // The comma appears only after decoding; it is part of the name.
         let env = parse_envelope_headers(
             b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, bogus, jane@x.se\r\n\r\n",
         );
@@ -1789,11 +2348,8 @@ mod addr_edge_cases {
 
     #[test]
     fn an_encoded_word_that_decodes_to_a_comma_keeps_its_whole_display_name() {
-        // Decoded, "=?UTF-8?Q?Doe=2C_John?=" is "Doe, John" -- an unquoted
-        // comma that only exists after RFC 2047 decoding. Splitting on the
-        // already-decoded value would mistake it for a separator and
-        // truncate the name to "John"; the whole-header parser decodes and
-        // parses together, so it isn't fooled.
+        // Each isolated raw item is decoded and parsed together, keeping the
+        // encoded comma inside the display-name token.
         let env =
             parse_envelope_headers(b"To: =?UTF-8?Q?Doe=2C_John?= <john@x.se>, jane@x.se\r\n\r\n");
         assert_eq!(
