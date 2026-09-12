@@ -3,6 +3,8 @@ use super::{accept_session, command, connect_session, finish_logout, respond, Pe
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
+mod malformed_tests;
+
 const HEADER_FIELDS: &str = "(SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)";
 const HEADERS: &str = "Subject: =?UTF-8?Q?H=C3=A4lsningar?=\r\n\
     From: \"Sender, Test\" <sender@example.test>\r\n\
