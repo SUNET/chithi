@@ -263,9 +263,8 @@ fn sync_account_blocking(
                                     Ok(fresh) => conn = fresh,
                                     Err(e) => {
                                         log::error!(
-                                            "Parallel sync thread {}: reconnect failed, {} folders left unsynced: {}",
+                                            "Parallel sync thread {}: reconnect failed; stopping this worker: {}",
                                             thread_idx,
-                                            folders.len(),
                                             e
                                         );
                                         return Ok(thread_total);

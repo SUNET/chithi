@@ -101,86 +101,35 @@ const IMAP_FETCH_UID_CHUNK_SIZE: usize = 100;
 const ENVELOPE_FETCH_SPEC: &str = "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS \
     (SUBJECT FROM TO CC DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])";
 
-/// How much of a rejected server response to put on one log line.
-const IMAP_PARSE_LOG_LIMIT: usize = 2048;
-
-/// Log the payload that `imap`'s parser rejected.
-///
-/// `imap::error::ParseError` carries the offending bytes, but its `Display`
-/// impl renders whole variants as one fixed string — every `ParseError::Invalid`
-/// prints "Unable to parse status response" regardless of content. Since
-/// `Error::Imap` keeps only `e.to_string()`, that payload is otherwise
-/// unrecoverable, and the log says nothing about what the server actually sent.
-///
-/// The payload is a slice of a live server response, so it can carry message
-/// subjects and addresses. That is the point — without it a parser failure is
-/// unattributable — but it does mean `chithi.log` holds mail data in the clear,
-/// so keep it capped and never log an authentication challenge. A `BODY[]`
-/// fetch (the one path that pulls a full message, not just headers) gets its
-/// payload text withheld entirely — the byte count is enough to see that a
-/// fetch failed, and full message content has no business sitting in a log
-/// file users may attach to bug reports.
-fn log_imap_parse_payload(context: &str, e: &imap::Error) {
+/// Format parse diagnostics without exposing correspondence in shareable logs.
+/// Headers are private too: retain only command context, error kind and size.
+/// Authentication challenges never produce a payload diagnostic.
+fn imap_parse_diagnostic(context: &str, e: &imap::Error) -> Option<String> {
     use imap::error::ParseError;
 
     let imap::Error::Parse(parse_err) = e else {
-        return;
+        return None;
     };
-    let redacted = is_full_body_fetch(context);
-    match parse_err {
-        ParseError::Invalid(bytes) => log::error!(
-            "{}: parser rejected {} bytes of server response{}",
+    Some(match parse_err {
+        ParseError::Invalid(bytes) => format!(
+            "{}: parser rejected {} bytes of server response (payload redacted)",
             context,
             bytes.len(),
-            payload_suffix(bytes, redacted),
         ),
-        ParseError::DataNotUtf8(bytes, utf8_err) => log::error!(
-            "{}: server sent {} bytes of non-UTF-8 data ({}){}",
+        ParseError::DataNotUtf8(bytes, utf8_err) => format!(
+            "{}: server sent {} bytes of non-UTF-8 data ({}) (payload redacted)",
             context,
             bytes.len(),
             utf8_err,
-            payload_suffix(bytes, redacted),
         ),
-        ParseError::Unexpected(text) => log::error!(
-            "{}: unexpected response{}",
+        ParseError::Unexpected(text) => format!(
+            "{}: unexpected response ({} diagnostic bytes, payload redacted)",
             context,
-            payload_suffix(text.as_bytes(), redacted),
+            text.len(),
         ),
         // Authentication challenges can carry credentials — never log them.
-        ParseError::Authentication(_, _) => {}
-    }
-}
-
-/// Whether `context` names a `BODY[]` fetch — the only command that returns a
-/// full message rather than headers/addresses/flags.
-fn is_full_body_fetch(context: &str) -> bool {
-    context.contains("BODY[]")
-}
-
-/// The `": \"...\""` piece appended after the byte count, or a redaction
-/// notice in its place when `redact` is set.
-fn payload_suffix(bytes: &[u8], redact: bool) -> String {
-    if redact {
-        " (message body, payload redacted)".to_string()
-    } else {
-        format!(": \"{}\"", escape_for_log(bytes))
-    }
-}
-
-/// Escape a raw server response so it survives as a single readable log line,
-/// capped at [`IMAP_PARSE_LOG_LIMIT`]. Slicing can split a multi-byte
-/// character; the lossy conversion renders the fragment as U+FFFD, which is
-/// fine for diagnostics.
-fn escape_for_log(bytes: &[u8]) -> String {
-    let head = &bytes[..bytes.len().min(IMAP_PARSE_LOG_LIMIT)];
-    let mut out: String = String::from_utf8_lossy(head)
-        .chars()
-        .flat_map(|c| c.escape_debug())
-        .collect();
-    if bytes.len() > head.len() {
-        out.push_str("…[truncated]");
-    }
-    out
+        ParseError::Authentication(_, _) => return None,
+    })
 }
 
 /// Whether a failure left the response stream in an unknown state.
@@ -218,7 +167,9 @@ impl ImapConnection {
     /// Log a failed IMAP command and mark the connection unusable if the
     /// failure desynchronized the stream.
     fn note_error(&mut self, context: &str, e: &imap::Error) {
-        log_imap_parse_payload(context, e);
+        if let Some(diagnostic) = imap_parse_diagnostic(context, e) {
+            log::error!("{diagnostic}");
+        }
         if !self.poisoned && leaves_stream_desynchronized(e) {
             self.poisoned = true;
             // Release the server's connection slot before any caller reconnects,
@@ -856,6 +807,9 @@ impl ImapConnection {
 
 #[cfg(test)]
 mod connection_tests;
+
+#[cfg(test)]
+mod diagnostic_tests;
 
 fn idle_outcome_has_notification(outcome: imap::extensions::idle::WaitOutcome) -> bool {
     outcome == imap::extensions::idle::WaitOutcome::MailboxChanged
