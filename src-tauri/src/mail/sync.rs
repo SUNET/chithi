@@ -160,8 +160,8 @@ fn sync_account_blocking(
                 folder
             );
             match ImapConnection::connect(imap_config) {
-                // Assigning drops the stale connection without a LOGOUT — its
-                // reply would arrive on a stream we already can't parse.
+                // Poisoning has already shut down the old socket, freeing its
+                // server-side slot before this replacement connects.
                 Ok(fresh) => conn_imap = fresh,
                 Err(e) => {
                     // Phase 2 opens its own connections, so give up on the
@@ -258,9 +258,8 @@ fn sync_account_blocking(
                                     folder
                                 );
                                 match ImapConnection::connect(&imap_config) {
-                                    // Assigning drops the stale connection
-                                    // without a LOGOUT — its reply would
-                                    // arrive on a stream we can't parse.
+                                    // The poisoned socket was already shut
+                                    // down before opening this replacement.
                                     Ok(fresh) => conn = fresh,
                                     Err(e) => {
                                         log::error!(
