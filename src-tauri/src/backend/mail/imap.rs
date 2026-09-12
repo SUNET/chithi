@@ -383,7 +383,6 @@ impl MailBackend for ImapMailBackend {
 
         tokio::task::spawn_blocking(move || {
             let mut conn_imap = ImapConnection::connect(&imap_config)?;
-            conn_imap.select_folder(&folder_clone)?;
             let count = mail_sync::sync_folder_envelopes_public(
                 &db,
                 &account_id,
