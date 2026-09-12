@@ -57,10 +57,9 @@ pub struct EnvelopeData {
     pub has_attachments: bool,
 }
 
-/// Outcome of [`ImapConnection::fetch_envelopes_batch`]. UIDs whose chunk the
-/// server or the parser rejected land in `failed_uids` instead of being
-/// silently dropped, so the caller can leave them outside its sync watermark
-/// and retry them later.
+/// Outcome of [`ImapConnection::fetch_envelopes_batch`]. Rejected chunks and
+/// requested UIDs without a header literal land in `failed_uids`, so the
+/// caller can leave them outside its sync watermark and retry them later.
 #[derive(Default)]
 pub struct EnvelopeBatch {
     pub envelopes: Vec<EnvelopeData>,
@@ -399,15 +398,23 @@ impl ImapConnection {
     /// one unreadable message must not cost a folder. Once the connection is
     /// poisoned no further chunk is attempted, since nothing read off a
     /// desynchronized stream can be trusted.
+    /// Attributes are merged per requested UID before emitting one envelope;
+    /// unsolicited flag-only responses cannot replace its message metadata.
     pub fn fetch_envelopes_batch(&mut self, uids: &[u32]) -> Result<EnvelopeBatch> {
         let mut batch = EnvelopeBatch::default();
         if uids.is_empty() {
             return Ok(batch);
         }
 
-        log::debug!("IMAP fetching {} envelopes", uids.len());
+        let mut seen_uids = std::collections::HashSet::new();
+        let unique_uids: Vec<u32> = uids
+            .iter()
+            .copied()
+            .filter(|uid| seen_uids.insert(*uid))
+            .collect();
+        log::debug!("IMAP fetching {} envelopes", unique_uids.len());
 
-        for chunk in uids.chunks(IMAP_FETCH_UID_CHUNK_SIZE) {
+        for chunk in unique_uids.chunks(IMAP_FETCH_UID_CHUNK_SIZE) {
             if self.poisoned {
                 batch.failed_uids.extend_from_slice(chunk);
                 continue;
@@ -420,65 +427,37 @@ impl ImapConnection {
                 &uid_set[..uid_set.len().min(80)]
             );
 
+            let mut pending: std::collections::HashMap<u32, EnvelopeAccumulator> = chunk
+                .iter()
+                .map(|&uid| (uid, EnvelopeAccumulator::default()))
+                .collect();
             let fetched = self.tolerant_uid_fetch(&uid_set, ENVELOPE_FETCH_SPEC, |uid, attrs| {
-                let flags: Vec<String> = attrs
-                    .iter()
-                    .find_map(|a| match a {
-                        imap_proto::types::AttributeValue::Flags(fs) => Some(
-                            fs.iter()
-                                .map(|s| flag_to_string(&imap::types::Flag::from(*s)))
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let size = attrs
-                    .iter()
-                    .find_map(|a| match a {
-                        imap_proto::types::AttributeValue::Rfc822Size(sz) => Some(*sz as u64),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-
-                let header_bytes = attrs.iter().find_map(|a| match a {
-                    imap_proto::types::AttributeValue::BodySection {
-                        section:
-                            Some(imap_proto::types::SectionPath::Full(
-                                imap_proto::types::MessageSection::Header,
-                            )),
-                        data: Some(header),
-                        ..
-                    }
-                    | imap_proto::types::AttributeValue::Rfc822Header(Some(header)) => {
-                        Some(*header)
-                    }
-                    _ => None,
-                });
-                let header = parse_envelope_headers(header_bytes.unwrap_or_default());
-
-                // Check for attachments from BODYSTRUCTURE
-                // Simple heuristic: if the response text mentions "attachment", it likely has one
-                // More accurate: check if it's multipart/mixed (indicates attachments)
-                let has_attachments = size > 10000; // rough heuristic; will improve later
-
-                Some(EnvelopeData {
-                    uid,
-                    subject: header.subject,
-                    from_name: header.from_name,
-                    from_email: header.from_email,
-                    to_addresses: header.to_addresses,
-                    cc_addresses: header.cc_addresses,
-                    date: header.date,
-                    message_id: header.message_id,
-                    in_reply_to: header.in_reply_to,
-                    references: header.references,
-                    flags,
-                    size,
-                    has_attachments,
-                })
+                let envelope = pending.get_mut(&uid)?;
+                let had_header = envelope.header.is_some();
+                envelope.merge_attributes(attrs);
+                // Preserve first-header response order without emitting duplicates.
+                (!had_header && envelope.header.is_some()).then_some(uid)
             });
             match fetched {
-                Ok(envelopes) => batch.envelopes.extend(envelopes),
+                Ok(header_uids) => {
+                    for uid in header_uids {
+                        match pending
+                            .remove(&uid)
+                            .and_then(|envelope| envelope.into_envelope(uid))
+                        {
+                            Some(envelope) => batch.envelopes.push(envelope),
+                            None => batch.failed_uids.push(uid),
+                        }
+                    }
+                    // Entries left over never received the requested header,
+                    // including missing responses and flag-only updates.
+                    batch.failed_uids.extend(
+                        chunk
+                            .iter()
+                            .copied()
+                            .filter(|uid| pending.contains_key(uid)),
+                    );
+                }
                 Err(e) => {
                     log::warn!(
                         "IMAP FETCH envelopes failed for {} UIDs (skipping chunk): {}",
@@ -1418,6 +1397,62 @@ struct HeaderEnvelope {
     message_id: Option<String>,
     in_reply_to: Option<String>,
     references: Vec<String>,
+}
+
+/// Attributes may arrive in separate FETCH responses for the same UID. Missing
+/// attributes leave previous values intact; explicit FLAGS () still clears flags.
+#[derive(Default)]
+struct EnvelopeAccumulator {
+    header: Option<HeaderEnvelope>,
+    flags: Vec<String>,
+    size: u64,
+}
+
+impl EnvelopeAccumulator {
+    fn merge_attributes(&mut self, attributes: &[imap_proto::types::AttributeValue<'_>]) {
+        use imap_proto::types::{AttributeValue, MessageSection, SectionPath};
+
+        for attribute in attributes {
+            match attribute {
+                AttributeValue::Flags(flags) => {
+                    self.flags = flags
+                        .iter()
+                        .map(|flag| flag_to_string(&imap::types::Flag::from(*flag)))
+                        .collect();
+                }
+                AttributeValue::Rfc822Size(size) => self.size = u64::from(*size),
+                AttributeValue::BodySection {
+                    section: Some(SectionPath::Full(MessageSection::Header)),
+                    data: Some(header),
+                    ..
+                }
+                | AttributeValue::Rfc822Header(Some(header)) => {
+                    self.header = Some(parse_envelope_headers(header));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn into_envelope(self, uid: u32) -> Option<EnvelopeData> {
+        let header = self.header?;
+        Some(EnvelopeData {
+            uid,
+            subject: header.subject,
+            from_name: header.from_name,
+            from_email: header.from_email,
+            to_addresses: header.to_addresses,
+            cc_addresses: header.cc_addresses,
+            date: header.date,
+            message_id: header.message_id,
+            in_reply_to: header.in_reply_to,
+            references: header.references,
+            flags: self.flags,
+            size: self.size,
+            // Size-based attachment heuristic, not MIME-derived metadata.
+            has_attachments: self.size > 10000,
+        })
+    }
 }
 
 /// Parse a `BODY.PEEK[HEADER.FIELDS (...)]` block into the fields chithi

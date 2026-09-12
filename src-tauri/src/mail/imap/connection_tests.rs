@@ -5,6 +5,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+mod envelope_tests;
+
 /// Public test-only identity for loopback sessions, never a production credential.
 const CERT: &[u8] = include_bytes!("localhost-test.pem");
 const KEY: &[u8] = include_bytes!("localhost-test-key.pem");

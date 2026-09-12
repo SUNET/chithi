@@ -91,6 +91,8 @@ ID and raw folder path. All IMAP envelope-sync paths use a common helper
 that acquires the lock before reading the checkpoint or issuing its
 SELECT, and holds it through reconciliation, filters, and final counts/UID
 metadata. Callers may establish connections before entering this helper.
+The command-path backend leaves folder selection to the helper rather than
+issuing a redundant SELECT outside the lock.
 Database reader and writer guards remain short-lived and are acquired afterward.
 Different folders, accounts, and pool instances have independent locks;
 unused registry entries are pruned on subsequent lookups.
@@ -99,6 +101,20 @@ The guard belongs to the synchronous pass itself. Errors and panics release
 it, but cancelling an async caller does not release it while its detached
 blocking work is still running. This coordinates envelope-sync passes,
 not every user operation or body-prefetch task.
+
+### 5. Merge envelope FETCH attributes by requested UID
+
+A command can receive several FETCH responses for one UID, including
+unsolicited flag-only updates. Envelope fetching therefore merges only
+attributes actually present, scoped to the UIDs requested in that command.
+Later flag updates do not clear headers or size; explicit empty flags do
+clear earlier flags.
+
+After successful command completion, emit one envelope per UID in the
+order its first header arrived. Duplicate input UIDs are removed before
+chunking, and unrequested UIDs are ignored. A requested UID without a
+header literal is reported as failed for retry, rather than inserting a
+blank message. A present zero-byte header literal remains a valid result.
 
 ## Consequences
 
