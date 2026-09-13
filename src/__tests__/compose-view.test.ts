@@ -69,6 +69,7 @@ vi.mock("@/lib/tauri", () => ({
 
 import ComposeView from "@/views/ComposeView.vue";
 import { useAccountsStore } from "@/stores/accounts";
+import { parseRecipients } from "@/lib/compose-recipients";
 import * as api from "@/lib/tauri";
 
 const ComposeMenuBarStub = defineComponent({
@@ -196,10 +197,14 @@ const settlePending: Array<() => void> = [];
 
 function deferred<T>(cleanupValue: T) {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
   // Also settle requests when an assertion fails before their explicit resolution.
   settlePending.push(() => resolve(cleanupValue));
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function keyStatuses(emails: string[], hasKey = true): PgpRecipientStatus[] {
@@ -385,6 +390,44 @@ describe("ComposeView recipient validation", () => {
       expect(native.window.close).not.toHaveBeenCalled();
       expect(native.window.destroy).not.toHaveBeenCalled();
     });
+  });
+
+  it.each(invalidFields)("retains a $field structural error across other recipient edits until $field changes", async ({ field, input, index, reason }) => {
+    const wrapper = await mountCompose({
+      to: "primary@example.com",
+      cc: "copy@example.com",
+      bcc: "hidden@example.com",
+    });
+    await setRecipient(wrapper, field, input);
+    await wrapper.get('[data-testid="compose-pgp-encrypt"]').trigger("click");
+    await wrapper.get('[data-testid="menu-send"]').trigger("click");
+    await flushPromises();
+
+    expectRecipientError(wrapper, field, index, reason);
+    const message = wrapper.get('[data-testid="compose-error"]').text();
+    expect(recipientInput(wrapper, field).attributes("aria-invalid")).toBe("true");
+    expect(recipientInput(wrapper, field).attributes("aria-describedby")).toBe("compose-error");
+
+    for (const otherField of recipientFields.filter((candidate) => candidate !== field)) {
+      await setRecipient(wrapper, otherField, `changed-${otherField}@example.com`);
+      expect(wrapper.get('[data-testid="compose-error"]').text()).toBe(message);
+      expect(recipientInput(wrapper, field).attributes("aria-invalid")).toBe("true");
+      await settleDebounces();
+      expect(wrapper.get('[data-testid="compose-error"]').text()).toBe(message);
+      expect(recipientInput(wrapper, field).attributes("aria-invalid")).toBe("true");
+      expect(recipientInput(wrapper, field).attributes("aria-describedby")).toBe("compose-error");
+      expect(recipientInput(wrapper, field).element.value).toBe(input);
+      expect(recipientInput(wrapper, otherField).attributes("aria-invalid")).toBe("false");
+    }
+    expect(api.pgpCheckRecipients).not.toHaveBeenCalled();
+
+    await setRecipient(wrapper, field, "corrected@example.com");
+    expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+    expect(recipientInput(wrapper, field).attributes("aria-invalid")).toBe("false");
+    expect(recipientInput(wrapper, field).attributes("aria-describedby")).toBeUndefined();
+    await settleDebounces();
+    expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+    expect(api.sendMessage).not.toHaveBeenCalled();
   });
 
   it("still requires To when the menu sends past the disabled toolbar with Cc/Bcc populated", async () => {
@@ -660,6 +703,44 @@ describe("ComposeView PGP recipient snapshots", () => {
     }));
   });
 
+  it.each(["IPC string", "Error instance"] as const)(
+    "preserves backend recipient validation from an %s without reporting missing keys",
+    async (rejectionType) => {
+      const input = '  "Doe, Jane" <jane@example.com>; "Alice; Team" <alice@example..com>, bare@example.com, ';
+      const addresses = ["jane@example.com", "alice@example..com", "bare@example.com"];
+      const message = "Invalid recipient address at position 2";
+      expect(parseRecipients(input)).toEqual({ ok: true, addresses });
+      vi.mocked(api.pgpCheckRecipients).mockRejectedValue(
+        rejectionType === "IPC string" ? message : new Error(message),
+      );
+      const wrapper = await mountCompose({ to: input });
+      const encrypt = wrapper.get('[data-testid="compose-pgp-encrypt"]');
+      await encrypt.trigger("click");
+      await settleDebounces();
+
+      expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(1);
+      expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(1, addresses);
+      expect(wrapper.find(".pgp-missing-badge").exists()).toBe(false);
+      expect(encrypt.classes()).not.toContain("warn");
+      expect(recipientInput(wrapper, "to").element.value).toBe(input);
+      expect(api.sendMessage).not.toHaveBeenCalled();
+
+      await wrapper.get('[data-testid="compose-send"]').trigger("click");
+      await flushPromises();
+
+      expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(2);
+      expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(2, addresses);
+      const banner = wrapper.get('[data-testid="compose-error"]');
+      expect(banner.attributes("role")).toBe("alert");
+      expect(banner.text()).toBe(message);
+      expect(wrapper.find(".pgp-missing-badge").exists()).toBe(false);
+      expect(encrypt.classes()).not.toContain("warn");
+      expect(recipientInput(wrapper, "to").element.value).toBe(input);
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(native.window.close).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["invalid edit", "empty field", "encryption off"] as const)(
     "clears missing-key status and ignores an in-flight result after %s",
     async (change) => {
@@ -711,6 +792,76 @@ describe("ComposeView PGP recipient snapshots", () => {
       expect(api.sendMessage).not.toHaveBeenCalled();
     },
   );
+
+  it.each([
+    { label: "available", hasKey: true },
+    { label: "missing", hasKey: false },
+  ])("preserves newer $label key statuses when an older debounced lookup rejects", async ({ hasKey }) => {
+    const pending = deferred<PgpRecipientStatus[]>([]);
+    vi.mocked(api.pgpCheckRecipients)
+      .mockReturnValueOnce(pending.promise)
+      .mockImplementation(async (emails) => keyStatuses(emails, hasKey));
+    const wrapper = await mountCompose({ to: "old@example.com" });
+    const encrypt = wrapper.get('[data-testid="compose-pgp-encrypt"]');
+    await encrypt.trigger("click");
+    await settleDebounces();
+    expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(1);
+    expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(1, ["old@example.com"]);
+
+    await recipientInput(wrapper, "to").setValue("current@example.com");
+    await settleDebounces();
+    expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(2);
+    expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(2, ["current@example.com"]);
+    expect(wrapper.find(".pgp-missing-badge").exists()).toBe(!hasKey);
+    expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+
+    pending.reject("Invalid recipient address at position 1");
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+    expect(wrapper.find(".pgp-missing-badge").exists()).toBe(!hasKey);
+    expect(encrypt.classes().includes("warn")).toBe(!hasKey);
+    if (!hasKey) {
+      const badge = wrapper.get(".pgp-missing-badge");
+      expect(badge.text()).toBe("1");
+      expect(badge.attributes("title")).toBe("Missing keys: current@example.com");
+    }
+    expect(recipientInput(wrapper, "to").element.value).toBe("current@example.com");
+    expect(api.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("preserves a newer structural field error when an older encrypted-send lookup rejects", async () => {
+    const pending = deferred<PgpRecipientStatus[]>([]);
+    vi.mocked(api.pgpCheckRecipients).mockReturnValueOnce(pending.promise);
+    const wrapper = await mountCompose({ to: "old@example.com" });
+    await wrapper.get('[data-testid="compose-pgp-encrypt"]').trigger("click");
+    await wrapper.get('[data-testid="menu-send"]').trigger("click");
+    await flushPromises();
+    expect(api.pgpCheckRecipients).toHaveBeenCalledWith(["old@example.com"]);
+
+    const input = 'copy@example.com; "Unclosed';
+    await setRecipient(wrapper, "cc", input);
+    await wrapper.get('[data-testid="menu-save-draft"]').trigger("click");
+    await flushPromises();
+    expectRecipientError(wrapper, "cc", 2, /quote/i);
+    const message = wrapper.get('[data-testid="compose-error"]').text();
+    expect(recipientInput(wrapper, "cc").attributes("aria-invalid")).toBe("true");
+    await settleDebounces();
+    expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(1);
+
+    pending.reject(new Error("Invalid recipient address at position 1"));
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="compose-error"]').text()).toBe(message);
+    expect(recipientInput(wrapper, "cc").attributes("aria-invalid")).toBe("true");
+    expect(recipientInput(wrapper, "cc").attributes("aria-describedby")).toBe("compose-error");
+    expect(recipientInput(wrapper, "cc").element.value).toBe(input);
+    expect(wrapper.find(".pgp-missing-badge").exists()).toBe(false);
+    expect(wrapper.get('[data-testid="compose-pgp-encrypt"]').classes()).not.toContain("warn");
+    expect(api.sendMessage).not.toHaveBeenCalled();
+    expect(api.saveDraft).not.toHaveBeenCalled();
+    expect(native.window.close).not.toHaveBeenCalled();
+  });
 
   it("fails closed when the explicit encrypted-send key check rejects", async () => {
     vi.mocked(api.pgpCheckRecipients).mockRejectedValueOnce(new Error("Key lookup offline"));

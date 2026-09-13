@@ -30,6 +30,9 @@ type ComposeRecipients = Record<RecipientField, string[]>;
 type ParsedRecipientFields =
   | { ok: true; recipients: ComposeRecipients }
   | { ok: false; field: RecipientField; error: RecipientParseError };
+type RecipientCheckResult =
+  | { ok: true; statuses: PgpRecipientStatus[] }
+  | { ok: false; error: string | null };
 
 // Compose runs in its own window; start the shared PGP prompt listener
 // so a sign/decrypt triggered from here is served. The passphrase / PIN
@@ -581,31 +584,32 @@ let recipientCheckSeq = 0;
 
 async function refreshRecipientStatuses(
   recipients?: ComposeRecipients,
-): Promise<PgpRecipientStatus[] | null> {
+): Promise<RecipientCheckResult> {
   const seq = ++recipientCheckSeq;
   recipientStatuses.value = [];
   if (!pgpEncrypt.value) {
-    return [];
+    return { ok: true, statuses: [] };
   }
   const parsed = recipients ? { ok: true as const, recipients } : readRecipientFields();
-  if (!parsed.ok) return null;
+  if (!parsed.ok) return { ok: false, error: null };
   const all = [
     ...parsed.recipients.to,
     ...parsed.recipients.cc,
     ...parsed.recipients.bcc,
   ];
   if (all.length === 0) {
-    return [];
+    return { ok: true, statuses: [] };
   }
   try {
     const result = await api.pgpCheckRecipients(all);
     // Drop a stale response: a newer call superseded this one in flight.
-    if (seq !== recipientCheckSeq) return null;
+    if (seq !== recipientCheckSeq) return { ok: false, error: null };
     recipientStatuses.value = result;
-    return result;
+    return { ok: true, statuses: result };
   } catch (e) {
+    if (seq !== recipientCheckSeq) return { ok: false, error: null };
     console.error("PGP recipient check failed:", e);
-    return null;
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -634,8 +638,11 @@ watch(
   { flush: "sync" },
 );
 
-watch([to, cc, bcc], () => {
-  if (recipientErrorField.value) {
+watch([to, cc, bcc], (values, previous) => {
+  const field = recipientErrorField.value;
+  if (field === null) return;
+  const index = { to: 0, cc: 1, bcc: 2 }[field];
+  if (values[index] !== previous[index]) {
     recipientErrorField.value = null;
     error.value = null;
   }
@@ -807,13 +814,13 @@ async function send() {
       // supersede it without a new edit. The backend also validates keys.
       if (recipientCheckTimer) clearTimeout(recipientCheckTimer);
       recipientCheckTimer = null;
-      const statuses = await refreshRecipientStatuses(recipients);
+      const check = await refreshRecipientStatuses(recipients);
       if (!recipientsStillMatch(snapshot)) return;
-      if (statuses === null) {
-        error.value = "Could not verify recipient encryption keys. Please try again.";
+      if (!check.ok) {
+        error.value = check.error ?? "Could not verify recipient encryption keys. Please try again.";
         return;
       }
-      const missing = statuses.filter((status) => !status.hasKey);
+      const missing = check.statuses.filter((status) => !status.hasKey);
       if (missing.length > 0) {
         error.value =
           `Cannot encrypt — no public key in keystore for: ` +
