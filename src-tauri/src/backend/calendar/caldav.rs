@@ -348,6 +348,10 @@ impl CalendarBackend for CalDavCalendarBackend {
         }
     }
 
+    fn validate_event_creation(&self, event: &CalendarEvent, _: &str) -> Result<()> {
+        creation_ical_data(event, event.uid.as_deref().unwrap_or(&event.id)).map(|_| ())
+    }
+
     /// CalDAV events are not pushed at create time — the next sync's
     /// unpushed-rows pass PUTs them (see `sync` step 3).
     async fn push_created_event(

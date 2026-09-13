@@ -17,9 +17,9 @@ describe("calendar move IPC contract", () => {
 
   it("uses the guarded ordinary notification command with camelCase arguments", async () => {
     vi.mocked(invoke).mockResolvedValueOnce(undefined);
-    await notifyCalendarEvent("account", "original-event", ["guest@example.test"]);
+    await notifyCalendarEvent("original-event");
     expect(invoke).toHaveBeenCalledExactlyOnceWith("notify_calendar_event", {
-      accountId: "account", eventId: "original-event", attendeeEmails: ["guest@example.test"],
+      eventId: "original-event",
     });
   });
 

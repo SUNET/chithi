@@ -186,6 +186,13 @@ pub trait CalendarBackend: Send + Sync {
     /// locally created events), so it takes the pool.
     async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()>;
 
+    /// Pure payload preflight, before local insertion or meeting ownership transfer.
+    fn validate_event_creation(
+        &self,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<()>;
+
     /// Push a newly created local event. `Ok(None)` means the provider
     /// defers the push (CalDAV events go out with the next sync's
     /// unpushed-rows pass). `remote_calendar_id` is the local

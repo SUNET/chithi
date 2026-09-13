@@ -126,6 +126,33 @@ describe("EventForm pending meeting lifecycle", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
   });
 
+  it.each(["Google", "Graph"])("keeps the form and pending binding after %s series preflight rejection", async (provider) => {
+    vi.mocked(api.meetCreateUrl).mockResolvedValue(binding("series"));
+    vi.mocked(api.createEvent).mockRejectedValueOnce(new Error(`${provider} recurring creation is unsupported`));
+    const wrapper = mountForm();
+    await wrapper.get('[data-testid="event-form-title"]').setValue("Weekly meeting");
+    const vm = wrapper.vm as unknown as { recurrenceRule: string; attendeeEmails: string[] };
+    vm.recurrenceRule = "FREQ=WEEKLY";
+    vm.attendeeEmails = ["guest@example.test"];
+    await wrapper.get('[data-testid="event-form-meet-meet-account"]').trigger("click");
+    await flushPromises();
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain(`${provider} recurring creation is unsupported`);
+    expect(wrapper.emitted("saved")).toBeUndefined();
+    expect(wrapper.emitted("close")).toBeUndefined();
+    expect(api.meetDiscardPending).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    vm.recurrenceRule = "";
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+    expect(vi.mocked(api.createEvent).mock.calls[1][0].meet_binding).toEqual(binding("series"));
+    expect(wrapper.emitted("saved")).toHaveLength(1);
+    expect(api.meetDiscardPending).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("offers configured La Suite Visio accounts", () => {
     useAccountsStore().accounts[1].meet_protocol = "visio";
     const wrapper = mountForm();

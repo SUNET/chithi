@@ -530,15 +530,7 @@ async fn create_event_inner(
         Some(serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string()))
     };
 
-    // Get organizer email from account
-    let organizer_email = {
-        let conn = state.db.reader();
-        db::accounts::get_account_full(&conn, &event.account_id)
-            .ok()
-            .map(|a| a.email)
-    };
-
-    let cal_event = CalendarEvent {
+    let mut cal_event = CalendarEvent {
         id: id.clone(),
         account_id: event.account_id,
         calendar_id: event.calendar_id,
@@ -552,7 +544,7 @@ async fn create_event_inner(
         timezone: event.timezone,
         recurrence_kind: RecurrenceKind::from_rule(event.recurrence_rule.as_deref()),
         recurrence_rule: event.recurrence_rule,
-        organizer_email,
+        organizer_email: None,
         attendees_json,
         my_status: None,
         source_message_id: None,
@@ -578,21 +570,24 @@ async fn create_event_inner(
         let transaction = conn.transaction()?;
         if let Some(source) = move_source {
             checked_mutation_target(&transaction, &source.id, Some(source))?;
-            check_target_calendar(&transaction, &cal_event.calendar_id, &cal_event.account_id)?;
+        }
+        let account = db::accounts::get_account_full(&transaction, &cal_event.account_id)?;
+        cal_event.organizer_email = Some(account.email.clone());
+
+        // The event's calendar's remote handle — the JMAP backend
+        // creates the event on that specific calendar; Google/Graph
+        // write to their default calendar and ignore it.
+        check_target_calendar(&transaction, &cal_event.calendar_id, &cal_event.account_id)?;
+        let remote_cal_id = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)?
+            .remote_id
+            .unwrap_or_default();
+        if let Some(backend) = crate::backend::calendar::for_account(&account) {
+            backend.validate_event_creation(&cal_event, &remote_cal_id)?;
         }
         db::calendar::insert_event(&transaction, &cal_event)?;
         if let Some(ref binding) = meet_binding {
             claim_meet_binding(&transaction, &id, binding)?;
         }
-        let account = db::accounts::get_account_full(&transaction, &cal_event.account_id)?;
-
-        // The event's calendar's remote handle — the JMAP backend
-        // creates the event on that specific calendar; Google/Graph
-        // write to their default calendar and ignore it.
-        let remote_cal_id = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)
-            .ok()
-            .and_then(|c| c.remote_id)
-            .unwrap_or_default();
         transaction.commit()?;
         (account, remote_cal_id)
     };
@@ -1971,13 +1966,8 @@ pub async fn send_invites(
 /// Notifications attached to ordinary edits/deletes never inherit the series
 /// creation exemption, even if the renderer is using stale event metadata.
 #[tauri::command]
-pub async fn notify_calendar_event(
-    state: State<'_, AppState>,
-    account_id: String,
-    event_id: String,
-    attendee_emails: Vec<String>,
-) -> Result<()> {
-    notify_calendar_event_inner(&state, account_id, event_id, attendee_emails).await
+pub async fn notify_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<()> {
+    notify_calendar_event_inner(&state, event_id).await
 }
 
 #[derive(Clone, Copy)]
@@ -2017,25 +2007,18 @@ async fn send_invites_inner(
 ) -> Result<()> {
     deliver_invites(
         state,
-        account_id,
         event_id,
-        attendee_emails,
+        Some((account_id, attendee_emails)),
         InvitationPurpose::Creation,
     )
     .await
 }
 
-async fn notify_calendar_event_inner(
-    state: &AppState,
-    account_id: String,
-    event_id: String,
-    attendee_emails: Vec<String>,
-) -> Result<()> {
+async fn notify_calendar_event_inner(state: &AppState, event_id: String) -> Result<()> {
     deliver_invites(
         state,
-        account_id,
         event_id,
-        attendee_emails,
+        None,
         InvitationPurpose::MutationNotification,
     )
     .await
@@ -2070,26 +2053,56 @@ async fn prepare_invitation_transport<T>(
     Ok(transport)
 }
 
+fn checked_invitation_snapshot(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    creation: Option<(String, Vec<String>)>,
+    purpose: InvitationPurpose,
+) -> Result<(db::accounts::AccountFull, CalendarEvent, Vec<Attendee>)> {
+    let stored = db::calendar::get_event(conn, event_id)?;
+    let account_id = creation
+        .as_ref()
+        .map(|(id, _)| id)
+        .unwrap_or(&stored.account_id);
+    let evt = checked_invitation_target(conn, account_id, event_id, purpose)?;
+    let acc = db::accounts::get_account_full(conn, account_id)?;
+    let attendees = if let Some((_, emails)) = creation {
+        emails
+            .into_iter()
+            .map(|email| Attendee {
+                email,
+                name: None,
+                status: "needs-action".into(),
+                is_self: None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        if !evt
+            .organizer_email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(&acc.email))
+        {
+            return Err(crate::error::Error::Other(
+                "Only the event organizer can notify attendees.".into(),
+            ));
+        }
+        serde_json::from_str::<Vec<Attendee>>(evt.attendees_json.as_deref().unwrap_or("[]"))
+            .map_err(|error| {
+                crate::error::Error::Other(format!("Invalid stored attendees: {error}"))
+            })?
+    };
+    Ok((acc, evt, attendees))
+}
+
 async fn deliver_invites(
     state: &AppState,
-    account_id: String,
     event_id: String,
-    attendee_emails: Vec<String>,
+    creation: Option<(String, Vec<String>)>,
     purpose: InvitationPurpose,
 ) -> Result<()> {
-    log::info!(
-        "send_invites: account={} event={} attendees={:?}",
-        account_id,
-        event_id,
-        attendee_emails
-    );
-
-    let (account, event) = {
-        let conn = state.db.writer().await;
-        let evt = checked_invitation_target(&conn, &account_id, &event_id, purpose)?;
-        let acc = db::accounts::get_account_full(&conn, &account_id)?;
-        (acc, evt)
-    };
+    let (account, event, attendees) =
+        checked_invitation_snapshot(&state.db.reader(), &event_id, creation, purpose)?;
+    let attendee_emails: Vec<String> = attendees.iter().map(|a| a.email.clone()).collect();
 
     // Gmail and O365 handle sending invite emails server-side when
     // events are pushed via Google Calendar API (sendUpdates=all) or
@@ -2099,21 +2112,13 @@ async fn deliver_invites(
             "send_invites: skipping manual send for {} account (server handles invites)",
             account.calendar_protocol_str()
         );
-        // Still update attendees in the local DB
+        // Provider-delegated ordinary notifications are read-only as well.
         let conn = state.db.writer().await;
         checked_delivery_snapshot(&conn, &event, purpose)?;
-        let attendees_json = serde_json::to_string(
-            &attendee_emails
-                .iter()
-                .map(|e| Attendee {
-                    email: e.clone(),
-                    name: None,
-                    status: "needs-action".to_string(),
-                    is_self: None,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default();
+        if matches!(purpose, InvitationPurpose::MutationNotification) {
+            return Ok(());
+        }
+        let attendees_json = serde_json::to_string(&attendees).unwrap_or_default();
         conn.execute(
             "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
             rusqlite::params![attendees_json, event_id],
@@ -2121,16 +2126,6 @@ async fn deliver_invites(
         .ok();
         return Ok(());
     }
-
-    let attendees: Vec<Attendee> = attendee_emails
-        .iter()
-        .map(|email| Attendee {
-            email: email.clone(),
-            name: None,
-            status: "needs-action".to_string(),
-            is_self: None,
-        })
-        .collect();
 
     let uid = event.uid.as_deref().unwrap_or(&event_id);
     let ical = ical::generate_invite(
@@ -2221,8 +2216,8 @@ async fn deliver_invites(
         log::info!("send_invites: sent to {}", attendee_email);
     }
 
-    // Update event's attendees in local DB
-    {
+    // Only explicit creation invitations change stored attendees.
+    if matches!(purpose, InvitationPurpose::Creation) {
         let conn = state.db.writer().await;
         checked_delivery_snapshot(&conn, &event, purpose)?;
         let attendees_json = serde_json::to_string(&attendees).unwrap_or_default();

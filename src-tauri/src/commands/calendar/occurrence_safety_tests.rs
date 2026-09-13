@@ -5,8 +5,8 @@ use std::cell::{Cell, RefCell};
 use rusqlite::{params, types::Value, Connection};
 
 use super::{
-    checked_delivery_snapshot, checked_invitation_target, checked_mutation_target,
-    create_event_inner, delete_event_inner, move_event_to_calendar_inner,
+    checked_delivery_snapshot, checked_invitation_snapshot, checked_invitation_target,
+    checked_mutation_target, create_event_inner, delete_event_inner, move_event_to_calendar_inner,
     notify_calendar_event_inner, prepare_invitation_transport, send_invites_inner,
     update_event_inner, InvitationPurpose, MeetBindingInput, NewEventInput, UpdateEventInput,
 };
@@ -134,6 +134,22 @@ impl Fixture {
 
     fn snapshot(&self) -> StoredRows {
         StoredRows::read(&self.state.db.reader())
+    }
+
+    async fn calendar_protocol(&self, protocol: &str) {
+        db::service_bindings::insert(
+            &*self.state.db.writer().await,
+            &db::service_bindings::ServiceBinding {
+                id: format!("calendar-{protocol}"),
+                account_id: "account-a".into(),
+                service: "calendar".into(),
+                protocol: protocol.into(),
+                enabled: true,
+                sync_interval_seconds: None,
+                config_json: "{}".into(),
+            },
+        )
+        .unwrap();
     }
 }
 
@@ -1200,14 +1216,9 @@ async fn notification_rejects_stale_standalone_view_of_nonstandalone_backend_eve
         }
         let before = fixture.snapshot();
 
-        let error = notify_calendar_event_inner(
-            &fixture.state,
-            stale_ui_event.account_id,
-            stale_ui_event.id,
-            vec![],
-        )
-        .await
-        .unwrap_err();
+        let error = notify_calendar_event_inner(&fixture.state, stale_ui_event.id)
+            .await
+            .unwrap_err();
 
         assert_blocked(error, reason);
         assert_eq!(fixture.event(&refreshed.id), refreshed);
@@ -1494,24 +1505,131 @@ async fn delivery_snapshot_rejects_post_preparation_refresh_before_final_attende
 async fn standalone_notification_accepts_empty_recipients_and_preserves_event_metadata() {
     let fixture = Fixture::new().await;
     let mut expected = stored_event("notified-standalone", RecurrenceKind::Standalone, None);
+    expected.organizer_email = Some("account-a@example.test".into());
+    expected.attendees_json = None;
     fixture.insert(&expected).await;
     fixture.attach_meeting_and_pending(&expected).await;
     let before = fixture.snapshot();
 
-    notify_calendar_event_inner(
-        &fixture.state,
-        expected.account_id.clone(),
-        expected.id.clone(),
-        vec![],
-    )
-    .await
-    .unwrap();
+    notify_calendar_event_inner(&fixture.state, expected.id.clone())
+        .await
+        .unwrap();
 
-    expected.attendees_json = Some("[]".into());
     assert_eq!(fixture.event(&expected.id), expected);
     let after = fixture.snapshot();
     assert_eq!(after.events.len(), 1);
     assert_eq!(after.calendars, before.calendars);
     assert_eq!(after.meetings, before.meetings);
     assert_eq!(after.pending, before.pending);
+}
+
+#[tokio::test]
+async fn unsupported_creation_preserves_all_events_and_pending_meeting_ownership() {
+    for protocol in ["google", "graph"] {
+        let fixture = Fixture::new().await;
+        fixture.calendar_protocol(protocol).await;
+        let existing = stored_event("existing", RecurrenceKind::Standalone, None);
+        fixture.insert(&existing).await;
+        let binding = fixture.attach_meeting_and_pending(&existing).await;
+        let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
+        input.meet_binding = Some(binding);
+        let before = fixture.snapshot();
+        let error = create_event_inner(&fixture.state, input, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("recurr"), "{protocol}: {error}");
+        assert_eq!(fixture.snapshot(), before, "{protocol}");
+    }
+}
+
+#[tokio::test]
+async fn supported_series_creation_commits_and_claims_pending_meeting() {
+    for protocol in ["local", "jmap", "caldav"] {
+        let fixture = Fixture::new().await;
+        if protocol != "local" {
+            fixture.calendar_protocol(protocol).await;
+        }
+        db::service_bindings::insert(
+            &*fixture.state.db.writer().await,
+            &db::service_bindings::ServiceBinding {
+                id: "meet-zoom".into(),
+                account_id: "account-a".into(),
+                service: "meet".into(),
+                protocol: "zoom".into(),
+                enabled: true,
+                sync_interval_seconds: None,
+                config_json: "{}".into(),
+            },
+        )
+        .unwrap();
+        let existing = stored_event("existing", RecurrenceKind::Standalone, None);
+        fixture.insert(&existing).await;
+        let binding = fixture.attach_meeting_and_pending(&existing).await;
+        let meeting_id = binding.meeting_id.clone();
+        let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
+        input.meet_binding = Some(binding);
+        let id = create_event_inner(&fixture.state, input, None)
+            .await
+            .unwrap();
+        let created = fixture.event(&id);
+        assert_eq!(created.recurrence_kind, RecurrenceKind::Series);
+        assert_eq!(created.recurrence_rule.as_deref(), Some("FREQ=WEEKLY"));
+        let rows = fixture.snapshot();
+        assert_eq!(rows.events.len(), 2);
+        assert!(rows.pending.is_empty());
+        assert!(rows
+            .meetings
+            .iter()
+            .any(|row| row.contains(&Value::Text(id.clone()))
+                && row.contains(&Value::Text(meeting_id.clone()))));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_notification_uses_fresh_stored_recipients_without_metadata_writes() {
+    for protocol in ["google", "graph"] {
+        let fixture = Fixture::new().await;
+        fixture.calendar_protocol(protocol).await;
+        let mut event = stored_event("notification", RecurrenceKind::Standalone, None);
+        fixture.insert(&event).await;
+        event.organizer_email = Some("ACCOUNT-A@example.test".into());
+        event.attendees_json = Some(r#"[{"email":"fresh@example.test","name":"Fresh Guest","status":"accepted","is_self":true}]"#.into());
+        db::calendar::update_event(&*fixture.state.db.writer().await, &event).unwrap();
+        let before = fixture.snapshot();
+        let (account, snapshot, recipients) = checked_invitation_snapshot(
+            &fixture.state.db.reader(),
+            &event.id,
+            None,
+            InvitationPurpose::MutationNotification,
+        )
+        .unwrap();
+        assert_eq!(account.id, event.account_id);
+        assert_eq!(snapshot, event);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].email, "fresh@example.test");
+        assert_eq!(recipients[0].name.as_deref(), Some("Fresh Guest"));
+        assert_eq!(recipients[0].status, "accepted");
+        assert_eq!(recipients[0].is_self, Some(true));
+        notify_calendar_event_inner(&fixture.state, event.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_notification_rejects_changed_or_unknown_organizer_without_writes() {
+    for organizer in [None, Some("someone-else@example.test")] {
+        let fixture = Fixture::new().await;
+        fixture.calendar_protocol("google").await;
+        let mut event = stored_event("notification", RecurrenceKind::Standalone, None);
+        event.organizer_email = organizer.map(str::to_owned);
+        fixture.insert(&event).await;
+        let before = fixture.snapshot();
+        let error = notify_calendar_event_inner(&fixture.state, event.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("organizer"));
+        assert_eq!(fixture.snapshot(), before);
+    }
 }

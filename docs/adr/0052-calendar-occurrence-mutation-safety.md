@@ -89,9 +89,17 @@ every recurrence pattern or synchronizing exceptions.
 Publication must not discard that evidence and turn a recurring local row
 into a provider standalone event on the next refresh. Google and Graph's
 current creation payloads cannot represent recurrence, so they reject
-recurring or unclassified creation before credential or HTTP access. The
-local creation remains stored under the existing best-effort push policy;
-this does not implement recurring creation for those providers.
+recurring or unclassified creation before credential or HTTP access.
+Every calendar backend implements the pure `validate_event_creation` hook
+using its existing payload builder/validation. The creation command resolves
+the account and destination calendar and runs this preflight in the write
+transaction before inserting the event or claiming a pending meeting.
+Deterministic unsupported creation returns an error with no local event or
+meeting ownership change; the form stays open with its pending binding.
+Supported local/JMAP/CalDAV series retain their normal creation workflow.
+Runtime provider failures after a successful preflight retain the existing
+post-commit best-effort semantics. This does not implement recurring creation
+for Google or Graph, or add a manual mail fallback for either provider.
 
 ### Conservative legacy recovery
 
@@ -176,13 +184,21 @@ series creation and invitation delivery for known series remain separate
 workflows, subject to existing provider capabilities. `send_invites` is the
 creation-invitation command and permits known series. Ordinary edit/delete/
 move notification callers use the distinct `notify_calendar_event` command,
-which requires confirmed standalone status and has no series exemption.
-Both validate account ownership and reject unsafe targets before attendee
-writes or mail delivery.
+which takes only the event ID, requires confirmed standalone status and has
+no series exemption. It derives the account, organizer eligibility and full
+attendee records from a checked persisted snapshot. A missing or different
+organizer cannot authorize notifications. Ordinary notifications never write
+attendees, names, response status or self markers. Only explicit creation
+invitations retain their existing attendee-write behavior.
+
+Detail and calendar-view callers fetch the exact current event for prompt
+eligibility and recheck after dialogs; captured range-list attendees and
+account IDs are not notification inputs. Ordinary detail edits omit the
+attendee patch because that form does not edit attendees.
 
 Delivery compares the current persisted event with its expected snapshot
 after asynchronous credentials/session preparation, before each transport
-submission and before attendee writes, including the Google/Graph branch
+submission and before creation attendee writes, including the Google/Graph branch
 that delegates mail delivery to the provider. Changes abort subsequent work.
 These checks do not undo delivery already in flight or make a multi-recipient
 send, notification plus mutation, or provider operation atomic.

@@ -398,6 +398,10 @@ impl CalendarBackend for GraphCalendarBackend {
         Ok(())
     }
 
+    fn validate_event_creation(&self, event: &CalendarEvent, _: &str) -> Result<()> {
+        event_to_graph_json(event).map(|_| ())
+    }
+
     /// Created on the account's default calendar (Graph resolves it);
     /// `remote_calendar_id` is ignored. Graph sends invite emails
     /// automatically when attendees are present.

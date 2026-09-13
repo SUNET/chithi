@@ -447,11 +447,9 @@ export async function sendInvites(
 }
 
 export async function notifyCalendarEvent(
-  accountId: string,
   eventId: string,
-  attendeeEmails: string[],
 ): Promise<void> {
-  return invoke("notify_calendar_event", { accountId, eventId, attendeeEmails });
+  return invoke("notify_calendar_event", { eventId });
 }
 
 export async function processInviteReply(
