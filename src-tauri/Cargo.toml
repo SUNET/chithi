@@ -43,6 +43,7 @@ mailparse = "0.16"
 markdown = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "gzip", "deflate", "cookies"] }
 url = "2"
+idna = "1"
 icalendar = "0.16"
 uppsala = "0.3"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }

@@ -405,10 +405,13 @@ mod registry_tests {
             .unwrap()
     }
 
-    async fn jmap_submission_server() -> (String, oneshot::Receiver<Vec<CapturedHttpRequest>>) {
+    async fn jmap_submission_server(
+        identity_email: &str,
+    ) -> (String, oneshot::Receiver<Vec<CapturedHttpRequest>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server_base_url = base_url.clone();
+        let identity_email = identity_email.to_string();
         let (requests_tx, requests_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -475,7 +478,7 @@ mod registry_tests {
                                     "state": "identity-state",
                                     "list": [{
                                         "id": "identity-1",
-                                        "email": "Sender@example.test"
+                                        "email": identity_email
                                     }],
                                     "notFound": []
                                 }, "id1"]]
@@ -718,7 +721,11 @@ mod registry_tests {
             bcc: Vec::new(),
             subject: "routing fixture".into(),
         };
-        let (action_type, payload) = mail_op_to_outbox(&original).unwrap();
+        persisted_send(account_id, &original)
+    }
+
+    fn persisted_send(account_id: &str, original: &MailOp) -> MailOp {
+        let (action_type, payload) = mail_op_to_outbox(original).unwrap();
         let entry = OutboxEntry {
             id: 1,
             account_id: account_id.into(),
@@ -726,8 +733,8 @@ mod registry_tests {
             payload_json: payload.to_string(),
             retry_count: 0,
         };
-        let replayed = outbox_to_mail_op(&entry).expect("valid send must replay from outbox");
-        assert_eq!(replayed, original);
+        let replayed = outbox_to_mail_op(&entry).expect("SendRaw must replay from outbox");
+        assert_eq!(&replayed, original);
         replayed
     }
 
@@ -985,6 +992,50 @@ mod registry_tests {
             "JMAP SendRaw must retain native JMAP submission: {jmap_error}"
         );
         assert!(!jmap_error.contains("SMTP send_raw"));
+
+        for invalid in [
+            r#"Private Recipient <"hidden>box@private.example.test>"#,
+            "Private Group: hidden@private.example.test;",
+        ] {
+            for position in 1..=3 {
+                let mut recipients = [
+                    vec!["recipient@example.test".into()],
+                    vec!["copy@example.test".into()],
+                    vec!["hidden@example.test".into()],
+                ];
+                recipients[position - 1] = vec![invalid.into()];
+                let [to, cc, bcc] = recipients;
+                let original = MailOp::SendRaw {
+                    raw_message:
+                        b"From: sender@example.test\r\nTo: recipient@example.test\r\n\r\nbody"
+                            .to_vec(),
+                    from: "sender@example.test".into(),
+                    to,
+                    cc,
+                    bcc,
+                    subject: "invalid recipient routing fixture".into(),
+                };
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    jmap.execute(&ctx, &jmap_id, persisted_send(&jmap_id, &original)),
+                )
+                .await
+                .expect("JMAP recipient validation timed out")
+                .unwrap_err()
+                .to_string();
+
+                assert_eq!(
+                    error,
+                    format!("Invalid JMAP submission recipient at position {position}"),
+                    "recipient validation must report only the position"
+                );
+                assert!(
+                    !token_store.was_loaded(&jmap_id),
+                    "JMAP recipients must be validated before loading credentials"
+                );
+            }
+        }
+
         assert_eq!(
             *endpoint.scopes.lock().unwrap(),
             vec![
@@ -996,7 +1047,77 @@ mod registry_tests {
 
     #[tokio::test]
     async fn persisted_jmap_send_retains_bcc_in_explicit_envelope() {
-        let (jmap_url, requests_rx) = jmap_submission_server().await;
+        let original = MailOp::SendRaw {
+            raw_message:
+                b"From: Sender <Sender@Example.test>\r\nTo: visible@example.test\r\nSubject: outbox\r\n\r\nbody\r\n"
+                    .to_vec(),
+            from: "Sender <Sender@Example.test>".into(),
+            to: vec!["Visible Recipient <visible@example.test>".into()],
+            cc: Vec::new(),
+            bcc: vec!["Hidden Recipient <hidden@example.test>".into()],
+            subject: "outbox".into(),
+        };
+        assert_persisted_jmap_envelope(
+            original,
+            "Sender@example.test",
+            "hidden@example.test",
+            serde_json::json!({
+                "mailFrom": {
+                    "email": "Sender@Example.test",
+                    "parameters": null
+                },
+                "rcptTo": [
+                    { "email": "visible@example.test", "parameters": null },
+                    { "email": "hidden@example.test", "parameters": null }
+                ]
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn persisted_jmap_send_retains_quoted_mailboxes_and_raw_mime() {
+        let from = r#""Sender > \"Desk\"" <"Send>er\"\\Box"@Example.test>"#;
+        let to = r#""Visible > Recipient" <"To>Box"@Example.test>"#;
+        let cc = r#"Copy <"Cc\"Box"@Example.test>"#;
+        let bcc = r#""Hidden \\ Recipient" <"Bcc\\Box"@Example.test>"#;
+        let original = MailOp::SendRaw {
+            raw_message: format!(
+                "From: {from}\r\nTo: {to}\r\nCc: {cc}\r\nSubject: outbox\r\n\r\nbody\r\n"
+            )
+            .into_bytes(),
+            from: from.into(),
+            to: vec![to.into()],
+            cc: vec![cc.into()],
+            bcc: vec![bcc.into()],
+            subject: "outbox".into(),
+        };
+        assert_persisted_jmap_envelope(
+            original,
+            r#""Send\>er\"\\Box"@EXAMPLE.test"#,
+            r#""Bcc\\Box"@Example.test"#,
+            serde_json::json!({
+                "mailFrom": {
+                    "email": r#""Send>er\"\\Box"@Example.test"#,
+                    "parameters": null
+                },
+                "rcptTo": [
+                    { "email": r#""To>Box"@Example.test"#, "parameters": null },
+                    { "email": r#""Cc\"Box"@Example.test"#, "parameters": null },
+                    { "email": r#""Bcc\\Box"@Example.test"#, "parameters": null }
+                ]
+            }),
+        )
+        .await;
+    }
+
+    async fn assert_persisted_jmap_envelope(
+        original: MailOp,
+        identity_email: &str,
+        bcc_addr_spec: &str,
+        expected_envelope: serde_json::Value,
+    ) {
+        let (jmap_url, requests_rx) = jmap_submission_server(identity_email).await;
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(DbPool::new(&temp.path().join("jmap-outbox.db"), 1).unwrap());
         {
@@ -1045,29 +1166,11 @@ mod registry_tests {
             providers,
         };
 
-        let bcc = "Hidden Recipient <hidden@example.test>";
-        let raw_message =
-            b"From: Sender <Sender@Example.test>\r\nTo: visible@example.test\r\nSubject: outbox\r\n\r\nbody\r\n"
-                .to_vec();
-        assert!(!String::from_utf8_lossy(&raw_message).contains("hidden@example.test"));
-        let original = MailOp::SendRaw {
-            raw_message: raw_message.clone(),
-            from: "Sender <Sender@Example.test>".into(),
-            to: vec!["Visible Recipient <visible@example.test>".into()],
-            cc: Vec::new(),
-            bcc: vec![bcc.into()],
-            subject: "outbox".into(),
+        let MailOp::SendRaw { raw_message, .. } = &original else {
+            panic!("expected a SendRaw fixture");
         };
-        let (action_type, payload) = mail_op_to_outbox(&original).unwrap();
-        let replayed = outbox_to_mail_op(&OutboxEntry {
-            id: 1,
-            account_id: account_id.clone(),
-            action_type: action_type.into(),
-            payload_json: payload.to_string(),
-            retry_count: 0,
-        })
-        .unwrap();
-        assert_eq!(replayed, original);
+        assert!(!String::from_utf8_lossy(raw_message).contains(bcc_addr_spec));
+        let replayed = persisted_send(&account_id, &original);
 
         let account = {
             let conn = db.reader();
@@ -1092,7 +1195,7 @@ mod registry_tests {
             .iter()
             .find(|request| request.path == "/upload/account-1")
             .unwrap();
-        assert_eq!(upload.body, raw_message);
+        assert_eq!(&upload.body, raw_message);
 
         let identity_index = requests
             .iter()
@@ -1125,26 +1228,19 @@ mod registry_tests {
             })
             .unwrap();
         let envelope = &submission["methodCalls"][1][1]["create"]["sub1"]["envelope"];
+        assert_eq!(envelope, &expected_envelope);
         assert_eq!(
-            envelope,
-            &serde_json::json!({
-                "mailFrom": {
-                    "email": "Sender@Example.test",
-                    "parameters": null
-                },
-                "rcptTo": [
-                    { "email": "visible@example.test", "parameters": null },
-                    { "email": "hidden@example.test", "parameters": null }
-                ]
-            })
+            submission["methodCalls"][1][1]["create"]["sub1"]["identityId"],
+            "identity-1"
         );
         assert!(submission["methodCalls"][1][1]
             .get("onSuccessUpdateEmail")
             .is_none());
+        let serialized_bcc = serde_json::to_string(bcc_addr_spec).unwrap();
         assert_eq!(
             serde_json::to_string(&submission)
                 .unwrap()
-                .matches("hidden@example.test")
+                .matches(serialized_bcc.as_str())
                 .count(),
             1,
             "Bcc must appear only in the explicit submission rcptTo"

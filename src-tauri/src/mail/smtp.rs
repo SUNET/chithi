@@ -1,15 +1,19 @@
 use std::time::Duration;
 
 use lettre::address::Envelope;
-use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::{
+    header::{self, ContentType},
+    Attachment, Mailbox, Mailboxes, MultiPart, SinglePart,
+};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
 use lettre::transport::smtp::response::{Code, Response, Severity};
 use lettre::transport::smtp::Error as SmtpError;
-use lettre::{Address, Message};
+use lettre::Address;
 
 use crate::error::{Error, Result};
+pub(crate) use crate::mail::mailbox::parse_mailbox;
 
 const SMTP_SEND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SMTP_QUIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -72,12 +76,17 @@ fn build_body(
 /// mild spam signal at strict receivers. RFC 5322 §3.6.4 only requires
 /// the id be globally unique; the sender's domain is the universal
 /// convention and keeps the header innocuous.
-fn sender_message_id(from: &Mailbox) -> String {
-    format!(
-        "<{}@{}>",
-        uuid::Uuid::new_v4().simple(),
-        from.email.domain()
-    )
+fn sender_message_id(from: &Mailbox) -> Result<String> {
+    let domain = from.email.domain();
+    // Message-ID cannot contain RFC 2047 encoded words. Use the ASCII IDNA
+    // spelling for generated IDs, while leaving the mailbox itself intact.
+    let domain = if domain.is_ascii() {
+        domain.to_string()
+    } else {
+        crate::mail::mailbox::ascii_domain(domain)
+            .ok_or_else(|| Error::Other("Invalid Message-ID sender domain".into()))?
+    };
+    Ok(format!("<{}@{}>", uuid::Uuid::new_v4().simple(), domain))
 }
 
 /// Establish and authenticate the exact SMTP connection used for submission.
@@ -145,34 +154,17 @@ fn definite_smtp_setup_error(stage: &str, error: &lettre::transport::smtp::Error
     }
 }
 
-/// Parse one RFC 5322 mailbox. lettre's mailbox parser rejects some valid
-/// quoted local-parts, so mailparse provides the standards-aware fallback and
-/// lettre still performs final addr-spec validation.
-pub(crate) fn parse_mailbox(value: &str) -> Result<Mailbox> {
-    if let Ok(mailbox) = value.trim().parse::<Mailbox>() {
-        return Ok(mailbox);
-    }
-
-    if let Some((name, addr_spec)) = quoted_angle_mailbox(value) {
-        let email = validated_address(addr_spec)?;
-        return Ok(Mailbox::new(name, email));
-    }
-
-    if let Ok(email) = validated_address(value.trim()) {
-        return Ok(Mailbox::new(None, email));
-    }
-
-    let mailbox = mailparse::addrparse(value)
-        .ok()
-        .and_then(|addresses| addresses.extract_single_info())
-        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
-    let email = validated_address(&mailbox.addr)?;
-    Ok(Mailbox::new(mailbox.display_name, email))
-}
-
 /// Build the sender mailbox from the account's bare address and optional
 /// user-facing name. SMTP and JMAP envelopes continue to use the address only.
 pub(crate) fn sender_mailbox(address: &str, sender_name: &str) -> Result<Mailbox> {
+    // The name is a separate UI string, so the mailbox parser never sees it.
+    // Validate before trimming: header encoders do not validate this input.
+    if sender_name
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(Error::Other("Invalid message sender name".into()));
+    }
     let mailbox = parse_mailbox(address)?;
     let sender_name = sender_name.trim();
     if sender_name.is_empty() {
@@ -180,106 +172,6 @@ pub(crate) fn sender_mailbox(address: &str, sender_name: &str) -> Result<Mailbox
     } else {
         Ok(Mailbox::new(Some(sender_name.to_string()), mailbox.email))
     }
-}
-
-fn validated_address(addr_spec: &str) -> Result<Address> {
-    if let Ok(address) = addr_spec.parse::<Address>() {
-        let domain = address.domain();
-        let untagged_ipv6 = domain
-            .strip_prefix('[')
-            .and_then(|domain| domain.strip_suffix(']'))
-            .is_some_and(|domain| domain.parse::<std::net::Ipv6Addr>().is_ok());
-        if !untagged_ipv6 {
-            return Ok(address);
-        }
-        return Err(Error::Other("Invalid mail address".into()));
-    }
-
-    let (local, domain) = addr_spec
-        .rsplit_once('@')
-        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
-    let literal = domain
-        .strip_prefix('[')
-        .and_then(|domain| domain.strip_suffix(']'))
-        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
-    let (tag, address) = literal
-        .split_once(':')
-        .ok_or_else(|| Error::Other("Invalid mail address".into()))?;
-    if !tag.eq_ignore_ascii_case("IPv6") {
-        return Err(Error::Other("Invalid mail address".into()));
-    }
-    let address = address
-        .parse::<std::net::Ipv6Addr>()
-        .map_err(|_| Error::Other("Invalid mail address".into()))?;
-
-    // lettre can validate the same local part only with its non-standard
-    // untagged IPv6 spelling. After that validation, retain the RFC 5321/5322
-    // `IPv6:` tag in the safely constructed address.
-    Address::new(local, format!("[{address}]"))
-        .map_err(|_| Error::Other("Invalid mail address".into()))?;
-    Ok(Address::new_dangerous(local, domain))
-}
-
-fn quoted_angle_mailbox(value: &str) -> Option<(Option<String>, &str)> {
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut left = None;
-    let mut right = None;
-
-    for (index, ch) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quoted && ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            quoted = !quoted;
-            continue;
-        }
-        if quoted {
-            continue;
-        }
-        match (ch, left) {
-            ('<', None) => left = Some(index),
-            ('>', Some(_)) => {
-                right = Some(index);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    let (left, right) = (left?, right?);
-    if quoted || !value[right + 1..].trim().is_empty() {
-        return None;
-    }
-    let addr_spec = value[left + 1..right].trim();
-    if addr_spec.is_empty() {
-        return None;
-    }
-    let raw_name = value[..left].trim();
-    if raw_name.chars().any(char::is_control) {
-        return None;
-    }
-    let name = if raw_name.is_empty() {
-        None
-    } else if let Some(inner) = raw_name
-        .strip_prefix('"')
-        .and_then(|name| name.strip_suffix('"'))
-    {
-        let mut name = String::with_capacity(inner.len());
-        let mut chars = inner.chars();
-        while let Some(ch) = chars.next() {
-            name.push(if ch == '\\' { chars.next()? } else { ch });
-        }
-        Some(name)
-    } else {
-        Some(raw_name.to_string())
-    };
-    Some((name, addr_spec))
 }
 
 /// Parse a mailbox into the addr-spec used by the SMTP envelope.
@@ -458,49 +350,47 @@ pub fn build_raw_message(
     let from_mailbox = sender_mailbox(from, sender_name)
         .map_err(|_| Error::Other("Invalid message From address".into()))?;
 
-    // Always emit a Message-ID. Lettre's `build()` does NOT add one
-    // automatically, so without this our outgoing replies have no
-    // Message-ID for the next reply to thread off of. The domain is the
-    // sender's own (see `sender_message_id`) per RFC 5322 §3.6.4, rather
-    // than lettre's local-hostname default.
-    let message_id = sender_message_id(&from_mailbox);
-    let mut builder = Message::builder()
-        .from(from_mailbox)
-        .subject(subject)
-        .message_id(Some(message_id));
+    // Encode complete mailbox lists once. MessageBuilder reparses From and
+    // previously set recipient headers, rejecting required quoted local-parts
+    // or silently losing earlier recipients when appending another mailbox.
+    let message_id = sender_message_id(&from_mailbox)?;
+    let mut headers = header::Headers::new();
+    headers.set(header::From::from(Mailboxes::from(from_mailbox)));
+    headers.set(header::Subject::from(subject.to_string()));
+    headers.set(header::MessageId::from(message_id));
 
-    for (index, addr) in to.iter().enumerate() {
-        let mailbox = parse_mailbox(addr).map_err(|_| {
-            Error::Other(format!(
-                "Invalid message To address at position {}",
-                index + 1
-            ))
-        })?;
-        builder = builder.to(mailbox);
+    for (name, addresses) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
+        let mailboxes = addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                parse_mailbox(address).map_err(|_| {
+                    Error::Other(format!(
+                        "Invalid message {name} address at position {}",
+                        index + 1
+                    ))
+                })
+            })
+            .collect::<Result<Mailboxes>>()?;
+        if !addresses.is_empty() {
+            match name {
+                "To" => headers.set(header::To::from(mailboxes)),
+                "Cc" => headers.set(header::Cc::from(mailboxes)),
+                // Bcc is validated for the envelope but never emitted in MIME.
+                _ => {}
+            }
+        }
     }
-    for (index, addr) in cc.iter().enumerate() {
-        let mailbox = parse_mailbox(addr).map_err(|_| {
-            Error::Other(format!(
-                "Invalid message Cc address at position {}",
-                index + 1
-            ))
-        })?;
-        builder = builder.cc(mailbox);
-    }
-    for (index, addr) in bcc.iter().enumerate() {
-        let mailbox = parse_mailbox(addr).map_err(|_| {
-            Error::Other(format!(
-                "Invalid message Bcc address at position {}",
-                index + 1
-            ))
-        })?;
-        builder = builder.bcc(mailbox);
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Err(Error::Other(
+            "Failed to build message: no recipients".into(),
+        ));
     }
 
     if let Some(irt) = in_reply_to {
         let trimmed = irt.trim();
         if !trimmed.is_empty() {
-            builder = builder.in_reply_to(trimmed.to_string());
+            headers.set(header::InReplyTo::from(trimmed.to_string()));
         }
     }
     if !references.is_empty() {
@@ -513,18 +403,35 @@ pub fn build_raw_message(
             .collect::<Vec<_>>()
             .join(" ");
         if !joined.is_empty() {
-            builder = builder.references(joined);
+            headers.set(header::References::from(joined));
         }
     }
 
     let body = build_body(body_text, body_html, attachments)
         .map_err(|e| Error::Other(format!("Failed to build body: {}", e)))?;
 
-    let message = builder
-        .multipart(body)
-        .map_err(|e| Error::Other(format!("Failed to build message: {}", e)))?;
+    headers.set(header::Date::now());
+    headers.set(header::MIME_VERSION_1_0);
 
-    Ok(message.formatted())
+    // Headers ends with CRLF; MultiPart supplies Content-Type, the blank-line
+    // separator, and the complete boundary framing of the existing MIME body.
+    let mut raw = headers.to_string().into_bytes();
+    raw.extend_from_slice(&body.formatted());
+
+    // Encoders may leave indivisible tokens or mailbox lists on a long line.
+    // Never insert arbitrary folds into quoted local-parts: whitespace there
+    // is meaningful. Enforce the RFC 5322 hard limit on the final wire bytes,
+    // including nested MIME headers, rather than sending malformed output.
+    if raw
+        .split(|&byte| byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line).len() > 998)
+    {
+        return Err(Error::Other(
+            "Failed to build message: line exceeds 998 octets".into(),
+        ));
+    }
+
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,7 +934,439 @@ mod send_error_tests {
                 .unwrap_or_else(|error| panic!("valid mailbox {value:?} was rejected: {error}"));
         }
 
-        assert!(parse_mailbox("ipv6@[2001:db8::1]").is_err());
+        for value in ["ipv6@[2001:db8::1]", "literal@[not-an-ip]"] {
+            assert!(parse_mailbox(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn mailbox_parser_minimally_quotes_without_changing_local_semantics() {
+        for (addr_spec, expected) in [
+            (r#""a>b"@Example.COM"#, r#""a>b"@Example.COM"#),
+            (r#""a\>b"@Example.COM"#, r#""a>b"@Example.COM"#),
+            (r#""a\"b"@Example.COM"#, r#""a\"b"@Example.COM"#),
+            (r#""a\\b"@Example.COM"#, r#""a\\b"@Example.COM"#),
+            (r#""ali\ce"@Example.COM"#, "alice@Example.COM"),
+            (r#""ALIce"@Example.COM"#, "ALIce@Example.COM"),
+            (r#""  A  b  "@Example.COM"#, r#""  A  b  "@Example.COM"#),
+            (r#""a\ b"@Example.COM"#, r#""a b"@Example.COM"#),
+        ] {
+            for value in [addr_spec.to_string(), format!("Name <{addr_spec}>")] {
+                let mailbox = parse_mailbox(&value).expect("valid quoted mailbox");
+                assert_eq!(mailbox.email.to_string(), expected, "{value:?}");
+                assert_eq!(parse_address(&value).unwrap().to_string(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn sender_name_rejects_controls_before_trimming() {
+        for control in (0u8..=31)
+            .map(char::from)
+            .chain(['\u{7f}', '\u{85}', '\u{2028}', '\u{2029}'])
+        {
+            for name in [
+                control.to_string(),
+                format!("{control}Sender"),
+                format!("Sender{control}"),
+                format!("Sender{control}X-Injected: yes"),
+            ] {
+                assert!(sender_mailbox("sender@example.com", &name).is_err());
+            }
+        }
+        assert_eq!(
+            sender_mailbox("Original <sender@example.com>", "  ")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Original")
+        );
+        assert_eq!(
+            sender_mailbox("Original <sender@example.com>", "  Åsa Österberg  ")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Åsa Österberg")
+        );
+    }
+}
+
+#[cfg(test)]
+mod raw_message_tests {
+    use super::*;
+    use mailparse::MailHeaderMap as _;
+
+    fn with_recipients(to: &[String], cc: &[String], bcc: &[String]) -> Result<Vec<u8>> {
+        build_raw_message(
+            "sender@example.com",
+            "",
+            to,
+            cc,
+            bcc,
+            "Subject",
+            "body",
+            None,
+            &[],
+            None,
+            &[],
+        )
+    }
+
+    #[test]
+    fn bcc_only_is_valid_but_never_discloses_recipients() {
+        let raw = with_recipients(
+            &[],
+            &[],
+            &[
+                r#"Hidden <"a\"b"@example.com>"#.into(),
+                "other-hidden@example.com".into(),
+            ],
+        )
+        .unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        for name in ["To", "Cc", "Bcc"] {
+            assert!(parsed.headers.get_first_value(name).is_none());
+        }
+        let wire = String::from_utf8_lossy(&raw);
+        assert!(!wire.contains("Hidden"));
+        assert!(!wire.contains("other-hidden"));
+        assert_eq!(parsed.subparts[0].get_body().unwrap(), "body");
+    }
+
+    #[test]
+    fn no_recipients_is_an_error_and_cc_only_is_valid() {
+        assert_eq!(
+            with_recipients(&[], &[], &[]).unwrap_err().to_string(),
+            "Failed to build message: no recipients"
+        );
+        let raw = with_recipients(&[], &["cc@example.com".into()], &[]).unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        assert_eq!(
+            parsed.headers.get_first_value("Cc").as_deref(),
+            Some("cc@example.com")
+        );
+        assert!(parsed.headers.get_first_value("To").is_none());
+    }
+
+    #[test]
+    fn every_recipient_is_validated_including_hidden_and_later_entries() {
+        for invalid in [
+            "",
+            "not-an-address",
+            "literal@[not-an-ip]",
+            "one@example.com, two@example.com",
+            "Friends: one@example.com;",
+            "victim@example.com\r\nX-Injected: yes",
+            "victim@example.com\nX-Injected: yes",
+            "victim@example.com\rX-Injected: yes",
+            "Name\0 <victim@example.com>",
+        ] {
+            for (index, name) in ["To", "Cc", "Bcc"].iter().enumerate() {
+                let mut lists = [vec!["valid@example.com".into()], vec![], vec![]];
+                lists[index] = vec!["first@example.com".into(), invalid.into()];
+                let error = with_recipients(&lists[0], &lists[1], &lists[2]).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("Invalid message {name} address at position 2"),
+                    "{invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_or_injected_from_and_sender_name_fail_message_building() {
+        for (from, name) in [
+            ("", "Sender"),
+            ("one@example.com, two@example.com", "Sender"),
+            ("literal@[not-an-ip]", "Sender"),
+            ("sender@example.com\r\nX-Injected: yes", ""),
+            ("sender@example.com", "Sender\r\nX-Injected: yes"),
+            ("sender@example.com", "Sender\n"),
+            ("sender@example.com", "\0Sender"),
+        ] {
+            let error = build_raw_message(
+                from,
+                name,
+                &["recipient@example.com".into()],
+                &[],
+                &[],
+                "Subject",
+                "body",
+                None,
+                &[],
+                None,
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "Invalid message From address");
+        }
+    }
+
+    #[test]
+    fn required_headers_are_unique_and_multipart_framing_is_complete() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let raw = with_recipients(&["to@example.com".into()], &[], &[]).unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        for name in ["From", "Subject", "Message-ID", "Date", "MIME-Version"] {
+            assert_eq!(parsed.headers.get_all_values(name).len(), 1, "{name}");
+        }
+        assert_eq!(
+            parsed.headers.get_first_value("From").as_deref(),
+            Some("sender@example.com")
+        );
+        assert_eq!(
+            parsed.headers.get_first_value("MIME-Version").as_deref(),
+            Some("1.0")
+        );
+        let date = mailparse::dateparse(&parsed.headers.get_first_value("Date").unwrap()).unwrap();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((before..=after).contains(&date));
+        let message_id = parsed.headers.get_first_value("Message-ID").unwrap();
+        let unique = message_id
+            .strip_prefix('<')
+            .unwrap()
+            .strip_suffix("@example.com>")
+            .unwrap();
+        uuid::Uuid::parse_str(unique).expect("Message-ID has a UUID local part");
+        let second = with_recipients(&["to@example.com".into()], &[], &[]).unwrap();
+        assert_ne!(
+            mailparse::parse_mail(&second)
+                .unwrap()
+                .headers
+                .get_first_value("Message-ID")
+                .unwrap(),
+            message_id
+        );
+
+        assert_eq!(parsed.ctype.mimetype, "multipart/alternative");
+        assert_eq!(parsed.subparts.len(), 1);
+        assert_eq!(parsed.subparts[0].get_body().unwrap(), "body");
+        let boundary = parsed.ctype.params.get("boundary").unwrap();
+        let split = find_subslice(&raw, b"\r\n\r\n").unwrap();
+        assert!(raw[split + 4..].starts_with(format!("--{boundary}\r\n").as_bytes()));
+        assert!(raw.ends_with(format!("--{boundary}--\r\n").as_bytes()));
+        for (index, byte) in raw.iter().enumerate() {
+            if *byte == b'\n' {
+                assert!(index > 0 && raw[index - 1] == b'\r');
+            } else if *byte == b'\r' {
+                assert_eq!(raw.get(index + 1), Some(&b'\n'));
+            }
+        }
+    }
+
+    #[test]
+    fn threading_preserves_order_trims_empty_entries_and_folds_long_chains() {
+        let ids: Vec<String> = (0..12)
+            .map(|index| format!("<message-{index}@example.com>"))
+            .collect();
+        let mut references = vec![" ".into()];
+        references.extend(ids.iter().map(|id| format!(" {id} ")));
+        references.push(String::new());
+        let raw = build_raw_message(
+            "sender@example.com",
+            "",
+            &["recipient@example.com".into()],
+            &[],
+            &[],
+            "",
+            "body",
+            None,
+            &[],
+            Some("  <message-11@example.com>  "),
+            &references,
+        )
+        .unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        assert_eq!(parsed.headers.get_all_values("Subject"), vec![""]);
+        assert_eq!(
+            parsed.headers.get_all_values("In-Reply-To"),
+            vec!["<message-11@example.com>"]
+        );
+        assert_eq!(
+            parsed.headers.get_all_values("References"),
+            vec![ids.join(" ")]
+        );
+        assert!(find_subslice(
+            parsed
+                .headers
+                .get_first_header("References")
+                .unwrap()
+                .get_value_raw(),
+            b"\r\n "
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn empty_threading_values_are_omitted() {
+        for in_reply_to in [None, Some(""), Some(" \t\r\n ")] {
+            let raw = build_raw_message(
+                "sender@example.com",
+                "",
+                &["recipient@example.com".into()],
+                &[],
+                &[],
+                "Subject",
+                "body",
+                None,
+                &[],
+                in_reply_to,
+                &["".into(), " \t\r\n ".into()],
+            )
+            .unwrap();
+            let parsed = mailparse::parse_mail(&raw).unwrap();
+            assert!(parsed.headers.get_first_value("In-Reply-To").is_none());
+            assert!(parsed.headers.get_first_value("References").is_none());
+        }
+    }
+
+    #[test]
+    fn textual_header_encoders_prevent_header_and_body_injection() {
+        for value in [
+            "safe\r\nX-Injected: yes\r\n\r\ninjected body",
+            "safe\nX-Injected: yes\n\ninjected body",
+            "safe\rX-Injected: yes",
+        ] {
+            let raw = build_raw_message(
+                "sender@example.com",
+                "",
+                &["recipient@example.com".into()],
+                &[],
+                &[],
+                value,
+                "body",
+                None,
+                &[],
+                Some(value),
+                &[value.into()],
+            )
+            .unwrap();
+            let parsed = mailparse::parse_mail(&raw).unwrap();
+            assert!(parsed.headers.get_first_value("X-Injected").is_none());
+            assert!(parsed.headers.get_first_value("Bcc").is_none());
+            for name in ["Subject", "In-Reply-To", "References"] {
+                assert_eq!(parsed.headers.get_all_values(name).len(), 1, "{name}");
+            }
+            assert_eq!(parsed.subparts.len(), 1);
+            assert_eq!(parsed.subparts[0].get_body().unwrap(), "body");
+        }
+    }
+
+    #[test]
+    fn hard_line_limit_counts_octets_and_allows_safe_encoder_folding() {
+        for (subject, valid) in [
+            ("x".repeat(998 - "Subject: ".len()), true),
+            ("x".repeat(999 - "Subject: ".len()), false),
+            ("A long subject with words ".repeat(100), true),
+            ("日本語の件名 ".repeat(100), true),
+        ] {
+            let result = build_raw_message(
+                "sender@example.com",
+                "",
+                &["recipient@example.com".into()],
+                &[],
+                &[],
+                &subject,
+                "body",
+                None,
+                &[],
+                None,
+                &[],
+            );
+            assert_eq!(result.is_ok(), valid);
+        }
+        // Each address is short and valid, but this UTF-8 mailbox list exceeds
+        // the octet limit without exceeding 998 Unicode scalar values.
+        let to = vec!["é@example.com".into(); 64];
+        let error = with_recipients(&to, &[], &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Failed to build message: line exceeds 998 octets"
+        );
+    }
+
+    #[test]
+    fn html_alternative_and_binary_attachment_round_trip() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let raw = build_raw_message(
+            "sender@example.com",
+            "",
+            &["recipient@example.com".into()],
+            &[],
+            &[],
+            "日本語の件名",
+            "plain body",
+            Some("<p>HTML body</p>"),
+            &[AttachmentData {
+                name: "日本語.bin".into(),
+                content_type: "application/octet-stream".into(),
+                data: data.clone(),
+            }],
+            None,
+            &[],
+        )
+        .unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        assert_eq!(
+            parsed.headers.get_first_value("Subject").as_deref(),
+            Some("日本語の件名")
+        );
+        assert_eq!(parsed.ctype.mimetype, "multipart/mixed");
+        assert_eq!(parsed.subparts.len(), 2);
+        let alternative = &parsed.subparts[0];
+        assert_eq!(alternative.ctype.mimetype, "multipart/alternative");
+        assert_eq!(alternative.subparts.len(), 2);
+        assert_eq!(alternative.subparts[0].get_body().unwrap(), "plain body");
+        assert_eq!(
+            alternative.subparts[1].get_body().unwrap(),
+            "<p>HTML body</p>"
+        );
+        assert_eq!(
+            parsed.subparts[1].ctype.mimetype,
+            "application/octet-stream"
+        );
+        assert_eq!(parsed.subparts[1].get_body_raw().unwrap(), data);
+    }
+
+    #[test]
+    fn bare_quoted_and_international_senders_have_valid_message_ids() {
+        for (from, id_domain) in [
+            (r#""s>end"@Example.COM"#, "Example.COM"),
+            ("sender@[192.0.2.1]", "[192.0.2.1]"),
+            ("sender@[IPv6:2001:db8::1]", "[IPv6:2001:db8::1]"),
+            ("é@bücher.example", "xn--bcher-kva.example"),
+            ("é@ab--cd.bücher.example", "ab--cd.xn--bcher-kva.example"),
+        ] {
+            let raw = build_raw_message(
+                from,
+                "",
+                &["recipient@example.com".into()],
+                &[],
+                &[],
+                "Subject",
+                "body",
+                None,
+                &[],
+                None,
+                &[],
+            )
+            .unwrap();
+            let parsed = mailparse::parse_mail(&raw).unwrap();
+            assert_eq!(parsed.headers.get_all_values("From"), vec![from]);
+            let id = parsed.headers.get_first_header("Message-ID").unwrap();
+            let value = std::str::from_utf8(id.get_value_raw()).unwrap();
+            assert!(value.starts_with('<'));
+            assert!(value.ends_with(&format!("@{id_domain}>")));
+            assert!(value.is_ascii());
+            assert!(!value.contains("=?"));
+        }
     }
 }
 
@@ -1050,6 +1389,55 @@ mod pgp_wrap_tests {
             &[],
         )
         .expect("build_raw_message")
+    }
+
+    #[test]
+    fn quoted_sender_and_recipients_survive_mime_building() {
+        use mailparse::MailHeaderMap as _;
+
+        let raw = build_raw_message(
+            r#""s>end"@Example.COM"#,
+            "Sender",
+            &[
+                r#"To <"a\"b"@example.com>"#.into(),
+                r#"Second <"a\>b"@Example.COM>"#.into(),
+                "ordinary@example.com".into(),
+            ],
+            &[
+                r#"Cc <"a\\b"@example.com>"#.into(),
+                r#"Second <"  Local  Case  "@Example.COM>"#.into(),
+                "ordinary-cc@example.com".into(),
+            ],
+            &[r#"Bcc <"ali\ce"@example.com>"#.into()],
+            "Subject",
+            "body",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .expect("build quoted mailboxes");
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        for (header, expected) in [
+            ("From", r#"Sender <"s>end"@Example.COM>"#),
+            (
+                "To",
+                concat!(
+                    r#"To <"a\"b"@example.com>, Second <"a>b"@Example.COM>, "#,
+                    "ordinary@example.com"
+                ),
+            ),
+            (
+                "Cc",
+                concat!(
+                    r#"Cc <"a\\b"@example.com>, Second <"  Local  Case  "@Example.COM>, "#,
+                    "ordinary-cc@example.com"
+                ),
+            ),
+        ] {
+            assert_eq!(parsed.headers.get_all_values(header), vec![expected]);
+        }
+        assert!(parsed.headers.get_first_value("Bcc").is_none());
     }
 
     /// Regression: the generated Message-ID's domain must be the
