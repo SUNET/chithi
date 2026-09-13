@@ -260,8 +260,7 @@ fn reconcile_duplicate_invite_rows(
     remote: ExistingEventForSync,
     local: ExistingEventForSync,
 ) -> Result<ExistingEventForSync> {
-    let transaction = conn.unchecked_transaction()?;
-    transaction.execute(
+    conn.execute(
         "UPDATE calendar_events SET
             my_status = CASE
                 WHEN (SELECT my_status FROM calendar_events WHERE id = ?1)
@@ -297,20 +296,22 @@ fn reconcile_duplicate_invite_rows(
          WHERE id = ?2",
         params![local.id, remote.id],
     )?;
-    let meeting_bindings: i64 = transaction.query_row(
+    super::calendar_invitation::invalidate(conn, &remote.id)?;
+    super::calendar_invitation::invalidate(conn, &local.id)?;
+    let meeting_bindings: i64 = conn.query_row(
         "SELECT COUNT(*) FROM meet_meetings WHERE event_id IN (?1, ?2)",
         params![remote.id, local.id],
         |row| row.get(0),
     )?;
     if meeting_bindings < 2 {
-        transaction.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO meet_meetings
                 (event_id, account_id, protocol, meeting_id, join_url)
              SELECT ?1, account_id, protocol, meeting_id, join_url
              FROM meet_meetings WHERE event_id = ?2",
             params![remote.id, local.id],
         )?;
-        transaction.execute(
+        conn.execute(
             "DELETE FROM calendar_events WHERE id = ?1",
             params![local.id],
         )?;
@@ -321,7 +322,7 @@ fn reconcile_duplicate_invite_rows(
         );
     }
 
-    let reconciled = transaction.query_row(
+    let reconciled = conn.query_row(
         "SELECT id, my_status, attendees_json, pending_rsvp_status
          FROM calendar_events WHERE id = ?1",
         params![remote.id],
@@ -334,7 +335,6 @@ fn reconcile_duplicate_invite_rows(
             })
         },
     )?;
-    transaction.commit()?;
     log::info!(
         "Reconciled duplicate invite rows for remote event {}",
         reconciled.id
@@ -343,7 +343,16 @@ fn reconcile_duplicate_invite_rows(
 }
 
 /// Upsert an event by remote ID, falling back to a single unpushed UID match.
+/// Owns the transaction for reconciliation, provider values, and invitation
+/// proof invalidation; callers must not open a transaction around this operation.
 pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    upsert_provider_event(&transaction, event)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
     if let Some(ref remote_id) = event.remote_id {
         let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
@@ -448,12 +457,16 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     existing.id,
                 ],
             )?;
+            // A provider read cannot prove that the reported RRULE includes all
+            // overrides, even when none of the persisted recurrence fields change.
+            super::calendar_invitation::invalidate(conn, &existing.id)?;
             return Ok(());
         }
     }
 
     // No remote_id match: insert a new event.
     insert_event(conn, event)?;
+    super::calendar_invitation::invalidate(conn, &event.id)?;
     Ok(())
 }
 
@@ -872,6 +885,10 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE calendar_invitation_recurrence (
+                event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+                recurrence_rule TEXT NOT NULL
+            );
             CREATE TABLE meet_meetings (
                 event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
                 account_id TEXT NOT NULL,
@@ -1074,6 +1091,84 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1);
         }
+    }
+
+    #[test]
+    fn test_provider_refresh_rolls_back_when_proof_invalidation_fails() {
+        let conn = setup_db();
+        let mut event = make_event("local", "Local series", None);
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=WEEKLY;COUNT=4".into());
+        let transaction = conn.unchecked_transaction().unwrap();
+        insert_event(&transaction, &event).unwrap();
+        crate::db::calendar_invitation::record_local_series(&transaction, &event).unwrap();
+        transaction.commit().unwrap();
+        conn.execute(
+            "UPDATE calendar_events SET remote_id = 'remote' WHERE id = 'local'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_proof_invalidation
+             BEFORE DELETE ON calendar_invitation_recurrence
+             BEGIN SELECT RAISE(ABORT, 'injected invalidation failure'); END;",
+        )
+        .unwrap();
+        let mut incoming = get_event(&conn, "local").unwrap();
+        incoming.title = "Provider series".into();
+        assert!(upsert_event_by_remote_id(&conn, &incoming).is_err());
+        let persisted = get_event(&conn, "local").unwrap();
+        assert_eq!(persisted.title, "Local series");
+        assert!(crate::db::calendar_invitation::validated_series_rule(&conn, &persisted).is_ok());
+    }
+
+    #[test]
+    fn test_failed_provider_update_preserves_local_proof() {
+        let conn = setup_db();
+        let mut event = make_event("local", "Local series", None);
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=WEEKLY;COUNT=4".into());
+        let transaction = conn.unchecked_transaction().unwrap();
+        insert_event(&transaction, &event).unwrap();
+        crate::db::calendar_invitation::record_local_series(&transaction, &event).unwrap();
+        transaction.commit().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_provider_update BEFORE UPDATE ON calendar_events
+             BEGIN SELECT RAISE(ABORT, 'injected provider update failure'); END;",
+        )
+        .unwrap();
+        let mut incoming = event.clone();
+        incoming.remote_id = Some("remote".into());
+        assert!(upsert_event_by_remote_id(&conn, &incoming).is_err());
+        let persisted = get_event(&conn, "local").unwrap();
+        assert!(persisted.remote_id.is_none());
+        assert!(crate::db::calendar_invitation::validated_series_rule(&conn, &persisted).is_ok());
+    }
+
+    #[test]
+    fn test_provider_refresh_rolls_back_insert_and_update_without_proof_table() {
+        let conn = setup_db();
+        let mut event = make_event("local", "Original", Some("remote"));
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+        conn.execute("DROP TABLE calendar_invitation_recurrence", [])
+            .unwrap();
+        event.title = "Refreshed".into();
+        assert!(matches!(
+            upsert_event_by_remote_id(&conn, &event),
+            Err(crate::error::Error::Database(_))
+        ));
+        assert_eq!(get_event(&conn, "local").unwrap().title, "Original");
+
+        let new_event = make_event("new", "New provider event", Some("new-remote"));
+        assert!(matches!(
+            upsert_event_by_remote_id(&conn, &new_event),
+            Err(crate::error::Error::Database(_))
+        ));
+        assert!(get_event(&conn, "new").is_err());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calendar_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

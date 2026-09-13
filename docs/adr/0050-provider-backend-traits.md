@@ -24,6 +24,9 @@ retained unchanged as a historical record.
 
 ### Calendar mutation safety amendment (2026-09-13, #288)
 
+Includes the approved #308 durable move revision and series invitation proof
+fixes. Review and integration validation are still in progress.
+
 [ADR 0052](0052-calendar-occurrence-mutation-safety.md) adds persisted,
 provider-neutral `recurrence_kind`. Transport/ICS adapters classify source
 metadata before lossy RRULE conversion, and backend sync persists that
@@ -33,14 +36,49 @@ targets and enforces it before local writes, meeting cleanup or provider
 calls. The backend `move_event_to_calendar` command owns source preflight,
 cross-account copy and guarded source deletion.
 
+Persistence owns the durable `calendar_event_revisions` side table: one
+current revision per event from a global `AUTOINCREMENT` allocator. Triggers
+revise every event insert/update and meeting insert/update/delete, including
+no-op and hidden-state writes and both owners on meeting reassignment.
+Deleted revision rows are pruned while the allocator retains its sequence
+across deletion and restart, detecting replacement and ABA changes even when
+the DTO is unchanged. `MoveSourceSnapshot` captures the event and revision
+in one transaction; cross-account moves recheck both before destination
+insertion and before source deletion/meeting cleanup in their respective
+write transactions. Even harmless sync updates can abort a move; an existing
+copy is reported through the existing partial-copy error.
+
 Ordinary notifications use standalone-only `notify_calendar_event`, accepting
-only an event ID and deriving account, organizer eligibility and attendees
-from persisted state without rewriting attendee metadata;
-creation invitations use `send_invites`, which also permits known series.
-Delivery revalidates the event snapshot after asynchronous transport
-preparation, before each submission and before creation attendee writes. The store
-owns exact-ID detail/capability refresh via `get_calendar_event`, independent
-of the rendered date range; backend guards remain authoritative.
+only the current event ID and deriving account, organizer eligibility and
+attendees from persisted state without rewriting attendee metadata.
+Creation invitations use `send_invites`; series require matching durable
+proof in `calendar_invitation_recurrence`, recorded only inside the known new
+local series insertion transaction. RRULE validation normalizes the supported
+subset and rejects CR/LF and doubled prefixes. Series classification, raw
+ICS/source-message provenance or null metadata cannot substitute for proof.
+Legacy rows receive no proof, even when classified `series`; missing proof
+or proof-table/database errors fail closed without a legacy fallback.
+Delivery revalidates the event snapshot and required series proof after
+asynchronous transport preparation, before each submission and before
+creation attendee writes. The store owns exact-ID detail/capability refresh
+via `get_calendar_event`, independent of the rendered date range; backend
+guards remain authoritative.
+
+Initial remote ID/UID attachment preserves proof, allowing a supported newly
+created local series to invite after its initial JMAP push or CalDAV PUT.
+CalDAV reloads the event and revision together before HTTP, then checks both
+DTO and revision in a post-PUT write transaction before saving only
+`remote_id`, `etag` and `uid`. `ical_data` retains authoritative original
+source ICS rather than generated outbound ICS. A stale save preserves the
+changed local row and current proof state and reports that the accepted
+remote upload has not been undone; no durable upload recovery is added.
+Shared provider upsert/UID reconciliation and Graph sync transactionally
+clear proof even for unchanged DTOs; invalidation failure rolls back the
+provider write.
+Recurrence/provenance, identity or account changes and deletion/replacement
+also invalidate it. Provider-refreshed series are read-only for generated
+invitations until a future full recurrence workflow; there is no automatic
+regrant, renderer-supplied manual bypass or full ICS transformation engine.
 
 Provider-owned pure `validate_event_creation` preflight reuses payload
 validation for all four calendar backends. The command invokes it inside
@@ -57,8 +95,9 @@ unknown rows; normal sync retains exclusive cursor and reconciliation ownership.
 
 RSVP, calendar/account removal and provider reconciliation are outside the
 ordinary mutation guards. Existing best-effort command pushes and JMAP/CalDAV
-ordinary-update no-ops continue; these safeguards add no atomic remote
-operation or ability to undo already-in-flight delivery.
+ordinary-update no-ops continue. Cross-account moves remain copy-then-delete;
+these safeguards add no atomic remote operation, durable calendar outbox,
+new iTIP delivery workflow or ability to undo already-in-flight delivery.
 
 ## Context
 

@@ -513,7 +513,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
 async fn create_event_inner(
     state: &AppState,
     event: NewEventInput,
-    move_source: Option<&CalendarEvent>,
+    move_source: Option<&MoveSourceSnapshot>,
 ) -> Result<String> {
     log::info!(
         "create_event: account={} calendar={} title='{}' attendees={}",
@@ -523,6 +523,21 @@ async fn create_event_inner(
         event.attendees.len()
     );
     let id = uuid::Uuid::new_v4().to_string();
+
+    let recurrence_rule = event
+        .recurrence_rule
+        .as_deref()
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| {
+            crate::calendar::recurrence::normalize_invitation_rrule(rule, event.timezone.as_deref())
+                .ok_or_else(|| {
+                    crate::error::Error::Other(
+                        "The recurrence rule cannot be represented safely in a new invitation."
+                            .into(),
+                    )
+                })
+        })
+        .transpose()?;
 
     let attendees_json = if event.attendees.is_empty() {
         None
@@ -542,8 +557,8 @@ async fn create_event_inner(
         end_time: event.end_time,
         all_day: event.all_day,
         timezone: event.timezone,
-        recurrence_kind: RecurrenceKind::from_rule(event.recurrence_rule.as_deref()),
-        recurrence_rule: event.recurrence_rule,
+        recurrence_kind: RecurrenceKind::from_rule(recurrence_rule.as_deref()),
+        recurrence_rule,
         organizer_email: None,
         attendees_json,
         my_status: None,
@@ -569,7 +584,7 @@ async fn create_event_inner(
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
         if let Some(source) = move_source {
-            checked_mutation_target(&transaction, &source.id, Some(source))?;
+            checked_mutation_target(&transaction, &source.event.id, Some(source))?;
         }
         let account = db::accounts::get_account_full(&transaction, &cal_event.account_id)?;
         cal_event.organizer_email = Some(account.email.clone());
@@ -585,6 +600,9 @@ async fn create_event_inner(
             backend.validate_event_creation(&cal_event, &remote_cal_id)?;
         }
         db::calendar::insert_event(&transaction, &cal_event)?;
+        if cal_event.recurrence_kind == RecurrenceKind::Series {
+            db::calendar_invitation::record_local_series(&transaction, &cal_event)?;
+        }
         if let Some(ref binding) = meet_binding {
             claim_meet_binding(&transaction, &id, binding)?;
         }
@@ -816,20 +834,46 @@ pub async fn update_event(
     update_event_inner(&state, event_id, event).await
 }
 
-/// Load the authoritative target inside the caller's write transaction. Moves
-/// also compare the source snapshot, so a concurrent refresh/edit cannot cause
-/// copying one version and deleting a different one.
+/// Move tokens are captured with event data in one database snapshot. A durable
+/// revision also tracks hidden RSVP/management state and meeting ownership,
+/// including changes that return all visible fields to their original values.
+struct MoveSourceSnapshot {
+    event: CalendarEvent,
+    revision: i64,
+}
+
+fn capture_move_source(conn: &rusqlite::Connection, event_id: &str) -> Result<MoveSourceSnapshot> {
+    if conn.is_autocommit() {
+        return Err(crate::error::Error::Other(
+            "Move snapshot requires a database transaction.".into(),
+        ));
+    }
+    let event = checked_mutation_target(conn, event_id, None)?;
+    let revision = db::calendar_revision::get(conn, event_id)?;
+    Ok(MoveSourceSnapshot { event, revision })
+}
+
+/// Revalidation belongs inside the transaction that commits the copy/deletion.
 fn checked_mutation_target(
     conn: &rusqlite::Connection,
     event_id: &str,
-    expected: Option<&CalendarEvent>,
+    expected: Option<&MoveSourceSnapshot>,
 ) -> Result<CalendarEvent> {
     let event = db::calendar::get_event(conn, event_id)?;
     event.ensure_mutable()?;
-    if expected.is_some_and(|expected| expected != &event) {
-        return Err(crate::error::Error::Other(
-            "Calendar event changed during the move. Refresh before trying again.".into(),
-        ));
+    if let Some(expected) = expected {
+        if conn.is_autocommit() {
+            return Err(crate::error::Error::Other(
+                "Move revalidation requires a database transaction.".into(),
+            ));
+        }
+        if expected.event != event
+            || expected.revision != db::calendar_revision::get(conn, event_id)?
+        {
+            return Err(crate::error::Error::Other(
+                "Calendar event changed during the move. Refresh before trying again.".into(),
+            ));
+        }
     }
     Ok(event)
 }
@@ -1040,7 +1084,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
 async fn delete_event_inner(
     state: &AppState,
     event_id: String,
-    expected: Option<&CalendarEvent>,
+    expected: Option<&MoveSourceSnapshot>,
 ) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
@@ -1121,14 +1165,17 @@ async fn move_event_to_calendar_inner(
     target_calendar_id: String,
     target_account_id: String,
 ) -> Result<String> {
-    let source = {
+    let snapshot = {
         let conn = state.db.reader();
-        let source = checked_mutation_target(&conn, &event_id, None)?;
-        check_target_calendar(&conn, &target_calendar_id, &target_account_id)?;
-        source
+        let transaction = conn.unchecked_transaction()?;
+        let snapshot = capture_move_source(&transaction, &event_id)?;
+        check_target_calendar(&transaction, &target_calendar_id, &target_account_id)?;
+        transaction.commit()?;
+        snapshot
     };
+    let source = &snapshot.event;
     if source.calendar_id == target_calendar_id {
-        return Ok(source.id);
+        return Ok(source.id.clone());
     }
     if source.account_id == target_account_id {
         update_event_inner(
@@ -1167,10 +1214,10 @@ async fn move_event_to_calendar_inner(
             attendees,
             meet_binding: None,
         },
-        Some(&source),
+        Some(&snapshot),
     )
     .await?;
-    if let Err(error) = delete_event_inner(state, event_id, Some(&source)).await {
+    if let Err(error) = delete_event_inner(state, event_id, Some(&snapshot)).await {
         return Err(crate::error::Error::Other(format!(
             "Event copy {copied_id} was created, but the source was not removed: {error}"
         )));
@@ -1976,24 +2023,28 @@ enum InvitationPurpose {
     MutationNotification,
 }
 
-/// Invitation delivery is a separate creation workflow: known series masters
-/// may be invited, but a detached occurrence or unclassified row cannot safely
-/// be serialized as a new invitation. Ordinary editing remains standalone-only.
+/// Creation invitations require stored proof that the supported RRULE is the
+/// entire recurrence definition, not just a Series classification. Ordinary
+/// editing notifications remain standalone-only.
 fn checked_invitation_target(
     conn: &rusqlite::Connection,
     account_id: &str,
     event_id: &str,
     purpose: InvitationPurpose,
 ) -> Result<CalendarEvent> {
-    let event = db::calendar::get_event(conn, event_id)?;
+    let mut event = db::calendar::get_event(conn, event_id)?;
     if event.account_id != account_id {
         return Err(crate::error::Error::Other(
             "Calendar event belongs to another account.".into(),
         ));
     }
-    if !matches!(purpose, InvitationPurpose::Creation)
-        || event.recurrence_kind != RecurrenceKind::Series
+    if matches!(purpose, InvitationPurpose::Creation)
+        && event.recurrence_kind == RecurrenceKind::Series
     {
+        event.recurrence_rule = Some(db::calendar_invitation::validated_series_rule(
+            conn, &event,
+        )?);
+    } else {
         event.ensure_mutable()?;
     }
     Ok(event)

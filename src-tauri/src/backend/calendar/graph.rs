@@ -305,7 +305,8 @@ impl CalendarBackend for GraphCalendarBackend {
                     Ok(local_id) => {
                         // Update in place. Also re-pin calendar_id in case
                         // the event moved between calendars on the server.
-                        conn.execute(
+                        let transaction = conn.transaction()?;
+                        transaction.execute(
                             "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                              all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
                              description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11,
@@ -326,8 +327,9 @@ impl CalendarBackend for GraphCalendarBackend {
                                 ge.recurrence_kind.as_str(),
                                 local_id,
                             ],
-                        )
-                        .ok();
+                        )?;
+                        db::calendar_invitation::invalidate(&transaction, &local_id)?;
+                        transaction.commit()?;
                     }
                     Err(_) => {
                         let event = CalendarEvent {
@@ -352,7 +354,10 @@ impl CalendarBackend for GraphCalendarBackend {
                             remote_id: Some(ge.id.clone()),
                             etag: None,
                         };
-                        db::calendar::insert_event(&conn, &event)?;
+                        let transaction = conn.transaction()?;
+                        db::calendar::insert_event(&transaction, &event)?;
+                        db::calendar_invitation::invalidate(&transaction, &event.id)?;
+                        transaction.commit()?;
                     }
                 }
             }
@@ -552,6 +557,77 @@ mod recurrence_sync_tests {
             .unwrap()
             .extend(metadata.as_object().unwrap().clone());
         event
+    }
+
+    #[tokio::test]
+    async fn only_successful_provider_refresh_invalidates_identical_series_proof() {
+        for (response_status, reject_invalidation) in [(200, false), (500, false), (200, true)] {
+            let (_dir, db) = setup_db().await;
+            {
+                let mut conn = db.writer().await;
+                let transaction = conn.transaction().unwrap();
+                cache_event(&transaction, "cached", None);
+                let mut local = db::calendar::get_event(&transaction, "cached").unwrap();
+                local.recurrence_kind = RecurrenceKind::Series;
+                local.recurrence_rule = Some("FREQ=WEEKLY;COUNT=4;BYDAY=MO".into());
+                local.timezone = Some("UTC".into());
+                db::calendar::update_event(&transaction, &local).unwrap();
+                db::calendar_invitation::record_local_series(&transaction, &local).unwrap();
+                transaction
+                    .execute(
+                        "UPDATE calendar_events SET remote_id = 'remote' WHERE id = 'cached'",
+                        [],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+                let attached = db::calendar::get_event(&conn, "cached").unwrap();
+                assert!(db::calendar_invitation::validated_series_rule(&conn, &attached).is_ok());
+                if reject_invalidation {
+                    conn.execute_batch(
+                        "CREATE TRIGGER reject_proof_invalidation
+                         BEFORE DELETE ON calendar_invitation_recurrence
+                         BEGIN SELECT RAISE(ABORT, 'injected invalidation failure'); END;",
+                    )
+                    .unwrap();
+                }
+            }
+            let metadata = json!({
+                "type": "seriesMaster", "seriesMasterId": null,
+                "recurrence": {
+                    "pattern": {"type": "weekly", "interval": 1, "daysOfWeek": ["monday"]},
+                    "range": {"type": "numbered", "startDate": "2026-09-14", "numberOfOccurrences": 4}
+                }
+            });
+            let (root, captured) = serve_responses(vec![
+                (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
+                (response_status, json!({"value": [remote_event("remote", &metadata)]})),
+            ]).await;
+            let result = GraphCalendarBackend
+                .sync(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services(&root),
+                    },
+                    &account("calendar", "graph"),
+                )
+                .await;
+            assert_eq!(result.is_err(), reject_invalidation);
+            assert_eq!(captured.await.unwrap().len(), 2);
+            let conn = db.reader();
+            let refreshed = db::calendar::get_event(&conn, "cached").unwrap();
+            assert_eq!(refreshed.recurrence_kind, RecurrenceKind::Series);
+            assert_eq!(
+                refreshed.recurrence_rule.as_deref(),
+                Some("FREQ=WEEKLY;COUNT=4;BYDAY=MO")
+            );
+            assert_eq!(
+                db::calendar_invitation::validated_series_rule(&conn, &refreshed).is_ok(),
+                response_status != 200 || reject_invalidation
+            );
+            if reject_invalidation {
+                assert_eq!(refreshed.title, "Cached event");
+            }
+        }
     }
 
     #[tokio::test]

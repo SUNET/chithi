@@ -22,6 +22,106 @@ fn is_valid_day(code: &str) -> bool {
     DAY_CODES.contains(&code)
 }
 
+/// Normalize the supported invitation RRULE subset without changing its bounds.
+///
+/// Accept one optional `RRULE:` prefix, normalize ASCII case and surrounding
+/// spaces, and retain the original part order, numeric values and UNTIL form.
+/// Unlike the viewer converter, this rejects malformed fields before conversion
+/// can discard them. A supported rule alone does not prove local provenance.
+pub fn normalize_invitation_rrule(rule: &str, timezone: Option<&str>) -> Option<String> {
+    if !rule.is_ascii()
+        || rule.bytes().any(|byte| byte.is_ascii_control())
+        || timezone.is_some_and(|timezone| timezone.parse::<chrono_tz::Tz>().is_err())
+    {
+        return None;
+    }
+    let rule = rule.trim().to_ascii_uppercase();
+    let rule = rule.strip_prefix("RRULE:").unwrap_or(&rule);
+    let mut keys = std::collections::HashSet::new();
+    let mut parts = Vec::new();
+    for part in rule.split(';') {
+        let (key, value) = part.split_once('=')?;
+        let key = key.trim();
+        let value = value.trim();
+        if !keys.insert(key) || value.is_empty() {
+            return None;
+        }
+        match key {
+            "INTERVAL" | "COUNT" => {
+                if !value.bytes().all(|byte| byte.is_ascii_digit())
+                    || value.parse::<u32>().ok()? == 0
+                {
+                    return None;
+                }
+            }
+            "UNTIL" if !valid_ical_until_grammar(value) => return None,
+            _ => {}
+        }
+        let value = if key == "BYDAY" {
+            value
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            value.to_string()
+        };
+        parts.push(format!("{key}={value}"));
+    }
+    if keys.contains("COUNT") && keys.contains("UNTIL") {
+        return None;
+    }
+    let normalized = parts.join(";");
+    // Check before the converter strips prefixes: a second RRULE prefix must
+    // never become valid by passing through another normalization layer.
+    if !is_locally_supported_rrule(&normalized) {
+        return None;
+    }
+    let rules = rrule_to_jscalendar(&normalized, timezone)?;
+    if keys.contains("UNTIL") && !rules[0]["until"].as_str().is_some_and(valid_local_datetime) {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Convert only rules that can be represented faithfully during local creation.
+pub(crate) fn faithful_local_recurrence_rules(rule: &str, timezone: Option<&str>) -> Option<Value> {
+    let rule = normalize_invitation_rrule(rule, timezone)?;
+    rrule_to_jscalendar(&rule, timezone)
+}
+
+fn valid_ical_until_grammar(value: &str) -> bool {
+    match value.len() {
+        8 => value.bytes().all(|byte| byte.is_ascii_digit()),
+        15 | 16 => value.bytes().enumerate().all(|(index, byte)| match index {
+            8 => byte == b'T',
+            15 => byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        }),
+        _ => false,
+    }
+}
+
+/// RFC 8984 LocalDateTime permits fractional seconds, but never a UTC suffix.
+pub(crate) fn valid_local_datetime(value: &str) -> bool {
+    if !value.is_ascii() || value.len() < 19 {
+        return false;
+    }
+    let (seconds, fraction) = value.split_at(19);
+    seconds.bytes().enumerate().all(|(i, byte)| match i {
+        4 | 7 => byte == b'-',
+        10 => byte == b'T',
+        13 | 16 => byte == b':',
+        _ => byte.is_ascii_digit(),
+    }) && (fraction.is_empty()
+        || fraction.strip_prefix('.').is_some_and(|digits| {
+            !digits.is_empty()
+                && !digits.ends_with('0')
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }))
+        && chrono::NaiveDateTime::parse_from_str(seconds, "%Y-%m-%dT%H:%M:%S").is_ok()
+}
+
 /// Convert an iCal RRULE value string into a JSCalendar `recurrenceRules`
 /// array (a one-element array — RRULE describes a single rule).
 /// Returns `None` when the input isn't an RRULE string (e.g. legacy rows
@@ -311,6 +411,153 @@ mod tests {
 
     fn rule(rules: &Value) -> &serde_json::Map<String, Value> {
         rules.as_array().unwrap()[0].as_object().unwrap()
+    }
+
+    #[test]
+    fn invitation_normalization_preserves_supported_grammar_and_bounds() {
+        for (input, normalized) in [
+            ("FREQ=DAILY;COUNT=5", "FREQ=DAILY;COUNT=5"),
+            ("RRULE:FREQ=YEARLY;INTERVAL=1", "FREQ=YEARLY;INTERVAL=1"),
+            (
+                " rrule:freq = weekly ;interval=02;byday= mo, we ;count=004 ",
+                "FREQ=WEEKLY;INTERVAL=02;BYDAY=MO,WE;COUNT=004",
+            ),
+            (
+                "COUNT=4;FREQ=WEEKLY;BYDAY=FR",
+                "COUNT=4;FREQ=WEEKLY;BYDAY=FR",
+            ),
+            ("FREQ=DAILY;UNTIL=20280229", "FREQ=DAILY;UNTIL=20280229"),
+            (
+                "FREQ=MONTHLY;UNTIL=20261231T170000",
+                "FREQ=MONTHLY;UNTIL=20261231T170000",
+            ),
+            (
+                "FREQ=WEEKLY;UNTIL=20261101T140000Z",
+                "FREQ=WEEKLY;UNTIL=20261101T140000Z",
+            ),
+        ] {
+            assert_eq!(
+                normalize_invitation_rrule(input, Some("America/New_York")).as_deref(),
+                Some(normalized),
+                "{input}"
+            );
+            assert_eq!(
+                normalize_invitation_rrule(normalized, Some("America/New_York")).as_deref(),
+                Some(normalized)
+            );
+        }
+    }
+
+    #[test]
+    fn faithful_conversion_preserves_existing_jmap_values() {
+        let rules = faithful_local_recurrence_rules(
+            "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=4;BYDAY=MO,WE",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            rules,
+            json!([{
+                "@type": "RecurrenceRule", "frequency": "weekly", "interval": 2,
+                "count": 4, "byDay": [
+                    {"@type": "NDay", "day": "mo"},
+                    {"@type": "NDay", "day": "we"}
+                ]
+            }])
+        );
+        for (input, timezone, until) in [
+            ("20280229", None, "2028-02-29T23:59:59"),
+            ("20261231T170000", None, "2026-12-31T17:00:00"),
+            ("20261231T170000Z", None, "2026-12-31T17:00:00"),
+            (
+                "20261101T140000Z",
+                Some("America/New_York"),
+                "2026-11-01T09:00:00",
+            ),
+        ] {
+            let rules =
+                faithful_local_recurrence_rules(&format!("FREQ=MONTHLY;UNTIL={input}"), timezone)
+                    .unwrap();
+            assert_eq!(rule(&rules)["frequency"], "monthly");
+            assert_eq!(rule(&rules)["until"], until);
+        }
+        let rules =
+            faithful_local_recurrence_rules("FREQ=YEARLY;INTERVAL=1;COUNT=2", None).unwrap();
+        assert_eq!(
+            rules,
+            json!([{"@type": "RecurrenceRule", "frequency": "yearly", "count": 2}])
+        );
+    }
+
+    #[test]
+    fn invitation_rules_reject_malformed_or_lossy_grammar() {
+        for input in [
+            "",
+            "RRULE:",
+            "RRULE:RRULE:FREQ=DAILY",
+            "rrule:RRULE:FREQ=DAILY",
+            "RRULE :FREQ=DAILY",
+            "FREQ=DAILY\r\nEXDATE:20260914T100000Z",
+            "FREQ=DAILY\n",
+            "\rFREQ=DAILY",
+            "FREQ=DAILY\t",
+            "FREQ=DAILY\u{000b}",
+            "FREQ=DAILY\0",
+            "FREQ=DAILY\u{007f}",
+            "FREQ=DAILY\u{00a0}",
+            "FREQ=DÄILY",
+            "FREQ=DAILY;FREQ=WEEKLY",
+            "FREQ=DAILY;freq=DAILY",
+            "FREQ=DAILY;",
+            "FREQ=DAILY;COUNT",
+            "FREQ=DAILY;COUNT=",
+            "FREQ=DAILY;COUNT==2",
+            "FREQ=DAILY;COUNT=bad",
+            "FREQ=DAILY;COUNT=0",
+            "FREQ=DAILY;COUNT=+2",
+            "FREQ=DAILY;COUNT=-2",
+            "FREQ=DAILY;COUNT=4294967296",
+            "FREQ=DAILY;INTERVAL=0",
+            "FREQ=DAILY;INTERVAL=+2",
+            "FREQ=DAILY;INTERVAL=1.5",
+            "FREQ=DAILY;INTERVAL=4294967296",
+            "FREQ=DAILY;COUNT=2;UNTIL=20261231",
+            "FREQ=DAILY;UNTIL=20260230",
+            "FREQ=DAILY;UNTIL=20260230T100000",
+            "FREQ=DAILY;UNTIL=20261331T100000Z",
+            "FREQ=DAILY;UNTIL=20261231T250000",
+            "FREQ=DAILY;UNTIL=20261231T170000ZZ",
+            "FREQ=DAILY;UNTIL=20261231Z",
+            "FREQ=DAILY;UNTIL=20261231T170000+0100",
+            "FREQ=DAILY;UNTIL=20261231T170000.1Z",
+            "FREQ=DAILY;UNTIL=2026-12-31",
+            "FREQ=DAILY;BYDAY=MO",
+            "FREQ=MONTHLY;BYDAY=1MO",
+            "FREQ=WEEKLY;BYDAY=1MO",
+            "FREQ=WEEKLY;BYDAY=MO,",
+            "FREQ=WEEKLY;BYDAY=MO,NO",
+            "FREQ=WEEKLY;BYDAY=MO;BYDAY=WE",
+            "FREQ=WEEKLY;BYSETPOS=1",
+            "FREQ=WEEKLY;WKST=SU",
+            "FREQ=YEARLY;BYMONTH=10",
+            "FREQ=HOURLY",
+            "FREQ=DAILY;EXDATE=20261231",
+            "RDATE:20261231",
+            "BYDAY=MO",
+            "[{\"frequency\":\"daily\"}]",
+        ] {
+            assert!(
+                normalize_invitation_rrule(input, None).is_none(),
+                "{input:?}"
+            );
+            assert!(
+                faithful_local_recurrence_rules(input, None).is_none(),
+                "{input:?}"
+            );
+        }
+        for timezone in ["", "Mars/Olympus_Mons", "UTC\n"] {
+            assert!(normalize_invitation_rrule("FREQ=DAILY", Some(timezone)).is_none());
+        }
     }
 
     #[test]

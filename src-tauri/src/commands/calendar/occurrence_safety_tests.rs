@@ -5,10 +5,11 @@ use std::cell::{Cell, RefCell};
 use rusqlite::{params, types::Value, Connection};
 
 use super::{
-    checked_delivery_snapshot, checked_invitation_snapshot, checked_invitation_target,
-    checked_mutation_target, create_event_inner, delete_event_inner, move_event_to_calendar_inner,
-    notify_calendar_event_inner, prepare_invitation_transport, send_invites_inner,
-    update_event_inner, InvitationPurpose, MeetBindingInput, NewEventInput, UpdateEventInput,
+    capture_move_source, checked_delivery_snapshot, checked_invitation_snapshot,
+    checked_invitation_target, checked_mutation_target, create_event_inner, delete_event_inner,
+    move_event_to_calendar_inner, notify_calendar_event_inner, prepare_invitation_transport,
+    send_invites_inner, update_event_inner, InvitationPurpose, MeetBindingInput,
+    MoveSourceSnapshot, NewEventInput, UpdateEventInput,
 };
 use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -132,6 +133,25 @@ impl Fixture {
         db::calendar::get_event(&self.state.db.reader(), id).unwrap()
     }
 
+    fn move_source(&self, id: &str) -> MoveSourceSnapshot {
+        let conn = self.state.db.reader();
+        let transaction = conn.unchecked_transaction().unwrap();
+        let snapshot = capture_move_source(&transaction, id).unwrap();
+        transaction.commit().unwrap();
+        snapshot
+    }
+
+    async fn create_series(&self) -> CalendarEvent {
+        let id = create_event_inner(
+            &self.state,
+            new_event("account-a", "source", Some("FREQ=WEEKLY;COUNT=3")),
+            None,
+        )
+        .await
+        .unwrap();
+        self.event(&id)
+    }
+
     fn snapshot(&self) -> StoredRows {
         StoredRows::read(&self.state.db.reader())
     }
@@ -161,6 +181,8 @@ struct StoredRows {
     calendars: Vec<Vec<Value>>,
     meetings: Vec<Vec<Value>>,
     pending: Vec<Vec<Value>>,
+    revisions: Vec<Vec<Value>>,
+    invitation_proofs: Vec<Vec<Value>>,
 }
 
 impl StoredRows {
@@ -181,6 +203,14 @@ impl StoredRows {
             pending: rows(
                 conn,
                 "SELECT * FROM meet_pending_meetings ORDER BY lifecycle_id",
+            ),
+            revisions: rows(
+                conn,
+                "SELECT * FROM calendar_event_revisions ORDER BY event_id",
+            ),
+            invitation_proofs: rows(
+                conn,
+                "SELECT * FROM calendar_invitation_recurrence ORDER BY event_id",
             ),
         }
     }
@@ -252,6 +282,14 @@ fn assert_stale(error: Error) {
     assert!(
         matches!(&error, Error::Other(message) if message.contains("changed during the move")),
         "expected stale-source rejection, got {error:?}"
+    );
+}
+
+fn assert_unproven_series(error: Error) {
+    assert!(
+        matches!(&error, Error::Other(message)
+            if message.contains("Cannot send this recurring invitation")),
+        "expected unrepresentable series invitation rejection, got {error:?}"
     );
 }
 
@@ -448,9 +486,6 @@ async fn mutation_guards_precede_missing_source_account_resolution() {
 async fn send_invites_rejects_unsafe_targets_before_account_lookup_or_attendee_mutation() {
     let fixture = Fixture::new().await;
     for (event, reason) in blocked_events() {
-        if event.recurrence_kind == RecurrenceKind::Series {
-            continue;
-        }
         fixture.insert(&event).await;
         fixture.attach_meeting_and_pending(&event).await;
         let orphan = fixture.orphan(&event).await;
@@ -465,7 +500,11 @@ async fn send_invites_rejects_unsafe_targets_before_account_lookup_or_attendee_m
         .await
         .unwrap_err();
 
-        assert_blocked(error, reason);
+        if event.recurrence_kind == RecurrenceKind::Series {
+            assert_unproven_series(error);
+        } else {
+            assert_blocked(error, reason);
+        }
         assert_eq!(fixture.snapshot(), before, "{}", event.id);
     }
 }
@@ -506,7 +545,10 @@ async fn local_creation_derives_standalone_or_series_kind_from_input_rule() {
         let event = fixture.event(&id);
 
         assert_eq!(event.recurrence_kind, kind);
-        assert_eq!(event.recurrence_rule.as_deref(), rule);
+        assert_eq!(
+            event.recurrence_rule.as_deref(),
+            rule.filter(|rule| !rule.is_empty())
+        );
         assert_eq!(
             event.organizer_email.as_deref(),
             Some("account-a@example.test")
@@ -561,6 +603,226 @@ async fn known_series_creation_invitation_is_allowed_while_editing_stays_blocked
         fixture.event(&event.id).recurrence_rule,
         event.recurrence_rule
     );
+}
+
+#[tokio::test]
+async fn imported_and_provider_series_without_proof_cannot_prepare_or_write_attendees() {
+    let fixture = Fixture::new().await;
+    let mut events = Vec::new();
+    for (id, recurrence) in [
+        ("imported-rrule", "RRULE:FREQ=WEEKLY;COUNT=3"),
+        ("rdate-only", "RDATE:20260921T090000Z"),
+        (
+            "rrule-exdate",
+            "RRULE:FREQ=WEEKLY;COUNT=3\r\nEXDATE:20260921T090000Z",
+        ),
+    ] {
+        let raw = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nMETHOD:REQUEST\r\n\
+             BEGIN:VEVENT\r\nUID:{id}\r\nDTSTAMP:20260901T080000Z\r\n\
+             DTSTART:20260914T090000Z\r\nDTEND:20260914T100000Z\r\n\
+             {recurrence}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let parsed = crate::calendar::ical::parse_ical_data(&raw);
+        assert_eq!(parsed.len(), 1, "{id}");
+        assert_eq!(parsed[0].recurrence_kind, RecurrenceKind::Series, "{id}");
+        let mut event = stored_event(
+            id,
+            parsed[0].recurrence_kind,
+            parsed[0].recurrence_rule.as_deref(),
+        );
+        event.ical_data = Some(raw);
+        event.remote_id = None;
+        events.push(event);
+    }
+    // These are the lossy provider/cache shapes: overrides are absent from
+    // CalendarEvent, and neither missing raw ICS nor a missing remote ID proves
+    // that the RRULE is the complete recurrence definition.
+    for (id, rule, remote_id) in [
+        (
+            "provider-series",
+            Some("FREQ=WEEKLY"),
+            Some("remote-series"),
+        ),
+        (
+            "provider-overrides",
+            Some("FREQ=WEEKLY"),
+            Some("remote-overrides"),
+        ),
+        ("provider-added-dates", None, Some("remote-added-dates")),
+        ("cached-without-provenance", Some("FREQ=WEEKLY"), None),
+    ] {
+        let mut event = stored_event(id, RecurrenceKind::Series, rule);
+        event.ical_data = None;
+        event.source_message_id = None;
+        event.remote_id = remote_id.map(str::to_owned);
+        events.push(event);
+    }
+    for event in events {
+        fixture.insert(&event).await;
+        fixture.attach_meeting_and_pending(&event).await;
+        let before = fixture.snapshot();
+        assert!(before.invitation_proofs.is_empty());
+        let preparations = Cell::new(0);
+        let error = prepare_invitation_transport(
+            &fixture.state,
+            &event,
+            InvitationPurpose::Creation,
+            async {
+                preparations.set(preparations.get() + 1);
+                Ok("credentials must not be requested")
+            },
+        )
+        .await
+        .unwrap_err();
+        if event.ical_data.is_none() && event.recurrence_rule.is_some() {
+            assert!(
+                matches!(&error, Error::Other(message)
+                if message.contains("complete local recurrence proof is missing or stale")),
+                "{}: {error:?}",
+                event.id
+            );
+        }
+        assert_unproven_series(error);
+        assert_eq!(preparations.get(), 0, "{}", event.id);
+        assert_unproven_series(
+            send_invites_inner(
+                &fixture.state,
+                event.account_id.clone(),
+                event.id.clone(),
+                vec!["replacement@example.test".into()],
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(fixture.snapshot(), before, "{}", event.id);
+    }
+}
+
+#[tokio::test]
+async fn local_series_creation_normalizes_the_rule_used_by_generated_invitations() {
+    let fixture = Fixture::new().await;
+    for (rule, normalized) in [
+        (
+            "FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE",
+            "FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE",
+        ),
+        (
+            " RRULE:freq=weekly; count=3; byday=mo, we ",
+            "FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE",
+        ),
+        (
+            "rrule:freq=weekly;until=20260928T090000z",
+            "FREQ=WEEKLY;UNTIL=20260928T090000Z",
+        ),
+    ] {
+        let id = create_event_inner(
+            &fixture.state,
+            new_event("account-a", "source", Some(rule)),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, event, recipients) = checked_invitation_snapshot(
+            &fixture.state.db.reader(),
+            &id,
+            Some(("account-a".into(), vec!["guest@example.test".into()])),
+            InvitationPurpose::Creation,
+        )
+        .unwrap();
+        assert_eq!(event.recurrence_rule.as_deref(), Some(normalized));
+        let ical = crate::calendar::ical::generate_invite(
+            event.uid.as_deref().unwrap(),
+            &event.title,
+            &event.start_time,
+            &event.end_time,
+            event.location.as_deref(),
+            event.description.as_deref(),
+            event.organizer_email.as_deref().unwrap(),
+            None,
+            &recipients,
+            event.recurrence_rule.as_deref(),
+            event.timezone.as_deref(),
+        );
+        assert!(!ical.contains("RRULE:RRULE:"), "{ical}");
+        let rules: Vec<_> = ical
+            .lines()
+            .filter(|line| line.starts_with("RRULE:"))
+            .collect();
+        assert_eq!(rules, [format!("RRULE:{normalized}")]);
+        let parsed = crate::calendar::ical::parse_ical_data(&ical);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].recurrence_rule, event.recurrence_rule);
+        assert_eq!(parsed[0].recurrence_kind, RecurrenceKind::Series);
+    }
+    assert_eq!(fixture.snapshot().invitation_proofs.len(), 3);
+}
+
+#[tokio::test]
+async fn malformed_creation_rules_fail_before_event_or_meeting_ownership_writes() {
+    let fixture = Fixture::new().await;
+    let existing = stored_event("existing", RecurrenceKind::Standalone, None);
+    fixture.insert(&existing).await;
+    let binding = fixture.attach_meeting_and_pending(&existing).await;
+    let before = fixture.snapshot();
+    for rule in [
+        "RRULE:RRULE:FREQ=WEEKLY",
+        "FREQ=WEEKLY\r\nEXDATE:20260921T090000Z",
+        "FREQ=WEEKLY;COUNT=3\0",
+        "FREQ=WEEKLY;\tCOUNT=3",
+        "FREQ=WEEKLY;COUNT=bad",
+        "FREQ=WEEKLY;COUNT=0",
+        "FREQ=WEEKLY;COUNT=-1",
+        "FREQ=WEEKLY;COUNT=4294967296",
+        "FREQ=WEEKLY;COUNT=3;COUNT=4",
+        "FREQ=WEEKLY;UNTIL=bad",
+        "FREQ=WEEKLY;UNTIL=20260230T090000Z",
+        "FREQ=WEEKLY;UNTIL=2026-09-21T09:00:00Z",
+        "FREQ=WEEKLY;COUNT=3;UNTIL=20260921T090000Z",
+    ] {
+        let mut input = new_event("account-a", "source", Some(rule));
+        input.meet_binding = Some(binding.clone());
+        let error = create_event_inner(&fixture.state, input, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Other(message)
+            if message.contains("recurrence rule cannot be represented safely")),
+            "{rule:?}: {error:?}"
+        );
+        assert_eq!(fixture.snapshot(), before, "{rule:?}");
+    }
+}
+
+#[tokio::test]
+async fn failed_invitation_proof_recording_rolls_back_series_creation() {
+    let fixture = Fixture::new().await;
+    let existing = stored_event("existing", RecurrenceKind::Standalone, None);
+    fixture.insert(&existing).await;
+    let binding = fixture.attach_meeting_and_pending(&existing).await;
+    fixture
+        .state
+        .db
+        .writer()
+        .await
+        .execute_batch(
+            "CREATE TRIGGER reject_invitation_proof AFTER INSERT ON calendar_invitation_recurrence
+         BEGIN SELECT RAISE(ABORT, 'fixture proof insertion failure'); END;",
+        )
+        .unwrap();
+    let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
+    input.meet_binding = Some(binding);
+    let before = fixture.snapshot();
+    let error = create_event_inner(&fixture.state, input, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("fixture proof insertion failure"),
+        "{error:?}"
+    );
+    assert_eq!(fixture.snapshot(), before);
 }
 
 #[tokio::test]
@@ -824,6 +1086,8 @@ async fn destination_creation_rejects_stale_source_content_and_metadata_without_
     fixture.insert(&source).await;
     fixture.attach_meeting_and_pending(&source).await;
     for refreshed in refreshed_versions(&source) {
+        db::calendar::update_event(&*fixture.state.db.writer().await, &source).unwrap();
+        let snapshot = fixture.move_source(&source.id);
         {
             let conn = fixture.state.db.writer().await;
             db::calendar::update_event(&conn, &refreshed).unwrap();
@@ -833,7 +1097,7 @@ async fn destination_creation_rejects_stale_source_content_and_metadata_without_
         let error = create_event_inner(
             &fixture.state,
             new_event("account-b", "cross-account", None),
-            Some(&source),
+            Some(&snapshot),
         )
         .await
         .unwrap_err();
@@ -851,13 +1115,15 @@ async fn source_deletion_rejects_stale_content_and_metadata_without_cleanup() {
     fixture.insert(&source).await;
     fixture.attach_meeting_and_pending(&source).await;
     for refreshed in refreshed_versions(&source) {
+        db::calendar::update_event(&*fixture.state.db.writer().await, &source).unwrap();
+        let snapshot = fixture.move_source(&source.id);
         {
             let conn = fixture.state.db.writer().await;
             db::calendar::update_event(&conn, &refreshed).unwrap();
         }
         let before = fixture.snapshot();
 
-        let error = delete_event_inner(&fixture.state, source.id.clone(), Some(&source))
+        let error = delete_event_inner(&fixture.state, source.id.clone(), Some(&snapshot))
             .await
             .unwrap_err();
 
@@ -874,22 +1140,26 @@ async fn move_helpers_reject_new_recurrence_evidence_instead_of_trusting_source_
         let source = stored_event(&refreshed.id, RecurrenceKind::Standalone, None);
         fixture.insert(&source).await;
         fixture.attach_meeting_and_pending(&source).await;
+        let snapshot = fixture.move_source(&source.id);
         {
             let conn = fixture.state.db.writer().await;
             db::calendar::update_event(&conn, &refreshed).unwrap();
         }
         let before = fixture.snapshot();
 
-        assert_blocked(
-            checked_mutation_target(&fixture.state.db.reader(), &source.id, Some(&source))
-                .unwrap_err(),
-            reason,
-        );
+        {
+            let conn = fixture.state.db.reader();
+            let transaction = conn.unchecked_transaction().unwrap();
+            assert_blocked(
+                checked_mutation_target(&transaction, &source.id, Some(&snapshot)).unwrap_err(),
+                reason,
+            );
+        }
         assert_blocked(
             create_event_inner(
                 &fixture.state,
                 new_event("account-b", "cross-account", None),
-                Some(&source),
+                Some(&snapshot),
             )
             .await
             .unwrap_err(),
@@ -897,7 +1167,7 @@ async fn move_helpers_reject_new_recurrence_evidence_instead_of_trusting_source_
         );
         assert_eq!(fixture.snapshot(), before);
         assert_blocked(
-            delete_event_inner(&fixture.state, source.id.clone(), Some(&source))
+            delete_event_inner(&fixture.state, source.id.clone(), Some(&snapshot))
                 .await
                 .unwrap_err(),
             reason,
@@ -1048,6 +1318,253 @@ async fn cross_account_move_reports_partial_copy_and_preserves_refreshed_source(
     assert_eq!(after.calendars, before.calendars);
 }
 
+/// Changes invisible to CalendarEvent equality still invalidate a move. The SQL
+/// is also used inside the copy-boundary trigger, so neither probe needs sleeps.
+struct InvisibleMoveRace {
+    name: &'static str,
+    setup: &'static str,
+    change: &'static str,
+}
+
+fn invisible_move_races() -> Vec<InvisibleMoveRace> {
+    [
+        (
+            "meeting attachment",
+            "DELETE FROM meet_meetings WHERE event_id = 'standalone';",
+            "INSERT INTO meet_meetings
+                 (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('standalone', 'account-a', 'zoom', 'newly-owned',
+                     'https://example.test/newly-owned');",
+        ),
+        (
+            "meeting replacement",
+            "",
+            "INSERT OR REPLACE INTO meet_meetings
+                 (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES ('standalone', 'account-a', 'zoom', 'replacement',
+                     'https://example.test/replacement');",
+        ),
+        (
+            "meeting reassigned away",
+            "",
+            "UPDATE meet_meetings SET event_id = 'other' WHERE event_id = 'standalone';",
+        ),
+        (
+            "meeting reassigned here",
+            "UPDATE meet_meetings SET event_id = 'other' WHERE event_id = 'standalone';",
+            "UPDATE meet_meetings SET event_id = 'standalone' WHERE event_id = 'other';",
+        ),
+        (
+            "meeting detached",
+            "",
+            "DELETE FROM meet_meetings WHERE event_id = 'standalone';",
+        ),
+        (
+            "pending RSVP only",
+            "",
+            "UPDATE calendar_events SET pending_rsvp_status = 'declined'
+             WHERE id = 'standalone';",
+        ),
+        (
+            "manual management only",
+            "",
+            "UPDATE calendar_events SET manually_managed_at = NULL WHERE id = 'standalone';",
+        ),
+        (
+            "creation timestamp only",
+            "",
+            "UPDATE calendar_events SET created_at = '2026-09-13T09:00:00Z'
+             WHERE id = 'standalone';",
+        ),
+        (
+            "update timestamp only",
+            "",
+            "UPDATE calendar_events SET updated_at = '2026-09-13T09:00:00Z'
+             WHERE id = 'standalone';",
+        ),
+        (
+            "same-second hidden writes",
+            "",
+            "UPDATE calendar_events SET pending_rsvp_status = 'accepted'
+             WHERE id = 'standalone';
+             UPDATE calendar_events SET pending_rsvp_status = 'declined'
+             WHERE id = 'standalone';",
+        ),
+        (
+            "no-op event write",
+            "",
+            "UPDATE calendar_events SET title = title WHERE id = 'standalone';",
+        ),
+        (
+            "A to B to A",
+            "",
+            "UPDATE calendar_events SET title = 'Intermediate title' WHERE id = 'standalone';
+             UPDATE calendar_events SET title = 'Original title' WHERE id = 'standalone';",
+        ),
+        (
+            "same-ID delete and reinsert",
+            "CREATE TABLE saved_event AS SELECT * FROM calendar_events WHERE id = 'standalone';
+             CREATE TABLE saved_meeting AS SELECT * FROM meet_meetings WHERE event_id = 'standalone';",
+            "DELETE FROM calendar_events WHERE id = 'standalone';
+             INSERT INTO calendar_events SELECT * FROM saved_event;
+             INSERT INTO meet_meetings SELECT * FROM saved_meeting;",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, setup, change)| InvisibleMoveRace { name, setup, change })
+    .collect()
+}
+
+async fn invisible_move_fixture(race: &InvisibleMoveRace) -> (Fixture, MoveSourceSnapshot) {
+    let fixture = Fixture::new().await;
+    let source = stored_event("standalone", RecurrenceKind::Standalone, None);
+    fixture.insert(&source).await;
+    fixture
+        .insert(&stored_event("other", RecurrenceKind::Standalone, None))
+        .await;
+    fixture.attach_meeting_and_pending(&source).await;
+    fixture
+        .state
+        .db
+        .writer()
+        .await
+        .execute_batch(race.setup)
+        .unwrap();
+    let snapshot = fixture.move_source(&source.id);
+    (fixture, snapshot)
+}
+
+#[tokio::test]
+async fn cross_account_move_rejects_invisible_races_before_copy_without_writes_or_cleanup() {
+    for race in invisible_move_races() {
+        let (fixture, source) = invisible_move_fixture(&race).await;
+        let conn = fixture.state.db.writer().await;
+        let moving = move_event_to_calendar_inner(
+            &fixture.state,
+            source.event.id.clone(),
+            "cross-account".into(),
+            "account-b".into(),
+        );
+        tokio::pin!(moving);
+        assert!(
+            futures::poll!(moving.as_mut()).is_pending(),
+            "{}",
+            race.name
+        );
+        conn.execute_batch(race.change).unwrap();
+        let changed = StoredRows::read(&conn);
+        assert_eq!(
+            db::calendar::get_event(&conn, &source.event.id).unwrap(),
+            source.event
+        );
+        assert!(db::calendar_revision::get(&conn, &source.event.id).unwrap() > source.revision);
+        drop(conn);
+
+        assert_stale(moving.await.unwrap_err());
+        assert_eq!(fixture.snapshot(), changed, "{}", race.name);
+        assert!(
+            db::meet_pending_meetings::list_cleanup_requested(&fixture.state.db.reader())
+                .unwrap()
+                .is_empty(),
+            "{}",
+            race.name
+        );
+        assert!(
+            fixture
+                .snapshot()
+                .events
+                .iter()
+                .all(|row| !row.contains(&Value::Text("cross-account".into()))),
+            "{}",
+            race.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_account_move_preserves_invisible_after_copy_races_without_new_cleanup() {
+    for race in invisible_move_races() {
+        let (fixture, source) = invisible_move_fixture(&race).await;
+        let expected = {
+            let conn = fixture.state.db.writer().await;
+            // Obtain exact post-race rows independently, then roll back. The
+            // real move must preserve these bytes while retaining its copy.
+            let transaction = conn.unchecked_transaction().unwrap();
+            transaction.execute_batch(race.change).unwrap();
+            let expected = StoredRows::read(&transaction);
+            transaction.rollback().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER change_source_after_copy
+                 AFTER INSERT ON calendar_events
+                 WHEN NEW.calendar_id = 'cross-account'
+                 BEGIN {} END;",
+                race.change
+            ))
+            .unwrap();
+            expected
+        };
+
+        let error = move_event_to_calendar_inner(
+            &fixture.state,
+            source.event.id.clone(),
+            "cross-account".into(),
+            "account-b".into(),
+        )
+        .await
+        .unwrap_err();
+
+        let copied_id: String = fixture
+            .state
+            .db
+            .reader()
+            .query_row(
+                "SELECT id FROM calendar_events WHERE calendar_id = 'cross-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(&error, Error::Other(message)
+            if message.contains(&copied_id)
+                && message.contains("source was not removed")
+                && message.contains("changed during the move")),
+            "{}: {error:?}",
+            race.name
+        );
+        assert_eq!(
+            fixture.event(&source.event.id),
+            source.event,
+            "{}",
+            race.name
+        );
+        let copied = fixture.event(&copied_id);
+        assert_eq!(copied.title, source.event.title);
+        assert_eq!(copied.account_id, "account-b");
+        assert_eq!(copied.attendees_json, source.event.attendees_json);
+        let mut actual = fixture.snapshot();
+        assert_eq!(actual.events.len(), expected.events.len() + 1);
+        actual
+            .events
+            .retain(|row| row[0] != Value::Text(copied_id.clone()));
+        assert_eq!(actual.events, expected.events, "{}", race.name);
+        assert_eq!(actual.meetings, expected.meetings, "{}", race.name);
+        assert_eq!(actual.pending, expected.pending, "{}", race.name);
+        assert_eq!(actual.calendars, expected.calendars, "{}", race.name);
+        assert_eq!(
+            actual.invitation_proofs, expected.invitation_proofs,
+            "{}",
+            race.name
+        );
+        assert!(
+            db::meet_pending_meetings::list_cleanup_requested(&fixture.state.db.reader())
+                .unwrap()
+                .is_empty(),
+            "{}",
+            race.name
+        );
+    }
+}
+
 #[tokio::test]
 async fn restart_preserves_unknown_classification_and_command_rejections() {
     let fixture = Fixture::new().await;
@@ -1151,7 +1668,8 @@ fn assert_delivery_refresh_rejected(
     reason: Option<CalendarMutationBlockReason>,
 ) {
     match (purpose, refreshed.recurrence_kind, reason) {
-        (InvitationPurpose::Creation, RecurrenceKind::Series, _) | (_, _, None) => {
+        (InvitationPurpose::Creation, RecurrenceKind::Series, _) => assert_unproven_series(error),
+        (_, _, None) => {
             assert!(
                 matches!(&error, Error::Other(message)
                     if message.contains("changed while preparing the notification")),
@@ -1408,8 +1926,7 @@ async fn stable_standalone_transport_preparation_returns_capability_for_both_pur
 #[tokio::test]
 async fn stable_series_transport_preparation_retains_only_the_creation_exemption() {
     let fixture = Fixture::new().await;
-    let source = stored_event("stable-series", RecurrenceKind::Series, Some("FREQ=WEEKLY"));
-    fixture.insert(&source).await;
+    let source = fixture.create_series().await;
     fixture.attach_meeting_and_pending(&source).await;
     let before = fixture.snapshot();
     let preparations = Cell::new(0);
@@ -1631,5 +2148,261 @@ async fn ordinary_notification_rejects_changed_or_unknown_organizer_without_writ
             .unwrap_err();
         assert!(error.to_string().contains("organizer"));
         assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+mod jmap_creation {
+    use super::*;
+    use serde_json::{json, Value as JsonValue};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Exercise the command's immediate provider push with the injected HTTP
+    /// clients. Only discovery and CalendarEvent/set are accepted by this peer.
+    struct CreationServer {
+        root: String,
+        task: tokio::task::JoinHandle<JsonValue>,
+    }
+
+    impl Drop for CreationServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl CreationServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}", listener.local_addr().unwrap());
+            let base = root.clone();
+            let task = tokio::spawn(async move {
+                let mut created = JsonValue::Null;
+                for request_index in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let header_end = loop {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + length {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let response = if request_index == 0 {
+                        assert!(headers.starts_with("GET /.well-known/jmap "), "{headers}");
+                        json!({
+                            "apiUrl": format!("{base}/jmap/api"),
+                            "downloadUrl": format!("{base}/download/{{blobId}}"),
+                            "uploadUrl": format!("{base}/upload/{{accountId}}"),
+                            "primaryAccounts": {"urn:ietf:params:jmap:mail": "remote-account"},
+                            "accounts": {"remote-account": {"accountCapabilities": {
+                                "urn:ietf:params:jmap:mail": {},
+                                "urn:ietf:params:jmap:calendars": {}
+                            }}}
+                        })
+                    } else {
+                        assert!(headers.starts_with("POST /jmap/api "), "{headers}");
+                        let request: JsonValue =
+                            serde_json::from_slice(&bytes[header_end..header_end + length])
+                                .unwrap();
+                        let calls = request["methodCalls"].as_array().unwrap();
+                        assert_eq!(calls.len(), 1);
+                        assert_eq!(calls[0][0], "CalendarEvent/set");
+                        created = calls[0][1]["create"]["new1"].clone();
+                        assert!(created.is_object());
+                        json!({"methodResponses": [["CalendarEvent/set", {
+                            "accountId": "remote-account",
+                            "created": {"new1": {"id": "immediate-remote-series"}}
+                        }, calls[0][2]]], "sessionState": "state"})
+                    };
+                    let body = response.to_string();
+                    stream.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    ).as_bytes()).await.unwrap();
+                }
+                created
+            });
+            Self { root, task }
+        }
+    }
+
+    async fn create_pushed_series(fixture: &mut Fixture) -> CalendarEvent {
+        let mut server = CreationServer::start().await;
+        fixture.calendar_protocol("jmap").await;
+        {
+            let conn = fixture.state.db.writer().await;
+            db::service_bindings::insert(
+                &conn,
+                &db::service_bindings::ServiceBinding {
+                    id: "mail-jmap".into(),
+                    account_id: "account-a".into(),
+                    service: "mail".into(),
+                    protocol: "jmap".into(),
+                    enabled: true,
+                    sync_interval_seconds: None,
+                    config_json: json!({"url": server.root, "auth_method": "basic"}).to_string(),
+                },
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE calendars SET remote_id = 'remote-calendar' WHERE id = 'source'",
+                [],
+            )
+            .unwrap();
+        }
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let services = Arc::get_mut(&mut fixture.state.providers).unwrap();
+        services.transports.jmap_discovery_http = http.clone();
+        services.transports.jmap_api_http = http;
+        let id = create_event_inner(
+            &fixture.state,
+            new_event("account-a", "source", Some("RRULE:freq=weekly;count=3")),
+            None,
+        )
+        .await
+        .unwrap();
+        let event = fixture.event(&id);
+        assert_eq!(event.remote_id.as_deref(), Some("immediate-remote-series"));
+        let wire = (&mut server.task).await.unwrap();
+        assert_eq!(wire["calendarIds"], json!({"remote-calendar": true}));
+        assert_eq!(wire["recurrenceRules"][0]["frequency"], "weekly");
+        assert_eq!(wire["recurrenceRules"][0]["count"], 3);
+        assert_eq!(wire["uid"].as_str(), event.uid.as_deref());
+        assert_eq!(
+            event.recurrence_rule.as_deref(),
+            Some("FREQ=WEEKLY;COUNT=3")
+        );
+        assert_eq!(
+            fixture.snapshot().invitation_proofs,
+            vec![vec![
+                Value::Text(id),
+                Value::Text("FREQ=WEEKLY;COUNT=3".into()),
+            ]]
+        );
+        event
+    }
+
+    #[tokio::test]
+    async fn immediate_jmap_remote_id_attachment_preserves_creation_invitation_proof() {
+        let mut fixture = Fixture::new().await;
+        let event = create_pushed_series(&mut fixture).await;
+        let before = fixture.snapshot();
+        let transport = prepare_invitation_transport(
+            &fixture.state,
+            &event,
+            InvitationPurpose::Creation,
+            async { Ok("series creation transport") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(transport, "series creation transport");
+        assert_eq!(fixture.snapshot(), before);
+        send_invites_inner(
+            &fixture.state,
+            event.account_id.clone(),
+            event.id.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.snapshot().invitation_proofs,
+            before.invitation_proofs
+        );
+        assert_blocked(
+            notify_calendar_event_inner(&fixture.state, event.id)
+                .await
+                .unwrap_err(),
+            CalendarMutationBlockReason::Recurring,
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_provider_refresh_revokes_proof_during_transport_preparation() {
+        let mut fixture = Fixture::new().await;
+        let event = create_pushed_series(&mut fixture).await;
+        fixture.attach_meeting_and_pending(&event).await;
+        let preparations = Cell::new(0);
+        let sends = Cell::new(0);
+        let after_refresh = RefCell::new(None);
+        let writer = fixture.state.db.writer().await;
+        let delivery = prepare_invitation_transport(
+            &fixture.state,
+            &event,
+            InvitationPurpose::Creation,
+            async {
+                preparations.set(preparations.get() + 1);
+                let conn = fixture.state.db.writer().await;
+                db::calendar::upsert_event_by_remote_id(&conn, &event)?;
+                assert_eq!(db::calendar::get_event(&conn, &event.id)?, event);
+                let refreshed = StoredRows::read(&conn);
+                assert!(refreshed.invitation_proofs.is_empty());
+                after_refresh.replace(Some(refreshed));
+                Ok("prepared but no longer authorized transport")
+            },
+        );
+        tokio::pin!(delivery);
+        assert!(futures::poll!(delivery.as_mut()).is_pending());
+        assert_eq!(preparations.get(), 1);
+        drop(writer);
+        let error = delivery
+            .await
+            .inspect(|_| sends.set(sends.get() + 1))
+            .unwrap_err();
+        assert_unproven_series(error);
+        assert_eq!(sends.get(), 0);
+        assert_eq!(fixture.event(&event.id), event);
+        assert_eq!(
+            &fixture.snapshot(),
+            after_refresh.borrow().as_ref().unwrap()
+        );
+
+        assert_unproven_series(
+            send_invites_inner(
+                &fixture.state,
+                event.account_id.clone(),
+                event.id.clone(),
+                vec!["new@example.test".into()],
+            )
+            .await
+            .unwrap_err(),
+        );
+        let error = prepare_invitation_transport(
+            &fixture.state,
+            &event,
+            InvitationPurpose::Creation,
+            async {
+                preparations.set(preparations.get() + 1);
+                Ok("must not prepare the next recipient")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_unproven_series(error);
+        assert_eq!(preparations.get(), 1);
+        assert_eq!(
+            &fixture.snapshot(),
+            after_refresh.borrow().as_ref().unwrap()
+        );
     }
 }
