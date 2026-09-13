@@ -5,6 +5,7 @@ import {
   getRecipientSearch,
   parseRecipients,
   rankRecipientAddressMatch,
+  recipientDeduplicationKey,
   replaceLastRecipient,
 } from "@/lib/compose-recipients";
 
@@ -311,6 +312,67 @@ describe("rankRecipientAddressMatch", () => {
     ['"A@b"@example.com', '"a@b"@EXAMPLE.com', 4],
   ])("ranks %s against %s without folding local-part case", (email, query, rank) => {
     expect(rankRecipientAddressMatch(email, query)).toBe(rank);
+  });
+});
+
+describe("recipientDeduplicationKey", () => {
+  it.each<[string, string]>([
+    ["user@example.com", "user@EXAMPLE.com"],
+    ["user@Example.COM", "user@example.com"],
+    ["User@example.com", "User@EXAMPLE.COM"],
+  ])("gives %s and %s the same key regardless of domain case", (email, equivalent) => {
+    expect(recipientDeduplicationKey(email)).toBe(recipientDeduplicationKey(equivalent));
+  });
+
+  it("tags valid mailbox keys and preserves local-part case", () => {
+    expect(recipientDeduplicationKey("user@EXAMPLE.com"))
+      .toBe(JSON.stringify(["mailbox", "user", "example.com"]));
+    expect(recipientDeduplicationKey("User@example.com"))
+      .toBe(JSON.stringify(["mailbox", "User", "example.com"]));
+    expect(recipientDeduplicationKey("user@EXAMPLE.com"))
+      .not.toBe(recipientDeduplicationKey("User@example.com"));
+  });
+
+  it("preserves quoted local-part @ signs, escaping and case while folding only the domain", () => {
+    const localPart = String.raw`"Team@Work\"Ops\\West"`;
+    const email = `${localPart}@EXAMPLE.com`;
+    expect(recipientDeduplicationKey(email))
+      .toBe(JSON.stringify(["mailbox", localPart, "example.com"]));
+    expect(recipientDeduplicationKey(email))
+      .toBe(recipientDeduplicationKey(`${localPart}@example.COM`));
+    expect(recipientDeduplicationKey(email))
+      .not.toBe(recipientDeduplicationKey(String.raw`"team@Work\"Ops\\West"@example.com`));
+    expect(recipientDeduplicationKey(email))
+      .not.toBe(recipientDeduplicationKey(String.raw`"Team@Work\"OpsWest"@example.com`));
+    expect(recipientDeduplicationKey(String.raw`"team\@work"@EXAMPLE.com`))
+      .not.toBe(recipientDeduplicationKey('"team@work"@example.com'));
+  });
+
+  it.each([
+    "",
+    "not-an-address",
+    "user@",
+    '"Unclosed@example.com',
+    "user@example.com, other@example.com",
+    "User Name <user@example.com>",
+    JSON.stringify(["mailbox", "user", "example.com"]),
+  ])("gives invalid bare input %j a stable raw key that cannot collide with a mailbox key", (input) => {
+    const key = recipientDeduplicationKey(input);
+    expect(typeof key).toBe("string");
+    expect(key).toBe(recipientDeduplicationKey(input));
+    expect(key).not.toBe(recipientDeduplicationKey("user@example.com"));
+    const tagged = JSON.parse(key);
+    expect(tagged).toEqual([expect.any(String), input]);
+    expect(tagged[0]).not.toBe("mailbox");
+  });
+
+  it("does not case-fold or merge different invalid raw inputs", () => {
+    const invalidInputs = [
+      "user@", "User@", "user@@example.com", "user@@EXAMPLE.com",
+      "user@example.com, other@example.com", "user@example.com; other@example.com",
+    ];
+    const keys = invalidInputs.map(recipientDeduplicationKey);
+    expect(new Set(keys).size).toBe(invalidInputs.length);
   });
 });
 
