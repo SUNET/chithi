@@ -312,6 +312,32 @@ pub fn sync_folder_envelopes_public(
     sync_folder_envelopes(db, account_id, conn_imap, folder_path, imap_config)
 }
 
+/// Whether a folder's local sync state can be trusted as fully caught up
+/// and unchanged, letting the caller skip deletion reconciliation, flag
+/// sync, and envelope fetch entirely for this cycle.
+///
+/// Comparing only the *current* server-reported `uid_next`/`exists` against
+/// what's already stored isn't sufficient on its own: if `stored_uid_next`
+/// was recorded while a backlog was still outstanding (e.g. an earlier sync
+/// attempt that got interrupted before catching up), nothing about the
+/// server's state needs to change for that comparison to keep matching —
+/// the shortcut would silently strand that backlog forever, for as long as
+/// no new mail happens to arrive and perturb uid_next/exists. `last_uid`
+/// must have actually reached `uid_next` too.
+fn folder_looks_unchanged(
+    last_uid: u32,
+    stored_uid_next: u32,
+    stored_total: i64,
+    uid_next: u32,
+    exists: u32,
+) -> bool {
+    last_uid > 0
+        && stored_uid_next > 0
+        && uid_next == stored_uid_next
+        && exists as i64 == stored_total
+        && last_uid.saturating_add(1) >= uid_next
+}
+
 fn sync_folder_envelopes(
     db: &Arc<DbPool>,
     account_id: &str,
@@ -380,11 +406,7 @@ fn sync_folder_envelopes(
     // folder is unchanged — skip deletion reconciliation, flag sync, and
     // envelope fetch entirely. Most folders are dormant, so this skips ~80%
     // of folders on a typical sync cycle.
-    if last_uid > 0
-        && stored_uid_next > 0
-        && uid_next == stored_uid_next
-        && exists as i64 == stored_total
-    {
+    if folder_looks_unchanged(last_uid, stored_uid_next, stored_total, uid_next, exists) {
         log::debug!(
             "Folder '{}' unchanged (uidnext={}, exists={}), skipping",
             folder_path,
@@ -1128,4 +1150,40 @@ fn parse_imap_date(date_str: &str) -> Option<String> {
     }
     log::debug!("Could not parse IMAP date: {}", date_str);
     None
+}
+
+#[cfg(test)]
+mod folder_preflight_tests {
+    use super::folder_looks_unchanged;
+
+    #[test]
+    fn caught_up_and_unchanged_is_skipped() {
+        assert!(folder_looks_unchanged(10, 11, 10, 11, 10));
+    }
+
+    #[test]
+    fn outstanding_backlog_is_not_skipped_even_if_uid_next_and_exists_match() {
+        // The exact bug this guards against: stored_uid_next/stored_total
+        // already match the server, but last_uid never caught up to them
+        // (an earlier sync attempt was interrupted). Without the
+        // last_uid vs uid_next check this matched forever, silently
+        // stranding the backlog since nothing about server state needs to
+        // change for it to keep matching.
+        assert!(!folder_looks_unchanged(3, 11, 10, 11, 10));
+    }
+
+    #[test]
+    fn first_sync_is_not_skipped() {
+        assert!(!folder_looks_unchanged(0, 0, 0, 11, 10));
+    }
+
+    #[test]
+    fn new_uid_next_is_not_skipped() {
+        assert!(!folder_looks_unchanged(10, 11, 10, 15, 10));
+    }
+
+    #[test]
+    fn changed_exists_count_is_not_skipped() {
+        assert!(!folder_looks_unchanged(10, 11, 10, 11, 9));
+    }
 }
