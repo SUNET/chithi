@@ -1,6 +1,7 @@
 //! JMAP calendar domain: `Calendar/*` and `CalendarEvent/*` methods
 //! (RFC 8984 JSCalendar).
 
+use crate::calendar::recurrence::{faithful_local_recurrence_rules, valid_local_datetime};
 use crate::calendar::RecurrenceKind;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -100,39 +101,6 @@ impl JmapCalendarEvent {
             }
         }
     }
-}
-
-/// The viewer's converter tolerates malformed numeric/UNTIL fields. Creation
-/// must reject those rather than turning bounded recurrence into another series.
-fn faithful_local_recurrence_rules(
-    rule: &str,
-    timezone: Option<&str>,
-) -> Option<serde_json::Value> {
-    if !rule.is_ascii()
-        || timezone.is_some_and(|timezone| timezone.parse::<chrono_tz::Tz>().is_err())
-    {
-        return None;
-    }
-    let rule = rule.trim().strip_prefix("RRULE:").unwrap_or(rule.trim());
-    let mut keys = std::collections::HashSet::new();
-    for part in rule.split(';') {
-        let (key, value) = part.split_once('=')?;
-        let key = key.trim().to_ascii_uppercase();
-        if !keys.insert(key.clone()) || value.trim().is_empty() {
-            return None;
-        }
-        if matches!(key.as_str(), "INTERVAL" | "COUNT") && value.trim().parse::<u32>().ok()? == 0 {
-            return None;
-        }
-    }
-    if keys.contains("COUNT") && keys.contains("UNTIL") {
-        return None;
-    }
-    let rules = crate::calendar::recurrence::rrule_to_jscalendar(rule, timezone)?;
-    if keys.contains("UNTIL") && !rules[0]["until"].as_str().is_some_and(valid_local_datetime) {
-        return None;
-    }
-    Some(rules)
 }
 
 /// Fetch the provider's complete native JSCalendar Event representation.
@@ -308,26 +276,6 @@ fn valid_recurrence_rule(rule: &serde_json::Value) -> bool {
             rule["frequency"].as_str(),
             Some("yearly" | "monthly" | "weekly" | "daily" | "hourly" | "minutely" | "secondly")
         )
-}
-
-/// RFC 8984 LocalDateTime permits fractional seconds, but never a UTC suffix.
-fn valid_local_datetime(value: &str) -> bool {
-    if !value.is_ascii() || value.len() < 19 {
-        return false;
-    }
-    let (seconds, fraction) = value.split_at(19);
-    seconds.bytes().enumerate().all(|(i, byte)| match i {
-        4 | 7 => byte == b'-',
-        10 => byte == b'T',
-        13 | 16 => byte == b':',
-        _ => byte.is_ascii_digit(),
-    }) && (fraction.is_empty()
-        || fraction.strip_prefix('.').is_some_and(|digits| {
-            !digits.is_empty()
-                && !digits.ends_with('0')
-                && digits.bytes().all(|byte| byte.is_ascii_digit())
-        }))
-        && chrono::NaiveDateTime::parse_from_str(seconds, "%Y-%m-%dT%H:%M:%S").is_ok()
 }
 
 impl JmapConnection {

@@ -4,6 +4,10 @@
 
 Accepted — approved scope of #288, 2026-09-13.
 
+Amended for the approved scope of #308: durable move revisions and
+provenance-gated series invitations. Review and integration validation are
+still in progress.
+
 ## Context
 
 A displayed calendar event is not necessarily an independently writable
@@ -143,6 +147,14 @@ events or known-local series with a representable RRULE, which is included
 in the generated resource. Unknown rows and incomplete/unrepresentable
 recurrence evidence are rejected rather than flattened into standalone ICS.
 
+Before an initial CalDAV PUT, the backend reloads the event and durable
+revision in one transaction. After HTTP succeeds, a write transaction checks
+both DTO and revision before attaching only `remote_id`, `etag` and `uid`.
+`ical_data` remains authoritative original source ICS; generated outbound ICS
+is never written back into it. A stale post-PUT save preserves the changed
+local row and its current proof state, reporting that the accepted remote
+upload has not been undone. This adds no durable upload recovery.
+
 Both deferred passes continue processing eligible rows and then report
 aggregated creation failures, including unsupported rows. Unsupported rows
 remain local; this policy does not enable ordinary recurrence editing.
@@ -157,19 +169,34 @@ waiting for a meeting lifecycle lock and rechecks after acquiring it.
 These are persisted-state guards, not an additional provider read or remote
 ETag compare-and-swap protocol.
 
+The durable `calendar_event_revisions` side table stores one current revision
+per event, allocated from a global SQLite `AUTOINCREMENT` sequence. Triggers
+allocate a new revision on every event insert/update, including no-op writes,
+hidden RSVP/management state and timestamps, and on every meeting
+insert/update/delete. Meeting reassignment revises both old and new event
+owners. Deleted events' revision rows are pruned, but the global allocator
+retains its sequence even when the table is empty and across restarts.
+Replacement, delete/reinsert and ABA changes (changed and then restored data)
+therefore cannot revive a committed revision. Revision changes commit or
+roll back with the underlying writes; missing revisions fail closed.
+
 The renderer invokes `move_event_to_calendar` with the source event ID and
 destination calendar/account IDs. The command:
 
-1. Loads and validates the authoritative source and destination ownership
-   before any copy. A same-account move uses the guarded update path.
+1. Captures a `MoveSourceSnapshot` containing the authoritative event and its
+   durable revision in one read transaction, checking eligibility and
+   destination ownership. A same-account move uses the guarded update path.
 2. For a cross-account move, builds the copy from persisted source content,
-   then rechecks source eligibility, the expected source snapshot and target
-   ownership inside the destination-insert transaction.
-3. Compares the expected source snapshot again in the source-deletion
-   transaction, before deleting or claiming meeting cleanup. Concurrent
-   changes to source content or represented metadata leave that source
-   intact. If the copy already exists, the error identifies the copy and
-   reports that the source was not removed.
+   then rechecks source eligibility, both snapshot content and revision, and
+   target ownership inside the destination-insert transaction before copying.
+3. Rechecks the snapshot content and revision in the source-deletion
+   transaction before deleting or claiming meeting cleanup. A mismatch leaves
+   the source intact. If the copy already exists, the existing partial-copy
+   error identifies it and reports that the source was not removed.
+
+DTO equality alone cannot detect hidden-state, meeting-ownership or ABA races.
+Unconditional revisions deliberately favor preservation: even a harmless
+sync update can abort a move, including after the destination copy exists.
 
 The cross-account move remains copy-then-delete with existing best-effort
 provider CRUD. It is not an atomic remote move or a new durable retry
@@ -177,15 +204,49 @@ protocol. A permitted local mutation can still outlive a failed provider
 push under [ADR 0050](0050-provider-backend-traits.md), including the existing
 JMAP/CalDAV ordinary-update no-ops.
 
+### Generated series invitations require local creation proof
+
+`send_invites` with creation purpose permits a `series` only when the private
+`calendar_invitation_recurrence` side table proves that its supported RRULE
+is the complete recurrence definition. Only known new local series creation
+records that proof, inside the event-insertion transaction after creation
+validation. Imports, refreshes, edits, migrations and invitation sends never
+grant it. The proof stores the normalized RRULE and must match the current
+persisted series. Normalization accepts one optional `RRULE:` prefix
+and rejects unsupported or malformed rules, CR/LF and other control
+characters, and doubled prefixes rather than dropping recurrence bounds.
+
+Series classification or a plausible RRULE is insufficient provenance. Raw
+ICS or source-message metadata marks imported/unproven recurrence for this
+workflow; null `ical_data`, `source_message_id` or `remote_id` never proves
+local creation. Missing or stale proof, a missing proof table, or a database
+error fails closed with no legacy fallback. The migration grants no
+invitation proof to existing records, even those already classified `series`.
+
+Proof survives the initial provider push attaching a remote ID or canonical
+UID. A newly created supported local series can therefore send generated
+invitations after its initial JMAP push or CalDAV PUT. Actual changes to
+recurrence, raw ICS/source-message provenance, event identity or account
+ownership, and deletion/replacement, invalidate proof. Provider reconciliation
+explicitly clears it even when the incoming DTO and RRULE are unchanged:
+shared calendar upsert/UID reconciliation and Graph's direct sync writes
+commit provider data and proof invalidation in the same transaction. An
+invalidation error rolls back that provider write.
+
+After a provider refresh, a series is read-only for generated invitations;
+there is no automatic regrant from a later matching DTO or cleared metadata.
+Supporting invitations for imported or refreshed recurrence requires a future
+full recurrence workflow. There is no renderer-supplied manual flag or bypass,
+and this safeguard is not a full ICS transformation engine.
+
 ## Scope
 
 Creation derives `standalone` or `series` from known creation input. New
-series creation and invitation delivery for known series remain separate
-workflows, subject to existing provider capabilities. `send_invites` is the
-creation-invitation command and permits known series. Ordinary edit/delete/
-move notification callers use the distinct `notify_calendar_event` command,
-which takes only the event ID, requires confirmed standalone status and has
-no series exemption. It derives the account, organizer eligibility and full
+series creation and proof-gated invitation delivery remain separate workflows,
+subject to existing provider capabilities. Ordinary edit/delete/move
+notifications retain the distinct `notify_calendar_event` command, which takes
+only the current event ID, requires confirmed standalone status and has no
+series exemption. It derives the account, organizer eligibility and full
 attendee records from a checked persisted snapshot. A missing or different
 organizer cannot authorize notifications. Ordinary notifications never write
 attendees, names, response status or self markers. Only explicit creation
@@ -198,14 +259,17 @@ attendee patch because that form does not edit attendees.
 
 Delivery compares the current persisted event with its expected snapshot
 after asynchronous credentials/session preparation, before each transport
-submission and before creation attendee writes, including the Google/Graph branch
-that delegates mail delivery to the provider. Changes abort subsequent work.
-These checks do not undo delivery already in flight or make a multi-recipient
-send, notification plus mutation, or provider operation atomic.
+submission and before creation attendee writes, including the Google/Graph
+branch that delegates mail delivery to the provider. For series creation
+invitations, each check also revalidates proof, so a provider refresh can
+abort subsequent work even with an unchanged event DTO. These checks do not
+undo delivery already in flight or make a multi-recipient send, notification
+plus mutation, or provider operation atomic.
 
 RSVP, calendar/account removal and provider reconciliation are outside the
 ordinary mutation guards. This decision adds no occurrence editor, series
-editor or exception-sync engine, and does not redesign provider CRUD delivery.
+editor or exception-sync engine, and does not redesign provider CRUD delivery
+or add a durable calendar outbox or new iTIP delivery workflow.
 
 ## Consequences
 
@@ -214,7 +278,11 @@ editor or exception-sync engine, and does not redesign provider CRUD delivery.
 - Conservative classification can keep events read-only until sufficient
   source evidence exists; some legacy rows will remain unknown.
 - Cross-account races can leave a reported partial copy for the user to
-  resolve, preserving a changed source rather than deleting a newer version.
+  resolve, preserving the source after any intervening tracked write, even
+  when its visible content is unchanged.
+- Legacy, imported and provider-refreshed series cannot generate invitations
+  without the future full recurrence workflow; initial push alone preserves
+  a supported new local series' creation proof.
 - Recurrence classification and ordinary mutation policy have explicit
   shared ownership, while provider-specific evidence remains in adapters.
 
@@ -234,7 +302,12 @@ Automated test sources cover:
   `src-tauri/src/commands/calendar/occurrence_safety_tests.rs`: real database
   state, rejected writes and meeting cleanup, ownership, standalone paths,
   creation/invitation scope, lock/transaction races, partial-copy reporting
-  and restart behavior.
+  and restart behavior, including hidden-state/ABA move races and invitation
+  proof revocation during transport preparation.
+- `src-tauri/src/db/calendar_revision.rs`, `calendar_invitation.rs` and schema
+  test sources cover durable token allocation/pruning, replacement, rollback,
+  restart and snapshot consistency, empty legacy proof migration, initial
+  identity attachment and fail-closed provider reconciliation.
 - Rust model, persistence, migration, ICS and provider tests: classification
   round trips, malformed/ambiguous metadata, conservative startup recovery,
   provider request shapes, and refresh of existing rows, including Google's

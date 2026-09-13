@@ -279,7 +279,109 @@ pub fn initialize(conn: &Connection) -> Result<()> {
 
     // Migrations for existing databases
     run_migrations(conn)?;
+    initialize_calendar_event_state(conn)?;
 
+    Ok(())
+}
+
+/// Install durable mutation tokens and invitation evidence after all source
+/// tables and migrated columns exist. Seeding and trigger installation commit
+/// together, and repeated initialization preserves already-issued tokens.
+fn initialize_calendar_event_state(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS calendar_event_revisions (
+             revision INTEGER PRIMARY KEY AUTOINCREMENT,
+             event_id TEXT NOT NULL UNIQUE
+         );
+
+         CREATE TABLE IF NOT EXISTS calendar_invitation_recurrence (
+             event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+             recurrence_rule TEXT NOT NULL
+         );
+
+         -- Allocate globally, rather than incrementing a per-event counter:
+         -- deleting/replacing an ID must never revive its committed token.
+         -- Explicit DELETE/INSERT avoids inheriting the source statement's
+         -- conflict policy for an existing revision row.
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_insert
+         AFTER INSERT ON calendar_events BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = NEW.id;
+             INSERT INTO calendar_event_revisions (event_id) VALUES (NEW.id);
+         END;
+
+         -- Unconditional: hidden state, timestamps, and no-op writes count.
+         -- Changing the root ID retires its old token and replaces any token
+         -- at the destination, including UPDATE OR REPLACE with recursion off.
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_update
+         AFTER UPDATE ON calendar_events BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id IN (OLD.id, NEW.id);
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id IN (OLD.id, NEW.id);
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_delete
+         AFTER DELETE ON calendar_events BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = OLD.id;
+         END;
+
+         -- A meeting replacement still fires INSERT when recursive_triggers
+         -- is off. During event cascades, only surviving events get tokens.
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_meeting_insert
+         AFTER INSERT ON meet_meetings BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = NEW.event_id;
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id = NEW.event_id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_meeting_update
+         AFTER UPDATE ON meet_meetings BEGIN
+             DELETE FROM calendar_event_revisions
+                 WHERE event_id IN (OLD.event_id, NEW.event_id);
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id IN (OLD.event_id, NEW.event_id);
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_meeting_delete
+         AFTER DELETE ON meet_meetings BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = OLD.event_id;
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id = OLD.event_id;
+         END;
+
+         -- Never infer invitation proof for legacy rows. INSERT invalidation
+         -- also covers REPLACE when SQLite suppresses the implicit DELETE
+         -- trigger; uid/remote_id assignment during initial push keeps proof.
+         CREATE TRIGGER IF NOT EXISTS calendar_invitation_recurrence_insert
+         AFTER INSERT ON calendar_events BEGIN
+             DELETE FROM calendar_invitation_recurrence WHERE event_id = NEW.id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_invitation_recurrence_delete
+         AFTER DELETE ON calendar_events BEGIN
+             DELETE FROM calendar_invitation_recurrence WHERE event_id = OLD.id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_invitation_recurrence_update
+         AFTER UPDATE OF id, recurrence_rule, recurrence_kind, ical_data,
+                         source_message_id, account_id ON calendar_events
+         WHEN OLD.id IS NOT NEW.id
+           OR OLD.recurrence_rule IS NOT NEW.recurrence_rule
+           OR OLD.recurrence_kind IS NOT NEW.recurrence_kind
+           OR OLD.ical_data IS NOT NEW.ical_data
+           OR OLD.source_message_id IS NOT NEW.source_message_id
+           OR OLD.account_id IS NOT NEW.account_id
+         BEGIN
+             DELETE FROM calendar_invitation_recurrence WHERE event_id IN (OLD.id, NEW.id);
+         END;
+
+         INSERT INTO calendar_event_revisions (event_id)
+             SELECT id FROM calendar_events
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM calendar_event_revisions WHERE event_id = calendar_events.id
+             );",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -981,6 +1083,194 @@ mod tests {
         .unwrap();
     }
 
+    fn invitation_connection(recursive: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "recursive_triggers", recursive)
+            .unwrap();
+        initialize(&conn).unwrap();
+        seed_recovery_account(&conn);
+        insert_recovery_row(&conn, "event", None, None);
+        conn.execute_batch(
+            "UPDATE calendar_events
+             SET recurrence_rule = 'FREQ=WEEKLY', recurrence_kind = 'series';
+             INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('other-account', 'Other', 'other@example.com', 'other@example.com');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn store_invitation_proof(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO calendar_invitation_recurrence (event_id, recurrence_rule)
+             VALUES ('event', 'FREQ=WEEKLY');",
+        )
+        .unwrap();
+    }
+
+    fn invitation_proof_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM calendar_invitation_recurrence",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn invitation_proof_migration_starts_empty_and_preserves_proof_on_restart() {
+        for recursive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("invitation-proof.db");
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "recursive_triggers", recursive)
+                    .unwrap();
+                initialize(&conn).unwrap();
+                seed_recovery_account(&conn);
+                insert_recovery_row(&conn, "event", None, None);
+                conn.execute_batch(
+                    "DROP TRIGGER calendar_invitation_recurrence_insert;
+                     DROP TRIGGER calendar_invitation_recurrence_update;
+                     DROP TRIGGER calendar_invitation_recurrence_delete;
+                     DROP TABLE calendar_invitation_recurrence;
+                     UPDATE calendar_events
+                     SET recurrence_rule = 'FREQ=WEEKLY', recurrence_kind = 'series';",
+                )
+                .unwrap();
+                initialize(&conn).unwrap();
+                assert_eq!(invitation_proof_count(&conn), 0);
+                store_invitation_proof(&conn);
+            }
+            for _ in 0..2 {
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "recursive_triggers", recursive)
+                    .unwrap();
+                initialize(&conn).unwrap();
+                let proof: String = conn
+                    .query_row(
+                        "SELECT recurrence_rule FROM calendar_invitation_recurrence
+                         WHERE event_id = 'event'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(proof, "FREQ=WEEKLY");
+                assert_eq!(invitation_proof_count(&conn), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn invitation_proof_is_invalidated_by_actual_evidence_changes_including_nulls() {
+        for recursive in [false, true] {
+            let conn = invitation_connection(recursive);
+            for assignment in [
+                "recurrence_rule = 'FREQ=DAILY'",
+                "recurrence_rule = NULL",
+                "recurrence_rule = ''",
+                "recurrence_kind = 'standalone'",
+                "ical_data = 'retained invitation'",
+                "ical_data = NULL",
+                "ical_data = ''",
+                "source_message_id = 'source-message'",
+                "source_message_id = NULL",
+                "source_message_id = ''",
+                "account_id = 'other-account'",
+                "id = 'renamed'",
+            ] {
+                store_invitation_proof(&conn);
+                conn.execute(
+                    &format!("UPDATE calendar_events SET {assignment} WHERE id = 'event'"),
+                    [],
+                )
+                .unwrap();
+                assert_eq!(invitation_proof_count(&conn), 0, "{assignment}");
+            }
+        }
+    }
+
+    #[test]
+    fn invitation_proof_survives_noops_initial_push_and_unrelated_changes() {
+        for recursive in [false, true] {
+            let conn = invitation_connection(recursive);
+            store_invitation_proof(&conn);
+            for assignment in [
+                "id = id, recurrence_rule = recurrence_rule, recurrence_kind = recurrence_kind,
+                 ical_data = ical_data, source_message_id = source_message_id,
+                 account_id = account_id",
+                "remote_id = 'initial-jmap-id', uid = 'initial-jmap-uid'",
+                "title = 'Edited title', location = 'Room', description = 'Description'",
+                "pending_rsvp_status = 'ACCEPTED', manually_managed_at = CURRENT_TIMESTAMP",
+                "updated_at = CURRENT_TIMESTAMP, etag = 'new-etag'",
+            ] {
+                conn.execute(
+                    &format!("UPDATE calendar_events SET {assignment} WHERE id = 'event'"),
+                    [],
+                )
+                .unwrap();
+                assert_eq!(invitation_proof_count(&conn), 1, "{assignment}");
+            }
+        }
+    }
+
+    #[test]
+    fn invitation_proof_is_cleared_on_delete_reinsert_and_identical_replacement() {
+        for recursive in [false, true] {
+            for foreign_keys in [false, true] {
+                let conn = invitation_connection(recursive);
+                conn.pragma_update(None, "foreign_keys", foreign_keys)
+                    .unwrap();
+                store_invitation_proof(&conn);
+                conn.execute_batch(
+                    "INSERT OR REPLACE INTO calendar_events
+                     SELECT * FROM calendar_events WHERE id = 'event';",
+                )
+                .unwrap();
+                assert_eq!(invitation_proof_count(&conn), 0);
+                store_invitation_proof(&conn);
+                conn.execute("DELETE FROM calendar_events WHERE id = 'event'", [])
+                    .unwrap();
+                assert_eq!(invitation_proof_count(&conn), 0);
+                if !foreign_keys {
+                    // Simulate leftover evidence so INSERT invalidation is
+                    // exercised independently of FK and DELETE cleanup.
+                    store_invitation_proof(&conn);
+                }
+                insert_recovery_row(&conn, "event", None, None);
+                assert_eq!(invitation_proof_count(&conn), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn invitation_proof_invalidation_rolls_back_with_the_event_write() {
+        for recursive in [false, true] {
+            let conn = invitation_connection(recursive);
+            store_invitation_proof(&conn);
+            for sql in [
+                "UPDATE calendar_events SET recurrence_rule = NULL WHERE id = 'event'",
+                "DELETE FROM calendar_events WHERE id = 'event'",
+                "INSERT OR REPLACE INTO calendar_events
+                 SELECT * FROM calendar_events WHERE id = 'event'",
+            ] {
+                let tx = conn.unchecked_transaction().unwrap();
+                tx.execute(sql, []).unwrap();
+                assert_eq!(invitation_proof_count(&tx), 0);
+                tx.rollback().unwrap();
+                assert_eq!(invitation_proof_count(&conn), 1);
+                let rule: String = conn
+                    .query_row(
+                        "SELECT recurrence_rule FROM calendar_events WHERE id = 'event'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rule, "FREQ=WEEKLY");
+            }
+        }
+    }
+
     #[test]
     fn local_recurrence_recovery_classifies_trustworthy_single_event_ics() {
         use crate::calendar::RecurrenceKind;
@@ -1018,8 +1308,11 @@ mod tests {
             event.recurrence_kind = kind;
             expected.push(event);
         }
-        conn.execute_batch("ALTER TABLE calendar_events DROP COLUMN recurrence_kind;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER calendar_invitation_recurrence_update;
+             ALTER TABLE calendar_events DROP COLUMN recurrence_kind;",
+        )
+        .unwrap();
 
         initialize(&conn).unwrap();
 
@@ -1231,7 +1524,8 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             initialize(&conn).unwrap();
             conn.execute_batch(
-                "ALTER TABLE calendar_events DROP COLUMN recurrence_kind;
+                "DROP TRIGGER calendar_invitation_recurrence_update;
+                 ALTER TABLE calendar_events DROP COLUMN recurrence_kind;
                  INSERT INTO accounts (id, display_name, email, username)
                  VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
                  INSERT INTO calendars (id, account_id, name)

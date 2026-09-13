@@ -1,6 +1,8 @@
 pub mod accounts;
 pub mod calendar;
 pub mod calendar_event_deletion;
+pub(crate) mod calendar_invitation;
+pub(crate) mod calendar_revision;
 pub mod contacts;
 pub mod filters;
 pub mod folders;
