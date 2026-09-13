@@ -1,7 +1,8 @@
 # ADR 0017: Google Calendar & Contacts Two-Way Sync
 
 ## Status
-Accepted; amended for complete contact reconciliation on 2026-08-22.
+Accepted; amended for complete contact reconciliation on 2026-08-22 and
+calendar mutation safety (#288) on 2026-09-13.
 
 ## Context
 Gmail accounts need full two-way sync for calendar events and contacts with Google's servers. Google's CalDAV/CardDAV endpoints don't support standard WebDAV discovery, so we use Google's REST APIs directly.
@@ -23,6 +24,38 @@ Gmail accounts need full two-way sync for calendar events and contacts with Goog
 - On 410 Gone: clears stored token, falls back to full sync on next cycle.
 
 **Routing:** `provider == "gmail"` is checked BEFORE `mail_protocol == "jmap"` in all operations (create, update, delete, sync) because Gmail accounts have `mail_protocol="imap"`.
+
+### Calendar mutation safety amendment (2026-09-13, #288)
+
+[ADR 0052](0052-calendar-occurrence-mutation-safety.md) limits ordinary
+Edit/Delete/Move to confirmed standalone events. Expanded Google instances
+remain viewable but read-only for these actions, including moves to another
+calendar or account. RSVP and invitation delivery are separate workflows.
+
+- Full reads retain `singleEvents=true`; both full and incremental reads
+  consume unmasked event objects. The adapter classifies `recurrence`,
+  `recurringEventId` and `originalStartTime` before persisting
+  `recurrence_kind`. Expanded instances can have no RRULE and opaque IDs;
+  neither is evidence that they are standalone. Malformed or conflicting
+  recurrence metadata yields `unknown`.
+- With a saved sync token and remote-backed `unknown` rows, the calendar
+  gets a separate bounded metadata read. It updates only `recurrence_kind`
+  on matching existing unknown rows when the response establishes a known
+  kind. It skips cancelled or inconclusive resources, preserves event
+  content, inserts no rows, prunes nothing and never changes the delta
+  cursor, including from a returned `nextSyncToken`.
+- Normal incremental sync always follows that recovery attempt using the
+  original saved token, including after a recovery error. Normal sync owns
+  content changes, inserts, cancellation tombstones and cursor advancement
+  or expiry. Recovery therefore cannot replace or starve delta catch-up.
+  With no saved token, the ordinary initial full read provides classification.
+- Unknown local-only rows do not trigger the supplemental read. Once no
+  unknown remote-backed rows remain, the extra read stops. Events outside
+  its window or with inconclusive metadata can remain unknown and read-only;
+  refresh is not a guarantee of recovery.
+
+The shared command guards precede ordinary writes and their side effects.
+Existing best-effort provider CRUD semantics still apply to allowed actions.
 
 ### Contacts: Google People API v1
 
@@ -103,12 +136,17 @@ Google returns `backgroundColor` as hex color directly in the calendarList respo
 ## Deferred Items
 
 1. **iCalUID cross-reference**: matching events across accounts by UID to avoid duplicates. Needs cross-account query + dedup logic.
-2. **Recurring event handling**: currently uses `singleEvents=true` which expands recurrences. Creating recurring events on Google, editing single instances, and the `events.instances` endpoint are not yet supported.
+2. **Recurring event handling**: full reads use `singleEvents=true` and now
+   classify expanded instances for mutation safety. Ordinary series and
+   occurrence editing, deletion and moves are blocked. Provider-native
+   recurring creation on Google and the `events.instances` endpoint remain
+   unsupported; the separate local series-creation workflow is not disabled.
 3. **Push notifications** (`events.watch`): requires a publicly accessible HTTPS webhook URL, not feasible for desktop apps without a relay server.
 4. **Calendar management**: creating/deleting Google calendars from the UI. No calendar management UI exists yet.
 
 ## Consequences
-- Gmail calendar events sync two-way: create, update, delete, RSVP all reflected on Google
+- Gmail calendar events use two-way provider CRUD, subject to the
+  standalone-only ordinary mutation policy and existing best-effort pushes
 - Incremental sync reduces API calls and improves performance after first sync
 - Contact CRUD pushes to Google People API
 - Contact sync uses persisted People API sync tokens, explicit tombstones and

@@ -346,6 +346,12 @@ export async function getEvents(
   return invoke("get_events", { accountId, start, end, calendarId: calendarId ?? null });
 }
 
+export async function getCalendarEvent(
+  eventId: string,
+): Promise<import("./types").CalendarEvent> {
+  return invoke("get_calendar_event", { eventId });
+}
+
 export async function listRoomSuggestions(
   accountId: string,
 ): Promise<import("./types").RoomSuggestion[]> {
@@ -397,6 +403,16 @@ export async function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }
 
+export async function moveEventToCalendar(
+  eventId: string,
+  targetCalendarId: string,
+  targetAccountId: string,
+): Promise<string> {
+  return invoke("move_event_to_calendar", {
+    eventId, targetCalendarId, targetAccountId,
+  });
+}
+
 export async function unsubscribeCalendar(calendarId: string): Promise<void> {
   return invoke("unsubscribe_calendar", { calendarId });
 }
@@ -428,6 +444,14 @@ export async function sendInvites(
   attendeeEmails: string[],
 ): Promise<void> {
   return invoke("send_invites", { accountId, eventId, attendeeEmails });
+}
+
+export async function notifyCalendarEvent(
+  accountId: string,
+  eventId: string,
+  attendeeEmails: string[],
+): Promise<void> {
+  return invoke("notify_calendar_event", { accountId, eventId, attendeeEmails });
 }
 
 export async function processInviteReply(

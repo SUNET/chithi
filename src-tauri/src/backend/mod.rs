@@ -94,6 +94,7 @@ pub(crate) mod testutil {
             all_day: false,
             timezone: None,
             recurrence_rule: None,
+            recurrence_kind: crate::calendar::RecurrenceKind::Standalone,
             organizer_email: None,
             attendees_json: None,
             my_status: None,

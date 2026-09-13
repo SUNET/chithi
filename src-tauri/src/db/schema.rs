@@ -91,6 +91,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             all_day INTEGER DEFAULT 0,
             timezone TEXT,
             recurrence_rule TEXT,
+            recurrence_kind TEXT NOT NULL DEFAULT 'unknown',
             organizer_email TEXT,
             attendees_json TEXT,
             my_status TEXT,
@@ -420,6 +421,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE calendar_events ADD COLUMN pending_rsvp_status TEXT;")?;
     }
 
+    // Legacy rows do not distinguish standalone events from occurrences.
+    // Add the conservative default before recovering local ICS evidence.
+    let has_recurrence_kind = conn
+        .prepare("SELECT recurrence_kind FROM calendar_events LIMIT 0")
+        .is_ok();
+    if !has_recurrence_kind {
+        log::info!("Migration: adding recurrence_kind to calendar_events");
+        conn.execute_batch(
+            "ALTER TABLE calendar_events
+             ADD COLUMN recurrence_kind TEXT NOT NULL DEFAULT 'unknown';",
+        )?;
+    }
+    recover_local_event_recurrence(conn)?;
+
     let has_cleanup_requested = conn
         .prepare("SELECT cleanup_requested FROM meet_pending_meetings LIMIT 0")
         .is_ok();
@@ -597,6 +612,82 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Recover local-only legacy rows from retained, matching ICS evidence.
+/// Run independently of column creation so an interrupted startup is retryable.
+fn recover_local_event_recurrence(conn: &Connection) -> Result<()> {
+    use crate::calendar::{ical::parse_ical_data, RecurrenceKind};
+
+    struct Candidate {
+        id: String,
+        uid: String,
+        start_time: String,
+        all_day: Option<bool>,
+        recurrence_rule: Option<String>,
+        ical_data: String,
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let candidates = {
+        let mut stmt = tx.prepare(
+            "SELECT id, uid, start_time, all_day, recurrence_rule, ical_data
+             FROM calendar_events
+             WHERE recurrence_kind = 'unknown'
+               AND (remote_id IS NULL OR remote_id = '')
+               AND uid IS NOT NULL AND uid != '' AND start_time != ''
+               AND ical_data IS NOT NULL AND ical_data != ''
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    uid: row.get(1)?,
+                    start_time: row.get(2)?,
+                    all_day: row.get(3)?,
+                    recurrence_rule: row.get(4)?,
+                    ical_data: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let mut recovered = 0;
+    for candidate in candidates {
+        let parsed = parse_ical_data(&candidate.ical_data);
+        let [invite] = parsed.as_slice() else {
+            continue;
+        };
+        if invite.recurrence_kind == RecurrenceKind::Unknown
+            || invite.uid != candidate.uid
+            || invite.dtstart != candidate.start_time
+            || Some(invite.all_day) != candidate.all_day
+        {
+            continue;
+        }
+        if invite.recurrence_kind == RecurrenceKind::Standalone
+            && candidate
+                .recurrence_rule
+                .as_deref()
+                .is_some_and(|rule| !rule.is_empty())
+        {
+            continue;
+        }
+
+        recovered += tx.execute(
+            "UPDATE calendar_events SET recurrence_kind = ?1
+             WHERE id = ?2 AND recurrence_kind = 'unknown'
+               AND (remote_id IS NULL OR remote_id = '')",
+            rusqlite::params![invite.recurrence_kind.as_str(), candidate.id],
+        )?;
+    }
+    tx.commit()?;
+    if recovered > 0 {
+        log::info!("Recovered recurrence classification for {recovered} local calendar events");
+    }
     Ok(())
 }
 
@@ -852,6 +943,356 @@ pub fn set_migration(conn: &Connection, key: &str) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_ics(uid: &str, recurrence: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Chithi//Recovery Test//EN\r\n\
+             BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260901T090000Z\r\n\
+             DTSTART:20260913T100000Z\r\nDTEND:20260913T110000Z\r\n\
+             SUMMARY:Retained Event\r\n{recurrence}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    fn seed_recovery_account(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
+             INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar', 'account', 'Calendar');",
+        )
+        .unwrap();
+    }
+
+    fn insert_recovery_row(
+        conn: &Connection,
+        id: &str,
+        ical_data: Option<&str>,
+        remote_id: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO calendar_events
+                (id, account_id, calendar_id, uid, title, start_time, end_time,
+                 ical_data, remote_id, updated_at)
+             VALUES (?1, 'account', 'calendar', 'recovery@example.com', 'Legacy Event',
+                     '2026-09-13T10:00:00Z', '2026-09-13T11:00:00Z', ?2, ?3,
+                     '2026-09-01T09:00:00Z')",
+            rusqlite::params![id, ical_data, remote_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_recurrence_recovery_classifies_trustworthy_single_event_ics() {
+        use crate::calendar::RecurrenceKind;
+
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        seed_recovery_account(&conn);
+        let cases = [
+            ("standalone", "", None, RecurrenceKind::Standalone),
+            ("empty-remote", "", Some(""), RecurrenceKind::Standalone),
+            (
+                "series",
+                "RRULE:FREQ=WEEKLY\r\n",
+                None,
+                RecurrenceKind::Series,
+            ),
+            (
+                "rdate",
+                "RDATE:20260920T100000Z\r\n",
+                None,
+                RecurrenceKind::Series,
+            ),
+            (
+                "occurrence",
+                "RECURRENCE-ID:20260913T100000Z\r\n",
+                None,
+                RecurrenceKind::Occurrence,
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (id, recurrence, remote_id, kind) in cases {
+            let ics = recovery_ics("recovery@example.com", recurrence);
+            insert_recovery_row(&conn, id, Some(&ics), remote_id);
+            let mut event = crate::db::calendar::get_event(&conn, id).unwrap();
+            event.recurrence_kind = kind;
+            expected.push(event);
+        }
+        conn.execute_batch("ALTER TABLE calendar_events DROP COLUMN recurrence_kind;")
+            .unwrap();
+
+        initialize(&conn).unwrap();
+
+        for event in expected {
+            let recovered = crate::db::calendar::get_event(&conn, &event.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(recovered).unwrap(),
+                serde_json::to_value(event).unwrap()
+            );
+        }
+        let untouched_timestamps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE updated_at = '2026-09-01T09:00:00Z'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched_timestamps, 5);
+    }
+
+    #[test]
+    fn local_recurrence_recovery_leaves_untrusted_or_provider_rows_unchanged() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        seed_recovery_account(&conn);
+        let valid = recovery_ics("recovery@example.com", "");
+        let cases = [
+            ("no-ics", None, None),
+            ("empty-ics", Some(String::new()), None),
+            ("malformed", Some("not iCalendar".into()), None),
+            (
+                "missing-metadata",
+                Some(valid.replace("DTSTAMP:20260901T090000Z\r\n", "")),
+                None,
+            ),
+            (
+                "missing-uid",
+                Some(valid.replace("UID:recovery@example.com\r\n", "")),
+                None,
+            ),
+            ("ambiguous", Some(format!("{valid}{valid}")), None),
+            (
+                "uid-mismatch",
+                Some(recovery_ics("another@example.com", "")),
+                None,
+            ),
+            (
+                "start-mismatch",
+                Some(valid.replace("DTSTART:20260913T100000Z", "DTSTART:20260920T100000Z")),
+                None,
+            ),
+            ("provider", Some(valid.clone()), Some("remote-event")),
+            (
+                "stale-provider-ics",
+                Some(valid.clone()),
+                Some("remote-series"),
+            ),
+            ("contradictory-rule", Some(valid.clone()), None),
+            ("whitespace-rule", Some(valid.clone()), None),
+            ("missing-local-uid", Some(valid.clone()), None),
+            ("all-day-mismatch", Some(valid.clone()), None),
+            ("known-occurrence", Some(valid), None),
+        ];
+        for (id, ical_data, remote_id) in &cases {
+            insert_recovery_row(&conn, id, ical_data.as_deref(), *remote_id);
+        }
+        conn.execute_batch(
+            "UPDATE calendar_events SET recurrence_rule = 'FREQ=WEEKLY'
+             WHERE id IN ('contradictory-rule', 'stale-provider-ics');
+             UPDATE calendar_events SET recurrence_rule = ' ' WHERE id = 'whitespace-rule';
+             UPDATE calendar_events SET uid = NULL WHERE id = 'missing-local-uid';
+             UPDATE calendar_events SET all_day = 1 WHERE id = 'all-day-mismatch';
+             UPDATE calendar_events SET recurrence_kind = 'occurrence' WHERE id = 'known-occurrence';",
+        )
+        .unwrap();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(id, _, _)| crate::db::calendar::get_event(&conn, id).unwrap())
+            .collect();
+
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+
+        for event in expected {
+            let actual = crate::db::calendar::get_event(&conn, &event.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(event).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn local_recurrence_recovery_rolls_back_and_resumes_idempotently_after_restart() {
+        use crate::calendar::RecurrenceKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-recurrence-recovery.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            seed_recovery_account(&conn);
+            insert_recovery_row(
+                &conn,
+                "a-standalone",
+                Some(&recovery_ics("recovery@example.com", "")),
+                None,
+            );
+            insert_recovery_row(
+                &conn,
+                "b-series",
+                Some(&recovery_ics(
+                    "recovery@example.com",
+                    "RRULE:FREQ=WEEKLY\r\n",
+                )),
+                None,
+            );
+            conn.execute_batch(
+                "CREATE TRIGGER interrupt_recurrence_recovery
+                 BEFORE UPDATE OF recurrence_kind ON calendar_events
+                 WHEN NEW.id = 'b-series'
+                 BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END;",
+            )
+            .unwrap();
+
+            assert!(initialize(&conn).is_err());
+            for id in ["a-standalone", "b-series"] {
+                assert_eq!(
+                    crate::db::calendar::get_event(&conn, id)
+                        .unwrap()
+                        .recurrence_kind,
+                    RecurrenceKind::Unknown
+                );
+            }
+            conn.execute_batch("DROP TRIGGER interrupt_recurrence_recovery;")
+                .unwrap();
+        }
+
+        for _ in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            for (id, kind) in [
+                ("a-standalone", RecurrenceKind::Standalone),
+                ("b-series", RecurrenceKind::Series),
+            ] {
+                assert_eq!(
+                    crate::db::calendar::get_event(&conn, id)
+                        .unwrap()
+                        .recurrence_kind,
+                    kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recurrence_kind_fresh_schema_defaults_unknown_and_rejects_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        initialize(&conn).unwrap();
+        let column: (String, bool, String) = conn
+            .query_row(
+                "SELECT type, \"notnull\", dflt_value
+                 FROM pragma_table_info('calendar_events') WHERE name = 'recurrence_kind'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(column, ("TEXT".into(), true, "'unknown'".into()));
+
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
+             INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('event', 'account', 'calendar', 'Event',
+                     '2026-09-13T10:00:00Z', '2026-09-13T11:00:00Z');",
+        )
+        .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT recurrence_kind FROM calendar_events WHERE id = 'event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "unknown");
+        assert!(conn
+            .execute(
+                "UPDATE calendar_events SET recurrence_kind = NULL WHERE id = 'event'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn recurrence_kind_migration_is_conservative_and_idempotent_across_restarts() {
+        use crate::calendar::RecurrenceKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar-recurrence.db");
+        let legacy_rows = [
+            ("local", None, None),
+            ("empty-rule", Some(""), Some("remote-empty")),
+            ("series", Some("FREQ=WEEKLY"), Some("remote-series")),
+            ("occurrence", None, Some("remote-occurrence")),
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE calendar_events DROP COLUMN recurrence_kind;
+                 INSERT INTO accounts (id, display_name, email, username)
+                 VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
+                 INSERT INTO calendars (id, account_id, name)
+                 VALUES ('calendar', 'account', 'Calendar');",
+            )
+            .unwrap();
+            for (id, rule, remote_id) in legacy_rows {
+                conn.execute(
+                    "INSERT INTO calendar_events
+                        (id, account_id, calendar_id, title, start_time, end_time,
+                         recurrence_rule, remote_id)
+                     VALUES (?1, 'account', 'calendar', 'Legacy Event',
+                             '2026-09-13T10:00:00Z', '2026-09-13T11:00:00Z', ?2, ?3)",
+                    rusqlite::params![id, rule, remote_id],
+                )
+                .unwrap();
+            }
+        }
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            for (id, rule, remote_id) in legacy_rows {
+                let event = crate::db::calendar::get_event(&conn, id).unwrap();
+                assert_eq!(event.recurrence_kind, RecurrenceKind::Unknown, "{id}");
+                assert_eq!(event.recurrence_rule.as_deref(), rule);
+                assert_eq!(event.remote_id.as_deref(), remote_id);
+                assert!(event.ensure_mutable().is_err());
+            }
+            conn.execute_batch(
+                "UPDATE calendar_events SET recurrence_kind = 'standalone' WHERE id = 'local';
+                 UPDATE calendar_events SET recurrence_kind = 'series' WHERE id = 'series';
+                 UPDATE calendar_events SET recurrence_kind = 'occurrence' WHERE id = 'occurrence';",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, recurrence_kind FROM calendar_events ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("empty-rule".into(), "unknown".into()),
+                    ("local".into(), "standalone".into()),
+                    ("occurrence".into(), "occurrence".into()),
+                    ("series".into(), "series".into()),
+                ]
+            );
+        }
+    }
 
     /// Fresh install and migration re-run must both yield the Graph sync
     /// columns (delta link + durability markers) and be idempotent.

@@ -7,7 +7,7 @@ use crate::backend::calendar::{
     RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
-use crate::calendar::{Attendee, CalendarEvent};
+use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
 use crate::db::calendar::{Calendar, Invite, NewCalendar};
@@ -76,7 +76,7 @@ pub struct NewEventInput {
     pub meet_binding: Option<MeetBindingInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateEventInput {
     pub calendar_id: Option<String>,
     pub title: Option<String>,
@@ -471,6 +471,12 @@ pub async fn get_events(
     Ok(events)
 }
 
+/// Refresh one selected event independently of the current displayed date range.
+#[tauri::command]
+pub fn get_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<CalendarEvent> {
+    db::calendar::get_event(&state.db.reader(), &event_id)
+}
+
 /// List all calendar invites for an account — events where the account is
 /// an attendee but not the organizer. Backs the dedicated Invites view.
 /// The recent-past window is fixed at 7 days; recurring invites always pass.
@@ -501,6 +507,14 @@ pub async fn mark_invite_managed(
 
 #[tauri::command]
 pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
+    create_event_inner(&state, event, None).await
+}
+
+async fn create_event_inner(
+    state: &AppState,
+    event: NewEventInput,
+    move_source: Option<&CalendarEvent>,
+) -> Result<String> {
     log::info!(
         "create_event: account={} calendar={} title='{}' attendees={}",
         event.account_id,
@@ -536,6 +550,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         end_time: event.end_time,
         all_day: event.all_day,
         timezone: event.timezone,
+        recurrence_kind: RecurrenceKind::from_rule(event.recurrence_rule.as_deref()),
         recurrence_rule: event.recurrence_rule,
         organizer_email,
         attendees_json,
@@ -561,6 +576,10 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
     let (account, remote_cal_id) = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        if let Some(source) = move_source {
+            checked_mutation_target(&transaction, &source.id, Some(source))?;
+            check_target_calendar(&transaction, &cal_event.calendar_id, &cal_event.account_id)?;
+        }
         db::calendar::insert_event(&transaction, &cal_event)?;
         if let Some(ref binding) = meet_binding {
             claim_meet_binding(&transaction, &id, binding)?;
@@ -588,7 +607,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
         }
         // Best-effort: the local insert above always stands; a failed
         // push is logged and the event goes out with a later sync.
-        let ctx = calendar_backend_ctx(&state);
+        let ctx = calendar_backend_ctx(state);
         match backend
             .push_created_event(&ctx, &account, &cal_event, &remote_cal_id)
             .await
@@ -630,7 +649,7 @@ pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> R
     // the title input is often still empty, so the remote room ends
     // up named "Meeting" until we sync the final title here.
     if let Some(ref b) = meet_binding {
-        sync_meet_topic(&state, b, &cal_event.title).await;
+        sync_meet_topic(state, b, &cal_event.title).await;
     }
 
     log::info!("create_event: created event id={}", id);
@@ -799,7 +818,56 @@ pub async fn update_event(
     event_id: String,
     event: UpdateEventInput,
 ) -> Result<()> {
+    update_event_inner(&state, event_id, event).await
+}
+
+/// Load the authoritative target inside the caller's write transaction. Moves
+/// also compare the source snapshot, so a concurrent refresh/edit cannot cause
+/// copying one version and deleting a different one.
+fn checked_mutation_target(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    expected: Option<&CalendarEvent>,
+) -> Result<CalendarEvent> {
+    let event = db::calendar::get_event(conn, event_id)?;
+    event.ensure_mutable()?;
+    if expected.is_some_and(|expected| expected != &event) {
+        return Err(crate::error::Error::Other(
+            "Calendar event changed during the move. Refresh before trying again.".into(),
+        ));
+    }
+    Ok(event)
+}
+
+fn check_target_calendar(
+    conn: &rusqlite::Connection,
+    calendar_id: &str,
+    account_id: &str,
+) -> Result<()> {
+    let calendar = db::calendar::get_calendar(conn, calendar_id)?;
+    if calendar.account_id != account_id {
+        return Err(crate::error::Error::Other(
+            "Target calendar does not belong to the selected account.".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn update_event_inner(
+    state: &AppState,
+    event_id: String,
+    event: UpdateEventInput,
+) -> Result<()> {
     log::info!("update_event: id={}", event_id);
+    // Reject unsupported targets before even resolving meeting ownership.
+    checked_mutation_target(&state.db.reader(), &event_id, None)?;
+    if event
+        .recurrence_rule
+        .as_deref()
+        .is_some_and(|rule| !rule.is_empty())
+    {
+        return Err(crate::error::CalendarMutationBlockReason::Recurring.into());
+    }
     let meet_binding = event.meet_binding;
     let lifecycle_lock = match meet_binding.as_ref() {
         Some(binding) => Some(state.meet_lifecycle.acquire(&binding.lifecycle_id)?),
@@ -814,12 +882,13 @@ pub async fn update_event(
         let transaction = conn.transaction()?;
 
         // Load existing event, apply updates
-        let mut existing = db::calendar::get_event(&transaction, &event_id)?;
+        let mut existing = checked_mutation_target(&transaction, &event_id, None)?;
         let prev_start = existing.start_time.clone();
         let prev_end = existing.end_time.clone();
         let prev_title = existing.title.clone();
 
         if let Some(calendar_id) = event.calendar_id {
+            check_target_calendar(&transaction, &calendar_id, &existing.account_id)?;
             existing.calendar_id = calendar_id;
         }
         if let Some(title) = event.title {
@@ -892,7 +961,7 @@ pub async fn update_event(
     drop(_lifecycle_guard);
 
     if let Some(lifecycle_id) = cleanup_lifecycle_id {
-        if let Err(error) = crate::commands::meet::discard_pending(&state, &lifecycle_id).await {
+        if let Err(error) = crate::commands::meet::discard_pending(state, &lifecycle_id).await {
             log::warn!(
                 "update_event: retained replaced meeting {} for retry: {}",
                 lifecycle_id,
@@ -914,7 +983,7 @@ pub async fn update_event(
             );
             if let Err(e) = provider
                 .reschedule_meeting(
-                    &meet_provider_ctx(&state),
+                    &meet_provider_ctx(state),
                     &meet_account,
                     &binding.meeting_id,
                     &existing.start_time,
@@ -933,12 +1002,7 @@ pub async fn update_event(
     if let Some(remote_id) = existing.remote_id.as_ref().filter(|r| !r.is_empty()) {
         if let Some(backend) = crate::backend::calendar::for_account(&account) {
             match backend
-                .push_updated_event(
-                    &calendar_backend_ctx(&state),
-                    &account,
-                    remote_id,
-                    &existing,
-                )
+                .push_updated_event(&calendar_backend_ctx(state), &account, remote_id, &existing)
                 .await
             {
                 Ok(()) => log::info!("update_event: pushed via {}", backend.protocol()),
@@ -966,7 +1030,7 @@ pub async fn update_event(
                 meeting_id: b.meeting_id,
                 join_url: b.join_url,
             };
-            sync_meet_topic(&state, &input, &existing.title).await;
+            sync_meet_topic(state, &input, &existing.title).await;
         }
     }
 
@@ -975,33 +1039,35 @@ pub async fn update_event(
 
 #[tauri::command]
 pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Result<()> {
+    delete_event_inner(&state, event_id, None).await
+}
+
+async fn delete_event_inner(
+    state: &AppState,
+    event_id: String,
+    expected: Option<&CalendarEvent>,
+) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
-    // Load calendar push data before the local transaction.
-    let (event, account, cal_remote_id) = {
-        let conn = state.db.reader();
-        let evt = db::calendar::get_event(&conn, &event_id)?;
-        let acc = db::accounts::get_account_full(&conn, &evt.account_id)?;
-        let cal = db::calendar::get_calendar(&conn, &evt.calendar_id).ok();
+    // Check recurrence and capture remote targets in the same transaction as
+    // local deletion and meeting-cleanup ownership. Sync cannot race the check.
+    let (event, account, cal_remote_id, cleanup_lifecycle_id) = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        let evt = checked_mutation_target(&transaction, &event_id, expected)?;
+        let acc = db::accounts::get_account_full(&transaction, &evt.account_id)?;
+        let cal = db::calendar::get_calendar(&transaction, &evt.calendar_id).ok();
         let cal_rid = cal
             .and_then(|c| c.remote_id)
             .unwrap_or_else(|| "primary".to_string());
-        (evt, acc, cal_rid)
-    };
-
-    // Persist cleanup ownership before the event cascade removes the bound
-    // row. The queue insert and local event deletion are atomic.
-    let cleanup_lifecycle_id = {
-        let mut conn = state.db.writer().await;
-        let transaction = conn.transaction()?;
         let mut cleanup = db::calendar_event_deletion::delete_event(&transaction, &event_id)?
             .cleanup_lifecycle_ids;
         transaction.commit()?;
-        cleanup.pop()
+        (evt, acc, cal_rid, cleanup.pop())
     };
 
     if let Some(lifecycle_id) = cleanup_lifecycle_id {
-        if let Err(error) = crate::commands::meet::discard_pending(&state, &lifecycle_id).await {
+        if let Err(error) = crate::commands::meet::discard_pending(state, &lifecycle_id).await {
             log::warn!(
                 "delete_event: retained meeting {} for cleanup retry: {}",
                 lifecycle_id,
@@ -1017,7 +1083,7 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
             if let Some(backend) = crate::backend::calendar::for_account(&account) {
                 match backend
                     .push_deleted_event(
-                        &calendar_backend_ctx(&state),
+                        &calendar_backend_ctx(state),
                         &account,
                         remote_id,
                         &cal_remote_id,
@@ -1040,6 +1106,81 @@ pub async fn delete_event(state: State<'_, AppState>, event_id: String) -> Resul
 
     log::info!("delete_event: deleted event {}", event_id);
     Ok(())
+}
+
+/// Move a confirmed standalone event using authoritative source data, rather
+/// than allowing a renderer to create a copy before validating its source.
+#[tauri::command]
+pub async fn move_event_to_calendar(
+    state: State<'_, AppState>,
+    event_id: String,
+    target_calendar_id: String,
+    target_account_id: String,
+) -> Result<String> {
+    move_event_to_calendar_inner(&state, event_id, target_calendar_id, target_account_id).await
+}
+
+async fn move_event_to_calendar_inner(
+    state: &AppState,
+    event_id: String,
+    target_calendar_id: String,
+    target_account_id: String,
+) -> Result<String> {
+    let source = {
+        let conn = state.db.reader();
+        let source = checked_mutation_target(&conn, &event_id, None)?;
+        check_target_calendar(&conn, &target_calendar_id, &target_account_id)?;
+        source
+    };
+    if source.calendar_id == target_calendar_id {
+        return Ok(source.id);
+    }
+    if source.account_id == target_account_id {
+        update_event_inner(
+            state,
+            event_id.clone(),
+            UpdateEventInput {
+                calendar_id: Some(target_calendar_id),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(event_id);
+    }
+    let attendees = source
+        .attendees_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| {
+            crate::error::Error::Other("Cannot move event with malformed attendees.".into())
+        })?
+        .unwrap_or_default();
+    let copied_id = create_event_inner(
+        state,
+        NewEventInput {
+            account_id: target_account_id,
+            calendar_id: target_calendar_id,
+            title: source.title.clone(),
+            description: source.description.clone(),
+            location: source.location.clone(),
+            start_time: source.start_time.clone(),
+            end_time: source.end_time.clone(),
+            all_day: source.all_day,
+            timezone: source.timezone.clone(),
+            recurrence_rule: None,
+            attendees,
+            meet_binding: None,
+        },
+        Some(&source),
+    )
+    .await?;
+    if let Err(error) = delete_event_inner(state, event_id, Some(&source)).await {
+        return Err(crate::error::Error::Other(format!(
+            "Event copy {copied_id} was created, but the source was not removed: {error}"
+        )));
+    }
+    Ok(copied_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1670,7 @@ async fn apply_invite_response(
             all_day: invite.all_day,
             timezone: invite.timezone.clone(),
             recurrence_rule: invite.recurrence_rule.clone(),
+            recurrence_kind: invite.recurrence_kind,
             organizer_email: invite.organizer_email.clone(),
             attendees_json,
             my_status: Some(my_status),
@@ -1655,6 +1797,7 @@ fn event_to_parsed_invite(event: &CalendarEvent, uid: &str) -> ParsedInvite {
         organizer_name: None,
         attendees,
         recurrence_rule: event.recurrence_rule.clone(),
+        recurrence_kind: event.recurrence_kind,
         sequence: 0,
         ical_raw: event.ical_data.clone().unwrap_or_default(),
     }
@@ -1822,6 +1965,118 @@ pub async fn send_invites(
     event_id: String,
     attendee_emails: Vec<String>,
 ) -> Result<()> {
+    send_invites_inner(&state, account_id, event_id, attendee_emails).await
+}
+
+/// Notifications attached to ordinary edits/deletes never inherit the series
+/// creation exemption, even if the renderer is using stale event metadata.
+#[tauri::command]
+pub async fn notify_calendar_event(
+    state: State<'_, AppState>,
+    account_id: String,
+    event_id: String,
+    attendee_emails: Vec<String>,
+) -> Result<()> {
+    notify_calendar_event_inner(&state, account_id, event_id, attendee_emails).await
+}
+
+#[derive(Clone, Copy)]
+enum InvitationPurpose {
+    Creation,
+    MutationNotification,
+}
+
+/// Invitation delivery is a separate creation workflow: known series masters
+/// may be invited, but a detached occurrence or unclassified row cannot safely
+/// be serialized as a new invitation. Ordinary editing remains standalone-only.
+fn checked_invitation_target(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    event_id: &str,
+    purpose: InvitationPurpose,
+) -> Result<CalendarEvent> {
+    let event = db::calendar::get_event(conn, event_id)?;
+    if event.account_id != account_id {
+        return Err(crate::error::Error::Other(
+            "Calendar event belongs to another account.".into(),
+        ));
+    }
+    if !matches!(purpose, InvitationPurpose::Creation)
+        || event.recurrence_kind != RecurrenceKind::Series
+    {
+        event.ensure_mutable()?;
+    }
+    Ok(event)
+}
+
+async fn send_invites_inner(
+    state: &AppState,
+    account_id: String,
+    event_id: String,
+    attendee_emails: Vec<String>,
+) -> Result<()> {
+    deliver_invites(
+        state,
+        account_id,
+        event_id,
+        attendee_emails,
+        InvitationPurpose::Creation,
+    )
+    .await
+}
+
+async fn notify_calendar_event_inner(
+    state: &AppState,
+    account_id: String,
+    event_id: String,
+    attendee_emails: Vec<String>,
+) -> Result<()> {
+    deliver_invites(
+        state,
+        account_id,
+        event_id,
+        attendee_emails,
+        InvitationPurpose::MutationNotification,
+    )
+    .await
+}
+
+fn checked_delivery_snapshot(
+    conn: &rusqlite::Connection,
+    expected: &CalendarEvent,
+    purpose: InvitationPurpose,
+) -> Result<()> {
+    let current = checked_invitation_target(conn, &expected.account_id, &expected.id, purpose)?;
+    if current != *expected {
+        return Err(crate::error::Error::Other(
+            "Calendar event changed while preparing the notification. Refresh before trying again."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck after asynchronous credential/session preparation and before each
+/// transport submission. Never hold a database reader/writer across network I/O.
+async fn prepare_invitation_transport<T>(
+    state: &AppState,
+    event: &CalendarEvent,
+    purpose: InvitationPurpose,
+    preparation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    checked_delivery_snapshot(&state.db.reader(), event, purpose)?;
+    let transport = preparation.await?;
+    checked_delivery_snapshot(&state.db.reader(), event, purpose)?;
+    Ok(transport)
+}
+
+async fn deliver_invites(
+    state: &AppState,
+    account_id: String,
+    event_id: String,
+    attendee_emails: Vec<String>,
+    purpose: InvitationPurpose,
+) -> Result<()> {
     log::info!(
         "send_invites: account={} event={} attendees={:?}",
         account_id,
@@ -1831,8 +2086,8 @@ pub async fn send_invites(
 
     let (account, event) = {
         let conn = state.db.writer().await;
+        let evt = checked_invitation_target(&conn, &account_id, &event_id, purpose)?;
         let acc = db::accounts::get_account_full(&conn, &account_id)?;
-        let evt = db::calendar::get_event(&conn, &event_id)?;
         (acc, evt)
     };
 
@@ -1846,6 +2101,7 @@ pub async fn send_invites(
         );
         // Still update attendees in the local DB
         let conn = state.db.writer().await;
+        checked_delivery_snapshot(&conn, &event, purpose)?;
         let attendees_json = serde_json::to_string(
             &attendee_emails
                 .iter()
@@ -1933,14 +2189,22 @@ pub async fn send_invites(
                 &[],
                 &[],
             )?;
-            let (jmap_config, conn_jmap) = state.providers.jmap_client(&account).await?;
+            let (jmap_config, conn_jmap) = prepare_invitation_transport(
+                state,
+                &event,
+                purpose,
+                state.providers.jmap_client(&account),
+            )
+            .await?;
             conn_jmap.send_email(&jmap_config, &raw, &envelope).await?;
         } else {
-            let credentials = state
-                .providers
-                .credentials()
-                .mail_credentials(&account)
-                .await?;
+            let credentials = prepare_invitation_transport(
+                state,
+                &event,
+                purpose,
+                state.providers.credentials().mail_credentials(&account),
+            )
+            .await?;
             send_raw_smtp(
                 &account.smtp_host,
                 account.smtp_port,
@@ -1960,6 +2224,7 @@ pub async fn send_invites(
     // Update event's attendees in local DB
     {
         let conn = state.db.writer().await;
+        checked_delivery_snapshot(&conn, &event, purpose)?;
         let attendees_json = serde_json::to_string(&attendees).unwrap_or_default();
         conn.execute(
             "UPDATE calendar_events SET attendees_json = ?1 WHERE id = ?2",
@@ -2251,6 +2516,9 @@ pub fn list_timezones() -> Vec<String> {
 pub fn get_default_timezone() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
 }
+
+#[cfg(test)]
+mod occurrence_safety_tests;
 
 #[cfg(test)]
 mod tests {

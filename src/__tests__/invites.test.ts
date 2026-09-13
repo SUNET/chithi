@@ -59,6 +59,7 @@ function makeInvite(id: string, opts: Partial<Invite> = {}): Invite {
     all_day: false,
     timezone: null,
     recurrence_rule: opts.recurrence_rule ?? null,
+    recurrence_kind: opts.recurrence_kind ?? (opts.recurrence_rule ? "series" : "standalone"),
     organizer_email: opts.organizer_email ?? "boss@example.com",
     attendees_json: opts.attendees_json ?? null,
     my_status: opts.my_status ?? null,

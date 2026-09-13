@@ -4,7 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
 import { getDateInTimezone } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
-import { dragCalendarEvent, isCalendarDragging, isDraggingSeriesOccurrence } from "@/lib/calendar-drag-state";
+import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 
 const emit = defineEmits<{
   dateClick: [date: string];
@@ -101,21 +101,22 @@ const dayNames = computed(() => {
 const dragStartPos = ref<{ x: number; y: number } | null>(null);
 const dragGhost = ref<HTMLElement | null>(null);
 const dragOverDay = ref<string | null>(null);
+const canDrop = computed(() => isCalendarDragging.value &&
+  canDragCalendarEvent(dragCalendarEvent.value,
+    calendarStore.getCachedEvent(dragCalendarEvent.value?.id ?? "")));
 const DRAG_THRESHOLD = 5;
 let dragCleanup: (() => void) | null = null;
 
 function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
   if (event.button !== 0) return;
-  // Recurring occurrences may be dragged onto a sidebar calendar (moves
-  // the whole series); day-cell drops are suppressed via
-  // isDraggingSeriesOccurrence in onCellEnter/onCellDrop.
-  if (ev.all_day) return;
+  if (ev.all_day || !canDragCalendarEvent(ev, calendarStore.getCachedEvent(ev.id))) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };
   const sourceEvent = ev;
 
   const handleMove = (e: MouseEvent) => {
     if (!dragStartPos.value) return;
+    if (!canDragCalendarEvent(sourceEvent, calendarStore.getCachedEvent(sourceEvent.id))) return;
     const dx = e.clientX - dragStartPos.value.x;
     const dy = e.clientY - dragStartPos.value.y;
     if (!isCalendarDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
@@ -124,9 +125,7 @@ function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
       dragCalendarEvent.value = sourceEvent;
       isCalendarDragging.value = true;
       const ghost = document.createElement("div");
-      ghost.textContent = isDraggingSeriesOccurrence.value
-        ? `${sourceEvent.title} — drop on a calendar to move the series`
-        : sourceEvent.title;
+      ghost.textContent = sourceEvent.title;
       ghost.dataset.testid = "cal-drag-ghost";
       ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
       document.body.appendChild(ghost);
@@ -169,9 +168,7 @@ onUnmounted(() => {
 });
 
 function onCellEnter(day: Date) {
-  if (!isCalendarDragging.value) return;
-  // Series occurrences can't be rescheduled — don't show a drop hint.
-  if (isDraggingSeriesOccurrence.value) return;
+  if (!canDrop.value) return;
   dragOverDay.value = day.toISOString().split("T")[0];
 }
 
@@ -182,9 +179,7 @@ function onCellLeave(day: Date) {
 }
 
 function onCellDrop(day: Date) {
-  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
-  // Series occurrences only accept sidebar (calendar) drops.
-  if (isDraggingSeriesOccurrence.value) return;
+  if (!canDrop.value || !dragCalendarEvent.value) return;
   dragOverDay.value = null;
 
   const ev = dragCalendarEvent.value;
@@ -223,7 +218,7 @@ function onCellDrop(day: Date) {
           :class="{
             today: isToday(day),
             'other-month': !isCurrentMonth(day),
-            'drag-over': isCalendarDragging && dragOverDay === day.toISOString().split('T')[0],
+            'drag-over': canDrop && dragOverDay === day.toISOString().split('T')[0],
           }"
           :data-testid="`cal-month-cell-${day.toISOString().split('T')[0]}`"
           @click="emit('dateClick', day.toISOString().split('T')[0])"

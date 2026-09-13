@@ -308,8 +308,9 @@ impl CalendarBackend for GraphCalendarBackend {
                         conn.execute(
                             "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
                              all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                             description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11
-                             WHERE id = ?12",
+                             description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11,
+                             recurrence_kind = ?12
+                             WHERE id = ?13",
                             rusqlite::params![
                                 ge.subject,
                                 ge.start,
@@ -322,6 +323,7 @@ impl CalendarBackend for GraphCalendarBackend {
                                 ge.timezone,
                                 ge.my_status,
                                 local_cal_id,
+                                ge.recurrence_kind.as_str(),
                                 local_id,
                             ],
                         )
@@ -341,6 +343,7 @@ impl CalendarBackend for GraphCalendarBackend {
                             all_day: ge.all_day,
                             timezone: ge.timezone.clone(),
                             recurrence_rule: None,
+                            recurrence_kind: ge.recurrence_kind,
                             organizer_email: ge.organizer_email.clone(),
                             attendees_json: ge.attendees_json.clone(),
                             my_status: ge.my_status.clone(),
@@ -405,11 +408,11 @@ impl CalendarBackend for GraphCalendarBackend {
         event: &CalendarEvent,
         _remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
+        let graph_event = event_to_graph_json(event)?;
         let client = ctx
             .services
             .graph_client(&account.id, GraphTokenPurpose::Baseline)
             .await?;
-        let graph_event = event_to_graph_json(event);
         if let Some(atts) = graph_event["attendees"].as_array() {
             log::info!("create_event: O365 event with {} attendees", atts.len());
         }
@@ -494,5 +497,157 @@ impl CalendarBackend for GraphCalendarBackend {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod creation_tests {
+    use super::GraphCalendarBackend;
+    use crate::backend::calendar::google::creation_testutil::{
+        assert_rejected_before_io, assert_standalone_creation,
+    };
+
+    #[tokio::test]
+    async fn rejects_lossy_creation_before_credentials_and_preserves_local_event() {
+        assert_rejected_before_io(&GraphCalendarBackend).await;
+    }
+
+    #[tokio::test]
+    async fn publishes_confirmed_standalone_creation() {
+        assert_standalone_creation(
+            &GraphCalendarBackend,
+            serde_json::json!({"id": "created-event", "iCalUId": "canonical@example.test"}),
+            "/calendar-api/me/events",
+            "subject",
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod recurrence_sync_tests {
+    use super::{CalendarBackend, CalendarBackendCtx, GraphCalendarBackend};
+    use crate::backend::calendar::google::sync_testutil::{
+        cache_event, serve_responses, services, setup_db,
+    };
+    use crate::backend::testutil::account;
+    use crate::calendar::RecurrenceKind;
+    use crate::db;
+    use serde_json::json;
+
+    fn remote_event(id: &str, metadata: &serde_json::Value) -> serde_json::Value {
+        let mut event = json!({
+            "id": id,
+            "iCalUId": format!("uid-{id}@example.test"),
+            "subject": "Refreshed event",
+            "start": {"dateTime": "2026-09-14T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-14T10:00:00", "timeZone": "UTC"}
+        });
+        event
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        event
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_recurrence_for_existing_and_new_rows() {
+        for (metadata, expected) in [
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": null}),
+                RecurrenceKind::Standalone,
+            ),
+            (
+                json!({"type": "occurrence", "seriesMasterId": "master", "recurrence": null}),
+                RecurrenceKind::Occurrence,
+            ),
+            (
+                json!({"type": "exception", "seriesMasterId": "master", "recurrence": null}),
+                RecurrenceKind::Occurrence,
+            ),
+            (
+                json!({"seriesMasterId": null, "recurrence": null}),
+                RecurrenceKind::Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": "master", "recurrence": null}),
+                RecurrenceKind::Unknown,
+            ),
+        ] {
+            let (_dir, db) = setup_db().await;
+            {
+                let conn = db.writer().await;
+                cache_event(&conn, "cached", Some("remote"));
+                cache_event(&conn, "local-only", None);
+                assert_eq!(
+                    db::calendar::get_event(&conn, "cached")
+                        .unwrap()
+                        .recurrence_kind,
+                    RecurrenceKind::Unknown
+                );
+            }
+            let (root, captured) = serve_responses(vec![
+                (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
+                (200, json!({"value": [remote_event("remote", &metadata), remote_event("new", &metadata)]})),
+            ]).await;
+            GraphCalendarBackend
+                .sync(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services(&root),
+                    },
+                    &account("calendar", "graph"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(captured.await.unwrap().len(), 2);
+            let conn = db.reader();
+            let cached = db::calendar::get_event(&conn, "cached").unwrap();
+            assert_eq!(cached.id, "cached");
+            assert_eq!(cached.title, "Refreshed event");
+            assert_eq!(cached.recurrence_kind, expected);
+            let new_kind: String = conn
+                .query_row(
+                    "SELECT recurrence_kind FROM calendar_events WHERE remote_id = 'new'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(new_kind, expected.as_str());
+            assert_eq!(
+                db::calendar::get_event(&conn, "local-only")
+                    .unwrap()
+                    .recurrence_kind,
+                RecurrenceKind::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_unknown_cached_events_unchanged() {
+        let (_dir, db) = setup_db().await;
+        let before = {
+            let conn = db.writer().await;
+            cache_event(&conn, "cached", Some("remote"));
+            serde_json::to_value(db::calendar::get_event(&conn, "cached").unwrap()).unwrap()
+        };
+        let (root, captured) = serve_responses(vec![
+            (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
+            (500, json!({"error": "injected read failure"})),
+        ]).await;
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.await.unwrap().len(), 2);
+        let after =
+            serde_json::to_value(db::calendar::get_event(&db.reader(), "cached").unwrap()).unwrap();
+        assert_eq!(after, before);
     }
 }

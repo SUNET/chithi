@@ -22,6 +22,37 @@ policy; event creation, deletion and JMAP attendee responses remain
 separate supported paths. The original context and decision text are
 retained unchanged as a historical record.
 
+### Calendar mutation safety amendment (2026-09-13, #288)
+
+[ADR 0052](0052-calendar-occurrence-mutation-safety.md) adds persisted,
+provider-neutral `recurrence_kind`. Transport/ICS adapters classify source
+metadata before lossy RRULE conversion, and backend sync persists that
+classification on new and existing rows. The shared event model defines
+ordinary mutation eligibility; command orchestration rereads persisted
+targets and enforces it before local writes, meeting cleanup or provider
+calls. The backend `move_event_to_calendar` command owns source preflight,
+cross-account copy and guarded source deletion.
+
+Ordinary notifications use standalone-only `notify_calendar_event`;
+creation invitations use `send_invites`, which also permits known series.
+Delivery revalidates the event snapshot after asynchronous transport
+preparation, before each submission and before attendee writes. The store
+owns exact-ID detail/capability refresh via `get_calendar_event`, independent
+of the rendered date range; backend guards remain authoritative.
+
+Provider creation also protects recurrence evidence: JMAP rejects unknown,
+occurrence and unrepresentable series payloads before creation. CalDAV's
+deferred pass preserves usable retained ICS verbatim, including occurrence
+identity, or generates only representable known-local data. Both deferred
+passes process eligible rows and then report aggregated creation failures.
+Google's supplemental legacy metadata read changes only the kind of matched
+unknown rows; normal sync retains exclusive cursor and reconciliation ownership.
+
+RSVP, calendar/account removal and provider reconciliation are outside the
+ordinary mutation guards. Existing best-effort command pushes and JMAP/CalDAV
+ordinary-update no-ops continue; these safeguards add no atomic remote
+operation or ability to undo already-in-flight delivery.
+
 ## Context
 
 The spec treats Google, Microsoft Graph, JMAP, CalDAV, CardDAV and IMAP

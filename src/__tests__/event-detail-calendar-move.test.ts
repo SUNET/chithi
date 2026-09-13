@@ -1,16 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { flushPromises, mount } from "@vue/test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { enableAutoUnmount, flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 
 vi.mock("@/lib/tauri", () => ({
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
   createEvent: vi.fn().mockResolvedValue("evt-new"),
+  moveEventToCalendar: vi.fn().mockResolvedValue("evt-new"),
   getEvents: vi.fn().mockResolvedValue([]),
+  getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
   listAccounts: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn().mockResolvedValue(undefined),
+  notifyCalendarEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -27,17 +30,15 @@ import { occurrenceId } from "@/lib/rrule";
 import { useAccountsStore } from "@/stores/accounts";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
+import type { CalendarEvent } from "@/lib/types";
 
-// Regression for "recurring event can't be moved to another calendar":
-// the sidebar drag was the only move path and recurring occurrences
-// couldn't use it. EventDetail now exposes a calendar picker in edit
-// mode that routes through moveEventToCalendar with the master id.
+enableAutoUnmount(afterEach);
 
-const masterEvent = {
-  id: "evt-r",
+const standaloneEvent: CalendarEvent = {
+  id: "evt-1",
   account_id: "acc1",
   calendar_id: "cal1",
-  uid: "evt-r@chithi",
+  uid: "evt-1@chithi",
   title: "OCM checkpoint meeting",
   description: null,
   location: null,
@@ -45,7 +46,8 @@ const masterEvent = {
   end_time: "2026-08-25T10:00:00.000Z",
   all_day: false,
   timezone: null,
-  recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
+  recurrence_rule: null,
+  recurrence_kind: "standalone",
   organizer_email: null,
   attendees_json: null,
   my_status: null,
@@ -78,15 +80,8 @@ function setupStores() {
     { id: "cal2", account_id: "acc1", name: "Stalwart Calendar", color: "#000", is_default: false, remote_id: "b", is_subscribed: true },
     { id: "cal3", account_id: "acc2", name: "Elsewhere", color: "#000", is_default: true, remote_id: null, is_subscribed: true },
   ];
-  calendarStore.events = [masterEvent];
-  // The detail panel is opened from a clicked occurrence (synthetic id,
-  // occurrence-local times) — exactly what onEventClick selects.
-  calendarStore.selectedEvent = {
-    ...masterEvent,
-    id: occurrenceId("evt-r", new Date("2026-09-08T09:00:00.000Z")),
-    start_time: "2026-09-08T09:00:00.000Z",
-    end_time: "2026-09-08T10:00:00.000Z",
-  };
+  calendarStore.events = [{ ...standaloneEvent }];
+  calendarStore.selectEvent(calendarStore.events[0]);
   return calendarStore;
 }
 
@@ -107,8 +102,9 @@ describe("EventDetail calendar picker", () => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
     vi.mocked(api.getEvents).mockImplementation(async (accountId: string) =>
-      accountId === "acc1" ? [masterEvent] : [],
+      accountId === "acc1" ? [{ ...standaloneEvent }] : [],
     );
+    vi.mocked(api.getCalendarEvent).mockImplementation(async (id) => ({ ...standaloneEvent, id }));
   });
 
   it("lists all subscribed calendars in edit mode", async () => {
@@ -126,8 +122,9 @@ describe("EventDetail calendar picker", () => {
     expect((wrapper.get('[data-testid="event-detail-calendar"]').element as HTMLSelectElement).value).toBe("cal1");
   });
 
-  it("moves the series (same account) when a different calendar is picked", async () => {
-    setupStores();
+  it("moves standalone (same account) when a different calendar is picked", async () => {
+    const store = setupStores();
+    const update = vi.spyOn(store, "updateEvent");
     const wrapper = mountDetail();
 
     await wrapper.get(".btn-edit").trigger("click");
@@ -135,46 +132,45 @@ describe("EventDetail calendar picker", () => {
     await wrapper.get('[data-testid="event-form-save"]').trigger("click");
     await flushPromises();
 
-    // Field edits are saved against the master id first...
-    expect(api.updateEvent).toHaveBeenNthCalledWith(
-      1,
-      "evt-r",
+    expect(update).toHaveBeenCalledExactlyOnceWith(
+      "evt-1",
       expect.objectContaining({ title: "OCM checkpoint meeting", calendar_id: "cal1" }),
     );
-    // ...then the move patches the calendar id on the master.
-    expect(api.updateEvent).toHaveBeenNthCalledWith(2, "evt-r", { calendar_id: "cal2" });
+    expect(api.updateEvent).toHaveBeenCalledTimes(1);
+    expect(api.moveEventToCalendar).toHaveBeenCalledExactlyOnceWith("evt-1", "cal2", "acc1");
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
-  it("saves a later occurrence's edits against the master dates and attendees", async () => {
+  it("keeps a later occurrence read-only without substituting master dates", async () => {
     setupStores();
     const calendarStore = useCalendarStore();
     calendarStore.events = [{
-      ...masterEvent,
+      ...standaloneEvent,
+      id: "evt-r",
+      recurrence_kind: "series",
+      recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
       attendees_json: JSON.stringify([{ email: "guest@example.test", name: "Guest", status: "accepted" }]),
     }];
     calendarStore.selectedEvent = {
       ...calendarStore.events[0],
       id: occurrenceId("evt-r", new Date("2026-09-08T09:00:00.000Z")),
+      recurrence_kind: "occurrence",
       start_time: "2026-09-08T09:00:00.000Z",
       end_time: "2026-09-08T10:00:00.000Z",
     };
     const wrapper = mountDetail();
 
     await wrapper.get(".btn-edit").trigger("click");
-    await wrapper.get('[data-testid="event-form-title"]').setValue("Renamed series");
-    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
-    await flushPromises();
-
-    expect(api.updateEvent).toHaveBeenCalledWith("evt-r", expect.objectContaining({
-      title: "Renamed series",
-      start_time: "2026-08-25T09:00:00.000Z",
-      end_time: "2026-08-25T10:00:00.000Z",
-      attendees: [{ email: "guest@example.test", name: "Guest", status: "accepted" }],
-    }));
+    expect(wrapper.find('[data-testid="event-detail-calendar"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain("September 8, 2026");
+    expect(wrapper.text()).toContain("Editing, deleting, or moving recurring events is not supported in Chithi.");
+    expect(api.updateEvent).not.toHaveBeenCalled();
+    expect(api.moveEventToCalendar).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
   });
 
-  it("recreates the series on the destination for cross-account moves", async () => {
+  it("uses the backend move command for standalone cross-account moves", async () => {
     setupStores();
     const wrapper = mountDetail();
 
@@ -183,18 +179,9 @@ describe("EventDetail calendar picker", () => {
     await wrapper.get('[data-testid="event-form-save"]').trigger("click");
     await flushPromises();
 
-    expect(api.createEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        account_id: "acc2",
-        calendar_id: "cal3",
-        recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
-        attendees: [],
-        // Master times — the clicked occurrence's dates must not leak in.
-        start_time: "2026-08-25T09:00:00.000Z",
-        end_time: "2026-08-25T10:00:00.000Z",
-      }),
-    );
-    expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
+    expect(api.moveEventToCalendar).toHaveBeenCalledExactlyOnceWith("evt-1", "cal3", "acc2");
+    expect(api.createEvent).not.toHaveBeenCalled();
+    expect(api.deleteEvent).not.toHaveBeenCalled();
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
@@ -207,6 +194,7 @@ describe("EventDetail calendar picker", () => {
     await flushPromises();
 
     expect(api.updateEvent).toHaveBeenCalledTimes(1);
+    expect(api.moveEventToCalendar).not.toHaveBeenCalled();
     expect(api.createEvent).not.toHaveBeenCalled();
     expect(api.deleteEvent).not.toHaveBeenCalled();
   });

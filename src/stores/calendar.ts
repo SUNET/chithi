@@ -1,8 +1,9 @@
 import { defineStore } from "pinia";
-import { ref, computed, onScopeDispose } from "vue";
+import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
-import { expandRRule, masterEventId, occurrenceId, parseRRule } from "@/lib/rrule";
+import { expandRRule, isOccurrenceId, occurrenceId, parseRRule } from "@/lib/rrule";
+import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
@@ -16,6 +17,15 @@ export const useCalendarStore = defineStore("calendar", () => {
   const currentDate = ref(new Date().toISOString().split("T")[0]); // YYYY-MM-DD
   const loading = ref(false);
   const selectedEvent = ref<CalendarEvent | null>(null);
+  // Exact-ID detail/capability data is independent of the rendered date range.
+  // Null revokes authorization while a refresh is pending or has failed.
+  const singleEventCache = ref(new Map<string, CalendarEvent | null>());
+  const singleEventRequests = new Map<string, symbol>();
+
+  watch(events, () => {
+    singleEventCache.value.clear();
+    singleEventRequests.clear();
+  }, { flush: "sync" });
 
   const accountsStore = useAccountsStore();
   const uiStore = useUiStore();
@@ -88,15 +98,17 @@ export const useCalendarStore = defineStore("calendar", () => {
         for (const occ of occurrences) {
           result.push({
             ...e,
-            // Synthetic per-occurrence id; resolve back with
-            // masterEventId() before any DB operation.
+            // Display-only identity; never substitute the master for a mutation.
             id: occurrenceId(e.id, occ.start),
+            recurrence_kind: "occurrence",
             start_time: occ.start.toISOString(),
             end_time: occ.end.toISOString(),
           });
         }
       } else {
-        result.push(e);
+        if (new Date(e.start_time) <= rangeEnd && new Date(e.end_time) >= rangeStart) {
+          result.push(e);
+        }
       }
     }
 
@@ -199,7 +211,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       .filter((c) => c.is_subscribed);
   }
 
-  async function fetchEvents() {
+  async function fetchEvents({ refreshSelected = true } = {}) {
     loading.value = true;
     try {
       const range = getDateRange();
@@ -214,10 +226,63 @@ export const useCalendarStore = defineStore("calendar", () => {
             }),
         ),
       );
+      // An exact read may have completed while the range request was pending.
+      const selectedId = selectedEvent.value?.id;
+      const hadSingleEvent = selectedId && singleEventCache.value.has(selectedId);
       events.value = results.flat();
+      if (refreshSelected && selectedId && hadSingleEvent) {
+        try {
+          await refreshSingleEvent(selectedId);
+        } catch (error) {
+          console.error("Failed to refresh selected calendar event:", error);
+        }
+      }
     } finally {
       loading.value = false;
     }
+  }
+
+  function getCachedEvent(eventId: string): CalendarEvent | undefined {
+    if (singleEventCache.value.has(eventId)) {
+      return singleEventCache.value.get(eventId) ?? undefined;
+    }
+    return events.value.find((event) => event.id === eventId);
+  }
+
+  async function refreshSingleEvent(eventId: string): Promise<CalendarEvent> {
+    if (isOccurrenceId(eventId)) {
+      throw new Error(calendarMutationSupport({ id: eventId }).reason!);
+    }
+    const request = Symbol();
+    singleEventRequests.set(eventId, request);
+    singleEventCache.value.set(eventId, null);
+    try {
+      const fresh = await api.getCalendarEvent(eventId);
+      if (singleEventRequests.get(eventId) !== request) {
+        throw new Error("Calendar data changed while refreshing. Please try again.");
+      }
+      if (fresh.id !== eventId) {
+        throw new Error("The refreshed calendar event has an unexpected ID.");
+      }
+      // Replace an existing range row, but never append out-of-range details.
+      const index = events.value.findIndex((event) => event.id === eventId);
+      if (index !== -1) events.value.splice(index, 1, fresh);
+      singleEventCache.value.set(eventId, fresh);
+      if (selectedEvent.value?.id === eventId) selectedEvent.value = fresh;
+      return fresh;
+    } finally {
+      if (singleEventRequests.get(eventId) === request) {
+        singleEventRequests.delete(eventId);
+      }
+    }
+  }
+
+  async function refreshAfterMutation(eventId: string) {
+    await fetchEvents({ refreshSelected: false });
+    const fresh = await refreshSingleEvent(eventId);
+    const support = calendarMutationSupport(fresh);
+    if (!support.supported) throw new Error(support.reason);
+    requireMutableEvent(eventId);
   }
 
   async function createEvent(event: NewEventInput): Promise<string> {
@@ -230,31 +295,43 @@ export const useCalendarStore = defineStore("calendar", () => {
     eventId: string,
     patch: Partial<NewEventInput>,
   ): Promise<void> {
+    requireMutableEvent(eventId);
     // Save original values for rollback on failure
-    const idx = events.value.findIndex((e) => e.id === eventId);
-    const snapshot = idx !== -1 ? { ...events.value[idx] } : null;
+    const original = getCachedEvent(eventId)!;
+    const snapshot = { ...original };
+    const optimisticFields = ["start_time", "end_time", "calendar_id"] as const;
 
     // Optimistic local update first for instant UI feedback
-    if (idx !== -1) {
-      if (patch.start_time) events.value[idx].start_time = patch.start_time;
-      if (patch.end_time) events.value[idx].end_time = patch.end_time;
-      if (patch.calendar_id) events.value[idx].calendar_id = patch.calendar_id;
+    for (const field of optimisticFields) {
+      if (patch[field]) original[field] = patch[field];
     }
     try {
       await api.updateEvent(eventId, patch);
-      await fetchEvents();
+      await refreshAfterMutation(eventId);
     } catch (e) {
-      // Rollback optimistic update
-      if (snapshot && idx !== -1 && idx < events.value.length) {
-        Object.assign(events.value[idx], snapshot);
+      // A refresh owns its new row and recurrence metadata. Roll back only
+      // our optimistic fields on the original object if they still match.
+      if (getCachedEvent(eventId) === original) {
+        for (const field of optimisticFields) {
+          if (patch[field] && original[field] === patch[field]) {
+            original[field] = snapshot[field];
+          }
+        }
       }
       throw e;
     }
   }
 
-  function safeParseAttendees(json: string | null): Array<{ email: string; name: string | null; status: string }> {
-    if (!json) return [];
-    try { return JSON.parse(json); } catch { return []; }
+  function getEventMutationSupport(eventId: string) {
+    // Preserve the requested identity even when no cached row exists.
+    return calendarMutationSupport(
+      getCachedEvent(eventId) ?? { id: eventId },
+    );
+  }
+
+  function requireMutableEvent(eventId: string) {
+    const support = getEventMutationSupport(eventId);
+    if (!support.supported) throw new Error(support.reason);
   }
 
   async function moveEventToCalendar(
@@ -262,47 +339,20 @@ export const useCalendarStore = defineStore("calendar", () => {
     targetCalendarId: string,
     targetAccountId: string,
   ): Promise<string> {
-    // Callers may pass a synthetic recurring-occurrence id (sidebar drops,
-    // detail panel) — the DB only knows the series master. Moving always
-    // moves the whole series.
-    const id = masterEventId(eventId);
-    const ev = events.value.find((e) => e.id === id);
-    if (!ev) return id;
-
-    if (ev.account_id === targetAccountId) {
-      // Same account — just update the calendar_id
-      await updateEvent(id, { calendar_id: targetCalendarId });
-      return id;
-    } else {
-      // Cross-account — create on destination, then delete source
-      const attendees = safeParseAttendees(ev.attendees_json);
-      const newId = await api.createEvent({
-        account_id: targetAccountId,
-        calendar_id: targetCalendarId,
-        title: ev.title,
-        description: ev.description,
-        location: ev.location,
-        start_time: ev.start_time,
-        end_time: ev.end_time,
-        all_day: ev.all_day,
-        timezone: ev.timezone,
-        recurrence_rule: ev.recurrence_rule,
-        attendees,
-      });
-      await api.deleteEvent(id);
-      await fetchEvents();
-      return newId;
-    }
+    requireMutableEvent(eventId);
+    const newId = await api.moveEventToCalendar(
+      eventId, targetCalendarId, targetAccountId,
+    );
+    await refreshAfterMutation(newId);
+    return newId;
   }
 
   async function deleteEvent(eventId: string) {
+    requireMutableEvent(eventId);
     await api.deleteEvent(eventId);
-    // The selected event may be a synthetic recurring occurrence of the
-    // deleted master — compare via master id so the panel closes too.
-    if (
-      selectedEvent.value &&
-      masterEventId(selectedEvent.value.id) === masterEventId(eventId)
-    ) {
+    singleEventRequests.delete(eventId);
+    singleEventCache.value.set(eventId, null);
+    if (selectedEvent.value?.id === eventId) {
       selectedEvent.value = null;
     }
     await fetchEvents();
@@ -435,13 +485,17 @@ export const useCalendarStore = defineStore("calendar", () => {
     currentDate,
     loading,
     selectedEvent,
+    singleEventCache,
     hiddenCalendarIds,
     unsubscribeCalendar,
     syncCalendars,
     fetchCalendars,
     fetchEvents,
+    refreshSingleEvent,
+    getCachedEvent,
     createEvent,
     updateEvent,
+    getEventMutationSupport,
     moveEventToCalendar,
     deleteEvent,
     setViewMode,

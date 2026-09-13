@@ -11,6 +11,7 @@ vi.mock("@/lib/tauri", () => ({
   createEvent: vi.fn().mockResolvedValue("event-1"),
   getEvents: vi.fn().mockResolvedValue([]),
   sendInvites: vi.fn(),
+  notifyCalendarEvent: vi.fn(),
 }));
 
 import EventForm from "@/components/calendar/EventForm.vue";
@@ -96,6 +97,20 @@ describe("EventForm pending meeting lifecycle", () => {
       },
     ];
     useUiStore().displayTimezone = "UTC";
+  });
+
+  it("uses creation invitations for a newly created series", async () => {
+    const wrapper = mountForm();
+    await wrapper.get('[data-testid="event-form-title"]').setValue("Weekly meeting");
+    const vm = wrapper.vm as unknown as { recurrenceRule: string; attendeeEmails: string[] };
+    vm.recurrenceRule = "FREQ=WEEKLY";
+    vm.attendeeEmails = ["guest@example.test"];
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+    expect(api.createEvent).toHaveBeenCalledWith(expect.objectContaining({ recurrence_rule: "FREQ=WEEKLY" }));
+    expect(api.sendInvites).toHaveBeenCalledExactlyOnceWith("calendar-account", "event-1", ["guest@example.test"]);
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    wrapper.unmount();
   });
 
   it("discards the pending meeting when closed", async () => {

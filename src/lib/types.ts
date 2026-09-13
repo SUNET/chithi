@@ -323,6 +323,8 @@ export interface Calendar {
   is_subscribed: boolean;
 }
 
+export type RecurrenceKind = "unknown" | "standalone" | "series" | "occurrence";
+
 export interface CalendarEvent {
   id: string;
   account_id: string;
@@ -336,6 +338,7 @@ export interface CalendarEvent {
   all_day: boolean;
   timezone: string | null;
   recurrence_rule: string | null;
+  recurrence_kind: RecurrenceKind;
   organizer_email: string | null;
   attendees_json: string | null;
   my_status: string | null;

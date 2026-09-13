@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch, useId } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
-import { masterEventId } from "@/lib/rrule";
+import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import type { Calendar } from "@/lib/types";
@@ -19,17 +19,34 @@ const emit = defineEmits<{
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
-const event = calendarStore.selectedEvent!;
-// The selected event may be a display-only occurrence with its own dates.
-// Edits apply to the series master because per-occurrence exceptions are not
-// supported, so initialize the form from that master instead.
-const masterEvent = calendarStore.events.find(
-  (candidate) => candidate.id === masterEventId(event.id),
-) ?? event;
+const event = computed(() => {
+  const selected = calendarStore.selectedEvent;
+  if (!selected) return null;
+  // Resolve the original identity on every refresh, retaining occurrence dates.
+  return calendarStore.getCachedEvent(selected.id)
+    ?? calendarStore.visibleEvents.find((candidate) => candidate.id === selected.id)
+    ?? selected;
+});
+const mutationSupport = computed(() =>
+  calendarStore.getEventMutationSupport(event.value?.id ?? ""),
+);
+const mutationReasonId = useId();
 
 const editing = ref(false);
 const saving = ref(false);
 const error = ref<string | null>(null);
+const editingEventId = ref<string | null>(null);
+let selectionVersion = 0;
+
+watch(() => calendarStore.selectedEvent?.id, () => {
+  selectionVersion++;
+}, { flush: "sync" });
+
+watch([() => event.value?.id, () => mutationSupport.value.reason], () => {
+  editing.value = false;
+  editingEventId.value = null;
+  error.value = null;
+}, { flush: "sync" });
 
 interface Attendee {
   email: string;
@@ -38,21 +55,21 @@ interface Attendee {
 }
 
 const attendees = computed<Attendee[]>(() => {
-  if (!event.attendees_json) return [];
-  try { return JSON.parse(event.attendees_json); } catch { return []; }
+  if (!event.value?.attendees_json) return [];
+  try { return JSON.parse(event.value.attendees_json); } catch { return []; }
 });
 
 const hasAttendees = computed(() => attendees.value.length > 0);
 
 const isOrganizer = computed(() => {
-  if (!event.organizer_email) return true; // No organizer set = you created it
-  const account = accountsStore.accounts.find(a => a.id === event.account_id);
-  return account?.email === event.organizer_email;
+  if (!event.value?.organizer_email) return true; // No organizer set = you created it
+  const account = accountsStore.accounts.find(a => a.id === event.value?.account_id);
+  return account?.email === event.value.organizer_email;
 });
 
 const calendarInfo = computed(() => {
-  const cal = calendarStore.calendars.find(c => c.id === event.calendar_id);
-  const account = accountsStore.accounts.find(a => a.id === event.account_id);
+  const cal = calendarStore.calendars.find(c => c.id === event.value?.calendar_id);
+  const account = accountsStore.accounts.find(a => a.id === event.value?.account_id);
   return {
     name: cal?.name || "Unknown calendar",
     color: cal?.color || "#4285f4",
@@ -61,15 +78,15 @@ const calendarInfo = computed(() => {
 });
 
 // Edit form state — convert UTC to display timezone
-const editTitle = ref(masterEvent.title);
-const editStartDate = ref(getDateInTimezone(masterEvent.start_time, uiStore.displayTimezone));
-const editStartTime = ref(toTimeInTimezone(new Date(masterEvent.start_time), uiStore.displayTimezone));
-const editEndDate = ref(getDateInTimezone(masterEvent.end_time, uiStore.displayTimezone));
-const editEndTime = ref(toTimeInTimezone(new Date(masterEvent.end_time), uiStore.displayTimezone));
-const editAllDay = ref(masterEvent.all_day);
-const editLocation = ref(masterEvent.location || "");
-const editDescription = ref(masterEvent.description || "");
-const editCalendarId = ref(masterEvent.calendar_id);
+const editTitle = ref("");
+const editStartDate = ref("");
+const editStartTime = ref("");
+const editEndDate = ref("");
+const editEndTime = ref("");
+const editAllDay = ref(false);
+const editLocation = ref("");
+const editDescription = ref("");
+const editCalendarId = ref("");
 
 function calendarLabel(cal: Calendar): string {
   // Same label format as EventForm's calendar picker.
@@ -100,20 +117,48 @@ function statusClass(status: string | null): string {
 }
 
 function getAttendees(): Array<{ email: string; name: string | null; status: string }> {
-  if (!event.attendees_json) return [];
-  try {
-    return JSON.parse(event.attendees_json);
-  } catch {
-    return [];
-  }
+  return attendees.value;
 }
 
 function startEditing() {
+  if (saving.value || !event.value || !mutationSupport.value.supported) return;
+  const current = event.value;
+  editTitle.value = current.title;
+  editStartDate.value = getDateInTimezone(current.start_time, uiStore.displayTimezone);
+  editStartTime.value = toTimeInTimezone(new Date(current.start_time), uiStore.displayTimezone);
+  editEndDate.value = getDateInTimezone(current.end_time, uiStore.displayTimezone);
+  editEndTime.value = toTimeInTimezone(new Date(current.end_time), uiStore.displayTimezone);
+  editAllDay.value = current.all_day;
+  editLocation.value = current.location || "";
+  editDescription.value = current.description || "";
+  editCalendarId.value = current.calendar_id;
+  editingEventId.value = current.id;
   editing.value = true;
   error.value = null;
 }
 
+function isCurrentSelection(id: string, version: number): boolean {
+  return calendarStore.selectedEvent?.id === id && selectionVersion === version;
+}
+
+async function refreshNotificationTarget(eventId: string) {
+  try {
+    const fresh = await calendarStore.refreshSingleEvent(eventId);
+    const support = calendarMutationSupport(fresh);
+    if (!support.supported) throw new Error(support.reason);
+  } catch (cause) {
+    throw new Error(`Could not verify the event for attendee notification. Please try again. ${String(cause)}`);
+  }
+}
+
 async function saveEdit() {
+  if (saving.value || !editing.value || !event.value ||
+    editingEventId.value !== event.value.id || !mutationSupport.value.supported) return;
+  const original = event.value;
+  const version = selectionVersion;
+  const targetCalendarId = editCalendarId.value;
+  const notifyAttendees = hasAttendees.value && isOrganizer.value;
+  const emails = attendees.value.map(a => a.email);
   saving.value = true;
   error.value = null;
   try {
@@ -124,45 +169,43 @@ async function saveEdit() {
       ? `${editEndDate.value}T23:59:59Z`
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
 
-    const realId = masterEvent.id;
-
-    await api.updateEvent(realId, {
-      account_id: masterEvent.account_id,
-      calendar_id: masterEvent.calendar_id,
+    await calendarStore.updateEvent(original.id, {
+      account_id: original.account_id,
+      calendar_id: original.calendar_id,
       title: editTitle.value,
       description: editDescription.value || null,
       location: editLocation.value || null,
       start_time: startISO,
       end_time: endISO,
       all_day: editAllDay.value,
-      timezone: masterEvent.timezone,
-      recurrence_rule: masterEvent.recurrence_rule,
+      timezone: original.timezone,
+      recurrence_rule: original.recurrence_rule,
       attendees: getAttendees(),
     });
 
-    // Move to another calendar if the picker changed. A cross-account
-    // move recreates the event on the destination and changes its id.
-    let notifyAccountId = masterEvent.account_id;
-    let notifyEventId = realId;
-    if (editCalendarId.value !== masterEvent.calendar_id) {
+    if (!isCurrentSelection(original.id, version) ||
+      !calendarStore.getEventMutationSupport(original.id).supported) return;
+
+    let notifyAccountId = original.account_id;
+    let notifyEventId = original.id;
+    if (targetCalendarId !== original.calendar_id) {
       const target = calendarStore.calendars.find(
-        (c) => c.id === editCalendarId.value,
+        (c) => c.id === targetCalendarId,
       );
-      if (target) {
-        // moveEventToCalendar reads the store's events array — refresh it
-        // first so a cross-account move copies the edits saved above.
-        await calendarStore.fetchEvents();
-        notifyEventId = await calendarStore.moveEventToCalendar(
-          realId,
-          target.id,
-          target.account_id,
-        );
-        notifyAccountId = target.account_id;
-      }
+      if (!target) throw new Error("The destination calendar is unavailable.");
+      notifyEventId = await calendarStore.moveEventToCalendar(
+        original.id, target.id, target.account_id,
+      );
+      notifyAccountId = target.account_id;
     }
 
+    if (!isCurrentSelection(original.id, version)) return;
+    if (!calendarStore.getEventMutationSupport(notifyEventId).supported) {
+      await refreshNotificationTarget(notifyEventId);
+      if (!isCurrentSelection(original.id, version)) return;
+    }
     // Notify attendees if organizer and event has attendees
-    if (hasAttendees.value && isOrganizer.value) {
+    if (notifyAttendees) {
       const result = await tauriMessage(
         "This event has attendees. Send an update notification?",
         {
@@ -172,65 +215,72 @@ async function saveEdit() {
         },
       );
       if (result === "Cancel") {
-        saving.value = false;
         return;
       }
+      if (!isCurrentSelection(original.id, version)) return;
+      // A background range refresh can evict the moved destination while
+      // the dialog is open. Revalidate the captured target, not the source.
+      await refreshNotificationTarget(notifyEventId);
+      if (!isCurrentSelection(original.id, version)) return;
       if (result === "Send Update" || result === "Yes") {
         const accountId = notifyAccountId || accountsStore.activeAccountId || "";
-        const emails = attendees.value.map(a => a.email);
-        try {
-          await api.sendInvites(accountId, notifyEventId, emails);
-        } catch (e) {
-          console.error("Failed to notify attendees:", e);
-        }
+        await api.notifyCalendarEvent(accountId, notifyEventId, emails);
       }
     }
 
-    editing.value = false;
-    await calendarStore.fetchEvents();
-    emit("close");
+    if (isCurrentSelection(original.id, version)) {
+      editing.value = false;
+      emit("close");
+    }
   } catch (e) {
-    error.value = String(e);
+    if (isCurrentSelection(original.id, version)) error.value = String(e);
   } finally {
     saving.value = false;
   }
 }
 
 async function handleDelete() {
-  // Selected recurring occurrences carry a synthetic id; the DB only
-  // knows the series master. Deleting an occurrence deletes the series
-  // (per-occurrence exceptions are not supported yet).
-  const realId = masterEventId(event.id);
-  if (hasAttendees.value && isOrganizer.value) {
-    const result = await tauriMessage(
-      "This event has attendees. Send a cancellation notification?",
-      {
-        title: "Notify Attendees",
-        kind: "warning",
-        buttons: { yes: "Send Cancellation", no: "Delete Only", cancel: "Cancel" },
-      },
-    );
-    if (result === "Cancel") return;
-    if (result === "Send Cancellation" || result === "Yes") {
-      // TODO: Send METHOD:CANCEL iCalendar to attendees
-      // For now, just log — full cancel flow requires generating CANCEL ical
-      const accountId = event.account_id || accountsStore.activeAccountId || "";
-      const emails = attendees.value.map(a => a.email);
-      try {
-        await api.sendInvites(accountId, realId, emails);
-      } catch (e) {
-        console.error("Failed to send cancellation:", e);
+  if (saving.value || !event.value || !mutationSupport.value.supported) return;
+  const original = event.value;
+  const version = selectionVersion;
+  const emails = attendees.value.map(a => a.email);
+  saving.value = true;
+  error.value = null;
+  try {
+    if (hasAttendees.value && isOrganizer.value) {
+      const result = await tauriMessage(
+        "This event has attendees. Send a cancellation notification?",
+        {
+          title: "Notify Attendees",
+          kind: "warning",
+          buttons: { yes: "Send Cancellation", no: "Delete Only", cancel: "Cancel" },
+        },
+      );
+      if (result === "Cancel") return;
+      if (!isCurrentSelection(original.id, version)) return;
+      await refreshNotificationTarget(original.id);
+      if (!isCurrentSelection(original.id, version)) return;
+      if (result === "Send Cancellation" || result === "Yes") {
+        // TODO: Send METHOD:CANCEL iCalendar to attendees
+        const accountId = original.account_id || accountsStore.activeAccountId || "";
+        await api.notifyCalendarEvent(accountId, original.id, emails);
       }
     }
-  }
 
-  await calendarStore.deleteEvent(realId);
-  emit("close");
+    if (!isCurrentSelection(original.id, version) ||
+      !calendarStore.getEventMutationSupport(original.id).supported) return;
+    await calendarStore.deleteEvent(original.id);
+    if (!calendarStore.selectedEvent) emit("close");
+  } catch (e) {
+    if (isCurrentSelection(original.id, version)) error.value = String(e);
+  } finally {
+    saving.value = false;
+  }
 }
 </script>
 
 <template>
-  <div class="event-detail-overlay" @click.self="emit('close')">
+  <div v-if="event" class="event-detail-overlay" @click.self="emit('close')">
     <div class="event-detail">
       <div class="detail-header">
         <h3 v-if="!editing">{{ event.title }}</h3>
@@ -239,6 +289,9 @@ async function handleDelete() {
       </div>
 
       <div v-if="error" class="detail-error">{{ error }}</div>
+      <p v-if="!mutationSupport.supported" :id="mutationReasonId" class="mutation-reason">
+        {{ mutationSupport.reason }}
+      </p>
 
       <!-- View mode -->
       <div v-if="!editing" class="detail-body">
@@ -347,11 +400,11 @@ async function handleDelete() {
 
       <div class="detail-footer">
         <template v-if="!editing">
-          <button class="btn-edit" @click="startEditing">Edit</button>
-          <button class="btn-danger" @click="handleDelete" data-testid="event-form-delete">Delete</button>
+          <button class="btn-edit" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="startEditing">Edit</button>
+          <button class="btn-danger" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="handleDelete" data-testid="event-form-delete">Delete</button>
         </template>
         <template v-else>
-          <button class="btn-save" :disabled="saving" @click="saveEdit" data-testid="event-form-save">
+          <button class="btn-save" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="saveEdit" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Save" }}
           </button>
           <button class="btn-cancel" @click="editing = false">Cancel</button>
@@ -427,6 +480,12 @@ async function handleDelete() {
 }
 
 .detail-body { padding: 16px; }
+
+.mutation-reason {
+  padding: 12px 16px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
 
 .detail-row {
   display: flex;
@@ -538,7 +597,7 @@ async function handleDelete() {
   font-size: 12px;
 }
 
-.btn-save:disabled { opacity: 0.5; }
+.detail-footer button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-cancel {
   padding: 6px 16px;
