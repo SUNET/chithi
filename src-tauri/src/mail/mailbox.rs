@@ -25,7 +25,7 @@ pub(crate) fn parse_mailbox(value: &str) -> Result<Mailbox> {
 /// Parse the entire item, keeping semantic comparison data separate from the
 /// minimally quoted wire spelling. Caller-owned input is never rewritten.
 pub(crate) fn parse(value: &str) -> Result<ParsedMailbox> {
-    let mut parser = Parser::new(value.trim());
+    let mut parser = Parser::new(value);
     parser.cfws().ok_or_else(invalid)?;
 
     let mut bare = parser.clone();
@@ -341,6 +341,54 @@ mod tests {
                 assert_eq!(reparsed.local_part, semantic);
                 assert_eq!(reparsed.mailbox, parsed.mailbox);
             }
+        }
+    }
+
+    #[test]
+    fn unicode_whitespace_is_smtputf8_local_data_not_outer_padding() {
+        // RFC 6531 §3.3 adds UTF8-non-ascii to atext, not to FWS/CFWS.
+        for ch in [
+            '\u{85}', '\u{a0}', '\u{1680}', '\u{2003}', '\u{2028}', '\u{2029}', '\u{202f}',
+            '\u{205f}', '\u{3000}', '\u{feff}',
+        ] {
+            let address = format!("{ch}alice{ch}@example.com");
+            for input in [
+                address.clone(),
+                format!(" \t{address} \t"),
+                format!("Name <{address}>"),
+            ] {
+                let parsed = parse(&input).unwrap();
+                assert_eq!(parsed.local_part, format!("{ch}alice{ch}"));
+                assert_eq!(parsed.mailbox.email.to_string(), address);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_edge_whitespace_is_not_discarded_before_parsing() {
+        for padding in [
+            "\r", "\n", "\r\n", "\r ", "\n ", " \r", " \n", "\x0b", "\x0c",
+        ] {
+            for input in [
+                format!("{padding}alice@example.com"),
+                format!("alice@example.com{padding}"),
+            ] {
+                assert!(parse(&input).is_err(), "accepted {input:?}");
+            }
+        }
+        for suffix in ['\u{a0}', '\u{2003}', '\u{202f}', '\u{3000}'] {
+            assert!(parse(&format!("alice@example.com{suffix}")).is_err());
+            assert!(parse(&format!("<alice@example.com>{suffix}")).is_err());
+        }
+        for input in [
+            " \talice@example.com \t",
+            "\r\n alice@example.com\r\n \t",
+            " \t\r\n (comment) alice@example.com (comment)\r\n \t",
+        ] {
+            assert_eq!(
+                parse(input).unwrap().mailbox.email.to_string(),
+                "alice@example.com"
+            );
         }
     }
 

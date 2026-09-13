@@ -21,6 +21,7 @@ import {
   rankRecipientAddressMatch,
   recipientDeduplicationKey,
   replaceLastRecipient,
+  trimRecipientPadding,
   type RecipientParseError,
 } from "@/lib/compose-recipients";
 import Select from "@/components/common/Select.vue";
@@ -319,7 +320,7 @@ function selectAutocomplete(item: AutocompleteItem) {
   acResults.value = [];
   const mailbox = parseRecipients(item.email);
   if (!mailbox.ok || mailbox.addresses.length !== 1 ||
-      mailbox.addresses[0] !== item.email.trim()) {
+      mailbox.addresses[0] !== trimRecipientPadding(item.email)) {
     error.value = "Selected contact does not contain a single email address. Correct the contact or enter an address manually.";
     recipientErrorField.value = acField.value;
     return;

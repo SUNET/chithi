@@ -1486,14 +1486,20 @@ fn check_pgp_recipient_keys(
 ) -> std::result::Result<Vec<PgpRecipientStatus>, PgpRecipientCheckError> {
     let mut validated = Vec::with_capacity(recipients.len());
     for (index, email) in recipients.into_iter().enumerate() {
-        let trimmed = email.trim();
-        if trimmed.is_empty() {
+        if email.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
             continue;
         }
         // Share MIME construction's validator without rewriting key identifiers.
-        smtp::parse_mailbox(trimmed)
+        smtp::parse_mailbox(&email)
             .map_err(|_| PgpRecipientCheckError::InvalidRecipient { index: index + 1 })?;
-        validated.push(trimmed.to_string());
+        // Strip plain ASCII padding only after validating the original value.
+        // Preserve valid folding intact: trimming its final WSP would leave a
+        // bare CRLF. Unicode whitespace can be significant SMTPUTF8 local data.
+        validated.push(if email.contains(['\r', '\n']) {
+            email
+        } else {
+            email.trim_matches([' ', '\t']).to_string()
+        });
     }
     if validated.is_empty() {
         return Ok(Vec::new());

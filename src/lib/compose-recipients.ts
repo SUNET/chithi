@@ -30,6 +30,19 @@ type MailboxResult =
 const controlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
 const missingSeparator = "Separate recipients with a comma or semicolon.";
 
+function isRecipientPadding(char: string): boolean {
+  return char === " " || char === "\t";
+}
+
+/** Strip ASCII SP/HTAB only; Unicode whitespace is significant mailbox content. */
+export function trimRecipientPadding(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isRecipientPadding(value[start])) start++;
+  while (end > start && isRecipientPadding(value[end - 1])) end--;
+  return value.slice(start, end);
+}
+
 /** Keep raw offsets even for unfinished syntax so autocomplete can use it. */
 function tokenizeRecipients(input: string): RecipientSpan[] {
   const spans: RecipientSpan[] = [];
@@ -58,7 +71,7 @@ function tokenizeRecipients(input: string): RecipientSpan[] {
 
   while (cursor < input.length) {
     const char = input[cursor];
-    if (/\s/u.test(char)) {
+    if (isRecipientPadding(char)) {
       cursor++;
       continue;
     }
@@ -145,7 +158,7 @@ function tokenizeRecipients(input: string): RecipientSpan[] {
   return spans;
 }
 
-/** Remove edge comments/whitespace, never join separate word fragments. */
+/** Remove edge comments/ASCII padding, never join separate word fragments. */
 function readAddrSpec(input: string, parts: RecipientPart[]): MailboxResult {
   const atSigns = parts.filter((part) => part.kind === "@");
   if (atSigns.length === 0) {
@@ -229,13 +242,13 @@ function readMailbox(input: string, parts: RecipientPart[]): MailboxResult {
   return mailbox;
 }
 
-/** Check list structure; the backend remains the final mailbox validator. */
+/** Reject raw controls and check list structure; the backend validates mailboxes. */
 export function parseRecipients(input: string): RecipientParseResult {
   const addresses: string[] = [];
   let index = 0;
 
   for (const span of tokenizeRecipients(input)) {
-    if (!span.error && input.slice(span.start, span.end).trim() === "") continue;
+    if (!span.error && trimRecipientPadding(input.slice(span.start, span.end)) === "") continue;
     index++;
     if (span.error) {
       return { ok: false, error: { index, message: span.error } };
@@ -253,7 +266,7 @@ export function parseRecipients(input: string): RecipientParseResult {
 export function getLastRecipientTerm(input: string): string {
   const spans = tokenizeRecipients(input);
   const last = spans[spans.length - 1];
-  return input.slice(last.start, last.end).trim();
+  return trimRecipientPadding(input.slice(last.start, last.end));
 }
 
 export interface RecipientSearch {
@@ -265,7 +278,7 @@ function bareAddress(value: string): Extract<MailboxResult, { ok: true }> | null
   const spans = tokenizeRecipients(value);
   if (spans.length !== 1 || spans[0].error) return null;
   const parsed = readAddrSpec(value, spans[0].parts);
-  return parsed.ok && parsed.address === value.trim() ? parsed : null;
+  return parsed.ok && parsed.address === trimRecipientPadding(value) ? parsed : null;
 }
 
 /** Match domain-case variants without merging case-distinct local parts. */
@@ -302,7 +315,10 @@ export function getRecipientSearch(input: string): RecipientSearch {
   const open = parts.find((part) => part.kind === "<");
   if (open) {
     const close = parts.find((part) => part.kind === ">");
-    return { query: raw.slice(open.end, close?.start ?? raw.length).trim(), kind: "address" };
+    return {
+      query: trimRecipientPadding(raw.slice(open.end, close?.start ?? raw.length)),
+      kind: "address",
+    };
   }
   // Quotes in a bare addr-spec are part of the stored mailbox spelling.
   if (parts.some((part) => part.kind === "@")) return { query: raw, kind: "address" };
@@ -332,7 +348,7 @@ export function replaceLastRecipient(input: string, name: string, email: string)
   const spans = tokenizeRecipients(input);
   const last = spans[spans.length - 1];
   let contentStart = last.start;
-  while (contentStart < last.end && /\s/u.test(input[contentStart])) contentStart++;
+  while (contentStart < last.end && isRecipientPadding(input[contentStart])) contentStart++;
   return input.slice(0, contentStart) + formatRecipient({ name, email }) + ", ";
 }
 

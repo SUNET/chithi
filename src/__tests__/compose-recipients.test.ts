@@ -113,6 +113,29 @@ describe("parseRecipients", () => {
     expect(parseRecipients(input)).toEqual({ ok: true, addresses });
   });
 
+  it.each(["\u00a0", "\u2003", "\u2028", "\u2029", "\ufeff"])(
+    "preserves Unicode %j as local-part content, including at either edge",
+    (char) => {
+      for (const local of [`${char}user`, `us${char}er`, `user${char}`, char]) {
+        const email = `${local}@example.com`;
+        expect(parseRecipients(`  ${email} ; Name < ${email} >, `)).toEqual({
+          ok: true, addresses: [email, email],
+        });
+      }
+      expect(parseRecipients(`good@x, ;  ${char}  `)).toEqual({
+        ok: false,
+        error: { index: 2, message: expect.stringMatching(/missing '@'/i) },
+      });
+    },
+  );
+
+  it("preserves a domain-ending NBSP for the backend to validate", () => {
+    const email = "user@example.com\u00a0";
+    expect(parseRecipients(`  ${email} ; Name < ${email} > `)).toEqual({
+      ok: true, addresses: [email, email],
+    });
+  });
+
   it.each<[string, RegExp]>([
     ["not-an-address", /missing '@'/i],
     ["Alice Smith", /missing '@'/i],
@@ -193,6 +216,8 @@ describe("parseRecipients", () => {
     (control) => {
       for (const token of [
         control,
+        `${control}a@x`,
+        `a@x${control}`,
         `a${control}@x`,
         `"a${control}b"@x`,
         `"A${control}B" <a@x>`,
@@ -264,7 +289,13 @@ describe("getLastRecipientTerm", () => {
     ["a@x; b@[unfinished,semi;", "b@[unfinished,semi;"],
     [String.raw`a@x; b@[escaped\],semi;`, String.raw`b@[escaped\],semi;`],
     ["a@x; <broken>>; bo", "bo"],
-    ["a@x,\n bo\t", "bo"],
+    ["a@x, \t bo\t ", "bo"],
+    ["a@x,\n bo\t", "\n bo"],
+    ["a@x, \rbo@x\n ", "\rbo@x\n"],
+    ["a@x, \u00a0user@x ", "\u00a0user@x"],
+    ["a@x, user\u2003@x ", "user\u2003@x"],
+    ["a@x, \t\u00a0\u2003\t ", "\u00a0\u2003"],
+    ["a@x, user@x\u00a0 ", "user@x\u00a0"],
   ])("gets the last term from %s without requiring valid syntax", (input, term) => {
     expect(getLastRecipientTerm(input)).toBe(term);
   });
@@ -292,6 +323,28 @@ describe("getRecipientSearch", () => {
     expect(getRecipientSearch(input).query).toBe(term);
   });
 
+  it.each<[string, string]>([
+    [" \tuser@ex\t ", "user@ex"],
+    [" \u00a0user@ex ", "\u00a0user@ex"],
+    [" user\u2003@ex ", "user\u2003@ex"],
+    [" user@ex\u00a0 ", "user@ex\u00a0"],
+    ["Name < \tuser@ex\t >", "user@ex"],
+    ["Name < \u00a0user@ex >", "\u00a0user@ex"],
+    ["Name < user\u2003@ex >", "user\u2003@ex"],
+    ["Name < user@ex\u00a0 >", "user@ex\u00a0"],
+    ["Name < \u00a0\u2003 >", "\u00a0\u2003"],
+    [" \ruser@ex\n ", "\ruser@ex\n"],
+    ["Name < \nuser@ex\r >", "\nuser@ex\r"],
+  ])("removes only ASCII SP/HTAB padding from address query %j", (input, query) => {
+    expect(getRecipientSearch(`existing@x; ${input}`)).toEqual({ query, kind: "address" });
+  });
+
+  it("keeps name-only search normalization separate from address padding", () => {
+    expect(getRecipientSearch('\u00a0"Alice"\u2003')).toEqual({
+      query: "Alice", kind: "name",
+    });
+  });
+
   it("distinguishes a quoted name containing @ from an address query", () => {
     expect(getRecipientSearch('"Team@Work"')).toEqual({ query: "Team@Work", kind: "name" });
     expect(getRecipientSearch('Name <ali')).toEqual({ query: "ali", kind: "address" });
@@ -310,6 +363,13 @@ describe("rankRecipientAddressMatch", () => {
     ["work@example.com", "work@EXAM", 2],
     ['"a@b"@EXAMPLE.com', '"a@b"@example.com', 1],
     ['"A@b"@example.com', '"a@b"@EXAMPLE.com', 4],
+    ["\u00a0user@example.com", "\u00a0user@EXAMPLE.com", 1],
+    ["user@example.com", "\u00a0user@EXAMPLE.com", 4],
+    ["\u00a0user@example.com", "user@EXAMPLE.com", 3],
+    ["us\u00a0er@example.com", "us\u00a0er@EXAM", 2],
+    ["user\u2003@example.com", "user\u2003@EXAMPLE.com", 1],
+    ["user@example.com", "user\u2003@EXAMPLE.com", 4],
+    ["user@example.com", "user@example.com\u00a0", 4],
   ])("ranks %s against %s without folding local-part case", (email, query, rank) => {
     expect(rankRecipientAddressMatch(email, query)).toBe(rank);
   });
@@ -331,6 +391,17 @@ describe("recipientDeduplicationKey", () => {
       .toBe(JSON.stringify(["mailbox", "User", "example.com"]));
     expect(recipientDeduplicationKey("user@EXAMPLE.com"))
       .not.toBe(recipientDeduplicationKey("User@example.com"));
+  });
+
+  it.each(["\u00a0", "\u2003"])("keeps local-part %j significant while folding domain case", (char) => {
+    const locals = ["user", `${char}user`, `us${char}er`, `user${char}`];
+    const keys = locals.map((local) => recipientDeduplicationKey(`${local}@example.com`));
+    expect(new Set(keys).size).toBe(locals.length);
+    for (const [index, local] of locals.entries()) {
+      expect(recipientDeduplicationKey(`  ${local}@EXAMPLE.com  `)).toBe(keys[index]);
+      expect(keys[index]).toBe(JSON.stringify(["mailbox", local, "example.com"]));
+    }
+    expect(recipientDeduplicationKey(`user@example.com${char}`)).not.toBe(keys[0]);
   });
 
   it("preserves quoted local-part @ signs, escaping and case while folding only the domain", () => {
@@ -383,6 +454,10 @@ describe("replaceLastRecipient", () => {
     ["  ali  ", "  Alice Smith <alice@example.com>, "],
     ["  ", "  Alice Smith <alice@example.com>, "],
     [" \t ", " \t Alice Smith <alice@example.com>, "],
+    ["\u00a0ali", "Alice Smith <alice@example.com>, "],
+    [" \u2003ali", " Alice Smith <alice@example.com>, "],
+    ["bob@test.com; \t\u00a0\u2003", "bob@test.com; \tAlice Smith <alice@example.com>, "],
+    ["bob@test.com; \nali", "bob@test.com; Alice Smith <alice@example.com>, "],
     [
       "bob@test.com, ali",
       "bob@test.com, Alice Smith <alice@example.com>, ",

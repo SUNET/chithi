@@ -324,6 +324,72 @@ afterEach(async () => {
 });
 
 describe("ComposeView recipient validation", () => {
+  it.each([false, true])("preserves Unicode address content in draft/send IPC and raw fields (encrypt=%s)", async (encrypt) => {
+    const inputs: Record<RecipientField, string> = {
+      to: "  \u00a0user@example.com; user@example.com, ",
+      cc: "Copy <us\u00a0er@example.com>; user\u00a0@example.com  ",
+      bcc: " \u2003user@example.com; us\u2003er@example.com; user\u2003@example.com ",
+    };
+    const recipients: Pick<ComposeMessage, RecipientField> = {
+      to: ["\u00a0user@example.com", "user@example.com"],
+      cc: ["us\u00a0er@example.com", "user\u00a0@example.com"],
+      bcc: ["\u2003user@example.com", "us\u2003er@example.com", "user\u2003@example.com"],
+    };
+    const addresses = [...recipients.to, ...recipients.cc, ...recipients.bcc];
+    const wrapper = await mountCompose();
+    for (const field of recipientFields) await setRecipient(wrapper, field, inputs[field]);
+    await wrapper.get('[data-testid="compose-save-draft"]').trigger("click");
+    await flushPromises();
+    expect(api.saveDraft).toHaveBeenCalledWith(account.id, expect.objectContaining(recipients));
+    for (const field of recipientFields) {
+      expect(recipientInput(wrapper, field).element.value).toBe(inputs[field]);
+    }
+
+    if (encrypt) {
+      await wrapper.get('[data-testid="compose-pgp-encrypt"]').trigger("click");
+      await settleDebounces();
+      expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(1, addresses);
+    }
+    await wrapper.get('[data-testid="compose-send"]').trigger("click");
+    await flushPromises();
+    expect(api.sendMessage).toHaveBeenCalledWith(account.id, expect.objectContaining({
+      ...recipients, pgp_encrypt: encrypt,
+    }));
+    expect(api.pgpCheckRecipients).toHaveBeenCalledTimes(encrypt ? 2 : 0);
+    if (encrypt) expect(api.pgpCheckRecipients).toHaveBeenNthCalledWith(2, addresses);
+    for (const field of recipientFields) {
+      expect(recipientInput(wrapper, field).element.value).toBe(inputs[field]);
+    }
+  });
+
+  it.each(["\ruser@example.com", "user@example.com\n", "\tuser@example.com", "user@example.com\t"])(
+    "rejects raw edge controls in %j before send, draft or key-check IPC",
+    async (input) => {
+      // Prefill preserves raw controls in the model; text inputs sanitize CR/LF in the DOM.
+      const wrapper = await mountCompose({ to: "  primary@example.com  ", cc: input });
+      await wrapper.get('[data-testid="compose-pgp-encrypt"]').trigger("click");
+      await settleDebounces();
+      for (const action of ["send", "save-draft"]) {
+        await wrapper.get(`[data-testid="menu-${action}"]`).trigger("click");
+        await flushPromises();
+        expectRecipientError(wrapper, "cc", 1, /control characters/i);
+      }
+      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(api.saveDraft).not.toHaveBeenCalled();
+      expect(api.pgpCheckRecipients).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not treat a Unicode-only recipient as an empty draft field", async () => {
+    const input = " \u00a0\u2003 ";
+    const wrapper = await mountCompose({ to: "primary@example.com", cc: input });
+    await wrapper.get('[data-testid="compose-save-draft"]').trigger("click");
+    await flushPromises();
+    expectRecipientError(wrapper, "cc", 1, /missing '@'/i);
+    expect(recipientInput(wrapper, "cc").element.value).toBe(input);
+    expect(api.saveDraft).not.toHaveBeenCalled();
+  });
+
   it("sends exact bare To/Cc/Bcc arrays with quoted names, escaped local parts and mixed separators", async () => {
     const wrapper = await mountCompose();
     await fillRecipients(wrapper);
@@ -547,6 +613,96 @@ describe("ComposeView recipient validation", () => {
 });
 
 describe("ComposeView recipient formatting", () => {
+  const unicodeEmails = [
+    "\u00a0user@example.com", "user@example.com", "us\u00a0er@example.com",
+    "user\u00a0@example.com", "\u2003user@example.com",
+  ];
+
+  it.each([
+    { query: "Team", emails: unicodeEmails },
+    { query: "\u00a0user@EXAMPLE.com", emails: [unicodeEmails[0]] },
+    { query: "user\u00a0@EXAM", emails: [unicodeEmails[3]] },
+    { query: "user@EXAM", emails: [unicodeEmails[1], unicodeEmails[0], unicodeEmails[4]] },
+  ])("preserves Unicode distinctions when matching, deduplicating and selecting $query", async ({ query, emails }) => {
+    vi.mocked(api.searchContactsForAccount).mockResolvedValue([{
+      ...contact,
+      display_name: "Team",
+      emails_json: JSON.stringify(unicodeEmails.flatMap((email) => [
+        { email, label: "work" },
+        { email: email.replace("example.com", "EXAMPLE.com"), label: "domain variant" },
+      ])),
+    }]);
+    vi.mocked(api.searchCollectedContacts).mockResolvedValue(unicodeEmails.map((email, index) => ({
+      id: index + 1,
+      account_id: account.id,
+      email: email.replace("example.com", "Example.COM"),
+      name: "Recent Team",
+      last_used: "2026-09-13T12:00:00Z",
+      use_count: 10,
+    })));
+    const wrapper = await mountCompose();
+    const input = recipientInput(wrapper, "to");
+    const prefix = "first@example.com;  ";
+    await input.setValue(prefix + query);
+    await settleDebounces();
+    expect(api.searchContactsForAccount).toHaveBeenLastCalledWith(query, account.id, "mail");
+    expect(api.searchCollectedContacts).toHaveBeenLastCalledWith(query);
+    expect(wrapper.findAll('[data-testid="compose-ac-item"]').map((item) => ({
+      email: item.get(".ac-email").text(), source: item.get(".ac-source").text(),
+    }))).toEqual(emails.map((email) => ({ email: `<${email}>`, source: "Contacts" })));
+
+    await input.trigger("keydown", { key: "Tab" });
+    expect(input.element.value).toBe(`${prefix}Team <${emails[0]}>, `);
+    expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+    await wrapper.get('[data-testid="compose-send"]').trigger("click");
+    await flushPromises();
+    expect(api.sendMessage).toHaveBeenCalledWith(account.id, expect.objectContaining({
+      to: ["first@example.com", emails[0]],
+    }));
+  });
+
+  it.each(["user@example.com", "\u00a0user@example.com"])(
+    "accepts ASCII padding on contact email %j without changing its local part",
+    async (email) => {
+      vi.mocked(api.searchContactsForAccount).mockResolvedValue([{
+        ...contact,
+        display_name: "Team",
+        emails_json: JSON.stringify([{ email: `  ${email}  `, label: "work" }]),
+      }]);
+      const wrapper = await mountCompose();
+      const input = recipientInput(wrapper, "to");
+      await input.setValue("Team");
+      await settleDebounces();
+      await wrapper.get('[data-testid="compose-ac-item"]').trigger("mousedown");
+      expect(input.element.value).toBe(`Team <${email}>, `);
+      expect(wrapper.find('[data-testid="compose-error"]').exists()).toBe(false);
+    },
+  );
+
+  it("retains a selected contact's domain-ending NBSP for backend rejection", async () => {
+    const email = "user@example.com\u00a0";
+    vi.mocked(api.searchContactsForAccount).mockResolvedValue([{
+      ...contact,
+      display_name: "Team",
+      emails_json: JSON.stringify([{ email, label: "work" }]),
+    }]);
+    vi.mocked(api.pgpCheckRecipients).mockRejectedValue({ kind: "invalidRecipient", index: 1 });
+    const wrapper = await mountCompose();
+    const input = recipientInput(wrapper, "to");
+    await input.setValue("Team");
+    await settleDebounces();
+    await input.trigger("keydown", { key: "Tab" });
+    const text = `Team <${email}>, `;
+    expect(input.element.value).toBe(text);
+    await wrapper.get('[data-testid="compose-pgp-encrypt"]').trigger("click");
+    await wrapper.get('[data-testid="compose-send"]').trigger("click");
+    await flushPromises();
+    expect(api.pgpCheckRecipients).toHaveBeenCalledWith([email]);
+    expectRecipientError(wrapper, "to", 1, /invalid email address/i);
+    expect(input.element.value).toBe(text);
+    expect(api.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("does not expand a malformed contact email into multiple recipients", async () => {
     const invalidEmail = "bad@example.com, extra@example.com";
     vi.mocked(api.searchContactsForAccount).mockResolvedValue([{
