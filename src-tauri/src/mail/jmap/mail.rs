@@ -1835,6 +1835,29 @@ mod submission_envelope_tests {
     }
 
     #[test]
+    fn unicode_padding_characters_remain_distinct_envelope_local_parts() {
+        let unicode = "\u{a0}alice@Example.COM";
+        let envelope = envelope_json(
+            unicode,
+            &["alice@example.com".into()],
+            &[unicode.into()],
+            &["\u{a0}alice@example.com".into()],
+        );
+        assert_eq!(envelope["mailFrom"]["email"], unicode);
+        assert_eq!(
+            envelope["mailFrom"]["parameters"],
+            serde_json::json!({"SMTPUTF8": null})
+        );
+        assert_eq!(
+            envelope["rcptTo"],
+            serde_json::json!([
+                {"email": "alice@example.com", "parameters": null},
+                {"email": unicode, "parameters": null},
+            ])
+        );
+    }
+
+    #[test]
     fn invalid_or_empty_envelopes_fail_before_upload_without_exposing_recipient() {
         // `send_email` requires this private-field type, so a constructor
         // failure occurs before its first operation (the blob upload).

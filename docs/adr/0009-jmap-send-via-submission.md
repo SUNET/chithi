@@ -61,6 +61,12 @@ normalization applies to newly generated header and envelope output.
   periods ([RFC 5322 §4.1][obsolete-lexical]) are accepted and normalized
   through the header encoder. This is not a general inbound
   obsolete-syntax/recovery parser.
+  Parse the original value without Unicode-wide trimming: non-ASCII
+  whitespace can be significant local-part data, and malformed edge CR/LF
+  must reach validation. The frontend retains its control-character
+  rejection and recognizes only ASCII SP/HTAB as recipient padding. PGP
+  pre-checks skip only empty/SP/HTAB-only items, validate other items before
+  stripping plain ASCII padding, and preserve valid folded identifiers.
 - **Local-part semantics:** keep decoded local data separate from wire
   spelling; preserve case and significant whitespace. Newly generated
   addresses use minimum necessary quoting and escaping under

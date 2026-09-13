@@ -1034,6 +1034,31 @@ mod raw_message_tests {
     }
 
     #[test]
+    fn unicode_padding_characters_reach_mime_and_smtp_addresses_unchanged() {
+        let address = "\u{a0}alice\u{2003}@Example.COM";
+        assert_eq!(parse_address(address).unwrap().to_string(), address);
+        let raw = build_raw_message(
+            address,
+            "",
+            &[address.into()],
+            &[],
+            &[],
+            "Subject",
+            "body",
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
+        // Inspect serialized bytes: decoding headers with a general-purpose
+        // parser could itself trim the characters this regression protects.
+        let wire = String::from_utf8(raw).unwrap();
+        assert!(wire.starts_with(&format!("From: {address}\r\n")));
+        assert!(wire.contains(&format!("\r\nTo: {address}\r\n")));
+    }
+
+    #[test]
     fn no_recipients_is_an_error_and_cc_only_is_valid() {
         assert_eq!(
             with_recipients(&[], &[], &[]).unwrap_err().to_string(),
