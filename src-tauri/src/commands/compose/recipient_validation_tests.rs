@@ -7,13 +7,14 @@ use super::{check_pgp_recipient_keys, PgpRecipientCheckError};
 use crate::error::Error;
 use crate::mail::smtp;
 
-const INVALID_RECIPIENTS: [&str; 3] = [
+const INVALID_RECIPIENTS: [&str; 4] = [
     "alice@example..com",
     ".alice@example.com",
     "alice..bob@example.com",
+    "alice@[not-an-ip]",
 ];
 
-const SUPPORTED_RECIPIENTS: [&str; 12] = [
+const SUPPORTED_RECIPIENTS: [&str; 11] = [
     "Alice@EXAMPLE.com",
     r#""quoted local"@Example.COM"#,
     r#""ali\ce"@EXAMPLE.com"#,
@@ -25,7 +26,6 @@ const SUPPORTED_RECIPIENTS: [&str; 12] = [
     "Åsa Österberg <asa@example.com>",
     "literal@[192.0.2.1]",
     "ipv6@[IPv6:2001:db8::1]",
-    "alice@[not-an-ip]",
 ];
 
 fn assert_invalid_before_open(recipients: &[&str], position: usize) {

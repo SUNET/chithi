@@ -95,8 +95,8 @@ impl JmapSubmissionEnvelope {
     ///
     /// RFC 5321 section 2.4 requires local-part comparisons to preserve case,
     /// while domains are case-insensitive. Duplicate recipients therefore use
-    /// a semantic quoted local-part and canonical IDNA domain key; the first
-    /// parsed addr-spec's spelling is retained in the emitted envelope.
+    /// a semantic local-part and canonical IDNA domain key. The first address
+    /// is emitted with minimum necessary quoting (RFC 5321 section 4.1.2).
     pub fn new(mail_from: &str, to: &[String], cc: &[String], bcc: &[String]) -> Result<Self> {
         let mail_from = parse_rfc5321_addr_spec(mail_from)
             .ok_or_else(|| Error::Other("Invalid JMAP submission mail-from address".into()))?;
@@ -174,123 +174,20 @@ fn raw_headers_contain_non_ascii(raw_message: &[u8]) -> bool {
     !raw_message[..header_end].is_ascii()
 }
 
-/// Parse either a bare addr-spec or one display-name mailbox into the exact
-/// addr-spec used for RFC 5321 submission. `mailparse` handles mailbox syntax
-/// (including quoted display names and quoted local parts inside angle
-/// brackets); lettre performs final addr-spec validation and exposes the
-/// parsed local/domain components used for standards-compliant deduplication.
+/// Share syntax and serialization with SMTP, leaving identity permissions and
+/// envelope deduplication in JMAP. RFC 8621 section 7 requires SMTP Mailboxes,
+/// not the more permissive best-effort header EmailAddress representation.
 pub(super) fn parse_rfc5321_addr_spec(value: &str) -> Option<ParsedMailbox> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let addr_spec = match value.parse::<lettre::Address>() {
-        Ok(address) => address.to_string(),
-        Err(_) => mailparse::addrparse(value)
-            .ok()
-            .and_then(|addresses| addresses.extract_single_info())
-            .map(|mailbox| mailbox.addr.trim().to_string())
-            .unwrap_or_else(|| value.to_string()),
-    };
-    let (local, domain) = validated_addr_spec_parts(&addr_spec)?;
+    let parsed = crate::mail::mailbox::parse(value).ok()?;
+    let unquoted_wildcard = !parsed.quoted_local_part && parsed.local_part == "*";
     Some(ParsedMailbox {
-        addr_spec,
+        addr_spec: parsed.mailbox.email.to_string(),
         key: MailboxKey {
-            local: semantic_local_part(&local)?,
-            domain,
+            local: parsed.local_part,
+            domain: parsed.domain_key,
         },
-        unquoted_wildcard: local == "*",
+        unquoted_wildcard,
     })
-}
-
-fn validated_addr_spec_parts(addr_spec: &str) -> Option<(String, String)> {
-    if let Ok(address) = addr_spec.parse::<lettre::Address>() {
-        return Some((
-            address.user().to_string(),
-            canonical_domain(address.domain())?,
-        ));
-    }
-
-    // lettre accepts IPv6 literals without RFC 5321's required `IPv6:` tag.
-    // Validate the tagged form by substituting lettre's accepted spelling,
-    // but retain the caller's RFC spelling in the serialized envelope.
-    let (local, domain) = addr_spec.rsplit_once('@')?;
-    let literal = domain.strip_prefix('[')?.strip_suffix(']')?;
-    let (tag, address) = literal.split_once(':')?;
-    if !tag.eq_ignore_ascii_case("IPv6") {
-        return None;
-    }
-    let address = address.parse::<std::net::Ipv6Addr>().ok()?;
-    lettre::Address::new(local, format!("[{address}]")).ok()?;
-    Some((local.to_string(), canonical_domain(domain)?))
-}
-
-fn semantic_local_part(local: &str) -> Option<String> {
-    let Some(inner) = local.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-        return Some(local.to_string());
-    };
-    let mut semantic = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            semantic.push(chars.next()?);
-        } else {
-            semantic.push(ch);
-        }
-    }
-    Some(semantic)
-}
-
-fn canonical_domain(domain: &str) -> Option<String> {
-    if domain.ends_with('.') {
-        return None;
-    }
-
-    if let Some(literal) = domain
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-    {
-        if let Ok(address) = literal.parse::<std::net::Ipv4Addr>() {
-            return Some(format!("[{address}]"));
-        }
-        let (tag, address) = literal.split_once(':')?;
-        if tag.eq_ignore_ascii_case("IPv6") {
-            let address = address.parse::<std::net::Ipv6Addr>().ok()?;
-            return Some(format!("[ipv6:{address}]"));
-        }
-        return None;
-    }
-
-    match url::Host::parse(domain).ok()? {
-        url::Host::Domain(domain) if valid_ascii_dns_domain(&domain) => {
-            Some(domain.to_ascii_lowercase())
-        }
-        // A dotted-quad without brackets is a domain spelling, not an SMTP
-        // address literal, so keep its key distinct from `[192.0.2.1]`.
-        url::Host::Ipv4(address) => Some(address.to_string()),
-        _ => None,
-    }
-}
-
-fn valid_ascii_dns_domain(domain: &str) -> bool {
-    !domain.is_empty()
-        && domain.len() <= 253
-        && domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1731,6 +1628,82 @@ mod submission_envelope_tests {
     }
 
     #[test]
+    fn quoted_mailboxes_use_minimal_quoting_in_sender_and_every_recipient_field() {
+        for (addr_spec, expected) in [
+            (r#""a>b"@Example.COM"#, r#""a>b"@Example.COM"#),
+            (r#""a<b"@Example.COM"#, r#""a<b"@Example.COM"#),
+            (r#""a\"b"@Example.COM"#, r#""a\"b"@Example.COM"#),
+            (r#""a\\b"@Example.COM"#, r#""a\\b"@Example.COM"#),
+            (r#""a\>b"@Example.COM"#, r#""a>b"@Example.COM"#),
+            (r#""ali\ce"@Example.COM"#, "alice@Example.COM"),
+            (r#""a@b, c;d"@Example.COM"#, r#""a@b, c;d"@Example.COM"#),
+        ] {
+            for mailbox in [
+                addr_spec.to_string(),
+                format!(r#""Display >, \"Name\"" <{addr_spec}>"#),
+            ] {
+                let sender = envelope_json(&mailbox, &["recipient@example.com".into()], &[], &[]);
+                assert_eq!(sender["mailFrom"]["email"], expected, "{mailbox:?}");
+
+                for field in 0..3 {
+                    let mut recipients = [vec![], vec![], vec![]];
+                    recipients[field].push(mailbox.clone());
+                    let envelope = envelope_json(
+                        "sender@example.com",
+                        &recipients[0],
+                        &recipients[1],
+                        &recipients[2],
+                    );
+                    assert_eq!(envelope["rcptTo"][0]["email"], expected, "{mailbox:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn groups_lists_and_malformed_mailboxes_cannot_form_submission_envelopes() {
+        for invalid in [
+            "Group: alice@example.com;",
+            "Group: <alice@example.com>;",
+            "alice@example.com, Bob <bob@example.com>",
+            r#""Group": Angle <"a>b"@example.com>;"#,
+            r#"alice@example.com, Angle <"a>b"@example.com>"#,
+            r#"Angle <"a>b"@example.com> trailing"#,
+            r#"Angle <"a>b"@example.com>,"#,
+            r#"Angle <"a>b"@example.com>;"#,
+            r#"Angle <"a>b"@example.com"#,
+            r#"Angle <"a>b@example.com>"#,
+            r#"Angle <"a\"@example.com>"#,
+            r#"Angle <<"a>b"@example.com>>"#,
+            r#""Name <alice@example.com>"#,
+            "Name <alice@example.com> (unfinished",
+            "Name\r\nBcc: secret@example.com <alice@example.com>",
+        ] {
+            assert!(
+                JmapSubmissionEnvelope::new(invalid, &["valid@example.com".into()], &[], &[])
+                    .is_err(),
+                "invalid sender accepted: {invalid:?}"
+            );
+            for field in 0..3 {
+                let mut recipients = [vec![], vec![], vec![]];
+                recipients[field].push(invalid.into());
+                let error = JmapSubmissionEnvelope::new(
+                    "sender@example.com",
+                    &recipients[0],
+                    &recipients[1],
+                    &recipients[2],
+                )
+                .err()
+                .unwrap_or_else(|| panic!("invalid recipient accepted: {invalid:?}"));
+                assert_eq!(
+                    error.to_string(),
+                    "Invalid JMAP submission recipient at position 1"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn duplicate_domains_ignore_case_and_keep_first_spelling() {
         let to = vec!["Alice <alice@EXAMPLE.com>".into()];
         let cc = vec!["alice@example.com".into()];
@@ -1747,7 +1720,7 @@ mod submission_envelope_tests {
     }
 
     #[test]
-    fn quoted_and_escaped_equivalents_dedupe_without_rewriting_first() {
+    fn quoted_and_escaped_equivalents_dedupe_with_minimal_quoting() {
         let to = vec![r#""ali\ce"@EXAMPLE.com"#.into()];
         let cc = vec!["alice@example.com".into(), r#""alice"@example.com"#.into()];
         let envelope = envelope_json("sender@example.com", &to, &cc, &[]);
@@ -1755,7 +1728,7 @@ mod submission_envelope_tests {
         assert_eq!(
             envelope["rcptTo"],
             serde_json::json!([{
-                "email": "\"ali\\ce\"@EXAMPLE.com",
+                "email": "alice@EXAMPLE.com",
                 "parameters": null
             }])
         );

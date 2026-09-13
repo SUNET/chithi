@@ -140,6 +140,23 @@ mod tests {
     }
 
     #[test]
+    fn quoted_sender_with_escapes_matches_exact_identity_over_wildcard() {
+        let envelope = sender(r#""Sender > \"Desk\"" <"Ali>ce\"\\Box"@Example.test>"#);
+        let identities = serde_json::json!([
+            { "id": "wildcard", "email": "*@example.test" },
+            { "id": "wrong-case", "email": r#""ali>ce\"\\Box"@example.test"# },
+            { "id": "exact-first", "email": r#""Ali\>ce\"\\Box"@EXAMPLE.test"# },
+            { "id": "exact-second", "email": r#""Ali>ce\"\\Box"@example.test"# }
+        ]);
+
+        assert_eq!(
+            select_identity_id(identities.as_array().unwrap(), envelope.mail_from_mailbox())
+                .unwrap(),
+            "exact-first"
+        );
+    }
+
+    #[test]
     fn same_domain_wildcard_is_accepted_without_exact_match() {
         let envelope = sender("alias@Example.test");
         let identities = serde_json::json!([
@@ -152,6 +169,26 @@ mod tests {
                 .unwrap(),
             "wildcard"
         );
+    }
+
+    #[test]
+    fn minimal_quoting_does_not_turn_a_literal_star_identity_into_a_wildcard() {
+        for email in [r#""*"@example.test"#, r#""\*"@example.test"#] {
+            let identities = serde_json::json!([{ "id": "literal", "email": email }]);
+            assert!(select_identity_id(
+                identities.as_array().unwrap(),
+                sender("alias@example.test").mail_from_mailbox(),
+            )
+            .is_err());
+            assert_eq!(
+                select_identity_id(
+                    identities.as_array().unwrap(),
+                    sender("*@example.test").mail_from_mailbox(),
+                )
+                .unwrap(),
+                "literal"
+            );
+        }
     }
 
     #[test]
@@ -170,15 +207,24 @@ mod tests {
 
     #[test]
     fn local_part_case_must_match_exactly() {
-        let envelope = sender("Alice@example.test");
-        let identities = serde_json::json!([
-            { "id": "wrong-case", "email": "alice@example.test" }
-        ]);
+        for (mail_from, identity_email) in [
+            ("Alice@example.test", "alice@example.test"),
+            (
+                r#"Sender <"Ali>ce\"\\Box"@Example.test>"#,
+                r#""ali>ce\"\\Box"@example.test"#,
+            ),
+        ] {
+            let envelope = sender(mail_from);
+            let identities = serde_json::json!([
+                { "id": "wrong-case", "email": identity_email }
+            ]);
 
-        assert!(
-            select_identity_id(identities.as_array().unwrap(), envelope.mail_from_mailbox())
-                .is_err()
-        );
+            assert!(select_identity_id(
+                identities.as_array().unwrap(),
+                envelope.mail_from_mailbox()
+            )
+            .is_err());
+        }
     }
 
     #[test]

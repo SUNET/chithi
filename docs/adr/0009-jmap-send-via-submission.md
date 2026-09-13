@@ -42,9 +42,69 @@ appropriate sending method:
      and To, Cc, and Bcc fields.
 - **No enabled mail binding**: fail before outbox persistence or transport.
 
-The raw RFC5322 message is built using `lettre`'s message builder (`build_raw_message`) — the same code path as SMTP, just without the transport step. This ensures consistent message formatting regardless of the sending protocol.
+### Outbound mailbox contract (#271)
 
-The original implementation omitted the JMAP `envelope` property and relied on the server to derive recipients from the imported message headers. That lost Bcc delivery whenever Bcc was absent from the raw MIME. Since 2026-08-21, `JmapSubmissionEnvelope` validates display-name mailboxes before upload, preserves the first parsed addr-spec, and deduplicates by semantic quoted local-part plus canonical IDNA domain. Bcc appears only in `rcptTo`; the uploaded MIME remains byte-for-byte unchanged.
+Following direct Datatracker review, the user-approved contract below
+supersedes issue #271's original exact addr-spec spelling expectation.
+Original compose/outbox input and already-built raw MIME remain unchanged;
+normalization applies to newly generated header and envelope output.
+
+- **Shared parser:** `crate::mail::mailbox` owns outbound parsing and
+  validation for SMTP and JMAP. Each sender or recipient item must parse
+  completely as one mailbox. Groups and lists are valid header constructs
+  but unsupported per composer item. [RFC 5322 §3.4][header-addresses]
+  header grammar is distinct from [RFC 5321 §4.1.2][smtp-mailbox] mailbox
+  semantic validity, with UTF-8 extensions from [RFC 6531 §3.3][smtp-utf8]
+  and [RFC 6532 §3.2][header-utf8].
+- **Header input:** support modern comments/folding whitespace (CFWS) and
+  quoted strings ([RFC 5322 §3.2][header-lexical]). Obsolete display-name
+  periods ([RFC 5322 §4.1][obsolete-lexical]) are accepted and normalized
+  through the header encoder. This is not a general inbound
+  obsolete-syntax/recovery parser.
+- **Local-part semantics:** keep decoded local data separate from wire
+  spelling; preserve case and significant whitespace. Newly generated
+  addresses use minimum necessary quoting and escaping under
+  [RFC 5321 §4.1.2][smtp-mailbox] and
+  [RFC 5322 §3.4.1][header-addr-spec]. Equivalent quoted spellings compare
+  equally without changing the mailbox's meaning.
+- **Domains:** use IDNA validation and case-insensitive canonical IDNA
+  comparison, not URL-host interpretation. Support IPv4 and tagged IPv6
+  address literals; reject `[not-an-ip]` and untagged IPv6 literals
+  ([RFC 5321 §4.1.3][smtp-literals]). The direct `idna` dependency was
+  already present transitively; no library versions were updated.
+- **Empty local-part:** published [RFC 5321 §4.1.2][smtp-mailbox] permits
+  an empty quoted local-part (`""@example.com`). Erratum 5414 is held for
+  document update, and draft 5321bis is not normative. The distinct null
+  reverse-path (`<>`) remains unsupported by the composer.
+- **SMTP sizes:** the 64-octet local-part and 256-octet path limits in
+  [RFC 5321 §4.5.3.1][smtp-sizes] are interoperability limits, not universal
+  mailbox syntax rejection rules. This change adds no hard SMTP-size
+  restriction; generated raw MIME has the physical-line check below.
+
+### Shared message serialization
+
+`smtp::build_raw_message()` is shared by SMTP and JMAP. Lettre still owns
+SMTP transport and typed header/MIME encoding, but `build_raw_message` no
+longer uses `MessageBuilder`: it reparses normalized local-parts as
+serialized syntax, rejects valid forms requiring quotes, and may lose
+earlier recipients when joining mailbox lists.
+
+Each complete emitted mailbox header list is serialized once. Bcc is
+validated but never emitted. From, Subject, Message-ID, Date, MIME-Version,
+applicable threading headers, and MIME framing are retained. Message
+building fails closed if any output physical line, including nested MIME
+headers, exceeds 998 octets excluding CRLF
+([RFC 5322 §2.1.1][header-lines], [RFC 6532 §3.4][utf8-lines]); arbitrary
+folding must not alter significant local-part whitespace.
+
+### JMAP envelope and submission
+
+`JmapSubmissionEnvelope` validates the sender and every To, Cc, and Bcc
+item before upload and deduplicates recipients by semantic local-part plus
+canonical IDNA domain. The first occurrence is emitted with minimum
+necessary quoting. The explicit [RFC 8621 §7][submission] envelope avoids
+losing Bcc delivery through server-side header inference: Bcc appears only
+in `rcptTo`, and the uploaded MIME remains byte-for-byte unchanged.
 
 RFC 8621 envelope address objects always include `parameters`. Ordinary
 addresses use `null`. If an emitted envelope addr-spec or transmitted RFC 5322
@@ -83,3 +143,16 @@ The identity ID is fetched dynamically via `Identity/get` rather than assumed to
   trustworthy completion evidence requires an explicit manual retry to avoid
   duplicate delivery.
 - Background body prefetch (`prefetch_bodies`) is skipped for JMAP accounts since bodies are fetched on-demand via the JMAP API.
+
+[header-addresses]: https://datatracker.ietf.org/doc/html/rfc5322#section-3.4
+[smtp-mailbox]: https://datatracker.ietf.org/doc/html/rfc5321#section-4.1.2
+[smtp-utf8]: https://datatracker.ietf.org/doc/html/rfc6531#section-3.3
+[header-utf8]: https://datatracker.ietf.org/doc/html/rfc6532#section-3.2
+[header-lexical]: https://datatracker.ietf.org/doc/html/rfc5322#section-3.2
+[obsolete-lexical]: https://datatracker.ietf.org/doc/html/rfc5322#section-4.1
+[header-addr-spec]: https://datatracker.ietf.org/doc/html/rfc5322#section-3.4.1
+[smtp-literals]: https://datatracker.ietf.org/doc/html/rfc5321#section-4.1.3
+[smtp-sizes]: https://datatracker.ietf.org/doc/html/rfc5321#section-4.5.3.1
+[header-lines]: https://datatracker.ietf.org/doc/html/rfc5322#section-2.1.1
+[utf8-lines]: https://datatracker.ietf.org/doc/html/rfc6532#section-3.4
+[submission]: https://datatracker.ietf.org/doc/html/rfc8621#section-7

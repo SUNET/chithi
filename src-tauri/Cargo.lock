@@ -760,6 +760,7 @@ dependencies = [
  "hickory-resolver",
  "iana-time-zone",
  "icalendar",
+ "idna",
  "imap",
  "imap-proto",
  "jni 0.21.1",
