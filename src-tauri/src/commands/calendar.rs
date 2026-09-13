@@ -1467,6 +1467,34 @@ pub async fn respond_to_invite(
     .await
 }
 
+/// Persist RSVP and conservative recurrence evidence in one transaction.
+fn persist_existing_invite_response(
+    conn: &rusqlite::Connection,
+    existing: &mut CalendarEvent,
+    invite: &ParsedInvite,
+    status: String,
+    attendees_json: Option<String>,
+) -> Result<()> {
+    // An email may be stale: it can revoke standalone certainty, never restore it.
+    // Keep already-protected recurrence evidence until an authoritative refresh.
+    if existing.recurrence_kind == RecurrenceKind::Standalone
+        && invite.recurrence_kind != RecurrenceKind::Standalone
+    {
+        existing.recurrence_kind = invite.recurrence_kind;
+        existing.recurrence_rule = invite.recurrence_rule.clone();
+        existing.ical_data = Some(invite.ical_raw.clone());
+    }
+    existing.my_status = Some(status);
+    existing.attendees_json = attendees_json;
+
+    let transaction = conn.unchecked_transaction()?;
+    db::calendar::update_event(&transaction, existing)?;
+    // Incoming invitations cannot attest to the completeness of a local series.
+    db::calendar_invitation::invalidate(&transaction, &existing.id)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Deliver an iTIP REPLY for `invite` and persist the RSVP locally.
 ///
 /// Shared by `respond_to_invite` (invite parsed from an email) and
@@ -1685,9 +1713,7 @@ async fn apply_invite_response(
     let responded_event_id = if let Some(mut existing) =
         db::calendar::get_event_by_uid_and_start(&conn, &account_id, &invite_uid, &invite.dtstart)?
     {
-        existing.my_status = Some(my_status);
-        existing.attendees_json = attendees_json;
-        db::calendar::update_event(&conn, &existing)?;
+        persist_existing_invite_response(&conn, &mut existing, invite, my_status, attendees_json)?;
         log::info!(
             "apply_invite_response: updated existing event {} status={}",
             existing.id,
