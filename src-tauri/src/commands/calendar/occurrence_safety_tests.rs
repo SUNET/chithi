@@ -250,6 +250,118 @@ fn stored_event(id: &str, kind: RecurrenceKind, rule: Option<&str>) -> CalendarE
     }
 }
 
+fn rsvp_invite(properties: &str) -> crate::calendar::ical::ParsedInvite {
+    let raw = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+         UID:rsvp@example.test\r\nDTSTAMP:20260901T080000Z\r\n\
+         DTSTART:20260914T090000Z\r\nDTEND:20260914T100000Z\r\n\
+         SUMMARY:Incoming title\r\n{properties}END:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+    crate::calendar::ical::parse_ical_data(&raw).remove(0)
+}
+
+#[tokio::test]
+async fn rsvp_existing_standalone_persists_incoming_recurrence_evidence() {
+    for (properties, kind) in [
+        ("RRULE:FREQ=WEEKLY\r\n", RecurrenceKind::Series),
+        ("RDATE:20260921T090000Z\r\n", RecurrenceKind::Series),
+        (
+            "RECURRENCE-ID:20260914T090000Z\r\n",
+            RecurrenceKind::Occurrence,
+        ),
+        ("RRULE:\r\n", RecurrenceKind::Unknown),
+    ] {
+        let fixture = Fixture::new().await;
+        let original = stored_event("rsvp", RecurrenceKind::Standalone, None);
+        fixture.insert(&original).await;
+        let invite = rsvp_invite(properties);
+        assert_eq!(invite.recurrence_kind, kind);
+        let conn = fixture.state.db.writer().await;
+        let mut existing = db::calendar::get_event_by_uid_and_start(
+            &conn,
+            &original.account_id,
+            &invite.uid,
+            &invite.dtstart,
+        )
+        .unwrap()
+        .unwrap();
+        super::persist_existing_invite_response(
+            &conn,
+            &mut existing,
+            &invite,
+            "tentative".into(),
+            Some("[]".into()),
+        )
+        .unwrap();
+        let persisted = db::calendar::get_event(&conn, &original.id).unwrap();
+        assert_eq!(persisted.recurrence_kind, kind);
+        assert_eq!(persisted.recurrence_rule, invite.recurrence_rule);
+        assert_eq!(
+            persisted.ical_data.as_deref(),
+            Some(invite.ical_raw.as_str())
+        );
+        assert!(persisted.ensure_mutable().is_err());
+        assert!(db::calendar_invitation::validated_series_rule(&conn, &persisted).is_err());
+        let mut expected = original;
+        expected.recurrence_kind = kind;
+        expected.recurrence_rule = invite.recurrence_rule;
+        expected.ical_data = Some(invite.ical_raw);
+        expected.my_status = Some("tentative".into());
+        expected.attendees_json = Some("[]".into());
+        assert_eq!(
+            serde_json::to_value(persisted).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn rsvp_existing_protected_event_never_loses_recurrence_evidence() {
+    for kind in [
+        RecurrenceKind::Series,
+        RecurrenceKind::Occurrence,
+        RecurrenceKind::Unknown,
+    ] {
+        for properties in ["", "RRULE:\r\n"] {
+            let fixture = Fixture::new().await;
+            let original = stored_event("rsvp", kind, Some("FREQ=WEEKLY"));
+            fixture.insert(&original).await;
+            let conn = fixture.state.db.writer().await;
+            let mut existing = original.clone();
+            super::persist_existing_invite_response(
+                &conn,
+                &mut existing,
+                &rsvp_invite(properties),
+                "declined".into(),
+                None,
+            )
+            .unwrap();
+            let persisted = db::calendar::get_event(&conn, &original.id).unwrap();
+            assert_eq!(persisted.recurrence_kind, kind);
+            assert_eq!(persisted.recurrence_rule, original.recurrence_rule);
+            assert_eq!(persisted.ical_data, original.ical_data);
+            assert!(persisted.ensure_mutable().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rsvp_existing_local_series_invalidates_invitation_proof() {
+    let fixture = Fixture::new().await;
+    let mut existing = fixture.create_series().await;
+    let conn = fixture.state.db.writer().await;
+    assert!(db::calendar_invitation::validated_series_rule(&conn, &existing).is_ok());
+    super::persist_existing_invite_response(
+        &conn,
+        &mut existing,
+        &rsvp_invite("RRULE:FREQ=WEEKLY\r\n"),
+        "accepted".into(),
+        None,
+    )
+    .unwrap();
+    assert!(db::calendar_invitation::validated_series_rule(&conn, &existing).is_err());
+}
+
 fn blocked_events() -> Vec<(CalendarEvent, CalendarMutationBlockReason)> {
     use CalendarMutationBlockReason::{Recurring, UnknownRecurrence};
     use RecurrenceKind::{Occurrence, Series, Standalone, Unknown};
