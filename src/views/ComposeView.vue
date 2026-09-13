@@ -19,6 +19,7 @@ import {
   getRecipientSearch,
   parseRecipients,
   rankRecipientAddressMatch,
+  recipientDeduplicationKey,
   replaceLastRecipient,
   type RecipientParseError,
 } from "@/lib/compose-recipients";
@@ -32,7 +33,7 @@ type ParsedRecipientFields =
   | { ok: false; field: RecipientField; error: RecipientParseError };
 type RecipientCheckResult =
   | { ok: true; statuses: PgpRecipientStatus[] }
-  | { ok: false; error: string | null };
+  | { ok: false; error: string | null; invalidRecipient?: { field: RecipientField; index: number } };
 
 // Compose runs in its own window; start the shared PGP prompt listener
 // so a sign/decrypt triggered from here is served. The passphrase / PIN
@@ -270,7 +271,7 @@ async function searchAutocomplete(query: string, field: RecipientField, seq: num
       try { emails = JSON.parse(c.emails_json); } catch { continue; }
       for (const e of emails) {
         if (addressQuery && !e.email.toLowerCase().includes(lowerQuery)) continue;
-        const key = e.email;
+        const key = recipientDeduplicationKey(e.email);
         if (!seen.has(key)) {
           seen.add(key);
           items.push({
@@ -285,7 +286,7 @@ async function searchAutocomplete(query: string, field: RecipientField, seq: num
     // Then collected contacts (recently used)
     for (const c of collected) {
       if (addressQuery && !c.email.toLowerCase().includes(lowerQuery)) continue;
-      const key = c.email;
+      const key = recipientDeduplicationKey(c.email);
       if (!seen.has(key)) {
         seen.add(key);
         items.push({
@@ -582,6 +583,23 @@ onMounted(() => {
 // Each call captures a seq; only the most recent writes the result.
 let recipientCheckSeq = 0;
 
+/** Map only typed, in-range backend positions using the request's snapshot. */
+function backendRecipientIssue(
+  value: unknown,
+  recipients: ComposeRecipients,
+): { field: RecipientField; index: number } | null {
+  if (typeof value !== "object" || value === null ||
+      !("kind" in value) || value.kind !== "invalidRecipient" || !("index" in value)) return null;
+  const index = value.index;
+  if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 1) return null;
+  let remaining = index;
+  for (const field of ["to", "cc", "bcc"] as const) {
+    if (remaining <= recipients[field].length) return { field, index: remaining };
+    remaining -= recipients[field].length;
+  }
+  return null;
+}
+
 async function refreshRecipientStatuses(
   recipients?: ComposeRecipients,
 ): Promise<RecipientCheckResult> {
@@ -608,8 +626,10 @@ async function refreshRecipientStatuses(
     return { ok: true, statuses: result };
   } catch (e) {
     if (seq !== recipientCheckSeq) return { ok: false, error: null };
+    const invalidRecipient = backendRecipientIssue(e, parsed.recipients);
+    if (invalidRecipient) return { ok: false, error: "Invalid email address.", invalidRecipient };
     console.error("PGP recipient check failed:", e);
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: e instanceof Error ? e.message : typeof e === "string" ? e : null };
   }
 }
 
@@ -731,15 +751,19 @@ function readRecipientFields(): ParsedRecipientFields {
   return { ok: true, recipients };
 }
 
+function showRecipientError(field: RecipientField, issue: RecipientParseError) {
+  const labels = { to: "To", cc: "Cc", bcc: "Bcc" };
+  error.value = `${labels[field]} recipient ${issue.index}: ${issue.message}`;
+  recipientErrorField.value = field;
+  if (field === "cc") showCc.value = true;
+  if (field === "bcc") showBcc.value = true;
+  void nextTick(() => recipientInputs[field].value?.focus());
+}
+
 function validateRecipientFields(): ComposeRecipients | null {
   const result = readRecipientFields();
   if (!result.ok) {
-    const labels = { to: "To", cc: "Cc", bcc: "Bcc" };
-    error.value = `${labels[result.field]} recipient ${result.error.index}: ${result.error.message}`;
-    recipientErrorField.value = result.field;
-    if (result.field === "cc") showCc.value = true;
-    if (result.field === "bcc") showBcc.value = true;
-    void nextTick(() => recipientInputs[result.field].value?.focus());
+    showRecipientError(result.field, result.error);
     return null;
   }
   recipientErrorField.value = null;
@@ -817,7 +841,14 @@ async function send() {
       const check = await refreshRecipientStatuses(recipients);
       if (!recipientsStillMatch(snapshot)) return;
       if (!check.ok) {
-        error.value = check.error ?? "Could not verify recipient encryption keys. Please try again.";
+        if (check.invalidRecipient) {
+          showRecipientError(check.invalidRecipient.field, {
+            index: check.invalidRecipient.index,
+            message: check.error ?? "Invalid email address.",
+          });
+        } else {
+          error.value = check.error ?? "Could not verify recipient encryption keys. Please try again.";
+        }
         return;
       }
       const missing = check.statuses.filter((status) => !status.hasKey);

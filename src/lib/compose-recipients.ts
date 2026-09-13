@@ -268,6 +268,14 @@ function bareAddress(value: string): Extract<MailboxResult, { ok: true }> | null
   return parsed.ok && parsed.address === value.trim() ? parsed : null;
 }
 
+/** Match domain-case variants without merging case-distinct local parts. */
+export function recipientDeduplicationKey(email: string): string {
+  const mailbox = bareAddress(email);
+  return mailbox
+    ? JSON.stringify(["mailbox", mailbox.localPart, mailbox.domainPart.toLowerCase()])
+    : JSON.stringify(["raw", email]);
+}
+
 /** Domain case is insignificant; local-part spelling must not be changed. */
 export function rankRecipientAddressMatch(email: string, query: string): number {
   if (email === query) return 0;

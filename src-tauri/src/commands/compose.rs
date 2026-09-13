@@ -1438,11 +1438,40 @@ pub struct PgpRecipientStatus {
     pub fingerprint: Option<String>,
 }
 
+/// Validation has machine-readable position data; operational failures retain
+/// the ordinary string error contract used by other compose commands.
+#[derive(Debug, thiserror::Error)]
+pub enum PgpRecipientCheckError {
+    #[error("Invalid recipient address at position {index}")]
+    InvalidRecipient { index: usize },
+    #[error(transparent)]
+    Other(#[from] Error),
+}
+
+impl serde::Serialize for PgpRecipientCheckError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            Self::InvalidRecipient { index } => {
+                let mut payload = serializer.serialize_struct("RecipientValidationError", 2)?;
+                payload.serialize_field("kind", "invalidRecipient")?;
+                payload.serialize_field("index", index)?;
+                payload.end()
+            }
+            Self::Other(error) => serde::Serialize::serialize(error, serializer),
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn pgp_check_recipients(
     state: State<'_, AppState>,
     recipients: Vec<String>,
-) -> Result<Vec<PgpRecipientStatus>> {
+) -> std::result::Result<Vec<PgpRecipientStatus>, PgpRecipientCheckError> {
     check_pgp_recipient_keys(recipients, || {
         state
             .pgp_store()
@@ -1454,7 +1483,7 @@ pub async fn pgp_check_recipients(
 fn check_pgp_recipient_keys(
     recipients: Vec<String>,
     open_keystore: impl FnOnce() -> Result<std::sync::Arc<std::sync::Mutex<libtumpa::KeyStore>>>,
-) -> Result<Vec<PgpRecipientStatus>> {
+) -> std::result::Result<Vec<PgpRecipientStatus>, PgpRecipientCheckError> {
     let mut validated = Vec::with_capacity(recipients.len());
     for (index, email) in recipients.into_iter().enumerate() {
         let trimmed = email.trim();
@@ -1462,12 +1491,8 @@ fn check_pgp_recipient_keys(
             continue;
         }
         // Share MIME construction's validator without rewriting key identifiers.
-        smtp::parse_mailbox(trimmed).map_err(|_| {
-            Error::Other(format!(
-                "Invalid recipient address at position {}",
-                index + 1
-            ))
-        })?;
+        smtp::parse_mailbox(trimmed)
+            .map_err(|_| PgpRecipientCheckError::InvalidRecipient { index: index + 1 })?;
         validated.push(trimmed.to_string());
     }
     if validated.is_empty() {

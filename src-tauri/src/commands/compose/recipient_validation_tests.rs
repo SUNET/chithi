@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use libtumpa::KeyStore;
 
-use super::check_pgp_recipient_keys;
+use super::{check_pgp_recipient_keys, PgpRecipientCheckError};
 use crate::error::Error;
 use crate::mail::smtp;
 
@@ -54,11 +54,17 @@ fn assert_invalid_before_open(recipients: &[&str], position: usize) {
     );
 
     let error = result.expect_err("an invalid batch must fail validation");
-    assert!(matches!(&error, Error::Other(_)));
+    assert!(
+        matches!(&error, PgpRecipientCheckError::InvalidRecipient { index } if *index == position)
+    );
     let message = error.to_string();
     assert_eq!(
         message,
         format!("Invalid recipient address at position {position}")
+    );
+    assert_eq!(
+        serde_json::to_value(&error).unwrap(),
+        serde_json::json!({"kind": "invalidRecipient", "index": position})
     );
     for recipient in recipients {
         let trimmed = recipient.trim();
@@ -209,7 +215,14 @@ fn valid_syntax_reaches_the_loader_and_preserves_its_error() {
         .expect_err("the loader failure must be propagated");
 
         assert_eq!(calls.get(), 1);
-        assert!(matches!(&error, Error::Other(_)));
+        assert!(matches!(
+            &error,
+            PgpRecipientCheckError::Other(Error::Other(_))
+        ));
         assert_eq!(error.to_string(), LOADER_ERROR);
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::Value::String(LOADER_ERROR.to_string())
+        );
     }
 }
