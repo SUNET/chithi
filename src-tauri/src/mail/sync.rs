@@ -338,6 +338,41 @@ fn folder_looks_unchanged(
         && last_uid.saturating_add(1) >= uid_next
 }
 
+/// The value it's safe to advance `last_seen_uid` to after one sync pass,
+/// or `None` if nothing was read and nothing can be inferred.
+///
+/// On a clean pass (`unread_uids` empty), `new_uids` — everything
+/// `fetch_uids` found above the old watermark — exhaustively covers what
+/// the server currently has, so it's safe to advance all the way to
+/// `uid_next - 1`: anything between `new_uids`'s highest entry (or the old
+/// watermark, if `new_uids` was empty) and `uid_next - 1` was expunged
+/// before this pass ever observed it, not missed. UIDs aren't contiguous —
+/// relying on `new_uids`'s own max alone can permanently strand a folder
+/// just below `uid_next - 1` once its highest-ever-assigned UIDs are
+/// expunged, forcing a full reconciliation/flag-fetch pass every cycle
+/// forever even though nothing is actually left to sync.
+///
+/// When some UIDs did fail to read, the mark holds just below the lowest
+/// failure instead, so they get retried next cycle (inserts are keyed by
+/// UID, so re-reading already-synced ones is a no-op).
+fn safe_watermark(new_uids: &[u32], unread_uids: &[u32], uid_next: u32) -> Option<u32> {
+    match unread_uids.iter().copied().min() {
+        Some(lowest_unread) => new_uids
+            .iter()
+            .copied()
+            .filter(|&u| u < lowest_unread)
+            .max(),
+        None => Some(
+            new_uids
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(uid_next.saturating_sub(1)),
+        ),
+    }
+}
+
 fn sync_folder_envelopes(
     db: &Arc<DbPool>,
     account_id: &str,
@@ -512,6 +547,9 @@ fn sync_folder_envelopes(
         db::folders::update_folder_counts(&conn, account_id, folder_path, unread, page.total)?;
         if uid_next > 0 {
             db::folders::update_uid_state(&conn, account_id, folder_path, uid_validity, uid_next)?;
+            if let Some(max_uid) = safe_watermark(&[], &[], uid_next) {
+                db::folders::advance_last_seen_uid(&conn, account_id, folder_path, max_uid)?;
+            }
         }
         return Ok(0);
     }
@@ -613,27 +651,15 @@ fn sync_folder_envelopes(
         tx.commit()?;
     }
 
-    // `last_seen_uid` asserts that every UID at or below it has been synced, so
-    // it may only advance past UIDs actually read off the server. A chunk the
-    // server or parser rejected pins the mark just below its lowest UID; the
-    // messages above it are re-fetched next cycle (inserts are keyed by UID, so
-    // re-reading them is a no-op).
-    let watermark = match unread_uids.iter().min() {
-        Some(&lowest_unread) => {
-            log::warn!(
-                "Folder '{}': {} messages could not be read; holding last_seen_uid below UID {}",
-                folder_path,
-                unread_uids.len(),
-                lowest_unread
-            );
-            new_uids
-                .iter()
-                .copied()
-                .filter(|&u| u < lowest_unread)
-                .max()
-        }
-        None => new_uids.iter().copied().max(),
-    };
+    if !unread_uids.is_empty() {
+        log::warn!(
+            "Folder '{}': {} messages could not be read; holding last_seen_uid below UID {}",
+            folder_path,
+            unread_uids.len(),
+            unread_uids.iter().min().unwrap()
+        );
+    }
+    let watermark = safe_watermark(&new_uids, &unread_uids, uid_next);
     if let Some(max_uid) = watermark.filter(|&u| u > last_uid) {
         let rt = tokio::runtime::Handle::current();
         let conn = rt.block_on(db.writer());
@@ -1154,7 +1180,7 @@ fn parse_imap_date(date_str: &str) -> Option<String> {
 
 #[cfg(test)]
 mod folder_preflight_tests {
-    use super::folder_looks_unchanged;
+    use super::{folder_looks_unchanged, safe_watermark};
 
     #[test]
     fn caught_up_and_unchanged_is_skipped() {
@@ -1185,5 +1211,40 @@ mod folder_preflight_tests {
     #[test]
     fn changed_exists_count_is_not_skipped() {
         assert!(!folder_looks_unchanged(10, 11, 10, 11, 9));
+    }
+
+    #[test]
+    fn clean_pass_advances_past_a_trailing_expunge_gap() {
+        // UIDs aren't contiguous: the server's highest-ever-assigned UIDs
+        // (here, up to uid_next - 1 = 10) can be expunged before a client
+        // ever observes them, so `new_uids`'s own max (7) can be less than
+        // uid_next - 1 even on a fully successful pass. Must still reach
+        // uid_next - 1, or the folder can never be marked caught up.
+        assert_eq!(safe_watermark(&[5, 6, 7], &[], 11), Some(10));
+    }
+
+    #[test]
+    fn clean_pass_with_no_new_uids_still_reaches_uid_next_minus_one() {
+        // Same trailing-gap case, but nothing above the old watermark
+        // exists at all any more (all expunged) — new_uids is empty.
+        assert_eq!(safe_watermark(&[], &[], 11), Some(10));
+    }
+
+    #[test]
+    fn clean_pass_prefers_new_mail_that_arrived_after_uid_next_was_captured() {
+        // uid_next is captured at SELECT time, before fetch_uids runs; if
+        // mail arrives in between, fetch_uids's "*" sees it live, so
+        // new_uids can already exceed the stale uid_next - 1.
+        assert_eq!(safe_watermark(&[5, 6, 20], &[], 11), Some(20));
+    }
+
+    #[test]
+    fn a_failed_uid_holds_the_watermark_below_it_regardless_of_uid_next() {
+        assert_eq!(safe_watermark(&[5, 6, 7], &[6, 8], 11), Some(5));
+    }
+
+    #[test]
+    fn all_uids_below_the_lowest_failure_yields_none() {
+        assert_eq!(safe_watermark(&[5], &[5], 11), None);
     }
 }
