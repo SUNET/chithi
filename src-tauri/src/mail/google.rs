@@ -5,7 +5,7 @@
 //! `ProviderCredentials`; this client just sends requests with a ready token,
 //! mirroring `GraphClient`.
 
-use crate::calendar::CalendarEvent;
+use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::error::{Error, Result};
 
 const PEOPLE_PAGE_SIZE: usize = 1_000;
@@ -99,6 +99,67 @@ pub enum EventsPage {
     /// HTTP 410 — the sync token expired; caller should clear it and
     /// run a full sync on the next cycle.
     SyncTokenExpired,
+}
+
+/// Classify a complete Calendar API event, never an ID or a field-masked payload.
+/// Google omits recurrence for both single events and expanded instances; the
+/// latter carry recurringEventId and originalStartTime instead.
+pub(crate) fn google_recurrence_kind(event: &serde_json::Value) -> RecurrenceKind {
+    use serde_json::Value;
+
+    let Some(event) = event.as_object() else {
+        return RecurrenceKind::Unknown;
+    };
+    if !event
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return RecurrenceKind::Unknown;
+    }
+    let recurring = match event.get("recurringEventId") {
+        None => false,
+        Some(Value::String(id)) if !id.trim().is_empty() => true,
+        Some(_) => return RecurrenceKind::Unknown,
+    };
+    let original_start = match event.get("originalStartTime") {
+        None => false,
+        Some(Value::Object(start)) => {
+            let has_date = match (start.get("date"), start.get("dateTime")) {
+                (Some(Value::String(date)), None) => !date.trim().is_empty(),
+                (None, Some(Value::String(datetime))) => !datetime.trim().is_empty(),
+                _ => false,
+            };
+            let valid_timezone = match start.get("timeZone") {
+                None => true,
+                Some(Value::String(zone)) => !zone.trim().is_empty(),
+                Some(_) => false,
+            };
+            if !has_date || !valid_timezone {
+                return RecurrenceKind::Unknown;
+            }
+            true
+        }
+        Some(_) => return RecurrenceKind::Unknown,
+    };
+    let series = match event.get("recurrence") {
+        None => false,
+        Some(Value::Array(lines))
+            if !lines.is_empty()
+                && lines
+                    .iter()
+                    .all(|line| line.as_str().is_some_and(|line| !line.trim().is_empty())) =>
+        {
+            true
+        }
+        Some(_) => return RecurrenceKind::Unknown,
+    };
+    match (series, recurring || original_start) {
+        (false, false) => RecurrenceKind::Standalone,
+        (true, false) => RecurrenceKind::Series,
+        (false, true) => RecurrenceKind::Occurrence,
+        (true, true) => RecurrenceKind::Unknown,
+    }
 }
 
 impl GoogleClient {
@@ -1602,6 +1663,150 @@ mod wire_tests {
         (root, request)
     }
 
+    #[test]
+    fn recurrence_classification_uses_explicit_google_metadata() {
+        use serde_json::json;
+        use RecurrenceKind::{Occurrence, Series, Standalone, Unknown};
+
+        let cases = [
+            (json!({}), Standalone),
+            (json!({"recurrence": ["RRULE:FREQ=WEEKLY"]}), Series),
+            (json!({"recurrence": ["RDATE;VALUE=DATE:20260914"]}), Series),
+            (json!({"recurringEventId": "master"}), Occurrence),
+            (
+                json!({"originalStartTime": {"date": "2026-09-14"}}),
+                Occurrence,
+            ),
+            (
+                json!({
+                    "recurringEventId": "master",
+                    "originalStartTime": {"dateTime": "2026-09-14T09:00:00Z"}
+                }),
+                Occurrence,
+            ),
+            (
+                json!({
+                    "recurringEventId": "master",
+                    "originalStartTime": {"date": "2026-09-14"}
+                }),
+                Occurrence,
+            ),
+            (json!({"recurringEventId": null}), Unknown),
+            (json!({"recurringEventId": ""}), Unknown),
+            (json!({"recurringEventId": 42}), Unknown),
+            (json!({"originalStartTime": null}), Unknown),
+            (json!({"originalStartTime": "2026-09-14"}), Unknown),
+            (json!({"originalStartTime": {}}), Unknown),
+            (json!({"originalStartTime": {"date": 42}}), Unknown),
+            (json!({"originalStartTime": {"date": ""}}), Unknown),
+            (
+                json!({"originalStartTime": {"date": "2026-09-14", "timeZone": 42}}),
+                Unknown,
+            ),
+            (
+                json!({"originalStartTime": {
+                    "date": "2026-09-14", "dateTime": "2026-09-14T09:00:00Z"
+                }}),
+                Unknown,
+            ),
+            (json!({"recurrence": null}), Unknown),
+            (json!({"recurrence": []}), Unknown),
+            (json!({"recurrence": "RRULE:FREQ=DAILY"}), Unknown),
+            (json!({"recurrence": [42]}), Unknown),
+            (json!({"recurrence": [""]}), Unknown),
+            (
+                json!({
+                    "recurrence": ["RRULE:FREQ=DAILY"],
+                    "recurringEventId": "master"
+                }),
+                Unknown,
+            ),
+            (
+                json!({
+                    "recurringEventId": "master", "originalStartTime": false
+                }),
+                Unknown,
+            ),
+        ];
+        for (metadata, expected) in cases {
+            // Event IDs are opaque, even if they resemble an expanded ID.
+            for id in ["opaque", "looks_like_an_instance_20260914T090000Z"] {
+                let mut event = json!({
+                    "id": id,
+                    "kind": "calendar#event",
+                    "start": {"dateTime": "2026-09-14T11:00:00Z"},
+                    "end": {"dateTime": "2026-09-14T12:00:00Z"}
+                });
+                event
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(metadata.as_object().unwrap().clone());
+                assert_eq!(google_recurrence_kind(&event), expected, "{event}");
+            }
+        }
+        for malformed in [json!(null), json!([]), json!({}), json!({"id": 42})] {
+            assert_eq!(google_recurrence_kind(&malformed), Unknown);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_reads_preserve_unmasked_recurrence_metadata() {
+        for incremental in [false, true] {
+            let (root, captured) = serve_once(
+                r#"{"items":[{
+                "id":"opaque","recurringEventId":"master",
+                "originalStartTime":{"date":"2026-09-14"}
+            }]}"#,
+            )
+            .await;
+            let client = GoogleClient::with_client(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                "test-token",
+                GoogleEndpoints {
+                    calendar_api_root: root,
+                    people_api_root: "http://127.0.0.1:1/unused".into(),
+                },
+            );
+            let page = if incremental {
+                client
+                    .list_events_incremental("primary", "cached-token")
+                    .await
+            } else {
+                client
+                    .list_events_full("primary", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+                    .await
+            }
+            .unwrap();
+            let EventsPage::Page(page) = page else {
+                panic!("unexpected expired token")
+            };
+            assert_eq!(
+                google_recurrence_kind(&page["items"][0]),
+                RecurrenceKind::Occurrence
+            );
+            let request = captured.await.unwrap();
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+            let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert!(request.starts_with("GET "));
+            assert!(!query.contains_key("fields"));
+            if incremental {
+                assert_eq!(query.get("syncToken").unwrap(), "cached-token");
+            } else {
+                assert!(!query.contains_key("syncToken"));
+                assert_eq!(query.get("singleEvents").unwrap(), "true");
+                assert_eq!(query.get("timeMin").unwrap(), "2026-09-01T00:00:00Z");
+                assert_eq!(query.get("timeMax").unwrap(), "2026-10-01T00:00:00Z");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn create_event_uses_injected_root_client_and_google_wire_format() {
         let (calendar_root, captured) =
@@ -2303,8 +2508,19 @@ pub fn send_updates_for(attendees_json: Option<&str>) -> &'static str {
 
 /// Calendar v3 payload for creating an event. Includes the local UID
 /// as iCalUID and the attendee list, so Google sends invites and RSVP
-/// replies match back.
-pub fn event_to_google_json(event: &CalendarEvent) -> serde_json::Value {
+/// replies match back. Recurrence is not represented by this creation payload.
+pub fn event_to_google_json(event: &CalendarEvent) -> Result<serde_json::Value> {
+    if event.recurrence_kind != RecurrenceKind::Standalone
+        || event
+            .recurrence_rule
+            .as_deref()
+            .is_some_and(|rule| !rule.is_empty())
+    {
+        return Err(Error::UnsupportedCapability {
+            protocol: "google",
+            capability: "recurring or unclassified event creation",
+        });
+    }
     let mut google_event = serde_json::json!({
         "summary": event.title,
         "start": time_json(&event.start_time, event.all_day),
@@ -2328,7 +2544,7 @@ pub fn event_to_google_json(event: &CalendarEvent) -> serde_json::Value {
             }
         }
     }
-    google_event
+    Ok(google_event)
 }
 
 /// Calendar v3 payload for patching an event. Deliberately narrower
@@ -2456,6 +2672,7 @@ mod builder_tests {
             all_day,
             timezone: None,
             recurrence_rule: None,
+            recurrence_kind: RecurrenceKind::Standalone,
             organizer_email: Some("me@example.org".into()),
             attendees_json: attendees_json.map(|s| s.to_string()),
             my_status: None,
@@ -2468,7 +2685,7 @@ mod builder_tests {
 
     #[test]
     fn timed_event_uses_datetime() {
-        let v = event_to_google_json(&event(false, None));
+        let v = event_to_google_json(&event(false, None)).unwrap();
         assert_eq!(v["start"]["dateTime"], "2026-07-14T09:00:00Z");
         assert!(v["start"]["date"].is_null());
         assert_eq!(v["iCalUID"], "uid-1@chithi");
@@ -2476,7 +2693,7 @@ mod builder_tests {
 
     #[test]
     fn all_day_event_uses_date_only() {
-        let v = event_to_google_json(&event(true, None));
+        let v = event_to_google_json(&event(true, None)).unwrap();
         assert_eq!(v["start"]["date"], "2026-07-14");
         assert!(v["start"]["dateTime"].is_null());
         assert_eq!(v["end"]["date"], "2026-07-14");
@@ -2487,7 +2704,8 @@ mod builder_tests {
         let v = event_to_google_json(&event(
             false,
             Some(r#"[{"email":"a@x.org","name":"A"},{"name":"no-email"}]"#),
-        ));
+        ))
+        .unwrap();
         let atts = v["attendees"].as_array().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["email"], "a@x.org");
@@ -2495,7 +2713,7 @@ mod builder_tests {
 
     #[test]
     fn empty_attendee_list_is_omitted() {
-        let v = event_to_google_json(&event(false, Some("[]")));
+        let v = event_to_google_json(&event(false, Some("[]"))).unwrap();
         assert!(v["attendees"].is_null());
     }
 

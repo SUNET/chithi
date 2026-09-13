@@ -7,6 +7,7 @@ import { usePlatformStore } from "@/stores/platform";
 import type { CalendarViewMode } from "@/stores/calendar";
 import type { CalendarEvent } from "@/lib/types";
 import { showToast, dismissToast } from "@/lib/toast";
+import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
@@ -25,6 +26,10 @@ const platformStore = usePlatformStore();
 const { isMobile } = storeToRefs(platformStore);
 const showEventForm = ref(false);
 const newEventStart = ref("");
+let selectionVersion = 0;
+watch(() => calendarStore.selectedEvent?.id, () => {
+  selectionVersion++;
+}, { flush: "sync" });
 
 // Mobile defaults to Day view. Flip once when the store is in a wider mode.
 watch(isMobile, (mobile) => {
@@ -272,22 +277,33 @@ async function promptAttendeeNotification(
   eventId: string,
   attendeesJson: string | null,
   organizerEmail: string | null,
+  version: number,
 ) {
   const attendees = tryParseAttendees(attendeesJson);
-  if (attendees.length === 0) return;
-  const ev = calendarStore.events.find((e) => e.id === eventId);
-  if (!ev || !isOrganizer(accountId, organizerEmail)) return;
+  if (attendees.length === 0 || selectionVersion !== version ||
+    !isOrganizer(accountId, organizerEmail)) return;
 
-  // Simple confirm — Tauri dialog requires plugin import, use browser confirm for now
-  const send = confirm("This event has attendees. Send an update notification?");
-  if (send) {
-    try {
-      await api.sendInvites(accountId, eventId, attendees.map((a) => a.email));
-      showToast("Update sent to attendees", "success");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      showToast(`Failed to send updates: ${msg}`, "error", 5000);
+  const refreshTarget = async () => {
+    const fresh = await calendarStore.refreshSingleEvent(eventId);
+    const support = calendarMutationSupport(fresh);
+    if (!support.supported) throw new Error(support.reason);
+  };
+
+  try {
+    if (!calendarStore.getEventMutationSupport(eventId).supported) {
+      await refreshTarget();
+      if (selectionVersion !== version) return;
     }
+    const send = await confirm("This event has attendees. Send an update notification?");
+    if (!send || selectionVersion !== version) return;
+    await refreshTarget();
+    if (selectionVersion !== version) return;
+    await api.notifyCalendarEvent(accountId, eventId, attendees.map((a) => a.email));
+    showToast("Update sent to attendees", "success");
+  } catch (e) {
+    if (selectionVersion !== version) return;
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast(`Failed to send updates. Please try again. ${msg}`, "error", 5000);
   }
 }
 
@@ -298,6 +314,9 @@ async function onEventReschedule(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
+  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const original = calendarStore.getCachedEvent(payload.eventId)!;
+  const version = selectionVersion;
   const toastId = showToast("Moving event...", "info", 0);
   try {
     await calendarStore.updateEvent(payload.eventId, {
@@ -307,10 +326,8 @@ async function onEventReschedule(payload: {
     dismissToast(toastId);
     showToast("Event rescheduled", "success");
 
-    const ev = calendarStore.events.find((e) => e.id === payload.eventId);
-    if (ev) {
-      await promptAttendeeNotification(ev.account_id, payload.eventId, payload.attendeesJson, payload.organizerEmail);
-    }
+    await promptAttendeeNotification(original.account_id, payload.eventId,
+      payload.attendeesJson, payload.organizerEmail, version);
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);
@@ -325,8 +342,8 @@ async function onCalendarDrop(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
-  const ev = calendarStore.events.find((e) => e.id === payload.eventId);
-  if (!ev) return;
+  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const version = selectionVersion;
 
   const toastId = showToast("Moving to calendar...", "info", 0);
   try {
@@ -343,6 +360,7 @@ async function onCalendarDrop(payload: {
       newId,
       payload.attendeesJson,
       payload.organizerEmail,
+      version,
     );
   } catch (e) {
     dismissToast(toastId);
@@ -596,11 +614,6 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Detail + form dialogs reuse the desktop components -->
-    <EventDetail
-      v-if="calendarStore.selectedEvent"
-      @close="calendarStore.selectEvent(null)"
-    />
   </div>
 
   <!-- Desktop -->
@@ -658,13 +671,12 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Event detail panel -->
-    <EventDetail
-      v-if="calendarStore.selectedEvent"
-      @close="calendarStore.selectEvent(null)"
-    />
-
   </div>
+
+  <EventDetail
+    v-if="calendarStore.selectedEvent"
+    @close="calendarStore.selectEvent(null)"
+  />
 
   <!-- Keep one form mounted while responsive layout branches switch. -->
   <EventForm

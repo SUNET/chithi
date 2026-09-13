@@ -9,6 +9,7 @@ vi.mock("@/lib/tauri", () => ({
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
+  moveEventToCalendar: vi.fn().mockResolvedValue("evt-moved"),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   unsubscribeCalendar: vi.fn().mockResolvedValue(undefined),
   getEmailInvites: vi.fn().mockResolvedValue([]),
@@ -43,6 +44,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { isOccurrenceId, masterEventId } from "@/lib/rrule";
+import type { CalendarEvent } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
 function setupAccounts() {
@@ -80,7 +82,7 @@ function makeEvent(
     calendar_id: string; my_status: string | null; uid: string | null;
     attendees_json: string | null; recurrence_rule: string | null;
   }> = {},
-) {
+): CalendarEvent {
   return {
     id, account_id: "acc1", calendar_id: opts.calendar_id ?? "cal1",
     uid: opts.uid ?? `${id}@chithi`,
@@ -88,6 +90,7 @@ function makeEvent(
     start_time: startTime, end_time: endTime,
     all_day: false, timezone: null,
     recurrence_rule: opts.recurrence_rule ?? null,
+    recurrence_kind: opts.recurrence_rule ? "series" : "standalone",
     organizer_email: null, attendees_json: opts.attendees_json ?? null,
     my_status: opts.my_status ?? null, source_message_id: null,
   };
@@ -134,6 +137,7 @@ describe("Calendar store", () => {
       setupAccounts();
       const store = useCalendarStore();
       store.selectedEvent = makeEvent("evt-1", "Test", "2026-04-07T17:00:00Z", "2026-04-07T18:00:00Z");
+      store.events = [store.selectedEvent];
 
       await store.deleteEvent("evt-1");
 
@@ -146,6 +150,7 @@ describe("Calendar store", () => {
       setupAccounts();
       const store = useCalendarStore();
       store.selectedEvent = makeEvent("evt-2", "Other", "2026-04-07T17:00:00Z", "2026-04-07T18:00:00Z");
+      store.events = [makeEvent("evt-1", "Test", "2026-04-07T17:00:00Z", "2026-04-07T18:00:00Z")];
 
       await store.deleteEvent("evt-1");
 
@@ -265,12 +270,7 @@ describe("Calendar store", () => {
   });
 
   describe("recurring occurrences (unclickable-event regression)", () => {
-    // Recurring masters are expanded into synthetic-id occurrences for
-    // display. Clicking one must resolve back to something actionable:
-    // previously onEventClick looked the synthetic id up in the raw
-    // events array, silently no-oped, and recurring events could not be
-    // opened, edited, or deleted (repro: biweekly event, RRULE
-    // FREQ=WEEKLY;INTERVAL=2;BYDAY=TU).
+    // Synthetic display identities remain selectable but cannot be mutated.
     function setupRecurring() {
       setupAccounts();
       const store = useCalendarStore();
@@ -294,6 +294,7 @@ describe("Calendar store", () => {
       expect(occurrences.length).toBeGreaterThan(0);
       for (const occ of occurrences) {
         expect(isOccurrenceId(occ.id)).toBe(true);
+        expect(occ.recurrence_kind).toBe("occurrence");
         expect(masterEventId(occ.id)).toBe("evt-r");
         // The click handler resolves against visibleEvents; the raw
         // events array must never be expected to contain synthetic ids.
@@ -304,18 +305,19 @@ describe("Calendar store", () => {
       }
     });
 
-    it("deleteEvent with the master id clears a selected synthetic occurrence", async () => {
+    it("rejects master and occurrence deletion without clearing selection", async () => {
       const store = setupRecurring();
       const occ = store.visibleEvents[0];
       store.selectedEvent = occ;
 
-      await store.deleteEvent(masterEventId(occ.id));
+      await expect(store.deleteEvent("evt-r")).rejects.toThrow("recurring events");
+      await expect(store.deleteEvent(occ.id)).rejects.toThrow("recurring events");
 
-      expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
-      expect(store.selectedEvent).toBeNull();
+      expect(api.deleteEvent).not.toHaveBeenCalled();
+      expect(store.selectedEvent).toEqual(occ);
     });
 
-    it("moveEventToCalendar accepts a synthetic id (same-account move)", async () => {
+    it("rejects a synthetic id for a same-account move", async () => {
       const store = setupRecurring();
       store.calendars.push({
         id: "cal2", account_id: "acc1", name: "Two", color: "#000",
@@ -323,31 +325,20 @@ describe("Calendar store", () => {
       });
       const occ = store.visibleEvents[0];
 
-      const id = await store.moveEventToCalendar(occ.id, "cal2", "acc1");
+      await expect(store.moveEventToCalendar(occ.id, "cal2", "acc1")).rejects.toThrow("recurring events");
 
-      expect(id).toBe("evt-r");
-      expect(api.updateEvent).toHaveBeenCalledWith("evt-r", { calendar_id: "cal2" });
+      expect(api.updateEvent).not.toHaveBeenCalled();
+      expect(api.moveEventToCalendar).not.toHaveBeenCalled();
     });
 
-    it("moveEventToCalendar accepts a synthetic id (cross-account move keeps series)", async () => {
+    it("rejects a synthetic id for a cross-account move", async () => {
       const store = setupRecurring();
       const occ = store.visibleEvents[0];
 
-      const newId = await store.moveEventToCalendar(occ.id, "cal-x", "acc2");
-
-      // The recreated event must carry the MASTER's times and RRULE —
-      // never the clicked occurrence's times.
-      expect(api.createEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          account_id: "acc2",
-          calendar_id: "cal-x",
-          start_time: "2026-08-25T09:00:00.000Z",
-          end_time: "2026-08-25T10:00:00.000Z",
-          recurrence_rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU",
-        }),
-      );
-      expect(api.deleteEvent).toHaveBeenCalledWith("evt-r");
-      expect(newId).toBe("evt-1");
+      await expect(store.moveEventToCalendar(occ.id, "cal-x", "acc2")).rejects.toThrow("recurring events");
+      expect(api.createEvent).not.toHaveBeenCalled();
+      expect(api.deleteEvent).not.toHaveBeenCalled();
+      expect(api.moveEventToCalendar).not.toHaveBeenCalled();
     });
   });
 

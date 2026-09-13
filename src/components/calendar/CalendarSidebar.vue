@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { ref, onBeforeUnmount, onMounted } from "vue";
+import { ref, computed, onBeforeUnmount, onMounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Calendar } from "@/lib/types";
-import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
-import { masterEventId } from "@/lib/rrule";
+import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 import { showToast } from "@/lib/toast";
 import * as api from "@/lib/tauri";
 
@@ -90,9 +89,12 @@ onBeforeUnmount(() => {
 });
 
 const dropTargetCalendarId = ref<string | null>(null);
+const canDrop = computed(() => isCalendarDragging.value &&
+  canDragCalendarEvent(dragCalendarEvent.value,
+    calendarStore.getCachedEvent(dragCalendarEvent.value?.id ?? "")));
 
 function onCalendarItemEnter(calId: string) {
-  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  if (!canDrop.value || !dragCalendarEvent.value) return;
   if (dragCalendarEvent.value.calendar_id === calId) return;
   dropTargetCalendarId.value = calId;
 }
@@ -104,7 +106,7 @@ function onCalendarItemLeave(calId: string) {
 }
 
 function onCalendarItemDrop(cal: Calendar) {
-  if (!isCalendarDragging.value || !dragCalendarEvent.value) return;
+  if (!canDrop.value || !dragCalendarEvent.value) return;
   const ev = dragCalendarEvent.value;
   if (ev.calendar_id === cal.id) {
     dropTargetCalendarId.value = null;
@@ -112,9 +114,7 @@ function onCalendarItemDrop(cal: Calendar) {
   }
   dropTargetCalendarId.value = null;
   emit("calendarDrop", {
-    // Recurring occurrences carry a synthetic `<masterId>_<start ISO>` id;
-    // downstream lookups and the move itself operate on the master row.
-    eventId: masterEventId(ev.id),
+    eventId: ev.id,
     targetCalendarId: cal.id,
     targetAccountId: cal.account_id,
     attendeesJson: ev.attendees_json,
@@ -299,7 +299,7 @@ async function unsubscribeThisCalendar() {
         v-for="cal in calendarStore.calendars"
         :key="cal.id"
         class="calendar-item"
-        :class="{ syncing: syncing === cal.id, 'drag-over': dropTargetCalendarId === cal.id }"
+        :class="{ syncing: syncing === cal.id, 'drag-over': canDrop && dropTargetCalendarId === cal.id }"
         :data-testid="`calendar-item-${cal.id}`"
         @contextmenu="onContextMenu($event, cal.id, cal.account_id)"
         @mouseenter="onCalendarItemEnter(cal.id)"

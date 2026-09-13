@@ -322,45 +322,73 @@ pub(crate) fn get_unpushed_events(
     account_id: &str,
 ) -> Result<Vec<CalendarEvent>> {
     let mut stmt = conn.prepare(
-        "SELECT id, account_id, calendar_id, uid, title, description, location,
-                start_time, end_time, all_day, timezone, recurrence_rule,
-                organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
-         FROM calendar_events
+        "SELECT id FROM calendar_events
          WHERE account_id = ?1 AND (remote_id IS NULL OR remote_id = '')",
     )?;
-    let events = stmt
-        .query_map(rusqlite::params![account_id], |row| {
-            Ok(CalendarEvent {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                calendar_id: row.get(2)?,
-                uid: row.get(3)?,
-                title: row.get(4)?,
-                description: row.get(5)?,
-                location: row.get(6)?,
-                start_time: row.get(7)?,
-                end_time: row.get(8)?,
-                all_day: row.get(9)?,
-                timezone: row.get(10)?,
-                recurrence_rule: row.get(11)?,
-                organizer_email: row.get(12)?,
-                attendees_json: row.get(13)?,
-                my_status: row.get(14)?,
-                source_message_id: row.get(15)?,
-                ical_data: row.get(16)?,
-                remote_id: row.get(17)?,
-                etag: row.get(18)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(events)
+    let ids = stmt
+        .query_map(rusqlite::params![account_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ids.iter()
+        .map(|id| crate::db::calendar::get_event(conn, id))
+        .collect()
 }
 
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn deferred_create_loader_preserves_recurrence_classification() {
+        use crate::calendar::RecurrenceKind;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com'),
+                    ('other', 'Other', 'other@example.com', 'other@example.com');",
+        )
+        .unwrap();
+
+        for kind in [
+            RecurrenceKind::Unknown,
+            RecurrenceKind::Standalone,
+            RecurrenceKind::Series,
+            RecurrenceKind::Occurrence,
+        ] {
+            let event = CalendarEvent {
+                id: kind.as_str().into(),
+                account_id: "account".into(),
+                recurrence_kind: kind,
+                recurrence_rule: (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into()),
+                remote_id: (kind == RecurrenceKind::Occurrence).then(String::new),
+                ..crate::backend::testutil::event()
+            };
+            crate::db::calendar::insert_event(&conn, &event).unwrap();
+        }
+        for (id, account_id, remote_id) in [
+            ("pushed", "account", Some("remote-id".into())),
+            ("another-account", "other", None),
+        ] {
+            let event = CalendarEvent {
+                id: id.into(),
+                account_id: account_id.into(),
+                remote_id,
+                ..crate::backend::testutil::event()
+            };
+            crate::db::calendar::insert_event(&conn, &event).unwrap();
+        }
+
+        let events = get_unpushed_events(&conn, "account").unwrap();
+        assert_eq!(events.len(), 4);
+        for event in events {
+            assert_eq!(event.id, event.recurrence_kind.as_str());
+            assert_eq!(
+                event.recurrence_rule.as_deref(),
+                (event.recurrence_kind == RecurrenceKind::Series).then_some("FREQ=WEEKLY")
+            );
+        }
+    }
 
     fn account(calendar_protocol: &str, caldav_url: &str) -> AccountFull {
         let mut account = crate::backend::testutil::account("calendar", calendar_protocol);

@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::calendar::{Attendee, CalendarEvent};
+use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -422,8 +422,9 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     pending_rsvp_status = ?14,
                     source_message_id = COALESCE(?15, source_message_id),
                     ical_data = COALESCE(?16, ical_data), remote_id = ?17, etag = ?18,
+                    recurrence_kind = ?19,
                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?19",
+                 WHERE id = ?20",
                 params![
                     event.calendar_id,
                     event.uid,
@@ -443,6 +444,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
                     event.ical_data,
                     event.remote_id,
                     event.etag,
+                    event.recurrence_kind.as_str(),
                     existing.id,
                 ],
             )?;
@@ -478,7 +480,7 @@ pub fn list_events(
             "SELECT id, account_id, calendar_id, uid, title, description, location,
                     start_time, end_time, all_day, timezone, recurrence_rule,
                     organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag
+                    ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
                AND ((start_time < ?4 AND end_time > ?3)
@@ -491,7 +493,7 @@ pub fn list_events(
             "SELECT id, account_id, calendar_id, uid, title, description, location,
                     start_time, end_time, all_day, timezone, recurrence_rule,
                     organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag
+                    ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1
                AND ((start_time < ?3 AND end_time > ?2)
@@ -536,7 +538,7 @@ pub fn list_invites(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag, manually_managed_at, created_at
+                ical_data, remote_id, etag, recurrence_kind, manually_managed_at, created_at
          FROM calendar_events
          WHERE account_id = ?1
            AND organizer_email IS NOT NULL
@@ -550,8 +552,8 @@ pub fn list_invites(
         .query_map(params![account_id, account_email, since], |row| {
             Ok(Invite {
                 event: map_event_row(row)?,
-                manually_managed_at: row.get(19)?,
-                created_at: row.get(20)?,
+                manually_managed_at: row.get(20)?,
+                created_at: row.get(21)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -630,7 +632,7 @@ pub fn get_event(conn: &Connection, id: &str) -> Result<CalendarEvent> {
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
+                ical_data, remote_id, etag, recurrence_kind
          FROM calendar_events WHERE id = ?1",
         params![id],
         map_event_row,
@@ -649,8 +651,9 @@ pub fn insert_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
          (id, account_id, calendar_id, uid, title, description, location,
           start_time, end_time, all_day, timezone, recurrence_rule,
           organizer_email, attendees_json, my_status, source_message_id,
-          ical_data, remote_id, etag)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          ical_data, remote_id, etag, recurrence_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19, ?20)",
         params![
             event.id,
             event.account_id,
@@ -671,6 +674,7 @@ pub fn insert_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             event.ical_data,
             event.remote_id,
             event.etag,
+            event.recurrence_kind.as_str(),
         ],
     )?;
     Ok(())
@@ -684,8 +688,9 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
             attendees_json = ?12, my_status = ?13, source_message_id = ?14,
             ical_data = ?15, remote_id = ?16, etag = ?17,
+            recurrence_kind = ?18,
             updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?18",
+         WHERE id = ?19",
         params![
             event.calendar_id,
             event.uid,
@@ -704,6 +709,7 @@ pub fn update_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
             event.ical_data,
             event.remote_id,
             event.etag,
+            event.recurrence_kind.as_str(),
             event.id,
         ],
     )?;
@@ -725,7 +731,7 @@ pub fn get_event_by_uid(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
+                ical_data, remote_id, etag, recurrence_kind
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2
          ORDER BY
@@ -755,7 +761,7 @@ pub fn get_event_by_uid_and_start(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag
+                ical_data, remote_id, etag, recurrence_kind
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
          ORDER BY
@@ -792,6 +798,7 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
         all_day: row.get(9)?,
         timezone: row.get(10)?,
         recurrence_rule: row.get(11)?,
+        recurrence_kind: RecurrenceKind::from_stored(&row.get::<_, String>(19)?),
         organizer_email: row.get(12)?,
         attendees_json: row.get(13)?,
         my_status: row.get(14)?,
@@ -852,6 +859,7 @@ mod tests {
                 all_day INTEGER DEFAULT 0,
                 timezone TEXT,
                 recurrence_rule TEXT,
+                recurrence_kind TEXT NOT NULL DEFAULT 'unknown',
                 organizer_email TEXT,
                 attendees_json TEXT,
                 my_status TEXT,
@@ -902,6 +910,7 @@ mod tests {
             all_day: false,
             timezone: None,
             recurrence_rule: None,
+            recurrence_kind: RecurrenceKind::Standalone,
             organizer_email: None,
             attendees_json: None,
             my_status: None,
@@ -909,6 +918,181 @@ mod tests {
             ical_data: None,
             remote_id: remote_id.map(|s| s.to_string()),
             etag: None,
+        }
+    }
+
+    #[test]
+    fn test_recurrence_kinds_roundtrip_through_all_event_queries() {
+        for kind in [
+            RecurrenceKind::Unknown,
+            RecurrenceKind::Standalone,
+            RecurrenceKind::Series,
+            RecurrenceKind::Occurrence,
+        ] {
+            let conn = setup_db();
+            let mut event = make_event("event", "Invite", Some("remote-event"));
+            event.recurrence_kind = kind;
+            event.recurrence_rule = (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into());
+            event.description = Some("Description".into());
+            event.location = Some("Location".into());
+            event.timezone = Some("Europe/Stockholm".into());
+            event.organizer_email = Some("organizer@example.com".into());
+            event.attendees_json = Some(attendees_json(&["test@example.com"]));
+            event.my_status = Some("accepted".into());
+            event.source_message_id = Some("message".into());
+            event.ical_data = Some("BEGIN:VCALENDAR".into());
+            event.etag = Some("etag".into());
+            insert_event(&conn, &event).unwrap();
+            conn.execute(
+                "UPDATE calendar_events
+                 SET manually_managed_at = '2026-04-01T10:00:00Z',
+                     created_at = '2026-04-01T09:00:00Z'
+                 WHERE id = 'event'",
+                [],
+            )
+            .unwrap();
+
+            let stored: String = conn
+                .query_row(
+                    "SELECT recurrence_kind FROM calendar_events WHERE id = 'event'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, kind.as_str());
+            let expected = serde_json::to_value(&event).unwrap();
+            let mut fetched = vec![
+                get_event(&conn, "event").unwrap(),
+                get_event_by_uid(&conn, "acc1", "event@test")
+                    .unwrap()
+                    .unwrap(),
+                get_event_by_uid_and_start(&conn, "acc1", "event@test", &event.start_time)
+                    .unwrap()
+                    .unwrap(),
+            ];
+            for calendar_id in [None, Some("cal1")] {
+                let listed = list_events(
+                    &conn,
+                    "acc1",
+                    calendar_id,
+                    "2026-04-01T00:00:00Z",
+                    "2026-05-01T00:00:00Z",
+                )
+                .unwrap();
+                assert_eq!(listed.len(), 1);
+                fetched.extend(listed);
+            }
+            let mut invites =
+                list_invites(&conn, "acc1", "test@example.com", "2026-04-01T00:00:00Z").unwrap();
+            assert_eq!(invites.len(), 1);
+            let invite = invites.pop().unwrap();
+            assert_eq!(
+                invite.manually_managed_at.as_deref(),
+                Some("2026-04-01T10:00:00Z")
+            );
+            assert_eq!(invite.created_at.as_deref(), Some("2026-04-01T09:00:00Z"));
+            fetched.push(invite.event);
+            for actual in fetched {
+                assert_eq!(serde_json::to_value(actual).unwrap(), expected, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unrecognized_stored_recurrence_kind_fails_closed() {
+        let conn = setup_db();
+        insert_event(&conn, &make_event("event", "Cached Event", None)).unwrap();
+        for stored in ["future-kind", "Standalone", "", " standalone "] {
+            conn.execute(
+                "UPDATE calendar_events SET recurrence_kind = ?1 WHERE id = 'event'",
+                params![stored],
+            )
+            .unwrap();
+            let fetched = get_event(&conn, "event").unwrap();
+            assert_eq!(fetched.recurrence_kind, RecurrenceKind::Unknown);
+            assert!(matches!(
+                fetched.ensure_mutable(),
+                Err(crate::error::Error::CalendarMutationBlocked(
+                    crate::error::CalendarMutationBlockReason::UnknownRecurrence
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_update_event_persists_recurrence_classification() {
+        let conn = setup_db();
+        let mut event = make_event("event", "Event", None);
+        insert_event(&conn, &event).unwrap();
+
+        for kind in [
+            RecurrenceKind::Occurrence,
+            RecurrenceKind::Series,
+            RecurrenceKind::Unknown,
+            RecurrenceKind::Standalone,
+        ] {
+            event.recurrence_kind = kind;
+            event.recurrence_rule = (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into());
+            update_event(&conn, &event).unwrap();
+            let fetched = get_event(&conn, "event").unwrap();
+            assert_eq!(
+                serde_json::to_value(fetched).unwrap(),
+                serde_json::to_value(&event).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_refresh_upsert_updates_recurrence_on_the_same_local_id() {
+        let conn = setup_db();
+        let mut event = make_event("local", "Cached Event", Some("remote-event"));
+        event.recurrence_kind = RecurrenceKind::Unknown;
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+
+        let mut refreshed = event.clone();
+        refreshed.id = "incoming".into();
+        refreshed.title = "Refreshed Event".into();
+        for kind in [
+            RecurrenceKind::Standalone,
+            RecurrenceKind::Occurrence,
+            RecurrenceKind::Series,
+            RecurrenceKind::Unknown,
+        ] {
+            refreshed.recurrence_kind = kind;
+            refreshed.recurrence_rule =
+                (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into());
+            upsert_event_by_remote_id(&conn, &refreshed).unwrap();
+
+            let mut expected = refreshed.clone();
+            expected.id = "local".into();
+            assert_eq!(
+                serde_json::to_value(get_event(&conn, "local").unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM calendar_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn test_sync_deletion_allows_all_recurrence_kinds() {
+        let mut conn = setup_db();
+        for kind in [
+            RecurrenceKind::Unknown,
+            RecurrenceKind::Standalone,
+            RecurrenceKind::Series,
+            RecurrenceKind::Occurrence,
+        ] {
+            let mut event = make_event(kind.as_str(), "Event", None);
+            event.recurrence_kind = kind;
+            insert_event(&conn, &event).unwrap();
+
+            let transaction = conn.transaction().unwrap();
+            crate::db::calendar_event_deletion::delete_event(&transaction, &event.id).unwrap();
+            transaction.commit().unwrap();
+            assert!(get_event(&conn, &event.id).is_err());
         }
     }
 
@@ -1174,6 +1358,7 @@ mod tests {
         ] {
             let mut occurrence = make_event(id, "Weekly Invite", Some(id));
             occurrence.uid = Some(uid.to_string());
+            occurrence.recurrence_kind = RecurrenceKind::Occurrence;
             occurrence.start_time = start.to_string();
             occurrence.end_time = end.to_string();
             occurrence.organizer_email = Some("boss@example.com".to_string());
@@ -1205,6 +1390,7 @@ mod tests {
         recurring.start_time = "2026-01-01T10:00:00Z".to_string();
         recurring.end_time = "2026-01-01T10:30:00Z".to_string();
         recurring.recurrence_rule = Some("FREQ=WEEKLY".to_string());
+        recurring.recurrence_kind = RecurrenceKind::Series;
         recurring.organizer_email = Some("boss@example.com".to_string());
         recurring.attendees_json = Some(attendees_json(&["test@example.com"]));
         insert_event(&conn, &recurring).unwrap();
@@ -1351,6 +1537,7 @@ mod tests {
     fn test_upsert_reconciles_a_single_unpushed_uid_row() {
         let conn = setup_db();
         let mut local = make_event("local", "Invite", None);
+        local.recurrence_kind = RecurrenceKind::Unknown;
         local.uid = Some("shared-uid@example.com".to_string());
         local.my_status = Some("accepted".to_string());
         local.source_message_id = Some("message-1".to_string());
@@ -1360,6 +1547,7 @@ mod tests {
         mark_invite_managed(&conn, "acc1", "local").unwrap();
 
         let mut synced = make_event("remote", "Invite", Some("remote-1"));
+        synced.recurrence_kind = RecurrenceKind::Occurrence;
         synced.uid = local.uid.clone();
         synced.my_status = Some("needs-action".to_string());
         synced.attendees_json = Some(attendees_json(&["test@example.com"]));
@@ -1375,6 +1563,7 @@ mod tests {
         assert_eq!(count, 1);
 
         let reconciled = get_event(&conn, "local").unwrap();
+        assert_eq!(reconciled.recurrence_kind, RecurrenceKind::Occurrence);
         assert_eq!(reconciled.remote_id.as_deref(), Some("remote-1"));
         assert_eq!(reconciled.my_status.as_deref(), Some("accepted"));
         assert_eq!(reconciled.source_message_id.as_deref(), Some("message-1"));
@@ -1393,10 +1582,12 @@ mod tests {
     fn test_upsert_does_not_reconcile_a_different_occurrence() {
         let conn = setup_db();
         let mut local = make_event("local", "Weekly Invite", None);
+        local.recurrence_kind = RecurrenceKind::Occurrence;
         local.uid = Some("shared-series@example.com".to_string());
         insert_event(&conn, &local).unwrap();
 
         let mut remote = make_event("remote", "Weekly Invite", Some("remote-1"));
+        remote.recurrence_kind = RecurrenceKind::Occurrence;
         remote.uid = local.uid.clone();
         remote.start_time = "2026-04-14T17:00:00Z".to_string();
         remote.end_time = "2026-04-14T18:00:00Z".to_string();

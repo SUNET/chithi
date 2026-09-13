@@ -1,7 +1,7 @@
 # ADR 0034: Microsoft 365 Graph Calendar Sync
 
 ## Status
-Accepted
+Accepted; amended for calendar mutation safety (#288) on 2026-09-13.
 
 ## Context
 O365 accounts use IMAP/SMTP for mail (with XOAUTH2), but calendar sync requires the Microsoft Graph API. The Graph Calendar API is REST-based at `https://graph.microsoft.com/v1.0` and uses OAuth2 Bearer tokens with `Calendars.ReadWrite` scope.
@@ -13,10 +13,37 @@ Implement full calendar CRUD via Microsoft Graph API for O365 accounts, followin
 
 - Sync lists every Graph calendar, preserves each local subscription setting, and fetches each subscribed calendar through `list_events_for_calendar()` at `GET /me/calendars/{id}/calendarView` with UTC preference and pagination.
 - Events retain their remote-to-local calendar mapping and are reconciled per calendar. Multi-calendar sync is therefore supported; new events are still created on the account's default calendar.
-- The account-wide `list_events()` client API has been removed. Recurrence metadata is not requested or persisted, and synced events continue to use `recurrence_rule = None`.
+- The account-wide `list_events()` client API has been removed. Synced events
+  continue to use `recurrence_rule = None`; recurrence classification is now
+  persisted as described in the 2026-09-13 amendment below.
 - Calendar sync still re-fetches the bounded six-month window rather than using calendar delta queries.
 
 This amendment supersedes the earlier method table, flow, and limitations where they conflict, while preserving their historical context.
+
+### Calendar mutation safety amendment (2026-09-13, #288)
+
+The `calendarView` projection now explicitly selects `type`,
+`seriesMasterId` and `recurrence`. The adapter checks their consistency and
+persists `recurrence_kind` on both inserts and refreshes of existing rows:
+
+- `singleInstance` with null series/recurrence metadata is `standalone`.
+- `seriesMaster` with recurrence metadata and no parent is `series`.
+- `occurrence` and `exception` with a series master and no recurrence rule
+  object are `occurrence`.
+- Missing, malformed, unrecognized or conflicting selected metadata is
+  `unknown`, never inferred to be standalone from an empty local RRULE.
+
+The existing bounded `calendarView` reread can reclassify legacy rows that
+it returns; it does not guarantee recovery of every unknown row.
+[ADR 0052](0052-calendar-occurrence-mutation-safety.md) governs the shared
+desktop/mobile controls and backend guards: ordinary Edit/Delete/Move is
+available only for confirmed standalone events. Series, provider instances
+and exceptions remain viewable but read-only for those actions. Dragging
+an occurrence to another calendar no longer operates on its series master.
+
+This amendment adds recurrence evidence and mutation guards, without an
+occurrence/series editor, exception-sync engine or new provider CRUD
+delivery guarantees. RSVP remains a separate workflow.
 
 ### Token management
 O365 uses a single refresh token for two resource servers (IMAP and Graph). The stored access token is IMAP-scoped, so `get_graph_token()` always refreshes with Graph-specific scopes (`User.Read Calendars.ReadWrite Contacts.ReadWrite offline_access`) rather than checking expiry on the cached token. The refresh may rotate the refresh token — only the refreshed token is saved back, preserving the stored IMAP access token.
@@ -53,12 +80,15 @@ O365 branch (`provider == "o365"`) added to:
 
 ### Known limitations
 - **RSVP not wired** — `rsvp_event()` method exists but the calendar RSVP command doesn't have an O365 branch yet
-- **Recurring events** — individual instances show via `calendarView` but series editing is not supported
+- **Recurring events** — individual instances show via `calendarView`;
+  ordinary edits, deletes and moves of series/occurrences are blocked under
+  ADR 0052
 - **No delta sync** — re-fetches full 6-month window each time. Graph's `/me/calendarView/delta` could optimize this
 - **Multiple calendars** — events assigned to default calendar only. Non-default calendar events won't be correctly categorized
 
 ## Consequences
-- O365 users can view, create, edit, and delete calendar events synced with Outlook
+- O365 users can view and create calendar events; ordinary edits, deletes
+  and moves require confirmed standalone classification under ADR 0052
 - Calendar shows events at correct local times (UTC stored, converted for display)
 - Token infrastructure handles the two-resource-server complexity transparently
 - Future: RSVP wiring, delta sync, and multi-calendar support can be added incrementally

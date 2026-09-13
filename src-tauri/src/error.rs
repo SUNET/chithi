@@ -1,5 +1,14 @@
 use serde::Serialize;
 
+/// Stable user-facing reasons an ordinary calendar mutation is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CalendarMutationBlockReason {
+    #[error("Editing, deleting, or moving recurring events is not supported in Chithi.")]
+    Recurring,
+    #[error("Recurrence information is unavailable. Refresh this event before editing.")]
+    UnknownRecurrence,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Database error: {0}")]
@@ -50,6 +59,9 @@ pub enum Error {
     #[error("Delivery outcome is unknown")]
     IndeterminateDelivery,
 
+    #[error(transparent)]
+    CalendarMutationBlocked(#[from] CalendarMutationBlockReason),
+
     #[error("{0}")]
     Other(String),
 }
@@ -73,7 +85,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::{CalendarMutationBlockReason, Error};
+
+    #[test]
+    fn calendar_mutation_block_errors_have_stable_wire_messages() {
+        for (reason, message) in [
+            (
+                CalendarMutationBlockReason::Recurring,
+                "Editing, deleting, or moving recurring events is not supported in Chithi.",
+            ),
+            (
+                CalendarMutationBlockReason::UnknownRecurrence,
+                "Recurrence information is unavailable. Refresh this event before editing.",
+            ),
+        ] {
+            let error = Error::from(reason);
+            assert!(matches!(
+                &error,
+                Error::CalendarMutationBlocked(actual) if *actual == reason
+            ));
+            assert_eq!(error.to_string(), message);
+            assert_eq!(serde_json::to_value(&error).unwrap(), message);
+        }
+    }
 
     #[test]
     fn indeterminate_delivery_has_safe_typed_classification() {

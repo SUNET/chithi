@@ -3,6 +3,7 @@
 //! All operations go through `https://graph.microsoft.com/v1.0` with
 //! Bearer token authentication. O365 mail delivery remains on SMTP+XOAUTH2.
 
+use crate::calendar::RecurrenceKind;
 use crate::error::{Error, Result};
 use crate::mail::search::build_graph_kql;
 use crate::message::{normalize_message_id, SearchHit, SearchQuery};
@@ -295,7 +296,15 @@ mod endpoint_tests {
 
     #[tokio::test]
     async fn calendar_request_uses_injected_root_client_and_graph_wire_format() {
-        let (root, captured) = serve_once(r#"{"value":[]}"#).await;
+        let (root, captured) = serve_once(
+            r#"{"value":[{
+            "id":"opaque","type":"occurrence","seriesMasterId":"master",
+            "recurrence":null,
+            "start":{"dateTime":"2026-08-09T09:00:00","timeZone":"UTC"},
+            "end":{"dateTime":"2026-08-09T10:00:00","timeZone":"UTC"}
+        }]}"#,
+        )
+        .await;
         let mut headers = HeaderMap::new();
         headers.insert("x-injected-client", HeaderValue::from_static("graph-test"));
         let http = reqwest::Client::builder()
@@ -316,7 +325,11 @@ mod endpoint_tests {
             )
             .await
             .unwrap();
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].recurrence_kind,
+            crate::calendar::RecurrenceKind::Occurrence
+        );
 
         let request = captured.await.unwrap();
         let mut lines = request.lines();
@@ -334,7 +347,10 @@ mod endpoint_tests {
         assert_eq!(query.get("endDateTime").unwrap(), "2026-08-10T00:00:00Z");
         assert_eq!(query.get("$top").unwrap(), "100");
         assert_eq!(query.get("$orderby").unwrap(), "start/dateTime");
-        assert!(query.get("$select").unwrap().contains("responseStatus"));
+        let selected: Vec<_> = query.get("$select").unwrap().split(',').collect();
+        for field in ["responseStatus", "type", "seriesMasterId", "recurrence"] {
+            assert!(selected.contains(&field), "missing {field} from $select");
+        }
 
         let headers = request.to_ascii_lowercase();
         assert!(headers.contains("authorization: bearer test-access-token\r\n"));
@@ -2010,7 +2026,7 @@ impl GraphClient {
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus"),
+                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,recurrence"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -2483,6 +2499,7 @@ pub struct GraphCalendarEvent {
     /// organized, or invites not yet responded to).
     pub my_status: Option<String>,
     pub ical_uid: Option<String>,
+    pub recurrence_kind: RecurrenceKind,
 }
 
 fn parse_graph_rooms(value: &serde_json::Value) -> Vec<GraphRoom> {
@@ -2806,6 +2823,39 @@ fn graph_response_to_my_status(response: &str) -> Option<String> {
     }
 }
 
+/// The calendarView projection must include all three classification fields.
+/// Null metadata is normal for single instances; omitted or malformed selected
+/// fields cannot establish that an event is safe to edit.
+fn graph_recurrence_kind(event: &serde_json::Value) -> RecurrenceKind {
+    use serde_json::Value;
+
+    let master = match event.get("seriesMasterId") {
+        Some(Value::Null) => false,
+        Some(Value::String(id)) if !id.trim().is_empty() => true,
+        _ => return RecurrenceKind::Unknown,
+    };
+    let recurrence = match event.get("recurrence") {
+        Some(Value::Null) => false,
+        Some(Value::Object(recurrence))
+            if recurrence.get("pattern").is_some_and(Value::is_object)
+                && recurrence.get("range").is_some_and(Value::is_object) =>
+        {
+            true
+        }
+        _ => return RecurrenceKind::Unknown,
+    };
+    match (
+        event.get("type").and_then(Value::as_str),
+        master,
+        recurrence,
+    ) {
+        (Some("singleInstance"), false, false) => RecurrenceKind::Standalone,
+        (Some("seriesMaster"), false, true) => RecurrenceKind::Series,
+        (Some("occurrence" | "exception"), true, false) => RecurrenceKind::Occurrence,
+        _ => RecurrenceKind::Unknown,
+    }
+}
+
 fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
     let start_obj = &e["start"];
     let end_obj = &e["end"];
@@ -2887,6 +2937,7 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
             e["responseStatus"]["response"].as_str().unwrap_or("none"),
         ),
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
+        recurrence_kind: graph_recurrence_kind(e),
     }
 }
 
@@ -3102,8 +3153,20 @@ fn graph_time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
 
 /// Graph payload for creating an event. Includes the attendee list plus
 /// the organizer as an attendee with `response: organizer` — Exchange
-/// needs it to render the organizer row correctly.
-pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> serde_json::Value {
+/// needs it to render the organizer row correctly. Recurrence is not represented
+/// by this creation payload.
+pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> Result<serde_json::Value> {
+    if event.recurrence_kind != RecurrenceKind::Standalone
+        || event
+            .recurrence_rule
+            .as_deref()
+            .is_some_and(|rule| !rule.is_empty())
+    {
+        return Err(Error::UnsupportedCapability {
+            protocol: "graph",
+            capability: "recurring or unclassified event creation",
+        });
+    }
     let mut graph_event = serde_json::json!({
         "subject": event.title,
         "start": graph_time_json(&event.start_time, event.all_day),
@@ -3142,7 +3205,7 @@ pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> serde_json
             }
         }
     }
-    graph_event
+    Ok(graph_event)
 }
 
 /// Graph payload for patching an event. Narrower than the create
@@ -3413,6 +3476,123 @@ mod batch_tests {
 }
 
 #[cfg(test)]
+mod recurrence_tests {
+    use super::parse_graph_event;
+    use crate::calendar::RecurrenceKind;
+    use serde_json::json;
+
+    #[test]
+    fn provider_types_and_consistent_metadata_determine_recurrence() {
+        use RecurrenceKind::{Occurrence, Series, Standalone, Unknown};
+
+        let recurrence = json!({
+            "pattern": {"type": "daily", "interval": 1},
+            "range": {"type": "noEnd", "startDate": "2026-09-14"}
+        });
+        let cases = [
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": null}),
+                Standalone,
+            ),
+            (
+                json!({"type": "seriesMaster", "seriesMasterId": null, "recurrence": recurrence}),
+                Series,
+            ),
+            (
+                json!({"type": "occurrence", "seriesMasterId": "master", "recurrence": null}),
+                Occurrence,
+            ),
+            (
+                json!({"type": "exception", "seriesMasterId": "master", "recurrence": null}),
+                Occurrence,
+            ),
+            (json!({"seriesMasterId": null, "recurrence": null}), Unknown),
+            (
+                json!({"type": "futureType", "seriesMasterId": null, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": null, "seriesMasterId": null, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": 42, "seriesMasterId": null, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": "master", "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": recurrence}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": 42, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": "", "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": []}),
+                Unknown,
+            ),
+            (
+                json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": {}}),
+                Unknown,
+            ),
+            (
+                json!({"type": "seriesMaster", "seriesMasterId": "master", "recurrence": recurrence}),
+                Unknown,
+            ),
+            (
+                json!({"type": "seriesMaster", "seriesMasterId": null, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "seriesMaster", "seriesMasterId": null, "recurrence": {"pattern": 42, "range": {}}}),
+                Unknown,
+            ),
+            (
+                json!({"type": "occurrence", "seriesMasterId": null, "recurrence": null}),
+                Unknown,
+            ),
+            (
+                json!({"type": "exception", "seriesMasterId": "master", "recurrence": recurrence}),
+                Unknown,
+            ),
+        ];
+        for (metadata, expected) in cases {
+            let mut event = json!({
+                "id": "opaque-id",
+                "subject": "Provider fixture",
+                "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
+            });
+            event
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            assert_eq!(
+                parse_graph_event(&event).recurrence_kind,
+                expected,
+                "{event}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod color_tests {
     use super::{
         dedupe_graph_rooms, graph_color_to_hex, graph_response_to_my_status,
@@ -3491,6 +3671,9 @@ mod color_tests {
     fn parse_graph_event_translates_attendee_status() {
         let raw = serde_json::json!({
             "id": "evt1",
+            "type": "singleInstance",
+            "seriesMasterId": null,
+            "recurrence": null,
             "subject": "Linux docs",
             "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
             "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
@@ -3536,6 +3719,9 @@ mod color_tests {
     fn parse_graph_event_extracts_my_status() {
         let raw = serde_json::json!({
             "id": "evt2",
+            "type": "singleInstance",
+            "seriesMasterId": null,
+            "recurrence": null,
             "subject": "Linux docs",
             "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
             "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
@@ -3550,6 +3736,9 @@ mod color_tests {
         // An event the user organized has no RSVP badge.
         let own = serde_json::json!({
             "id": "evt3",
+            "type": "singleInstance",
+            "seriesMasterId": null,
+            "recurrence": null,
             "subject": "My own event",
             "start": { "dateTime": "2026-05-19T11:00:00.0000000", "timeZone": "UTC" },
             "end": { "dateTime": "2026-05-19T11:30:00.0000000", "timeZone": "UTC" },
@@ -3808,7 +3997,7 @@ mod builder_tests {
     use super::{
         contact_to_graph_json, event_patch_to_graph_json, event_to_graph_json, parse_graph_contact,
     };
-    use crate::calendar::CalendarEvent;
+    use crate::calendar::{CalendarEvent, RecurrenceKind};
 
     fn event(all_day: bool, attendees_json: Option<&str>) -> CalendarEvent {
         CalendarEvent {
@@ -3824,6 +4013,7 @@ mod builder_tests {
             all_day,
             timezone: None,
             recurrence_rule: None,
+            recurrence_kind: RecurrenceKind::Standalone,
             organizer_email: Some("me@example.org".into()),
             attendees_json: attendees_json.map(|s| s.to_string()),
             my_status: None,
@@ -3836,14 +4026,15 @@ mod builder_tests {
 
     #[test]
     fn all_day_event_is_midnight_anchored() {
-        let v = event_to_graph_json(&event(true, None));
+        let v = event_to_graph_json(&event(true, None)).unwrap();
         assert_eq!(v["start"]["dateTime"], "2026-07-14T00:00:00");
         assert_eq!(v["isAllDay"], true);
     }
 
     #[test]
     fn create_appends_organizer_as_attendee() {
-        let v = event_to_graph_json(&event(false, Some(r#"[{"email":"a@x.org","name":"A"}]"#)));
+        let v = event_to_graph_json(&event(false, Some(r#"[{"email":"a@x.org","name":"A"}]"#)))
+            .unwrap();
         let atts = v["attendees"].as_array().unwrap();
         assert_eq!(atts.len(), 2);
         assert_eq!(atts[0]["emailAddress"]["address"], "a@x.org");

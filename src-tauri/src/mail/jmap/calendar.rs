@@ -1,6 +1,7 @@
 //! JMAP calendar domain: `Calendar/*` and `CalendarEvent/*` methods
 //! (RFC 8984 JSCalendar).
 
+use crate::calendar::RecurrenceKind;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +27,307 @@ pub struct JmapCalendarEvent {
     pub all_day: bool,
     pub timezone: Option<String>,
     pub recurrence_rule: Option<String>,
+    #[serde(default)]
+    pub recurrence_kind: RecurrenceKind,
+    /// Only known local creation can prove that RRULE is all recurrence data.
+    #[serde(skip)]
+    recurrence_rule_is_complete: bool,
     pub uid: Option<String>,
     pub organizer_email: Option<String>,
     pub attendees_json: Option<String>,
+}
+
+impl JmapCalendarEvent {
+    pub(crate) fn for_local_creation(
+        event: &crate::calendar::CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<Self> {
+        let wire = Self {
+            id: String::new(),
+            calendar_id: remote_calendar_id.to_string(),
+            title: event.title.clone(),
+            description: event.description.clone(),
+            location: event.location.clone(),
+            start: event.start_time.clone(),
+            end: event.end_time.clone(),
+            all_day: event.all_day,
+            timezone: event.timezone.clone(),
+            recurrence_rule: event.recurrence_rule.clone(),
+            recurrence_kind: event.recurrence_kind,
+            recurrence_rule_is_complete: event.recurrence_kind == RecurrenceKind::Series
+                && event.ical_data.is_none()
+                && event.source_message_id.is_none(),
+            uid: event.uid.clone(),
+            organizer_email: event.organizer_email.clone(),
+            attendees_json: event.attendees_json.clone(),
+        };
+        wire.creation_recurrence_rules()?;
+        Ok(wire)
+    }
+
+    /// Validate before transport I/O; never drop an unsupported rule or instance id.
+    fn creation_recurrence_rules(&self) -> Result<Option<serde_json::Value>> {
+        let unsupported = |reason: &str| {
+            Error::Other(format!(
+            "Cannot create JMAP event '{}': {reason}. Keep this event local and manage its recurrence in the source calendar",
+            self.title
+        ))
+        };
+        let rule = self
+            .recurrence_rule
+            .as_deref()
+            .filter(|rule| !rule.is_empty());
+        match self.recurrence_kind {
+            RecurrenceKind::Unknown => Err(unsupported("recurrence classification is unknown")),
+            RecurrenceKind::Occurrence => {
+                Err(unsupported("detached occurrence creation is unsupported"))
+            }
+            RecurrenceKind::Standalone if rule.is_none() => Ok(None),
+            RecurrenceKind::Standalone => Err(unsupported(
+                "standalone classification conflicts with a recurrence rule",
+            )),
+            RecurrenceKind::Series if !self.recurrence_rule_is_complete => Err(unsupported(
+                "source recurrence data cannot be represented by the available RRULE alone",
+            )),
+            RecurrenceKind::Series => {
+                let rule =
+                    rule.ok_or_else(|| unsupported("a complete recurrence rule is missing"))?;
+                let rules = faithful_local_recurrence_rules(rule, self.timezone.as_deref())
+                    .ok_or_else(|| {
+                        unsupported("the recurrence rule cannot be represented faithfully")
+                    })?;
+                Ok(Some(rules))
+            }
+        }
+    }
+}
+
+/// The viewer's converter tolerates malformed numeric/UNTIL fields. Creation
+/// must reject those rather than turning bounded recurrence into another series.
+fn faithful_local_recurrence_rules(
+    rule: &str,
+    timezone: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !rule.is_ascii()
+        || timezone.is_some_and(|timezone| timezone.parse::<chrono_tz::Tz>().is_err())
+    {
+        return None;
+    }
+    let rule = rule.trim().strip_prefix("RRULE:").unwrap_or(rule.trim());
+    let mut keys = std::collections::HashSet::new();
+    for part in rule.split(';') {
+        let (key, value) = part.split_once('=')?;
+        let key = key.trim().to_ascii_uppercase();
+        if !keys.insert(key.clone()) || value.trim().is_empty() {
+            return None;
+        }
+        if matches!(key.as_str(), "INTERVAL" | "COUNT") && value.trim().parse::<u32>().ok()? == 0 {
+            return None;
+        }
+    }
+    if keys.contains("COUNT") && keys.contains("UNTIL") {
+        return None;
+    }
+    let rules = crate::calendar::recurrence::rrule_to_jscalendar(rule, timezone)?;
+    if keys.contains("UNTIL") && !rules[0]["until"].as_str().is_some_and(valid_local_datetime) {
+        return None;
+    }
+    Some(rules)
+}
+
+/// Fetch the provider's complete native JSCalendar Event representation.
+/// JMAP Calendars §5.7 defines omitted `properties` to return stored properties;
+/// listing names from different schema versions risks RFC 8620 §5.1 rejection.
+fn calendar_events_request(account_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [
+            ["CalendarEvent/query", {
+                "accountId": account_id,
+                "limit": 1000
+            }, "q1"],
+            ["CalendarEvent/get", {
+                "#ids": { "resultOf": "q1", "name": "CalendarEvent/query", "path": "/ids" },
+                "accountId": account_id
+            }, "g1"]
+        ]
+    })
+}
+
+/// Classify the native provider object before lossy DTO/RRULE conversion.
+/// Optional absent/null properties and empty recurrence sets mean no recurrence.
+/// RFC 8984 §4.3 and JSCalendar-bis §4.3 define the two rule representations;
+/// JMAP Calendars §5 defines detached instances and synthetic `baseEventId`.
+fn classify_recurrence(event: &serde_json::Value) -> RecurrenceKind {
+    use serde_json::Value;
+
+    if event["@type"].as_str() != Some("Event") {
+        return RecurrenceKind::Unknown;
+    }
+    let present = |name: &str| event.get(name).filter(|value| !value.is_null());
+    let recurrence_id = match present("recurrenceId") {
+        Some(Value::String(value)) if valid_local_datetime(value) => true,
+        Some(_) => return RecurrenceKind::Unknown,
+        None => false,
+    };
+    if let Some(timezone) = present("recurrenceIdTimeZone") {
+        if !recurrence_id || !timezone.as_str().is_some_and(|s| !s.is_empty()) {
+            return RecurrenceKind::Unknown;
+        }
+    }
+    if let Some(base_id) = present("baseEventId") {
+        if !recurrence_id || !base_id.as_str().is_some_and(|s| !s.is_empty()) {
+            return RecurrenceKind::Unknown;
+        }
+    }
+    if let Some(excluded) = present("excluded") {
+        if !excluded.is_boolean() || (excluded == &Value::Bool(true) && !recurrence_id) {
+            return RecurrenceKind::Unknown;
+        }
+    }
+
+    let mut recurring = false;
+    for name in ["recurrenceRules", "excludedRecurrenceRules"] {
+        if let Some(value) = present(name) {
+            let Some(rules) = value.as_array() else {
+                return RecurrenceKind::Unknown;
+            };
+            if !rules.iter().all(valid_recurrence_rule) {
+                return RecurrenceKind::Unknown;
+            }
+            recurring |= !rules.is_empty();
+        }
+    }
+    if let Some(rule) = present("recurrenceRule") {
+        if !valid_recurrence_rule(rule) {
+            return RecurrenceKind::Unknown;
+        }
+        recurring = true;
+    }
+    if let Some(value) = present("recurrenceOverrides") {
+        let Some(overrides) = value.as_object() else {
+            return RecurrenceKind::Unknown;
+        };
+        for (id, patch) in overrides {
+            let Some(patch) = patch.as_object() else {
+                return RecurrenceKind::Unknown;
+            };
+            // An empty patch adds a date; it is not an empty recurrence set.
+            if !valid_local_datetime(id)
+                || patch
+                    .get("@type")
+                    .is_some_and(|value| value.as_str() != Some("Event"))
+                || patch
+                    .get("excluded")
+                    .is_some_and(|value| !value.is_boolean())
+            {
+                return RecurrenceKind::Unknown;
+            }
+        }
+        recurring |= !overrides.is_empty();
+    }
+    if recurrence_id {
+        return if recurring {
+            RecurrenceKind::Unknown
+        } else {
+            RecurrenceKind::Occurrence
+        };
+    }
+
+    // "This and future" splits link the series with first/next relations.
+    if let Some(value) = present("relatedTo") {
+        let Some(relations) = value.as_object() else {
+            return RecurrenceKind::Unknown;
+        };
+        for relation in relations.values() {
+            if !relation.is_object()
+                || relation
+                    .get("@type")
+                    .is_some_and(|value| value.as_str() != Some("Relation"))
+            {
+                return RecurrenceKind::Unknown;
+            }
+            if let Some(value) = relation.get("relation") {
+                let Some(kinds) = value.as_object() else {
+                    return RecurrenceKind::Unknown;
+                };
+                if kinds.values().any(|value| value.as_bool() != Some(true)) {
+                    return RecurrenceKind::Unknown;
+                }
+                recurring |= kinds.contains_key("first") || kinds.contains_key("next");
+            }
+        }
+    }
+    if recurring {
+        return RecurrenceKind::Series;
+    }
+
+    // A native event can omit legitimate optional fields, but not its event
+    // identity/start. Do not authorize mutation from malformed DTO fallbacks.
+    if !["id", "uid"]
+        .iter()
+        .all(|name| event[*name].as_str().is_some_and(|s| !s.trim().is_empty()))
+        || !event["start"].as_str().is_some_and(valid_local_datetime)
+        || !event["calendarIds"].as_object().is_some_and(|ids| {
+            !ids.is_empty()
+                && ids
+                    .iter()
+                    .all(|(id, value)| !id.is_empty() && value.as_bool() == Some(true))
+        })
+        || ["title", "description", "timeZone", "duration"]
+            .iter()
+            .any(|name| present(name).is_some_and(|value| !value.is_string()))
+        || present("showWithoutTime").is_some_and(|value| !value.is_boolean())
+        || [("locations", "Location"), ("participants", "Participant")]
+            .iter()
+            .any(|(name, expected_type)| {
+                present(name).is_some_and(|value| {
+                    !value.as_object().is_some_and(|objects| {
+                        objects.values().all(|object| {
+                            object.is_object()
+                                && object
+                                    .get("@type")
+                                    .is_none_or(|value| value.as_str() == Some(*expected_type))
+                        })
+                    })
+                })
+            })
+    {
+        return RecurrenceKind::Unknown;
+    }
+    RecurrenceKind::Standalone
+}
+
+/// Validate rule identity without restricting recurrence to the local expander.
+fn valid_recurrence_rule(rule: &serde_json::Value) -> bool {
+    rule.is_object()
+        && rule
+            .get("@type")
+            .is_none_or(|value| value.as_str() == Some("RecurrenceRule"))
+        && matches!(
+            rule["frequency"].as_str(),
+            Some("yearly" | "monthly" | "weekly" | "daily" | "hourly" | "minutely" | "secondly")
+        )
+}
+
+/// RFC 8984 LocalDateTime permits fractional seconds, but never a UTC suffix.
+fn valid_local_datetime(value: &str) -> bool {
+    if !value.is_ascii() || value.len() < 19 {
+        return false;
+    }
+    let (seconds, fraction) = value.split_at(19);
+    seconds.bytes().enumerate().all(|(i, byte)| match i {
+        4 | 7 => byte == b'-',
+        10 => byte == b'T',
+        13 | 16 => byte == b':',
+        _ => byte.is_ascii_digit(),
+    }) && (fraction.is_empty()
+        || fraction.strip_prefix('.').is_some_and(|digits| {
+            !digits.is_empty()
+                && !digits.ends_with('0')
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }))
+        && chrono::NaiveDateTime::parse_from_str(seconds, "%Y-%m-%dT%H:%M:%S").is_ok()
 }
 
 impl JmapConnection {
@@ -179,26 +478,7 @@ impl JmapConnection {
 
         // Note: Stalwart doesn't support "inCalendars" filter, so we fetch all
         // events and filter by calendarIds client-side.
-        let request = serde_json::json!({
-            "using": [
-                "urn:ietf:params:jmap:core",
-                "urn:ietf:params:jmap:calendars"
-            ],
-            "methodCalls": [
-                ["CalendarEvent/query", {
-                    "accountId": self.account_id,
-                    "limit": 1000
-                }, "q1"],
-                ["CalendarEvent/get", {
-                    "#ids": { "resultOf": "q1", "name": "CalendarEvent/query", "path": "/ids" },
-                    "accountId": self.account_id,
-                    "properties": ["id", "calendarIds", "title", "description",
-                                   "start", "duration", "showWithoutTime",
-                                   "timeZone", "recurrenceRules", "uid", "locations",
-                                   "participants", "@type"]
-                }, "g1"]
-            ]
-        });
+        let request = calendar_events_request(&self.account_id);
 
         let resp = self.api_request(&request, config).await?;
         log::debug!(
@@ -226,6 +506,7 @@ impl JmapConnection {
 
         let mut events = Vec::new();
         for ev in events_json {
+            let recurrence_kind = classify_recurrence(&ev);
             let id = ev["id"].as_str().unwrap_or("").to_string();
             let title = ev["title"].as_str().unwrap_or("(No title)").to_string();
             let description = ev["description"].as_str().map(|s| s.to_string());
@@ -277,7 +558,13 @@ impl JmapConnection {
             // backends all agree on one format.
             let recurrence_rules = ev["recurrenceRules"]
                 .as_array()
-                .filter(|rules| !rules.is_empty());
+                .filter(|rules| !rules.is_empty())
+                .map(Vec::as_slice)
+                .or_else(|| {
+                    ev.get("recurrenceRule")
+                        .filter(|rule| rule.is_object())
+                        .map(std::slice::from_ref)
+                });
             let recurrence_rule = recurrence_rules
                 .and_then(|rules| {
                     crate::calendar::recurrence::jscalendar_to_rrule(rules, Some(&event_tz))
@@ -356,6 +643,8 @@ impl JmapConnection {
                 all_day,
                 timezone: event_tz_opt,
                 recurrence_rule,
+                recurrence_kind,
+                recurrence_rule_is_complete: false,
                 uid,
                 organizer_email,
                 attendees_json,
@@ -383,6 +672,7 @@ impl JmapConnection {
         config: &JmapConfig,
         event: &JmapCalendarEvent,
     ) -> Result<String> {
+        let recurrence_rules = event.creation_recurrence_rules()?;
         log::info!(
             "JMAP creating calendar event: '{}' organizer={:?} attendees={:?}",
             event.title,
@@ -415,26 +705,8 @@ impl JmapConnection {
                 "loc1": { "@type": "Location", "name": loc }
             });
         }
-        if let Some(ref rrule) = event.recurrence_rule {
-            // Local rows canonically hold iCal RRULE strings — convert to
-            // JSCalendar recurrenceRules for the wire. (Previously the
-            // recurrence was silently dropped here unless the string
-            // happened to be raw JSON.) Rows synced before the format fix
-            // may still hold a JSON array; pass those through unchanged.
-            if let Some(rules) =
-                crate::calendar::recurrence::rrule_to_jscalendar(rrule, event.timezone.as_deref())
-            {
-                event_obj["recurrenceRules"] = rules;
-            } else if let Ok(rules @ serde_json::Value::Array(_)) =
-                serde_json::from_str::<serde_json::Value>(rrule)
-            {
-                event_obj["recurrenceRules"] = rules;
-            } else {
-                log::warn!(
-                    "JMAP create: unsupported recurrence_rule format, sending event without recurrence: {}",
-                    rrule
-                );
-            }
+        if let Some(rules) = recurrence_rules {
+            event_obj["recurrenceRules"] = rules;
         }
 
         // Add participants (organizer + attendees)
@@ -731,4 +1003,216 @@ fn parse_iso8601_duration_seconds(dur: &str) -> i64 {
     } else {
         total
     } // default 1 hour
+}
+
+#[cfg(test)]
+mod recurrence_tests {
+    use super::{
+        calendar_events_request, classify_recurrence, faithful_local_recurrence_rules,
+        JmapCalendarEvent,
+    };
+    use crate::calendar::RecurrenceKind;
+    use serde_json::{json, Value};
+
+    fn event() -> Value {
+        json!({
+            "@type": "Event",
+            "id": "event-1",
+            "uid": "uid-1",
+            "calendarIds": {"calendar-1": true},
+            "start": "2026-09-13T10:00:00"
+        })
+    }
+
+    #[test]
+    fn creation_never_drops_malformed_or_unrepresentable_rrule_parts() {
+        for rule in [
+            "",
+            "FREQ=HOURLY",
+            "FREQ=WEEKLY;BYSETPOS=1",
+            "FREQ=WEEKLY;COUNT=bad",
+            "FREQ=WEEKLY;COUNT=0",
+            "FREQ=WEEKLY;INTERVAL=bad",
+            "FREQ=WEEKLY;INTERVAL=0",
+            "FREQ=WEEKLY;UNTIL=bad",
+            "FREQ=WEEKLY;UNTIL=20260230",
+            "FREQ=WEEKLY;FREQ=DAILY",
+            "FREQ=WEEKLY;COUNT=2;UNTIL=20261001",
+            "[{\"frequency\":\"weekly\"}]",
+        ] {
+            assert!(
+                faithful_local_recurrence_rules(rule, None).is_none(),
+                "{rule}"
+            );
+        }
+        for rule in [
+            "FREQ=WEEKLY;COUNT=4",
+            "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
+            "FREQ=DAILY;UNTIL=20261231",
+        ] {
+            assert!(
+                faithful_local_recurrence_rules(rule, None).is_some(),
+                "{rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn serialization_cannot_invent_proof_of_complete_local_series_recurrence() {
+        let mut local = crate::backend::testutil::event();
+        local.recurrence_kind = RecurrenceKind::Series;
+        local.recurrence_rule = Some("FREQ=WEEKLY;COUNT=4".into());
+        let wire = JmapCalendarEvent::for_local_creation(&local, "calendar").unwrap();
+        let restored: JmapCalendarEvent =
+            serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
+        assert_eq!(restored.recurrence_kind, RecurrenceKind::Series);
+        assert!(restored.creation_recurrence_rules().is_err());
+    }
+
+    #[test]
+    fn get_requests_native_events_without_a_version_specific_property_list() {
+        let request = calendar_events_request("account-1");
+        let calls = &request["methodCalls"];
+        assert_eq!(calls[0][0], "CalendarEvent/query");
+        assert_eq!(calls[0][1]["limit"], 1000);
+        assert!(calls[0][1].get("expandRecurrences").is_none());
+        assert_eq!(calls[1][0], "CalendarEvent/get");
+        let get = &calls[1][1];
+        assert_eq!(get["accountId"], "account-1");
+        assert_eq!(get["#ids"]["path"], "/ids");
+        assert!(get.get("recurrenceOverridesBefore").is_none());
+        assert!(get.get("recurrenceOverridesAfter").is_none());
+        assert!(get.get("properties").is_none());
+        assert!(get.get("reduceParticipants").is_none());
+    }
+
+    #[test]
+    fn standalone_accepts_omitted_null_and_empty_optional_recurrence_metadata() {
+        let mut event = event();
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Standalone);
+        for name in [
+            "recurrenceId",
+            "recurrenceIdTimeZone",
+            "recurrenceRules",
+            "recurrenceRule",
+            "excludedRecurrenceRules",
+            "recurrenceOverrides",
+            "baseEventId",
+            "relatedTo",
+        ] {
+            event[name] = Value::Null;
+        }
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Standalone);
+        event["recurrenceRules"] = json!([]);
+        event["excludedRecurrenceRules"] = json!([]);
+        event["recurrenceOverrides"] = json!({});
+        event["excluded"] = json!(false);
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Standalone);
+    }
+
+    #[test]
+    fn series_includes_overrides_exclusions_unsupported_rules_and_bis_rule() {
+        for (name, value) in [
+            (
+                "recurrenceRules",
+                json!([{"@type": "RecurrenceRule", "frequency": "weekly"}]),
+            ),
+            (
+                "recurrenceRules",
+                json!([{"frequency": "hourly"}, {"frequency": "yearly"}]),
+            ),
+            ("recurrenceRule", json!({"frequency": "daily"})),
+            ("excludedRecurrenceRules", json!([{"frequency": "monthly"}])),
+            ("recurrenceOverrides", json!({"2026-09-20T10:00:00": {}})),
+            (
+                "recurrenceOverrides",
+                json!({"2026-09-20T10:00:00": {"excluded": true}}),
+            ),
+            (
+                "relatedTo",
+                json!({"previous": {"relation": {"first": true}}}),
+            ),
+        ] {
+            let mut event = event();
+            event[name] = value;
+            assert_eq!(
+                classify_recurrence(&event),
+                RecurrenceKind::Series,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_and_server_expanded_instances_are_occurrences() {
+        let mut event = event();
+        event["recurrenceId"] = json!("2026-09-20T10:00:00");
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Occurrence);
+        event["recurrenceId"] = json!("2026-09-20T10:00:00.123");
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Occurrence);
+        event["recurrenceIdTimeZone"] = json!("Europe/Stockholm");
+        event["baseEventId"] = json!("base-1");
+        event["recurrenceRules"] = Value::Null;
+        event["recurrenceRule"] = Value::Null;
+        event["recurrenceOverrides"] = Value::Null;
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Occurrence);
+        event["recurrenceId"] = json!("2026-09-20T00:00:00");
+        event["showWithoutTime"] = json!(true);
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Occurrence);
+        event["recurrenceRules"] = json!([{"frequency": "weekly"}]);
+        assert_eq!(classify_recurrence(&event), RecurrenceKind::Unknown);
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_provider_metadata_cannot_become_standalone() {
+        for (name, value) in [
+            ("@type", json!("Task")),
+            ("@type", json!("VendorEvent")),
+            ("@type", Value::Null),
+            ("recurrenceId", json!(true)),
+            ("recurrenceId", json!("")),
+            ("recurrenceId", json!("2026-02-30T10:00:00")),
+            ("recurrenceId", json!("2026-09-20T10:00:00Z")),
+            ("recurrenceId", json!("2026-09-20T10:00:00.000")),
+            ("recurrenceId", json!("2026-09-20")),
+            ("recurrenceIdTimeZone", json!("UTC")),
+            ("baseEventId", json!("base-1")),
+            ("baseEventId", json!(false)),
+            ("recurrenceRules", json!({})),
+            ("recurrenceRules", json!([null])),
+            (
+                "recurrenceRules",
+                json!([{"@type": "Unknown", "frequency": "weekly"}]),
+            ),
+            ("recurrenceRules", json!([{"frequency": false}])),
+            ("recurrenceRule", json!([])),
+            ("recurrenceRule", json!({})),
+            ("excludedRecurrenceRules", json!(false)),
+            ("recurrenceOverrides", json!([])),
+            ("recurrenceOverrides", json!({"invalid": {}})),
+            ("recurrenceOverrides", json!({"2026-09-20T10:00:00": null})),
+            (
+                "recurrenceOverrides",
+                json!({"2026-09-20T10:00:00": {"@type": "Task"}}),
+            ),
+            ("excluded", json!(true)),
+            ("excluded", json!("false")),
+            ("relatedTo", json!([])),
+            ("id", json!("")),
+            ("uid", Value::Null),
+            ("start", json!(42)),
+            ("calendarIds", json!({"calendar-1": false})),
+            ("showWithoutTime", json!("false")),
+            ("locations", json!({"location-1": {"@type": "Unknown"}})),
+            ("participants", json!({"participant-1": false})),
+        ] {
+            let mut event = event();
+            event[name] = value;
+            assert_eq!(
+                classify_recurrence(&event),
+                RecurrenceKind::Unknown,
+                "{event}"
+            );
+        }
+    }
 }
