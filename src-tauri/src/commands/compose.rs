@@ -1443,24 +1443,49 @@ pub async fn pgp_check_recipients(
     state: State<'_, AppState>,
     recipients: Vec<String>,
 ) -> Result<Vec<PgpRecipientStatus>> {
-    let store = state
-        .pgp_store()
-        .map_err(|e| Error::Other(format!("openpgp keystore: {e}")))?;
-    let guard = store.lock().expect("pgp keystore mutex poisoned");
-    let mut out = Vec::with_capacity(recipients.len());
-    for email in recipients {
-        let trimmed = email.trim().to_string();
+    check_pgp_recipient_keys(recipients, || {
+        state
+            .pgp_store()
+            .map_err(|e| Error::Other(format!("openpgp keystore: {e}")))
+    })
+}
+
+/// Reject invalid mailboxes before touching the keystore or resolving any key.
+fn check_pgp_recipient_keys(
+    recipients: Vec<String>,
+    open_keystore: impl FnOnce() -> Result<std::sync::Arc<std::sync::Mutex<libtumpa::KeyStore>>>,
+) -> Result<Vec<PgpRecipientStatus>> {
+    let mut validated = Vec::with_capacity(recipients.len());
+    for (index, email) in recipients.into_iter().enumerate() {
+        let trimmed = email.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let status = match libtumpa::store::resolve_recipient(&guard, &trimmed) {
+        // Share MIME construction's validator without rewriting key identifiers.
+        smtp::parse_mailbox(trimmed).map_err(|_| {
+            Error::Other(format!(
+                "Invalid recipient address at position {}",
+                index + 1
+            ))
+        })?;
+        validated.push(trimmed.to_string());
+    }
+    if validated.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let store = open_keystore()?;
+    let guard = store.lock().expect("pgp keystore mutex poisoned");
+    let mut out = Vec::with_capacity(validated.len());
+    for email in validated {
+        let status = match libtumpa::store::resolve_recipient(&guard, &email) {
             Ok((_data, info)) => PgpRecipientStatus {
-                email: trimmed,
+                email,
                 has_key: true,
                 fingerprint: Some(info.fingerprint),
             },
             Err(_) => PgpRecipientStatus {
-                email: trimmed,
+                email,
                 has_key: false,
                 fingerprint: None,
             },
@@ -1469,6 +1494,9 @@ pub async fn pgp_check_recipients(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod recipient_validation_tests;
 
 #[cfg(test)]
 mod send_safety_tests {
