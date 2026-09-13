@@ -32,8 +32,9 @@ Edit/Delete/Move to confirmed standalone events. Expanded Google instances
 remain viewable but read-only for these actions, including moves to another
 calendar or account. RSVP and invitation delivery are separate workflows.
 
-- Full reads retain `singleEvents=true`; both full and incremental reads
-  consume unmasked event objects. The adapter classifies `recurrence`,
+- Full and incremental reads share `singleEvents=true` and `maxResults=500`.
+  Incremental reads omit `timeMin`/`timeMax`, which cannot accompany `syncToken`.
+  Both consume unmasked event objects. The adapter classifies `recurrence`,
   `recurringEventId` and `originalStartTime` before persisting
   `recurrence_kind`. Expanded instances can have no RRULE and opaque IDs;
   neither is evidence that they are standalone. Malformed or conflicting
@@ -136,9 +137,9 @@ Google returns `backgroundColor` as hex color directly in the calendarList respo
 ## Deferred Items
 
 1. **iCalUID cross-reference**: matching events across accounts by UID to avoid duplicates. Needs cross-account query + dedup logic.
-2. **Recurring event handling**: full reads use `singleEvents=true` and now
-   classify expanded instances for mutation safety. Ordinary series and
-   occurrence editing, deletion and moves are blocked. Provider-native
+2. **Recurring event handling**: full and incremental reads use
+   `singleEvents=true` and classify expanded instances for mutation safety.
+   Ordinary series and occurrence editing, deletion and moves are blocked. Provider-native
    recurring creation on Google and the `events.instances` endpoint remain
    unsupported; the separate local series-creation workflow is not disabled.
 3. **Push notifications** (`events.watch`): requires a publicly accessible HTTPS webhook URL, not feasible for desktop apps without a relay server.
