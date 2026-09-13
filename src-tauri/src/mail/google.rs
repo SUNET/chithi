@@ -242,6 +242,18 @@ impl GoogleClient {
         Ok(parse_google_schedules(&value, emails))
     }
 
+    /// Google requires expansion and page-size parameters to stay consistent
+    /// when reusing a full listing's sync token. Time bounds are full-list-only.
+    fn list_events_request(&self, calendar_id: &str) -> reqwest::RequestBuilder {
+        self.http
+            .get(self.calendar_url(&format!(
+                "calendars/{}/events",
+                urlencoding::encode(calendar_id)
+            )))
+            .bearer_auth(&self.token)
+            .query(&[("singleEvents", "true"), ("maxResults", "500")])
+    }
+
     /// Incremental events listing using a stored sync token.
     pub async fn list_events_incremental(
         &self,
@@ -249,12 +261,7 @@ impl GoogleClient {
         sync_token: &str,
     ) -> Result<EventsPage> {
         let resp = self
-            .http
-            .get(self.calendar_url(&format!(
-                "calendars/{}/events",
-                urlencoding::encode(calendar_id)
-            )))
-            .bearer_auth(&self.token)
+            .list_events_request(calendar_id)
             .query(&[("syncToken", sync_token)])
             .send()
             .await
@@ -271,18 +278,8 @@ impl GoogleClient {
         time_max: &str,
     ) -> Result<EventsPage> {
         let resp = self
-            .http
-            .get(self.calendar_url(&format!(
-                "calendars/{}/events",
-                urlencoding::encode(calendar_id)
-            )))
-            .bearer_auth(&self.token)
-            .query(&[
-                ("timeMin", time_min),
-                ("timeMax", time_max),
-                ("singleEvents", "true"),
-                ("maxResults", "500"),
-            ])
+            .list_events_request(calendar_id)
+            .query(&[("timeMin", time_min), ("timeMax", time_max)])
             .send()
             .await
             .map_err(|e| Error::Other(format!("Google Calendar events fetch failed: {}", e)))?;
@@ -1796,11 +1793,20 @@ mod wire_tests {
             let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
             assert!(request.starts_with("GET "));
             assert!(!query.contains_key("fields"));
+            assert_eq!(
+                query.get("singleEvents").map(|value| value.as_ref()),
+                Some("true")
+            );
+            assert_eq!(
+                query.get("maxResults").map(|value| value.as_ref()),
+                Some("500")
+            );
             if incremental {
                 assert_eq!(query.get("syncToken").unwrap(), "cached-token");
+                assert!(!query.contains_key("timeMin"));
+                assert!(!query.contains_key("timeMax"));
             } else {
                 assert!(!query.contains_key("syncToken"));
-                assert_eq!(query.get("singleEvents").unwrap(), "true");
                 assert_eq!(query.get("timeMin").unwrap(), "2026-09-01T00:00:00Z");
                 assert_eq!(query.get("timeMax").unwrap(), "2026-10-01T00:00:00Z");
             }

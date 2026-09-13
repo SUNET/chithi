@@ -5,8 +5,9 @@
 Accepted — approved scope of #288, 2026-09-13.
 
 Amended for the approved scope of #308: durable move revisions and
-provenance-gated series invitations. Review and integration validation are
-still in progress.
+provenance-gated series invitations, destination-copy revalidation, consistent
+Google sync queries, and removal of unsupported manual cancellation controls.
+Review and integration validation are still in progress.
 
 ## Context
 
@@ -64,8 +65,10 @@ selection. Out-of-range detail rows are not appended to the rendered range.
 ### Classify source evidence before lossy conversion
 
 - **Google:** full expanded reads and incremental reads retain unmasked
-  `recurrence`, `recurringEventId` and `originalStartTime` metadata. The
-  adapter persists a kind independently of the local RRULE. See
+  `recurrence`, `recurringEventId` and `originalStartTime` metadata. Both use
+  `singleEvents=true` and `maxResults=500`; only full reads include time bounds,
+  which are prohibited with `syncToken`. The adapter persists a kind
+  independently of the local RRULE. See
   [ADR 0017](0017-google-api-two-way-sync.md).
 - **Graph:** `calendarView` selects `type`, `seriesMasterId` and `recurrence`.
   Consistent `singleInstance`, `seriesMaster`, and `occurrence`/`exception`
@@ -189,14 +192,28 @@ destination calendar/account IDs. The command:
 2. For a cross-account move, builds the copy from persisted source content,
    then rechecks source eligibility, both snapshot content and revision, and
    target ownership inside the destination-insert transaction before copying.
-3. Rechecks the snapshot content and revision in the source-deletion
-   transaction before deleting or claiming meeting cleanup. A mismatch leaves
-   the source intact. If the copy already exists, the existing partial-copy
-   error identifies it and reports that the source was not removed.
+   Captures a creation receipt containing the copy, its durable revision and
+   destination calendar in that same transaction, before provider I/O.
+3. A successful immediate provider push attaches its remote ID and optional
+   canonical UID in a guarded write transaction. The receipt must still match
+   before that write; only this operation's committed identity write advances
+   its expected revision. An attachment failure aborts the move without undoing
+   remote creation or deleting the source.
+4. Rechecks both the source snapshot and the destination receipt in the
+   source-deletion transaction before deleting or claiming meeting cleanup.
+   The destination copy must still exist with unchanged content and revision;
+   its calendar must retain account ownership, remote identity and subscription
+   state. Presentation-only calendar changes do not invalidate the receipt.
+   Deletion, replacement, unsubscribe, or conflicting changes preserve the
+   source. A partial-move error identifies the attempted copy and reports that
+   the source was not removed; it does not promise the copy still exists.
 
 DTO equality alone cannot detect hidden-state, meeting-ownership or ABA races.
 Unconditional revisions deliberately favor preservation: even a harmless
 sync update can abort a move, including after the destination copy exists.
+The same creation receipt guards immediate identity attachment for ordinary
+creation. A failure is logged without overwriting concurrent changes, retaining
+ordinary creation's existing best-effort publication contract.
 
 The cross-account move remains copy-then-delete with existing best-effort
 provider CRUD. It is not an atomic remote move or a new durable retry
@@ -243,7 +260,7 @@ and this safeguard is not a full ICS transformation engine.
 
 Creation derives `standalone` or `series` from known creation input. New
 series creation and proof-gated invitation delivery remain separate workflows,
-subject to existing provider capabilities. Ordinary edit/delete/move
+subject to existing provider capabilities. Ordinary edit/move
 notifications retain the distinct `notify_calendar_event` command, which takes
 only the current event ID, requires confirmed standalone status and has no
 series exemption. It derives the account, organizer eligibility and full
@@ -256,6 +273,14 @@ Detail and calendar-view callers fetch the exact current event for prompt
 eligibility and recheck after dialogs; captured range-list attendees and
 account IDs are not notification inputs. Ordinary detail edits omit the
 attendee patch because that form does not edit attendees.
+
+Deletion never calls ordinary `METHOD:REQUEST` notification delivery. For
+organizer-owned events with attendees, the detail view offers Delete/Cancel
+and explains that Chithi does not send manual cancellation notifications;
+the calendar provider may notify automatically. It does not offer a misleading
+"Send Cancellation" or "Delete Only" choice. Proper manual `METHOD:CANCEL`
+delivery, sequence handling and delivery/deletion recovery remain unsupported.
+Exact-event and selection checks still run around deletion confirmation.
 
 Delivery compares the current persisted event with its expected snapshot
 after asynchronous credentials/session preparation, before each transport
@@ -294,7 +319,8 @@ Automated test sources cover:
   at mobile/desktop widths, occurrence identity and displayed times, shared
   reasons, forced handlers, stale selection/editor state, refresh races,
   drag/drop guards, exact-ID stale-read rejection and out-of-range standalone
-  save/move/notification flows.
+  save/move/notification flows, plus delete confirmation and cancellation
+  without issuing an ordinary invitation notification.
 - `src/__tests__/calendar-move-tauri.test.ts` and
   `src/__tests__/event-detail-calendar-move.test.ts`: exact-read, move and
   notification IPC arguments, and detail-panel move behavior.
@@ -303,7 +329,9 @@ Automated test sources cover:
   state, rejected writes and meeting cleanup, ownership, standalone paths,
   creation/invitation scope, lock/transaction races, partial-copy reporting
   and restart behavior, including hidden-state/ABA move races and invitation
-  proof revocation during transport preparation.
+  proof revocation during transport preparation. Paused HTTP creation tests
+  exercise destination loss/conflicts on successful and failed pushes; receipt
+  tests cover canonical UID attachment, rollback and the deletion write lock.
 - `src-tauri/src/db/calendar_revision.rs`, `calendar_invitation.rs` and schema
   test sources cover durable token allocation/pruning, replacement, rollback,
   restart and snapshot consistency, empty legacy proof migration, initial

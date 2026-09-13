@@ -264,21 +264,29 @@ describe("calendar mutation safety", () => {
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
-  it("deletes standalone from the detail panel through the store", async () => {
+  it.each(["Delete", "Ok"])("deletes standalone through the store after confirming %s without manual notification", async (answer) => {
     const store = setup();
     const remove = vi.spyOn(store, "deleteEvent");
+    vi.mocked(message).mockResolvedValueOnce(answer);
     const wrapper = detail();
     await wrapper.get(".btn-danger").trigger("click");
     await flushPromises();
+    expect(message).toHaveBeenCalledExactlyOnceWith(
+      "Delete this event with attendees? Chithi does not send manual cancellation notifications. Your calendar provider may notify attendees automatically.",
+      { title: "Delete Event", kind: "warning", buttons: { ok: "Delete", cancel: "Cancel" } },
+    );
+    expect(api.getCalendarEvent).toHaveBeenCalledTimes(2);
+    expect(api.getCalendarEvent).toHaveBeenNthCalledWith(1, event().id);
+    expect(api.getCalendarEvent).toHaveBeenNthCalledWith(2, event().id);
     expect(remove).toHaveBeenCalledExactlyOnceWith(event().id);
     expect(api.deleteEvent).toHaveBeenCalledExactlyOnceWith(event().id);
-    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(store.selectedEvent).toBeNull();
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
-  it("does not send or delete after metadata becomes blocked during a notification dialog", async () => {
+  it("does not send or delete after metadata becomes blocked during deletion confirmation", async () => {
     const store = setup();
     let answer!: (value: string) => void;
     vi.mocked(message).mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
@@ -287,7 +295,7 @@ describe("calendar mutation safety", () => {
     await flushPromises();
     expect(message).toHaveBeenCalledTimes(1);
     store.events = [event({ recurrence_kind: "occurrence" })];
-    answer("Yes");
+    answer("Delete");
     await flushPromises();
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(api.deleteEvent).not.toHaveBeenCalled();
@@ -358,6 +366,176 @@ describe("calendar mutation safety", () => {
     expect(api.updateEvent).not.toHaveBeenCalled();
     expect(api.createEvent).not.toHaveBeenCalled();
     expect(api.deleteEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("event deletion confirmation", () => {
+  async function pendingDeletion() {
+    const store = setup();
+    let answer!: (result: string) => void;
+    vi.mocked(message).mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const wrapper = detail();
+    await wrapper.get(".btn-danger").trigger("click");
+    await flushPromises();
+    expect(message).toHaveBeenCalledTimes(1);
+    expect(api.deleteEvent).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    return { store, wrapper, answer };
+  }
+
+  it.each(["Cancel", "No", "", "Yes"])("aborts without mutations when confirmation returns %j", async (result) => {
+    const { store, wrapper, answer } = await pendingDeletion();
+    answer(result);
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    for (const fn of [api.deleteEvent, api.updateEvent, api.createEvent,
+      api.moveEventToCalendar, api.notifyCalendarEvent, api.sendInvites]) {
+      expect(fn).not.toHaveBeenCalled();
+    }
+    expect(api.getEvents).not.toHaveBeenCalled();
+    expect(store.selectedEvent?.id).toBe(event().id);
+    expect(wrapper.emitted("close")).toBeUndefined();
+    expect(wrapper.get(".btn-danger").attributes("disabled")).toBeUndefined();
+  });
+
+  const participantChanges = [
+    ["attendees", { attendees_json: null }],
+    ["organizer", { organizer_email: "other@example.test" }],
+  ] as const;
+
+  it.each(participantChanges)("uses fresh %s to decide whether deletion needs confirmation", async (_label, stale) => {
+    const store = setup(event(stale));
+    vi.mocked(api.getCalendarEvent).mockResolvedValueOnce(event());
+    vi.mocked(message).mockResolvedValueOnce("Cancel");
+    const wrapper = detail();
+    await wrapper.get(".btn-danger").trigger("click");
+    await flushPromises();
+    expect(message).toHaveBeenCalledTimes(1);
+    expect(api.deleteEvent).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(store.selectedEvent?.id).toBe(event().id);
+    expect(wrapper.emitted("close")).toBeUndefined();
+  });
+
+  it.each(participantChanges)("deletes without prompting or notifying when fresh %s make notification inapplicable", async (_label, fresh) => {
+    setup();
+    vi.mocked(api.getCalendarEvent).mockResolvedValueOnce(event(fresh));
+    const wrapper = detail();
+    await wrapper.get(".btn-danger").trigger("click");
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(message).not.toHaveBeenCalled();
+    expect(api.deleteEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(wrapper.emitted("close")).toHaveLength(1);
+  });
+
+  it("revalidates the captured target after a range refresh and prevents duplicate deletion", async () => {
+    const { store, wrapper, answer } = await pendingDeletion();
+    expect(wrapper.get(".btn-danger").attributes("disabled")).toBeDefined();
+    await (wrapper.vm as unknown as { handleDelete(): Promise<void> }).handleDelete();
+    expect(message).toHaveBeenCalledTimes(1);
+    expect(api.getCalendarEvent).toHaveBeenCalledTimes(1);
+    vi.mocked(api.getEvents).mockResolvedValue([]);
+    vi.mocked(api.getCalendarEvent).mockResolvedValue(event());
+    await store.fetchEvents();
+    const reads = vi.mocked(api.getCalendarEvent).mock.calls.length;
+    answer("Delete");
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledTimes(reads + 1);
+    expect(api.getCalendarEvent).toHaveBeenLastCalledWith(event().id);
+    expect(api.deleteEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(store.selectedEvent).toBeNull();
+    expect(store.events).toEqual([]);
+    expect(wrapper.emitted("close")).toHaveLength(1);
+  });
+
+  describe.each(["before", "after"])("exact target verification %s confirmation", (phase) => {
+    it.each(["occurrence", "series", "unknown", "read failure", "mismatched ID"] as const)("blocks deletion for %s despite a standalone range cache", async (state) => {
+      const { store, wrapper, answer } = phase === "after"
+        ? await pendingDeletion()
+        : { store: setup(), wrapper: detail(), answer: undefined };
+      let reason: string;
+      if (state === "read failure") {
+        reason = "Exact fetch failed";
+        vi.mocked(api.getCalendarEvent).mockRejectedValueOnce(new Error(reason));
+      } else if (state === "mismatched ID") {
+        reason = "unexpected ID";
+        vi.mocked(api.getCalendarEvent).mockResolvedValueOnce(event({ id: "other" }));
+      } else {
+        reason = state === "unknown" ? unknownReason : recurringReason;
+        vi.mocked(api.getCalendarEvent).mockResolvedValueOnce(event({ recurrence_kind: state }));
+      }
+      expect(store.events[0].recurrence_kind).toBe("standalone");
+      if (answer) answer("Delete");
+      else await wrapper.get(".btn-danger").trigger("click");
+      await flushPromises();
+      expect(api.getCalendarEvent).toHaveBeenCalledTimes(phase === "after" ? 2 : 1);
+      expect(api.getCalendarEvent).toHaveBeenLastCalledWith(event().id);
+      expect(message).toHaveBeenCalledTimes(phase === "after" ? 1 : 0);
+      expect(api.deleteEvent).not.toHaveBeenCalled();
+      expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+      expect(api.sendInvites).not.toHaveBeenCalled();
+      expect(store.selectedEvent?.id).toBe(event().id);
+      expect(store.getEventMutationSupport(event().id).supported).toBe(false);
+      expect(wrapper.emitted("close")).toBeUndefined();
+      const error = wrapper.get(".detail-error").text();
+      expect(error).toContain("Could not verify the event for deletion. Please try again.");
+      expect(error).toContain(reason);
+    });
+  });
+
+  it.each([false, true])("abandons confirmation after selection changes (and returns: %s)", async (returnToOriginal) => {
+    const { store, wrapper, answer } = await pendingDeletion();
+    store.selectEvent(event({ id: "other" }));
+    if (returnToOriginal) store.selectEvent(event());
+    answer("Delete");
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(api.deleteEvent).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(store.selectedEvent?.id).toBe(returnToOriginal ? event().id : "other");
+    expect(wrapper.emitted("close")).toBeUndefined();
+  });
+
+  it.each(["before", "after"])("rechecks selection when the exact fetch %s confirmation finishes", async (phase) => {
+    const { store, wrapper, answer } = phase === "after"
+      ? await pendingDeletion()
+      : { store: setup(), wrapper: detail(), answer: undefined };
+    let finish!: (row: CalendarEvent) => void;
+    vi.mocked(api.getCalendarEvent).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    if (answer) answer("Delete");
+    else await wrapper.get(".btn-danger").trigger("click");
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledTimes(phase === "after" ? 2 : 1);
+    store.selectEvent(event({ id: "other" }));
+    finish(event());
+    await flushPromises();
+    expect(message).toHaveBeenCalledTimes(phase === "after" ? 1 : 0);
+    expect(api.deleteEvent).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(store.selectedEvent?.id).toBe("other");
+    expect(wrapper.emitted("close")).toBeUndefined();
+  });
+
+  it.each(participantChanges)("does not send manual notification when %s change during deletion confirmation", async (_label, changed) => {
+    const { store, wrapper, answer } = await pendingDeletion();
+    store.events = [event(changed)];
+    answer("Delete");
+    await flushPromises();
+    expect(api.getCalendarEvent).toHaveBeenCalledTimes(2);
+    expect(api.getCalendarEvent).toHaveBeenLastCalledWith(event().id);
+    expect(api.deleteEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+    expect(api.sendInvites).not.toHaveBeenCalled();
+    expect(store.selectedEvent).toBeNull();
+    expect(wrapper.emitted("close")).toHaveLength(1);
   });
 });
 
@@ -713,7 +891,7 @@ describe("notification target revalidation after modal resolution", () => {
 });
 
 describe("fresh notification participants", () => {
-  it.each(["edit", "delete", "reschedule"])("uses fresh attendees after the %s dialog without an attendee edit patch", async (operation) => {
+  it.each(["edit", "reschedule"])("uses fresh attendees after the %s dialog without an attendee edit patch", async (operation) => {
     const store = setup();
     const changed = event({ attendees_json: '[{"email":"new@example.test","name":"New guest","status":"accepted","is_self":false}]' });
     vi.mocked(message).mockImplementationOnce(async () => {
@@ -733,10 +911,8 @@ describe("fresh notification participants", () => {
       });
     } else {
       const wrapper = detail();
-      if (operation === "edit") {
-        await wrapper.get(".btn-edit").trigger("click");
-        await wrapper.get('[data-testid="event-form-save"]').trigger("click");
-      } else await wrapper.get(".btn-danger").trigger("click");
+      await wrapper.get(".btn-edit").trigger("click");
+      await wrapper.get('[data-testid="event-form-save"]').trigger("click");
       await flushPromises();
     }
     expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
@@ -745,7 +921,7 @@ describe("fresh notification participants", () => {
     }
   });
 
-  it.each(["edit", "delete", "reschedule"])("does not notify after organizer changes during the %s dialog", async (operation) => {
+  it.each(["edit", "reschedule"])("does not notify after organizer changes during the %s dialog", async (operation) => {
     const store = setup();
     const changeOrganizer = () => { store.events = [event({ organizer_email: "other@example.test" })]; };
     vi.mocked(message).mockImplementationOnce(async () => { changeOrganizer(); return "Yes"; });
@@ -760,10 +936,8 @@ describe("fresh notification participants", () => {
       expect(window.confirm).toHaveBeenCalledTimes(1);
     } else {
       const wrapper = detail();
-      if (operation === "edit") {
-        await wrapper.get(".btn-edit").trigger("click");
-        await wrapper.get('[data-testid="event-form-save"]').trigger("click");
-      } else await wrapper.get(".btn-danger").trigger("click");
+      await wrapper.get(".btn-edit").trigger("click");
+      await wrapper.get('[data-testid="event-form-save"]').trigger("click");
       await flushPromises();
       expect(message).toHaveBeenCalledTimes(1);
     }

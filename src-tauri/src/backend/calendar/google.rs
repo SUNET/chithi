@@ -1234,6 +1234,32 @@ mod recurrence_sync_tests {
 
     const SYNC_KEY: &str = "google_sync_token_acc1_primary";
 
+    fn assert_events_query(request: &str, sync_token: Option<&str>) {
+        let target = request.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(url.path(), "/calendar-api/calendars/primary/events");
+        assert_eq!(
+            query.get("singleEvents").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("maxResults").map(|value| value.as_ref()),
+            Some("500")
+        );
+        assert_eq!(
+            query.get("syncToken").map(|value| value.as_ref()),
+            sync_token
+        );
+        for bound in ["timeMin", "timeMax"] {
+            assert_eq!(
+                query.contains_key(bound),
+                sync_token.is_none(),
+                "{bound}: {request}"
+            );
+        }
+    }
+
     fn remote_event(id: &str) -> serde_json::Value {
         json!({
             "id": id,
@@ -1336,10 +1362,8 @@ mod recurrence_sync_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(requests.len(), 3);
-            assert!(requests[1].contains("singleEvents=true"));
-            assert!(!requests[1].contains("syncToken="));
-            assert!(requests[2].contains("syncToken=old-token"));
-            assert!(!requests[2].contains("timeMin="));
+            assert_events_query(&requests[1], None);
+            assert_events_query(&requests[2], Some("old-token"));
         }
     }
 
@@ -1408,11 +1432,9 @@ mod recurrence_sync_tests {
 
             let requests = captured.await.unwrap();
             assert_eq!(requests.len(), if has_token { 3 } else { 2 });
-            assert!(!requests[1].contains("syncToken="));
-            assert!(requests[1].contains("singleEvents=true"));
+            assert_events_query(&requests[1], None);
             if has_token {
-                assert!(requests[2].contains("syncToken=old-token"));
-                assert!(!requests[2].contains("singleEvents="));
+                assert_events_query(&requests[2], Some("old-token"));
             }
             let conn = db.reader();
             for (id, expected) in [
@@ -1526,12 +1548,10 @@ mod recurrence_sync_tests {
             let requests = captured.await.unwrap();
             assert_eq!(requests.len(), if metadata_read { 3 } else { 2 });
             if metadata_read {
-                assert!(requests[1].contains("singleEvents=true"));
-                assert!(!requests[1].contains("syncToken="));
+                assert_events_query(&requests[1], None);
             }
             let normal_request = requests.last().unwrap();
-            assert_eq!(normal_request.contains("syncToken=old-token"), incremental);
-            assert_eq!(normal_request.contains("singleEvents=true"), !incremental);
+            assert_events_query(normal_request, incremental.then_some("old-token"));
             let conn = db.reader();
             let after =
                 serde_json::to_value(db::calendar::get_event(&conn, "cached").unwrap()).unwrap();
@@ -1588,11 +1608,9 @@ mod recurrence_sync_tests {
 
         let requests = captured.await.unwrap();
         assert_eq!(requests.len(), 5);
-        assert!(requests[1].contains("singleEvents=true"));
-        assert!(!requests[1].contains("syncToken="));
-        assert!(requests[2].contains("syncToken=old-token"));
-        assert!(requests[4].contains("syncToken=delta-token"));
-        assert!(!requests[4].contains("singleEvents="));
+        assert_events_query(&requests[1], None);
+        assert_events_query(&requests[2], Some("old-token"));
+        assert_events_query(&requests[4], Some("delta-token"));
         let conn = db.reader();
         assert_eq!(
             db::calendar::get_event(&conn, "cached")
@@ -1663,7 +1681,8 @@ mod recurrence_sync_tests {
             .unwrap();
             let requests = captured.await.unwrap();
             assert_eq!(requests.len(), 3);
-            assert!(requests[2].contains("syncToken=old-token"));
+            assert_events_query(&requests[1], None);
+            assert_events_query(&requests[2], Some("old-token"));
             let conn = db.reader();
             let token: Option<String> = conn
                 .query_row(

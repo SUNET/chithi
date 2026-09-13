@@ -135,14 +135,14 @@ function isCurrentSelection(id: string, version: number): boolean {
   return calendarStore.selectedEvent?.id === id && selectionVersion === version;
 }
 
-async function refreshNotificationTarget(eventId: string) {
+async function refreshMutationTarget(eventId: string, purpose: "attendee notification" | "deletion") {
   try {
     const fresh = await calendarStore.refreshSingleEvent(eventId);
     const support = calendarMutationSupport(fresh);
     if (!support.supported) throw new Error(support.reason);
     return fresh;
   } catch (cause) {
-    throw new Error(`Could not verify the event for attendee notification. Please try again. ${String(cause)}`);
+    throw new Error(`Could not verify the event for ${purpose}. Please try again. ${String(cause)}`);
   }
 }
 
@@ -190,7 +190,7 @@ async function saveEdit() {
     }
 
     if (!isCurrentSelection(original.id, version)) return;
-    const fresh = await refreshNotificationTarget(notifyEventId);
+    const fresh = await refreshMutationTarget(notifyEventId, "attendee notification");
     if (!isCurrentSelection(original.id, version)) return;
     // Notify attendees if organizer and event has attendees
     if (canNotify(fresh)) {
@@ -208,7 +208,7 @@ async function saveEdit() {
       if (!isCurrentSelection(original.id, version)) return;
       // A background range refresh can evict the moved destination while
       // the dialog is open. Revalidate the captured target, not the source.
-      const notificationTarget = await refreshNotificationTarget(notifyEventId);
+      const notificationTarget = await refreshMutationTarget(notifyEventId, "attendee notification");
       if (!isCurrentSelection(original.id, version)) return;
       if ((result === "Send Update" || result === "Yes") && canNotify(notificationTarget)) {
         await api.notifyCalendarEvent(notifyEventId);
@@ -233,25 +233,21 @@ async function handleDelete() {
   saving.value = true;
   error.value = null;
   try {
-    const fresh = await refreshNotificationTarget(original.id);
+    const fresh = await refreshMutationTarget(original.id, "deletion");
     if (!isCurrentSelection(original.id, version)) return;
     if (canNotify(fresh)) {
       const result = await tauriMessage(
-        "This event has attendees. Send a cancellation notification?",
+        "Delete this event with attendees? Chithi does not send manual cancellation notifications. Your calendar provider may notify attendees automatically.",
         {
-          title: "Notify Attendees",
+          title: "Delete Event",
           kind: "warning",
-          buttons: { yes: "Send Cancellation", no: "Delete Only", cancel: "Cancel" },
+          buttons: { ok: "Delete", cancel: "Cancel" },
         },
       );
-      if (result === "Cancel") return;
+      if (result !== "Delete" && result !== "Ok") return;
       if (!isCurrentSelection(original.id, version)) return;
-      const notificationTarget = await refreshNotificationTarget(original.id);
+      await refreshMutationTarget(original.id, "deletion");
       if (!isCurrentSelection(original.id, version)) return;
-      if ((result === "Send Cancellation" || result === "Yes") && canNotify(notificationTarget)) {
-        // TODO: Send METHOD:CANCEL iCalendar to attendees
-        await api.notifyCalendarEvent(original.id);
-      }
     }
 
     if (!isCurrentSelection(original.id, version) ||

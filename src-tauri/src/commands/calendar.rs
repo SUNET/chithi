@@ -515,6 +515,76 @@ async fn create_event_inner(
     event: NewEventInput,
     move_source: Option<&MoveSourceSnapshot>,
 ) -> Result<String> {
+    Ok(create_event_with_receipt(state, event, move_source)
+        .await?
+        .event
+        .id)
+}
+
+/// The receipt is captured at insertion, not after provider I/O, so a move
+/// cannot accept a different destination row that appeared while publishing.
+#[derive(Debug)]
+struct CreatedEventReceipt {
+    event: CalendarEvent,
+    revision: i64,
+    calendar: db::calendar::Calendar,
+}
+
+impl CreatedEventReceipt {
+    fn ensure_current(&self, conn: &rusqlite::Connection) -> Result<()> {
+        if conn.is_autocommit() {
+            return Err(crate::error::Error::Other(
+                "Creation receipt validation requires a database transaction.".into(),
+            ));
+        }
+        let event = db::calendar::get_event(conn, &self.event.id)?;
+        let calendar = db::calendar::get_calendar(conn, &self.calendar.id)?;
+        if event != self.event
+            || db::calendar_revision::get(conn, &self.event.id)? != self.revision
+            || calendar.account_id != self.calendar.account_id
+            || calendar.remote_id != self.calendar.remote_id
+            || calendar.is_subscribed != self.calendar.is_subscribed
+        {
+            return Err(crate::error::Error::Other(
+                "Created event or destination calendar changed. Refresh before trying again."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Attach only this operation's provider identity and advance its receipt in
+/// one transaction. Never bless intervening writes by taking a fresh snapshot.
+async fn attach_created_event_identity(
+    state: &AppState,
+    created: &mut CreatedEventReceipt,
+    pushed: crate::backend::calendar::PushedEvent,
+) -> Result<()> {
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    created.ensure_current(&transaction)?;
+    let mut event = created.event.clone();
+    event.remote_id = Some(pushed.remote_id);
+    if let Some(uid) = pushed.canonical_uid {
+        event.uid = Some(uid);
+    }
+    transaction.execute(
+        "UPDATE calendar_events SET remote_id = ?1, uid = ?2 WHERE id = ?3",
+        rusqlite::params![event.remote_id, event.uid, event.id],
+    )?;
+    let revision = db::calendar_revision::get(&transaction, &event.id)?;
+    transaction.commit()?;
+    created.event = event;
+    created.revision = revision;
+    Ok(())
+}
+
+async fn create_event_with_receipt(
+    state: &AppState,
+    event: NewEventInput,
+    move_source: Option<&MoveSourceSnapshot>,
+) -> Result<CreatedEventReceipt> {
     log::info!(
         "create_event: account={} calendar={} title='{}' attendees={}",
         event.account_id,
@@ -580,7 +650,7 @@ async fn create_event_inner(
     };
 
     // Insert the event and transfer meeting ownership in one transaction.
-    let (account, remote_cal_id) = {
+    let (account, mut created) = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
         if let Some(source) = move_source {
@@ -593,11 +663,10 @@ async fn create_event_inner(
         // creates the event on that specific calendar; Google/Graph
         // write to their default calendar and ignore it.
         check_target_calendar(&transaction, &cal_event.calendar_id, &cal_event.account_id)?;
-        let remote_cal_id = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)?
-            .remote_id
-            .unwrap_or_default();
+        let calendar = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)?;
+        let remote_cal_id = calendar.remote_id.as_deref().unwrap_or_default();
         if let Some(backend) = crate::backend::calendar::for_account(&account) {
-            backend.validate_event_creation(&cal_event, &remote_cal_id)?;
+            backend.validate_event_creation(&cal_event, remote_cal_id)?;
         }
         db::calendar::insert_event(&transaction, &cal_event)?;
         if cal_event.recurrence_kind == RecurrenceKind::Series {
@@ -606,23 +675,29 @@ async fn create_event_inner(
         if let Some(ref binding) = meet_binding {
             claim_meet_binding(&transaction, &id, binding)?;
         }
+        let created = CreatedEventReceipt {
+            event: cal_event.clone(),
+            revision: db::calendar_revision::get(&transaction, &id)?,
+            calendar,
+        };
         transaction.commit()?;
-        (account, remote_cal_id)
+        (account, created)
     };
     drop(_lifecycle_guard);
 
     if let Some(backend) = crate::backend::calendar::for_account(&account) {
+        let remote_cal_id = created.calendar.remote_id.as_deref().unwrap_or_default();
         if remote_cal_id.is_empty() {
             log::warn!(
                 "create_event: no remote calendar ID for local calendar '{}'",
                 cal_event.calendar_id
             );
         }
-        // Best-effort: the local insert above always stands; a failed
-        // push is logged and the event goes out with a later sync.
+        // Best-effort: a failed push does not roll back the local insert.
+        // Moves still require their unchanged local copy before source deletion.
         let ctx = calendar_backend_ctx(state);
         match backend
-            .push_created_event(&ctx, &account, &cal_event, &remote_cal_id)
+            .push_created_event(&ctx, &account, &cal_event, remote_cal_id)
             .await
         {
             Ok(Some(pushed)) => {
@@ -631,25 +706,16 @@ async fn create_event_inner(
                     backend.protocol(),
                     pushed.remote_id
                 );
-                let conn = state.db.writer().await;
-                conn.execute(
-                    "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
-                    rusqlite::params![pushed.remote_id, id],
-                )
-                .ok();
-                // Update the local UID to the server's canonical UID
-                // (Google iCalUID / Exchange iCalUid) so incoming RSVP
-                // replies can be matched back to the event.
-                if let Some(ref canonical_uid) = pushed.canonical_uid {
-                    conn.execute(
-                        "UPDATE calendar_events SET uid = ?1 WHERE id = ?2",
-                        rusqlite::params![canonical_uid, id],
-                    )
-                    .ok();
-                    log::info!(
-                        "create_event: updated local UID to canonical UID={}",
-                        canonical_uid
+                if let Err(error) = attach_created_event_identity(state, &mut created, pushed).await
+                {
+                    log::error!(
+                        "create_event: remote creation succeeded but identity attachment failed for {id}: {error}"
                     );
+                    if move_source.is_some() {
+                        return Err(crate::error::Error::Other(format!(
+                            "Event copy {id} was created remotely, but its local identity could not be saved; the source was not removed: {error}"
+                        )));
+                    }
                 }
             }
             Ok(None) => {} // provider defers the push to its next sync
@@ -666,7 +732,7 @@ async fn create_event_inner(
     }
 
     log::info!("create_event: created event id={}", id);
-    Ok(id)
+    Ok(created)
 }
 
 #[tauri::command]
@@ -1086,6 +1152,15 @@ async fn delete_event_inner(
     event_id: String,
     expected: Option<&MoveSourceSnapshot>,
 ) -> Result<()> {
+    delete_event_with_destination(state, event_id, expected, None).await
+}
+
+async fn delete_event_with_destination(
+    state: &AppState,
+    event_id: String,
+    expected: Option<&MoveSourceSnapshot>,
+    destination: Option<&CreatedEventReceipt>,
+) -> Result<()> {
     log::info!("delete_event: id={}", event_id);
 
     // Check recurrence and capture remote targets in the same transaction as
@@ -1094,6 +1169,9 @@ async fn delete_event_inner(
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
         let evt = checked_mutation_target(&transaction, &event_id, expected)?;
+        if let Some(destination) = destination {
+            destination.ensure_current(&transaction)?;
+        }
         let acc = db::accounts::get_account_full(&transaction, &evt.account_id)?;
         let cal = db::calendar::get_calendar(&transaction, &evt.calendar_id).ok();
         let cal_rid = cal
@@ -1198,7 +1276,7 @@ async fn move_event_to_calendar_inner(
             crate::error::Error::Other("Cannot move event with malformed attendees.".into())
         })?
         .unwrap_or_default();
-    let copied_id = create_event_inner(
+    let copied = create_event_with_receipt(
         state,
         NewEventInput {
             account_id: target_account_id,
@@ -1217,12 +1295,15 @@ async fn move_event_to_calendar_inner(
         Some(&snapshot),
     )
     .await?;
-    if let Err(error) = delete_event_inner(state, event_id, Some(&snapshot)).await {
+    let copied_id = &copied.event.id;
+    if let Err(error) =
+        delete_event_with_destination(state, event_id, Some(&snapshot), Some(&copied)).await
+    {
         return Err(crate::error::Error::Other(format!(
-            "Event copy {copied_id} was created, but the source was not removed: {error}"
+            "Event copy {copied_id} was created, but the move could not be completed; the source was not removed: {error}"
         )));
     }
-    Ok(copied_id)
+    Ok(copied.event.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2036,7 +2117,7 @@ pub async fn send_invites(
     send_invites_inner(&state, account_id, event_id, attendee_emails).await
 }
 
-/// Notifications attached to ordinary edits/deletes never inherit the series
+/// Notifications attached to ordinary edits/moves never inherit the series
 /// creation exemption, even if the renderer is using stale event metadata.
 #[tauri::command]
 pub async fn notify_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<()> {
