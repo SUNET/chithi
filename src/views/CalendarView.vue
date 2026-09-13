@@ -267,38 +267,33 @@ function tryParseAttendees(json: string | null): Array<{ email: string }> {
 }
 
 function isOrganizer(accountId: string, organizerEmail: string | null): boolean {
-  if (!organizerEmail) return true;
+  if (!organizerEmail) return false;
   const account = accountsStore.accounts.find((a) => a.id === accountId);
-  return account?.email === organizerEmail;
+  return account?.email.toLowerCase() === organizerEmail.toLowerCase();
 }
 
 async function promptAttendeeNotification(
-  accountId: string,
   eventId: string,
-  attendeesJson: string | null,
-  organizerEmail: string | null,
   version: number,
 ) {
-  const attendees = tryParseAttendees(attendeesJson);
-  if (attendees.length === 0 || selectionVersion !== version ||
-    !isOrganizer(accountId, organizerEmail)) return;
-
+  if (selectionVersion !== version) return;
   const refreshTarget = async () => {
     const fresh = await calendarStore.refreshSingleEvent(eventId);
     const support = calendarMutationSupport(fresh);
     if (!support.supported) throw new Error(support.reason);
+    return fresh;
   };
 
   try {
-    if (!calendarStore.getEventMutationSupport(eventId).supported) {
-      await refreshTarget();
-      if (selectionVersion !== version) return;
-    }
+    const fresh = await refreshTarget();
+    if (selectionVersion !== version || tryParseAttendees(fresh.attendees_json).length === 0 ||
+      !isOrganizer(fresh.account_id, fresh.organizer_email)) return;
     const send = await confirm("This event has attendees. Send an update notification?");
     if (!send || selectionVersion !== version) return;
-    await refreshTarget();
-    if (selectionVersion !== version) return;
-    await api.notifyCalendarEvent(accountId, eventId, attendees.map((a) => a.email));
+    const target = await refreshTarget();
+    if (selectionVersion !== version || tryParseAttendees(target.attendees_json).length === 0 ||
+      !isOrganizer(target.account_id, target.organizer_email)) return;
+    await api.notifyCalendarEvent(eventId);
     showToast("Update sent to attendees", "success");
   } catch (e) {
     if (selectionVersion !== version) return;
@@ -315,7 +310,6 @@ async function onEventReschedule(payload: {
   organizerEmail: string | null;
 }) {
   if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
-  const original = calendarStore.getCachedEvent(payload.eventId)!;
   const version = selectionVersion;
   const toastId = showToast("Moving event...", "info", 0);
   try {
@@ -326,8 +320,7 @@ async function onEventReschedule(payload: {
     dismissToast(toastId);
     showToast("Event rescheduled", "success");
 
-    await promptAttendeeNotification(original.account_id, payload.eventId,
-      payload.attendeesJson, payload.organizerEmail, version);
+    await promptAttendeeNotification(payload.eventId, version);
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);
@@ -354,12 +347,9 @@ async function onCalendarDrop(payload: {
     );
     dismissToast(toastId);
     showToast("Event moved to calendar", "success");
-    // Use the destination account + new event ID for attendee notification
+    // Resolve notification eligibility from the persisted destination.
     await promptAttendeeNotification(
-      payload.targetAccountId,
       newId,
-      payload.attendeesJson,
-      payload.organizerEmail,
       version,
     );
   } catch (e) {

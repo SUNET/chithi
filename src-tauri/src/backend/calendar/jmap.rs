@@ -255,6 +255,14 @@ impl CalendarBackend for JmapCalendarBackend {
         }
     }
 
+    fn validate_event_creation(
+        &self,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<()> {
+        to_jmap_event(event, remote_calendar_id).map(|_| ())
+    }
+
     async fn push_created_event(
         &self,
         ctx: &CalendarBackendCtx<'_>,

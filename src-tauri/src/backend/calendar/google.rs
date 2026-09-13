@@ -635,6 +635,10 @@ impl CalendarBackend for GoogleCalendarBackend {
         }
     }
 
+    fn validate_event_creation(&self, event: &CalendarEvent, _: &str) -> Result<()> {
+        event_to_google_json(event).map(|_| ())
+    }
+
     /// Google events are always created on the primary calendar (the
     /// pre-trait behaviour); `remote_calendar_id` is ignored.
     async fn push_created_event(

@@ -7,7 +7,7 @@ import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC 
 import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
-import type { Calendar } from "@/lib/types";
+import type { Calendar, CalendarEvent } from "@/lib/types";
 import TimeInput from "@/components/common/TimeInput.vue";
 import DateInput from "@/components/common/DateInput.vue";
 import LinkifiedText from "@/components/common/LinkifiedText.vue";
@@ -59,13 +59,11 @@ const attendees = computed<Attendee[]>(() => {
   try { return JSON.parse(event.value.attendees_json); } catch { return []; }
 });
 
-const hasAttendees = computed(() => attendees.value.length > 0);
-
-const isOrganizer = computed(() => {
-  if (!event.value?.organizer_email) return true; // No organizer set = you created it
-  const account = accountsStore.accounts.find(a => a.id === event.value?.account_id);
-  return account?.email === event.value.organizer_email;
-});
+function canNotify(current: CalendarEvent): boolean {
+  const account = accountsStore.accounts.find(a => a.id === current.account_id);
+  if (!current.organizer_email || account?.email.toLowerCase() !== current.organizer_email.toLowerCase()) return false;
+  try { return JSON.parse(current.attendees_json || "[]").length > 0; } catch { return false; }
+}
 
 const calendarInfo = computed(() => {
   const cal = calendarStore.calendars.find(c => c.id === event.value?.calendar_id);
@@ -116,10 +114,6 @@ function statusClass(status: string | null): string {
   }
 }
 
-function getAttendees(): Array<{ email: string; name: string | null; status: string }> {
-  return attendees.value;
-}
-
 function startEditing() {
   if (saving.value || !event.value || !mutationSupport.value.supported) return;
   const current = event.value;
@@ -146,6 +140,7 @@ async function refreshNotificationTarget(eventId: string) {
     const fresh = await calendarStore.refreshSingleEvent(eventId);
     const support = calendarMutationSupport(fresh);
     if (!support.supported) throw new Error(support.reason);
+    return fresh;
   } catch (cause) {
     throw new Error(`Could not verify the event for attendee notification. Please try again. ${String(cause)}`);
   }
@@ -157,8 +152,6 @@ async function saveEdit() {
   const original = event.value;
   const version = selectionVersion;
   const targetCalendarId = editCalendarId.value;
-  const notifyAttendees = hasAttendees.value && isOrganizer.value;
-  const emails = attendees.value.map(a => a.email);
   saving.value = true;
   error.value = null;
   try {
@@ -180,13 +173,11 @@ async function saveEdit() {
       all_day: editAllDay.value,
       timezone: original.timezone,
       recurrence_rule: original.recurrence_rule,
-      attendees: getAttendees(),
     });
 
     if (!isCurrentSelection(original.id, version) ||
       !calendarStore.getEventMutationSupport(original.id).supported) return;
 
-    let notifyAccountId = original.account_id;
     let notifyEventId = original.id;
     if (targetCalendarId !== original.calendar_id) {
       const target = calendarStore.calendars.find(
@@ -196,16 +187,13 @@ async function saveEdit() {
       notifyEventId = await calendarStore.moveEventToCalendar(
         original.id, target.id, target.account_id,
       );
-      notifyAccountId = target.account_id;
     }
 
     if (!isCurrentSelection(original.id, version)) return;
-    if (!calendarStore.getEventMutationSupport(notifyEventId).supported) {
-      await refreshNotificationTarget(notifyEventId);
-      if (!isCurrentSelection(original.id, version)) return;
-    }
+    const fresh = await refreshNotificationTarget(notifyEventId);
+    if (!isCurrentSelection(original.id, version)) return;
     // Notify attendees if organizer and event has attendees
-    if (notifyAttendees) {
+    if (canNotify(fresh)) {
       const result = await tauriMessage(
         "This event has attendees. Send an update notification?",
         {
@@ -220,11 +208,10 @@ async function saveEdit() {
       if (!isCurrentSelection(original.id, version)) return;
       // A background range refresh can evict the moved destination while
       // the dialog is open. Revalidate the captured target, not the source.
-      await refreshNotificationTarget(notifyEventId);
+      const notificationTarget = await refreshNotificationTarget(notifyEventId);
       if (!isCurrentSelection(original.id, version)) return;
-      if (result === "Send Update" || result === "Yes") {
-        const accountId = notifyAccountId || accountsStore.activeAccountId || "";
-        await api.notifyCalendarEvent(accountId, notifyEventId, emails);
+      if ((result === "Send Update" || result === "Yes") && canNotify(notificationTarget)) {
+        await api.notifyCalendarEvent(notifyEventId);
       }
     }
 
@@ -243,11 +230,12 @@ async function handleDelete() {
   if (saving.value || !event.value || !mutationSupport.value.supported) return;
   const original = event.value;
   const version = selectionVersion;
-  const emails = attendees.value.map(a => a.email);
   saving.value = true;
   error.value = null;
   try {
-    if (hasAttendees.value && isOrganizer.value) {
+    const fresh = await refreshNotificationTarget(original.id);
+    if (!isCurrentSelection(original.id, version)) return;
+    if (canNotify(fresh)) {
       const result = await tauriMessage(
         "This event has attendees. Send a cancellation notification?",
         {
@@ -258,12 +246,11 @@ async function handleDelete() {
       );
       if (result === "Cancel") return;
       if (!isCurrentSelection(original.id, version)) return;
-      await refreshNotificationTarget(original.id);
+      const notificationTarget = await refreshNotificationTarget(original.id);
       if (!isCurrentSelection(original.id, version)) return;
-      if (result === "Send Cancellation" || result === "Yes") {
+      if ((result === "Send Cancellation" || result === "Yes") && canNotify(notificationTarget)) {
         // TODO: Send METHOD:CANCEL iCalendar to attendees
-        const accountId = original.account_id || accountsStore.activeAccountId || "";
-        await api.notifyCalendarEvent(accountId, original.id, emails);
+        await api.notifyCalendarEvent(original.id);
       }
     }
 
@@ -331,10 +318,10 @@ async function handleDelete() {
           <span>Organizer: {{ event.organizer_email }}</span>
         </div>
 
-        <div v-if="getAttendees().length > 0" class="detail-row">
+        <div v-if="attendees.length > 0" class="detail-row">
           <span class="detail-icon">&#x1F465;</span>
           <div>
-            <div v-for="a in getAttendees()" :key="a.email" class="attendee">
+            <div v-for="a in attendees" :key="a.email" class="attendee">
               {{ a.name || a.email }}
               <span class="attendee-status" :class="statusClass(a.status)">
                 ({{ a.status }})

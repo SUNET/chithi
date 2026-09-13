@@ -53,7 +53,7 @@ function event(patch: Partial<CalendarEvent> = {}): CalendarEvent {
     end_time: "2026-09-08T10:00:00.000Z",
     all_day: false, timezone: "UTC", recurrence_rule: null,
     recurrence_kind: "standalone",
-    organizer_email: null,
+    organizer_email: "me@example.test",
     attendees_json: '[{"email":"guest@example.test","name":null,"status":"accepted"}]',
     my_status: null, source_message_id: null,
     ...patch,
@@ -95,7 +95,7 @@ function setup(selected = event()) {
   store.events = [{ ...selected }];
   store.selectEvent({ ...selected });
   useUiStore().displayTimezone = "Europe/Stockholm";
-  vi.mocked(api.getEvents).mockImplementation(async () => [...store.events]);
+  vi.mocked(api.getEvents).mockImplementation(async (accountId) => store.events.filter(e => e.account_id === accountId));
   vi.mocked(api.getCalendarEvent).mockImplementation(async (id) => {
     const current = store.events.find((candidate) => candidate.id === id);
     if (!current) throw new Error("Event unavailable");
@@ -259,7 +259,7 @@ describe("calendar mutation safety", () => {
       title: "Edited appointment", start_time: event().start_time, end_time: event().end_time,
     }));
     expect(api.updateEvent).toHaveBeenCalledTimes(1);
-    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("acc1", event().id, ["guest@example.test"]);
+    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(wrapper.emitted("close")).toBeTruthy();
   });
@@ -272,7 +272,7 @@ describe("calendar mutation safety", () => {
     await flushPromises();
     expect(remove).toHaveBeenCalledExactlyOnceWith(event().id);
     expect(api.deleteEvent).toHaveBeenCalledExactlyOnceWith(event().id);
-    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("acc1", event().id, ["guest@example.test"]);
+    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(store.selectedEvent).toBeNull();
     expect(wrapper.emitted("close")).toBeTruthy();
@@ -284,6 +284,7 @@ describe("calendar mutation safety", () => {
     vi.mocked(message).mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
     const wrapper = detail();
     await wrapper.get(".btn-danger").trigger("click");
+    await flushPromises();
     expect(message).toHaveBeenCalledTimes(1);
     store.events = [event({ recurrence_kind: "occurrence" })];
     answer("Yes");
@@ -368,6 +369,7 @@ describe("exact-ID post-mutation refresh", () => {
 
   it.each(["cal1", "cal2", "cross-account"])("completes an out-of-week edit and %s move before notifying and closing", async (destination) => {
     const store = setup();
+    useAccountsStore().accounts.push({ ...useAccountsStore().accounts[0], id: "acc2" });
     let persisted = event();
     if (destination === "cross-account") store.calendars[1].account_id = "acc2";
     vi.mocked(api.updateEvent).mockImplementationOnce(async (_id, patch) => {
@@ -397,7 +399,7 @@ describe("exact-ID post-mutation refresh", () => {
       expect(api.moveEventToCalendar).toHaveBeenCalledExactlyOnceWith(event().id, "cal2", destination === "cross-account" ? "acc2" : "acc1");
     }
     expect(message).toHaveBeenCalledTimes(1);
-    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(persisted.account_id, persisted.id, ["guest@example.test"]);
+    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(persisted.id);
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(wrapper.emitted("close")).toHaveLength(1);
     expect(store.events).toEqual([]);
@@ -461,7 +463,7 @@ describe("exact-ID post-mutation refresh", () => {
     else await vm.onCalendarDrop(payload);
     expect(window.confirm).toHaveBeenCalledTimes(1);
     expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(
-      "acc1", operation === "reschedule" ? event().id : "moved-event", ["guest@example.test"],
+      operation === "reschedule" ? event().id : "moved-event",
     );
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(store.visibleEvents).toEqual([]);
@@ -574,6 +576,7 @@ describe("notification target revalidation after modal resolution", () => {
 
   async function pendingDetailNotification(eraseBeforePrompt = false) {
     const store = setup();
+    useAccountsStore().accounts.push({ ...useAccountsStore().accounts[0], id: "acc2" });
     store.calendars[1].account_id = "acc2";
     vi.mocked(api.getCalendarEvent).mockImplementation(async (id) => {
       if (id === event().id) return event(outside);
@@ -618,7 +621,7 @@ describe("notification target revalidation after modal resolution", () => {
     await flushPromises();
     expect(api.getCalendarEvent).toHaveBeenCalledTimes(reads + 1);
     expect(api.getCalendarEvent).toHaveBeenLastCalledWith("moved-event");
-    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("acc2", "moved-event", ["guest@example.test"]);
+    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("moved-event");
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(wrapper.emitted("close")).toHaveLength(1);
     expect(store.visibleEvents).toEqual([]);
@@ -669,6 +672,7 @@ describe("notification target revalidation after modal resolution", () => {
 
   it.each(["standalone", "occurrence", "unknown", "read failure", "selection changed"])("CalendarView revalidates its captured target after confirm: %s", async (state) => {
     const store = setup();
+    useAccountsStore().accounts.push({ ...useAccountsStore().accounts[0], id: "acc2" });
     usePlatformStore().width = 1280;
     const wrapper = calendarView();
     await flushPromises();
@@ -695,7 +699,7 @@ describe("notification target revalidation after modal resolution", () => {
     answer(true);
     await operation;
     if (state === "standalone") {
-      expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("acc2", "moved-event", ["guest@example.test"]);
+      expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith("moved-event");
     } else {
       expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
       if (state !== "selection changed") {
@@ -705,6 +709,65 @@ describe("notification target revalidation after modal resolution", () => {
       }
     }
     expect(api.sendInvites).not.toHaveBeenCalled();
+  });
+});
+
+describe("fresh notification participants", () => {
+  it.each(["edit", "delete", "reschedule"])("uses fresh attendees after the %s dialog without an attendee edit patch", async (operation) => {
+    const store = setup();
+    const changed = event({ attendees_json: '[{"email":"new@example.test","name":"New guest","status":"accepted","is_self":false}]' });
+    vi.mocked(message).mockImplementationOnce(async () => {
+      store.events = [changed];
+      return "Yes";
+    });
+    vi.mocked(window.confirm).mockImplementationOnce(() => {
+      store.events = [changed];
+      return true;
+    });
+    if (operation === "reschedule") {
+      const wrapper = calendarView();
+      await flushPromises();
+      await (wrapper.vm as unknown as { onEventReschedule(p: object): Promise<void> }).onEventReschedule({
+        eventId: event().id, newStart: event().start_time, newEnd: event().end_time,
+        attendeesJson: null, organizerEmail: "stale@example.test",
+      });
+    } else {
+      const wrapper = detail();
+      if (operation === "edit") {
+        await wrapper.get(".btn-edit").trigger("click");
+        await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+      } else await wrapper.get(".btn-danger").trigger("click");
+      await flushPromises();
+    }
+    expect(api.notifyCalendarEvent).toHaveBeenCalledExactlyOnceWith(event().id);
+    for (const [, patch] of vi.mocked(api.updateEvent).mock.calls) {
+      expect(patch).not.toHaveProperty("attendees");
+    }
+  });
+
+  it.each(["edit", "delete", "reschedule"])("does not notify after organizer changes during the %s dialog", async (operation) => {
+    const store = setup();
+    const changeOrganizer = () => { store.events = [event({ organizer_email: "other@example.test" })]; };
+    vi.mocked(message).mockImplementationOnce(async () => { changeOrganizer(); return "Yes"; });
+    vi.mocked(window.confirm).mockImplementationOnce(() => { changeOrganizer(); return true; });
+    if (operation === "reschedule") {
+      const wrapper = calendarView();
+      await flushPromises();
+      await (wrapper.vm as unknown as { onEventReschedule(p: object): Promise<void> }).onEventReschedule({
+        eventId: event().id, newStart: event().start_time, newEnd: event().end_time,
+        attendeesJson: event().attendees_json, organizerEmail: event().organizer_email,
+      });
+      expect(window.confirm).toHaveBeenCalledTimes(1);
+    } else {
+      const wrapper = detail();
+      if (operation === "edit") {
+        await wrapper.get(".btn-edit").trigger("click");
+        await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+      } else await wrapper.get(".btn-danger").trigger("click");
+      await flushPromises();
+      expect(message).toHaveBeenCalledTimes(1);
+    }
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
   });
 });
 

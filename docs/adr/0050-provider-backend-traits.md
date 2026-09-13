@@ -33,14 +33,21 @@ targets and enforces it before local writes, meeting cleanup or provider
 calls. The backend `move_event_to_calendar` command owns source preflight,
 cross-account copy and guarded source deletion.
 
-Ordinary notifications use standalone-only `notify_calendar_event`;
+Ordinary notifications use standalone-only `notify_calendar_event`, accepting
+only an event ID and deriving account, organizer eligibility and attendees
+from persisted state without rewriting attendee metadata;
 creation invitations use `send_invites`, which also permits known series.
 Delivery revalidates the event snapshot after asynchronous transport
-preparation, before each submission and before attendee writes. The store
+preparation, before each submission and before creation attendee writes. The store
 owns exact-ID detail/capability refresh via `get_calendar_event`, independent
 of the rendered date range; backend guards remain authoritative.
 
-Provider creation also protects recurrence evidence: JMAP rejects unknown,
+Provider-owned pure `validate_event_creation` preflight reuses payload
+validation for all four calendar backends. The command invokes it inside
+the creation transaction before event insertion or pending meeting claim.
+Unsupported Google/Graph series creation therefore fails without reporting
+a committed local event as success; post-commit runtime pushes remain
+best-effort. Provider creation also protects recurrence evidence: JMAP rejects unknown,
 occurrence and unrepresentable series payloads before creation. CalDAV's
 deferred pass preserves usable retained ICS verbatim, including occurrence
 identity, or generates only representable known-local data. Both deferred
