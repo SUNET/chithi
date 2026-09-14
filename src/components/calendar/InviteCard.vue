@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, watch } from "vue";
 import type { ParsedInvite } from "@/lib/types";
-import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone } from "@/lib/datetime";
 import * as api from "@/lib/tauri";
@@ -9,39 +8,47 @@ import * as api from "@/lib/tauri";
 const props = defineProps<{
   invite: ParsedInvite;
   messageId: string;
+  sourceAccountId: string;
 }>();
 
-const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 const responding = ref(false);
 const responded = ref<string | null>(null);
 const error = ref<string | null>(null);
 
-onMounted(async () => {
-  const accountId = accountsStore.activeAccountId;
-  if (!accountId || !props.invite.uid) return;
-  try {
-    const status = await api.getInviteStatus(accountId, props.invite.uid);
-    if (status) {
-      responded.value = status;
+let statusRequest = 0;
+watch(
+  () => [props.sourceAccountId, props.invite.uid] as const,
+  async ([accountId, inviteUid]) => {
+    const request = ++statusRequest;
+    responded.value = null;
+    if (!inviteUid) return;
+    try {
+      const status = await api.getInviteStatus(accountId, inviteUid);
+      if (request === statusRequest && status) {
+        responded.value = status;
+      }
+    } catch {
+      // Ignore status lookup failures; responding remains available.
     }
-  } catch {
-    // ignore
-  }
-});
+  },
+  { immediate: true },
+);
 
 function formatDateTime(iso: string): string {
   return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
 }
 
 async function respond(response: string) {
-  const accountId = accountsStore.activeAccountId;
-  if (!accountId) return;
-
   responding.value = true;
   error.value = null;
   try {
-    await api.respondToInvite(accountId, props.messageId, props.invite.uid, response);
+    await api.respondToInvite(
+      props.sourceAccountId,
+      props.messageId,
+      props.invite.uid,
+      response,
+    );
     responded.value = response;
   } catch (e) {
     error.value = String(e);

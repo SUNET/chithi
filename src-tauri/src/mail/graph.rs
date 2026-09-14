@@ -3151,28 +3151,231 @@ fn graph_time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
     }
 }
 
+fn recurring_graph_time(
+    timestamp: &str,
+    all_day: bool,
+    timezone: Option<&str>,
+) -> Result<(serde_json::Value, chrono::NaiveDateTime)> {
+    use chrono::TimeZone as _;
+
+    if all_day {
+        let date = chrono::NaiveDate::parse_from_str(
+            timestamp.split('T').next().unwrap_or_default(),
+            "%Y-%m-%d",
+        )
+        .map_err(|_| Error::Other("Recurring all-day event has an invalid date".into()))?;
+        let local = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| Error::Other("Recurring all-day event has an invalid time".into()))?;
+        return Ok((
+            serde_json::json!({"dateTime": local.format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"}),
+            local,
+        ));
+    }
+
+    let instant = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|_| Error::Other("Recurring event has an invalid timestamp".into()))?
+        .with_timezone(&chrono::Utc);
+    let timezone = timezone
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("UTC");
+    let resolved = crate::calendar::timezone::windows_to_iana(timezone).unwrap_or(timezone);
+    let tz = resolved.parse::<chrono_tz::Tz>().map_err(|_| {
+        Error::Other(format!(
+            "Recurring event timezone is unsupported: {timezone}"
+        ))
+    })?;
+    let local = tz.from_utc_datetime(&instant.naive_utc()).naive_local();
+    Ok((
+        serde_json::json!({
+            "dateTime": local.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "timeZone": timezone,
+        }),
+        local,
+    ))
+}
+
+fn graph_weekday(day: chrono::Weekday) -> &'static str {
+    match day {
+        chrono::Weekday::Mon => "monday",
+        chrono::Weekday::Tue => "tuesday",
+        chrono::Weekday::Wed => "wednesday",
+        chrono::Weekday::Thu => "thursday",
+        chrono::Weekday::Fri => "friday",
+        chrono::Weekday::Sat => "saturday",
+        chrono::Weekday::Sun => "sunday",
+    }
+}
+
+fn graph_recurrence_json(
+    event: &crate::calendar::CalendarEvent,
+    start: chrono::NaiveDateTime,
+) -> Result<serde_json::Value> {
+    use chrono::Datelike as _;
+
+    let rule = event
+        .recurrence_rule
+        .as_deref()
+        .and_then(|rule| {
+            crate::calendar::recurrence::normalize_invitation_rrule(rule, event.timezone.as_deref())
+        })
+        .ok_or(Error::UnsupportedCapability {
+            protocol: "graph",
+            capability: "unrepresentable recurring event creation",
+        })?;
+    let fields: std::collections::HashMap<&str, &str> = rule
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .collect();
+    let interval = fields
+        .get("INTERVAL")
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|_| Error::Other("Recurring event has an invalid interval".into()))?
+        .unwrap_or(1);
+    let mut pattern = serde_json::json!({"interval": interval});
+    match fields.get("FREQ").copied() {
+        Some("DAILY") => pattern["type"] = serde_json::json!("daily"),
+        Some("WEEKLY") => {
+            let start_day = graph_weekday(start.weekday());
+            let days: Vec<&str> = fields
+                .get("BYDAY")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|day| match day {
+                            "MO" => Some("monday"),
+                            "TU" => Some("tuesday"),
+                            "WE" => Some("wednesday"),
+                            "TH" => Some("thursday"),
+                            "FR" => Some("friday"),
+                            "SA" => Some("saturday"),
+                            "SU" => Some("sunday"),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![start_day]);
+            if !days.contains(&start_day) {
+                return Err(Error::Other(
+                    "Graph recurrence would omit the invitation's first occurrence".into(),
+                ));
+            }
+            pattern["type"] = serde_json::json!("weekly");
+            pattern["daysOfWeek"] = serde_json::json!(days);
+            pattern["firstDayOfWeek"] = serde_json::json!("monday");
+        }
+        Some("MONTHLY") => {
+            pattern["type"] = serde_json::json!("absoluteMonthly");
+            pattern["dayOfMonth"] = serde_json::json!(start.day());
+        }
+        Some("YEARLY") => {
+            pattern["type"] = serde_json::json!("absoluteYearly");
+            pattern["month"] = serde_json::json!(start.month());
+            pattern["dayOfMonth"] = serde_json::json!(start.day());
+        }
+        _ => {
+            return Err(Error::UnsupportedCapability {
+                protocol: "graph",
+                capability: "recurring event frequency",
+            });
+        }
+    }
+
+    let start_date = start.date();
+    let timezone = event.timezone.as_deref().unwrap_or("UTC");
+    let mut range = serde_json::json!({
+        "startDate": start_date.format("%Y-%m-%d").to_string(),
+        "recurrenceTimeZone": timezone,
+    });
+    if let Some(count) = fields.get("COUNT") {
+        let count = count
+            .parse::<i32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| Error::Other("Graph recurrence count is out of range".into()))?;
+        range["type"] = serde_json::json!("numbered");
+        range["numberOfOccurrences"] = serde_json::json!(count);
+    } else if fields.contains_key("UNTIL") {
+        let rules =
+            crate::calendar::recurrence::rrule_to_jscalendar(&rule, event.timezone.as_deref())
+                .ok_or_else(|| Error::Other("Recurring event end date is invalid".into()))?;
+        let until = rules[0]["until"]
+            .as_str()
+            .and_then(|value| {
+                chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok()
+            })
+            .ok_or_else(|| Error::Other("Recurring event end date is invalid".into()))?;
+        let end_date = if until.time() < start.time() {
+            until.date() - chrono::Duration::days(1)
+        } else {
+            until.date()
+        };
+        if end_date < start_date {
+            return Err(Error::Other(
+                "Recurring event ends before its first occurrence".into(),
+            ));
+        }
+        range["type"] = serde_json::json!("endDate");
+        range["endDate"] = serde_json::json!(end_date.format("%Y-%m-%d").to_string());
+    } else {
+        range["type"] = serde_json::json!("noEnd");
+    }
+    Ok(serde_json::json!({"pattern": pattern, "range": range}))
+}
+
 /// Graph payload for creating an event. Includes the attendee list plus
 /// the organizer as an attendee with `response: organizer` — Exchange
-/// needs it to render the organizer row correctly. Recurrence is not represented
-/// by this creation payload.
+/// needs it to render the organizer row correctly. Recurring creation is
+/// limited to the subset that can be represented without changing semantics.
 pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> Result<serde_json::Value> {
-    if event.recurrence_kind != RecurrenceKind::Standalone
-        || event
-            .recurrence_rule
-            .as_deref()
-            .is_some_and(|rule| !rule.is_empty())
-    {
-        return Err(Error::UnsupportedCapability {
-            protocol: "graph",
-            capability: "recurring or unclassified event creation",
-        });
-    }
+    let (start, end, recurrence) = match event.recurrence_kind {
+        RecurrenceKind::Standalone
+            if event.recurrence_rule.as_deref().is_none_or(str::is_empty) =>
+        {
+            (
+                graph_time_json(&event.start_time, event.all_day),
+                graph_time_json(&event.end_time, event.all_day),
+                None,
+            )
+        }
+        RecurrenceKind::Series => {
+            if event
+                .ical_data
+                .as_deref()
+                .is_some_and(|raw| !crate::calendar::ical::is_rrule_only_series(raw))
+            {
+                return Err(Error::UnsupportedCapability {
+                    protocol: "graph",
+                    capability: "recurrence exceptions or additional dates",
+                });
+            }
+            let (start_json, local_start) =
+                recurring_graph_time(&event.start_time, event.all_day, event.timezone.as_deref())?;
+            let (end_json, _) =
+                recurring_graph_time(&event.end_time, event.all_day, event.timezone.as_deref())?;
+            (
+                start_json,
+                end_json,
+                Some(graph_recurrence_json(event, local_start)?),
+            )
+        }
+        _ => {
+            return Err(Error::UnsupportedCapability {
+                protocol: "graph",
+                capability: "recurring or unclassified event creation",
+            });
+        }
+    };
     let mut graph_event = serde_json::json!({
         "subject": event.title,
-        "start": graph_time_json(&event.start_time, event.all_day),
-        "end": graph_time_json(&event.end_time, event.all_day),
+        "start": start,
+        "end": end,
         "isAllDay": event.all_day,
     });
+    if let Some(recurrence) = recurrence {
+        graph_event["recurrence"] = recurrence;
+    }
     if let Some(ref desc) = event.description {
         graph_event["body"] = serde_json::json!({"contentType": "text", "content": desc});
     }
@@ -3477,9 +3680,90 @@ mod batch_tests {
 
 #[cfg(test)]
 mod recurrence_tests {
-    use super::parse_graph_event;
-    use crate::calendar::RecurrenceKind;
+    use super::{event_to_graph_json, parse_graph_event};
+    use crate::calendar::{CalendarEvent, RecurrenceKind};
     use serde_json::json;
+
+    fn recurring_event(rule: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: "local-event".into(),
+            account_id: "account".into(),
+            calendar_id: "calendar".into(),
+            uid: Some("series@example.test".into()),
+            title: "Recurring event".into(),
+            description: None,
+            location: None,
+            start_time: "2026-09-14T09:00:00Z".into(),
+            end_time: "2026-09-14T10:00:00Z".into(),
+            all_day: false,
+            timezone: Some("Europe/Stockholm".into()),
+            recurrence_rule: Some(rule.into()),
+            recurrence_kind: RecurrenceKind::Series,
+            organizer_email: None,
+            attendees_json: None,
+            my_status: None,
+            source_message_id: Some("message".into()),
+            ical_data: Some(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series@example.test\r\n\
+                 RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=4\r\n\
+                 END:VEVENT\r\nEND:VCALENDAR\r\n"
+                    .into(),
+            ),
+            remote_id: None,
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn recurring_creation_maps_supported_weekly_rule_and_local_time() {
+        let event = recurring_event("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=4");
+        let value = event_to_graph_json(&event).unwrap();
+
+        assert_eq!(value["start"]["dateTime"], "2026-09-14T11:00:00");
+        assert_eq!(value["start"]["timeZone"], "Europe/Stockholm");
+        assert_eq!(value["recurrence"]["pattern"]["type"], "weekly");
+        assert_eq!(value["recurrence"]["pattern"]["interval"], 2);
+        assert_eq!(
+            value["recurrence"]["pattern"]["daysOfWeek"],
+            json!(["monday", "wednesday"])
+        );
+        assert_eq!(value["recurrence"]["range"]["type"], "numbered");
+        assert_eq!(value["recurrence"]["range"]["numberOfOccurrences"], 4);
+        assert_eq!(
+            value["recurrence"]["range"]["recurrenceTimeZone"],
+            "Europe/Stockholm"
+        );
+    }
+
+    #[test]
+    fn recurring_creation_maps_daily_monthly_and_yearly_patterns() {
+        for (rule, pattern, field, expected) in [
+            ("FREQ=DAILY", "daily", "interval", json!(1)),
+            ("FREQ=MONTHLY", "absoluteMonthly", "dayOfMonth", json!(14)),
+            ("FREQ=YEARLY", "absoluteYearly", "month", json!(9)),
+        ] {
+            let event = recurring_event(rule);
+            let value = event_to_graph_json(&event).unwrap();
+            assert_eq!(value["recurrence"]["pattern"]["type"], pattern);
+            assert_eq!(value["recurrence"]["pattern"][field], expected);
+            assert_eq!(value["recurrence"]["range"]["type"], "noEnd");
+        }
+    }
+
+    #[test]
+    fn recurring_creation_rejects_lossy_series() {
+        let mut omitted_start = recurring_event("FREQ=WEEKLY;BYDAY=WE");
+        assert!(event_to_graph_json(&omitted_start).is_err());
+
+        omitted_start.recurrence_rule = Some("FREQ=WEEKLY;BYDAY=MO".into());
+        omitted_start.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series@example.test\r\n\
+             RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEXDATE:20260921T090000Z\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+                .into(),
+        );
+        assert!(event_to_graph_json(&omitted_start).is_err());
+    }
 
     #[test]
     fn provider_types_and_consistent_metadata_determine_recurrence() {

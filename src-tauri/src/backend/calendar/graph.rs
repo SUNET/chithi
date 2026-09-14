@@ -28,6 +28,10 @@ impl CalendarBackend for GraphCalendarBackend {
         super::EventCreationTarget::AccountDefault
     }
 
+    fn recurring_import_fidelity(&self) -> super::RecurringImportFidelity {
+        super::RecurringImportFidelity::PatternedRecurrence
+    }
+
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
         InviteReplyDelivery::Provider
     }
@@ -516,14 +520,13 @@ impl CalendarBackend for GraphCalendarBackend {
 #[cfg(test)]
 mod creation_tests {
     use super::GraphCalendarBackend;
-    use crate::backend::calendar::google::creation_testutil::{
-        assert_rejected_before_io, assert_standalone_creation,
+    use crate::backend::calendar::google::{
+        creation_testutil::assert_standalone_creation,
+        sync_testutil::{serve_create_response, services, setup_db},
     };
-
-    #[tokio::test]
-    async fn rejects_lossy_creation_before_credentials_and_preserves_local_event() {
-        assert_rejected_before_io(&GraphCalendarBackend).await;
-    }
+    use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
+    use crate::backend::testutil::{account, event};
+    use crate::calendar::RecurrenceKind;
 
     #[tokio::test]
     async fn publishes_confirmed_standalone_creation() {
@@ -534,6 +537,48 @@ mod creation_tests {
             "subject",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn publishes_supported_recurrence_in_the_graph_request() {
+        let (_directory, db) = setup_db().await;
+        let (root, captured) = serve_create_response(
+            serde_json::json!({"id": "created-series", "iCalUId": "series@example.test"}),
+        )
+        .await;
+        let mut event = event();
+        event.start_time = "2026-09-14T09:00:00Z".into();
+        event.end_time = "2026-09-14T10:00:00Z".into();
+        event.timezone = Some("Europe/Stockholm".into());
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=WEEKLY;BYDAY=MO;COUNT=3".into());
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series@example.test\r\n\
+             RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3\r\nEND:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+                .into(),
+        );
+        let provider_services = services(&root);
+
+        let pushed = GraphCalendarBackend
+            .push_created_event(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &provider_services,
+                },
+                &account("calendar", "graph"),
+                &event,
+                "ignored",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed.remote_id, "created-series");
+        let requests = captured.await.unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload["recurrence"]["pattern"]["type"], "weekly");
+        assert_eq!(payload["recurrence"]["range"]["numberOfOccurrences"], 3);
     }
 }
 

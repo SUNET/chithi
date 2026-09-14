@@ -300,6 +300,15 @@ fn initialize_calendar_event_state(conn: &Connection) -> Result<()> {
              recurrence_rule TEXT NOT NULL
          );
 
+         CREATE TABLE IF NOT EXISTS calendar_invitation_sources (
+             event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+             source_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+             source_message_id TEXT NOT NULL,
+             invitation_uid TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_invitation_source
+             ON calendar_invitation_sources(source_account_id, invitation_uid);
+
          -- Allocate globally, rather than incrementing a per-event counter:
          -- deleting/replacing an ID must never revive its committed token.
          -- Explicit DELETE/INSERT avoids inheriting the source statement's

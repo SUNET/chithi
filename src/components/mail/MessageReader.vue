@@ -39,6 +39,7 @@ const showHtml = computed({
   set: (v: boolean) => uiStore.setPreferHtmlBody(v),
 });
 const invites = ref<ParsedInvite[]>([]);
+const inviteSourceAccountId = ref<string | null>(null);
 const calendarAttachment = ref<Attachment | null>(null);
 
 // Remote images: per-message, not persisted
@@ -57,6 +58,7 @@ watch(
   () => messagesStore.activeMessageId,
   () => {
     invites.value = [];
+    inviteSourceAccountId.value = null;
     calendarAttachment.value = null;
     imagesHtml.value = null;
     loadingImages.value = false;
@@ -173,8 +175,13 @@ watch(
     if (accountId && msgId) {
       try {
         const all = await api.getEmailInvites(accountId, msgId);
+        if (
+          messagesStore.activeMessageId !== msgId ||
+          accountsStore.activeAccountId !== accountId
+        ) return;
         // Only show invite card for METHOD:REQUEST (new invites), not REPLY/CANCEL
         invites.value = all.filter((inv) => inv.method.toUpperCase() === "REQUEST");
+        inviteSourceAccountId.value = accountId;
 
         // Auto-process METHOD:REPLY emails (attendee responses) to update participant status
         const replies = all.filter((inv) => inv.method.toUpperCase() === "REPLY");
@@ -814,12 +821,13 @@ async function markSpam() {
       </div>
 
       <!-- Calendar invites -->
-      <div v-if="invites.length > 0" class="invite-section">
+      <div v-if="invites.length > 0 && inviteSourceAccountId" class="invite-section">
         <InviteCard
           v-for="invite in invites"
           :key="invite.uid"
           :invite="invite"
           :message-id="messagesStore.activeMessageId!"
+          :source-account-id="inviteSourceAccountId"
         />
       </div>
 

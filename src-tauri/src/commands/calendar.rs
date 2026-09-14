@@ -595,6 +595,12 @@ struct ImportedEventMetadata {
     recurrence_kind: RecurrenceKind,
     ical_data: String,
     source_message_id: String,
+    organizer_email: Option<String>,
+    attendees_json: Option<String>,
+    my_status: Option<String>,
+    invitation_source: Option<db::calendar_invitation_source::InvitationSource>,
+    personal_copy: bool,
+    require_remote_creation: bool,
 }
 
 async fn create_event_with_metadata(
@@ -664,8 +670,13 @@ async fn create_event_with_metadata(
         recurrence_kind,
         recurrence_rule,
         organizer_email: None,
-        attendees_json,
-        my_status: None,
+        attendees_json: imported
+            .as_ref()
+            .and_then(|metadata| metadata.attendees_json.clone())
+            .or(attendees_json),
+        my_status: imported
+            .as_ref()
+            .and_then(|metadata| metadata.my_status.clone()),
         source_message_id: imported
             .as_ref()
             .map(|metadata| metadata.source_message_id.clone()),
@@ -693,7 +704,10 @@ async fn create_event_with_metadata(
             checked_mutation_target(&transaction, &source.event.id, Some(source))?;
         }
         let account = db::accounts::get_account_full(&transaction, &cal_event.account_id)?;
-        cal_event.organizer_email = Some(account.email.clone());
+        cal_event.organizer_email = imported
+            .as_ref()
+            .and_then(|metadata| metadata.organizer_email.clone())
+            .or_else(|| Some(account.email.clone()));
 
         // The event's calendar's remote handle — the JMAP backend
         // creates the event on that specific calendar; Google/Graph
@@ -705,8 +719,14 @@ async fn create_event_with_metadata(
             backend.validate_event_creation(&cal_event, remote_cal_id)?;
         }
         db::calendar::insert_event(&transaction, &cal_event)?;
-        if cal_event.recurrence_kind == RecurrenceKind::Series {
+        if imported.is_none() && cal_event.recurrence_kind == RecurrenceKind::Series {
             db::calendar_invitation::record_local_series(&transaction, &cal_event)?;
+        }
+        if let Some(source) = imported
+            .as_ref()
+            .and_then(|metadata| metadata.invitation_source.as_ref())
+        {
+            db::calendar_invitation_source::record(&transaction, &cal_event.id, source)?;
         }
         if let Some(ref binding) = meet_binding {
             claim_meet_binding(&transaction, &id, binding)?;
@@ -732,8 +752,16 @@ async fn create_event_with_metadata(
         // Best-effort: a failed push does not roll back the local insert.
         // Moves still require their unchanged local copy before source deletion.
         let ctx = calendar_backend_ctx(state);
+        let mut provider_event = cal_event.clone();
+        if imported
+            .as_ref()
+            .is_some_and(|metadata| metadata.personal_copy)
+        {
+            provider_event.organizer_email = None;
+            provider_event.attendees_json = None;
+        }
         match backend
-            .push_created_event(&ctx, &account, &cal_event, remote_cal_id)
+            .push_created_event(&ctx, &account, &provider_event, remote_cal_id)
             .await
         {
             Ok(Some(pushed)) => {
@@ -747,6 +775,14 @@ async fn create_event_with_metadata(
                     log::error!(
                         "create_event: remote creation succeeded but identity attachment failed for {id}: {error}"
                     );
+                    if imported
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.require_remote_creation)
+                    {
+                        return Err(crate::error::Error::Other(format!(
+                            "The invitation copy was created remotely, but its remote identity could not be saved; the RSVP was not sent: {error}"
+                        )));
+                    }
                     if move_source.is_some() {
                         return Err(crate::error::Error::Other(format!(
                             "Event copy {id} was created remotely, but its local identity could not be saved; the source was not removed: {error}"
@@ -755,7 +791,24 @@ async fn create_event_with_metadata(
                 }
             }
             Ok(None) => {} // provider defers the push to its next sync
-            Err(e) => log::error!("create_event: {} push failed: {}", backend.protocol(), e),
+            Err(error) => {
+                log::error!(
+                    "create_event: {} push failed: {}",
+                    backend.protocol(),
+                    error
+                );
+                if imported
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.require_remote_creation)
+                {
+                    let conn = state.db.writer().await;
+                    conn.execute(
+                        "DELETE FROM calendar_events WHERE id = ?1",
+                        rusqlite::params![id],
+                    )?;
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -1585,6 +1638,20 @@ fn checked_calendar_import_target(
     Ok((calendar, backend))
 }
 
+fn configured_invite_destination(
+    conn: &rusqlite::Connection,
+    source_account_id: &str,
+) -> Result<Option<(Calendar, db::accounts::AccountFull)>> {
+    let Some(calendar_id) =
+        db::service_bindings::get_default_import_calendar(conn, source_account_id)?
+    else {
+        return Ok(None);
+    };
+    let (calendar, _) = checked_calendar_import_target(conn, &calendar_id)?;
+    let account = db::accounts::get_account_full(conn, &calendar.account_id)?;
+    Ok(Some((calendar, account)))
+}
+
 fn imported_event_for_validation(
     group: &ical::IcalEventGroup,
     calendar: &db::calendar::Calendar,
@@ -1627,12 +1694,21 @@ fn import_group_error(
             "Calendar {method} messages cannot be imported as events"
         ));
     }
-    if group.representative.recurrence_kind != RecurrenceKind::Standalone
-        && backend
-            .map(CalendarBackend::recurring_import_fidelity)
-            .is_some_and(|fidelity| fidelity == RecurringImportFidelity::Unsupported)
-    {
-        return Some("This provider cannot preserve recurring imports".into());
+    if group.representative.recurrence_kind != RecurrenceKind::Standalone {
+        match backend.map(CalendarBackend::recurring_import_fidelity) {
+            Some(RecurringImportFidelity::Unsupported) => {
+                return Some("This provider cannot preserve recurring imports".into());
+            }
+            Some(RecurringImportFidelity::PatternedRecurrence)
+                if !ical::is_rrule_only_series(&group.ical_raw) =>
+            {
+                return Some(
+                    "This provider cannot preserve recurrence exceptions or additional dates"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
     }
     let event = imported_event_for_validation(group, calendar, source_message_id);
     backend.and_then(|backend| {
@@ -1848,6 +1924,12 @@ async fn import_calendar_groups_inner(
             recurrence_kind: event.recurrence_kind,
             ical_data: group.ical_raw,
             source_message_id: message_id.to_string(),
+            organizer_email: None,
+            attendees_json: None,
+            my_status: None,
+            invitation_source: None,
+            personal_copy: true,
+            require_remote_creation: false,
         };
         if let Err(error) = create_event_with_metadata(state, input, None, Some(metadata)).await {
             if result.imported > 0 || result.skipped_existing > 0 {
@@ -1914,6 +1996,11 @@ pub async fn get_invite_status(
     invite_uid: String,
 ) -> Result<Option<String>> {
     let conn = state.db.reader();
+    if let Some(event_id) =
+        db::calendar_invitation_source::event_id(&conn, &account_id, &invite_uid)?
+    {
+        return Ok(db::calendar::get_event(&conn, &event_id)?.my_status);
+    }
     let event = db::calendar::get_event_by_uid(&conn, &account_id, &invite_uid)?;
     Ok(event.and_then(|e| e.my_status))
 }
@@ -1935,8 +2022,33 @@ pub async fn respond_to_invite(
         response
     );
 
-    // Step 1: Parse the invite from the email
-    let (raw, account) = {
+    let initial_destination = {
+        let conn = state.db.reader();
+        configured_invite_destination(&conn, &account_id)?
+    };
+    let destination_account_id = initial_destination
+        .as_ref()
+        .map(|(_, account)| account.id.clone())
+        .unwrap_or_else(|| account_id.clone());
+    let (first_account_id, second_account_id) = if account_id == destination_account_id {
+        (account_id.clone(), None)
+    } else if account_id < destination_account_id {
+        (account_id.clone(), Some(destination_account_id.clone()))
+    } else {
+        (destination_account_id.clone(), Some(account_id.clone()))
+    };
+    let first_account_lock = state.account_lifecycle.acquire(&first_account_id);
+    let second_account_lock = second_account_id
+        .as_deref()
+        .map(|id| state.account_lifecycle.acquire(id));
+    let _first_account_guard = first_account_lock.lock().await;
+    let _second_account_guard = match second_account_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    // Re-read every account-owned input after acquiring both lifecycle locks.
+    let (raw, account, destination) = {
         let conn = state.db.writer().await;
         let (maildir_path, _from_email, _to, _cc, _flags, _encrypted, _signed) =
             db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
@@ -1957,7 +2069,34 @@ pub async fn respond_to_invite(
         })?;
 
         let account = db::accounts::get_account_full(&conn, &account_id)?;
-        (raw, account)
+        if !account.enabled || account.mail_binding().is_none() {
+            return Err(crate::error::Error::Other(
+                "Invitation responses require an enabled source mail account".into(),
+            ));
+        }
+        let destination = configured_invite_destination(&conn, &account_id)?;
+        let current_destination_id = destination
+            .as_ref()
+            .map(|(calendar, _)| calendar.id.as_str());
+        let initial_destination_id = initial_destination
+            .as_ref()
+            .map(|(calendar, _)| calendar.id.as_str());
+        if current_destination_id != initial_destination_id {
+            return Err(crate::error::Error::Other(
+                "The default invitation calendar changed while preparing the response".into(),
+            ));
+        }
+        if destination
+            .as_ref()
+            .is_some_and(|(_, destination_account)| {
+                destination_account.id != destination_account_id
+            })
+        {
+            return Err(crate::error::Error::Other(
+                "The invitation calendar changed accounts while preparing the response".into(),
+            ));
+        }
+        (raw, account, destination)
     };
 
     let invites = ical::parse_ical_from_email(&raw);
@@ -1971,6 +2110,24 @@ pub async fn respond_to_invite(
             ))
         })?;
 
+    if let Some((calendar, destination_account)) = destination.as_ref() {
+        let group = ical::parse_ical_event_groups(&invite.ical_raw)
+            .map_err(crate::error::Error::Other)?
+            .into_iter()
+            .find(|group| group.representative.uid == invite_uid)
+            .ok_or_else(|| {
+                crate::error::Error::Other(
+                    "The invitation recurrence group could not be resolved safely".into(),
+                )
+            })?;
+        let backend = crate::backend::calendar::for_account(destination_account);
+        if let Some(error) = import_group_error(&group, calendar, backend, &message_id) {
+            return Err(crate::error::Error::Other(format!(
+                "Cannot add this invitation to the configured calendar: {error}"
+            )));
+        }
+    }
+
     apply_invite_response(
         &app,
         &state,
@@ -1980,6 +2137,7 @@ pub async fn respond_to_invite(
         invite_uid,
         response,
         Some(message_id),
+        destination,
     )
     .await
 }
@@ -2012,6 +2170,105 @@ fn persist_existing_invite_response(
     Ok(())
 }
 
+fn responded_attendees_json(
+    invite: &ParsedInvite,
+    respondent_email: &str,
+    status: &str,
+) -> Option<String> {
+    if invite.attendees.is_empty() {
+        return None;
+    }
+    let mut attendees = invite.attendees.clone();
+    let respondent = attendees
+        .iter()
+        .position(|attendee| attendee.is_self == Some(true))
+        .or_else(|| {
+            attendees
+                .iter()
+                .position(|attendee| attendee.email.eq_ignore_ascii_case(respondent_email))
+        });
+    if let Some(attendee) = respondent.and_then(|index| attendees.get_mut(index)) {
+        attendee.status = status.into();
+    }
+    serde_json::to_string(&attendees).ok()
+}
+
+async fn ensure_cross_account_invitation_copy(
+    state: &AppState,
+    source_account_id: &str,
+    source_message_id: Option<&str>,
+    invite_uid: &str,
+    invite: &ParsedInvite,
+    calendar: &Calendar,
+    destination_account: &db::accounts::AccountFull,
+) -> Result<String> {
+    if let Some(event_id) =
+        db::calendar_invitation_source::event_id(&state.db.reader(), source_account_id, invite_uid)?
+    {
+        let existing = db::calendar::get_event(&state.db.reader(), &event_id)?;
+        if existing.account_id != destination_account.id || existing.calendar_id != calendar.id {
+            return Err(crate::error::Error::Other(
+                "The existing invitation copy no longer matches the configured calendar".into(),
+            ));
+        }
+        if crate::backend::calendar::for_account(destination_account)
+            .is_some_and(|backend| backend.protocol() == "graph")
+            && existing.remote_id.is_none()
+        {
+            return Err(crate::error::Error::Other(
+                "The existing Microsoft 365 invitation copy has no confirmed remote identity"
+                    .into(),
+            ));
+        }
+        return Ok(event_id);
+    }
+
+    let message_id = source_message_id.ok_or_else(|| {
+        crate::error::Error::Other(
+            "Cross-account invitation response is missing message provenance".into(),
+        )
+    })?;
+    let input = NewEventInput {
+        account_id: destination_account.id.clone(),
+        calendar_id: calendar.id.clone(),
+        title: invite
+            .summary
+            .clone()
+            .unwrap_or_else(|| "(No title)".into()),
+        description: invite.description.clone(),
+        location: invite.location.clone(),
+        start_time: invite.dtstart.clone(),
+        end_time: invite.dtend.clone(),
+        all_day: invite.all_day,
+        timezone: invite.timezone.clone(),
+        recurrence_rule: invite.recurrence_rule.clone(),
+        attendees: vec![],
+        meet_binding: None,
+    };
+    let metadata = ImportedEventMetadata {
+        uid: invite_uid.into(),
+        recurrence_kind: invite.recurrence_kind,
+        ical_data: invite.ical_raw.clone(),
+        source_message_id: message_id.into(),
+        organizer_email: invite.organizer_email.clone(),
+        attendees_json: serde_json::to_string(&invite.attendees).ok(),
+        my_status: None,
+        invitation_source: Some(db::calendar_invitation_source::InvitationSource {
+            source_account_id: source_account_id.into(),
+            source_message_id: message_id.into(),
+            invitation_uid: invite_uid.into(),
+        }),
+        personal_copy: true,
+        require_remote_creation: true,
+    };
+    Ok(
+        create_event_with_metadata(state, input, None, Some(metadata))
+            .await?
+            .event
+            .id,
+    )
+}
+
 /// Deliver an iTIP REPLY for `invite` and persist the RSVP locally.
 ///
 /// Shared by `respond_to_invite` (invite parsed from an email) and
@@ -2029,6 +2286,7 @@ async fn apply_invite_response(
     invite_uid: String,
     response: String,
     source_message_id: Option<String>,
+    destination: Option<(Calendar, db::accounts::AccountFull)>,
 ) -> Result<()> {
     let response = InviteResponse::try_from(response.as_str())?;
     let response_text = response.as_str();
@@ -2048,6 +2306,28 @@ async fn apply_invite_response(
         organizer_email: invite.organizer_email.clone(),
         attendees: invite.attendees.clone(),
     };
+    let my_status = response_text.to_string();
+    let attendees_json = responded_attendees_json(invite, &account.email, &my_status);
+    let cross_account_destination = destination
+        .as_ref()
+        .filter(|(_, destination_account)| destination_account.id != account_id);
+    let cross_account_event_id =
+        if let Some((calendar, destination_account)) = cross_account_destination {
+            Some(
+                ensure_cross_account_invitation_copy(
+                    state,
+                    &account_id,
+                    source_message_id.as_deref(),
+                    &invite_uid,
+                    invite,
+                    calendar,
+                    destination_account,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
     // Step 2: Generate the iTIP REPLY
     let reply_ical = ical::generate_reply(
@@ -2169,14 +2449,35 @@ async fn apply_invite_response(
         None
     };
 
+    if let (Some(responded_event_id), Some((_, destination_account))) =
+        (cross_account_event_id, cross_account_destination)
+    {
+        let conn = state.db.writer().await;
+        let mut existing = db::calendar::get_event(&conn, &responded_event_id)?;
+        persist_existing_invite_response(&conn, &mut existing, invite, my_status, attendees_json)?;
+        conn.execute(
+            "UPDATE calendar_events SET pending_rsvp_status = ?1 WHERE id = ?2",
+            rusqlite::params![
+                track_pending_rsvp.then_some(response_text),
+                responded_event_id
+            ],
+        )?;
+        drop(conn);
+        use tauri::Emitter as _;
+        app.emit("calendar-changed", destination_account.id.as_str())
+            .ok();
+        return Ok(());
+    }
+
     // Step 4: Create/update event in local calendar
-    let my_status = response_text.to_string();
     let conn = state.db.writer().await;
 
     // Find the best calendar for this account: prefer default, then any with
     // a remote_id (synced from server), then any existing, finally create one.
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
-    let calendar_id = if let Some(cal) = calendars
+    let calendar_id = if let Some((calendar, _)) = destination.as_ref() {
+        calendar.id.clone()
+    } else if let Some(cal) = calendars
         .iter()
         .find(|c| c.is_default && c.remote_id.is_some())
     {
@@ -2208,24 +2509,6 @@ async fn apply_invite_response(
     // carries the original "needs-action" PARTSTAT for every attendee, so
     // without this patch the event popup shows "needs-action" next to the
     // user's own name even though they just responded.
-    let attendees_json = if invite.attendees.is_empty() {
-        None
-    } else {
-        let mut attendees = invite.attendees.clone();
-        let account_attendee = attendees
-            .iter()
-            .position(|attendee| attendee.is_self == Some(true))
-            .or_else(|| {
-                attendees
-                    .iter()
-                    .position(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))
-            });
-        if let Some(attendee) = account_attendee.and_then(|index| attendees.get_mut(index)) {
-            attendee.status = my_status.clone();
-        }
-        Some(serde_json::to_string(&attendees).unwrap_or_else(|_| "[]".to_string()))
-    };
-
     // Check if we already have this event
     let responded_event_id = if let Some(mut existing) =
         db::calendar::get_event_by_uid_and_start(&conn, &account_id, &invite_uid, &invite.dtstart)?
@@ -2407,38 +2690,96 @@ pub async fn respond_to_event(
         response
     );
 
-    let (event, account) = {
+    let initial_source_account_id = {
         let conn = state.db.reader();
         let event = db::calendar::get_event(&conn, &event_id)?;
-        let account = db::accounts::get_account_full(&conn, &account_id)?;
-        (event, account)
+        if event.account_id != account_id {
+            return Err(crate::error::Error::Other(
+                "Event does not belong to the specified account".into(),
+            ));
+        }
+        let provenance = db::calendar_invitation_source::get(&conn, &event_id)?;
+        provenance
+            .as_ref()
+            .map(|source| source.source_account_id.clone())
+            .unwrap_or_else(|| account_id.clone())
+    };
+    let (first_account_id, second_account_id) = if account_id == initial_source_account_id {
+        (account_id.clone(), None)
+    } else if account_id < initial_source_account_id {
+        (account_id.clone(), Some(initial_source_account_id.clone()))
+    } else {
+        (initial_source_account_id.clone(), Some(account_id.clone()))
+    };
+    let first_account_lock = state.account_lifecycle.acquire(&first_account_id);
+    let second_account_lock = second_account_id
+        .as_deref()
+        .map(|id| state.account_lifecycle.acquire(id));
+    let _first_account_guard = first_account_lock.lock().await;
+    let _second_account_guard = match second_account_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
     };
 
-    // Reject cross-account requests: the event must belong to the account
-    // we are about to RSVP as, otherwise the reply would be sent from the
-    // wrong identity.
-    if event.account_id != account_id {
-        return Err(crate::error::Error::Other(
-            "Event does not belong to the specified account".to_string(),
-        ));
-    }
+    let (event, source_account, destination, provenance) = {
+        let conn = state.db.reader();
+        let event = db::calendar::get_event(&conn, &event_id)?;
+        if event.account_id != account_id {
+            return Err(crate::error::Error::Other(
+                "Event ownership changed while preparing the response".into(),
+            ));
+        }
+        let provenance = db::calendar_invitation_source::get(&conn, &event_id)?;
+        let source_account_id = provenance
+            .as_ref()
+            .map(|source| source.source_account_id.as_str())
+            .unwrap_or(&account_id);
+        if source_account_id != initial_source_account_id {
+            return Err(crate::error::Error::Other(
+                "Invitation provenance changed while preparing the response".into(),
+            ));
+        }
+        let source_account = db::accounts::get_account_full(&conn, source_account_id)?;
+        if !source_account.enabled || source_account.mail_binding().is_none() {
+            return Err(crate::error::Error::Other(
+                "Invitation responses require an enabled source mail account".into(),
+            ));
+        }
+        let destination_account = db::accounts::get_account_full(&conn, &event.account_id)?;
+        let calendar = db::calendar::get_calendar(&conn, &event.calendar_id)?;
+        (
+            event,
+            source_account,
+            Some((calendar, destination_account)),
+            provenance,
+        )
+    };
 
-    let uid = event.uid.clone().ok_or_else(|| {
-        crate::error::Error::Other("Event has no UID; cannot send an RSVP".to_string())
-    })?;
+    let uid = provenance
+        .as_ref()
+        .map(|source| source.invitation_uid.clone())
+        .or_else(|| event.uid.clone())
+        .ok_or_else(|| {
+            crate::error::Error::Other("Event has no UID; cannot send an RSVP".to_string())
+        })?;
 
     let invite = event_to_parsed_invite(&event, &uid);
-    let source_message_id = event.source_message_id.clone();
+    let source_message_id = provenance
+        .as_ref()
+        .map(|source| source.source_message_id.clone())
+        .or_else(|| event.source_message_id.clone());
+    let source_account_id = source_account.id.clone();
 
     apply_invite_response(
         &app,
         &state,
-        account_id,
-        account,
+        source_account_id,
+        source_account,
         &invite,
         uid,
         response,
         source_message_id,
+        destination,
     )
     .await
 }
@@ -3145,7 +3486,7 @@ mod tests {
             "message"
         )
         .is_none());
-        for protocol in ["jmap", "google", "graph"] {
+        for protocol in ["jmap", "google"] {
             let error = import_group_error(
                 &group,
                 &calendar,
@@ -3159,6 +3500,13 @@ mod tests {
                 "{protocol} should reject a recurring import"
             );
         }
+        assert!(import_group_error(
+            &group,
+            &calendar,
+            crate::backend::calendar::for_protocol("graph"),
+            "message"
+        )
+        .is_none());
     }
 
     #[test]
