@@ -50,12 +50,16 @@ const calendarOptions = computed(() =>
 
 const selectedCount = computed(() => selectedUids.value.length);
 
-function chooseDefaultCalendar() {
+function chooseDefaultCalendar(preferredCalendarId: string | null) {
+  const preferred = importTargets.value.find(
+    (calendar) => calendar.id === preferredCalendarId,
+  );
   const sourceDefault = importTargets.value.find(
     (calendar) =>
       calendar.account_id === props.sourceAccountId && calendar.is_default,
   );
   const fallback =
+    preferred ??
     sourceDefault ??
     importTargets.value.find((calendar) => calendar.is_default) ??
     importTargets.value[0];
@@ -131,8 +135,12 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    importTargets.value = await api.listCalendarImportTargets();
-    chooseDefaultCalendar();
+    const [targets, preferredCalendarId] = await Promise.all([
+      api.listCalendarImportTargets(),
+      api.getDefaultImportCalendar(props.sourceAccountId).catch(() => null),
+    ]);
+    importTargets.value = targets;
+    chooseDefaultCalendar(preferredCalendarId);
     targetsLoaded = true;
     await loadPreview();
   } catch (cause) {

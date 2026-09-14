@@ -213,10 +213,13 @@ describe("SyncBindingsSection", () => {
         hasCalendarBinding: true,
         hasContactsBinding: true,
         availableBooks: [{ id: "b1", label: "Acc / Personal" }],
+        availableImportCalendars: [{ id: "c1", label: "Work / Calendar" }],
         mailBookId: null,
         calendarBookId: null,
+        importCalendarId: null,
         "onUpdate:mailBookId": () => {},
         "onUpdate:calendarBookId": () => {},
+        "onUpdate:importCalendarId": () => {},
       },
     });
   }
@@ -239,5 +242,12 @@ describe("SyncBindingsSection", () => {
     const input = wrapper.find('[data-testid="contacts-sync-interval"]')
       .element as HTMLInputElement;
     expect(input.value).toBe("30");
+  });
+
+  it("offers a per-mail-account default import calendar", () => {
+    const wrapper = mountSection(makeForm());
+    const select = wrapper.get('[data-testid="default-import-calendar"]');
+
+    expect(select.text()).toContain("Work / Calendar");
   });
 });

@@ -18,10 +18,12 @@ const props = defineProps<{
   hasCalendarBinding: boolean;
   hasContactsBinding: boolean;
   availableBooks: BookOption[];
+  availableImportCalendars: BookOption[];
 }>();
 
 const mailBookId = defineModel<string | null>("mailBookId", { required: true });
 const calendarBookId = defineModel<string | null>("calendarBookId", { required: true });
+const importCalendarId = defineModel<string | null>("importCalendarId", { required: true });
 
 // Wire form-side number inputs in minutes; convert to/from seconds when
 // reading and writing AccountConfig so the wire format keeps the
@@ -124,6 +126,27 @@ const contactsIntervalMinutes = makeMinutesField("contacts_sync_interval_seconds
     <p class="form-help bindings-footer">
       When a service is off, the corresponding data is not fetched from the server. Already-synced data remains available offline.
     </p>
+
+    <div v-if="form.mail_protocol" class="form-group binding-row">
+      <label>Default calendar for imported events</label>
+      <select
+        v-model="importCalendarId"
+        class="form-control"
+        data-testid="default-import-calendar"
+      >
+        <option :value="null">Auto (source account default when available)</option>
+        <option
+          v-for="calendar in availableImportCalendars"
+          :key="calendar.id"
+          :value="calendar.id"
+        >
+          {{ calendar.label }}
+        </option>
+      </select>
+      <span class="field-hint">
+        Calendar attachments opened from this email account use this destination first.
+      </span>
+    </div>
 
     <div v-if="form.mail_protocol" class="form-group binding-row">
       <label>Default address book for compose</label>

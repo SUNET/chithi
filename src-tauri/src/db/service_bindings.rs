@@ -382,6 +382,7 @@ pub fn rebuild_for_account(
     fields: LegacyBindingFields<'_>,
 ) -> Result<()> {
     let preserved = snapshot_user_set_config(conn, account_id)?;
+    let default_import_calendar = get_default_import_calendar(conn, account_id)?;
     let zoom_identity = snapshot_zoom_identity(conn, account_id)?;
     let visio_identity = snapshot_visio_identity(conn, account_id)?;
     delete_for_account(conn, account_id)?;
@@ -402,6 +403,15 @@ pub fn rebuild_for_account(
                 service,
                 account_id,
                 e
+            );
+        }
+    }
+    if let Some(calendar_id) = default_import_calendar {
+        if let Err(error) = set_default_import_calendar(conn, account_id, Some(&calendar_id)) {
+            log::debug!(
+                "rebuild_for_account: drop preserved import calendar for missing mail binding ({}): {}",
+                account_id,
+                error
             );
         }
     }
@@ -552,6 +562,7 @@ fn snapshot_visio_identity(conn: &Connection, account_id: &str) -> Result<Option
 /// the account) so the same identity can route compose autocomplete
 /// to one book and event-attendee autocomplete to a different one.
 const DEFAULT_CONTACT_BOOK_KEY: &str = "default_contact_book_id";
+const DEFAULT_IMPORT_CALENDAR_KEY: &str = "default_import_calendar_id";
 
 /// Services that can carry a `default_contact_book_id`. The contacts
 /// binding *is* the source of contact books, so a default-book field
@@ -654,6 +665,83 @@ pub fn set_default_contact_book(
         return Err(Error::Other(format!(
             "no {} binding for account {} (race?)",
             service, account_id
+        )));
+    }
+    Ok(())
+}
+
+/// Read the preferred calendar for imports originating from this account's
+/// mail binding. The calendar may belong to another account.
+pub fn get_default_import_calendar(conn: &Connection, account_id: &str) -> Result<Option<String>> {
+    let cfg: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'mail'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&cfg).unwrap_or(serde_json::json!({}));
+    Ok(value
+        .get(DEFAULT_IMPORT_CALENDAR_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string))
+}
+
+/// Write or clear the preferred import calendar on an account's mail binding.
+pub fn set_default_import_calendar(
+    conn: &Connection,
+    account_id: &str,
+    calendar_id: Option<&str>,
+) -> Result<()> {
+    let cfg: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM service_bindings
+             WHERE account_id = ?1 AND service = 'mail'",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let cfg = cfg.ok_or_else(|| {
+        Error::Other(format!(
+            "no mail binding for account {} — cannot set default import calendar",
+            account_id
+        ))
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&cfg).unwrap_or(serde_json::json!({}));
+    let object = value.as_object_mut().ok_or_else(|| {
+        Error::Other(format!(
+            "mail binding for account {} has non-object config_json",
+            account_id
+        ))
+    })?;
+    match calendar_id {
+        Some(id) => {
+            object.insert(
+                DEFAULT_IMPORT_CALENDAR_KEY.into(),
+                serde_json::Value::String(id.into()),
+            );
+        }
+        None => {
+            object.remove(DEFAULT_IMPORT_CALENDAR_KEY);
+        }
+    }
+    let serialized = serde_json::to_string(&value)
+        .map_err(|error| Error::Other(format!("re-serialize config_json: {error}")))?;
+    let rows = conn.execute(
+        "UPDATE service_bindings
+         SET config_json = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = ?2 AND service = 'mail'",
+        params![serialized, account_id],
+    )?;
+    if rows == 0 {
+        return Err(Error::Other(format!(
+            "no mail binding for account {} (race?)",
+            account_id
         )));
     }
     Ok(())
@@ -1268,6 +1356,34 @@ mod tests {
         assert_eq!(cfg["imap_host"], "imap.example.com");
         assert_eq!(cfg["imap_port"], 993);
         assert_eq!(cfg["default_contact_book_id"], "book-1");
+    }
+
+    #[test]
+    fn default_import_calendar_round_trips_without_overwriting_mail_config() {
+        let conn = setup_db_with_books();
+        insert_account(&conn, "a1");
+        let binding = ServiceBinding {
+            id: "a1-mail".into(),
+            account_id: "a1".into(),
+            service: "mail".into(),
+            protocol: "imap".into(),
+            enabled: true,
+            sync_interval_seconds: None,
+            config_json: r#"{"imap_host":"imap.example.com"}"#.into(),
+        };
+        insert(&conn, &binding).unwrap();
+
+        set_default_import_calendar(&conn, "a1", Some("calendar-2")).unwrap();
+        assert_eq!(
+            get_default_import_calendar(&conn, "a1").unwrap(),
+            Some("calendar-2".into())
+        );
+        let stored = list_for_account(&conn, "a1").unwrap();
+        let config: serde_json::Value = serde_json::from_str(&stored[0].config_json).unwrap();
+        assert_eq!(config["imap_host"], "imap.example.com");
+
+        set_default_import_calendar(&conn, "a1", None).unwrap();
+        assert!(get_default_import_calendar(&conn, "a1").unwrap().is_none());
     }
 
     #[test]
