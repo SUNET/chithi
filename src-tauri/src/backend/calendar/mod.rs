@@ -164,6 +164,22 @@ pub enum RemoteRsvpPolicy {
     BestEffortAfterLocal,
 }
 
+/// How precisely a provider can honor a user-selected creation destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventCreationTarget {
+    /// Creation uses the selected calendar's remote identifier.
+    SelectedCalendar,
+    /// The provider API currently creates only on the account default.
+    AccountDefault,
+}
+
+/// Recurrence fidelity available when importing source-backed iCalendar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurringImportFidelity {
+    Unsupported,
+    RawIcalendar,
+}
+
 #[async_trait]
 pub trait CalendarBackend: Send + Sync {
     /// Protocol discriminator stored on the calendar service binding
@@ -178,6 +194,14 @@ pub trait CalendarBackend: Send + Sync {
     /// When the command should invoke this provider's remote RSVP call.
     fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
         RemoteRsvpPolicy::Unsupported
+    }
+
+    fn event_creation_target(&self) -> EventCreationTarget {
+        EventCreationTarget::SelectedCalendar
+    }
+
+    fn recurring_import_fidelity(&self) -> RecurringImportFidelity {
+        RecurringImportFidelity::Unsupported
     }
 
     /// Full account calendar sync: fetch remote calendars/events and
@@ -313,13 +337,20 @@ pub fn registry() -> &'static [&'static dyn CalendarBackend] {
 /// accounts with DAV extras have always synced through that path.
 pub fn for_account(account: &AccountFull) -> Option<&'static dyn CalendarBackend> {
     let proto = account.calendar_protocol_str();
-    if let Some(backend) = registry().iter().copied().find(|b| b.protocol() == proto) {
+    if let Some(backend) = for_protocol(proto) {
         return Some(backend);
     }
     if !account.caldav_url.is_empty() {
         return Some(&caldav::CalDavCalendarBackend);
     }
     None
+}
+
+pub fn for_protocol(protocol: &str) -> Option<&'static dyn CalendarBackend> {
+    registry()
+        .iter()
+        .copied()
+        .find(|backend| backend.protocol() == protocol)
 }
 
 /// Local events that have never been pushed (no remote_id). Shared by

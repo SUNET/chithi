@@ -223,6 +223,10 @@ impl CalendarBackend for CalDavCalendarBackend {
         "caldav"
     }
 
+    fn recurring_import_fidelity(&self) -> super::RecurringImportFidelity {
+        super::RecurringImportFidelity::RawIcalendar
+    }
+
     async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let db = ctx.db;
         let account_id = account.id.as_str();

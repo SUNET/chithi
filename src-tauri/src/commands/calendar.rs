@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::backend::calendar::{
-    AttendeeResponseUpdate, CalendarBackendCtx, CalendarCapability, InviteReplyDelivery,
-    InviteResponse, ParticipantSchedule, ParticipantScheduleRequest, RemoteRsvpPolicy,
-    RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+    AttendeeResponseUpdate, CalendarBackend, CalendarBackendCtx, CalendarCapability,
+    EventCreationTarget, InviteReplyDelivery, InviteResponse, ParticipantSchedule,
+    ParticipantScheduleRequest, RecurringImportFidelity, RemoteRsvpPolicy, RemoteRsvpRequest,
+    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
 use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
@@ -1483,6 +1484,7 @@ pub struct CalendarImportPreview {
     pub organizer_email: Option<String>,
     pub attendee_count: usize,
     pub importable: bool,
+    pub import_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1521,18 +1523,164 @@ fn read_calendar_attachment_groups(
     Ok(groups)
 }
 
+fn calendar_backend_for_account(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<Option<&'static dyn CalendarBackend>> {
+    let binding = db::service_bindings::list_for_account(conn, account_id)?
+        .into_iter()
+        .find(|binding| binding.service == "calendar" && binding.enabled);
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    crate::backend::calendar::for_protocol(&binding.protocol)
+        .map(Some)
+        .ok_or_else(|| crate::error::Error::UnsupportedCapability {
+            protocol: "calendar",
+            capability: "configured calendar protocol",
+        })
+}
+
+fn import_target_error(
+    calendar: &db::calendar::Calendar,
+    backend: Option<&dyn CalendarBackend>,
+) -> Option<String> {
+    if !calendar.is_subscribed {
+        return Some("The calendar is not subscribed".into());
+    }
+    match backend {
+        Some(backend)
+            if backend.event_creation_target() == EventCreationTarget::AccountDefault
+                && !calendar.is_default =>
+        {
+            Some(format!(
+                "{} currently supports importing only into its default calendar",
+                backend.protocol()
+            ))
+        }
+        Some(backend)
+            if backend.event_creation_target() == EventCreationTarget::SelectedCalendar
+                && calendar.remote_id.as_deref().is_none_or(str::is_empty) =>
+        {
+            Some("The calendar has no writable remote identity".into())
+        }
+        _ => None,
+    }
+}
+
+fn checked_calendar_import_target(
+    conn: &rusqlite::Connection,
+    calendar_id: &str,
+) -> Result<(db::calendar::Calendar, Option<&'static dyn CalendarBackend>)> {
+    let calendar = db::calendar::get_calendar(conn, calendar_id)?;
+    if !db::accounts::get_account_full(conn, &calendar.account_id)?.enabled {
+        return Err(crate::error::Error::Other(
+            "Events cannot be imported into a disabled account".into(),
+        ));
+    }
+    let backend = calendar_backend_for_account(conn, &calendar.account_id)?;
+    if let Some(error) = import_target_error(&calendar, backend) {
+        return Err(crate::error::Error::Other(error));
+    }
+    Ok((calendar, backend))
+}
+
+fn imported_event_for_validation(
+    group: &ical::IcalEventGroup,
+    calendar: &db::calendar::Calendar,
+    source_message_id: &str,
+) -> CalendarEvent {
+    let event = &group.representative;
+    CalendarEvent {
+        id: "calendar-import-preview".into(),
+        account_id: calendar.account_id.clone(),
+        calendar_id: calendar.id.clone(),
+        uid: Some(event.uid.clone()),
+        title: event.summary.clone().unwrap_or_else(|| "(No title)".into()),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        start_time: event.dtstart.clone(),
+        end_time: event.dtend.clone(),
+        all_day: event.all_day,
+        timezone: event.timezone.clone(),
+        recurrence_rule: event.recurrence_rule.clone(),
+        recurrence_kind: event.recurrence_kind,
+        organizer_email: None,
+        attendees_json: None,
+        my_status: None,
+        source_message_id: Some(source_message_id.into()),
+        ical_data: Some(group.ical_raw.clone()),
+        remote_id: None,
+        etag: None,
+    }
+}
+
+fn import_group_error(
+    group: &ical::IcalEventGroup,
+    calendar: &db::calendar::Calendar,
+    backend: Option<&dyn CalendarBackend>,
+    source_message_id: &str,
+) -> Option<String> {
+    let method = group.representative.method.to_ascii_uppercase();
+    if matches!(method.as_str(), "REPLY" | "CANCEL") {
+        return Some(format!(
+            "Calendar {method} messages cannot be imported as events"
+        ));
+    }
+    if group.representative.recurrence_kind != RecurrenceKind::Standalone
+        && backend
+            .map(CalendarBackend::recurring_import_fidelity)
+            .is_some_and(|fidelity| fidelity == RecurringImportFidelity::Unsupported)
+    {
+        return Some("This provider cannot preserve recurring imports".into());
+    }
+    let event = imported_event_for_validation(group, calendar, source_message_id);
+    backend.and_then(|backend| {
+        backend
+            .validate_event_creation(&event, calendar.remote_id.as_deref().unwrap_or_default())
+            .err()
+            .map(|error| error.to_string())
+    })
+}
+
+#[tauri::command]
+pub fn list_calendar_import_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<db::calendar::Calendar>> {
+    let conn = state.db.reader();
+    let mut targets = Vec::new();
+    for account in db::accounts::list_accounts(&conn)?
+        .into_iter()
+        .filter(|account| account.enabled)
+    {
+        let backend = calendar_backend_for_account(&conn, &account.id)?;
+        targets.extend(
+            db::calendar::list_calendars(&conn, &account.id)?
+                .into_iter()
+                .filter(|calendar| import_target_error(calendar, backend).is_none()),
+        );
+    }
+    Ok(targets)
+}
+
 #[tauri::command]
 pub async fn preview_calendar_attachment(
     state: State<'_, AppState>,
     source_account_id: String,
     message_id: String,
     attachment_index: u32,
+    calendar_id: String,
 ) -> Result<Vec<CalendarImportPreview>> {
+    let (calendar, backend) = {
+        let conn = state.db.reader();
+        checked_calendar_import_target(&conn, &calendar_id)?
+    };
     let groups =
         read_calendar_attachment_groups(&state, &source_account_id, &message_id, attachment_index)?;
     Ok(groups
         .into_iter()
         .map(|group| {
+            let import_error = import_group_error(&group, &calendar, backend, &message_id);
             let event = group.representative;
             let method = event.method.to_ascii_uppercase();
             CalendarImportPreview {
@@ -1544,7 +1692,8 @@ pub async fn preview_calendar_attachment(
                 end_time: event.dtend,
                 all_day: event.all_day,
                 timezone: event.timezone,
-                importable: !matches!(method.as_str(), "REPLY" | "CANCEL"),
+                importable: import_error.is_none(),
+                import_error,
                 method,
                 recurrence_kind: event.recurrence_kind,
                 component_count: group.component_count,
@@ -1564,6 +1713,18 @@ pub async fn import_calendar_attachment(
     calendar_id: String,
     selected_uids: Vec<String>,
 ) -> Result<CalendarImportResult> {
+    let groups =
+        read_calendar_attachment_groups(&state, &source_account_id, &message_id, attachment_index)?;
+    import_calendar_groups_inner(&state, &message_id, &calendar_id, selected_uids, groups).await
+}
+
+async fn import_calendar_groups_inner(
+    state: &AppState,
+    message_id: &str,
+    calendar_id: &str,
+    selected_uids: Vec<String>,
+    groups: Vec<ical::IcalEventGroup>,
+) -> Result<CalendarImportResult> {
     if selected_uids.is_empty() {
         return Err(crate::error::Error::Other(
             "Select at least one event to import".into(),
@@ -1577,8 +1738,6 @@ pub async fn import_calendar_attachment(
         ));
     }
 
-    let groups =
-        read_calendar_attachment_groups(&state, &source_account_id, &message_id, attachment_index)?;
     if selected
         .iter()
         .any(|uid| !groups.iter().any(|group| group.representative.uid == *uid))
@@ -1588,16 +1747,39 @@ pub async fn import_calendar_attachment(
         ));
     }
 
-    let target = {
+    let target_account_id = {
         let conn = state.db.reader();
-        let calendar = db::calendar::get_calendar(&conn, &calendar_id)?;
-        if !calendar.is_subscribed {
+        db::calendar::get_calendar(&conn, calendar_id)?.account_id
+    };
+    let account_lock = state.account_lifecycle.acquire(&target_account_id);
+    let _account_guard = account_lock.lock().await;
+
+    let (target, backend) = {
+        let conn = state.db.reader();
+        let (calendar, backend) = checked_calendar_import_target(&conn, calendar_id)?;
+        if calendar.account_id != target_account_id {
             return Err(crate::error::Error::Other(
-                "Events cannot be imported into an unsubscribed calendar".into(),
+                "The destination calendar changed accounts while waiting to import".into(),
             ));
         }
-        calendar
+        (calendar, backend)
     };
+
+    for group in groups
+        .iter()
+        .filter(|group| selected.contains(group.representative.uid.as_str()))
+    {
+        if let Some(error) = import_group_error(group, &target, backend, message_id) {
+            return Err(crate::error::Error::Other(format!(
+                "Cannot import '{}': {error}",
+                group
+                    .representative
+                    .summary
+                    .as_deref()
+                    .unwrap_or("(No title)")
+            )));
+        }
+    }
 
     let mut result = CalendarImportResult {
         imported: 0,
@@ -1612,15 +1794,6 @@ pub async fn import_calendar_attachment(
         .filter(|group| selected.contains(group.representative.uid.as_str()))
     {
         let event = group.representative;
-        if matches!(
-            event.method.to_ascii_uppercase().as_str(),
-            "REPLY" | "CANCEL"
-        ) {
-            return Err(crate::error::Error::Other(format!(
-                "Calendar {} messages cannot be imported as events",
-                event.method.to_ascii_uppercase()
-            )));
-        }
         if existing_uids.contains(&event.uid) {
             result.skipped_existing += 1;
             continue;
@@ -1646,9 +1819,9 @@ pub async fn import_calendar_attachment(
             uid: imported_uid.clone(),
             recurrence_kind: event.recurrence_kind,
             ical_data: group.ical_raw,
-            source_message_id: message_id.clone(),
+            source_message_id: message_id.to_string(),
         };
-        if let Err(error) = create_event_with_metadata(&state, input, None, Some(metadata)).await {
+        if let Err(error) = create_event_with_metadata(state, input, None, Some(metadata)).await {
             if result.imported > 0 || result.skipped_existing > 0 {
                 return Err(crate::error::Error::Other(format!(
                     "Import stopped after {} event(s) were added and {} existing event(s) were skipped: {}",
@@ -2911,6 +3084,80 @@ mod occurrence_safety_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import_group(ical: &str) -> ical::IcalEventGroup {
+        ical::parse_ical_event_groups(ical)
+            .expect("parse import fixture")
+            .remove(0)
+    }
+
+    #[test]
+    fn recurring_import_requires_a_raw_series_capable_backend() {
+        let group = import_group(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+             UID:series@example.test\r\nSUMMARY:Series\r\n\
+             DTSTART:20260914T080000Z\r\nDTEND:20260914T090000Z\r\n\
+             RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        let calendar = Calendar {
+            id: "calendar".into(),
+            account_id: "account".into(),
+            name: "Calendar".into(),
+            color: "#123456".into(),
+            is_default: true,
+            remote_id: Some("remote-calendar".into()),
+            is_subscribed: true,
+        };
+
+        assert!(import_group_error(&group, &calendar, None, "message").is_none());
+        assert!(import_group_error(
+            &group,
+            &calendar,
+            crate::backend::calendar::for_protocol("caldav"),
+            "message"
+        )
+        .is_none());
+        for protocol in ["jmap", "google", "graph"] {
+            let error = import_group_error(
+                &group,
+                &calendar,
+                crate::backend::calendar::for_protocol(protocol),
+                "message",
+            );
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("recurring")),
+                "{protocol} should reject a recurring import"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_target_rules_reject_unusable_calendars() {
+        let mut calendar = Calendar {
+            id: "calendar".into(),
+            account_id: "account".into(),
+            name: "Calendar".into(),
+            color: "#123456".into(),
+            is_default: false,
+            remote_id: Some("remote-calendar".into()),
+            is_subscribed: true,
+        };
+
+        for protocol in ["google", "graph"] {
+            let backend = crate::backend::calendar::for_protocol(protocol);
+            assert!(import_target_error(&calendar, backend).is_some());
+            calendar.is_default = true;
+            assert!(import_target_error(&calendar, backend).is_none());
+            calendar.is_default = false;
+        }
+
+        let caldav = crate::backend::calendar::for_protocol("caldav");
+        assert!(import_target_error(&calendar, caldav).is_none());
+        calendar.remote_id = None;
+        assert!(import_target_error(&calendar, caldav).is_some());
+    }
 
     #[test]
     fn calendar_messages_use_the_configured_sender_name() {

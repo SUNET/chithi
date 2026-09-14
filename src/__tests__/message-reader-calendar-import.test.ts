@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("@/lib/tauri", () => ({
   getEmailInvites: vi.fn().mockResolvedValue([]),
+  listCalendarImportTargets: vi.fn(),
   previewCalendarAttachment: vi.fn(),
   importCalendarAttachment: vi.fn(),
   saveAttachment: vi.fn().mockResolvedValue(undefined),
@@ -22,6 +23,7 @@ vi.mock("@/lib/compose-window", () => ({
 import MessageReader from "@/components/mail/MessageReader.vue";
 import { useAccountsStore } from "@/stores/accounts";
 import { useMessagesStore } from "@/stores/messages";
+import { useUiStore } from "@/stores/ui";
 import * as api from "@/lib/tauri";
 import type {
   Account,
@@ -73,6 +75,7 @@ const previews: CalendarImportPreview[] = [
     organizer_email: "owner@example.test",
     attendee_count: 3,
     importable: true,
+    import_error: null,
   },
   {
     uid: "single@example.test",
@@ -89,6 +92,7 @@ const previews: CalendarImportPreview[] = [
     organizer_email: null,
     attendee_count: 0,
     importable: true,
+    import_error: null,
   },
 ];
 
@@ -126,6 +130,7 @@ beforeEach(() => {
   setActivePinia(createPinia());
   vi.clearAllMocks();
   vi.mocked(api.listCalendars).mockResolvedValue([calendar]);
+  vi.mocked(api.listCalendarImportTargets).mockResolvedValue([calendar]);
   vi.mocked(api.previewCalendarAttachment).mockResolvedValue(previews);
   vi.mocked(api.importCalendarAttachment).mockResolvedValue({
     imported: 1,
@@ -156,6 +161,7 @@ describe("MessageReader calendar attachments", () => {
       "acc1",
       "message1",
       4,
+      "cal1",
     );
     expect(document.body.querySelector('[data-testid="calendar-import-dialog"]'))
       .not.toBeNull();
@@ -223,5 +229,118 @@ describe("MessageReader calendar attachments", () => {
       1,
       "notes.txt",
     );
+  });
+
+  it("names the import dialog for assistive technology", async () => {
+    const reader = mountReader({
+      index: 0,
+      filename: "event.ics",
+      content_type: "text/calendar",
+      size: 100,
+    });
+
+    await reader.get('[data-testid="attachment-0"]').trigger("click");
+    await flushPromises();
+
+    expect(
+      document.body
+        .querySelector('[role="dialog"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("Import calendar events");
+  });
+
+  it("renders all-day dates without shifting display timezones", async () => {
+    vi.mocked(api.previewCalendarAttachment).mockResolvedValue([
+      {
+        ...previews[0],
+        all_day: true,
+        start_time: "2026-01-15T00:00:00Z",
+        end_time: "2026-01-16T00:00:00Z",
+      },
+    ]);
+    const uiStore = useUiStore();
+    uiStore.displayTimezone = "America/Los_Angeles";
+    const reader = mountReader({
+      index: 0,
+      filename: "event.ics",
+      content_type: "text/calendar",
+      size: 100,
+    });
+
+    await reader.get('[data-testid="attachment-0"]').trigger("click");
+    await flushPromises();
+
+    expect(document.body.textContent).toContain("January 15, 2026");
+    expect(document.body.textContent).not.toContain("January 14, 2026");
+  });
+
+  it("prefers the source default and reassesses a changed target", async () => {
+    const otherCalendar: Calendar = {
+      ...calendar,
+      id: "cal2",
+      account_id: "acc2",
+      name: "Work",
+    };
+    vi.mocked(api.listCalendarImportTargets).mockResolvedValue([
+      otherCalendar,
+      calendar,
+    ]);
+    vi.mocked(api.previewCalendarAttachment).mockImplementation(
+      async (_accountId, _messageId, _attachmentIndex, calendarId) =>
+        calendarId === otherCalendar.id
+          ? [
+              {
+                ...previews[0],
+                importable: false,
+                import_error:
+                  "Recurring events cannot be imported into this provider.",
+              },
+            ]
+          : previews,
+    );
+    const reader = mountReader({
+      index: 0,
+      filename: "event.ics",
+      content_type: "text/calendar",
+      size: 100,
+    });
+
+    await reader.get('[data-testid="attachment-0"]').trigger("click");
+    await flushPromises();
+    expect(api.previewCalendarAttachment).toHaveBeenLastCalledWith(
+      "acc1",
+      "message1",
+      0,
+      "cal1",
+    );
+
+    const select = document.body.querySelector<HTMLButtonElement>(
+      '[data-testid="calendar-import-calendar"]',
+    );
+    select?.click();
+    await flushPromises();
+    const workOption = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="option"]'),
+    ).find((option) => option.textContent?.includes("Work"));
+    expect(workOption).toBeDefined();
+    workOption?.dispatchEvent(
+      new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+    );
+    await flushPromises();
+
+    expect(api.previewCalendarAttachment).toHaveBeenLastCalledWith(
+      "acc1",
+      "message1",
+      0,
+      "cal2",
+    );
+    expect(document.body.textContent).toContain(
+      "Recurring events cannot be imported into this provider.",
+    );
+    expect(
+      document.body.querySelector<HTMLInputElement>(
+        '[data-testid="calendar-import-event-series@example.test"]',
+      )?.disabled,
+    ).toBe(true);
   });
 });

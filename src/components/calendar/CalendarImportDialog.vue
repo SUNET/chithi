@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import ModalShell from "@/components/common/ModalShell.vue";
 import Select from "@/components/common/Select.vue";
 import { useAccountsStore } from "@/stores/accounts";
@@ -8,6 +8,7 @@ import { useUiStore } from "@/stores/ui";
 import { formatInTimezone } from "@/lib/datetime";
 import type {
   Attachment,
+  Calendar,
   CalendarImportPreview,
   CalendarImportResult,
 } from "@/lib/types";
@@ -34,9 +35,12 @@ const calendarId = ref("");
 const loading = ref(true);
 const importing = ref(false);
 const error = ref<string | null>(null);
+const importTargets = ref<Calendar[]>([]);
+let targetsLoaded = false;
+let previewVersion = 0;
 
 const calendarOptions = computed(() =>
-  calendarStore.calendars.map((calendar) => ({
+  importTargets.value.map((calendar) => ({
     value: calendar.id,
     label: `${calendar.name} (${accountsStore.accounts.find(
       (account) => account.id === calendar.account_id,
@@ -47,26 +51,38 @@ const calendarOptions = computed(() =>
 const selectedCount = computed(() => selectedUids.value.length);
 
 function chooseDefaultCalendar() {
-  const sourceDefault = calendarStore.calendars.find(
+  const sourceDefault = importTargets.value.find(
     (calendar) =>
       calendar.account_id === props.sourceAccountId && calendar.is_default,
   );
   const fallback =
     sourceDefault ??
-    calendarStore.calendars.find((calendar) => calendar.is_default) ??
-    calendarStore.calendars[0];
+    importTargets.value.find((calendar) => calendar.is_default) ??
+    importTargets.value[0];
   calendarId.value = fallback?.id ?? "";
 }
 
 function formatRange(event: CalendarImportPreview): string {
+  if (event.all_day) return formatAllDayDate(event.start_time);
   const start = formatInTimezone(event.start_time, uiStore.displayTimezone, {
     hour12: uiStore.hour12,
   });
-  if (event.all_day) return start;
   const end = formatInTimezone(event.end_time, uiStore.displayTimezone, {
     hour12: uiStore.hour12,
   });
   return `${start} – ${end}`;
+}
+
+function formatAllDayDate(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
+  if (!match) return value;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return date.toLocaleDateString(undefined, {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
 }
 
 function toggle(uid: string) {
@@ -79,23 +95,48 @@ function close() {
   if (!importing.value) emit("close");
 }
 
+async function loadPreview() {
+  if (!calendarId.value) {
+    previews.value = [];
+    selectedUids.value = [];
+    loading.value = false;
+    return;
+  }
+  const version = ++previewVersion;
+  loading.value = true;
+  error.value = null;
+  try {
+    const nextPreviews = await api.previewCalendarAttachment(
+      props.sourceAccountId,
+      props.messageId,
+      props.attachment.index,
+      calendarId.value,
+    );
+    if (version !== previewVersion) return;
+    previews.value = nextPreviews;
+    selectedUids.value = nextPreviews
+      .filter((event) => event.importable)
+      .map((event) => event.uid);
+  } catch (cause) {
+    if (version !== previewVersion) return;
+    previews.value = [];
+    selectedUids.value = [];
+    error.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    if (version === previewVersion) loading.value = false;
+  }
+}
+
 async function load() {
   loading.value = true;
   error.value = null;
   try {
-    await calendarStore.fetchCalendars();
+    importTargets.value = await api.listCalendarImportTargets();
     chooseDefaultCalendar();
-    previews.value = await api.previewCalendarAttachment(
-      props.sourceAccountId,
-      props.messageId,
-      props.attachment.index,
-    );
-    selectedUids.value = previews.value
-      .filter((event) => event.importable)
-      .map((event) => event.uid);
+    targetsLoaded = true;
+    await loadPreview();
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
-  } finally {
     loading.value = false;
   }
 }
@@ -133,6 +174,14 @@ onMounted(() => {
   void load();
 });
 onUnmounted(() => window.removeEventListener("keydown", onKeydown));
+
+watch(
+  calendarId,
+  () => {
+    if (targetsLoaded) void loadPreview();
+  },
+  { flush: "sync" },
+);
 </script>
 
 <template>
@@ -142,6 +191,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
     modal-class="calendar-import-modal"
     role="dialog"
     aria-modal="true"
+    aria-label="Import calendar events"
     data-testid="calendar-import-dialog"
     @close="close"
   >
@@ -176,7 +226,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
               }}
             </span>
             <span v-if="!event.importable">
-              {{ event.method }} messages cannot be imported as events.
+              {{ event.import_error || `${event.method} messages cannot be imported.` }}
             </span>
           </span>
         </label>

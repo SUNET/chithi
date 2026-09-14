@@ -24,6 +24,10 @@ impl CalendarBackend for GraphCalendarBackend {
         "graph"
     }
 
+    fn event_creation_target(&self) -> super::EventCreationTarget {
+        super::EventCreationTarget::AccountDefault
+    }
+
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
         InviteReplyDelivery::Provider
     }

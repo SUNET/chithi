@@ -521,6 +521,10 @@ impl CalendarBackend for GoogleCalendarBackend {
         "google"
     }
 
+    fn event_creation_target(&self) -> super::EventCreationTarget {
+        super::EventCreationTarget::AccountDefault
+    }
+
     fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
         RemoteRsvpPolicy::BestEffortAfterLocal
     }
