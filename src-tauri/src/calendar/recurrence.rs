@@ -31,7 +31,17 @@ fn is_valid_day(code: &str) -> bool {
 pub fn normalize_invitation_rrule(rule: &str, timezone: Option<&str>) -> Option<String> {
     if !rule.is_ascii()
         || rule.bytes().any(|byte| byte.is_ascii_control())
-        || timezone.is_some_and(|timezone| timezone.parse::<chrono_tz::Tz>().is_err())
+        || timezone.is_some_and(|timezone| {
+            if timezone.is_empty()
+                || !timezone.is_ascii()
+                || timezone.trim() != timezone
+                || timezone.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return true;
+            }
+            let resolved = crate::calendar::timezone::windows_to_iana(timezone).unwrap_or(timezone);
+            resolved.parse::<chrono_tz::Tz>().is_err()
+        })
     {
         return None;
     }
@@ -364,7 +374,12 @@ fn ical_until_to_local(value: &str, timezone: Option<&str>) -> Option<String> {
         }
         let naive = chrono::NaiveDateTime::parse_from_str(&local, "%Y-%m-%dT%H:%M:%S").ok()?;
         let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
-        if let Some(tz) = timezone.and_then(|tz| tz.parse::<chrono_tz::Tz>().ok()) {
+        if let Some(tz) = timezone.and_then(|timezone| {
+            crate::calendar::timezone::windows_to_iana(timezone)
+                .unwrap_or(timezone)
+                .parse::<chrono_tz::Tz>()
+                .ok()
+        }) {
             return Some(
                 utc.with_timezone(&tz)
                     .format("%Y-%m-%dT%H:%M:%S")

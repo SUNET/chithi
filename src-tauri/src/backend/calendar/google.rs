@@ -1038,7 +1038,7 @@ pub(super) mod sync_testutil {
         serve_requests("GET", responses).await
     }
 
-    pub(super) async fn serve_create_response(
+    pub(crate) async fn serve_create_response(
         response: serde_json::Value,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         serve_requests("POST", vec![(200, response)]).await

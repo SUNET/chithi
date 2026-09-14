@@ -177,6 +177,7 @@ pub enum EventCreationTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecurringImportFidelity {
     Unsupported,
+    PatternedRecurrence,
     RawIcalendar,
 }
 

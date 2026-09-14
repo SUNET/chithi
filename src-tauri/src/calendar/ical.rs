@@ -40,6 +40,38 @@ pub struct IcalEventGroup {
     pub ical_raw: String,
 }
 
+/// Whether a calendar resource is one recurring master whose complete
+/// recurrence set is represented by exactly one RRULE and no exceptions or
+/// additional-date properties.
+pub fn is_rrule_only_series(ical_text: &str) -> bool {
+    let Ok(parts) = split_calendar_components(ical_text) else {
+        return false;
+    };
+    let Some(event) = parts.events.first().filter(|_| parts.events.len() == 1) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut rrules = 0usize;
+    for line in event {
+        let line = line.trim();
+        let current_depth = depth;
+        if component_marker(line, "BEGIN").is_some() {
+            depth += 1;
+        }
+        if current_depth == 1 {
+            match property_name(line).map(str::to_ascii_uppercase).as_deref() {
+                Some("RRULE") => rrules += 1,
+                Some("RECURRENCE-ID" | "RDATE" | "EXDATE" | "EXRULE") => return false,
+                _ => {}
+            }
+        }
+        if component_marker(line, "END").is_some() {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    rrules == 1
+}
+
 /// Split an iCalendar resource into logical events grouped by UID.
 ///
 /// The structured parser remains the authority for event identity and field

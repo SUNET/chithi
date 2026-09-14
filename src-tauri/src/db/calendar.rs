@@ -215,6 +215,8 @@ struct ExistingEventForSync {
     my_status: Option<String>,
     attendees_json: Option<String>,
     pending_rsvp_status: Option<String>,
+    organizer_email: Option<String>,
+    personal_invitation_copy: bool,
 }
 
 fn single_unpushed_event_by_uid(
@@ -224,7 +226,10 @@ fn single_unpushed_event_by_uid(
     start_time: &str,
 ) -> Result<Option<ExistingEventForSync>> {
     let mut stmt = conn.prepare(
-        "SELECT id, my_status, attendees_json, pending_rsvp_status
+        "SELECT id, my_status, attendees_json, pending_rsvp_status,
+                organizer_email,
+                EXISTS(SELECT 1 FROM calendar_invitation_sources source
+                       WHERE source.event_id = calendar_events.id)
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
            AND (remote_id IS NULL OR remote_id = '')
@@ -237,6 +242,8 @@ fn single_unpushed_event_by_uid(
                 my_status: row.get(1)?,
                 attendees_json: row.get(2)?,
                 pending_rsvp_status: row.get(3)?,
+                organizer_email: row.get(4)?,
+                personal_invitation_copy: row.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -292,9 +299,18 @@ fn reconcile_duplicate_invite_rows(
             pending_rsvp_status = COALESCE(
                 (SELECT pending_rsvp_status FROM calendar_events WHERE id = ?1),
                 pending_rsvp_status
-            )
+            ),
+            organizer_email = CASE
+                WHEN ?3 THEN ?4
+                ELSE organizer_email
+            END
          WHERE id = ?2",
-        params![local.id, remote.id],
+        params![
+            local.id,
+            remote.id,
+            local.personal_invitation_copy,
+            local.organizer_email
+        ],
     )?;
     super::calendar_invitation::invalidate(conn, &remote.id)?;
     super::calendar_invitation::invalidate(conn, &local.id)?;
@@ -304,6 +320,16 @@ fn reconcile_duplicate_invite_rows(
         |row| row.get(0),
     )?;
     if meeting_bindings < 2 {
+        if local.personal_invitation_copy {
+            conn.execute(
+                "DELETE FROM calendar_invitation_sources WHERE event_id = ?1",
+                params![remote.id],
+            )?;
+            conn.execute(
+                "UPDATE calendar_invitation_sources SET event_id = ?1 WHERE event_id = ?2",
+                params![remote.id, local.id],
+            )?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO meet_meetings
                 (event_id, account_id, protocol, meeting_id, join_url)
@@ -323,7 +349,10 @@ fn reconcile_duplicate_invite_rows(
     }
 
     let reconciled = conn.query_row(
-        "SELECT id, my_status, attendees_json, pending_rsvp_status
+        "SELECT id, my_status, attendees_json, pending_rsvp_status,
+                organizer_email,
+                EXISTS(SELECT 1 FROM calendar_invitation_sources source
+                       WHERE source.event_id = calendar_events.id)
          FROM calendar_events WHERE id = ?1",
         params![remote.id],
         |row| {
@@ -332,6 +361,8 @@ fn reconcile_duplicate_invite_rows(
                 my_status: row.get(1)?,
                 attendees_json: row.get(2)?,
                 pending_rsvp_status: row.get(3)?,
+                organizer_email: row.get(4)?,
+                personal_invitation_copy: row.get(5)?,
             })
         },
     )?;
@@ -356,7 +387,10 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
     if let Some(ref remote_id) = event.remote_id {
         let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
-                "SELECT id, my_status, attendees_json, pending_rsvp_status
+                "SELECT id, my_status, attendees_json, pending_rsvp_status,
+                        organizer_email,
+                        EXISTS(SELECT 1 FROM calendar_invitation_sources source
+                               WHERE source.event_id = calendar_events.id)
                  FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
                 params![event.account_id, remote_id],
                 |row| {
@@ -365,6 +399,8 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
                         my_status: row.get(1)?,
                         attendees_json: row.get(2)?,
                         pending_rsvp_status: row.get(3)?,
+                        organizer_email: row.get(4)?,
+                        personal_invitation_copy: row.get(5)?,
                     })
                 },
             )
@@ -394,7 +430,9 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
             } else {
                 existing.pending_rsvp_status.clone()
             };
-            let preserved_status = if provider_confirmed_pending {
+            let preserved_status = if existing.personal_invitation_copy {
+                existing.my_status.clone()
+            } else if provider_confirmed_pending {
                 None
             } else if existing.pending_rsvp_status.is_some() {
                 existing.pending_rsvp_status.clone()
@@ -405,20 +443,31 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
                     .filter(|status| is_answered_status(Some(status.as_str())))
             };
             let effective_status = preserved_status.clone().or_else(|| event.my_status.clone());
-            let mut effective_attendees = event.attendees_json.clone();
-            if let Some(status) = preserved_status.as_deref() {
-                let account_email: String = conn.query_row(
-                    "SELECT email FROM accounts WHERE id = ?1",
-                    params![event.account_id],
-                    |row| row.get(0),
-                )?;
-                effective_attendees = attendees_with_status(
-                    effective_attendees
-                        .as_deref()
-                        .or(existing.attendees_json.as_deref()),
-                    &account_email,
-                    status,
-                );
+            let effective_organizer = if existing.personal_invitation_copy {
+                existing.organizer_email.clone()
+            } else {
+                event.organizer_email.clone()
+            };
+            let mut effective_attendees = if existing.personal_invitation_copy {
+                existing.attendees_json.clone()
+            } else {
+                event.attendees_json.clone()
+            };
+            if !existing.personal_invitation_copy {
+                if let Some(status) = preserved_status.as_deref() {
+                    let account_email: String = conn.query_row(
+                        "SELECT email FROM accounts WHERE id = ?1",
+                        params![event.account_id],
+                        |row| row.get(0),
+                    )?;
+                    effective_attendees = attendees_with_status(
+                        effective_attendees
+                            .as_deref()
+                            .or(existing.attendees_json.as_deref()),
+                        &account_email,
+                        status,
+                    );
+                }
             }
 
             // Update the existing event, keeping its local ID
@@ -426,7 +475,8 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
                 "UPDATE calendar_events SET
                     calendar_id = ?1, uid = ?2, title = ?3, description = ?4,
                     location = ?5, start_time = ?6, end_time = ?7, all_day = ?8,
-                    timezone = ?9, recurrence_rule = ?10, organizer_email = ?11,
+                    timezone = ?9, recurrence_rule = ?10,
+                    organizer_email = ?11,
                     attendees_json = ?12, my_status = ?13,
                     pending_rsvp_status = ?14,
                     source_message_id = COALESCE(?15, source_message_id),
@@ -445,7 +495,7 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
                     event.all_day,
                     event.timezone,
                     event.recurrence_rule,
-                    event.organizer_email,
+                    effective_organizer,
                     effective_attendees,
                     effective_status,
                     pending_rsvp_status,
@@ -920,6 +970,13 @@ mod tests {
             CREATE TABLE calendar_invitation_recurrence (
                 event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
                 recurrence_rule TEXT NOT NULL
+            );
+            CREATE TABLE calendar_invitation_sources (
+                event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
+                source_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                source_message_id TEXT NOT NULL,
+                invitation_uid TEXT NOT NULL,
+                UNIQUE(source_account_id, invitation_uid)
             );
             CREATE TABLE meet_meetings (
                 event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
@@ -1774,8 +1831,33 @@ mod tests {
         local.my_status = Some("accepted".to_string());
         local.source_message_id = Some("message-1".to_string());
         local.ical_data = Some("BEGIN:VCALENDAR".to_string());
+        local.organizer_email = Some("organizer@example.test".to_string());
         local.attendees_json = Some(attendees_json(&["test@example.com"]));
         insert_event(&conn, &local).unwrap();
+        crate::db::calendar_invitation_source::record(
+            &conn,
+            &local.id,
+            &crate::db::calendar_invitation_source::InvitationSource {
+                source_account_id: "acc1".into(),
+                source_message_id: "message-1".into(),
+                invitation_uid: uid.into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::db::calendar_invitation_source::get(&conn, "local-row")
+                .unwrap()
+                .is_some()
+        );
+        let personal_copy: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM calendar_invitation_sources
+                               WHERE event_id = 'local-row')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(personal_copy);
         mark_invite_managed(&conn, "acc1", "local-row").unwrap();
         conn.execute(
             "INSERT INTO meet_meetings
@@ -1788,7 +1870,7 @@ mod tests {
         let mut synced = make_event("incoming", "Invite", Some("remote-1"));
         synced.uid = Some(uid.to_string());
         synced.my_status = Some("needs-action".to_string());
-        synced.attendees_json = Some(attendees_json(&["test@example.com"]));
+        synced.attendees_json = Some(attendees_json(&["provider-copy@example.com"]));
         upsert_event_by_remote_id(&conn, &synced).unwrap();
 
         let count: i64 = conn
@@ -1803,8 +1885,24 @@ mod tests {
 
         let repaired = get_event(&conn, "remote-row").unwrap();
         assert_eq!(repaired.my_status.as_deref(), Some("accepted"));
+        assert!(repaired
+            .attendees_json
+            .as_deref()
+            .is_some_and(|attendees| attendees.contains("test@example.com")
+                && !attendees.contains("provider-copy@example.com")));
+        assert_eq!(
+            repaired.organizer_email.as_deref(),
+            Some("organizer@example.test")
+        );
         assert_eq!(repaired.source_message_id.as_deref(), Some("message-1"));
         assert_eq!(repaired.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+        assert_eq!(
+            crate::db::calendar_invitation_source::get(&conn, "remote-row")
+                .unwrap()
+                .unwrap()
+                .invitation_uid,
+            uid
+        );
         let (managed_at, meeting_event_id): (Option<String>, String) = conn
             .query_row(
                 "SELECT e.manually_managed_at, m.event_id

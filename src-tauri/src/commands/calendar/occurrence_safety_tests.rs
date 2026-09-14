@@ -7,11 +7,12 @@ use rusqlite::{params, types::Value, Connection};
 use super::{
     attach_created_event_identity, capture_move_source, checked_delivery_snapshot,
     checked_invitation_snapshot, checked_invitation_target, checked_mutation_target,
-    create_event_inner, create_event_with_metadata, create_event_with_receipt, delete_event_inner,
-    delete_event_with_destination, import_calendar_groups_inner, move_event_to_calendar_inner,
-    notify_calendar_event_inner, prepare_invitation_transport, send_invites_inner,
-    update_event_inner, ImportedEventMetadata, InvitationPurpose, MeetBindingInput,
-    MoveSourceSnapshot, NewEventInput, UpdateEventInput,
+    configured_invite_destination, create_event_inner, create_event_with_metadata,
+    create_event_with_receipt, delete_event_inner, delete_event_with_destination,
+    ensure_cross_account_invitation_copy, import_calendar_groups_inner,
+    move_event_to_calendar_inner, notify_calendar_event_inner, prepare_invitation_transport,
+    send_invites_inner, update_event_inner, ImportedEventMetadata, InvitationPurpose,
+    MeetBindingInput, MoveSourceSnapshot, NewEventInput, UpdateEventInput,
 };
 use crate::calendar::{ical, Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -185,6 +186,7 @@ struct StoredRows {
     pending: Vec<Vec<Value>>,
     revisions: Vec<Vec<Value>>,
     invitation_proofs: Vec<Vec<Value>>,
+    invitation_sources: Vec<Vec<Value>>,
 }
 
 impl StoredRows {
@@ -213,6 +215,10 @@ impl StoredRows {
             invitation_proofs: rows(
                 conn,
                 "SELECT * FROM calendar_invitation_recurrence ORDER BY event_id",
+            ),
+            invitation_sources: rows(
+                conn,
+                "SELECT * FROM calendar_invitation_sources ORDER BY event_id",
             ),
         }
     }
@@ -475,6 +481,12 @@ async fn imported_creation_preserves_source_identity_and_personal_resource() {
             recurrence_kind: RecurrenceKind::Standalone,
             ical_data: raw.into(),
             source_message_id: "message-1".into(),
+            organizer_email: None,
+            attendees_json: None,
+            my_status: None,
+            invitation_source: None,
+            personal_copy: true,
+            require_remote_creation: false,
         }),
     )
     .await
@@ -489,6 +501,147 @@ async fn imported_creation_preserves_source_identity_and_personal_resource() {
         Some("account-a@example.test")
     );
     assert!(created.attendees_json.is_none());
+}
+
+#[tokio::test]
+async fn imported_invitation_records_source_provenance_for_status_lookup() {
+    let fixture = Fixture::new().await;
+    let mut input = new_event("account-b", "cross-account", None);
+    input.title = "Invitation copy".into();
+    let created = create_event_with_metadata(
+        &fixture.state,
+        input,
+        None,
+        Some(ImportedEventMetadata {
+            uid: "invite@example.test".into(),
+            recurrence_kind: RecurrenceKind::Standalone,
+            ical_data: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+            source_message_id: "message-1".into(),
+            organizer_email: Some("organizer@example.test".into()),
+            attendees_json: None,
+            my_status: Some("accepted".into()),
+            invitation_source: Some(db::calendar_invitation_source::InvitationSource {
+                source_account_id: "account-a".into(),
+                source_message_id: "message-1".into(),
+                invitation_uid: "invite@example.test".into(),
+            }),
+            personal_copy: true,
+            require_remote_creation: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .event;
+
+    let conn = fixture.state.db.reader();
+    assert_eq!(
+        db::calendar_invitation_source::event_id(&conn, "account-a", "invite@example.test")
+            .unwrap()
+            .as_deref(),
+        Some(created.id.as_str())
+    );
+    assert_eq!(
+        db::calendar_invitation_source::response_status(&conn, "account-a", "invite@example.test")
+            .unwrap()
+            .as_deref(),
+        Some("accepted")
+    );
+}
+
+#[tokio::test]
+async fn invitation_destination_comes_from_the_source_mail_binding() {
+    let fixture = Fixture::new().await;
+    let conn = fixture.state.db.writer().await;
+    db::service_bindings::insert(
+        &conn,
+        &db::service_bindings::ServiceBinding {
+            id: "source-mail".into(),
+            account_id: "account-a".into(),
+            service: "mail".into(),
+            protocol: "imap".into(),
+            enabled: true,
+            sync_interval_seconds: None,
+            config_json: "{}".into(),
+        },
+    )
+    .unwrap();
+    db::service_bindings::set_default_import_calendar(&conn, "account-a", Some("cross-account"))
+        .unwrap();
+
+    let (calendar, account) = configured_invite_destination(&conn, "account-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(calendar.id, "cross-account");
+    assert_eq!(account.id, "account-b");
+}
+
+#[tokio::test]
+async fn cross_account_copy_is_idempotent_and_unanswered_until_delivery() {
+    let fixture = Fixture::new().await;
+    let (calendar, destination_account) = {
+        let conn = fixture.state.db.reader();
+        (
+            db::calendar::get_calendar(&conn, "cross-account").unwrap(),
+            db::accounts::get_account_full(&conn, "account-b").unwrap(),
+        )
+    };
+    let invite = ical::ParsedInvite {
+        method: "REQUEST".into(),
+        uid: "cross-account@example.test".into(),
+        summary: Some("Cross-account invite".into()),
+        description: None,
+        location: None,
+        dtstart: "2026-09-15T11:00:00Z".into(),
+        dtend: "2026-09-15T12:00:00Z".into(),
+        all_day: false,
+        timezone: Some("Europe/Stockholm".into()),
+        organizer_email: Some("organizer@example.test".into()),
+        organizer_name: None,
+        attendees: vec![attendee("account-a@example.test")],
+        recurrence_rule: None,
+        recurrence_kind: RecurrenceKind::Standalone,
+        sequence: 0,
+        ical_raw: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+    };
+
+    let first = ensure_cross_account_invitation_copy(
+        &fixture.state,
+        "account-a",
+        Some("message-1"),
+        &invite.uid,
+        &invite,
+        &calendar,
+        &destination_account,
+    )
+    .await
+    .unwrap();
+    let second = ensure_cross_account_invitation_copy(
+        &fixture.state,
+        "account-a",
+        Some("message-1"),
+        &invite.uid,
+        &invite,
+        &calendar,
+        &destination_account,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(second, first);
+    let conn = fixture.state.db.reader();
+    let event = db::calendar::get_event(&conn, &first).unwrap();
+    assert_eq!(event.account_id, "account-b");
+    assert_eq!(event.calendar_id, "cross-account");
+    assert!(event.my_status.is_none());
+    assert_eq!(
+        db::calendar_invitation_source::response_status(
+            &conn,
+            "account-a",
+            "cross-account@example.test"
+        )
+        .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -2340,21 +2493,19 @@ async fn standalone_notification_accepts_empty_recipients_and_preserves_event_me
 
 #[tokio::test]
 async fn unsupported_creation_preserves_all_events_and_pending_meeting_ownership() {
-    for protocol in ["google", "graph"] {
-        let fixture = Fixture::new().await;
-        fixture.calendar_protocol(protocol).await;
-        let existing = stored_event("existing", RecurrenceKind::Standalone, None);
-        fixture.insert(&existing).await;
-        let binding = fixture.attach_meeting_and_pending(&existing).await;
-        let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
-        input.meet_binding = Some(binding);
-        let before = fixture.snapshot();
-        let error = create_event_inner(&fixture.state, input, None)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("recurr"), "{protocol}: {error}");
-        assert_eq!(fixture.snapshot(), before, "{protocol}");
-    }
+    let fixture = Fixture::new().await;
+    fixture.calendar_protocol("google").await;
+    let existing = stored_event("existing", RecurrenceKind::Standalone, None);
+    fixture.insert(&existing).await;
+    let binding = fixture.attach_meeting_and_pending(&existing).await;
+    let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
+    input.meet_binding = Some(binding);
+    let before = fixture.snapshot();
+    let error = create_event_inner(&fixture.state, input, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("recurr"), "google: {error}");
+    assert_eq!(fixture.snapshot(), before, "google");
 }
 
 #[tokio::test]
