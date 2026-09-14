@@ -431,6 +431,34 @@ export async function getEmailInvites(
   return invoke("get_email_invites", { accountId, messageId });
 }
 
+export async function previewCalendarAttachment(
+  sourceAccountId: string,
+  messageId: string,
+  attachmentIndex: number,
+): Promise<import("./types").CalendarImportPreview[]> {
+  return invoke("preview_calendar_attachment", {
+    sourceAccountId,
+    messageId,
+    attachmentIndex,
+  });
+}
+
+export async function importCalendarAttachment(
+  sourceAccountId: string,
+  messageId: string,
+  attachmentIndex: number,
+  calendarId: string,
+  selectedUids: string[],
+): Promise<import("./types").CalendarImportResult> {
+  return invoke("import_calendar_attachment", {
+    sourceAccountId,
+    messageId,
+    attachmentIndex,
+    calendarId,
+    selectedUids,
+  });
+}
+
 export async function getEventByUid(
   accountId: string,
   uid: string,

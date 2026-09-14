@@ -886,27 +886,19 @@ pub async fn delete_folder(
     Ok(())
 }
 
-/// Extract an attachment from a message and save it.
-/// The save dialog is opened by the backend — the renderer never supplies a path.
-#[tauri::command]
-pub async fn save_attachment(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    account_id: String,
-    message_id: String,
+/// Read one attachment by the same stable index exposed in `MessageBody`.
+/// Keeping extraction here gives save and typed attachment handlers identical
+/// path validation and MIME traversal semantics.
+pub(crate) fn read_attachment_contents(
+    state: &AppState,
+    account_id: &str,
+    message_id: &str,
     attachment_index: u32,
-    suggested_filename: String,
-) -> Result<()> {
-    log::info!(
-        "Saving attachment {} from message {}",
-        attachment_index,
-        message_id,
-    );
-
+) -> Result<Vec<u8>> {
     let maildir_path = {
         let conn = state.db.reader();
         let (mp, _, _, _, _, _, _) =
-            db::messages::get_message_metadata(&conn, &account_id, &message_id)?;
+            db::messages::get_message_metadata(&conn, account_id, message_id)?;
         mp
     };
 
@@ -930,7 +922,27 @@ pub async fn save_attachment(
         .nth(attachment_index as usize)
         .ok_or_else(|| Error::Other(format!("Attachment index {} not found", attachment_index)))?;
 
-    let contents = attachment.contents().to_vec();
+    Ok(attachment.contents().to_vec())
+}
+
+/// Extract an attachment from a message and save it.
+/// The save dialog is opened by the backend — the renderer never supplies a path.
+#[tauri::command]
+pub async fn save_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+    attachment_index: u32,
+    suggested_filename: String,
+) -> Result<()> {
+    log::info!(
+        "Saving attachment {} from message {}",
+        attachment_index,
+        message_id,
+    );
+
+    let contents = read_attachment_contents(&state, &account_id, &message_id, attachment_index)?;
 
     prompt_save_and_stream(
         &app,

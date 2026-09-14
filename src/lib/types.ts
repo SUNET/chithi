@@ -379,6 +379,28 @@ export interface ParsedInvite {
   sequence: number;
 }
 
+export interface CalendarImportPreview {
+  uid: string;
+  title: string;
+  description: string | null;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  all_day: boolean;
+  timezone: string | null;
+  method: string;
+  recurrence_kind: RecurrenceKind;
+  component_count: number;
+  organizer_email: string | null;
+  attendee_count: number;
+  importable: boolean;
+}
+
+export interface CalendarImportResult {
+  imported: number;
+  skipped_existing: number;
+}
+
 export interface NewEventInput {
   account_id: string;
   calendar_id: string;
