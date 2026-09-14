@@ -1664,6 +1664,34 @@ pub fn list_calendar_import_targets(
 }
 
 #[tauri::command]
+pub fn get_default_import_calendar(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<String>> {
+    let conn = state.db.reader();
+    db::service_bindings::get_default_import_calendar(&conn, &account_id)
+}
+
+#[tauri::command]
+pub async fn set_default_import_calendar(
+    state: State<'_, AppState>,
+    account_id: String,
+    calendar_id: Option<String>,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    let account = db::accounts::get_account_full(&conn, &account_id)?;
+    if !account.enabled || account.mail_binding().is_none() {
+        return Err(crate::error::Error::Other(
+            "A default import calendar requires an enabled mail account".into(),
+        ));
+    }
+    if let Some(calendar_id) = calendar_id.as_deref() {
+        checked_calendar_import_target(&conn, calendar_id)?;
+    }
+    db::service_bindings::set_default_import_calendar(&conn, &account_id, calendar_id.as_deref())
+}
+
+#[tauri::command]
 pub async fn preview_calendar_attachment(
     state: State<'_, AppState>,
     source_account_id: String,

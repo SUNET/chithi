@@ -10,6 +10,7 @@ vi.mock("@/lib/tauri", () => ({
     folder_path: null,
   }),
   addAccount: vi.fn().mockResolvedValue("new-id"),
+  triggerSync: vi.fn().mockResolvedValue(undefined),
   updateAccount: vi.fn().mockResolvedValue(undefined),
   deleteAccount: vi.fn().mockResolvedValue(undefined),
   abandonZoomAccount: vi.fn().mockResolvedValue(undefined),
@@ -18,6 +19,9 @@ vi.mock("@/lib/tauri", () => ({
   listContactBooks: vi.fn().mockResolvedValue([]),
   getDefaultContactBook: vi.fn().mockResolvedValue(null),
   setDefaultContactBook: vi.fn().mockResolvedValue(undefined),
+  listCalendarImportTargets: vi.fn().mockResolvedValue([]),
+  getDefaultImportCalendar: vi.fn().mockResolvedValue(null),
+  setDefaultImportCalendar: vi.fn().mockResolvedValue(undefined),
   discoverMailServers: vi.fn(),
   meetVisioLoginStart: vi.fn().mockResolvedValue({ session_id: "visio-session" }),
   meetVisioLoginComplete: vi.fn().mockResolvedValue("visio-1"),
@@ -33,7 +37,7 @@ import AccountFormModal from "@/components/settings/AccountFormModal.vue";
 import { useAccountsStore } from "@/stores/accounts";
 import { usePlatformStore } from "@/stores/platform";
 import * as api from "@/lib/tauri";
-import type { Account, AccountConfig } from "@/lib/types";
+import type { Account, AccountConfig, Calendar } from "@/lib/types";
 
 function makeRouter() {
   return createRouter({
@@ -204,6 +208,68 @@ describe("SettingsView", () => {
     expect(api.getAccountConfig).toHaveBeenCalledWith("acc1");
     expect(bodyEl('[data-testid="account-type-readonly"]')!.textContent).toContain("Gmail");
     expect(document.body.textContent).toContain("Signed in with Google");
+  });
+
+  it("loads and saves the mail account default import calendar", async () => {
+    vi.mocked(api.getAccountConfig).mockResolvedValue(gmailConfig);
+    vi.mocked(api.getDefaultImportCalendar).mockResolvedValue("ms-calendar");
+    const sourceAccount: Account = {
+      id: "mail-account",
+      display_name: "Mail",
+      email: "mail@example.org",
+      username: "mail@example.org",
+      provider: "gmail",
+      mail_protocol: "imap",
+      enabled: true,
+      mail_sync_interval_seconds: null,
+      calendar_sync_interval_seconds: null,
+      contacts_sync_interval_seconds: null,
+      has_calendar_binding: true,
+      has_contacts_binding: true,
+      meet_protocol: "",
+    };
+    const targetAccount: Account = {
+      ...sourceAccount,
+      id: "ms-account",
+      display_name: "Microsoft 365",
+      email: "calendar@example.org",
+      provider: "o365",
+      mail_protocol: "graph",
+    };
+    const targetCalendar: Calendar = {
+      id: "ms-calendar",
+      account_id: targetAccount.id,
+      name: "Calendar",
+      color: "#123456",
+      is_default: true,
+      remote_id: "remote-calendar",
+      is_subscribed: true,
+    };
+    const store = useAccountsStore();
+    store.accounts = [sourceAccount, targetAccount];
+    vi.mocked(api.listCalendarImportTargets).mockResolvedValue([targetCalendar]);
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+
+    await wrapper.find('[title="Edit"]').trigger("click");
+    await flushPromises();
+    const select = bodyEl(
+      '[data-testid="default-import-calendar"]',
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("ms-calendar");
+
+    bodyEl(".account-form")!
+      .closest(".modal")!
+      .querySelector<HTMLButtonElement>(".btn-primary")!
+      .click();
+    await flushPromises();
+
+    expect(api.setDefaultImportCalendar).toHaveBeenCalledWith(
+      "mail-account",
+      "ms-calendar",
+    );
   });
 
   it("?addAccount deep link skips the picker and opens the form", async () => {

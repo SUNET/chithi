@@ -451,6 +451,19 @@ export async function listCalendarImportTargets(): Promise<
   return invoke("list_calendar_import_targets");
 }
 
+export async function getDefaultImportCalendar(
+  accountId: string,
+): Promise<string | null> {
+  return invoke("get_default_import_calendar", { accountId });
+}
+
+export async function setDefaultImportCalendar(
+  accountId: string,
+  calendarId: string | null,
+): Promise<void> {
+  return invoke("set_default_import_calendar", { accountId, calendarId });
+}
+
 export async function importCalendarAttachment(
   sourceAccountId: string,
   messageId: string,

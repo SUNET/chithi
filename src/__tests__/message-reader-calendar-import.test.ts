@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("@/lib/tauri", () => ({
   getEmailInvites: vi.fn().mockResolvedValue([]),
+  getDefaultImportCalendar: vi.fn(),
   listCalendarImportTargets: vi.fn(),
   previewCalendarAttachment: vi.fn(),
   importCalendarAttachment: vi.fn(),
@@ -131,6 +132,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.listCalendars).mockResolvedValue([calendar]);
   vi.mocked(api.listCalendarImportTargets).mockResolvedValue([calendar]);
+  vi.mocked(api.getDefaultImportCalendar).mockResolvedValue(null);
   vi.mocked(api.previewCalendarAttachment).mockResolvedValue(previews);
   vi.mocked(api.importCalendarAttachment).mockResolvedValue({
     imported: 1,
@@ -274,7 +276,7 @@ describe("MessageReader calendar attachments", () => {
     expect(document.body.textContent).not.toContain("January 14, 2026");
   });
 
-  it("prefers the source default and reassesses a changed target", async () => {
+  it("prefers the account import target and reassesses a changed target", async () => {
     const otherCalendar: Calendar = {
       ...calendar,
       id: "cal2",
@@ -285,6 +287,7 @@ describe("MessageReader calendar attachments", () => {
       otherCalendar,
       calendar,
     ]);
+    vi.mocked(api.getDefaultImportCalendar).mockResolvedValue(otherCalendar.id);
     vi.mocked(api.previewCalendarAttachment).mockImplementation(
       async (_accountId, _messageId, _attachmentIndex, calendarId) =>
         calendarId === otherCalendar.id
@@ -311,7 +314,10 @@ describe("MessageReader calendar attachments", () => {
       "acc1",
       "message1",
       0,
-      "cal1",
+      "cal2",
+    );
+    expect(document.body.textContent).toContain(
+      "Recurring events cannot be imported into this provider.",
     );
 
     const select = document.body.querySelector<HTMLButtonElement>(
@@ -319,11 +325,11 @@ describe("MessageReader calendar attachments", () => {
     );
     select?.click();
     await flushPromises();
-    const workOption = Array.from(
+    const homeOption = Array.from(
       document.body.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).find((option) => option.textContent?.includes("Work"));
-    expect(workOption).toBeDefined();
-    workOption?.dispatchEvent(
+    ).find((option) => option.textContent?.includes("Home"));
+    expect(homeOption).toBeDefined();
+    homeOption?.dispatchEvent(
       new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
     );
     await flushPromises();
@@ -332,15 +338,12 @@ describe("MessageReader calendar attachments", () => {
       "acc1",
       "message1",
       0,
-      "cal2",
-    );
-    expect(document.body.textContent).toContain(
-      "Recurring events cannot be imported into this provider.",
+      "cal1",
     );
     expect(
       document.body.querySelector<HTMLInputElement>(
         '[data-testid="calendar-import-event-series@example.test"]',
       )?.disabled,
-    ).toBe(true);
+    ).toBe(false);
   });
 });

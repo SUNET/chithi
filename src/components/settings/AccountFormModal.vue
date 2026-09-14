@@ -73,9 +73,11 @@ function invalidateVisioLogin() {
 // back to the auto-pick on the backend.
 const defaultMailBookId = ref<string | null>(null);
 const defaultCalendarBookId = ref<string | null>(null);
+const defaultImportCalendarId = ref<string | null>(null);
 
 // Cross-account list of contact books shown in the dropdowns.
 const availableBooks = ref<BookOption[]>([]);
+const availableImportCalendars = ref<BookOption[]>([]);
 
 async function loadAvailableBooks() {
   // Fetch all accounts' books in parallel — sequential awaits made the
@@ -106,6 +108,27 @@ async function loadAvailableBooks() {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
+async function loadAvailableImportCalendars() {
+  try {
+    const calendars = await api.listCalendarImportTargets();
+    availableImportCalendars.value = calendars
+      .map((calendar) => {
+        const account = accountsStore.accounts.find(
+          (candidate) => candidate.id === calendar.account_id,
+        );
+        const accountLabel = account?.display_name || account?.email || calendar.account_id;
+        return {
+          id: calendar.id,
+          label: `${accountLabel} / ${calendar.name}`,
+        };
+      })
+      .sort((a, b) => a.label.localeCompare(b.label));
+  } catch (e) {
+    console.warn("loadAvailableImportCalendars: failed", e);
+    availableImportCalendars.value = [];
+  }
+}
+
 // Per-binding default-book state lives outside `form` because it
 // belongs to service_bindings.config_json, not AccountConfig. Reset
 // when the modal closes or opens fresh so a previously edited
@@ -114,7 +137,9 @@ async function loadAvailableBooks() {
 function resetDefaultBookState() {
   defaultMailBookId.value = null;
   defaultCalendarBookId.value = null;
+  defaultImportCalendarId.value = null;
   availableBooks.value = [];
+  availableImportCalendars.value = [];
 }
 
 // Whether the current form would result in a calendar / contacts
@@ -358,7 +383,7 @@ function openNew(type: AccountType) {
   // Pre-load the cross-account book list so the create-flow dropdowns
   // are populated for users who already have an account with synced
   // books and want to point a new account at one of them.
-  loadAvailableBooks();
+  void Promise.all([loadAvailableBooks(), loadAvailableImportCalendars()]);
   showForm.value = true;
 }
 
@@ -374,16 +399,22 @@ async function openEdit(id: string) {
     // non-fatal: a missing binding or backend failure leaves the
     // dropdown empty and the user can still pick a value.
     try {
-      [defaultMailBookId.value, defaultCalendarBookId.value] = await Promise.all([
+      [
+        defaultMailBookId.value,
+        defaultCalendarBookId.value,
+        defaultImportCalendarId.value,
+      ] = await Promise.all([
         api.getDefaultContactBook(id, "mail").catch(() => null),
         api.getDefaultContactBook(id, "calendar").catch(() => null),
+        api.getDefaultImportCalendar(id).catch(() => null),
       ]);
     } catch (e) {
       console.warn("openEdit: load default contact books failed", e);
       defaultMailBookId.value = null;
       defaultCalendarBookId.value = null;
+      defaultImportCalendarId.value = null;
     }
-    await loadAvailableBooks();
+    await Promise.all([loadAvailableBooks(), loadAvailableImportCalendars()]);
     // The edit path deliberately never calls selectAccountType — the
     // per-type switch would clobber the loaded hosts/flags. It only
     // assigns accountType from what the loaded config looks like.
@@ -539,25 +570,30 @@ async function saveAccount() {
       savedId = editingAccountId.value;
       await accountsStore.fetchAccounts();
     } else {
-      await accountsStore.addAccount(form.value);
+      savedId = await accountsStore.addAccount(form.value);
       router.push("/");
     }
-    // Persist the default-book picks for the account we just saved
-    // (#137). Skipped on creation because the backend hasn't
-    // synced books yet — the auto-pick on first contacts sync will
-    // fill these in. Failures are non-fatal: the rest of the
-    // account update has already succeeded.
+    // Persist explicit cross-account defaults after the account and its
+    // bindings exist. First-sync auto-picking fills blank book defaults.
+    // Failures are non-fatal because the account save already succeeded.
     if (savedId) {
       try {
         if (form.value.mail_protocol) {
-          await api.setDefaultContactBook(savedId, "mail", defaultMailBookId.value);
+          if (editingAccountId.value || defaultMailBookId.value) {
+            await api.setDefaultContactBook(savedId, "mail", defaultMailBookId.value);
+          }
+          if (editingAccountId.value || defaultImportCalendarId.value) {
+            await api.setDefaultImportCalendar(savedId, defaultImportCalendarId.value);
+          }
         }
         if (hasCalendarBinding.value) {
-          await api.setDefaultContactBook(
-            savedId,
-            "calendar",
-            defaultCalendarBookId.value,
-          );
+          if (editingAccountId.value || defaultCalendarBookId.value) {
+            await api.setDefaultContactBook(
+              savedId,
+              "calendar",
+              defaultCalendarBookId.value,
+            );
+          }
         }
       } catch (e) {
         console.warn("saveAccount: persist default contact books failed", e);
@@ -1064,10 +1100,12 @@ async function signInWithVisio() {
       v-if="accountType !== 'caldav' && accountType !== 'carddav' && !isMeetTab"
       v-model:mail-book-id="defaultMailBookId"
       v-model:calendar-book-id="defaultCalendarBookId"
+      v-model:import-calendar-id="defaultImportCalendarId"
       :form="form"
       :has-calendar-binding="hasCalendarBinding"
       :has-contacts-binding="hasContactsBinding"
       :available-books="availableBooks"
+      :available-import-calendars="availableImportCalendars"
     />
 
     <PgpAdvancedSection v-if="!isMeetTab && form.mail_protocol" :form="form" />
