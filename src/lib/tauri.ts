@@ -435,12 +435,20 @@ export async function previewCalendarAttachment(
   sourceAccountId: string,
   messageId: string,
   attachmentIndex: number,
+  calendarId: string,
 ): Promise<import("./types").CalendarImportPreview[]> {
   return invoke("preview_calendar_attachment", {
     sourceAccountId,
     messageId,
     attachmentIndex,
+    calendarId,
   });
+}
+
+export async function listCalendarImportTargets(): Promise<
+  import("./types").Calendar[]
+> {
+  return invoke("list_calendar_import_targets");
 }
 
 export async function importCalendarAttachment(

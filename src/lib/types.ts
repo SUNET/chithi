@@ -394,6 +394,7 @@ export interface CalendarImportPreview {
   organizer_email: string | null;
   attendee_count: number;
   importable: boolean;
+  import_error: string | null;
 }
 
 export interface CalendarImportResult {

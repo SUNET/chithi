@@ -8,11 +8,12 @@ use super::{
     attach_created_event_identity, capture_move_source, checked_delivery_snapshot,
     checked_invitation_snapshot, checked_invitation_target, checked_mutation_target,
     create_event_inner, create_event_with_metadata, create_event_with_receipt, delete_event_inner,
-    delete_event_with_destination, move_event_to_calendar_inner, notify_calendar_event_inner,
-    prepare_invitation_transport, send_invites_inner, update_event_inner, ImportedEventMetadata,
-    InvitationPurpose, MeetBindingInput, MoveSourceSnapshot, NewEventInput, UpdateEventInput,
+    delete_event_with_destination, import_calendar_groups_inner, move_event_to_calendar_inner,
+    notify_calendar_event_inner, prepare_invitation_transport, send_invites_inner,
+    update_event_inner, ImportedEventMetadata, InvitationPurpose, MeetBindingInput,
+    MoveSourceSnapshot, NewEventInput, UpdateEventInput,
 };
-use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
+use crate::calendar::{ical, Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::error::{CalendarMutationBlockReason, Error};
 use crate::state::AppState;
@@ -249,6 +250,39 @@ fn stored_event(id: &str, kind: RecurrenceKind, rule: Option<&str>) -> CalendarE
         remote_id: Some(format!("remote-{id}")),
         etag: Some("original-etag".into()),
     }
+}
+
+#[tokio::test]
+async fn concurrent_calendar_imports_create_only_one_local_copy() {
+    let fixture = Fixture::new().await;
+    let groups = ical::parse_ical_event_groups(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+         UID:import@example.test\r\nSUMMARY:Imported event\r\n\
+         DTSTART:20260914T080000Z\r\nDTEND:20260914T090000Z\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n",
+    )
+    .unwrap();
+    let first = import_calendar_groups_inner(
+        &fixture.state,
+        "message",
+        "source",
+        vec!["import@example.test".into()],
+        groups.clone(),
+    );
+    let second = import_calendar_groups_inner(
+        &fixture.state,
+        "message",
+        "source",
+        vec!["import@example.test".into()],
+        groups,
+    );
+
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.imported + second.imported, 1);
+    assert_eq!(first.skipped_existing + second.skipped_existing, 1);
+    assert_eq!(fixture.snapshot().events.len(), 1);
 }
 
 fn rsvp_invite(properties: &str) -> crate::calendar::ical::ParsedInvite {
