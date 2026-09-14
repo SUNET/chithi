@@ -763,6 +763,38 @@ pub fn get_event_by_uid(
     }
 }
 
+/// Collect current provider UIDs and original UIDs retained in iCalendar.
+/// Import callers use one snapshot so a multi-event file does not repeatedly
+/// parse every existing calendar resource.
+pub fn event_identity_uids(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut identities = std::collections::HashSet::new();
+    let mut statement =
+        conn.prepare("SELECT uid, ical_data FROM calendar_events WHERE account_id = ?1")?;
+    let rows = statement.query_map([account_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    for row in rows {
+        let (uid, raw) = row?;
+        if let Some(uid) = uid {
+            identities.insert(uid);
+        }
+        if let Some(raw) = raw {
+            identities.extend(
+                crate::calendar::ical::parse_ical_data(&raw)
+                    .into_iter()
+                    .map(|event| event.uid),
+            );
+        }
+    }
+    Ok(identities)
+}
+
 /// Find the local row for one concrete occurrence in a recurring series.
 pub fn get_event_by_uid_and_start(
     conn: &Connection,
@@ -1270,6 +1302,29 @@ mod tests {
 
         let not_found = get_event_by_uid(&conn, "acc1", "nonexistent@test").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn imported_source_uid_remains_a_duplicate_after_provider_uid_replacement() {
+        let conn = setup_db();
+        let mut event = make_event("e1", "Imported", None);
+        event.uid = Some("provider-canonical@test".into());
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n\
+             BEGIN:VEVENT\r\nUID:source@test\r\nDTSTART:20260914T080000Z\r\n\
+             DTEND:20260914T090000Z\r\nSUMMARY:Imported\r\nEND:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+                .into(),
+        );
+        insert_event(&conn, &event).unwrap();
+
+        let identities = event_identity_uids(&conn, "acc1").unwrap();
+        assert!(identities.contains("source@test"));
+        assert!(identities.contains("provider-canonical@test"));
+        assert!(!identities.contains("other@test"));
+        assert!(!event_identity_uids(&conn, "acc2")
+            .unwrap()
+            .contains("source@test"));
     }
 
     #[test]

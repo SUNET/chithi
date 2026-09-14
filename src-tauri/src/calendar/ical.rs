@@ -24,7 +24,195 @@ pub struct ParsedInvite {
     #[serde(default)]
     pub recurrence_kind: RecurrenceKind,
     pub sequence: u32,
+    #[serde(skip_serializing)]
     pub ical_raw: String, // Original iCalendar text
+}
+
+/// One logical event from an iCalendar resource. A recurring master and all
+/// of its RECURRENCE-ID exceptions share a UID and therefore stay together.
+#[derive(Debug, Clone)]
+pub struct IcalEventGroup {
+    pub representative: ParsedInvite,
+    pub component_count: usize,
+    /// A self-contained VCALENDAR containing this UID and its timezones.
+    /// Scheduling properties are removed so importing creates a personal
+    /// calendar copy rather than sending invitations to the original guests.
+    pub ical_raw: String,
+}
+
+/// Split an iCalendar resource into logical events grouped by UID.
+///
+/// The structured parser remains the authority for event identity and field
+/// values. A small component splitter is used only to retain each group's raw
+/// VEVENTs and shared VTIMEZONE definitions for recurrence fidelity.
+pub fn parse_ical_event_groups(ical_text: &str) -> Result<Vec<IcalEventGroup>, String> {
+    let invites = parse_ical_data(ical_text);
+    if invites.is_empty() {
+        return Err("The attachment does not contain any valid events".into());
+    }
+
+    let parts = split_calendar_components(ical_text)?;
+    if parts.events.len() != invites.len() {
+        return Err("The calendar event structure could not be matched safely".into());
+    }
+
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, invite) in invites.iter().enumerate() {
+        if let Some((_, indices)) = groups.iter_mut().find(|(uid, _)| uid == &invite.uid) {
+            indices.push(index);
+        } else {
+            groups.push((invite.uid.clone(), vec![index]));
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(uid, indices)| {
+            let representative_index = indices
+                .iter()
+                .copied()
+                .find(|index| invites[*index].recurrence_kind != RecurrenceKind::Occurrence)
+                .unwrap_or(indices[0]);
+            let raw = build_personal_calendar(&parts, &indices);
+            let reparsed = parse_ical_data(&raw);
+            if reparsed.len() != indices.len() || reparsed.iter().any(|event| event.uid != uid) {
+                return Err(format!(
+                    "The calendar event with UID '{uid}' could not be isolated safely"
+                ));
+            }
+            Ok(IcalEventGroup {
+                representative: invites[representative_index].clone(),
+                component_count: indices.len(),
+                ical_raw: raw,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct SplitCalendar {
+    properties: Vec<String>,
+    timezones: Vec<Vec<String>>,
+    events: Vec<Vec<String>>,
+}
+
+fn split_calendar_components(ical_text: &str) -> Result<SplitCalendar, String> {
+    let normalized = ical_text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .replace("\r\n", "\n")
+        .replace("\n ", "")
+        .replace("\n\t", "");
+    let lines: Vec<String> = normalized.lines().map(str::to_string).collect();
+    let first = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .ok_or_else(|| "The calendar attachment is empty".to_string())?;
+    if !lines[first].trim().eq_ignore_ascii_case("BEGIN:VCALENDAR") {
+        return Err("The attachment is not a VCALENDAR resource".into());
+    }
+
+    let mut properties = Vec::new();
+    let mut timezones = Vec::new();
+    let mut events = Vec::new();
+    let mut index = first + 1;
+    let mut found_end = false;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if line.eq_ignore_ascii_case("END:VCALENDAR") {
+            found_end = true;
+            index += 1;
+            break;
+        }
+        if let Some(name) = component_marker(line, "BEGIN") {
+            let (block, next) = take_component(&lines, index)?;
+            if name.eq_ignore_ascii_case("VEVENT") {
+                events.push(block);
+            } else if name.eq_ignore_ascii_case("VTIMEZONE") {
+                timezones.push(block);
+            }
+            index = next;
+            continue;
+        }
+        if property_name(line).is_some_and(|name| !name.eq_ignore_ascii_case("METHOD")) {
+            properties.push(lines[index].clone());
+        }
+        index += 1;
+    }
+
+    if !found_end || lines[index..].iter().any(|line| !line.trim().is_empty()) || events.is_empty()
+    {
+        return Err("The attachment must contain one complete VCALENDAR resource".into());
+    }
+    Ok(SplitCalendar {
+        properties,
+        timezones,
+        events,
+    })
+}
+
+fn take_component(lines: &[String], start: usize) -> Result<(Vec<String>, usize), String> {
+    let mut depth = 0usize;
+    for index in start..lines.len() {
+        let line = lines[index].trim();
+        if component_marker(line, "BEGIN").is_some() {
+            depth += 1;
+        } else if component_marker(line, "END").is_some() {
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| "The calendar contains an unmatched END component".to_string())?;
+            if depth == 0 {
+                return Ok((lines[start..=index].to_vec(), index + 1));
+            }
+        }
+    }
+    Err("The calendar contains an unterminated component".into())
+}
+
+fn component_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let (prefix, name) = line.split_once(':')?;
+    prefix.eq_ignore_ascii_case(marker).then_some(name)
+}
+
+fn property_name(line: &str) -> Option<&str> {
+    let end = line.find([';', ':'])?;
+    Some(&line[..end])
+}
+
+fn strip_event_scheduling(block: &[String]) -> Vec<String> {
+    let mut depth = 0usize;
+    block
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let current_depth = depth;
+            if component_marker(trimmed, "BEGIN").is_some() {
+                depth += 1;
+            }
+            let scheduling_property = current_depth == 1
+                && property_name(trimmed).is_some_and(|name| {
+                    name.eq_ignore_ascii_case("ORGANIZER") || name.eq_ignore_ascii_case("ATTENDEE")
+                });
+            if component_marker(trimmed, "END").is_some() {
+                depth = depth.saturating_sub(1);
+            }
+            (!scheduling_property).then(|| line.clone())
+        })
+        .collect()
+}
+
+fn build_personal_calendar(parts: &SplitCalendar, event_indices: &[usize]) -> String {
+    let mut lines = vec!["BEGIN:VCALENDAR".to_string()];
+    lines.extend(parts.properties.iter().cloned());
+    for timezone in &parts.timezones {
+        lines.extend(timezone.iter().cloned());
+    }
+    for index in event_indices {
+        lines.extend(strip_event_scheduling(&parts.events[*index]));
+    }
+    lines.push("END:VCALENDAR".to_string());
+    format!("{}\r\n", lines.join("\r\n"))
 }
 
 /// Parse calendar invites from a raw RFC 5322 email message.
@@ -1002,6 +1190,53 @@ mod tests {
             "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Chithi//EN\n\
              {components}END:VCALENDAR\n"
         )
+    }
+
+    #[test]
+    fn import_groups_series_by_uid_and_keeps_timezone_without_scheduling() {
+        let raw = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Example//EN\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:series@example.test\r\nDTSTART:20260914T080000Z\r\n\
+DTEND:20260914T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Series\r\n\
+ORGANIZER:mailto:owner@example.test\r\n\
+ATTENDEE:mailto:guest@example.test\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:single@example.test\r\nDTSTART:20260915T080000Z\r\n\
+DTEND:20260915T090000Z\r\nSUMMARY:Single\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:series@example.test\r\n\
+RECURRENCE-ID:20260921T080000Z\r\nDTSTART:20260921T100000Z\r\n\
+DTEND:20260921T110000Z\r\nSUMMARY:Moved occurrence\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let groups = parse_ical_event_groups(raw).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].representative.uid, "series@example.test");
+        assert_eq!(
+            groups[0].representative.recurrence_kind,
+            RecurrenceKind::Series
+        );
+        assert_eq!(groups[0].component_count, 2);
+        assert_eq!(parse_ical_data(&groups[0].ical_raw).len(), 2);
+        assert!(groups[0].ical_raw.contains("BEGIN:VTIMEZONE"));
+        assert!(!groups[0].ical_raw.contains("METHOD:"));
+        assert!(!groups[0].ical_raw.contains("ORGANIZER:"));
+        assert!(!groups[0].ical_raw.contains("ATTENDEE:"));
+        assert!(!groups[0].ical_raw.contains("UID:single@example.test"));
+        assert_eq!(groups[1].representative.uid, "single@example.test");
+        assert_eq!(groups[1].component_count, 1);
+    }
+
+    #[test]
+    fn import_rejects_multiple_calendar_envelopes() {
+        let event = recurrence_event("one", "");
+        let raw = format!(
+            "{}{}",
+            recurrence_calendar(&event),
+            recurrence_calendar(&event)
+        );
+        assert!(parse_ical_event_groups(&raw).is_err());
     }
 
     #[test]

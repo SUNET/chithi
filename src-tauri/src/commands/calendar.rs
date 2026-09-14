@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::backend::calendar::{
@@ -585,6 +585,23 @@ async fn create_event_with_receipt(
     event: NewEventInput,
     move_source: Option<&MoveSourceSnapshot>,
 ) -> Result<CreatedEventReceipt> {
+    create_event_with_metadata(state, event, move_source, None).await
+}
+
+#[derive(Debug)]
+struct ImportedEventMetadata {
+    uid: String,
+    recurrence_kind: RecurrenceKind,
+    ical_data: String,
+    source_message_id: String,
+}
+
+async fn create_event_with_metadata(
+    state: &AppState,
+    event: NewEventInput,
+    move_source: Option<&MoveSourceSnapshot>,
+    imported: Option<ImportedEventMetadata>,
+) -> Result<CreatedEventReceipt> {
     log::info!(
         "create_event: account={} calendar={} title='{}' attendees={}",
         event.account_id,
@@ -594,20 +611,27 @@ async fn create_event_with_receipt(
     );
     let id = uuid::Uuid::new_v4().to_string();
 
-    let recurrence_rule = event
-        .recurrence_rule
-        .as_deref()
-        .filter(|rule| !rule.is_empty())
-        .map(|rule| {
-            crate::calendar::recurrence::normalize_invitation_rrule(rule, event.timezone.as_deref())
+    let recurrence_rule = if imported.is_some() {
+        event.recurrence_rule.clone()
+    } else {
+        event
+            .recurrence_rule
+            .as_deref()
+            .filter(|rule| !rule.is_empty())
+            .map(|rule| {
+                crate::calendar::recurrence::normalize_invitation_rrule(
+                    rule,
+                    event.timezone.as_deref(),
+                )
                 .ok_or_else(|| {
                     crate::error::Error::Other(
                         "The recurrence rule cannot be represented safely in a new invitation."
                             .into(),
                     )
                 })
-        })
-        .transpose()?;
+            })
+            .transpose()?
+    };
 
     let attendees_json = if event.attendees.is_empty() {
         None
@@ -615,11 +639,20 @@ async fn create_event_with_receipt(
         Some(serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string()))
     };
 
+    let recurrence_kind = imported
+        .as_ref()
+        .map(|metadata| metadata.recurrence_kind)
+        .unwrap_or_else(|| RecurrenceKind::from_rule(recurrence_rule.as_deref()));
     let mut cal_event = CalendarEvent {
         id: id.clone(),
         account_id: event.account_id,
         calendar_id: event.calendar_id,
-        uid: Some(format!("{}@chithi", uuid::Uuid::new_v4())),
+        uid: Some(
+            imported
+                .as_ref()
+                .map(|metadata| metadata.uid.clone())
+                .unwrap_or_else(|| format!("{}@chithi", uuid::Uuid::new_v4())),
+        ),
         title: event.title,
         description: event.description,
         location: event.location,
@@ -627,13 +660,15 @@ async fn create_event_with_receipt(
         end_time: event.end_time,
         all_day: event.all_day,
         timezone: event.timezone,
-        recurrence_kind: RecurrenceKind::from_rule(recurrence_rule.as_deref()),
+        recurrence_kind,
         recurrence_rule,
         organizer_email: None,
         attendees_json,
         my_status: None,
-        source_message_id: None,
-        ical_data: None,
+        source_message_id: imported
+            .as_ref()
+            .map(|metadata| metadata.source_message_id.clone()),
+        ical_data: imported.as_ref().map(|metadata| metadata.ical_data.clone()),
         remote_id: None,
         etag: None,
     };
@@ -1428,6 +1463,206 @@ pub async fn sync_calendars(
 // ---------------------------------------------------------------------------
 // Invite handling commands
 // ---------------------------------------------------------------------------
+
+const MAX_CALENDAR_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_CALENDAR_IMPORT_EVENTS: usize = 1_000;
+
+#[derive(Debug, Serialize)]
+pub struct CalendarImportPreview {
+    pub uid: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub start_time: String,
+    pub end_time: String,
+    pub all_day: bool,
+    pub timezone: Option<String>,
+    pub method: String,
+    pub recurrence_kind: RecurrenceKind,
+    pub component_count: usize,
+    pub organizer_email: Option<String>,
+    pub attendee_count: usize,
+    pub importable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CalendarImportResult {
+    pub imported: usize,
+    pub skipped_existing: usize,
+}
+
+fn read_calendar_attachment_groups(
+    state: &AppState,
+    source_account_id: &str,
+    message_id: &str,
+    attachment_index: u32,
+) -> Result<Vec<ical::IcalEventGroup>> {
+    let contents = crate::commands::mail::read_attachment_contents(
+        state,
+        source_account_id,
+        message_id,
+        attachment_index,
+    )?;
+    if contents.len() > MAX_CALENDAR_ATTACHMENT_BYTES {
+        return Err(crate::error::Error::Other(format!(
+            "Calendar attachments larger than {} MiB cannot be imported",
+            MAX_CALENDAR_ATTACHMENT_BYTES / 1024 / 1024
+        )));
+    }
+    let text = String::from_utf8(contents).map_err(|_| {
+        crate::error::Error::Other("The calendar attachment is not valid UTF-8".into())
+    })?;
+    let groups = ical::parse_ical_event_groups(&text).map_err(crate::error::Error::Other)?;
+    if groups.len() > MAX_CALENDAR_IMPORT_EVENTS {
+        return Err(crate::error::Error::Other(format!(
+            "Calendar attachments containing more than {MAX_CALENDAR_IMPORT_EVENTS} events cannot be imported"
+        )));
+    }
+    Ok(groups)
+}
+
+#[tauri::command]
+pub async fn preview_calendar_attachment(
+    state: State<'_, AppState>,
+    source_account_id: String,
+    message_id: String,
+    attachment_index: u32,
+) -> Result<Vec<CalendarImportPreview>> {
+    let groups =
+        read_calendar_attachment_groups(&state, &source_account_id, &message_id, attachment_index)?;
+    Ok(groups
+        .into_iter()
+        .map(|group| {
+            let event = group.representative;
+            let method = event.method.to_ascii_uppercase();
+            CalendarImportPreview {
+                uid: event.uid,
+                title: event.summary.unwrap_or_else(|| "(No title)".into()),
+                description: event.description,
+                location: event.location,
+                start_time: event.dtstart,
+                end_time: event.dtend,
+                all_day: event.all_day,
+                timezone: event.timezone,
+                importable: !matches!(method.as_str(), "REPLY" | "CANCEL"),
+                method,
+                recurrence_kind: event.recurrence_kind,
+                component_count: group.component_count,
+                organizer_email: event.organizer_email,
+                attendee_count: event.attendees.len(),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn import_calendar_attachment(
+    state: State<'_, AppState>,
+    source_account_id: String,
+    message_id: String,
+    attachment_index: u32,
+    calendar_id: String,
+    selected_uids: Vec<String>,
+) -> Result<CalendarImportResult> {
+    if selected_uids.is_empty() {
+        return Err(crate::error::Error::Other(
+            "Select at least one event to import".into(),
+        ));
+    }
+    let selected: std::collections::HashSet<&str> =
+        selected_uids.iter().map(String::as_str).collect();
+    if selected.len() != selected_uids.len() {
+        return Err(crate::error::Error::Other(
+            "The import selection contains duplicate event UIDs".into(),
+        ));
+    }
+
+    let groups =
+        read_calendar_attachment_groups(&state, &source_account_id, &message_id, attachment_index)?;
+    if selected
+        .iter()
+        .any(|uid| !groups.iter().any(|group| group.representative.uid == *uid))
+    {
+        return Err(crate::error::Error::Other(
+            "The calendar attachment changed or the selection is invalid".into(),
+        ));
+    }
+
+    let target = {
+        let conn = state.db.reader();
+        let calendar = db::calendar::get_calendar(&conn, &calendar_id)?;
+        if !calendar.is_subscribed {
+            return Err(crate::error::Error::Other(
+                "Events cannot be imported into an unsubscribed calendar".into(),
+            ));
+        }
+        calendar
+    };
+
+    let mut result = CalendarImportResult {
+        imported: 0,
+        skipped_existing: 0,
+    };
+    let mut existing_uids = {
+        let conn = state.db.reader();
+        db::calendar::event_identity_uids(&conn, &target.account_id)?
+    };
+    for group in groups
+        .into_iter()
+        .filter(|group| selected.contains(group.representative.uid.as_str()))
+    {
+        let event = group.representative;
+        if matches!(
+            event.method.to_ascii_uppercase().as_str(),
+            "REPLY" | "CANCEL"
+        ) {
+            return Err(crate::error::Error::Other(format!(
+                "Calendar {} messages cannot be imported as events",
+                event.method.to_ascii_uppercase()
+            )));
+        }
+        if existing_uids.contains(&event.uid) {
+            result.skipped_existing += 1;
+            continue;
+        }
+
+        let input = NewEventInput {
+            account_id: target.account_id.clone(),
+            calendar_id: target.id.clone(),
+            title: event.summary.unwrap_or_else(|| "(No title)".into()),
+            description: event.description,
+            location: event.location,
+            start_time: event.dtstart,
+            end_time: event.dtend,
+            all_day: event.all_day,
+            timezone: event.timezone,
+            recurrence_rule: event.recurrence_rule,
+            // Import is a personal copy, not an RSVP or a new invitation.
+            attendees: Vec::new(),
+            meet_binding: None,
+        };
+        let imported_uid = event.uid;
+        let metadata = ImportedEventMetadata {
+            uid: imported_uid.clone(),
+            recurrence_kind: event.recurrence_kind,
+            ical_data: group.ical_raw,
+            source_message_id: message_id.clone(),
+        };
+        if let Err(error) = create_event_with_metadata(&state, input, None, Some(metadata)).await {
+            if result.imported > 0 || result.skipped_existing > 0 {
+                return Err(crate::error::Error::Other(format!(
+                    "Import stopped after {} event(s) were added and {} existing event(s) were skipped: {}",
+                    result.imported, result.skipped_existing, error
+                )));
+            }
+            return Err(error);
+        }
+        result.imported += 1;
+        existing_uids.insert(imported_uid);
+    }
+
+    Ok(result)
+}
 
 #[tauri::command]
 pub async fn get_email_invites(

@@ -7,10 +7,10 @@ use rusqlite::{params, types::Value, Connection};
 use super::{
     attach_created_event_identity, capture_move_source, checked_delivery_snapshot,
     checked_invitation_snapshot, checked_invitation_target, checked_mutation_target,
-    create_event_inner, create_event_with_receipt, delete_event_inner,
+    create_event_inner, create_event_with_metadata, create_event_with_receipt, delete_event_inner,
     delete_event_with_destination, move_event_to_calendar_inner, notify_calendar_event_inner,
-    prepare_invitation_transport, send_invites_inner, update_event_inner, InvitationPurpose,
-    MeetBindingInput, MoveSourceSnapshot, NewEventInput, UpdateEventInput,
+    prepare_invitation_transport, send_invites_inner, update_event_inner, ImportedEventMetadata,
+    InvitationPurpose, MeetBindingInput, MoveSourceSnapshot, NewEventInput, UpdateEventInput,
 };
 use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -421,6 +421,40 @@ fn new_event(account: &str, calendar: &str, rule: Option<&str>) -> NewEventInput
         attendees: vec![],
         meet_binding: None,
     }
+}
+
+#[tokio::test]
+async fn imported_creation_preserves_source_identity_and_personal_resource() {
+    let fixture = Fixture::new().await;
+    let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n\
+               BEGIN:VEVENT\r\nUID:source@test\r\nDTSTART:20260915T110000Z\r\n\
+               DTEND:20260915T120000Z\r\nSUMMARY:Imported\r\nEND:VEVENT\r\n\
+               END:VCALENDAR\r\n";
+    let mut input = new_event("account-a", "source", None);
+    input.title = "Imported".into();
+    let created = create_event_with_metadata(
+        &fixture.state,
+        input,
+        None,
+        Some(ImportedEventMetadata {
+            uid: "source@test".into(),
+            recurrence_kind: RecurrenceKind::Standalone,
+            ical_data: raw.into(),
+            source_message_id: "message-1".into(),
+        }),
+    )
+    .await
+    .unwrap()
+    .event;
+
+    assert_eq!(created.uid.as_deref(), Some("source@test"));
+    assert_eq!(created.source_message_id.as_deref(), Some("message-1"));
+    assert_eq!(created.ical_data.as_deref(), Some(raw));
+    assert_eq!(
+        created.organizer_email.as_deref(),
+        Some("account-a@example.test")
+    );
+    assert!(created.attendees_json.is_none());
 }
 
 #[tokio::test]

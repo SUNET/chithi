@@ -4,8 +4,15 @@ import { useMessagesStore } from "@/stores/messages";
 import { useUiStore } from "@/stores/ui";
 import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
-import type { ParsedInvite, Contact, ContactBook } from "@/lib/types";
+import type {
+  Attachment,
+  CalendarImportResult,
+  ParsedInvite,
+  Contact,
+  ContactBook,
+} from "@/lib/types";
 import InviteCard from "@/components/calendar/InviteCard.vue";
+import CalendarImportDialog from "@/components/calendar/CalendarImportDialog.vue";
 import ContactFormModal from "@/components/contacts/ContactFormModal.vue";
 import { openComposeWindow } from "@/lib/compose-window";
 import { parseMailto } from "@/lib/mailto";
@@ -32,6 +39,7 @@ const showHtml = computed({
   set: (v: boolean) => uiStore.setPreferHtmlBody(v),
 });
 const invites = ref<ParsedInvite[]>([]);
+const calendarAttachment = ref<Attachment | null>(null);
 
 // Remote images: per-message, not persisted
 const imagesHtml = ref<string | null>(null);
@@ -49,6 +57,7 @@ watch(
   () => messagesStore.activeMessageId,
   () => {
     invites.value = [];
+    calendarAttachment.value = null;
     imagesHtml.value = null;
     loadingImages.value = false;
     decryptedOverlay.value = null;
@@ -411,6 +420,45 @@ async function saveAttachment(index: number, filename: string | null) {
   } finally {
     savingAttachment.value = null;
   }
+}
+
+function isCalendarAttachment(attachment: Attachment): boolean {
+  const filename = attachment.filename?.trim().toLowerCase() ?? "";
+  const contentType = attachment.content_type
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return filename.endsWith(".ics") || contentType === "text/calendar";
+}
+
+function openAttachment(attachment: Attachment) {
+  if (isCalendarAttachment(attachment)) {
+    calendarAttachment.value = attachment;
+    return;
+  }
+  void saveAttachment(attachment.index, attachment.filename);
+}
+
+async function downloadCalendarAttachment() {
+  const attachment = calendarAttachment.value;
+  if (!attachment) return;
+  calendarAttachment.value = null;
+  await saveAttachment(attachment.index, attachment.filename);
+}
+
+function onCalendarImported(result: CalendarImportResult) {
+  const parts: string[] = [];
+  if (result.imported > 0) {
+    parts.push(`${result.imported} event${result.imported === 1 ? "" : "s"} imported`);
+  }
+  if (result.skipped_existing > 0) {
+    parts.push(
+      `${result.skipped_existing} existing event${
+        result.skipped_existing === 1 ? "" : "s"
+      } skipped`,
+    );
+  }
+  showToast(parts.join("; ") || "Nothing to import");
 }
 
 function formatSize(bytes: number): string {
@@ -788,9 +836,11 @@ async function markSpam() {
             class="attachment-chip"
             :data-testid="`attachment-${att.index}`"
             :disabled="savingAttachment === att.index"
-            @click="saveAttachment(att.index, att.filename)"
+            :title="isCalendarAttachment(att) ? 'Import calendar events' : 'Save attachment'"
+            @click="openAttachment(att)"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <svg v-if="isCalendarAttachment(att)" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M12 14v4M10 16h4"/></svg>
+            <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             <span class="att-name">{{ att.filename || 'attachment' }}</span>
             <span class="att-size">{{ formatSize(att.size) }}</span>
           </button>
@@ -907,6 +957,16 @@ async function markSpam() {
       ref="contactForm"
       :books="contactBooks"
       @saved="onContactSaved"
+    />
+
+    <CalendarImportDialog
+      v-if="calendarAttachment && accountsStore.activeAccountId && messagesStore.activeMessageId"
+      :source-account-id="accountsStore.activeAccountId"
+      :message-id="messagesStore.activeMessageId"
+      :attachment="calendarAttachment"
+      @close="calendarAttachment = null"
+      @download="downloadCalendarAttachment"
+      @imported="onCalendarImported"
     />
   </div>
 </template>

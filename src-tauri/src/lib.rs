@@ -154,6 +154,8 @@ pub fn run() {
             commands::calendar::update_event,
             commands::calendar::delete_event,
             commands::calendar::move_event_to_calendar,
+            commands::calendar::preview_calendar_attachment,
+            commands::calendar::import_calendar_attachment,
             commands::calendar::get_email_invites,
             commands::calendar::get_invite_status,
             commands::calendar::respond_to_invite,
