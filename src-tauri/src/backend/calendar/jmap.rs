@@ -278,6 +278,7 @@ impl CalendarBackend for JmapCalendarBackend {
         Ok(Some(PushedEvent {
             remote_id,
             canonical_uid: None,
+            etag: None,
         }))
     }
 
@@ -292,6 +293,21 @@ impl CalendarBackend for JmapCalendarBackend {
         conn_jmap
             .delete_calendar_event(&jmap_config, remote_id)
             .await
+    }
+
+    async fn push_updated_invitation_copy(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<Option<String>> {
+        let patch = JmapCalendarEvent::personal_copy_update_patch(event)?;
+        let (jmap_config, connection) = connect(ctx, account).await?;
+        connection
+            .update_calendar_event(&jmap_config, remote_id, &patch)
+            .await?;
+        Ok(None)
     }
 
     async fn push_calendar_rename(
@@ -479,14 +495,25 @@ mod deferred_creation_tests {
                                     json!({"list": stored.lock().unwrap().clone()})
                                 }
                                 "CalendarEvent/set" => {
-                                    let mut event = call[1]["create"]["new1"].clone();
-                                    assert!(event.is_object());
-                                    captured.lock().unwrap().push(event.clone());
-                                    let mut events = stored.lock().unwrap();
-                                    let id = format!("remote-{}", events.len());
-                                    event["id"] = json!(id);
-                                    events.push(event);
-                                    json!({"created": {"new1": {"id": id}}})
+                                    if let Some(event) = call[1]["create"]["new1"].as_object() {
+                                        let mut event = Value::Object(event.clone());
+                                        captured.lock().unwrap().push(event.clone());
+                                        let mut events = stored.lock().unwrap();
+                                        let id = format!("remote-{}", events.len());
+                                        event["id"] = json!(id);
+                                        events.push(event);
+                                        json!({"created": {"new1": {"id": id}}})
+                                    } else {
+                                        assert_eq!(call[1]["sendSchedulingMessages"], false);
+                                        let (id, patch) = call[1]["update"]
+                                            .as_object()
+                                            .unwrap()
+                                            .iter()
+                                            .next()
+                                            .unwrap();
+                                        captured.lock().unwrap().push(patch.clone());
+                                        json!({"updated": {id: null}})
+                                    }
                                 }
                                 _ => panic!("unexpected JMAP method {method}"),
                             };
@@ -697,5 +724,39 @@ mod deferred_creation_tests {
             .await
             .is_err());
         assert!(server.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn personal_copy_update_clears_scheduling_and_stale_optional_fields() {
+        let server = CalendarServer::start().await;
+        let services = server.services();
+        let account = server.account();
+        let (_directory, db) = temp_pool();
+        let mut local = event();
+        local.description = None;
+        local.location = None;
+        local.organizer_email = Some("owner@example.test".into());
+        local.attendees_json = Some("[]".into());
+
+        JmapCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &account,
+                "remote-copy",
+                &local,
+            )
+            .await
+            .unwrap();
+
+        let writes = server.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0]["description"].is_null());
+        assert_eq!(writes[0]["locations"], json!({}));
+        assert_eq!(writes[0]["participants"], json!({}));
+        assert!(writes[0]["recurrenceRules"].is_null());
+        assert!(writes[0]["recurrenceOverrides"].is_null());
     }
 }

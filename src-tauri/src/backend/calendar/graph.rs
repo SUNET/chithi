@@ -7,7 +7,9 @@ use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::NewCalendar;
 use crate::error::Result;
-use crate::mail::graph::{event_patch_to_graph_json, event_to_graph_json};
+use crate::mail::graph::{
+    event_patch_to_graph_json, event_to_graph_json, invitation_copy_patch_to_graph_json,
+};
 use crate::provider::GraphTokenPurpose;
 
 use super::{
@@ -441,6 +443,7 @@ impl CalendarBackend for GraphCalendarBackend {
         Ok(Some(PushedEvent {
             remote_id,
             canonical_uid: ical_uid,
+            etag: None,
         }))
     }
 
@@ -457,6 +460,23 @@ impl CalendarBackend for GraphCalendarBackend {
             .await?;
         let patch = event_patch_to_graph_json(event);
         client.update_event(remote_id, &patch).await
+    }
+
+    async fn push_updated_invitation_copy(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<Option<String>> {
+        let client = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?;
+        client
+            .update_event(remote_id, &invitation_copy_patch_to_graph_json(event)?)
+            .await?;
+        Ok(None)
     }
 
     async fn push_deleted_event(
@@ -522,7 +542,7 @@ mod creation_tests {
     use super::GraphCalendarBackend;
     use crate::backend::calendar::google::{
         creation_testutil::assert_standalone_creation,
-        sync_testutil::{serve_create_response, services, setup_db},
+        sync_testutil::{serve_create_response, serve_patch_response, services, setup_db},
     };
     use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
     use crate::backend::testutil::{account, event};
@@ -579,6 +599,85 @@ mod creation_tests {
             serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(payload["recurrence"]["pattern"]["type"], "weekly");
         assert_eq!(payload["recurrence"]["range"]["numberOfOccurrences"], 3);
+    }
+
+    #[tokio::test]
+    async fn personal_copy_update_preserves_recurrence_without_scheduling_guests() {
+        let (_directory, db) = setup_db().await;
+        let (root, captured) = serve_patch_response(serde_json::json!({})).await;
+        let mut event = event();
+        event.title = "Changed".into();
+        event.description = None;
+        event.location = None;
+        event.start_time = "2026-09-14T09:00:00Z".into();
+        event.end_time = "2026-09-14T10:00:00Z".into();
+        event.timezone = Some("Europe/Stockholm".into());
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=WEEKLY;BYDAY=MO;COUNT=3".into());
+        event.organizer_email = Some("organizer@example.test".into());
+        event.attendees_json = Some(
+            serde_json::json!([{"email": "guest@example.test", "status": "accepted"}]).to_string(),
+        );
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series@example.test\r\n\
+             RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3\r\nEND:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+                .into(),
+        );
+        let provider_services = services(&root);
+
+        GraphCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &provider_services,
+                },
+                &account("calendar", "graph"),
+                "remote-series",
+                &event,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload["subject"], "Changed");
+        assert_eq!(payload["body"]["content"], "");
+        assert_eq!(payload["location"]["displayName"], "");
+        assert_eq!(payload["start"]["timeZone"], "Europe/Stockholm");
+        assert_eq!(payload["recurrence"]["pattern"]["type"], "weekly");
+        assert!(payload.get("organizer").is_none());
+        assert!(payload.get("attendees").is_none());
+    }
+
+    #[tokio::test]
+    async fn personal_copy_update_explicitly_removes_recurrence() {
+        let (_directory, db) = setup_db().await;
+        let (root, captured) = serve_patch_response(serde_json::json!({})).await;
+        let mut event = event();
+        event.recurrence_kind = RecurrenceKind::Standalone;
+        event.recurrence_rule = None;
+        event.attendees_json =
+            Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
+        let provider_services = services(&root);
+
+        GraphCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &provider_services,
+                },
+                &account("calendar", "graph"),
+                "remote-event",
+                &event,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(payload["recurrence"].is_null());
+        assert!(payload.get("attendees").is_none());
     }
 }
 

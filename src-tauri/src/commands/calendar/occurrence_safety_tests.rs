@@ -5,14 +5,15 @@ use std::cell::{Cell, RefCell};
 use rusqlite::{params, types::Value, Connection};
 
 use super::{
-    attach_created_event_identity, capture_move_source, checked_delivery_snapshot,
-    checked_invitation_snapshot, checked_invitation_target, checked_mutation_target,
-    configured_invite_destination, create_event_inner, create_event_with_metadata,
-    create_event_with_receipt, delete_event_inner, delete_event_with_destination,
-    ensure_cross_account_invitation_copy, import_calendar_groups_inner,
+    attach_created_event_identity, attach_created_event_transport_identity, capture_move_source,
+    checked_delivery_snapshot, checked_invitation_snapshot, checked_invitation_target,
+    checked_mutation_target, commit_invitation_copy_move, configured_invite_destination,
+    create_event_inner, create_event_with_metadata, create_event_with_receipt, delete_event_inner,
+    delete_event_with_destination, delete_provenance_invitation_copy, import_calendar_groups_inner,
     move_event_to_calendar_inner, notify_calendar_event_inner, prepare_invitation_transport,
-    send_invites_inner, update_event_inner, ImportedEventMetadata, InvitationPurpose,
-    MeetBindingInput, MoveSourceSnapshot, NewEventInput, UpdateEventInput,
+    refreshed_invitation_copy, send_invites_inner, update_event_inner, ImportedEventMetadata,
+    InvitationPurpose, MeetBindingInput, MoveSourceSnapshot, NewEventInput, ProvenanceCancellation,
+    UpdateEventInput,
 };
 use crate::calendar::{ical, Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -488,6 +489,7 @@ async fn imported_creation_preserves_source_identity_and_personal_resource() {
             personal_copy: true,
             require_remote_creation: false,
         }),
+        false,
     )
     .await
     .unwrap()
@@ -528,6 +530,7 @@ async fn imported_invitation_records_source_provenance_for_status_lookup() {
             personal_copy: true,
             require_remote_creation: false,
         }),
+        false,
     )
     .await
     .unwrap()
@@ -575,24 +578,29 @@ async fn invitation_destination_comes_from_the_source_mail_binding() {
     assert_eq!(account.id, "account-b");
 }
 
-#[tokio::test]
-async fn cross_account_copy_is_idempotent_and_unanswered_until_delivery() {
-    let fixture = Fixture::new().await;
-    let (calendar, destination_account) = {
-        let conn = fixture.state.db.reader();
-        (
-            db::calendar::get_calendar(&conn, "cross-account").unwrap(),
-            db::accounts::get_account_full(&conn, "account-b").unwrap(),
-        )
-    };
+#[test]
+fn invitation_updates_refresh_content_but_preserve_identity_and_response() {
+    let mut existing = stored_event("copy", RecurrenceKind::Standalone, None);
+    existing.account_id = "account-b".into();
+    existing.calendar_id = "cross-account".into();
+    existing.uid = Some("provider-copy@example.test".into());
+    existing.organizer_email = Some("organizer@example.test".into());
+    existing.my_status = Some("accepted".into());
+    existing.ical_data = Some(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+         UID:cross-account@example.test\r\nSEQUENCE:1\r\n\
+         DTSTART:20260915T110000Z\r\nDTEND:20260915T120000Z\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n"
+            .into(),
+    );
     let invite = ical::ParsedInvite {
         method: "REQUEST".into(),
         uid: "cross-account@example.test".into(),
-        summary: Some("Cross-account invite".into()),
-        description: None,
-        location: None,
-        dtstart: "2026-09-15T11:00:00Z".into(),
-        dtend: "2026-09-15T12:00:00Z".into(),
+        summary: Some("Updated invitation".into()),
+        description: Some("Updated details".into()),
+        location: Some("Updated room".into()),
+        dtstart: "2026-09-16T13:00:00Z".into(),
+        dtend: "2026-09-16T14:00:00Z".into(),
         all_day: false,
         timezone: Some("Europe/Stockholm".into()),
         organizer_email: Some("organizer@example.test".into()),
@@ -600,48 +608,268 @@ async fn cross_account_copy_is_idempotent_and_unanswered_until_delivery() {
         attendees: vec![attendee("account-a@example.test")],
         recurrence_rule: None,
         recurrence_kind: RecurrenceKind::Standalone,
-        sequence: 0,
-        ical_raw: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+        sequence: 2,
+        ical_raw: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+                   BEGIN:VEVENT\r\nUID:cross-account@example.test\r\nSEQUENCE:2\r\n\
+                   DTSTART:20260916T130000Z\r\nDTEND:20260916T140000Z\r\n\
+                   SUMMARY:Updated invitation\r\n\
+                   ORGANIZER:mailto:organizer@example.test\r\n\
+                   ATTENDEE:mailto:account-a@example.test\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n"
+            .into(),
     };
 
-    let first = ensure_cross_account_invitation_copy(
-        &fixture.state,
-        "account-a",
-        Some("message-1"),
+    let refreshed = refreshed_invitation_copy(
+        &existing,
         &invite.uid,
         &invite,
-        &calendar,
-        &destination_account,
+        "account-a@example.test",
+        Some("message-1"),
+    )
+    .unwrap();
+    assert_eq!(refreshed.id, existing.id);
+    assert_eq!(refreshed.account_id, existing.account_id);
+    assert_eq!(refreshed.calendar_id, existing.calendar_id);
+    assert_eq!(refreshed.remote_id, existing.remote_id);
+    assert_eq!(refreshed.uid, existing.uid);
+    assert_eq!(refreshed.my_status.as_deref(), Some("accepted"));
+    assert_eq!(refreshed.title, "Updated invitation");
+    assert_eq!(refreshed.start_time, "2026-09-16T13:00:00Z");
+    assert!(refreshed
+        .attendees_json
+        .as_deref()
+        .is_some_and(|attendees| attendees.contains("accepted")));
+
+    let mut stale = invite.clone();
+    stale.sequence = 0;
+    assert!(refreshed_invitation_copy(
+        &existing,
+        &stale.uid,
+        &stale,
+        "account-a@example.test",
+        Some("message-2")
+    )
+    .is_err());
+    let mut spoofed = invite;
+    spoofed.organizer_email = Some("attacker@example.test".into());
+    assert!(refreshed_invitation_copy(
+        &existing,
+        &spoofed.uid,
+        &spoofed,
+        "account-a@example.test",
+        Some("message-2")
+    )
+    .is_err());
+    let mut missing_organizer = spoofed;
+    missing_organizer.organizer_email = None;
+    assert!(refreshed_invitation_copy(
+        &existing,
+        &missing_organizer.uid,
+        &missing_organizer,
+        "account-a@example.test",
+        Some("message-2")
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn provenance_cancellation_rejects_spoof_stale_and_remote_failure() {
+    let fixture = Fixture::new().await;
+    let mut event = stored_event("cancel-copy", RecurrenceKind::Standalone, None);
+    event.account_id = "account-b".into();
+    event.calendar_id = "cross-account".into();
+    event.uid = Some("provider-copy@example.test".into());
+    event.organizer_email = Some("organizer@example.test".into());
+    event.ical_data = Some(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+         UID:cancel@example.test\r\nSEQUENCE:2\r\n\
+         DTSTART:20260915T110000Z\r\nDTEND:20260915T120000Z\r\n\
+         END:VEVENT\r\nEND:VCALENDAR\r\n"
+            .into(),
+    );
+    fixture.insert(&event).await;
+    {
+        let conn = fixture.state.db.writer().await;
+        db::calendar_invitation_source::record(
+            &conn,
+            &event.id,
+            &db::calendar_invitation_source::InvitationSource {
+                source_account_id: "account-a".into(),
+                source_message_id: "message-1".into(),
+                invitation_uid: "cancel@example.test".into(),
+            },
+        )
+        .unwrap();
+    }
+    let cancel = |organizer: &str, sequence| ical::ParsedInvite {
+        method: "CANCEL".into(),
+        uid: "cancel@example.test".into(),
+        summary: Some("Cancelled".into()),
+        description: None,
+        location: None,
+        dtstart: "2026-09-15T11:00:00Z".into(),
+        dtend: "2026-09-15T12:00:00Z".into(),
+        all_day: false,
+        timezone: None,
+        organizer_email: Some(organizer.into()),
+        organizer_name: None,
+        attendees: vec![],
+        recurrence_rule: None,
+        recurrence_kind: RecurrenceKind::Standalone,
+        sequence,
+        ical_raw: String::new(),
+    };
+    let before = fixture.snapshot();
+
+    assert!(matches!(
+        delete_provenance_invitation_copy(
+            &fixture.state,
+            "account-a",
+            &cancel("attacker@example.test", 2)
+        )
+        .await
+        .unwrap(),
+        ProvenanceCancellation::Ignored
+    ));
+    assert!(matches!(
+        delete_provenance_invitation_copy(
+            &fixture.state,
+            "account-a",
+            &cancel("organizer@example.test", 1)
+        )
+        .await
+        .unwrap(),
+        ProvenanceCancellation::Ignored
+    ));
+    let mut missing_organizer = cancel("organizer@example.test", 2);
+    missing_organizer.organizer_email = None;
+    assert!(matches!(
+        delete_provenance_invitation_copy(&fixture.state, "account-a", &missing_organizer)
+            .await
+            .unwrap(),
+        ProvenanceCancellation::Ignored
+    ));
+    let mut occurrence = cancel("organizer@example.test", 2);
+    occurrence.recurrence_kind = RecurrenceKind::Occurrence;
+    assert!(matches!(
+        delete_provenance_invitation_copy(&fixture.state, "account-a", &occurrence)
+            .await
+            .unwrap(),
+        ProvenanceCancellation::Ignored
+    ));
+    let error = delete_provenance_invitation_copy(
+        &fixture.state,
+        "account-a",
+        &cancel("organizer@example.test", 2),
     )
     .await
-    .unwrap();
-    let second = ensure_cross_account_invitation_copy(
+    .unwrap_err();
+    assert!(error.to_string().contains("calendar provider"));
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[tokio::test]
+async fn invitation_move_commit_transfers_provenance_and_metadata() {
+    let fixture = Fixture::new().await;
+    let mut source = stored_event("invite-source", RecurrenceKind::Standalone, None);
+    source.uid = Some("provider-source@example.test".into());
+    source.organizer_email = Some("organizer@example.test".into());
+    source.my_status = Some("accepted".into());
+    source.source_message_id = Some("message-1".into());
+    source.ical_data = Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into());
+    fixture.insert(&source).await;
+    {
+        let conn = fixture.state.db.writer().await;
+        db::calendar_invitation_source::record(
+            &conn,
+            &source.id,
+            &db::calendar_invitation_source::InvitationSource {
+                source_account_id: "account-a".into(),
+                source_message_id: "message-1".into(),
+                invitation_uid: "invite@example.test".into(),
+            },
+        )
+        .unwrap();
+    }
+    let snapshot = fixture.move_source(&source.id);
+    let copied = create_event_with_metadata(
         &fixture.state,
-        "account-a",
-        Some("message-1"),
-        &invite.uid,
-        &invite,
-        &calendar,
-        &destination_account,
+        new_event("account-b", "cross-account", None),
+        Some(&snapshot),
+        Some(ImportedEventMetadata {
+            uid: source.uid.clone().unwrap(),
+            recurrence_kind: source.recurrence_kind,
+            ical_data: source.ical_data.clone().unwrap(),
+            source_message_id: "message-1".into(),
+            organizer_email: source.organizer_email.clone(),
+            attendees_json: source.attendees_json.clone(),
+            my_status: source.my_status.clone(),
+            invitation_source: None,
+            personal_copy: true,
+            require_remote_creation: false,
+        }),
+        false,
     )
     .await
     .unwrap();
 
-    assert_eq!(second, first);
-    let conn = fixture.state.db.reader();
-    let event = db::calendar::get_event(&conn, &first).unwrap();
-    assert_eq!(event.account_id, "account-b");
-    assert_eq!(event.calendar_id, "cross-account");
-    assert!(event.my_status.is_none());
+    let cleanup_ids = {
+        let mut conn = fixture.state.db.writer().await;
+        commit_invitation_copy_move(&mut conn, &source.id, &snapshot, &copied).unwrap()
+    };
+    assert!(cleanup_ids.is_empty());
+    assert!(db::calendar::get_event(&fixture.state.db.reader(), &source.id).is_err());
+    let moved = fixture.event(&copied.event.id);
+    assert_eq!(moved.account_id, "account-b");
+    assert_eq!(moved.organizer_email, source.organizer_email);
+    assert_eq!(moved.attendees_json, source.attendees_json);
+    assert_eq!(moved.my_status, source.my_status);
     assert_eq!(
-        db::calendar_invitation_source::response_status(
-            &conn,
-            "account-a",
-            "cross-account@example.test"
-        )
-        .unwrap(),
-        None
+        db::calendar_invitation_source::get(&fixture.state.db.reader(), &moved.id)
+            .unwrap()
+            .unwrap()
+            .source_account_id,
+        "account-a"
     );
+}
+
+#[tokio::test]
+async fn invitation_move_snapshot_rejects_provenance_changes() {
+    let fixture = Fixture::new().await;
+    let source = stored_event("invite-race", RecurrenceKind::Standalone, None);
+    fixture.insert(&source).await;
+    {
+        let conn = fixture.state.db.writer().await;
+        db::calendar_invitation_source::record(
+            &conn,
+            &source.id,
+            &db::calendar_invitation_source::InvitationSource {
+                source_account_id: "account-a".into(),
+                source_message_id: "message-1".into(),
+                invitation_uid: "invite-race@example.test".into(),
+            },
+        )
+        .unwrap();
+    }
+    let snapshot = fixture.move_source(&source.id);
+    {
+        let conn = fixture.state.db.writer().await;
+        db::calendar_invitation_source::record(
+            &conn,
+            &source.id,
+            &db::calendar_invitation_source::InvitationSource {
+                source_account_id: "account-a".into(),
+                source_message_id: "message-2".into(),
+                invitation_uid: "invite-race@example.test".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let conn = fixture.state.db.reader();
+    let transaction = conn.unchecked_transaction().unwrap();
+    let error = checked_mutation_target(&transaction, &source.id, Some(&snapshot)).unwrap_err();
+    assert!(error.to_string().contains("changed during the move"));
 }
 
 #[tokio::test]
@@ -1359,6 +1587,7 @@ async fn move_destination_is_rechecked_after_waiting_for_source_deletion_transac
         &fixture.state,
         new_event("account-b", "cross-account", None),
         Some(&snapshot),
+        false,
     )
     .await
     .unwrap();
@@ -1392,6 +1621,7 @@ async fn creation_receipt_tracks_canonical_identity_without_losing_content_or_se
             &fixture.state,
             new_event("account-b", "cross-account", rule),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1400,12 +1630,14 @@ async fn creation_receipt_tracks_canonical_identity_without_losing_content_or_se
         let mut expected = created.event.clone();
         expected.remote_id = Some("remote-copy".into());
         expected.uid = Some("canonical@example.test".into());
+        expected.etag = Some("created-etag".into());
         attach_created_event_identity(
             &fixture.state,
             &mut created,
             crate::backend::calendar::PushedEvent {
                 remote_id: "remote-copy".into(),
                 canonical_uid: Some("canonical@example.test".into()),
+                etag: Some("created-etag".into()),
             },
         )
         .await
@@ -1427,12 +1659,13 @@ async fn creation_receipt_tracks_canonical_identity_without_losing_content_or_se
 }
 
 #[tokio::test]
-async fn failed_identity_attachment_rolls_back_both_identifiers_and_keeps_original_receipt() {
+async fn failed_canonical_identity_attachment_can_recover_transport_identity() {
     let fixture = Fixture::new().await;
     let mut created = create_event_with_receipt(
         &fixture.state,
         new_event("account-b", "cross-account", None),
         None,
+        false,
     )
     .await
     .unwrap();
@@ -1455,6 +1688,7 @@ async fn failed_identity_attachment_rolls_back_both_identifiers_and_keeps_origin
         crate::backend::calendar::PushedEvent {
             remote_id: "remote-copy".into(),
             canonical_uid: Some("canonical@example.test".into()),
+            etag: None,
         },
     )
     .await
@@ -1463,6 +1697,25 @@ async fn failed_identity_attachment_rolls_back_both_identifiers_and_keeps_origin
     assert_eq!(created.event, event);
     assert_eq!(created.revision, revision);
     assert_eq!(fixture.snapshot(), before);
+
+    fixture
+        .state
+        .db
+        .writer()
+        .await
+        .execute_batch("DROP TRIGGER reject_canonical_uid")
+        .unwrap();
+    attach_created_event_transport_identity(
+        &fixture.state,
+        &mut created,
+        "remote-copy".into(),
+        Some("created-etag".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.event.title, event.title);
+    assert_eq!(created.event.remote_id.as_deref(), Some("remote-copy"));
+    assert_eq!(created.event.etag.as_deref(), Some("created-etag"));
 }
 
 #[tokio::test]
@@ -2621,7 +2874,7 @@ mod jmap_creation {
 
     impl CreationServer {
         async fn start() -> Self {
-            Self::start_with_response(None, true).await
+            Self::start_with_response(None, true, false).await
         }
 
         async fn start_with_response(
@@ -2630,13 +2883,15 @@ mod jmap_creation {
                 tokio::sync::oneshot::Receiver<()>,
             )>,
             succeeds: bool,
+            expect_delete: bool,
         ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let root = format!("http://{}", listener.local_addr().unwrap());
             let base = root.clone();
             let task = tokio::spawn(async move {
                 let mut created = JsonValue::Null;
-                for request_index in 0..2 {
+                let request_count = if expect_delete { 4 } else { 2 };
+                for request_index in 0..request_count {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut bytes = Vec::new();
                     let mut chunk = [0; 4096];
@@ -2662,7 +2917,7 @@ mod jmap_creation {
                         assert!(count > 0);
                         bytes.extend_from_slice(&chunk[..count]);
                     }
-                    let response = if request_index == 0 {
+                    let response = if request_index % 2 == 0 {
                         assert!(headers.starts_with("GET /.well-known/jmap "), "{headers}");
                         json!({
                             "apiUrl": format!("{base}/jmap/api"),
@@ -2682,16 +2937,21 @@ mod jmap_creation {
                         let calls = request["methodCalls"].as_array().unwrap();
                         assert_eq!(calls.len(), 1);
                         assert_eq!(calls[0][0], "CalendarEvent/set");
-                        created = calls[0][1]["create"]["new1"].clone();
-                        assert!(created.is_object());
-                        if let Some((ready, release)) = pause.take() {
-                            ready.send(()).unwrap();
-                            release.await.unwrap();
-                        }
-                        let result = if succeeds {
-                            json!({"created": {"new1": {"id": "immediate-remote-series"}}})
+                        let result = if request_index == 1 {
+                            created = calls[0][1]["create"]["new1"].clone();
+                            assert!(created.is_object());
+                            if let Some((ready, release)) = pause.take() {
+                                ready.send(()).unwrap();
+                                release.await.unwrap();
+                            }
+                            if succeeds {
+                                json!({"created": {"new1": {"id": "immediate-remote-series"}}})
+                            } else {
+                                json!({"notCreated": {"new1": {"type": "forbidden"}}})
+                            }
                         } else {
-                            json!({"notCreated": {"new1": {"type": "forbidden"}}})
+                            assert_eq!(calls[0][1]["destroy"], json!(["immediate-remote-series"]));
+                            json!({"destroyed": ["immediate-remote-series"]})
                         };
                         json!({"methodResponses": [["CalendarEvent/set", result, calls[0][2]]],
                             "sessionState": "state"})
@@ -2814,9 +3074,12 @@ mod jmap_creation {
                 let mut fixture = Fixture::new().await;
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-                let mut server =
-                    CreationServer::start_with_response(Some((ready_tx, release_rx)), succeeds)
-                        .await;
+                let mut server = CreationServer::start_with_response(
+                    Some((ready_tx, release_rx)),
+                    succeeds,
+                    succeeds,
+                )
+                .await;
                 configure_creation(&mut fixture, &server, "account-b", "cross-account").await;
                 let source = stored_event("standalone", RecurrenceKind::Standalone, None);
                 fixture.insert(&source).await;
@@ -2941,19 +3204,27 @@ mod jmap_creation {
                     release_tx.send(()).unwrap();
                     (id, after_change)
                 };
-                let (result, (id, after_change)) =
+                let (result, (_id, after_change)) =
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         tokio::join!(moving, change)
                     })
                     .await
                     .unwrap();
-                let error = result.unwrap_err().to_string();
+                let error = match result {
+                    Err(error) => error.to_string(),
+                    Ok(id) => panic!("{race}, {succeeds}: move unexpectedly succeeded as {id}"),
+                };
                 assert!(
-                    error.contains(&id) && error.contains("source was not removed"),
+                    error.contains("rolled back") || error.contains("source was not removed"),
                     "{race}, {succeeds}: {error}"
                 );
                 assert_eq!(fixture.event(&source.id), source, "{race}, {succeeds}");
-                assert_eq!(fixture.snapshot(), after_change, "{race}, {succeeds}");
+                let expected = if race == "identity-write-failure" && succeeds {
+                    &before
+                } else {
+                    &after_change
+                };
+                assert_eq!(&fixture.snapshot(), expected, "{race}, {succeeds}");
                 assert_eq!(after_change.meetings, before.meetings);
                 assert_eq!(after_change.pending, before.pending);
                 (&mut server.task).await.unwrap();
@@ -2965,7 +3236,7 @@ mod jmap_creation {
     async fn unchanged_destination_allows_move_after_successful_or_failed_push() {
         for succeeds in [false, true] {
             let mut fixture = Fixture::new().await;
-            let mut server = CreationServer::start_with_response(None, succeeds).await;
+            let mut server = CreationServer::start_with_response(None, succeeds, false).await;
             configure_creation(&mut fixture, &server, "account-b", "cross-account").await;
             let source = stored_event("standalone", RecurrenceKind::Standalone, None);
             fixture.insert(&source).await;

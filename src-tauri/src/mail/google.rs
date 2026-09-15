@@ -2571,6 +2571,92 @@ pub fn event_patch_to_google_json(event: &CalendarEvent) -> serde_json::Value {
     patch
 }
 
+/// Authoritative Calendar v3 PATCH for a personal invitation copy. Every
+/// locally owned field is present, while scheduling fields are never emitted.
+pub fn invitation_copy_patch_to_google_json(event: &CalendarEvent) -> Result<serde_json::Value> {
+    let timezone = if event.all_day {
+        None
+    } else {
+        event
+            .timezone
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|timezone| {
+                let resolved =
+                    crate::calendar::timezone::windows_to_iana(timezone).unwrap_or(timezone);
+                resolved.parse::<chrono_tz::Tz>().map_err(|_| {
+                    Error::Other(format!("Google event timezone is unsupported: {timezone}"))
+                })?;
+                Ok::<_, Error>(resolved)
+            })
+            .transpose()?
+    };
+    let timed_boundary = |timestamp: &str| {
+        let mut boundary = serde_json::json!({"dateTime": timestamp});
+        if let Some(timezone) = timezone {
+            boundary["timeZone"] = serde_json::json!(timezone);
+        }
+        boundary
+    };
+    let boundary = |timestamp: &str| {
+        if event.all_day {
+            serde_json::json!({
+                "date": timestamp.split('T').next().unwrap_or_default()
+            })
+        } else {
+            timed_boundary(timestamp)
+        }
+    };
+    let recurrence = match event.recurrence_kind {
+        RecurrenceKind::Standalone
+            if event.recurrence_rule.as_deref().is_none_or(str::is_empty) =>
+        {
+            serde_json::json!([])
+        }
+        RecurrenceKind::Series => {
+            if event
+                .ical_data
+                .as_deref()
+                .is_some_and(|raw| !crate::calendar::ical::is_rrule_only_series(raw))
+            {
+                return Err(Error::UnsupportedCapability {
+                    protocol: "google",
+                    capability: "recurrence exceptions or additional dates",
+                });
+            }
+            let rule = event
+                .recurrence_rule
+                .as_deref()
+                .and_then(|rule| {
+                    crate::calendar::recurrence::normalize_invitation_rrule(
+                        rule,
+                        event.timezone.as_deref(),
+                    )
+                })
+                .ok_or(Error::UnsupportedCapability {
+                    protocol: "google",
+                    capability: "unrepresentable recurring invitation copy update",
+                })?;
+            serde_json::json!([format!("RRULE:{rule}")])
+        }
+        _ => {
+            return Err(Error::UnsupportedCapability {
+                protocol: "google",
+                capability: "recurring or unclassified invitation copy update",
+            });
+        }
+    };
+
+    Ok(serde_json::json!({
+        "summary": event.title,
+        "description": event.description,
+        "location": event.location,
+        "start": boundary(&event.start_time),
+        "end": boundary(&event.end_time),
+        "recurrence": recurrence,
+    }))
+}
+
 /// People v1 `Person` payload for all fields owned by the Google adapter.
 pub fn contact_to_person_json(
     display_name: &str,
@@ -2729,6 +2815,65 @@ mod builder_tests {
         assert!(v["iCalUID"].is_null());
         assert!(v["attendees"].is_null());
         assert_eq!(v["summary"], "Standup");
+    }
+
+    #[test]
+    fn invitation_copy_patch_is_authoritative_without_scheduling_fields() {
+        let mut event = event(false, Some(r#"[{"email":"a@x.org"}]"#));
+        event.title = "Changed".into();
+        event.description = None;
+        event.location = None;
+        event.timezone = Some("Europe/Stockholm".into());
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("freq=weekly;byday=tu;count=3".into());
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nRRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=3\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+                .into(),
+        );
+
+        let value = invitation_copy_patch_to_google_json(&event).unwrap();
+        assert_eq!(value["summary"], "Changed");
+        assert!(value["description"].is_null());
+        assert!(value["location"].is_null());
+        assert_eq!(value["start"]["dateTime"], event.start_time);
+        assert_eq!(value["start"]["timeZone"], "Europe/Stockholm");
+        assert_eq!(
+            value["recurrence"],
+            serde_json::json!(["RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=3"])
+        );
+        assert!(value.get("organizer").is_none());
+        assert!(value.get("attendees").is_none());
+    }
+
+    #[test]
+    fn invitation_copy_patch_explicitly_removes_recurrence_and_optional_fields() {
+        let mut event = event(true, Some(r#"[{"email":"a@x.org"}]"#));
+        event.description = None;
+        event.location = None;
+
+        let value = invitation_copy_patch_to_google_json(&event).unwrap();
+        assert!(value["description"].is_null());
+        assert!(value["location"].is_null());
+        assert_eq!(value["recurrence"], serde_json::json!([]));
+        assert_eq!(value["start"], serde_json::json!({"date": "2026-07-14"}));
+        assert!(value.get("attendees").is_none());
+    }
+
+    #[test]
+    fn invitation_copy_patch_rejects_lossy_recurrence() {
+        let mut event = event(false, None);
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=HOURLY".into());
+        assert!(invitation_copy_patch_to_google_json(&event).is_err());
+
+        event.recurrence_rule = Some("FREQ=WEEKLY".into());
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nRRULE:FREQ=WEEKLY\r\n\
+             EXDATE:20260721T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                .into(),
+        );
+        assert!(invitation_copy_patch_to_google_json(&event).is_err());
     }
 
     #[test]

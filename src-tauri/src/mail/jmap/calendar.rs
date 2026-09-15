@@ -56,8 +56,11 @@ impl JmapCalendarEvent {
             recurrence_rule: event.recurrence_rule.clone(),
             recurrence_kind: event.recurrence_kind,
             recurrence_rule_is_complete: event.recurrence_kind == RecurrenceKind::Series
-                && event.ical_data.is_none()
-                && event.source_message_id.is_none(),
+                && ((event.ical_data.is_none() && event.source_message_id.is_none())
+                    || event
+                        .ical_data
+                        .as_deref()
+                        .is_some_and(crate::calendar::ical::is_rrule_only_series)),
             uid: event.uid.clone(),
             organizer_email: event.organizer_email.clone(),
             attendees_json: event.attendees_json.clone(),
@@ -100,6 +103,51 @@ impl JmapCalendarEvent {
                 Ok(Some(rules))
             }
         }
+    }
+
+    /// Build an authoritative patch for a personal copy. Scheduling data is
+    /// always cleared, including participants left on an older remote copy.
+    pub(crate) fn personal_copy_update_patch(
+        event: &crate::calendar::CalendarEvent,
+    ) -> Result<serde_json::Value> {
+        let wire = Self::for_local_creation(event, "")?;
+        let recurrence_rules = wire.creation_recurrence_rules()?;
+        let start = if event.all_day {
+            if event.start_time.contains('T') {
+                event.start_time.trim_end_matches('Z').to_string()
+            } else {
+                format!("{}T00:00:00", event.start_time)
+            }
+        } else if let Some(timezone) = event.timezone.as_deref() {
+            crate::mail::caldav::utc_to_local(&event.start_time, timezone)
+        } else {
+            event.start_time.trim_end_matches('Z').to_string()
+        };
+        let locations = event
+            .location
+            .as_deref()
+            .filter(|location| !location.is_empty())
+            .map(|location| {
+                serde_json::json!({
+                    "loc1": {"@type": "Location", "name": location}
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        Ok(serde_json::json!({
+            "title": event.title,
+            "description": event.description,
+            "locations": locations,
+            "start": start,
+            "duration": compute_duration(&event.start_time, &event.end_time),
+            "showWithoutTime": event.all_day,
+            "timeZone": event.timezone,
+            "participants": {},
+            "recurrenceRules": recurrence_rules,
+            "recurrenceRule": null,
+            "excludedRecurrenceRules": null,
+            "recurrenceOverrides": null,
+        }))
     }
 }
 
@@ -738,6 +786,36 @@ impl JmapConnection {
         Ok(created_id)
     }
 
+    /// Apply a caller-built JSCalendar patch through `CalendarEvent/set`.
+    pub async fn update_calendar_event(
+        &self,
+        config: &JmapConfig,
+        event_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<()> {
+        let mut update = serde_json::Map::new();
+        update.insert(event_id.to_string(), patch.clone());
+        let request = serde_json::json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+            "methodCalls": [["CalendarEvent/set", {
+                "accountId": self.account_id,
+                "sendSchedulingMessages": false,
+                "update": update
+            }, "u1"]]
+        });
+        let response = self.api_request(&request, config).await?;
+        if let Some(error) = response["methodResponses"][0][1]["notUpdated"][event_id].as_object() {
+            let description = error
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unknown error");
+            return Err(Error::Other(format!(
+                "JMAP update calendar event failed: {description}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Update a participant's status on a calendar event via JMAP patch.
     /// Uses the JSCalendar-bis path syntax: participants/<id>/participationStatus
     pub async fn update_participant_status(
@@ -851,10 +929,21 @@ fn compute_end_from_duration(start: &str, duration: &str) -> String {
 /// Compute an ISO 8601 duration string from start and end datetimes.
 /// Returns "P1D" for full-day spans, "PT{n}H" / "PT{n}M" for shorter spans.
 fn compute_duration(start: &str, end: &str) -> String {
-    use chrono::NaiveDateTime;
+    use chrono::{NaiveDate, NaiveDateTime};
 
-    let start_dt = NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S");
-    let end_dt = NaiveDateTime::parse_from_str(end, "%Y-%m-%dT%H:%M:%S");
+    let parse_datetime = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|value| value.naive_utc())
+            .or_else(|_| {
+                NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S")
+            })
+            .or_else(|_| {
+                NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .map(|value| value.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+            })
+    };
+    let start_dt = parse_datetime(start);
+    let end_dt = parse_datetime(end);
 
     if let (Ok(s), Ok(e)) = (start_dt, end_dt) {
         let diff = e - s;
@@ -1015,6 +1104,46 @@ mod recurrence_tests {
             serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
         assert_eq!(restored.recurrence_kind, RecurrenceKind::Series);
         assert!(restored.creation_recurrence_rules().is_err());
+    }
+
+    #[test]
+    fn personal_copy_patch_is_authoritative_and_has_no_participants() {
+        let mut local = crate::backend::testutil::event();
+        local.title = "Updated".into();
+        local.description = None;
+        local.location = None;
+        local.start_time = "2026-09-14T07:00:00Z".into();
+        local.end_time = "2026-09-14T08:30:00Z".into();
+        local.timezone = Some("Europe/Stockholm".into());
+        local.recurrence_kind = RecurrenceKind::Series;
+        local.recurrence_rule = Some("FREQ=WEEKLY;COUNT=3".into());
+        local.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:u\r\n\
+             DTSTART:20260914T070000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+                .into(),
+        );
+        local.source_message_id = Some("message".into());
+        local.organizer_email = Some("owner@example.test".into());
+        local.attendees_json = Some("[]".into());
+
+        let patch = JmapCalendarEvent::personal_copy_update_patch(&local).unwrap();
+        assert_eq!(patch["title"], "Updated");
+        assert!(patch["description"].is_null());
+        assert_eq!(patch["locations"], json!({}));
+        assert_eq!(patch["participants"], json!({}));
+        assert_eq!(patch["start"], "2026-09-14T09:00:00");
+        assert_eq!(patch["duration"], "PT1H30M");
+        assert_eq!(patch["timeZone"], "Europe/Stockholm");
+        assert_eq!(patch["recurrenceRules"][0]["frequency"], "weekly");
+        assert_eq!(patch["recurrenceRules"][0]["count"], 3);
+        assert!(patch["recurrenceOverrides"].is_null());
+
+        local.recurrence_kind = RecurrenceKind::Standalone;
+        local.recurrence_rule = None;
+        local.ical_data = None;
+        let cleared = JmapCalendarEvent::personal_copy_update_patch(&local).unwrap();
+        assert!(cleared["recurrenceRules"].is_null());
     }
 
     #[test]
