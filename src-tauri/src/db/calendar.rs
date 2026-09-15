@@ -382,9 +382,18 @@ fn reconcile_duplicate_invite_rows(
 /// proof invalidation; callers must not open a transaction around this operation.
 pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Result<()> {
     let transaction = conn.unchecked_transaction()?;
-    upsert_provider_event(&transaction, event)?;
+    upsert_event_by_remote_id_in_transaction(&transaction, event)?;
     transaction.commit()?;
     Ok(())
+}
+
+/// Reconcile a provider event inside a caller-owned transaction.
+/// The caller must roll back the transaction on error.
+pub(crate) fn upsert_event_by_remote_id_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &CalendarEvent,
+) -> Result<()> {
+    upsert_provider_event(transaction, event).map(|_| ())
 }
 
 /// Atomically ingest a provider event and its complete recurrence object set.
@@ -398,6 +407,23 @@ pub fn upsert_event_by_remote_id_with_recurrence(
     event: &CalendarEvent,
     recurrence_seeds: &[RecurrenceIdentitySeed],
 ) -> Result<String> {
+    let transaction = conn.unchecked_transaction()?;
+    let event_id = upsert_event_by_remote_id_with_recurrence_in_transaction(
+        &transaction,
+        event,
+        recurrence_seeds,
+    )?;
+    transaction.commit()?;
+    Ok(event_id)
+}
+
+/// Reconcile a provider event and its authoritative recurrence set in the
+/// caller's transaction. The caller must roll back the transaction on error.
+pub(crate) fn upsert_event_by_remote_id_with_recurrence_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &CalendarEvent,
+    recurrence_seeds: &[RecurrenceIdentitySeed],
+) -> Result<String> {
     let mut seed_keys = std::collections::HashSet::new();
     for seed in recurrence_seeds {
         seed.validate()?;
@@ -406,10 +432,8 @@ pub fn upsert_event_by_remote_id_with_recurrence(
         }
     }
 
-    let transaction = conn.unchecked_transaction()?;
-    let event_id = upsert_provider_event(&transaction, event)?;
-    replace_event_recurrence_objects(&transaction, &event.account_id, &event_id, recurrence_seeds)?;
-    transaction.commit()?;
+    let event_id = upsert_provider_event(transaction, event)?;
+    replace_event_recurrence_objects(transaction, &event.account_id, &event_id, recurrence_seeds)?;
     Ok(event_id)
 }
 
@@ -1363,6 +1387,44 @@ mod tests {
             provider_revision: Some("revision-1".into()),
             kind: RecurrenceObjectKind::Occurrence,
         }
+    }
+
+    #[test]
+    fn provider_ingestion_participates_in_the_callers_transaction() {
+        let mut conn = setup_db();
+        let event = make_event("incoming", "First", Some("remote-event"));
+        let seed = recurrence_seed("provider-occurrence", "2026-04-07T17:00:00Z");
+        {
+            let tx = conn.transaction().unwrap();
+            let event_id = upsert_event_by_remote_id_with_recurrence_in_transaction(
+                &tx,
+                &event,
+                std::slice::from_ref(&seed),
+            )
+            .unwrap();
+            let mut refreshed = event.clone();
+            refreshed.id = "ignored-incoming-id".into();
+            refreshed.title = "Refreshed".into();
+            upsert_event_by_remote_id_in_transaction(&tx, &refreshed).unwrap();
+            assert_eq!(get_event(&tx, &event_id).unwrap().title, "Refreshed");
+            assert_eq!(
+                super::super::calendar_recurrence::get_by_event_id(&tx, &event_id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            tx.rollback().unwrap();
+        }
+        assert!(get_event(&conn, "incoming").is_err());
+        assert!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "incoming")
+                .unwrap()
+                .is_empty()
+        );
+        let tx = conn.transaction().unwrap();
+        upsert_event_by_remote_id_with_recurrence_in_transaction(&tx, &event, &[seed]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(get_event(&conn, "incoming").unwrap().title, "First");
     }
 
     #[test]

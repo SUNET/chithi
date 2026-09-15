@@ -1150,10 +1150,23 @@ fn validate_recurrence_plan_classification(
         ));
     }
 
+    if protocol == "caldav"
+        && scope == RecurrenceMutationScope::ThisOccurrence
+        && (event.recurrence_kind != RecurrenceKind::Series
+            || identity.provider_occurrence_id.is_some()
+            || nonempty(event.remote_id.as_deref()).is_none()
+            || identity.provider_series_id.as_deref() != event.remote_id.as_deref())
+    {
+        return Err(crate::error::Error::Other(
+            "CalDAV THIS-OCCURRENCE requires a trusted embedded exception resource".into(),
+        ));
+    }
+
     let detached_occurrence = matches!(
         identity.kind,
         RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
-    ) && event.recurrence_kind == RecurrenceKind::Occurrence;
+    ) && event.recurrence_kind == RecurrenceKind::Occurrence
+        && matches!(protocol, "google" | "graph" | "jmap");
     let embedded_occurrence = matches!(
         identity.kind,
         RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
@@ -5358,6 +5371,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recurrence_plans_allow_only_supported_provider_resource_shapes() {
+        for (protocol, embedded) in [
+            ("google", false),
+            ("graph", false),
+            ("jmap", false),
+            ("jmap", true),
+            ("caldav", true),
+        ] {
+            let (_directory, _state, plan) = occurrence_fixture(protocol, embedded).await;
+            assert_eq!(plan.backend_protocol, protocol);
+            assert_eq!(plan.scope, RecurrenceMutationScope::ThisOccurrence);
+        }
+    }
+
+    #[tokio::test]
+    async fn caldav_planning_rejects_detached_and_mismatched_resource_targets() {
+        for (kind, series_id, occurrence_id) in [
+            (RecurrenceKind::Occurrence, "resource.ics", None),
+            (
+                RecurrenceKind::Occurrence,
+                "resource.ics",
+                Some("detached.ics"),
+            ),
+            (RecurrenceKind::Series, "resource.ics", Some("detached.ics")),
+            (RecurrenceKind::Series, "different.ics", None),
+        ] {
+            let (_directory, state) = recurrence_plan_state("caldav").await;
+            let event = recurrence_plan_event("event", "account", kind, Some("resource.ics"));
+            insert_plan_event(&state, &event).await;
+            let identity = recurrence_plan_identity(
+                "object",
+                "event",
+                RecurrenceObjectKind::Exception,
+                None,
+                Some(series_id),
+                occurrence_id,
+            );
+            insert_plan_identity(&state, &identity).await;
+            let revision = db::calendar_revision::get(&state.db.reader(), "event").unwrap();
+            let summaries = get_event_recurrence_objects_inner(&state, "event")
+                .await
+                .unwrap();
+            assert_eq!(summaries.len(), 1);
+            let error = plan_event_recurrence_mutation_inner(
+                &state,
+                "event",
+                "object",
+                RecurrenceMutationScope::ThisOccurrence,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("trusted embedded exception resource"),
+                "{error}"
+            );
+            assert_eq!(
+                db::calendar_revision::get(&state.db.reader(), "event").unwrap(),
+                revision
+            );
+            assert_eq!(
+                db::calendar_recurrence::get_by_object_id(&state.db.reader(), "object").unwrap(),
+                Some(identity)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recurrence_discovery_is_owned_complete_safe_and_deterministic() {
         let (_directory, state) = recurrence_plan_state("caldav").await;
         let series = recurrence_plan_event(
@@ -5522,8 +5604,11 @@ mod tests {
         )
         .await;
         let conn = state.db.writer().await;
-        conn.execute_batch("DROP TRIGGER calendar_recurrence_account_update")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER calendar_recurrence_account_update;
+             DROP TRIGGER calendar_recurrence_id_immutable;",
+        )
+        .unwrap();
         conn.execute(
             "UPDATE calendar_recurrence_objects SET account_id = 'other'
              WHERE object_id = 'ownership-object'",
@@ -5574,19 +5659,7 @@ mod tests {
         assert_eq!(changed_protocol_backend.calls.load(Ordering::SeqCst), 0);
 
         let mut stale_target = plan.clone();
-        state
-            .db
-            .writer()
-            .await
-            .execute(
-                "UPDATE calendar_recurrence_objects
-                 SET provider_occurrence_id = 'replacement-target'
-                 WHERE object_id = 'occurrence-object'",
-                [],
-            )
-            .unwrap();
-        stale_target.expected_local_revision =
-            db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap();
+        stale_target.remote_target_id = "replacement-target".into();
         assert!(
             run_occurrence_update(&state, &stale_target, occurrence_update(), &backend)
                 .await
@@ -6239,7 +6312,10 @@ mod tests {
             .db
             .writer()
             .await
-            .execute_batch("DROP TRIGGER calendar_recurrence_account_update")
+            .execute_batch(
+                "DROP TRIGGER calendar_recurrence_account_update;
+                 DROP TRIGGER calendar_recurrence_id_immutable;",
+            )
             .unwrap();
         state
             .db

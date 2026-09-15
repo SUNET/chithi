@@ -15,9 +15,10 @@ const SELECT_COLUMNS: &str = "object_id, account_id, event_id,
      effective_timezone,
      provider_native_data, provider_revision, object_kind";
 
+/// Refresh mutable content only when an object ID still names the exact identity.
 pub fn upsert(conn: &Connection, identity: &RecurrenceIdentity) -> Result<()> {
     identity.validate()?;
-    conn.execute(
+    let written = conn.execute(
         "INSERT INTO calendar_recurrence_objects
              (object_id, account_id, event_id, local_series_event_id,
                provider_calendar_id, provider_series_id,
@@ -28,17 +29,8 @@ pub fn upsert(conn: &Connection, identity: &RecurrenceIdentity) -> Result<()> {
                provider_native_data, provider_revision, object_kind)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20)
-         ON CONFLICT(object_id) DO UPDATE SET
-             account_id = excluded.account_id,
-             event_id = excluded.event_id,
-             local_series_event_id = excluded.local_series_event_id,
-             provider_calendar_id = excluded.provider_calendar_id,
-             provider_series_id = excluded.provider_series_id,
-             provider_occurrence_id = excluded.provider_occurrence_id,
-             recurrence_id = excluded.recurrence_id,
-             recurrence_timezone = excluded.recurrence_timezone,
-             recurrence_value_type = excluded.recurrence_value_type,
-             effective_title = excluded.effective_title,
+          ON CONFLICT(object_id) DO UPDATE SET
+              effective_title = excluded.effective_title,
              effective_description = excluded.effective_description,
              effective_location = excluded.effective_location,
              effective_start = excluded.effective_start,
@@ -47,7 +39,16 @@ pub fn upsert(conn: &Connection, identity: &RecurrenceIdentity) -> Result<()> {
              effective_timezone = excluded.effective_timezone,
              provider_native_data = excluded.provider_native_data,
              provider_revision = excluded.provider_revision,
-             object_kind = excluded.object_kind",
+              object_kind = excluded.object_kind
+          WHERE calendar_recurrence_objects.account_id IS excluded.account_id
+            AND calendar_recurrence_objects.event_id IS excluded.event_id
+            AND calendar_recurrence_objects.local_series_event_id IS excluded.local_series_event_id
+            AND calendar_recurrence_objects.provider_calendar_id IS excluded.provider_calendar_id
+            AND calendar_recurrence_objects.provider_series_id IS excluded.provider_series_id
+            AND calendar_recurrence_objects.provider_occurrence_id IS excluded.provider_occurrence_id
+            AND calendar_recurrence_objects.recurrence_id IS excluded.recurrence_id
+            AND calendar_recurrence_objects.recurrence_timezone IS excluded.recurrence_timezone
+            AND calendar_recurrence_objects.recurrence_value_type IS excluded.recurrence_value_type",
         params![
             identity.object_id,
             identity.account_id,
@@ -73,6 +74,9 @@ pub fn upsert(conn: &Connection, identity: &RecurrenceIdentity) -> Result<()> {
             identity.kind.as_str(),
         ],
     )?;
+    if written != 1 {
+        return Err(Error::Other("recurrence identity is immutable".into()));
+    }
     Ok(())
 }
 
@@ -411,12 +415,15 @@ mod tests {
         let tx = conn.transaction().unwrap();
         let mut updated = identity(RecurrenceObjectKind::Occurrence, "object-1");
         updated.provider_revision = Some("updated".into());
+        updated.provider_native_data = Some("updated provider content".into());
+        updated.kind = RecurrenceObjectKind::Exception;
         updated.occurrence.title = "Updated effective title".into();
         updated.occurrence.timezone = Some("America/Toronto".into());
         upsert(&tx, &updated).unwrap();
         let stored = get_by_object_id(&tx, "object-1").unwrap().unwrap();
         assert_eq!(stored.provider_revision, Some("updated".into()));
         assert_eq!(stored.occurrence, updated.occurrence);
+        assert_eq!(stored, updated);
         assert!(delete(&tx, "object-1").unwrap());
         tx.rollback().unwrap();
         assert_eq!(
@@ -491,6 +498,107 @@ mod tests {
     }
 
     #[test]
+    fn upsert_rejects_every_changed_identity_component_without_writes() {
+        let conn = connection();
+        let original = identity(RecurrenceObjectKind::Occurrence, "immutable");
+        upsert(&conn, &original).unwrap();
+        let revision = crate::db::calendar_revision::get(&conn, "event").unwrap();
+
+        for field in [
+            "account_id",
+            "event_id",
+            "local_series_event_id",
+            "provider_calendar_id",
+            "provider_series_id",
+            "provider_occurrence_id",
+            "recurrence_id",
+            "recurrence_timezone",
+            "recurrence_value_type",
+        ] {
+            let mut changed = original.clone();
+            match field {
+                "account_id" => changed.account_id = "other-account".into(),
+                "event_id" => changed.event_id = "other-event".into(),
+                "local_series_event_id" => changed.local_series_event_id = None,
+                "provider_calendar_id" => changed.provider_calendar_id = Some("other".into()),
+                "provider_series_id" => changed.provider_series_id = Some("other".into()),
+                "provider_occurrence_id" => changed.provider_occurrence_id = Some("other".into()),
+                "recurrence_id" => changed.recurrence_id = Some("2026-09-17".into()),
+                "recurrence_timezone" => changed.recurrence_timezone = Some("UTC".into()),
+                "recurrence_value_type" => {
+                    changed.recurrence_value_type = Some(RecurrenceValueType::DateTime);
+                }
+                _ => unreachable!(),
+            }
+            changed.occurrence.title = "Must not persist".into();
+            assert!(upsert(&conn, &changed).is_err(), "{field}");
+            assert_eq!(
+                get_by_object_id(&conn, "immutable").unwrap().as_ref(),
+                Some(&original)
+            );
+            assert_eq!(
+                crate::db::calendar_revision::get(&conn, "event").unwrap(),
+                revision
+            );
+        }
+    }
+
+    #[test]
+    fn schema_protects_identity_from_direct_updates_and_reparenting() {
+        let conn = connection();
+        let original = identity(RecurrenceObjectKind::Occurrence, "immutable");
+        upsert(&conn, &original).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('other-account', 'Other', 'other@example.test', 'other@example.test');
+             INSERT INTO calendar_events
+                 (id, account_id, calendar_id, title, start_time, end_time)
+             VALUES ('other-account-event', 'other-account', 'other-calendar', 'Other',
+                     '2026-09-16', '2026-09-17');",
+        )
+        .unwrap();
+        let revision = crate::db::calendar_revision::get(&conn, "event").unwrap();
+        for assignment in [
+            "object_id = 'renamed'",
+            "event_id = 'other-event'",
+            "account_id = 'other-account', event_id = 'other-account-event', local_series_event_id = NULL",
+            "local_series_event_id = 'other-event'",
+            "local_series_event_id = NULL",
+            "provider_calendar_id = 'other-calendar'",
+            "provider_series_id = 'other-series'",
+            "provider_series_id = NULL",
+            "provider_occurrence_id = 'other-occurrence'",
+            "provider_occurrence_id = NULL",
+            "recurrence_id = '2026-09-17'",
+            "recurrence_timezone = 'UTC'",
+            "recurrence_timezone = NULL",
+            "recurrence_value_type = 'date-time'",
+        ] {
+            let error = conn.execute(
+                &format!("UPDATE calendar_recurrence_objects SET {assignment} WHERE object_id = 'immutable'"),
+                [],
+            ).unwrap_err();
+            assert!(error.to_string().contains("recurrence identity is immutable"), "{assignment}: {error}");
+            assert_eq!(get_by_object_id(&conn, "immutable").unwrap().as_ref(), Some(&original));
+            assert_eq!(crate::db::calendar_revision::get(&conn, "event").unwrap(), revision);
+        }
+
+        let mut unlinked = original.clone();
+        unlinked.object_id = "unlinked".into();
+        unlinked.local_series_event_id = None;
+        unlinked.provider_occurrence_id = Some("unlinked-occurrence".into());
+        unlinked.recurrence_id = Some("2026-09-18".into());
+        upsert(&conn, &unlinked).unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE calendar_recurrence_objects SET local_series_event_id = 'master-event'
+             WHERE object_id = 'unlinked'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
     fn owning_event_cascades_and_local_series_event_is_set_null() {
         let conn = connection();
         let occurrence = identity(RecurrenceObjectKind::Occurrence, "occurrence");
@@ -502,6 +610,7 @@ mod tests {
         local_only.provider_occurrence_id = None;
         local_only.recurrence_id = Some("2026-09-17".into());
         upsert(&conn, &local_only).unwrap();
+        let revision = crate::db::calendar_revision::get(&conn, "event").unwrap();
         conn.execute("DELETE FROM calendar_events WHERE id = 'master-event'", [])
             .unwrap();
         let stored = get_by_object_id(&conn, "occurrence").unwrap().unwrap();
@@ -511,6 +620,8 @@ mod tests {
             Some("provider-series")
         );
         assert!(get_by_object_id(&conn, "local-only").unwrap().is_none());
+        assert!(crate::db::calendar_revision::get(&conn, "event").unwrap() > revision);
+        upsert(&conn, &stored).unwrap();
 
         conn.execute("DELETE FROM calendar_events WHERE id = 'event'", [])
             .unwrap();
@@ -653,7 +764,13 @@ mod tests {
             value.recurrence_id = Some("2026-09-18".into());
             conn.execute_batch("DROP TRIGGER calendar_recurrence_id_immutable")
                 .unwrap();
-            upsert(&conn, &value).unwrap();
+            // Exercise the revision trigger defensively against legacy raw writes.
+            conn.execute(
+                "UPDATE calendar_recurrence_objects SET event_id = ?1, recurrence_id = ?2
+                 WHERE object_id = ?3",
+                params![value.event_id, value.recurrence_id, value.object_id],
+            )
+            .unwrap();
             assert!(crate::db::calendar_revision::get(&conn, "event").unwrap() > after_insert);
             assert!(
                 crate::db::calendar_revision::get(&conn, "other-event").unwrap() > other_before

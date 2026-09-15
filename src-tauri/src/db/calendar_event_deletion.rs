@@ -91,6 +91,23 @@ pub fn delete_events_by_remote_id(
     delete_events(conn, &event_ids)
 }
 
+/// Delete an explicit provider tombstone in its mapped local calendar only.
+/// The caller owns the transaction covering selection, meeting cleanup, and deletion.
+pub fn delete_calendar_events_by_remote_id(
+    conn: &Connection,
+    account_id: &str,
+    calendar_id: &str,
+    remote_id: &str,
+) -> Result<DeletionResult> {
+    let event_ids = select_event_ids(
+        conn,
+        "SELECT id FROM calendar_events
+         WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
+        &[account_id, calendar_id, remote_id],
+    )?;
+    delete_events(conn, &event_ids)
+}
+
 pub fn delete_unpushed_events_by_uid(
     conn: &Connection,
     account_id: &str,
@@ -158,6 +175,105 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    fn record_recurrence(conn: &Connection, event_id: &str) {
+        conn.execute(
+            "INSERT INTO calendar_recurrence_objects
+                (object_id, account_id, event_id, provider_calendar_id,
+                 provider_series_id, provider_occurrence_id, recurrence_id,
+                 recurrence_value_type, effective_title, effective_start,
+                 effective_end, effective_all_day, object_kind)
+             SELECT 'identity-' || id, account_id, id, calendar_id,
+                    'series', remote_id, start_time, 'date', title,
+                    start_time, end_time, 1, 'occurrence'
+             FROM calendar_events WHERE id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_tombstone_is_scoped_to_account_and_calendar_and_cascades_recurrence() {
+        let mut conn = connection();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('other-account', 'Other', 'other@example.test', 'other@example.test');
+             INSERT INTO calendars (id, account_id, name)
+             VALUES ('other-calendar', 'account', 'Other calendar'),
+                    ('other-account-calendar', 'other-account', 'Other account');",
+        )
+        .unwrap();
+        for id in [
+            "target",
+            "other-calendar",
+            "other-account",
+            "shared-uid",
+            "unpushed",
+        ] {
+            insert_event(&conn, id);
+        }
+        conn.execute_batch(
+            "UPDATE calendar_events SET uid = 'shared@example.test', remote_id = 'immutable-id';
+             UPDATE calendar_events SET calendar_id = 'other-calendar' WHERE id = 'other-calendar';
+             UPDATE calendar_events SET account_id = 'other-account',
+                 calendar_id = 'other-account-calendar' WHERE id = 'other-account';
+             UPDATE calendar_events SET remote_id = 'different-id' WHERE id = 'shared-uid';
+             UPDATE calendar_events SET remote_id = NULL WHERE id = 'unpushed';",
+        )
+        .unwrap();
+        for id in ["target", "other-calendar", "other-account"] {
+            record_recurrence(&conn, id);
+        }
+        bind(&conn, "target");
+
+        assert!(
+            delete_calendar_events_by_remote_id(&conn, "account", "calendar", "immutable-id")
+                .is_err()
+        );
+        let transaction = conn.transaction().unwrap();
+        let result = delete_calendar_events_by_remote_id(
+            &transaction,
+            "account",
+            "calendar",
+            "immutable-id",
+        )
+        .unwrap();
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.cleanup_lifecycle_ids.len(), 1);
+        assert_eq!(
+            delete_calendar_events_by_remote_id(
+                &transaction,
+                "account",
+                "calendar",
+                "immutable-id"
+            )
+            .unwrap(),
+            DeletionResult::default()
+        );
+        transaction.commit().unwrap();
+
+        assert!(db::calendar::get_event(&conn, "target").is_err());
+        assert!(db::calendar_recurrence::get_by_event_id(&conn, "target")
+            .unwrap()
+            .is_empty());
+        for id in ["other-calendar", "other-account", "shared-uid", "unpushed"] {
+            assert!(db::calendar::get_event(&conn, id).is_ok(), "deleted {id}");
+        }
+        for id in ["other-calendar", "other-account"] {
+            assert_eq!(
+                db::calendar_recurrence::get_by_event_id(&conn, id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(count(&conn, "meet_meetings"), 0);
+        assert_eq!(count(&conn, "meet_pending_meetings"), 1);
+        assert_eq!(
+            db::meet_pending_meetings::list_cleanup_requested(&conn).unwrap()[0].meeting_id,
+            "target"
+        );
     }
 
     #[test]
