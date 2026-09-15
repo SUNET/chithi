@@ -233,6 +233,14 @@ pub struct CalDavEvent {
     pub ical_data: String,
 }
 
+/// Identifiers confirmed by a successful event PUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedCalDavEvent {
+    pub href: String,
+    pub etag: Option<String>,
+    pub uid: String,
+}
+
 // XML payloads below use these namespace URIs:
 // - WebDAV: `DAV:`
 // - CalDAV: `urn:ietf:params:xml:ns:caldav`
@@ -459,21 +467,40 @@ impl CalDavClient {
         Ok(events)
     }
 
-    /// PUT an iCalendar event to the server. Returns the new etag.
+    /// PUT an iCalendar event to the server. Returns the new ETag when supplied.
     pub async fn put_event(
         &self,
         calendar_href: &str,
         uid: &str,
         ical_data: &str,
-    ) -> Result<String> {
-        let calendar_url = self.resolve_url(calendar_href)?;
-        let event_url = format!("{}/{}.ics", calendar_url.trim_end_matches('/'), uid);
+    ) -> Result<PushedCalDavEvent> {
+        let href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), uid);
+        let etag = self.put_event_at_href(&href, ical_data, None).await?;
+        Ok(PushedCalDavEvent {
+            href,
+            etag,
+            uid: uid.to_string(),
+        })
+    }
+
+    /// Replace the calendar object at an existing DAV href.
+    pub async fn put_event_at_href(
+        &self,
+        event_href: &str,
+        ical_data: &str,
+        if_match: Option<&str>,
+    ) -> Result<Option<String>> {
+        let event_url = self.resolve_url(event_href)?;
         log::info!("caldav: PUT event to {}", event_url);
 
-        let resp = self
+        let mut request = self
             .apply_auth(self.http.put(&event_url))
             .header("Content-Type", "text/calendar; charset=utf-8")
-            .body(ical_data.to_string())
+            .body(ical_data.to_string());
+        if let Some(etag) = if_match {
+            request = request.header(reqwest::header::IF_MATCH, etag);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| Error::Other(format!("CalDAV PUT failed: {}", e)))?;
@@ -491,15 +518,14 @@ impl CalDavClient {
             )));
         }
 
-        // Extract ETag from response headers
+        // An omitted ETag must remain distinguishable from a real validator.
         let etag = resp
             .headers()
             .get("etag")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .map(str::to_owned);
 
-        log::info!("caldav: PUT success, etag={}", etag);
+        log::info!("caldav: PUT success, etag={etag:?}");
         Ok(etag)
     }
 

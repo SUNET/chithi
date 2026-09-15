@@ -7,8 +7,8 @@ use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::google::{
-    event_patch_to_google_json, event_to_google_json, google_recurrence_kind, send_updates_for,
-    EventsPage, GoogleClient,
+    event_patch_to_google_json, event_to_google_json, google_recurrence_kind,
+    invitation_copy_patch_to_google_json, send_updates_for, EventsPage, GoogleClient,
 };
 
 use super::{
@@ -661,6 +661,7 @@ impl CalendarBackend for GoogleCalendarBackend {
         Ok(Some(PushedEvent {
             remote_id,
             canonical_uid,
+            etag: None,
         }))
     }
 
@@ -677,6 +678,21 @@ impl CalendarBackend for GoogleCalendarBackend {
         client
             .patch_event("primary", remote_id, &patch, send_updates)
             .await
+    }
+
+    async fn push_updated_invitation_copy(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<Option<String>> {
+        let client = ctx.services.google_client(&account.id).await?;
+        let patch = invitation_copy_patch_to_google_json(event)?;
+        client
+            .patch_event("primary", remote_id, &patch, "none")
+            .await?;
+        Ok(None)
     }
 
     async fn push_deleted_event(
@@ -1044,6 +1060,12 @@ pub(super) mod sync_testutil {
         serve_requests("POST", vec![(200, response)]).await
     }
 
+    pub(crate) async fn serve_patch_response(
+        response: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_requests("PATCH", vec![(200, response)]).await
+    }
+
     async fn serve_requests(
         method: &'static str,
         responses: Vec<(u16, serde_json::Value)>,
@@ -1207,7 +1229,11 @@ pub(super) mod creation_testutil {
 #[cfg(test)]
 mod creation_tests {
     use super::creation_testutil::{assert_rejected_before_io, assert_standalone_creation};
+    use super::sync_testutil::{serve_patch_response, services, setup_db};
     use super::GoogleCalendarBackend;
+    use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
+    use crate::backend::testutil::{account, event};
+    use crate::calendar::RecurrenceKind;
 
     #[tokio::test]
     async fn rejects_lossy_creation_before_credentials_and_preserves_local_event() {
@@ -1223,6 +1249,91 @@ mod creation_tests {
             "summary",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn personal_copy_update_is_authoritative_without_scheduling_guests() {
+        let (_directory, db) = setup_db().await;
+        let (root, captured) = serve_patch_response(serde_json::json!({})).await;
+        let mut event = event();
+        event.title = "Changed".into();
+        event.description = None;
+        event.location = None;
+        event.start_time = "2026-09-14T09:00:00Z".into();
+        event.end_time = "2026-09-14T10:00:00Z".into();
+        event.timezone = Some("Europe/Stockholm".into());
+        event.recurrence_kind = RecurrenceKind::Series;
+        event.recurrence_rule = Some("FREQ=WEEKLY;BYDAY=MO;COUNT=3".into());
+        event.organizer_email = Some("organizer@example.test".into());
+        event.attendees_json = Some(
+            serde_json::json!([{"email": "guest@example.test", "status": "accepted"}]).to_string(),
+        );
+        event.ical_data = Some(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:series@example.test\r\n\
+             RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3\r\nEND:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+                .into(),
+        );
+        let provider_services = services(&root);
+
+        GoogleCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &provider_services,
+                },
+                &account("calendar", "google"),
+                "remote-series",
+                &event,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        assert!(requests[0].starts_with(
+            "PATCH /calendar-api/calendars/primary/events/remote-series?sendUpdates=none "
+        ));
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload["summary"], "Changed");
+        assert!(payload["description"].is_null());
+        assert!(payload["location"].is_null());
+        assert_eq!(payload["start"]["timeZone"], "Europe/Stockholm");
+        assert_eq!(
+            payload["recurrence"][0],
+            "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3"
+        );
+        assert!(payload.get("organizer").is_none());
+        assert!(payload.get("attendees").is_none());
+    }
+
+    #[tokio::test]
+    async fn personal_copy_update_explicitly_removes_recurrence() {
+        let (_directory, db) = setup_db().await;
+        let (root, captured) = serve_patch_response(serde_json::json!({})).await;
+        let mut event = event();
+        event.recurrence_kind = RecurrenceKind::Standalone;
+        event.recurrence_rule = None;
+        event.attendees_json =
+            Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
+        let provider_services = services(&root);
+
+        GoogleCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &provider_services,
+                },
+                &account("calendar", "google"),
+                "remote-event",
+                &event,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload["recurrence"], serde_json::json!([]));
+        assert!(payload.get("attendees").is_none());
     }
 }
 

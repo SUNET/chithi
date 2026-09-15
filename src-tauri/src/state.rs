@@ -207,7 +207,7 @@ pub struct AppState {
     pub visio_login_sessions: std::sync::Mutex<HashMap<String, Arc<VisioLoginSession>>>,
     /// Serializes claims and cleanup for each durable meeting lifecycle.
     pub meet_lifecycle: MeetLifecycleCoordinator,
-    /// Serializes account mutation with remote meeting create/cleanup.
+    /// Serializes account mutation and calendar/meeting provider lifecycles.
     pub account_lifecycle: AccountLifecycleCoordinator,
     /// Shared OpenPGP keystore (~/.tumpa/keys.db by default, overridable
     /// with $TUMPA_DIR / $TUMPA_KEYSTORE). Lazily opened on first use so a

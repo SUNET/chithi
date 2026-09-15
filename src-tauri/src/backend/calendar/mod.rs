@@ -38,6 +38,8 @@ pub struct PushedEvent {
     /// Exchange iCalUid). Persisted as the local UID so incoming RSVP
     /// replies match back to the event.
     pub canonical_uid: Option<String>,
+    /// Provider revision returned with creation, when available.
+    pub etag: Option<String>,
 }
 
 /// Explicit result for optional provider capabilities.
@@ -218,11 +220,9 @@ pub trait CalendarBackend: Send + Sync {
         remote_calendar_id: &str,
     ) -> Result<()>;
 
-    /// Push a newly created local event. `Ok(None)` means the provider
-    /// defers the push (CalDAV events go out with the next sync's
-    /// unpushed-rows pass). `remote_calendar_id` is the local
-    /// calendar's remote handle; providers that only write to the
-    /// default calendar ignore it.
+    /// Push a newly created local event. `Ok(None)` means the provider defers
+    /// the push. `remote_calendar_id` is the local calendar's remote handle;
+    /// providers that only write to the default calendar ignore it.
     async fn push_created_event(
         &self,
         ctx: &CalendarBackendCtx<'_>,
@@ -231,9 +231,8 @@ pub trait CalendarBackend: Send + Sync {
         remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>>;
 
-    /// Push field updates for an event. Default no-op: JMAP and CalDAV
-    /// do not push event updates today (ADR 0050). Their edits remain
-    /// local and may be overwritten by a subsequent server sync.
+    /// Push field updates for an event. Providers without immediate ordinary
+    /// update support inherit the no-op and reconcile on their next sync.
     async fn push_updated_event(
         &self,
         _ctx: &CalendarBackendCtx<'_>,
@@ -242,6 +241,21 @@ pub trait CalendarBackend: Send + Sync {
         _event: &CalendarEvent,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Push a refreshed personal invitation copy without scheduling guests.
+    /// Returns the replacement provider revision when one is available.
+    async fn push_updated_invitation_copy(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _remote_id: &str,
+        _event: &CalendarEvent,
+    ) -> Result<Option<String>> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "personal invitation copy update",
+        })
     }
 
     /// Delete an event on the server.
@@ -517,6 +531,7 @@ mod registry_tests {
 mod contract_tests {
     use super::*;
     use crate::backend::testutil::{account, event, temp_pool};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn services() -> &'static ProviderServices {
         static SERVICES: std::sync::OnceLock<ProviderServices> = std::sync::OnceLock::new();
@@ -530,21 +545,72 @@ mod contract_tests {
         }
     }
 
-    /// CalDAV never pushes at create time — events go out with the
-    /// next sync's unpushed-rows pass.
     #[tokio::test]
-    async fn caldav_defers_event_creation_to_sync() {
+    async fn caldav_creation_is_synchronous_and_returns_remote_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/dav/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nETag: \"created-etag\"\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
         let (_dir, db) = temp_pool();
+        let mut services = google::sync_testutil::services("");
+        services.transports.dav_http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut caldav_account = account("calendar", "caldav");
+        caldav_account.caldav_url = root;
+        let created = CalendarEvent {
+            uid: Some("contract-uid".into()),
+            ..event()
+        };
         let pushed = caldav::CalDavCalendarBackend
             .push_created_event(
-                &ctx(&db),
-                &account("calendar", "caldav"),
-                &event(),
-                "cal-href",
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &caldav_account,
+                &created,
+                "/calendar/",
             )
             .await
+            .unwrap()
             .unwrap();
-        assert!(pushed.is_none());
+        assert_eq!(pushed.remote_id, "/calendar/contract-uid.ics");
+        assert_eq!(pushed.canonical_uid.as_deref(), Some("contract-uid"));
+        assert_eq!(pushed.etag.as_deref(), Some("\"created-etag\""));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("PUT /calendar/contract-uid.ics HTTP/1.1\r\n"));
     }
 
     /// JMAP and CalDAV do not push event updates (trait default

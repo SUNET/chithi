@@ -3195,6 +3195,37 @@ fn recurring_graph_time(
     ))
 }
 
+fn invitation_copy_graph_time(
+    timestamp: &str,
+    all_day: bool,
+    timezone: Option<&str>,
+) -> Result<(serde_json::Value, chrono::NaiveDateTime)> {
+    match recurring_graph_time(timestamp, all_day, timezone) {
+        Ok(value) => Ok(value),
+        Err(error) if !all_day => {
+            let local = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+                .map_err(|_| error)?;
+            let timezone = timezone
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("UTC");
+            let resolved = crate::calendar::timezone::windows_to_iana(timezone).unwrap_or(timezone);
+            resolved.parse::<chrono_tz::Tz>().map_err(|_| {
+                Error::Other(format!(
+                    "Recurring event timezone is unsupported: {timezone}"
+                ))
+            })?;
+            Ok((
+                serde_json::json!({
+                    "dateTime": timestamp,
+                    "timeZone": timezone,
+                }),
+                local,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn graph_weekday(day: chrono::Weekday) -> &'static str {
     match day {
         chrono::Weekday::Mon => "monday",
@@ -3428,6 +3459,59 @@ pub fn event_patch_to_graph_json(event: &crate::calendar::CalendarEvent) -> serd
         patch["location"] = serde_json::json!({"displayName": loc});
     }
     patch
+}
+
+/// Authoritative Graph PATCH for a personal invitation copy. This uses the
+/// recurrence-safe time conversion and deliberately excludes all scheduling
+/// fields so editing the copy cannot notify or replace guests.
+pub fn invitation_copy_patch_to_graph_json(
+    event: &crate::calendar::CalendarEvent,
+) -> Result<serde_json::Value> {
+    let (start, local_start) =
+        invitation_copy_graph_time(&event.start_time, event.all_day, event.timezone.as_deref())?;
+    let (end, _) =
+        invitation_copy_graph_time(&event.end_time, event.all_day, event.timezone.as_deref())?;
+    let recurrence = match event.recurrence_kind {
+        RecurrenceKind::Standalone
+            if event.recurrence_rule.as_deref().is_none_or(str::is_empty) =>
+        {
+            serde_json::Value::Null
+        }
+        RecurrenceKind::Series => {
+            if event
+                .ical_data
+                .as_deref()
+                .is_some_and(|raw| !crate::calendar::ical::is_rrule_only_series(raw))
+            {
+                return Err(Error::UnsupportedCapability {
+                    protocol: "graph",
+                    capability: "recurrence exceptions or additional dates",
+                });
+            }
+            graph_recurrence_json(event, local_start)?
+        }
+        _ => {
+            return Err(Error::UnsupportedCapability {
+                protocol: "graph",
+                capability: "recurring or unclassified invitation copy update",
+            });
+        }
+    };
+
+    Ok(serde_json::json!({
+        "subject": event.title,
+        "body": {
+            "contentType": "text",
+            "content": event.description.as_deref().unwrap_or("")
+        },
+        "location": {
+            "displayName": event.location.as_deref().unwrap_or("")
+        },
+        "start": start,
+        "end": end,
+        "isAllDay": event.all_day,
+        "recurrence": recurrence,
+    }))
 }
 
 /// Graph `contact` payload from our contact fields. Phones split into
@@ -3680,7 +3764,7 @@ mod batch_tests {
 
 #[cfg(test)]
 mod recurrence_tests {
-    use super::{event_to_graph_json, parse_graph_event};
+    use super::{event_to_graph_json, invitation_copy_patch_to_graph_json, parse_graph_event};
     use crate::calendar::{CalendarEvent, RecurrenceKind};
     use serde_json::json;
 
@@ -3763,6 +3847,38 @@ mod recurrence_tests {
                 .into(),
         );
         assert!(event_to_graph_json(&omitted_start).is_err());
+    }
+
+    #[test]
+    fn invitation_copy_patch_is_authoritative_without_scheduling_fields() {
+        let mut event = recurring_event("FREQ=WEEKLY;BYDAY=MO;COUNT=3");
+        event.title = "Changed".into();
+        event.description = None;
+        event.location = None;
+        event.organizer_email = Some("organizer@example.test".into());
+        event.attendees_json = Some(r#"[{"email":"guest@example.test"}]"#.into());
+
+        let value = invitation_copy_patch_to_graph_json(&event).unwrap();
+        assert_eq!(value["subject"], "Changed");
+        assert_eq!(value["body"]["content"], "");
+        assert_eq!(value["location"]["displayName"], "");
+        assert_eq!(value["start"]["dateTime"], "2026-09-14T11:00:00");
+        assert_eq!(value["start"]["timeZone"], "Europe/Stockholm");
+        assert_eq!(value["recurrence"]["pattern"]["type"], "weekly");
+        assert!(value.get("organizer").is_none());
+        assert!(value.get("attendees").is_none());
+    }
+
+    #[test]
+    fn invitation_copy_patch_sends_null_to_remove_recurrence() {
+        let mut event = recurring_event("FREQ=WEEKLY");
+        event.recurrence_kind = RecurrenceKind::Standalone;
+        event.recurrence_rule = None;
+        event.ical_data = None;
+
+        let value = invitation_copy_patch_to_graph_json(&event).unwrap();
+        assert!(value["recurrence"].is_null());
+        assert!(value.get("attendees").is_none());
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn persist_initial_upload(
     conn: &mut rusqlite::Connection,
     expected: &InitialUploadSnapshot,
     remote_id: &str,
-    etag: &str,
+    etag: Option<&str>,
     uid: &str,
 ) -> Result<()> {
     (|| -> Result<()> {
@@ -94,10 +94,16 @@ async fn push_initial_event(
         .clone()
         .unwrap_or_else(|| format!("{}@chithi", uuid::Uuid::new_v4()));
     let ical_data = creation_ical_data(event, &uid)?;
-    let etag = client.put_event(remote_cal_href, &uid, &ical_data).await?;
-    let remote_id = format!("{}/{}.ics", remote_cal_href.trim_end_matches('/'), uid);
+    let pushed = client.put_event(remote_cal_href, &uid, &ical_data).await?;
+    let remote_id = pushed.href;
     let mut conn = db.writer().await;
-    persist_initial_upload(&mut conn, &snapshot, &remote_id, &etag, &uid)?;
+    persist_initial_upload(
+        &mut conn,
+        &snapshot,
+        &remote_id,
+        pushed.etag.as_deref(),
+        &pushed.uid,
+    )?;
     log::info!(
         "sync_calendars: pushed event '{}' to CalDAV, remote_id={}",
         event.title,
@@ -122,6 +128,12 @@ fn creation_ical_data(event: &CalendarEvent, uid: &str) -> Result<String> {
             .iter()
             .any(|invite| invite.recurrence_kind == event.recurrence_kind)
         {
+            if event.source_message_id.is_some()
+                && event.organizer_email.is_none()
+                && event.attendees_json.is_none()
+            {
+                return personal_copy_ical_data(event, uid);
+            }
             return Ok(raw.clone());
         }
         return Err(unsupported());
@@ -160,6 +172,105 @@ fn creation_ical_data(event: &CalendarEvent, uid: &str) -> Result<String> {
         raw = raw.replace("\r\nEND:VEVENT", &format!("\r\nRRULE:{rule}\r\nEND:VEVENT"));
     }
     Ok(raw)
+}
+
+/// Produce a scheduling-free resource while preserving the source's complete
+/// recurrence set whenever raw iCalendar is available.
+fn personal_copy_ical_data(event: &CalendarEvent, uid: &str) -> Result<String> {
+    if let Some(raw) = event.ical_data.as_deref() {
+        let groups = ical::parse_ical_event_groups(raw).map_err(Error::Other)?;
+        let group = groups
+            .into_iter()
+            .find(|group| group.representative.uid == uid)
+            .ok_or_else(|| {
+                Error::Other("The personal copy UID is missing from iCalendar".into())
+            })?;
+        if group.representative.recurrence_kind != event.recurrence_kind {
+            return Err(Error::Other(
+                "The personal copy recurrence does not match its iCalendar source".into(),
+            ));
+        }
+        return Ok(overlay_personal_fields(&group.ical_raw, event, uid));
+    }
+    creation_ical_data(event, uid)
+}
+
+/// Replace only the representative VEVENT's editable fields. Recurrence
+/// properties, exceptions, timezone definitions, alarms, and vendor data stay
+/// byte-for-byte equivalent after the shared parser's unfolding.
+fn overlay_personal_fields(raw: &str, event: &CalendarEvent, uid: &str) -> String {
+    let generated = crate::mail::caldav::generate_ical_event(
+        uid,
+        &event.title,
+        event.description.as_deref(),
+        event.location.as_deref(),
+        &event.start_time,
+        &event.end_time,
+        event.all_day,
+        event.timezone.as_deref(),
+    );
+    let replacement: Vec<&str> = generated
+        .lines()
+        .filter(|line| is_personal_editable_property(line))
+        .collect();
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut event_ranges = Vec::new();
+    let mut start = None;
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().eq_ignore_ascii_case("BEGIN:VEVENT") {
+            start = Some(index);
+        } else if line.trim().eq_ignore_ascii_case("END:VEVENT") {
+            if let Some(start) = start.take() {
+                event_ranges.push((start, index));
+            }
+        }
+    }
+    let selected = event_ranges
+        .iter()
+        .copied()
+        .find(|(start, end)| {
+            !lines[start + 1..*end]
+                .iter()
+                .any(|line| ical_property_name(line) == Some("RECURRENCE-ID"))
+        })
+        .or_else(|| event_ranges.first().copied());
+    let Some((selected_start, selected_end)) = selected else {
+        return raw.to_string();
+    };
+
+    let mut output = Vec::with_capacity(lines.len() + replacement.len());
+    let mut nested_depth = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let inside_selected = index > selected_start && index < selected_end;
+        let replaceable =
+            inside_selected && nested_depth == 0 && is_personal_editable_property(line);
+        if replaceable {
+            continue;
+        }
+        if index == selected_end {
+            output.extend(replacement.iter().copied());
+        }
+        output.push(*line);
+        if inside_selected && line.trim().starts_with("BEGIN:") {
+            nested_depth += 1;
+        } else if inside_selected && line.trim().starts_with("END:") {
+            nested_depth = nested_depth.saturating_sub(1);
+        }
+    }
+    format!("{}\r\n", output.join("\r\n"))
+}
+
+fn ical_property_name(line: &str) -> Option<&str> {
+    let end = line.find([';', ':'])?;
+    Some(&line[..end])
+}
+
+fn is_personal_editable_property(line: &str) -> bool {
+    ical_property_name(line).is_some_and(|name| {
+        ["DTSTART", "DTEND", "SUMMARY", "DESCRIPTION", "LOCATION"]
+            .iter()
+            .any(|expected| name.eq_ignore_ascii_case(expected))
+    })
 }
 
 /// Map the selected component, retaining the classification of its full resource.
@@ -405,16 +516,50 @@ impl CalendarBackend for CalDavCalendarBackend {
         creation_ical_data(event, event.uid.as_deref().unwrap_or(&event.id)).map(|_| ())
     }
 
-    /// CalDAV events are not pushed at create time — the next sync's
-    /// unpushed-rows pass PUTs them (see `sync` step 3).
     async fn push_created_event(
         &self,
-        _ctx: &CalendarBackendCtx<'_>,
-        _account: &AccountFull,
-        _event: &CalendarEvent,
-        _remote_calendar_id: &str,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
-        Ok(None)
+        let uid = event
+            .uid
+            .clone()
+            .unwrap_or_else(|| format!("{}@chithi", uuid::Uuid::new_v4()));
+        let data = if event.source_message_id.is_some()
+            && event.organizer_email.is_none()
+            && event.attendees_json.is_none()
+        {
+            personal_copy_ical_data(event, &uid)?
+        } else {
+            creation_ical_data(event, &uid)?
+        };
+        let client = connect(ctx, account).await?;
+        let pushed = client.put_event(remote_calendar_id, &uid, &data).await?;
+        Ok(Some(PushedEvent {
+            remote_id: pushed.href,
+            canonical_uid: Some(pushed.uid),
+            etag: pushed.etag,
+        }))
+    }
+
+    async fn push_updated_invitation_copy(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<Option<String>> {
+        let uid = event
+            .uid
+            .as_deref()
+            .ok_or_else(|| Error::Other("The personal copy has no UID".into()))?;
+        let data = personal_copy_ical_data(event, uid)?;
+        connect(ctx, account)
+            .await?
+            .put_event_at_href(remote_id, &data, event.etag.as_deref())
+            .await
     }
 
     async fn push_deleted_event(
@@ -590,6 +735,13 @@ mod recurrence_tests {
     async fn serve_dav(
         responses: Vec<(&'static str, u16, String)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_dav_with_etag(responses, Some("\"uploaded-etag\"")).await
+    }
+
+    async fn serve_dav_with_etag(
+        responses: Vec<(&'static str, u16, String)>,
+        etag: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let root = format!("http://{}/dav/", listener.local_addr().unwrap());
         let captured = tokio::spawn(async move {
@@ -625,10 +777,12 @@ mod recurrence_tests {
                 assert_eq!(request.split_whitespace().next(), Some(method), "{request}");
                 assert!(request.contains("x-injected-client: caldav-upload-test\r\n"));
                 requests.push(request);
+                let etag_header = etag
+                    .map(|etag| format!("ETag: {etag}\r\n"))
+                    .unwrap_or_default();
                 let response = format!(
                     "HTTP/1.1 {status} Test\r\nContent-Type: application/xml\r\n\
-                     ETag: \"uploaded-etag\"\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{body}",
+                     {etag_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -787,7 +941,22 @@ mod recurrence_tests {
                 })
                 .unwrap();
             if let Some(raw) = &original.ical_data {
-                assert_eq!(request.split_once("\r\n\r\n").unwrap().1, raw);
+                let uploaded = request.split_once("\r\n\r\n").unwrap().1;
+                let parsed = ical::parse_ical_data(uploaded);
+                assert_eq!(parsed[0].summary.as_deref(), Some(original.title.as_str()));
+                assert_eq!(
+                    parsed[0].dtstart.trim_end_matches('Z'),
+                    original.start_time.trim_end_matches('Z')
+                );
+                assert_eq!(
+                    parsed[0].dtend.trim_end_matches('Z'),
+                    original.end_time.trim_end_matches('Z')
+                );
+                assert_eq!(parsed[0].recurrence_kind, original.recurrence_kind);
+                assert!(!uploaded.contains("METHOD:"));
+                assert!(!uploaded.contains("ORGANIZER"));
+                assert!(!uploaded.contains("ATTENDEE"));
+                assert!(raw.contains(&format!("UID:{uid}")));
             }
             assert_eq!(
                 attached,
@@ -1054,7 +1223,7 @@ mod recurrence_tests {
                 &mut conn,
                 &snapshot,
                 "/calendar/uploaded.ics",
-                "uploaded-etag",
+                Some("uploaded-etag"),
                 "uploaded-uid",
             )
             .unwrap_err()
@@ -1224,5 +1393,141 @@ mod recurrence_tests {
             )
             .unwrap();
         assert_eq!(stored, (legacy.id, "standalone".into(), resource.etag));
+    }
+
+    #[test]
+    fn personal_resource_strips_scheduling_and_preserves_recurrence_set() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+                   BEGIN:VEVENT\r\nUID:series\r\nDTSTART:20260913T100000Z\r\n\
+                   DTEND:20260913T110000Z\r\nSUMMARY:Updated title\r\n\
+                   DESCRIPTION:Remove me\r\nLOCATION:Remove me\r\n\
+                   ORGANIZER:mailto:owner@example.test\r\n\
+                   ATTENDEE:mailto:guest@example.test\r\nRRULE:FREQ=WEEKLY\r\n\
+                   EXDATE:20260920T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let local = CalendarEvent {
+            uid: Some("series".into()),
+            title: "Updated title".into(),
+            recurrence_kind: RecurrenceKind::Series,
+            recurrence_rule: Some("FREQ=WEEKLY".into()),
+            source_message_id: Some("message".into()),
+            ical_data: Some(raw.into()),
+            organizer_email: Some("owner@example.test".into()),
+            attendees_json: Some("[]".into()),
+            ..event()
+        };
+
+        let personal = personal_copy_ical_data(&local, "series").unwrap();
+        assert!(!personal.contains("METHOD:"));
+        assert!(!personal.contains("ORGANIZER"));
+        assert!(!personal.contains("ATTENDEE"));
+        assert!(personal.contains("SUMMARY:Updated title\r\n"));
+        assert!(!personal.contains("DESCRIPTION:"));
+        assert!(!personal.contains("LOCATION:"));
+        assert!(personal.contains("RRULE:FREQ=WEEKLY\r\n"));
+        assert!(personal.contains("EXDATE:20260920T100000Z\r\n"));
+        let parsed = ical::parse_ical_data(&personal);
+        assert_eq!(parsed[0].recurrence_kind, RecurrenceKind::Series);
+    }
+
+    #[tokio::test]
+    async fn direct_creation_returns_confirmed_identity_and_update_uses_existing_href() {
+        let (root, created_request) = serve_dav(vec![("PUT", 201, String::new())]).await;
+        let (_directory, db) = temp_pool();
+        let services = injected_services();
+        let mut destination = account("calendar", "caldav");
+        destination.caldav_url = root;
+        let context = CalendarBackendCtx {
+            db: &db,
+            services: &services,
+        };
+        let local = CalendarEvent {
+            uid: Some("created-uid".into()),
+            ..event()
+        };
+        let pushed = CalDavCalendarBackend
+            .push_created_event(&context, &destination, &local, "/calendar/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed.remote_id, "/calendar/created-uid.ics");
+        assert_eq!(pushed.canonical_uid.as_deref(), Some("created-uid"));
+        assert_eq!(pushed.etag.as_deref(), Some("\"uploaded-etag\""));
+        let requests = created_request.await.unwrap();
+        assert!(requests[0].starts_with("PUT /calendar/created-uid.ics HTTP/1.1\r\n"));
+
+        let (root, updated_request) = serve_dav(vec![("PUT", 204, String::new())]).await;
+        destination.caldav_url = root;
+        let updated = CalendarEvent {
+            uid: Some("created-uid".into()),
+            etag: Some("\"stored-etag\"".into()),
+            title: "Authoritative".into(),
+            source_message_id: Some("message".into()),
+            organizer_email: Some("owner@example.test".into()),
+            attendees_json: Some("[]".into()),
+            ical_data: Some(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\n\
+                 METHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:created-uid\r\n\
+                 DTSTAMP:20260901T120000Z\r\nDTSTART:20260914T100000Z\r\n\
+                 DTEND:20260914T110000Z\r\nSUMMARY:Authoritative\r\n\
+                 ORGANIZER:mailto:owner@example.test\r\n\
+                 ATTENDEE:mailto:guest@example.test\r\nEND:VEVENT\r\n\
+                 END:VCALENDAR\r\n"
+                    .into(),
+            ),
+            ..event()
+        };
+        let revision = CalDavCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &destination,
+                "/calendar/existing-name.ics",
+                &updated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision.as_deref(), Some("\"uploaded-etag\""));
+        let requests = updated_request.await.unwrap();
+        assert!(requests[0].starts_with("PUT /calendar/existing-name.ics HTTP/1.1\r\n"));
+        assert!(requests[0].contains("if-match: \"stored-etag\"\r\n"));
+        let body = requests[0].split_once("\r\n\r\n").unwrap().1;
+        assert!(body.contains("SUMMARY:Authoritative\r\n"));
+        assert!(body.contains("DTSTART:20260716T100000\r\n"));
+        assert!(body.contains("DTEND:20260716T103000\r\n"));
+        assert!(!body.contains("METHOD:"));
+        assert!(!body.contains("ORGANIZER"));
+        assert!(!body.contains("ATTENDEE"));
+
+        let (root, created_request) =
+            serve_dav_with_etag(vec![("PUT", 201, String::new())], None).await;
+        destination.caldav_url = root;
+        let pushed = CalDavCalendarBackend
+            .push_created_event(&context, &destination, &local, "/calendar/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed.etag, None);
+        assert_eq!(created_request.await.unwrap().len(), 1);
+
+        let (root, updated_request) =
+            serve_dav_with_etag(vec![("PUT", 204, String::new())], None).await;
+        destination.caldav_url = root;
+        let revision = CalDavCalendarBackend
+            .push_updated_invitation_copy(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &destination,
+                "/calendar/existing-name.ics",
+                &updated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision, None);
+        let requests = updated_request.await.unwrap();
+        assert!(requests[0].contains("if-match: \"stored-etag\"\r\n"));
     }
 }
