@@ -12,7 +12,8 @@ use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::google::{
     event_patch_to_google_json, event_to_google_json, google_recurrence_kind,
-    invitation_copy_patch_to_google_json, send_updates_for, EventsPage, GoogleClient,
+    invitation_copy_patch_to_google_json, occurrence_patch_to_google_json, send_updates_for,
+    EventsPage, GoogleClient,
 };
 
 use super::{
@@ -830,6 +831,7 @@ impl CalendarBackend for GoogleCalendarBackend {
             ));
         }
 
+        let patch = occurrence_patch_to_google_json(&request.patch, &request.desired, &native)?;
         let canonical_source = ctx
             .services
             .google_client(&account.id)
@@ -838,9 +840,7 @@ impl CalendarBackend for GoogleCalendarBackend {
                 provider_calendar_id,
                 &request.target_id,
                 expected_etag,
-                &request.patch,
-                &request.desired,
-                &native,
+                &patch,
             )
             .await?;
         let canonical =
@@ -1916,11 +1916,11 @@ mod occurrence_update_tests {
             body,
             json!({
                 "start": {
-                    "dateTime": "2026-09-15T11:00:00Z",
+                    "dateTime": "2026-09-15T13:00:00+02:00",
                     "timeZone": "Europe/Stockholm"
                 },
                 "end": {
-                    "dateTime": "2026-09-15T12:00:00Z",
+                    "dateTime": "2026-09-15T14:00:00+02:00",
                     "timeZone": "Europe/Stockholm"
                 }
             })
@@ -1956,6 +1956,71 @@ mod occurrence_update_tests {
         let body: serde_json::Value =
             serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body, json!({"summary": "Renamed occurrence"}));
+    }
+
+    #[tokio::test]
+    async fn invalid_timezone_edits_fail_before_credentials_or_http() {
+        let (_directory, db) = setup_db().await;
+        for source in ["start", "end", "requested", "rewrite"] {
+            for with_credentials in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let root = format!("http://{}", listener.local_addr().unwrap());
+                let mut request = request(false);
+                request.patch = UpdateOccurrenceInput::default();
+                match source {
+                    "requested" => {
+                        request.desired.timezone = Some("Unsupported/Requested".into());
+                        request.patch.timezone = request.desired.timezone.clone();
+                    }
+                    "rewrite" => {
+                        request.desired.timezone = Some("Unsupported/Retained".into());
+                        request.patch.all_day = Some(false);
+                    }
+                    name => {
+                        if name == "start" {
+                            request.patch.start_time = Some(request.desired.start_time.clone());
+                        } else {
+                            request.patch.end_time = Some(request.desired.end_time.clone());
+                        }
+                        let mut native: serde_json::Value = serde_json::from_str(
+                            request
+                                .trusted_identity
+                                .provider_native_data
+                                .as_deref()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        native[name]["timeZone"] = json!("Unsupported/Retained");
+                        request.trusted_identity.provider_native_data = Some(native.to_string());
+                    }
+                }
+                let provider_services = services_with_credentials(&root, with_credentials);
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    GoogleCalendarBackend.update_recurrence_occurrence(
+                        &CalendarBackendCtx {
+                            db: &db,
+                            services: &provider_services,
+                        },
+                        &account("calendar", "google"),
+                        &request,
+                    ),
+                )
+                .await
+                .expect("timezone validation must precede HTTP")
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("timezone is unsupported"),
+                    "source={source}, credentials={with_credentials}: {error}"
+                );
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    listener.accept()
+                )
+                .await
+                .is_err());
+            }
+        }
     }
 
     #[tokio::test]

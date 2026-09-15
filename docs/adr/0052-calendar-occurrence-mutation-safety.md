@@ -68,6 +68,12 @@ serialized plans and summaries. Inserts, updates, and deletes advance the
 owning event's durable revision, including embedded override changes that do
 not alter the `calendar_events` row.
 
+The schema protects the object ID and every hashed identity component, and
+upserts update only mutable fields after an exact identity match. Deleting a
+local master is the sole unlinking exception: its foreign-key action clears
+the local series link on provider-backed objects and advances their owning
+event revisions. Local-only objects are pruned when their master disappears.
+
 Ingestion replaces an event and its recurrence object set in one transaction.
 Malformed or incomplete recurrence metadata uses the legacy event upsert and
 cannot erase previously trusted identity. Stable object IDs are derived from
@@ -81,6 +87,10 @@ Planning never substitutes a synthetic occurrence ID with a master ID.
 Execution re-resolves all state under the account lifecycle lock and rejects a
 changed binding, target, identity, local revision, or provider revision before
 network I/O.
+
+CalDAV occurrence plans require an embedded exception in the exact series
+resource. Detached CalDAV resources remain discoverable but read-only;
+detached occurrence writes are supported only for Google, Graph, and JMAP.
 
 Only the dedicated `update_event_recurrence_occurrence` command executes this
 amendment. Its shape fixes the scope to `THIS-OCCURRENCE`; it cannot express a
@@ -102,6 +112,13 @@ occurrence content. Any post-write local race or invalid provider response is
 reported as requiring reconciliation; Chithi does not claim that the remote
 write was rolled back.
 
+For CalDAV, the canonical GET ETag takes precedence over the successful PUT
+ETag. If GET omits a validator, the PUT ETag is retained for every object in
+the resource. If both omit it, no old ETag is reused and a further occurrence
+write is blocked until sync supplies a validator. Google time edits preserve
+the instant while emitting an offset matching each selected/provider timezone,
+including across DST transitions; unedited boundaries remain untouched.
+
 Provider-specific evidence remains lossless:
 
 - Google preserves the remote calendar, master ID, occurrence ID,
@@ -119,6 +136,14 @@ paginates query/get snapshots and does not reconcile ambiguous multi-calendar
 membership. CalDAV rejects malformed or partial multistatus snapshots. Google
 and Graph bounded time windows never use absence as deletion proof. Explicit
 tombstones and demonstrably complete snapshots remain authoritative.
+
+Graph requests and validates `isCancelled` on every calendar-view item and
+canonical occurrence read. Explicit cancellations delete only the matching
+account, local calendar, and immutable remote ID, using meeting-aware cleanup.
+Each complete paginated calendar batch reconciles live rows, cancellations,
+and recurrence objects in one transaction. Missing cancellation state,
+conflicting duplicate IDs, or reconciliation failure rejects the batch rather
+than guessing whether an event is live; other calendar batches can still sync.
 
 Desktop and mobile use the same detail component and the shared
 `src/lib/calendar-mutation-support.ts` policy/reasons. The store and drag

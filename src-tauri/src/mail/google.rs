@@ -487,15 +487,13 @@ impl GoogleClient {
     }
 
     /// Conditionally update one expanded recurrence instance and return the
-    /// complete canonical event.
+    /// complete canonical event using a preflighted occurrence payload.
     pub async fn patch_recurrence_occurrence(
         &self,
         calendar_id: &str,
         event_id: &str,
         expected_etag: &str,
-        patch: &UpdateOccurrenceInput,
-        desired: &OccurrenceFields,
-        native: &serde_json::Value,
+        patch: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let path = format!(
             "calendars/{}/events/{}",
@@ -507,7 +505,7 @@ impl GoogleClient {
             .patch(self.calendar_url(&format!("{path}?sendUpdates=none")))
             .bearer_auth(&self.token)
             .header(reqwest::header::IF_MATCH, expected_etag)
-            .json(&occurrence_patch_to_google_json(patch, desired, native)?)
+            .json(patch)
             .send()
             .await
             .map_err(|error| {
@@ -2924,53 +2922,80 @@ fn time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
     }
 }
 
-fn occurrence_patch_to_google_json(
+/// Prepare the sparse occurrence payload before acquiring OAuth credentials.
+pub(crate) fn occurrence_patch_to_google_json(
     patch: &UpdateOccurrenceInput,
     desired: &OccurrenceFields,
     native: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     desired.validate()?;
-    let timezone = if desired.all_day {
-        None
-    } else {
-        desired
-            .timezone
-            .as_deref()
-            .map(|timezone| {
-                let resolved =
-                    crate::calendar::timezone::windows_to_iana(timezone).unwrap_or(timezone);
-                resolved.parse::<chrono_tz::Tz>().map_err(|_| {
-                    Error::Other(format!("Google event timezone is unsupported: {timezone}"))
-                })?;
-                Ok::<_, Error>(resolved)
-            })
-            .transpose()?
-    };
     let rewrite_boundaries = patch.all_day.is_some() || patch.timezone.is_some();
     let boundary = |name: &str, timestamp: &str| -> Result<serde_json::Value> {
-        if rewrite_boundaries {
-            if desired.all_day {
-                return Ok(serde_json::json!({"date": timestamp}));
-            }
-            let mut value = serde_json::json!({"dateTime": timestamp});
-            if let Some(timezone) = timezone {
-                value["timeZone"] = serde_json::json!(timezone);
-            }
-            return Ok(value);
-        }
-
         let key = if desired.all_day { "date" } else { "dateTime" };
-        let mut value = native[name].as_object().cloned().ok_or_else(|| {
-            Error::Other(format!(
-                "Google occurrence native {name} boundary is invalid"
-            ))
-        })?;
-        if !value.get(key).is_some_and(serde_json::Value::is_string) {
-            return Err(Error::Other(format!(
-                "Google occurrence native {name} boundary shape changed"
-            )));
+        let mut value = if rewrite_boundaries {
+            serde_json::Map::new()
+        } else {
+            let value = native[name].as_object().cloned().ok_or_else(|| {
+                Error::Other(format!(
+                    "Google occurrence native {name} boundary is invalid"
+                ))
+            })?;
+            if !value.get(key).is_some_and(serde_json::Value::is_string) {
+                return Err(Error::Other(format!(
+                    "Google occurrence native {name} boundary shape changed"
+                )));
+            }
+            value
+        };
+        if desired.all_day {
+            value.insert(key.into(), serde_json::json!(timestamp));
+        } else {
+            let timezone = if rewrite_boundaries {
+                desired.timezone.as_deref()
+            } else {
+                value
+                    .get("timeZone")
+                    .map(|timezone| {
+                        timezone
+                            .as_str()
+                            .filter(|timezone| !timezone.chars().any(char::is_control))
+                            .ok_or_else(|| {
+                                Error::Other(format!(
+                                    "Google occurrence native {name} timezone is invalid"
+                                ))
+                            })
+                    })
+                    .transpose()?
+            };
+            let instant = chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+                Error::Other(format!(
+                    "Google occurrence {name} must be an RFC 3339 timestamp"
+                ))
+            })?;
+            let datetime = if let Some(timezone) = timezone {
+                let zone = timezone
+                    .parse::<chrono_tz::Tz>()
+                    .or_else(|_| {
+                        crate::calendar::timezone::windows_to_iana(timezone)
+                            .unwrap_or(timezone)
+                            .parse::<chrono_tz::Tz>()
+                    })
+                    .map_err(|_| {
+                        Error::Other(format!(
+                            "Google occurrence {name} timezone is unsupported: {timezone}"
+                        ))
+                    })?;
+                value.insert("timeZone".into(), serde_json::json!(zone.name()));
+                instant
+                    .with_timezone(&zone)
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            } else {
+                instant
+                    .with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            };
+            value.insert(key.into(), serde_json::json!(datetime));
         }
-        value.insert(key.into(), serde_json::json!(timestamp));
         Ok(serde_json::Value::Object(value))
     };
 
@@ -3380,6 +3405,291 @@ mod builder_tests {
         let all_day = occurrence_patch_to_google_json(&patch, &fields, &native).unwrap();
         assert_eq!(all_day["start"], serde_json::json!({"date": "2026-07-15"}));
         assert_eq!(all_day["end"], serde_json::json!({"date": "2026-07-16"}));
+    }
+
+    fn timed_occurrence_fields(start: &str, end: &str, timezone: Option<&str>) -> OccurrenceFields {
+        OccurrenceFields {
+            title: "Moved".into(),
+            description: None,
+            location: None,
+            start_time: start.into(),
+            end_time: end.into(),
+            all_day: false,
+            timezone: timezone.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_converts_stockholm_instants_across_seasons_and_dst() {
+        for (start, end, local_start, local_end) in [
+            (
+                "2026-01-14T09:00:00.123456789Z",
+                "2026-01-14T10:00:00.987654321Z",
+                "2026-01-14T10:00:00.123456789+01:00",
+                "2026-01-14T11:00:00.987654321+01:00",
+            ),
+            (
+                "2026-07-14T09:00:00.123456789Z",
+                "2026-07-14T10:00:00.987654321Z",
+                "2026-07-14T11:00:00.123456789+02:00",
+                "2026-07-14T12:00:00.987654321+02:00",
+            ),
+            (
+                "2026-03-29T00:30:00Z",
+                "2026-03-29T01:30:00Z",
+                "2026-03-29T01:30:00+01:00",
+                "2026-03-29T03:30:00+02:00",
+            ),
+            (
+                "2026-10-25T00:30:00Z",
+                "2026-10-25T01:30:00Z",
+                "2026-10-25T02:30:00+02:00",
+                "2026-10-25T02:30:00+01:00",
+            ),
+        ] {
+            for rewrite in [false, true] {
+                let fields = timed_occurrence_fields(
+                    start,
+                    end,
+                    Some(if rewrite { "Europe/Stockholm" } else { "UTC" }),
+                );
+                let patch = UpdateOccurrenceInput {
+                    start_time: Some(start.into()),
+                    end_time: Some(end.into()),
+                    timezone: rewrite.then(|| "Europe/Stockholm".into()),
+                    ..Default::default()
+                };
+                let native = serde_json::json!({
+                    "start": {
+                        "dateTime": "2026-01-14T10:00:00+01:00",
+                        "timeZone": "Europe/Stockholm"
+                    },
+                    "end": {
+                        "dateTime": "2026-01-14T11:00:00+01:00",
+                        "timeZone": "Europe/Stockholm"
+                    }
+                });
+                assert_eq!(
+                    occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+                    serde_json::json!({
+                        "start": {"dateTime": local_start, "timeZone": "Europe/Stockholm"},
+                        "end": {"dateTime": local_end, "timeZone": "Europe/Stockholm"}
+                    }),
+                    "start={start}, rewrite={rewrite}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_uses_each_native_zone_and_resolves_windows_aliases() {
+        let fields =
+            timed_occurrence_fields("2026-07-14T09:00:00Z", "2026-07-14T10:00:00Z", Some("UTC"));
+        let patch = UpdateOccurrenceInput {
+            start_time: Some(fields.start_time.clone()),
+            end_time: Some(fields.end_time.clone()),
+            ..Default::default()
+        };
+        for (start_zone, end_zone, resolved_start, resolved_end, local_end) in [
+            (
+                "Europe/Stockholm",
+                "America/New_York",
+                "Europe/Stockholm",
+                "America/New_York",
+                "2026-07-14T06:00:00-04:00",
+            ),
+            (
+                "W. Europe Standard Time",
+                "Pacific Standard Time",
+                "Europe/Berlin",
+                "America/Los_Angeles",
+                "2026-07-14T03:00:00-07:00",
+            ),
+        ] {
+            let native = serde_json::json!({
+                "start": {
+                    "dateTime": "2026-07-14T08:00:00Z",
+                    "timeZone": start_zone,
+                    "providerExtension": {"preserve": true}
+                },
+                "end": {"dateTime": "2026-07-14T09:00:00Z", "timeZone": end_zone},
+                "summary": "Original",
+                "recurrence": ["RRULE:FREQ=WEEKLY"]
+            });
+            assert_eq!(
+                occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+                serde_json::json!({
+                    "start": {
+                        "dateTime": "2026-07-14T11:00:00+02:00",
+                        "timeZone": resolved_start,
+                        "providerExtension": {"preserve": true}
+                    },
+                    "end": {"dateTime": local_end, "timeZone": resolved_end}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_validates_and_converts_only_the_edited_native_boundary() {
+        let fields = timed_occurrence_fields(
+            "2026-07-14T09:00:00Z",
+            "2026-07-14T10:00:00Z",
+            Some("Unsupported/Projection"),
+        );
+        for edit_start in [true, false] {
+            let patch = UpdateOccurrenceInput {
+                start_time: edit_start.then(|| fields.start_time.clone()),
+                end_time: (!edit_start).then(|| fields.end_time.clone()),
+                ..Default::default()
+            };
+            let mut native = serde_json::json!({
+                "start": {"dateTime": "2026-07-14T08:00:00Z", "timeZone": "Europe/Stockholm"},
+                "end": {"dateTime": "2026-07-14T09:00:00Z", "timeZone": "America/New_York"}
+            });
+            native[if edit_start { "end" } else { "start" }]["timeZone"] =
+                serde_json::json!("Unsupported/Untouched");
+            let expected = if edit_start {
+                serde_json::json!({"start": {
+                    "dateTime": "2026-07-14T11:00:00+02:00", "timeZone": "Europe/Stockholm"
+                }})
+            } else {
+                serde_json::json!({"end": {
+                    "dateTime": "2026-07-14T06:00:00-04:00", "timeZone": "America/New_York"
+                }})
+            };
+            assert_eq!(
+                occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_timezone_only_rewrites_both_boundaries_in_the_desired_zone() {
+        for (requested, resolved) in [
+            ("Europe/Stockholm", "Europe/Stockholm"),
+            ("W. Europe Standard Time", "Europe/Berlin"),
+        ] {
+            let fields = timed_occurrence_fields(
+                "2026-07-14T09:00:00Z",
+                "2026-07-14T10:00:00Z",
+                Some(requested),
+            );
+            let patch = UpdateOccurrenceInput {
+                timezone: Some(requested.into()),
+                ..Default::default()
+            };
+            let native = serde_json::json!({
+                "start": {"dateTime": fields.start_time, "timeZone": "Unsupported/Replaced"},
+                "end": {"dateTime": fields.end_time, "timeZone": "America/New_York"}
+            });
+            assert_eq!(
+                occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+                serde_json::json!({
+                    "start": {"dateTime": "2026-07-14T11:00:00+02:00", "timeZone": resolved},
+                    "end": {"dateTime": "2026-07-14T12:00:00+02:00", "timeZone": resolved}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_without_timezone_emits_canonical_instants() {
+        let fields = timed_occurrence_fields(
+            "2026-07-14T11:00:00.123456789+02:00",
+            "2026-07-14T12:00:00.987654321+02:00",
+            None,
+        );
+        for patch in [
+            UpdateOccurrenceInput {
+                all_day: Some(false),
+                ..Default::default()
+            },
+            UpdateOccurrenceInput {
+                timezone: Some(String::new()),
+                ..Default::default()
+            },
+            UpdateOccurrenceInput {
+                start_time: Some(fields.start_time.clone()),
+                end_time: Some(fields.end_time.clone()),
+                ..Default::default()
+            },
+        ] {
+            let mut fields = fields.clone();
+            let native = if patch.all_day.is_some() {
+                serde_json::json!({"start": {"date": "2026-07-14"}, "end": {"date": "2026-07-15"}})
+            } else if patch.timezone.is_some() {
+                serde_json::json!({
+                    "start": {"dateTime": fields.start_time, "timeZone": "Europe/Stockholm"},
+                    "end": {"dateTime": fields.end_time, "timeZone": "America/New_York"}
+                })
+            } else {
+                fields.timezone = Some("Europe/Stockholm".into());
+                serde_json::json!({
+                    "start": {"dateTime": fields.start_time},
+                    "end": {"dateTime": fields.end_time}
+                })
+            };
+            assert_eq!(
+                occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+                serde_json::json!({
+                    "start": {"dateTime": "2026-07-14T09:00:00.123456789Z"},
+                    "end": {"dateTime": "2026-07-14T10:00:00.987654321Z"}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_patch_text_only_ignores_unsupported_timezones() {
+        let fields = timed_occurrence_fields(
+            "2026-07-14T09:00:00Z",
+            "2026-07-14T10:00:00Z",
+            Some("Unsupported/Projection"),
+        );
+        let patch = UpdateOccurrenceInput {
+            title: Some(fields.title.clone()),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            ..Default::default()
+        };
+        let native = serde_json::json!({
+            "start": {"dateTime": fields.start_time, "timeZone": "Unsupported/Retained"},
+            "end": {"dateTime": fields.end_time, "timeZone": 42}
+        });
+        assert_eq!(
+            occurrence_patch_to_google_json(&patch, &fields, &native).unwrap(),
+            serde_json::json!({"summary": "Moved", "description": "", "location": ""})
+        );
+    }
+
+    #[test]
+    fn occurrence_patch_rejects_invalid_edited_native_timezones() {
+        let fields =
+            timed_occurrence_fields("2026-07-14T09:00:00Z", "2026-07-14T10:00:00Z", Some("UTC"));
+        for name in ["start", "end"] {
+            for invalid in [
+                serde_json::json!("Unsupported/Retained"),
+                serde_json::json!(""),
+                serde_json::json!("W. Europe Standard Time\n"),
+                serde_json::json!(42),
+                serde_json::Value::Null,
+            ] {
+                let patch = UpdateOccurrenceInput {
+                    start_time: (name == "start").then(|| fields.start_time.clone()),
+                    end_time: (name == "end").then(|| fields.end_time.clone()),
+                    ..Default::default()
+                };
+                let mut native = serde_json::json!({
+                    "start": {"dateTime": fields.start_time},
+                    "end": {"dateTime": fields.end_time}
+                });
+                native[name]["timeZone"] = invalid;
+                let error = occurrence_patch_to_google_json(&patch, &fields, &native).unwrap_err();
+                assert!(error.to_string().contains(&format!("{name} timezone")));
+            }
+        }
     }
 
     #[test]

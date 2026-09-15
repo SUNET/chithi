@@ -191,12 +191,30 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             WHERE object_kind = 'master' AND provider_calendar_id IS NOT NULL AND
                   provider_series_id IS NOT NULL;
 
-        -- A recurrence position identifies the object and cannot be reinterpreted.
-        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_id_immutable
-        BEFORE UPDATE OF provider_calendar_id, recurrence_id, recurrence_value_type
+        -- Identity is stable across content and occurrence-to-exception updates.
+        -- Only FK-driven unlinking after master deletion may clear a local link.
+        DROP TRIGGER IF EXISTS calendar_recurrence_id_immutable;
+        CREATE TRIGGER calendar_recurrence_id_immutable
+        BEFORE UPDATE OF object_id, account_id, event_id, local_series_event_id,
+                         provider_calendar_id, provider_series_id, provider_occurrence_id,
+                         recurrence_id, recurrence_timezone, recurrence_value_type
         ON calendar_recurrence_objects
-        WHEN OLD.provider_calendar_id IS NOT NEW.provider_calendar_id
+        WHEN OLD.object_id IS NOT NEW.object_id
+          OR OLD.account_id IS NOT NEW.account_id
+          OR OLD.event_id IS NOT NEW.event_id
+          OR (OLD.local_series_event_id IS NOT NEW.local_series_event_id AND NOT (
+              OLD.local_series_event_id IS NOT NULL
+              AND NEW.local_series_event_id IS NULL
+              AND OLD.provider_series_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM calendar_events WHERE id = OLD.local_series_event_id
+              )
+          ))
+          OR OLD.provider_calendar_id IS NOT NEW.provider_calendar_id
+          OR OLD.provider_series_id IS NOT NEW.provider_series_id
+          OR OLD.provider_occurrence_id IS NOT NEW.provider_occurrence_id
           OR OLD.recurrence_id IS NOT NEW.recurrence_id
+          OR OLD.recurrence_timezone IS NOT NEW.recurrence_timezone
           OR OLD.recurrence_value_type IS NOT NEW.recurrence_value_type
         BEGIN
             SELECT RAISE(ABORT, 'recurrence identity is immutable');
@@ -1243,7 +1261,17 @@ mod tests {
                           'provider-calendar', 'provider-series',
                           '2026-09-15', 'date',
                           'Occurrence', '2026-09-15', '2026-09-16', 1,
-                         'occurrence');",
+                         'occurrence');
+                 DROP TRIGGER calendar_recurrence_id_immutable;
+                 CREATE TRIGGER calendar_recurrence_id_immutable
+                 BEFORE UPDATE OF provider_calendar_id, recurrence_id, recurrence_value_type
+                 ON calendar_recurrence_objects
+                 WHEN OLD.provider_calendar_id IS NOT NEW.provider_calendar_id
+                   OR OLD.recurrence_id IS NOT NEW.recurrence_id
+                   OR OLD.recurrence_value_type IS NOT NEW.recurrence_value_type
+                 BEGIN
+                     SELECT RAISE(ABORT, 'recurrence identity is immutable');
+                 END;",
             )
             .unwrap();
         }
@@ -1251,6 +1279,13 @@ mod tests {
         for _ in 0..2 {
             let conn = Connection::open(&path).unwrap();
             initialize(&conn).unwrap();
+            assert!(conn
+                .execute(
+                    "UPDATE calendar_recurrence_objects SET provider_series_id = 'reassigned'
+                 WHERE object_id = 'occurrence'",
+                    [],
+                )
+                .is_err());
             assert_eq!(
                 conn.query_row(
                     "SELECT COUNT(*) FROM calendar_recurrence_objects",

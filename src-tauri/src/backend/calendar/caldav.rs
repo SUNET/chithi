@@ -815,7 +815,7 @@ impl CalendarBackend for CalDavCalendarBackend {
         .map_err(Error::Other)?;
         let etag = request.expected_provider_revision.as_deref().unwrap();
         let client = connect(ctx, account).await?;
-        client
+        let put_etag = client
             .put_event_at_href(&request.target_id, &updated, Some(etag))
             .await?;
         let canonical = client
@@ -851,7 +851,7 @@ impl CalendarBackend for CalDavCalendarBackend {
             })?;
         let mut canonical_recurrence_objects = recurrence_seeds_from_parts(
             &canonical.ical_data,
-            canonical.etag.as_deref(),
+            canonical.etag.as_deref().or(put_etag.as_deref()),
             &request.target_id,
             provider_calendar_id,
             &components,
@@ -1102,11 +1102,23 @@ mod recurrence_tests {
         responses: Vec<(&'static str, u16, String)>,
         etag: Option<&'static str>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_dav_with_response_etags(
+            responses
+                .into_iter()
+                .map(|(method, status, body)| (method, status, body, etag))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn serve_dav_with_response_etags(
+        responses: Vec<(&'static str, u16, String, Option<&'static str>)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let root = format!("http://{}/dav/", listener.local_addr().unwrap());
         let captured = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for (method, status, body) in responses {
+            for (method, status, body, etag) in responses {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept())
                         .await
@@ -1263,7 +1275,7 @@ mod recurrence_tests {
     }
 
     #[tokio::test]
-    async fn occurrence_update_uses_if_match_then_ingests_canonical_get() {
+    async fn occurrence_update_prefers_canonical_get_etag_over_put() {
         let native =
             occurrence_resource_with_sibling("ATTENDEE:mailto:guest@example.test\nX-KEEP:value\n");
         let canonical = native
@@ -1271,9 +1283,9 @@ mod recurrence_tests {
             .replace("DTSTART:20260913T100000Z", "DTSTART:20260920T121500Z")
             .replace("DTEND:20260913T110000Z", "DTEND:20260920T134500Z")
             .replace("X-SIBLING:original", "X-SIBLING:canonical");
-        let (root, captured) = serve_dav(vec![
-            ("PUT", 204, String::new()),
-            ("GET", 200, canonical.clone()),
+        let (root, captured) = serve_dav_with_response_etags(vec![
+            ("PUT", 204, String::new(), Some("\"uploaded-etag\"")),
+            ("GET", 200, canonical.clone(), Some("W/\"canonical-etag\"")),
         ])
         .await;
         let mut caldav_account = account("calendar", "caldav");
@@ -1313,7 +1325,7 @@ mod recurrence_tests {
         );
         assert_eq!(
             outcome.replacement_identity.provider_revision.as_deref(),
-            Some("\"uploaded-etag\"")
+            Some("W/\"canonical-etag\"")
         );
         assert_eq!(
             outcome.replacement_identity.provider_calendar_id,
@@ -1328,7 +1340,7 @@ mod recurrence_tests {
         assert_eq!(seeds.len(), 3);
         assert!(seeds.iter().all(|seed| {
             seed.provider_native_data.as_deref() == Some(canonical.as_str())
-                && seed.provider_revision.as_deref() == Some("\"uploaded-etag\"")
+                && seed.provider_revision.as_deref() == Some("W/\"canonical-etag\"")
         }));
         assert!(seeds.iter().any(|seed| {
             seed.recurrence_id.as_deref() == Some("20260927T100000Z")
@@ -1382,11 +1394,101 @@ mod recurrence_tests {
     }
 
     #[tokio::test]
-    async fn occurrence_update_preserves_missing_canonical_etag_as_none() {
-        let native = occurrence_resource("");
+    async fn occurrence_update_retains_put_etag_when_canonical_get_omits_it() {
+        for put_etag in ["\"uploaded-etag\"", "W/\"uploaded-etag\""] {
+            let native = occurrence_resource_with_sibling("X-KEEP:value\n");
+            let canonical = native
+                .replace("SUMMARY:Visible event", "SUMMARY:Canonical")
+                .replace("X-SIBLING:original", "X-SIBLING:canonical");
+            let follow_up_canonical =
+                canonical.replace("SUMMARY:Canonical", "SUMMARY:Follow-up canonical");
+            let (root, captured) = serve_dav_with_response_etags(vec![
+                ("PUT", 204, String::new(), Some(put_etag)),
+                ("GET", 200, canonical.clone(), None),
+                ("PUT", 204, String::new(), Some("\"next-etag\"")),
+                ("GET", 200, follow_up_canonical.clone(), None),
+            ])
+            .await;
+            let mut caldav_account = account("calendar", "caldav");
+            caldav_account.caldav_url = root;
+            let (_dir, db) = temp_pool();
+            let services = injected_services();
+            let ctx = CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            };
+            let request = occurrence_update_request(native);
+            let outcome = CalDavCalendarBackend
+                .update_recurrence_occurrence(&ctx, &caldav_account, &request)
+                .await
+                .unwrap();
+            assert_eq!(outcome.occurrence.title, "Canonical");
+            assert_eq!(
+                outcome.replacement_identity.provider_revision.as_deref(),
+                Some(put_etag)
+            );
+            let seeds = outcome.canonical_recurrence_objects.as_ref().unwrap();
+            assert_eq!(seeds.len(), 3);
+            assert!(seeds.iter().all(|seed| {
+                seed.provider_revision.as_deref() == Some(put_etag)
+                    && seed.provider_native_data.as_deref() == Some(canonical.as_str())
+            }));
+
+            let mut next = request;
+            next.expected_provider_revision =
+                outcome.replacement_identity.provider_revision.clone();
+            next.trusted_identity = outcome
+                .replacement_identity
+                .bind("acc1", next.current_event.id.clone(), "exception-object")
+                .unwrap();
+            next.desired = outcome.occurrence;
+            next.desired.title = "Follow-up title".into();
+            next.patch = UpdateOccurrenceInput {
+                title: Some(next.desired.title.clone()),
+                ..Default::default()
+            };
+            let follow_up = CalDavCalendarBackend
+                .update_recurrence_occurrence(&ctx, &caldav_account, &next)
+                .await
+                .unwrap();
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
+            assert!(requests[2].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
+            assert!(requests[2].contains(&format!("if-match: {put_etag}\r\n")));
+            assert!(!requests[2].contains("if-match: \"old-etag\"\r\n"));
+            let put_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+            assert!(put_body.contains("SUMMARY:Follow-up title\n"));
+            assert!(put_body.contains("DESCRIPTION:Old\nLOCATION:Old\nX-KEEP:value\n"));
+            assert!(put_body.contains(
+                &component("RRULE:FREQ=WEEKLY\nX-MASTER:keep\n")
+                    .replace("SUMMARY:Visible event", "SUMMARY:Canonical")
+            ));
+            assert!(put_body.contains(
+                &occurrence_sibling()
+                    .replace("SUMMARY:Visible event", "SUMMARY:Canonical")
+                    .replace("X-SIBLING:original", "X-SIBLING:canonical")
+            ));
+            assert_eq!(follow_up.occurrence.title, "Follow-up canonical");
+            assert_eq!(
+                follow_up.replacement_identity.provider_revision.as_deref(),
+                Some("\"next-etag\"")
+            );
+            let seeds = follow_up.canonical_recurrence_objects.unwrap();
+            assert_eq!(seeds.len(), 3);
+            assert!(seeds.iter().all(|seed| {
+                seed.provider_revision.as_deref() == Some("\"next-etag\"")
+                    && seed.provider_native_data.as_deref() == Some(follow_up_canonical.as_str())
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_without_response_etags_never_reuses_old_etag() {
+        let native = occurrence_resource_with_sibling("");
         let canonical = native.replace("SUMMARY:Visible event", "SUMMARY:Canonical");
         let (root, captured) = serve_dav_with_etag(
-            vec![("PUT", 204, String::new()), ("GET", 200, canonical)],
+            vec![("PUT", 204, String::new()), ("GET", 200, canonical.clone())],
             None,
         )
         .await;
@@ -1406,19 +1508,21 @@ mod recurrence_tests {
             )
             .await
             .unwrap();
-        assert_eq!(captured.await.unwrap().len(), 2);
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
         assert_eq!(outcome.replacement_identity.provider_revision, None);
-        assert!(outcome
-            .canonical_recurrence_objects
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|seed| seed.provider_revision.is_none()));
+        let seeds = outcome.canonical_recurrence_objects.as_ref().unwrap();
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds.iter().all(|seed| {
+            seed.provider_revision.is_none()
+                && seed.provider_native_data.as_deref() == Some(canonical.as_str())
+        }));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         caldav_account.caldav_url = format!("http://{}/dav/", listener.local_addr().unwrap());
         let mut next = request;
-        next.expected_provider_revision = None;
+        next.expected_provider_revision = outcome.replacement_identity.provider_revision.clone();
         next.trusted_identity = outcome
             .replacement_identity
             .bind("acc1", next.current_event.id.clone(), "exception-object")
@@ -1435,6 +1539,7 @@ mod recurrence_tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Sync(_)));
+        assert!(error.to_string().contains("has no expected ETag"));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), listener.accept())
                 .await

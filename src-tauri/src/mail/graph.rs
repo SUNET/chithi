@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 
+const CALENDAR_EVENT_SELECT: &str = "id,subject,body,bodyPreview,start,end,location,isAllDay,\
+    organizer,attendees,iCalUId,responseStatus,isCancelled,type,seriesMasterId,originalStart,\
+    recurrence,@odata.etag,changeKey,lastModifiedDateTime";
+
 /// Graph JSON batching allows at most 20 sub-requests per `$batch` call.
 const BATCH_SIZE: usize = 20;
 
@@ -324,7 +328,7 @@ mod endpoint_tests {
             r#"{"value":[{
             "id":"opaque","type":"occurrence","seriesMasterId":"master",
             "originalStart":"2026-08-09T09:00:00Z","@odata.etag":"revision-1",
-            "recurrence":null,
+            "recurrence":null,"isCancelled":false,
             "start":{"dateTime":"2026-08-09T09:00:00","timeZone":"UTC"},
             "end":{"dateTime":"2026-08-09T10:00:00","timeZone":"UTC"}
         }]}"#,
@@ -351,12 +355,13 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
+        let event = events.into_iter().next().unwrap().into_live().unwrap();
         assert_eq!(
-            events[0].recurrence_kind,
+            event.recurrence_kind,
             crate::calendar::RecurrenceKind::Occurrence
         );
         assert_eq!(
-            events[0].recurrence_seeds.as_ref().unwrap()[0]
+            event.recurrence_seeds.as_ref().unwrap()[0]
                 .provider_calendar_id
                 .as_deref(),
             Some("team@example.org")
@@ -381,6 +386,7 @@ mod endpoint_tests {
         let selected: Vec<_> = query.get("$select").unwrap().split(',').collect();
         for field in [
             "responseStatus",
+            "isCancelled",
             "type",
             "seriesMasterId",
             "originalStart",
@@ -421,10 +427,10 @@ mod endpoint_tests {
         }
     }
 
-    #[tokio::test]
-    async fn occurrence_time_update_is_sparse_conditional_and_reads_canonical_event() {
-        let canonical = serde_json::json!({
+    fn canonical_occurrence() -> serde_json::Value {
+        serde_json::json!({
             "id": "immutable-occurrence",
+            "isCancelled": false,
             "@odata.etag": "etag-2",
             "changeKey": "native-change-key",
             "lastModifiedDateTime": "2026-09-15T10:00:00Z",
@@ -447,7 +453,12 @@ mod endpoint_tests {
             "attendees": [],
             "iCalUId": "series@example.test",
             "responseStatus": {"response": "organizer"}
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn occurrence_time_update_is_sparse_conditional_and_reads_canonical_event() {
+        let canonical = canonical_occurrence();
         let (root, captured) = serve_responses(|_| {
             vec![
                 TestResponse {
@@ -552,7 +563,13 @@ mod endpoint_tests {
             .find(|(name, _)| name == "$select")
             .unwrap()
             .1;
-        for field in ["body", "attendees", "originalStart", "changeKey"] {
+        for field in [
+            "body",
+            "attendees",
+            "originalStart",
+            "changeKey",
+            "isCancelled",
+        ] {
             assert!(selected.split(',').any(|selected| selected == field));
         }
     }
@@ -598,6 +615,185 @@ mod endpoint_tests {
             assert!(matches!(error, crate::error::Error::Sync(_)));
             assert_eq!(captured.await.unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_rejects_cancelled_or_unknown_canonical_state() {
+        let mut missing = canonical_occurrence();
+        missing.as_object_mut().unwrap().remove("isCancelled");
+        let mut cases = vec![
+            missing,
+            serde_json::json!({"id": "immutable-occurrence", "isCancelled": true}),
+        ];
+        for state in [
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let mut canonical = canonical_occurrence();
+            canonical["isCancelled"] = state;
+            cases.push(canonical);
+        }
+        for canonical in cases {
+            let (root, captured) = serve_responses(|_| {
+                vec![
+                    TestResponse {
+                        status: 204,
+                        retry_after: None,
+                        body: String::new(),
+                    },
+                    TestResponse::ok(canonical.to_string()),
+                ]
+            })
+            .await;
+            let desired = OccurrenceFields {
+                title: "Changed".into(),
+                description: None,
+                location: None,
+                start_time: "2026-09-15T12:00:00Z".into(),
+                end_time: "2026-09-15T13:00:00Z".into(),
+                all_day: false,
+                timezone: Some("UTC".into()),
+            };
+            let error = test_client(&root)
+                .update_recurrence_occurrence(
+                    "immutable-occurrence",
+                    "provider-calendar",
+                    "etag-1",
+                    "immutable-master",
+                    "2026-09-15T09:00:00.0000000Z",
+                    &UpdateOccurrenceInput {
+                        title: Some(desired.title.clone()),
+                        ..Default::default()
+                    },
+                    &desired,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, crate::error::Error::Sync(_)));
+            assert!(error.to_string().contains("reconciliation required"));
+            assert!(
+                error.to_string().contains("isCancelled")
+                    || error.to_string().contains("is cancelled"),
+                "{error}"
+            );
+            assert_eq!(captured.await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_view_deduplicates_identical_live_events_and_sparse_tombstones() {
+        let live = canonical_occurrence();
+        let cancelled = serde_json::json!({"id": "cancelled-id", "isCancelled": true});
+        let (root, captured) = serve_many(|root| {
+            vec![
+                serde_json::json!({
+                    "value": [live, cancelled],
+                    "@odata.nextLink": format!("{root}/page-2")
+                })
+                .to_string(),
+                serde_json::json!({"value": [cancelled, live], "@odata.nextLink": null})
+                    .to_string(),
+            ]
+        })
+        .await;
+
+        let events = test_client(&root)
+            .list_events_for_calendar("calendar", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], super::GraphCalendarItem::Live(event)
+            if event.id == "immutable-occurrence"));
+        assert!(
+            matches!(&events[1], super::GraphCalendarItem::Cancelled(tombstone)
+            if tombstone.remote_id() == "cancelled-id")
+        );
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_view_rejects_conflicting_ids_across_pages() {
+        let live = canonical_occurrence();
+        let cancelled = serde_json::json!({"id": "immutable-occurrence", "isCancelled": true});
+        let mut changed = live.clone();
+        changed["@odata.etag"] = serde_json::json!("different-revision");
+        for (first, second) in [
+            (live.clone(), cancelled.clone()),
+            (cancelled, live.clone()),
+            (live, changed),
+        ] {
+            let (root, captured) = serve_many(|root| {
+                vec![
+                    serde_json::json!({
+                        "value": [first], "@odata.nextLink": format!("{root}/page-2")
+                    })
+                    .to_string(),
+                    serde_json::json!({"value": [second]}).to_string(),
+                ]
+            })
+            .await;
+
+            let error = test_client(&root)
+                .list_events_for_calendar(
+                    "calendar",
+                    "2026-09-01T00:00:00Z",
+                    "2026-10-01T00:00:00Z",
+                )
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("conflicting duplicate event ID"));
+            assert_eq!(captured.await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_view_rejects_incomplete_page_envelopes() {
+        for body in [
+            "{}",
+            r#"{"value":null}"#,
+            r#"{"value":{}}"#,
+            r#"{"value":[],"@odata.nextLink":42}"#,
+            r#"{"value":[],"@odata.nextLink":" "}"#,
+        ] {
+            let (root, captured) = serve_once(body).await;
+            assert!(test_client(&root)
+                .list_events_for_calendar(
+                    "calendar",
+                    "2026-09-01T00:00:00Z",
+                    "2026-10-01T00:00:00Z"
+                )
+                .await
+                .is_err());
+            captured.await.unwrap();
+        }
+
+        let (root, captured) = serve_many(|root| {
+            let page = serde_json::json!({
+                "value": [], "@odata.nextLink": format!("{root}/page-2")
+            })
+            .to_string();
+            vec![page.clone(), page]
+        })
+        .await;
+        let error = test_client(&root)
+            .list_events_for_calendar("calendar", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("repeated a pagination link"));
+        assert_eq!(captured.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2225,13 +2421,16 @@ impl GraphClient {
 
     /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
     /// Uses UTC and immutable IDs on every page and follows `@odata.nextLink`.
+    /// Returns only a complete, validated view, with identical duplicates removed.
     pub async fn list_events_for_calendar(
         &self,
         calendar_id: &str,
         start: &str,
         end: &str,
-    ) -> Result<Vec<GraphCalendarEvent>> {
+    ) -> Result<Vec<GraphCalendarItem>> {
         let mut events = Vec::new();
+        let mut seen_events = std::collections::HashMap::new();
+        let mut seen_pages = std::collections::HashSet::new();
         let mut next_path: Option<String> = None;
         loop {
             let resp: serde_json::Value = match next_path.take() {
@@ -2261,23 +2460,26 @@ impl GraphClient {
                         "/me/calendars/{}/calendarView",
                         urlencoding::encode(calendar_id)
                     ));
-                    let resp = self.http
+                    let resp = self
+                        .http
                         .get(&url)
                         .bearer_auth(&self.access_token)
-                        .header(
-                            "Prefer",
-                            "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"",
-                        )
+                        .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,body,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,originalStart,recurrence,@odata.etag,changeKey,lastModifiedDateTime"),
+                            ("$select", CALENDAR_EVENT_SELECT),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
                         .send()
                         .await
-                        .map_err(|e| Error::Other(format!("Graph GET /me/calendars/{}/calendarView failed: {}", calendar_id, e)))?;
+                        .map_err(|e| {
+                            Error::Other(format!(
+                                "Graph GET /me/calendars/{}/calendarView failed: {}",
+                                calendar_id, e
+                            ))
+                        })?;
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
@@ -2292,17 +2494,39 @@ impl GraphClient {
                         .map_err(|e| Error::Other(format!("Graph JSON parse failed: {}", e)))?
                 }
             };
-            if let Some(items) = resp["value"].as_array() {
-                for e in items {
-                    events.push(parse_graph_event(e, calendar_id));
+            let items = resp["value"].as_array().ok_or_else(|| {
+                Error::Sync("Graph calendarView response `value` must be an array".into())
+            })?;
+            for source in items {
+                let event = parse_graph_event(source, calendar_id)?;
+                let id = event.remote_id();
+                if let Some(previous) = seen_events.get(id) {
+                    if previous != source {
+                        return Err(Error::Sync(format!(
+                            "Graph calendarView contains conflicting duplicate event ID {id:?}"
+                        )));
+                    }
+                    continue;
                 }
+                seen_events.insert(id.to_owned(), source.clone());
+                events.push(event);
             }
-            let next_link = resp["@odata.nextLink"]
-                .as_str()
-                .map(|s: &str| s.to_string());
-            match next_link {
-                Some(next) => next_path = Some(next),
-                None => break,
+            match resp.get("@odata.nextLink") {
+                None | Some(serde_json::Value::Null) => break,
+                Some(serde_json::Value::String(next)) if !next.trim().is_empty() => {
+                    if !seen_pages.insert(next.clone()) {
+                        return Err(Error::Sync(
+                            "Graph calendarView repeated a pagination link".into(),
+                        ));
+                    }
+                    next_path = Some(next.clone());
+                }
+                Some(_) => {
+                    return Err(Error::Sync(
+                        "Graph calendarView response `@odata.nextLink` must be a non-empty string"
+                            .into(),
+                    ));
+                }
             }
         }
         Ok(events)
@@ -2369,9 +2593,6 @@ impl GraphClient {
             )));
         }
 
-        const EVENT_SELECT: &str = "id,subject,body,bodyPreview,start,end,location,isAllDay,\
-            organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,originalStart,\
-            recurrence,@odata.etag,changeKey,lastModifiedDateTime";
         let response = self
             .send_with_retry(
                 || {
@@ -2379,7 +2600,7 @@ impl GraphClient {
                         .get(&url)
                         .bearer_auth(&self.access_token)
                         .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
-                        .query(&[("$select", EVENT_SELECT)])
+                        .query(&[("$select", CALENDAR_EVENT_SELECT)])
                 },
                 &format!("GET {path}"),
                 true,
@@ -2831,6 +3052,45 @@ pub struct GraphCalendar {
     pub is_default: bool,
 }
 
+/// A calendarView item with an explicit, validated cancellation state.
+#[derive(Debug, Clone)]
+pub enum GraphCalendarItem {
+    Live(Box<GraphCalendarEvent>),
+    Cancelled(GraphCalendarTombstone),
+}
+
+impl GraphCalendarItem {
+    fn remote_id(&self) -> &str {
+        match self {
+            Self::Live(event) => &event.id,
+            Self::Cancelled(tombstone) => tombstone.remote_id(),
+        }
+    }
+
+    fn into_live(self) -> Result<GraphCalendarEvent> {
+        match self {
+            Self::Live(event) => Ok(*event),
+            Self::Cancelled(_) => Err(Error::Sync(
+                "Graph event is cancelled and cannot be used as a live event".into(),
+            )),
+        }
+    }
+}
+
+/// An explicit cancellation identified by the non-empty immutable ID requested
+/// from Graph. Sparse tombstones do not need live event fields or an iCalUId.
+#[derive(Debug, Clone)]
+pub struct GraphCalendarTombstone {
+    id: String,
+}
+
+impl GraphCalendarTombstone {
+    pub fn remote_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Live provider data; cancellation is represented separately by GraphCalendarItem.
 #[derive(Debug, Clone)]
 pub struct GraphCalendarEvent {
     pub id: String,
@@ -3216,7 +3476,10 @@ fn graph_recurrence_seeds(
 ) -> Option<Vec<RecurrenceIdentitySeed>> {
     let recurrence_kind = graph_recurrence_kind(event);
     let id = event.get("id")?.as_str()?.trim();
-    if id.is_empty() || !valid_graph_effective_range(effective_start, effective_end) {
+    if id.is_empty()
+        || graph_effective_duration(effective_start, effective_end)
+            .is_none_or(|duration| duration <= chrono::TimeDelta::zero())
+    {
         return None;
     }
     if recurrence_kind == RecurrenceKind::Standalone {
@@ -3295,23 +3558,39 @@ fn graph_recurrence_seeds(
     Some(vec![seed])
 }
 
-fn valid_graph_effective_range(start: &str, end: &str) -> bool {
+fn graph_effective_duration(start: &str, end: &str) -> Option<chrono::TimeDelta> {
     if let (Ok(start), Ok(end)) = (
         chrono::DateTime::parse_from_rfc3339(start),
         chrono::DateTime::parse_from_rfc3339(end),
     ) {
-        end > start
+        Some(end - start)
     } else if let (Ok(start), Ok(end)) = (
         chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d"),
         chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d"),
     ) {
-        end > start
+        Some(end - start)
     } else {
-        false
+        None
     }
 }
 
-fn parse_graph_event(e: &serde_json::Value, provider_calendar_id: &str) -> GraphCalendarEvent {
+fn parse_graph_event(
+    e: &serde_json::Value,
+    provider_calendar_id: &str,
+) -> Result<GraphCalendarItem> {
+    let id = e["id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && !id.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .ok_or_else(|| Error::Sync("Graph event `id` must be a non-empty immutable ID".into()))?;
+    let cancelled = e["isCancelled"].as_bool().ok_or_else(|| {
+        Error::Sync("Graph event `isCancelled` must be present and boolean".into())
+    })?;
+    if cancelled {
+        return Ok(GraphCalendarItem::Cancelled(GraphCalendarTombstone {
+            id: id.to_owned(),
+        }));
+    }
+
     let start_obj = &e["start"];
     let end_obj = &e["end"];
     let all_day = e["isAllDay"].as_bool().unwrap_or(false);
@@ -3380,8 +3659,16 @@ fn parse_graph_event(e: &serde_json::Value, provider_calendar_id: &str) -> Graph
     let recurrence_kind = graph_recurrence_kind(e);
     let recurrence_seeds = graph_recurrence_seeds(e, provider_calendar_id, &start, &end);
 
-    GraphCalendarEvent {
-        id: e["id"].as_str().unwrap_or("").to_string(),
+    if graph_effective_duration(&start, &end)
+        .is_none_or(|duration| duration < chrono::TimeDelta::zero())
+    {
+        return Err(Error::Sync(
+            "Graph live event has an invalid start/end range".into(),
+        ));
+    }
+
+    Ok(GraphCalendarItem::Live(Box::new(GraphCalendarEvent {
+        id: id.to_owned(),
         subject: e["subject"].as_str().unwrap_or("(No title)").to_string(),
         body_preview: graph_event_description(e),
         start,
@@ -3397,7 +3684,7 @@ fn parse_graph_event(e: &serde_json::Value, provider_calendar_id: &str) -> Graph
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
         recurrence_kind,
         recurrence_seeds,
-    }
+    })))
 }
 
 fn graph_event_description(event: &serde_json::Value) -> Option<String> {
@@ -3412,6 +3699,7 @@ fn parse_graph_event_strict(
     event: &serde_json::Value,
     provider_calendar_id: &str,
 ) -> Result<GraphCalendarEvent> {
+    let parsed = parse_graph_event(event, provider_calendar_id)?.into_live()?;
     let object = event
         .as_object()
         .ok_or_else(|| Error::Other("Graph event must be an object".into()))?;
@@ -3472,7 +3760,6 @@ fn parse_graph_event_strict(
             "Graph event has malformed canonical fields".into(),
         ));
     }
-    let parsed = parse_graph_event(event, provider_calendar_id);
     if parsed.recurrence_seeds.is_none() {
         return Err(Error::Other(
             "Graph event has incomplete recurrence identity or revision".into(),
@@ -4404,6 +4691,126 @@ mod batch_tests {
 }
 
 #[cfg(test)]
+mod cancellation_tests {
+    use super::{parse_graph_event, GraphCalendarItem};
+    use serde_json::{json, Value};
+
+    fn live_event() -> Value {
+        json!({
+            "id": "immutable-event",
+            "isCancelled": false,
+            "subject": "Live event",
+            "start": {"dateTime": "2026-09-14T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-14T10:00:00", "timeZone": "UTC"}
+        })
+    }
+
+    #[test]
+    fn sparse_tombstone_needs_only_boolean_cancellation_and_immutable_id() {
+        let tombstone = json!({"id": "opaque+/immutable=", "isCancelled": true});
+        let parsed = parse_graph_event(&tombstone, "provider-calendar").unwrap();
+        assert!(matches!(&parsed, GraphCalendarItem::Cancelled(event)
+            if event.remote_id() == "opaque+/immutable="));
+        assert!(parsed.into_live().is_err());
+
+        let mut full = live_event();
+        full["isCancelled"] = json!(true);
+        full["start"] = json!({"malformed": true});
+        assert!(matches!(
+            parse_graph_event(&full, "provider-calendar").unwrap(),
+            GraphCalendarItem::Cancelled(_)
+        ));
+    }
+
+    #[test]
+    fn only_explicit_false_is_live() {
+        let parsed = parse_graph_event(&live_event(), "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(parsed.id, "immutable-event");
+        assert_eq!(parsed.subject, "Live event");
+        assert_eq!(parsed.start, "2026-09-14T09:00:00Z");
+
+        for state in [
+            None,
+            Some(Value::Null),
+            Some(json!("true")),
+            Some(json!("false")),
+            Some(json!(0)),
+            Some(json!(1)),
+            Some(json!({})),
+            Some(json!([])),
+        ] {
+            let mut event = live_event();
+            match state {
+                Some(state) => event["isCancelled"] = state,
+                None => {
+                    event.as_object_mut().unwrap().remove("isCancelled");
+                }
+            }
+            let error = parse_graph_event(&event, "provider-calendar").unwrap_err();
+            assert!(
+                error.to_string().contains("isCancelled"),
+                "{event}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_states_require_a_valid_nonempty_remote_id() {
+        for cancelled in [true, false] {
+            for id in [
+                None,
+                Some(Value::Null),
+                Some(json!(42)),
+                Some(json!("")),
+                Some(json!("  ")),
+                Some(json!(" immutable-id")),
+                Some(json!("immutable\nid")),
+                Some(json!("immutable\u{0000}id")),
+            ] {
+                let mut event = live_event();
+                event["isCancelled"] = json!(cancelled);
+                match id {
+                    Some(id) => event["id"] = id,
+                    None => {
+                        event.as_object_mut().unwrap().remove("id");
+                    }
+                }
+                let error = parse_graph_event(&event, "provider-calendar").unwrap_err();
+                assert!(error.to_string().contains("`id`"), "{event}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_live_range_cannot_be_reconciled_as_a_complete_event() {
+        for range in [json!(null), json!({}), json!({"dateTime": "not-a-date"})] {
+            let mut event = live_event();
+            event["start"] = range;
+            assert!(parse_graph_event(&event, "provider-calendar").is_err());
+        }
+        let mut sparse = json!({"id": "immutable-id", "isCancelled": false});
+        assert!(parse_graph_event(&sparse, "provider-calendar").is_err());
+        sparse["isCancelled"] = json!(true);
+        assert!(parse_graph_event(&sparse, "provider-calendar").is_ok());
+    }
+
+    #[test]
+    fn zero_duration_live_events_remain_syncable() {
+        let mut event = live_event();
+        event["end"] = event["start"].clone();
+        let parsed = parse_graph_event(&event, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(parsed.start, parsed.end);
+        assert!(parsed.recurrence_seeds.is_none());
+    }
+}
+
+#[cfg(test)]
 mod recurrence_tests {
     use super::{event_to_graph_json, invitation_copy_patch_to_graph_json, parse_graph_event};
     use crate::calendar::{
@@ -4619,6 +5026,7 @@ mod recurrence_tests {
         for (metadata, expected) in cases {
             let mut event = json!({
                 "id": "opaque-id",
+                "isCancelled": false,
                 "subject": "Provider fixture",
                 "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
@@ -4628,7 +5036,11 @@ mod recurrence_tests {
                 .unwrap()
                 .extend(metadata.as_object().unwrap().clone());
             assert_eq!(
-                parse_graph_event(&event, "provider-calendar").recurrence_kind,
+                parse_graph_event(&event, "provider-calendar")
+                    .unwrap()
+                    .into_live()
+                    .unwrap()
+                    .recurrence_kind,
                 expected,
                 "{event}"
             );
@@ -4641,6 +5053,7 @@ mod recurrence_tests {
         parse_graph_event(
             &json!({
                 "id": "immutable-event-id",
+                "isCancelled": false,
                 "type": graph_type,
                 "seriesMasterId": child.then_some("immutable-master-id"),
                 "originalStart": child.then_some("2026-09-14T09:00:00.0000000Z"),
@@ -4660,6 +5073,9 @@ mod recurrence_tests {
             }),
             "provider-calendar",
         )
+        .unwrap()
+        .into_live()
+        .unwrap()
     }
 
     #[test]
@@ -4669,6 +5085,7 @@ mod recurrence_tests {
 
         let mut no_etag = json!({
             "id": "immutable-event-id",
+            "isCancelled": false,
             "type": "occurrence",
             "seriesMasterId": "immutable-master-id",
             "originalStart": "2026-09-14T09:00:00Z",
@@ -4680,10 +5097,16 @@ mod recurrence_tests {
             "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
         });
         assert!(parse_graph_event(&no_etag, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap()
             .recurrence_seeds
             .is_none());
         no_etag["@odata.etag"] = json!("");
         assert!(parse_graph_event(&no_etag, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap()
             .recurrence_seeds
             .is_none());
 
@@ -4748,17 +5171,25 @@ mod recurrence_tests {
     fn occurrence_without_original_start_fails_closed() {
         let mut event = json!({
             "id": "immutable-occurrence-id",
+            "isCancelled": false,
             "type": "occurrence",
             "seriesMasterId": "immutable-master-id",
             "recurrence": null,
             "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
             "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
         });
-        let parsed = parse_graph_event(&event, "provider-calendar");
+        let parsed = parse_graph_event(&event, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap();
         assert!(parsed.recurrence_seeds.is_none());
 
         event["start"]["dateTime"] = json!("2026-09-15T11:00:00");
-        let moved = parse_graph_event(&event, "provider-calendar");
+        event["end"]["dateTime"] = json!("2026-09-15T12:00:00");
+        let moved = parse_graph_event(&event, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap();
         assert!(moved.recurrence_seeds.is_none());
     }
 }
@@ -4842,6 +5273,7 @@ mod color_tests {
     fn parse_graph_event_translates_attendee_status() {
         let raw = serde_json::json!({
             "id": "evt1",
+            "isCancelled": false,
             "type": "singleInstance",
             "seriesMasterId": null,
             "recurrence": null,
@@ -4857,7 +5289,10 @@ mod color_tests {
                 }
             ]
         });
-        let parsed = parse_graph_event(&raw, "provider-calendar");
+        let parsed = parse_graph_event(&raw, "provider-calendar")
+            .unwrap()
+            .into_live()
+            .unwrap();
         let atts: serde_json::Value =
             serde_json::from_str(&parsed.attendees_json.unwrap()).unwrap();
         assert_eq!(atts[0]["status"], "tentative");
@@ -4890,6 +5325,7 @@ mod color_tests {
     fn parse_graph_event_extracts_my_status() {
         let raw = serde_json::json!({
             "id": "evt2",
+            "isCancelled": false,
             "type": "singleInstance",
             "seriesMasterId": null,
             "recurrence": null,
@@ -4901,6 +5337,9 @@ mod color_tests {
         });
         assert_eq!(
             parse_graph_event(&raw, "provider-calendar")
+                .unwrap()
+                .into_live()
+                .unwrap()
                 .my_status
                 .as_deref(),
             Some("tentative")
@@ -4909,6 +5348,7 @@ mod color_tests {
         // An event the user organized has no RSVP badge.
         let own = serde_json::json!({
             "id": "evt3",
+            "isCancelled": false,
             "type": "singleInstance",
             "seriesMasterId": null,
             "recurrence": null,
@@ -4918,7 +5358,14 @@ mod color_tests {
             "isAllDay": false,
             "responseStatus": { "response": "organizer" }
         });
-        assert_eq!(parse_graph_event(&own, "provider-calendar").my_status, None);
+        assert_eq!(
+            parse_graph_event(&own, "provider-calendar")
+                .unwrap()
+                .into_live()
+                .unwrap()
+                .my_status,
+            None
+        );
     }
 
     #[test]
