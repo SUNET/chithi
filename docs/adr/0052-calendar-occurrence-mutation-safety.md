@@ -7,7 +7,11 @@ Accepted — approved scope of #288, 2026-09-13.
 Amended for the approved scope of #308: durable move revisions and
 provenance-gated series invitations, destination-copy revalidation, consistent
 Google sync queries, and removal of unsupported manual cancellation controls.
-Review and integration validation are still in progress.
+
+Amended for the backend scope of #309, 2026-09-15: durable provider recurrence
+identity, lossless exception ingestion, explicit mutation planning, and
+remote-first `THIS-OCCURRENCE` updates. Series writes, recurrence moves,
+`THISANDFUTURE`, and renderer integration remain outside this amendment.
 
 ## Context
 
@@ -19,8 +23,10 @@ cached rows lack enough evidence to distinguish these cases.
 
 Some UI paths previously converted a synthetic occurrence ID to its master
 ID before editing, deleting or moving it. That silently changed the target
-from the selected occurrence to the series. Chithi has no occurrence or
-series mutation engine to implement those operations safely.
+from the selected occurrence to the series. Chithi had no occurrence or
+series mutation engine to implement those operations safely. The original
+decision therefore blocked all such mutations until authoritative identity
+and conditional provider writes existed.
 
 ## Decision
 
@@ -36,6 +42,83 @@ Ordinary Edit/Delete/Move requires `standalone` with no nonempty
 `recurrence_rule`. Series, occurrences and unknown events are read-only for
 these actions. A contradictory standalone row carrying a rule is blocked
 too. Updating a standalone event cannot introduce an RRULE.
+
+This ordinary-action guard remains unchanged. The #309 occurrence workflow is
+a separate command surface and is not an exemption in `ensure_mutable`.
+
+### First-class recurrence identity and occurrence mutation
+
+Provider sync stores validated recurrence objects in
+`calendar_recurrence_objects`. Existing rows are not backfilled from guesses;
+legacy rows without linked objects remain read-only. Each object records:
+
+- its owning event and account, and its remote calendar collection;
+- local and provider series identity and provider occurrence identity;
+- the immutable original recurrence position, value type, and timezone;
+- complete effective occurrence content, independently of the series master;
+- master, occurrence, exception, or exclusion classification;
+- provider-native recurrence data and the provider revision needed for a
+  conditional write.
+
+Provider identities are scoped by account and remote calendar. Partial unique
+indexes prevent duplicate original positions, provider occurrence IDs, and
+series masters. Original recurrence identity cannot be reassigned by an
+upsert. Native provider data is private persistence state and is excluded from
+serialized plans and summaries. Inserts, updates, and deletes advance the
+owning event's durable revision, including embedded override changes that do
+not alter the `calendar_events` row.
+
+Ingestion replaces an event and its recurrence object set in one transaction.
+Malformed or incomplete recurrence metadata uses the legacy event upsert and
+cannot erase previously trusted identity. Stable object IDs are derived from
+length-delimited, hashed immutable identity and survive ordinary content,
+revision, and occurrence-to-exception changes.
+
+The renderer-facing backend exposes sanitized recurrence-object summaries and
+an explicit mutation plan. A plan binds the account, event, recurrence object,
+scope, backend protocol, remote target, local revision, and provider revision.
+Planning never substitutes a synthetic occurrence ID with a master ID.
+Execution re-resolves all state under the account lifecycle lock and rejects a
+changed binding, target, identity, local revision, or provider revision before
+network I/O.
+
+Only the dedicated `update_event_recurrence_occurrence` command executes this
+amendment. Its shape fixes the scope to `THIS-OCCURRENCE`; it cannot express a
+series move or `THISANDFUTURE`. The input contains only occurrence title,
+description, location, start/end, all-day state, and timezone. It cannot move
+calendars, rewrite recurrence rules or attendees, or transfer meeting
+ownership. Sparse patch intent is retained through the provider boundary so
+unchanged rich provider fields are not rewritten.
+
+The provider write is conditional and happens before local mutation. Google
+and Graph use immutable occurrence targets and HTTP validators; JMAP uses
+`ifInState`; CalDAV uses the exact resource ETag. The provider is read back
+after success and its canonical recurrence identity is validated before local
+persistence. A detached occurrence updates its projected event and recurrence
+object together. An embedded JMAP or CalDAV exception replaces the complete
+canonical recurrence-object set, refreshing shared native data and revisions
+for the master and every sibling without overwriting the master event with
+occurrence content. Any post-write local race or invalid provider response is
+reported as requiring reconciliation; Chithi does not claim that the remote
+write was rolled back.
+
+Provider-specific evidence remains lossless:
+
+- Google preserves the remote calendar, master ID, occurrence ID,
+  `originalStartTime`, full event JSON, and ETag.
+- Graph requests immutable IDs and preserves the remote calendar,
+  `seriesMasterId`, `originalStart`, event type, full JSON, and `@odata.etag`.
+- JMAP preserves the complete JSCalendar object, recurrence override keys,
+  detached instance identity, and collection state.
+- CalDAV preserves the complete VCALENDAR resource, href, exact strong or weak
+  ETag, and raw `RECURRENCE-ID` value, type, TZID, and RANGE parameters.
+
+Sync completeness is part of recurrence safety. Google consumes every page
+before applying a batch or advancing its sync token. JMAP validates and
+paginates query/get snapshots and does not reconcile ambiguous multi-calendar
+membership. CalDAV rejects malformed or partial multistatus snapshots. Google
+and Graph bounded time windows never use absence as deletion proof. Explicit
+tombstones and demonstrably complete snapshots remain authoritative.
 
 Desktop and mobile use the same detail component and the shared
 `src/lib/calendar-mutation-support.ts` policy/reasons. The store and drag
@@ -292,9 +375,10 @@ undo delivery already in flight or make a multi-recipient send, notification
 plus mutation, or provider operation atomic.
 
 RSVP, calendar/account removal and provider reconciliation are outside the
-ordinary mutation guards. This decision adds no occurrence editor, series
-editor or exception-sync engine, and does not redesign provider CRUD delivery
-or add a durable calendar outbox or new iTIP delivery workflow.
+ordinary mutation guards. The #309 amendment adds backend occurrence identity,
+planning, ingestion, and `THIS-OCCURRENCE` updates, but no renderer occurrence
+editor, series writer, recurrence move, `THISANDFUTURE` split, durable calendar
+outbox, or new iTIP delivery workflow.
 
 ## Consequences
 

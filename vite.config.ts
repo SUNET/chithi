@@ -21,7 +21,7 @@ export default defineConfig(async () => ({
   test: {
     environment: "happy-dom",
     globals: true,
-    exclude: ["e2e-tests/**", "node_modules/**"],
+    exclude: ["e2e-tests/**", "node_modules/**", ".claude/worktrees/**"],
   },
   clearScreen: false,
   server: {

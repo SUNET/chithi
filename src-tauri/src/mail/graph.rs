@@ -3,7 +3,13 @@
 //! All operations go through `https://graph.microsoft.com/v1.0` with
 //! Bearer token authentication. O365 mail delivery remains on SMTP+XOAUTH2.
 
-use crate::calendar::RecurrenceKind;
+use crate::calendar::{
+    recurrence_identity::{
+        OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
+        UpdateOccurrenceInput,
+    },
+    RecurrenceKind,
+};
 use crate::error::{Error, Result};
 use crate::mail::search::build_graph_kql;
 use crate::message::{normalize_message_id, SearchHit, SearchQuery};
@@ -138,6 +144,7 @@ fn join_url(root: &str, path: &str) -> String {
 #[cfg(test)]
 mod endpoint_tests {
     use super::{parse_graph_contact, GraphClient, GraphEndpoints};
+    use crate::calendar::recurrence_identity::{OccurrenceFields, UpdateOccurrenceInput};
     use reqwest::header::{HeaderMap, HeaderValue};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -199,17 +206,34 @@ mod endpoint_tests {
                 loop {
                     let mut chunk = [0; 1024];
                     let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "request ended before its headers and body");
                     if count == 0 {
                         break;
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    if let Some(header_end) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= header_end + 4 + content_length {
+                            break;
+                        }
                     }
                 }
                 let reason = match response.status {
                     200 => "OK",
+                    204 => "No Content",
                     400 => "Bad Request",
+                    409 => "Conflict",
+                    412 => "Precondition Failed",
                     429 => "Too Many Requests",
                     503 => "Service Unavailable",
                     504 => "Gateway Timeout",
@@ -299,6 +323,7 @@ mod endpoint_tests {
         let (root, captured) = serve_once(
             r#"{"value":[{
             "id":"opaque","type":"occurrence","seriesMasterId":"master",
+            "originalStart":"2026-08-09T09:00:00Z","@odata.etag":"revision-1",
             "recurrence":null,
             "start":{"dateTime":"2026-08-09T09:00:00","timeZone":"UTC"},
             "end":{"dateTime":"2026-08-09T10:00:00","timeZone":"UTC"}
@@ -330,6 +355,12 @@ mod endpoint_tests {
             events[0].recurrence_kind,
             crate::calendar::RecurrenceKind::Occurrence
         );
+        assert_eq!(
+            events[0].recurrence_seeds.as_ref().unwrap()[0]
+                .provider_calendar_id
+                .as_deref(),
+            Some("team@example.org")
+        );
 
         let request = captured.await.unwrap();
         let mut lines = request.lines();
@@ -348,14 +379,225 @@ mod endpoint_tests {
         assert_eq!(query.get("$top").unwrap(), "100");
         assert_eq!(query.get("$orderby").unwrap(), "start/dateTime");
         let selected: Vec<_> = query.get("$select").unwrap().split(',').collect();
-        for field in ["responseStatus", "type", "seriesMasterId", "recurrence"] {
+        for field in [
+            "responseStatus",
+            "type",
+            "seriesMasterId",
+            "originalStart",
+            "recurrence",
+            "changeKey",
+            "lastModifiedDateTime",
+        ] {
             assert!(selected.contains(&field), "missing {field} from $select");
         }
 
         let headers = request.to_ascii_lowercase();
         assert!(headers.contains("authorization: bearer test-access-token\r\n"));
         assert!(headers.contains("x-injected-client: graph-test\r\n"));
-        assert!(headers.contains("prefer: outlook.timezone=\"utc\"\r\n"));
+        assert!(headers.contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n"));
+    }
+
+    #[tokio::test]
+    async fn calendar_continuation_repeats_timezone_and_immutable_id_preferences() {
+        let (root, captured) = serve_many(|root| {
+            vec![
+                format!(r#"{{"value":[],"@odata.nextLink":"{root}/page-2"}}"#),
+                r#"{"value":[]}"#.into(),
+            ]
+        })
+        .await;
+
+        test_client(&root)
+            .list_events_for_calendar("calendar", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn occurrence_time_update_is_sparse_conditional_and_reads_canonical_event() {
+        let canonical = serde_json::json!({
+            "id": "immutable-occurrence",
+            "@odata.etag": "etag-2",
+            "changeKey": "native-change-key",
+            "lastModifiedDateTime": "2026-09-15T10:00:00Z",
+            "type": "exception",
+            "seriesMasterId": "immutable-master",
+            "originalStart": "2026-09-15T09:00:00.0000000Z",
+            "recurrence": null,
+            "subject": "Canonical title",
+            "body": {"contentType": "html", "content": "<p>Canonical body</p>"},
+            "bodyPreview": "Truncated body",
+            "location": {
+                "displayName": "Canonical room",
+                "locationType": "conferenceRoom",
+                "uniqueId": "room-1"
+            },
+            "start": {"dateTime": "2026-09-15T12:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-15T13:00:00", "timeZone": "UTC"},
+            "isAllDay": false,
+            "organizer": {"emailAddress": {"address": "owner@example.test"}},
+            "attendees": [],
+            "iCalUId": "series@example.test",
+            "responseStatus": {"response": "organizer"}
+        });
+        let (root, captured) = serve_responses(|_| {
+            vec![
+                TestResponse {
+                    status: 204,
+                    retry_after: None,
+                    body: String::new(),
+                },
+                TestResponse::ok(canonical.to_string()),
+            ]
+        })
+        .await;
+        let desired = OccurrenceFields {
+            title: "Canonical title".into(),
+            description: Some("<p>Canonical body</p>".into()),
+            location: Some("Canonical room".into()),
+            start_time: "2026-09-15T12:00:00Z".into(),
+            end_time: "2026-09-15T13:00:00Z".into(),
+            all_day: false,
+            timezone: Some("UTC".into()),
+        };
+        let patch = UpdateOccurrenceInput {
+            start_time: Some(desired.start_time.clone()),
+            ..Default::default()
+        };
+
+        let updated = test_client(&root)
+            .update_recurrence_occurrence(
+                "immutable-occurrence",
+                "team@example.org",
+                "etag-1",
+                "immutable-master",
+                "2026-09-15T09:00:00.0000000Z",
+                &patch,
+                &desired,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.subject, "Canonical title");
+        assert_eq!(
+            updated.body_preview.as_deref(),
+            Some("<p>Canonical body</p>")
+        );
+        assert_eq!(updated.location.as_deref(), Some("Canonical room"));
+        let seed = &updated.recurrence_seeds.as_ref().unwrap()[0];
+        assert_eq!(
+            seed.provider_calendar_id.as_deref(),
+            Some("team@example.org")
+        );
+        assert_eq!(seed.provider_revision.as_deref(), Some("etag-2"));
+        assert_eq!(seed.occurrence.title, "Canonical title");
+        assert_eq!(
+            seed.occurrence.description.as_deref(),
+            Some("<p>Canonical body</p>")
+        );
+        let native: serde_json::Value =
+            serde_json::from_str(seed.provider_native_data.as_deref().unwrap()).unwrap();
+        assert_eq!(native["changeKey"], "native-change-key");
+        assert_eq!(native["body"]["contentType"], "html");
+        assert_eq!(native["location"]["uniqueId"], "room-1");
+
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("PATCH /injected/me/events/immutable-occurrence "));
+        let patch_headers = requests[0].to_ascii_lowercase();
+        assert!(patch_headers.contains("prefer: idtype=\"immutableid\"\r\n"));
+        assert!(patch_headers.contains("if-match: etag-1\r\n"));
+        let payload: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            payload
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["end", "isAllDay", "start"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert!(payload.get("subject").is_none());
+        assert!(payload.get("body").is_none());
+        assert!(payload.get("location").is_none());
+        assert_eq!(payload["start"]["timeZone"], "UTC");
+        assert_eq!(payload["end"]["timeZone"], "UTC");
+        assert!(requests[1].starts_with("GET /injected/me/events/immutable-occurrence?"));
+        let get_headers = requests[1].to_ascii_lowercase();
+        assert!(
+            get_headers.contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n")
+        );
+        let target = requests[1]
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+        let selected = url
+            .query_pairs()
+            .find(|(name, _)| name == "$select")
+            .unwrap()
+            .1;
+        for field in ["body", "attendees", "originalStart", "changeKey"] {
+            assert!(selected.split(',').any(|selected| selected == field));
+        }
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_maps_conflicts_to_reconciliation_errors() {
+        for status in [409, 412] {
+            let (root, captured) = serve_responses(|_| {
+                vec![TestResponse {
+                    status,
+                    retry_after: None,
+                    body: r#"{"error":"stale"}"#.into(),
+                }]
+            })
+            .await;
+            let fields = OccurrenceFields {
+                title: "Title".into(),
+                description: None,
+                location: None,
+                start_time: "2026-09-15T12:00:00Z".into(),
+                end_time: "2026-09-15T13:00:00Z".into(),
+                all_day: false,
+                timezone: Some("UTC".into()),
+            };
+            let patch = UpdateOccurrenceInput {
+                title: Some(fields.title.clone()),
+                ..Default::default()
+            };
+
+            let error = test_client(&root)
+                .update_recurrence_occurrence(
+                    "occurrence",
+                    "provider-calendar",
+                    "etag-1",
+                    "master",
+                    "2026-09-15T09:00:00Z",
+                    &patch,
+                    &fields,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, crate::error::Error::Sync(_)));
+            assert_eq!(captured.await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -1982,7 +2224,7 @@ impl GraphClient {
     }
 
     /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
-    /// Uses `Prefer: outlook.timezone="UTC"` and follows `@odata.nextLink`.
+    /// Uses UTC and immutable IDs on every page and follows `@odata.nextLink`.
     pub async fn list_events_for_calendar(
         &self,
         calendar_id: &str,
@@ -1998,7 +2240,7 @@ impl GraphClient {
                         .http
                         .get(&path)
                         .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
                         .send()
                         .await
                         .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
@@ -2022,11 +2264,14 @@ impl GraphClient {
                     let resp = self.http
                         .get(&url)
                         .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\"")
+                        .header(
+                            "Prefer",
+                            "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"",
+                        )
                         .query(&[
                             ("startDateTime", start),
                             ("endDateTime", end),
-                            ("$select", "id,subject,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,recurrence"),
+                            ("$select", "id,subject,body,bodyPreview,start,end,location,isAllDay,organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,originalStart,recurrence,@odata.etag,changeKey,lastModifiedDateTime"),
                             ("$top", "100"),
                             ("$orderby", "start/dateTime"),
                         ])
@@ -2049,7 +2294,7 @@ impl GraphClient {
             };
             if let Some(items) = resp["value"].as_array() {
                 for e in items {
-                    events.push(parse_graph_event(e));
+                    events.push(parse_graph_event(e, calendar_id));
                 }
             }
             let next_link = resp["@odata.nextLink"]
@@ -2079,6 +2324,110 @@ impl GraphClient {
     pub async fn update_event(&self, event_id: &str, updates: &serde_json::Value) -> Result<()> {
         self.patch_json(&format!("/me/events/{}", event_id), updates)
             .await
+    }
+
+    /// Conditionally update one immutable recurrence instance, then read back
+    /// Graph's canonical representation because PATCH normally returns 204.
+    pub async fn update_recurrence_occurrence(
+        &self,
+        event_id: &str,
+        provider_calendar_id: &str,
+        etag: &str,
+        expected_series_id: &str,
+        expected_original_start: &str,
+        patch: &UpdateOccurrenceInput,
+        desired: &OccurrenceFields,
+    ) -> Result<GraphCalendarEvent> {
+        let path = format!("/me/events/{}", urlencoding::encode(event_id));
+        let url = self.endpoints.v1_url(&path);
+        let patch = occurrence_patch_to_graph_json(patch, desired)?;
+        let response = self
+            .send_with_retry(
+                || {
+                    self.http
+                        .patch(&url)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "IdType=\"ImmutableId\"")
+                        .header("If-Match", etag)
+                        .json(&patch)
+                },
+                &format!("PATCH {path}"),
+                true,
+            )
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if matches!(status.as_u16(), 409 | 412) {
+            return Err(Error::Sync(
+                "Graph occurrence changed remotely; refresh and reconcile before retrying".into(),
+            ));
+        }
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "Graph PATCH {path} returned {status}: {}",
+                truncate(&body, 500)
+            )));
+        }
+
+        const EVENT_SELECT: &str = "id,subject,body,bodyPreview,start,end,location,isAllDay,\
+            organizer,attendees,iCalUId,responseStatus,type,seriesMasterId,originalStart,\
+            recurrence,@odata.etag,changeKey,lastModifiedDateTime";
+        let response = self
+            .send_with_retry(
+                || {
+                    self.http
+                        .get(&url)
+                        .bearer_auth(&self.access_token)
+                        .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
+                        .query(&[("$select", EVENT_SELECT)])
+                },
+                &format!("GET {path}"),
+                true,
+            )
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Sync(format!(
+                "Graph occurrence update succeeded but canonical GET failed with {status}; reconciliation required: {}",
+                truncate(&body, 500)
+            )));
+        }
+        let source: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            Error::Sync(format!(
+                "Graph occurrence update succeeded but canonical response was invalid; reconciliation required: {error}"
+            ))
+        })?;
+        let parsed = parse_graph_event_strict(&source, provider_calendar_id).map_err(|error| {
+            Error::Sync(format!(
+                "Graph occurrence update succeeded but canonical response was incomplete; reconciliation required: {error}"
+            ))
+        })?;
+        let seed = parsed
+            .recurrence_seeds
+            .as_ref()
+            .and_then(|seeds| seeds.first())
+            .ok_or_else(|| {
+                Error::Sync(
+                    "Graph occurrence update returned no conditional recurrence identity; reconciliation required"
+                        .into(),
+                )
+            })?;
+        if parsed.id != event_id
+            || seed.provider_occurrence_id.as_deref() != Some(event_id)
+            || seed.provider_series_id.as_deref() != Some(expected_series_id)
+            || seed.recurrence_id.as_deref() != Some(expected_original_start)
+            || !matches!(
+                seed.kind,
+                RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+            )
+        {
+            return Err(Error::Sync(
+                "Graph occurrence update returned a different immutable recurrence identity; reconciliation required"
+                    .into(),
+            ));
+        }
+        Ok(parsed)
     }
 
     /// Delete a calendar event.
@@ -2500,6 +2849,9 @@ pub struct GraphCalendarEvent {
     pub my_status: Option<String>,
     pub ical_uid: Option<String>,
     pub recurrence_kind: RecurrenceKind,
+    /// `None` means Graph did not provide enough trustworthy recurrence
+    /// metadata. An empty vector is an authoritative standalone classification.
+    pub recurrence_seeds: Option<Vec<RecurrenceIdentitySeed>>,
 }
 
 fn parse_graph_rooms(value: &serde_json::Value) -> Vec<GraphRoom> {
@@ -2856,7 +3208,110 @@ fn graph_recurrence_kind(event: &serde_json::Value) -> RecurrenceKind {
     }
 }
 
-fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
+fn graph_recurrence_seeds(
+    event: &serde_json::Value,
+    provider_calendar_id: &str,
+    effective_start: &str,
+    effective_end: &str,
+) -> Option<Vec<RecurrenceIdentitySeed>> {
+    let recurrence_kind = graph_recurrence_kind(event);
+    let id = event.get("id")?.as_str()?.trim();
+    if id.is_empty() || !valid_graph_effective_range(effective_start, effective_end) {
+        return None;
+    }
+    if recurrence_kind == RecurrenceKind::Standalone {
+        return Some(Vec::new());
+    }
+
+    let native = serde_json::to_string(event).ok()?;
+    let revision = event
+        .get("@odata.etag")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())?
+        .to_owned();
+    let recurrence_timezone = event["start"]["timeZone"].as_str().map(str::to_owned);
+    let occurrence = OccurrenceFields {
+        title: event["subject"].as_str().unwrap_or("(No title)").to_owned(),
+        description: graph_event_description(event),
+        location: event["location"]["displayName"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        start_time: effective_start.to_owned(),
+        end_time: effective_end.to_owned(),
+        all_day: event["isAllDay"].as_bool().unwrap_or(false),
+        timezone: if event["isAllDay"].as_bool().unwrap_or(false) {
+            None
+        } else {
+            recurrence_timezone.clone()
+        },
+    };
+
+    let seed = match event.get("type")?.as_str()? {
+        "seriesMaster" if recurrence_kind == RecurrenceKind::Series => RecurrenceIdentitySeed {
+            local_series_event_id: None,
+            provider_calendar_id: Some(provider_calendar_id.to_owned()),
+            provider_series_id: Some(id.to_owned()),
+            provider_occurrence_id: None,
+            recurrence_id: None,
+            recurrence_timezone,
+            recurrence_value_type: None,
+            occurrence,
+            provider_native_data: Some(native),
+            provider_revision: Some(revision),
+            kind: RecurrenceObjectKind::Master,
+        },
+        graph_type @ ("occurrence" | "exception")
+            if recurrence_kind == RecurrenceKind::Occurrence =>
+        {
+            let series_id = event.get("seriesMasterId")?.as_str()?.trim();
+            let original_start = event.get("originalStart")?.as_str()?;
+            if series_id.is_empty() || original_start.trim().is_empty() {
+                return None;
+            }
+            RecurrenceIdentitySeed {
+                local_series_event_id: None,
+                provider_calendar_id: Some(provider_calendar_id.to_owned()),
+                provider_series_id: Some(series_id.to_owned()),
+                provider_occurrence_id: Some(id.to_owned()),
+                // Graph's originalStart is the recurrence position. Keep its
+                // DateTimeOffset spelling exactly; the effective start may move.
+                recurrence_id: Some(original_start.to_owned()),
+                recurrence_timezone,
+                recurrence_value_type: Some(RecurrenceValueType::DateTime),
+                occurrence,
+                provider_native_data: Some(native),
+                provider_revision: Some(revision),
+                kind: if graph_type == "occurrence" {
+                    RecurrenceObjectKind::Occurrence
+                } else {
+                    RecurrenceObjectKind::Exception
+                },
+            }
+        }
+        _ => return None,
+    };
+    seed.validate().ok()?;
+    Some(vec![seed])
+}
+
+fn valid_graph_effective_range(start: &str, end: &str) -> bool {
+    if let (Ok(start), Ok(end)) = (
+        chrono::DateTime::parse_from_rfc3339(start),
+        chrono::DateTime::parse_from_rfc3339(end),
+    ) {
+        end > start
+    } else if let (Ok(start), Ok(end)) = (
+        chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d"),
+    ) {
+        end > start
+    } else {
+        false
+    }
+}
+
+fn parse_graph_event(e: &serde_json::Value, provider_calendar_id: &str) -> GraphCalendarEvent {
     let start_obj = &e["start"];
     let end_obj = &e["end"];
     let all_day = e["isAllDay"].as_bool().unwrap_or(false);
@@ -2922,10 +3377,13 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
         serde_json::to_string(&parsed).unwrap_or_else(|_| "[]".to_string())
     });
 
+    let recurrence_kind = graph_recurrence_kind(e);
+    let recurrence_seeds = graph_recurrence_seeds(e, provider_calendar_id, &start, &end);
+
     GraphCalendarEvent {
         id: e["id"].as_str().unwrap_or("").to_string(),
         subject: e["subject"].as_str().unwrap_or("(No title)").to_string(),
-        body_preview: e["bodyPreview"].as_str().map(|s| s.to_string()),
+        body_preview: graph_event_description(e),
         start,
         end,
         all_day,
@@ -2937,8 +3395,90 @@ fn parse_graph_event(e: &serde_json::Value) -> GraphCalendarEvent {
             e["responseStatus"]["response"].as_str().unwrap_or("none"),
         ),
         ical_uid: e["iCalUId"].as_str().map(|s| s.to_string()),
-        recurrence_kind: graph_recurrence_kind(e),
+        recurrence_kind,
+        recurrence_seeds,
     }
+}
+
+fn graph_event_description(event: &serde_json::Value) -> Option<String> {
+    event["body"]["content"]
+        .as_str()
+        .or_else(|| event["bodyPreview"].as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_graph_event_strict(
+    event: &serde_json::Value,
+    provider_calendar_id: &str,
+) -> Result<GraphCalendarEvent> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| Error::Other("Graph event must be an object".into()))?;
+    for field in [
+        "id",
+        "subject",
+        "start",
+        "end",
+        "location",
+        "isAllDay",
+        "organizer",
+        "attendees",
+        "iCalUId",
+        "responseStatus",
+        "type",
+        "seriesMasterId",
+        "originalStart",
+        "recurrence",
+        "@odata.etag",
+    ] {
+        if !object.contains_key(field) {
+            return Err(Error::Other(format!(
+                "Graph event field `{field}` is missing"
+            )));
+        }
+    }
+    let has_string = |value: &serde_json::Value, field: &str| {
+        value.get(field).is_some_and(serde_json::Value::is_string)
+    };
+    if event["id"]
+        .as_str()
+        .is_none_or(|value| value.trim().is_empty())
+        || !has_string(event, "subject")
+        || !has_string(&event["body"], "content")
+        || !has_string(&event["location"], "displayName")
+        || !has_string(&event["start"], "dateTime")
+        || !has_string(&event["start"], "timeZone")
+        || !has_string(&event["end"], "dateTime")
+        || !has_string(&event["end"], "timeZone")
+        || event["isAllDay"].as_bool().is_none()
+        || !event["organizer"].is_object()
+        || !event["attendees"].is_array()
+        || !has_string(event, "iCalUId")
+        || !has_string(&event["responseStatus"], "response")
+        || !matches!(event["type"].as_str(), Some("occurrence" | "exception"))
+        || event["seriesMasterId"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        || event["originalStart"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        || !event["recurrence"].is_null()
+        || event["@odata.etag"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::Other(
+            "Graph event has malformed canonical fields".into(),
+        ));
+    }
+    let parsed = parse_graph_event(event, provider_calendar_id);
+    if parsed.recurrence_seeds.is_none() {
+        return Err(Error::Other(
+            "Graph event has incomplete recurrence identity or revision".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn graph_contact_string<'a>(
@@ -3461,6 +4001,107 @@ pub fn event_patch_to_graph_json(event: &crate::calendar::CalendarEvent) -> serd
     patch
 }
 
+/// Sparse writable projection for one recurrence instance. Graph time fields
+/// are emitted as a coherent group because all-day and timezone changes alter
+/// the representation of both boundaries.
+pub fn occurrence_patch_to_graph_json(
+    patch: &UpdateOccurrenceInput,
+    desired: &OccurrenceFields,
+) -> Result<serde_json::Value> {
+    desired.validate()?;
+    let mut graph = serde_json::Map::new();
+    if patch.title.is_some() {
+        graph.insert("subject".into(), serde_json::json!(desired.title));
+    }
+    if patch.description.is_some() {
+        graph.insert(
+            "body".into(),
+            serde_json::json!({
+                "contentType": "text",
+                "content": desired.description.as_deref().unwrap_or("")
+            }),
+        );
+    }
+    if patch.location.is_some() {
+        graph.insert(
+            "location".into(),
+            serde_json::json!({
+                "displayName": desired.location.as_deref().unwrap_or("")
+            }),
+        );
+    }
+    if patch.start_time.is_some()
+        || patch.end_time.is_some()
+        || patch.all_day.is_some()
+        || patch.timezone.is_some()
+    {
+        let (start, _) = invitation_copy_graph_time(
+            &desired.start_time,
+            desired.all_day,
+            desired.timezone.as_deref(),
+        )?;
+        let (end, _) = invitation_copy_graph_time(
+            &desired.end_time,
+            desired.all_day,
+            desired.timezone.as_deref(),
+        )?;
+        graph.insert("start".into(), start);
+        graph.insert("end".into(), end);
+        graph.insert("isAllDay".into(), serde_json::json!(desired.all_day));
+    }
+    Ok(serde_json::Value::Object(graph))
+}
+
+#[cfg(test)]
+mod occurrence_patch_tests {
+    use super::occurrence_patch_to_graph_json;
+    use crate::calendar::recurrence_identity::{OccurrenceFields, UpdateOccurrenceInput};
+
+    fn desired() -> OccurrenceFields {
+        OccurrenceFields {
+            title: "Changed title".into(),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            start_time: "2026-09-15T12:00:00Z".into(),
+            end_time: "2026-09-15T13:00:00Z".into(),
+            all_day: false,
+            timezone: Some("UTC".into()),
+        }
+    }
+
+    #[test]
+    fn title_only_excludes_body_location_and_time() {
+        let desired = desired();
+        let patch = UpdateOccurrenceInput {
+            title: Some(desired.title.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            occurrence_patch_to_graph_json(&patch, &desired).unwrap(),
+            serde_json::json!({"subject": "Changed title"})
+        );
+    }
+
+    #[test]
+    fn empty_description_and_location_explicitly_clear_graph_fields() {
+        let desired = desired();
+        let patch = UpdateOccurrenceInput {
+            description: Some(String::new()),
+            location: Some(String::new()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            occurrence_patch_to_graph_json(&patch, &desired).unwrap(),
+            serde_json::json!({
+                "body": {"contentType": "text", "content": ""},
+                "location": {"displayName": ""}
+            })
+        );
+    }
+}
+
 /// Authoritative Graph PATCH for a personal invitation copy. This uses the
 /// recurrence-safe time conversion and deliberately excludes all scheduling
 /// fields so editing the copy cannot notify or replace guests.
@@ -3765,7 +4406,10 @@ mod batch_tests {
 #[cfg(test)]
 mod recurrence_tests {
     use super::{event_to_graph_json, invitation_copy_patch_to_graph_json, parse_graph_event};
-    use crate::calendar::{CalendarEvent, RecurrenceKind};
+    use crate::calendar::{
+        recurrence_identity::{RecurrenceObjectKind, RecurrenceValueType},
+        CalendarEvent, RecurrenceKind,
+    };
     use serde_json::json;
 
     fn recurring_event(rule: &str) -> CalendarEvent {
@@ -3984,11 +4628,138 @@ mod recurrence_tests {
                 .unwrap()
                 .extend(metadata.as_object().unwrap().clone());
             assert_eq!(
-                parse_graph_event(&event).recurrence_kind,
+                parse_graph_event(&event, "provider-calendar").recurrence_kind,
                 expected,
                 "{event}"
             );
         }
+    }
+
+    fn parsed_provider_event(graph_type: &str) -> super::GraphCalendarEvent {
+        let recurring = matches!(graph_type, "seriesMaster");
+        let child = matches!(graph_type, "occurrence" | "exception");
+        parse_graph_event(
+            &json!({
+                "id": "immutable-event-id",
+                "type": graph_type,
+                "seriesMasterId": child.then_some("immutable-master-id"),
+                "originalStart": child.then_some("2026-09-14T09:00:00.0000000Z"),
+                "recurrence": recurring.then(|| json!({
+                    "pattern": {"type": "daily", "interval": 1},
+                    "range": {"type": "noEnd", "startDate": "2026-09-14"}
+                })),
+                "@odata.etag": "revision-1",
+                "changeKey": "kept-native-change-key",
+                "lastModifiedDateTime": "2026-09-14T08:00:00Z",
+                "subject": "Provider fixture",
+                "bodyPreview": "Effective description",
+                "location": {"displayName": "Effective room"},
+                "isAllDay": false,
+                "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
+            }),
+            "provider-calendar",
+        )
+    }
+
+    #[test]
+    fn recurrence_seed_mapping_is_authoritative_and_lossless() {
+        let standalone = parsed_provider_event("singleInstance");
+        assert_eq!(standalone.recurrence_seeds, Some(Vec::new()));
+
+        let mut no_etag = json!({
+            "id": "immutable-event-id",
+            "type": "occurrence",
+            "seriesMasterId": "immutable-master-id",
+            "originalStart": "2026-09-14T09:00:00Z",
+            "recurrence": null,
+            "changeKey": "must-not-be-used",
+            "lastModifiedDateTime": "2026-09-14T08:00:00Z",
+            "subject": "Provider fixture",
+            "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
+        });
+        assert!(parse_graph_event(&no_etag, "provider-calendar")
+            .recurrence_seeds
+            .is_none());
+        no_etag["@odata.etag"] = json!("");
+        assert!(parse_graph_event(&no_etag, "provider-calendar")
+            .recurrence_seeds
+            .is_none());
+
+        for (graph_type, expected_kind) in [
+            ("seriesMaster", RecurrenceObjectKind::Master),
+            ("occurrence", RecurrenceObjectKind::Occurrence),
+            ("exception", RecurrenceObjectKind::Exception),
+        ] {
+            let parsed = parsed_provider_event(graph_type);
+            let seed = &parsed.recurrence_seeds.as_ref().unwrap()[0];
+            assert_eq!(seed.kind, expected_kind);
+            assert_eq!(
+                seed.provider_calendar_id.as_deref(),
+                Some("provider-calendar")
+            );
+            assert_eq!(seed.provider_revision.as_deref(), Some("revision-1"));
+            assert_eq!(seed.occurrence.start_time, "2026-09-14T11:00:00Z");
+            assert_eq!(seed.occurrence.end_time, "2026-09-14T12:00:00Z");
+            assert_eq!(seed.occurrence.title, "Provider fixture");
+            assert_eq!(
+                seed.occurrence.description.as_deref(),
+                Some("Effective description")
+            );
+            assert_eq!(seed.occurrence.location.as_deref(), Some("Effective room"));
+            assert!(!seed.occurrence.all_day);
+            assert_eq!(seed.occurrence.timezone.as_deref(), Some("UTC"));
+            let native: serde_json::Value =
+                serde_json::from_str(seed.provider_native_data.as_deref().unwrap()).unwrap();
+            assert_eq!(native["id"], "immutable-event-id");
+            assert_eq!(native["changeKey"], "kept-native-change-key");
+            assert_eq!(native["lastModifiedDateTime"], "2026-09-14T08:00:00Z");
+
+            if graph_type == "seriesMaster" {
+                assert_eq!(
+                    seed.provider_series_id.as_deref(),
+                    Some("immutable-event-id")
+                );
+                assert!(seed.provider_occurrence_id.is_none());
+                assert!(seed.recurrence_id.is_none());
+            } else {
+                assert_eq!(
+                    seed.provider_series_id.as_deref(),
+                    Some("immutable-master-id")
+                );
+                assert_eq!(
+                    seed.provider_occurrence_id.as_deref(),
+                    Some("immutable-event-id")
+                );
+                assert_eq!(
+                    seed.recurrence_id.as_deref(),
+                    Some("2026-09-14T09:00:00.0000000Z")
+                );
+                assert_eq!(
+                    seed.recurrence_value_type,
+                    Some(RecurrenceValueType::DateTime)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn occurrence_without_original_start_fails_closed() {
+        let mut event = json!({
+            "id": "immutable-occurrence-id",
+            "type": "occurrence",
+            "seriesMasterId": "immutable-master-id",
+            "recurrence": null,
+            "start": {"dateTime": "2026-09-14T11:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-09-14T12:00:00", "timeZone": "UTC"}
+        });
+        let parsed = parse_graph_event(&event, "provider-calendar");
+        assert!(parsed.recurrence_seeds.is_none());
+
+        event["start"]["dateTime"] = json!("2026-09-15T11:00:00");
+        let moved = parse_graph_event(&event, "provider-calendar");
+        assert!(moved.recurrence_seeds.is_none());
     }
 }
 
@@ -4086,7 +4857,7 @@ mod color_tests {
                 }
             ]
         });
-        let parsed = parse_graph_event(&raw);
+        let parsed = parse_graph_event(&raw, "provider-calendar");
         let atts: serde_json::Value =
             serde_json::from_str(&parsed.attendees_json.unwrap()).unwrap();
         assert_eq!(atts[0]["status"], "tentative");
@@ -4129,7 +4900,9 @@ mod color_tests {
             "responseStatus": { "response": "tentativelyAccepted" }
         });
         assert_eq!(
-            parse_graph_event(&raw).my_status.as_deref(),
+            parse_graph_event(&raw, "provider-calendar")
+                .my_status
+                .as_deref(),
             Some("tentative")
         );
 
@@ -4145,7 +4918,7 @@ mod color_tests {
             "isAllDay": false,
             "responseStatus": { "response": "organizer" }
         });
-        assert_eq!(parse_graph_event(&own).my_status, None);
+        assert_eq!(parse_graph_event(&own, "provider-calendar").my_status, None);
     }
 
     #[test]

@@ -1,8 +1,12 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
-use crate::error::Result;
+use crate::calendar::{
+    recurrence_identity::{RecurrenceIdentitySeed, RecurrenceValueType},
+    Attendee, CalendarEvent, RecurrenceKind,
+};
+use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -383,7 +387,33 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
     Ok(())
 }
 
-fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()> {
+/// Atomically ingest a provider event and its complete recurrence object set.
+///
+/// Unlike [`upsert_event_by_remote_id`], an empty `recurrence_seeds` slice is
+/// authoritative and removes recurrence objects previously owned by the event.
+/// Returns the final local event ID selected by reconciliation.
+#[allow(dead_code)]
+pub fn upsert_event_by_remote_id_with_recurrence(
+    conn: &Connection,
+    event: &CalendarEvent,
+    recurrence_seeds: &[RecurrenceIdentitySeed],
+) -> Result<String> {
+    let mut seed_keys = std::collections::HashSet::new();
+    for seed in recurrence_seeds {
+        seed.validate()?;
+        if !seed_keys.insert(recurrence_seed_key(&event.account_id, None, seed)) {
+            return Err(Error::Other("duplicate recurrence identity seed".into()));
+        }
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    let event_id = upsert_provider_event(&transaction, event)?;
+    replace_event_recurrence_objects(&transaction, &event.account_id, &event_id, recurrence_seeds)?;
+    transaction.commit()?;
+    Ok(event_id)
+}
+
+fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<String> {
     if let Some(ref remote_id) = event.remote_id {
         let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
@@ -510,14 +540,211 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<()>
             // A provider read cannot prove that the reported RRULE includes all
             // overrides, even when none of the persisted recurrence fields change.
             super::calendar_invitation::invalidate(conn, &existing.id)?;
-            return Ok(());
+            return Ok(existing.id);
         }
     }
 
     // No remote_id match: insert a new event.
     insert_event(conn, event)?;
     super::calendar_invitation::invalidate(conn, &event.id)?;
+    Ok(event.id.clone())
+}
+
+/// Replace the complete recurrence object set owned by one event.
+///
+/// This helper never starts or commits a transaction. Callers that require
+/// atomic replacement must pass a connection with an active transaction.
+pub(crate) fn replace_event_recurrence_objects(
+    conn: &Connection,
+    account_id: &str,
+    event_id: &str,
+    seeds: &[RecurrenceIdentitySeed],
+) -> Result<()> {
+    let previous = super::calendar_recurrence::get_by_event_id(conn, event_id)?;
+    let mut retained_ids = std::collections::HashSet::new();
+
+    for seed in seeds {
+        if let Some(local_series_event_id) = seed.local_series_event_id.as_deref() {
+            let same_account: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM calendar_events
+                     WHERE id = ?1 AND account_id = ?2
+                 )",
+                params![local_series_event_id, account_id],
+                |row| row.get(0),
+            )?;
+            if !same_account {
+                return Err(Error::Other(format!(
+                    "local recurrence series {local_series_event_id:?} does not belong to account"
+                )));
+            }
+        }
+
+        let existing_id = recurrence_object_id_for_key(conn, account_id, event_id, seed)?;
+        if let Some(provider_occurrence_id) = seed.provider_occurrence_id.as_deref() {
+            let occurrence_id: Option<String> = conn
+                .query_row(
+                    "SELECT object_id FROM calendar_recurrence_objects
+                     WHERE account_id = ?1 AND provider_calendar_id = ?2
+                       AND provider_occurrence_id = ?3",
+                    params![
+                        account_id,
+                        seed.provider_calendar_id,
+                        provider_occurrence_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if occurrence_id.is_some() && occurrence_id != existing_id {
+                return Err(Error::Other(
+                    "provider occurrence ID cannot be remapped to another recurrence position"
+                        .into(),
+                ));
+            }
+        }
+
+        let object_id =
+            existing_id.unwrap_or_else(|| deterministic_object_id(account_id, event_id, seed));
+        if let Some(existing) = super::calendar_recurrence::get_by_object_id(conn, &object_id)? {
+            if recurrence_seed_key(account_id, Some(event_id), seed)
+                != recurrence_seed_key(
+                    &existing.account_id,
+                    Some(&existing.event_id),
+                    &identity_seed(&existing),
+                )
+            {
+                return Err(Error::Other(
+                    "deterministic recurrence object ID collision".into(),
+                ));
+            }
+        }
+        let identity = seed.bind(account_id, event_id, &object_id)?;
+        super::calendar_recurrence::upsert(conn, &identity)?;
+        retained_ids.insert(object_id);
+    }
+
+    for identity in previous {
+        if !retained_ids.contains(&identity.object_id) {
+            super::calendar_recurrence::delete(conn, &identity.object_id)?;
+        }
+    }
     Ok(())
+}
+
+fn recurrence_object_id_for_key(
+    conn: &Connection,
+    account_id: &str,
+    event_id: &str,
+    seed: &RecurrenceIdentitySeed,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT object_id FROM calendar_recurrence_objects
+         WHERE account_id = ?1
+            AND event_id = ?2
+            AND local_series_event_id IS ?3
+            AND provider_calendar_id IS ?4
+            AND provider_series_id IS ?5
+            AND provider_occurrence_id IS ?6
+             AND recurrence_id IS ?7
+             AND recurrence_timezone IS ?8
+             AND recurrence_value_type IS ?9",
+        params![
+            account_id,
+            event_id,
+            seed.local_series_event_id,
+            seed.provider_calendar_id,
+            seed.provider_series_id,
+            seed.provider_occurrence_id,
+            seed.recurrence_id,
+            seed.recurrence_timezone,
+            seed.recurrence_value_type.map(RecurrenceValueType::as_str),
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Error::Database)
+}
+
+fn deterministic_object_id(
+    account_id: &str,
+    event_id: &str,
+    seed: &RecurrenceIdentitySeed,
+) -> String {
+    let digest = Sha256::digest(recurrence_seed_key(account_id, Some(event_id), seed));
+    format!("recurrence-{digest:x}")
+}
+
+fn recurrence_seed_key(
+    account_id: &str,
+    event_id: Option<&str>,
+    seed: &RecurrenceIdentitySeed,
+) -> Vec<u8> {
+    let mut key = Vec::new();
+    append_key_part(&mut key, "account", Some(account_id));
+    append_key_part(&mut key, "owning-event", event_id);
+    append_key_part(
+        &mut key,
+        "local-series",
+        seed.local_series_event_id.as_deref(),
+    );
+    append_key_part(
+        &mut key,
+        "provider-calendar",
+        seed.provider_calendar_id.as_deref(),
+    );
+    append_key_part(
+        &mut key,
+        "provider-series",
+        seed.provider_series_id.as_deref(),
+    );
+    append_key_part(
+        &mut key,
+        "provider-occurrence",
+        seed.provider_occurrence_id.as_deref(),
+    );
+    append_key_part(&mut key, "recurrence-id", seed.recurrence_id.as_deref());
+    append_key_part(
+        &mut key,
+        "recurrence-timezone",
+        seed.recurrence_timezone.as_deref(),
+    );
+    append_key_part(
+        &mut key,
+        "value-type",
+        seed.recurrence_value_type.map(RecurrenceValueType::as_str),
+    );
+    key
+}
+
+fn append_key_part(key: &mut Vec<u8>, name: &str, value: Option<&str>) {
+    key.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    match value {
+        Some(value) => {
+            key.push(1);
+            key.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            key.extend_from_slice(value.as_bytes());
+        }
+        None => key.push(0),
+    }
+}
+
+fn identity_seed(
+    identity: &crate::calendar::recurrence_identity::RecurrenceIdentity,
+) -> RecurrenceIdentitySeed {
+    RecurrenceIdentitySeed {
+        local_series_event_id: identity.local_series_event_id.clone(),
+        provider_calendar_id: identity.provider_calendar_id.clone(),
+        provider_series_id: identity.provider_series_id.clone(),
+        provider_occurrence_id: identity.provider_occurrence_id.clone(),
+        recurrence_id: identity.recurrence_id.clone(),
+        recurrence_timezone: identity.recurrence_timezone.clone(),
+        recurrence_value_type: identity.recurrence_value_type,
+        occurrence: identity.occurrence.clone(),
+        provider_native_data: identity.provider_native_data.clone(),
+        provider_revision: identity.provider_revision.clone(),
+        kind: identity.kind,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1134,7 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calendar::recurrence_identity::{OccurrenceFields, RecurrenceObjectKind};
     use rusqlite::Connection;
 
     fn setup_db() -> Connection {
@@ -967,6 +1195,90 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE calendar_recurrence_objects (
+                object_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                event_id TEXT NOT NULL REFERENCES calendar_events(id) ON DELETE CASCADE,
+                local_series_event_id TEXT REFERENCES calendar_events(id) ON DELETE SET NULL,
+                provider_calendar_id TEXT,
+                provider_series_id TEXT,
+                provider_occurrence_id TEXT,
+                recurrence_id TEXT,
+                recurrence_timezone TEXT,
+                recurrence_value_type TEXT,
+                effective_title TEXT NOT NULL,
+                effective_description TEXT,
+                effective_location TEXT,
+                effective_start TEXT NOT NULL,
+                effective_end TEXT NOT NULL,
+                effective_all_day INTEGER NOT NULL,
+                effective_timezone TEXT,
+                provider_native_data TEXT,
+                provider_revision TEXT,
+                object_kind TEXT NOT NULL,
+                CHECK (effective_all_day IN (0, 1)),
+                CHECK (object_kind IN ('master', 'occurrence', 'exception', 'exclusion')),
+                CHECK (recurrence_value_type IS NULL OR
+                       recurrence_value_type IN ('date', 'date-time')),
+                CHECK (((provider_series_id IS NOT NULL OR
+                         provider_occurrence_id IS NOT NULL) AND
+                        provider_calendar_id IS NOT NULL AND
+                        length(trim(provider_calendar_id)) > 0) OR
+                       (provider_series_id IS NULL AND
+                        provider_occurrence_id IS NULL AND
+                        provider_calendar_id IS NULL))
+            );
+            CREATE UNIQUE INDEX idx_test_recurrence_local_position
+                ON calendar_recurrence_objects(
+                    local_series_event_id, recurrence_value_type, recurrence_id
+                )
+                WHERE local_series_event_id IS NOT NULL AND recurrence_id IS NOT NULL;
+            CREATE UNIQUE INDEX idx_test_recurrence_provider_position
+                ON calendar_recurrence_objects(
+                    account_id, provider_calendar_id, provider_series_id,
+                    recurrence_value_type, recurrence_id
+                )
+                WHERE provider_calendar_id IS NOT NULL AND
+                      provider_series_id IS NOT NULL AND recurrence_id IS NOT NULL;
+            CREATE UNIQUE INDEX idx_test_recurrence_provider_occurrence
+                ON calendar_recurrence_objects(
+                    account_id, provider_calendar_id, provider_occurrence_id
+                )
+                WHERE provider_calendar_id IS NOT NULL AND
+                      provider_occurrence_id IS NOT NULL;
+            CREATE UNIQUE INDEX idx_test_recurrence_event_master
+                ON calendar_recurrence_objects(event_id)
+                WHERE object_kind = 'master';
+            CREATE UNIQUE INDEX idx_test_recurrence_provider_master
+                ON calendar_recurrence_objects(
+                    account_id, provider_calendar_id, provider_series_id
+                )
+                WHERE object_kind = 'master' AND provider_calendar_id IS NOT NULL AND
+                      provider_series_id IS NOT NULL;
+            CREATE TRIGGER test_recurrence_id_immutable
+            BEFORE UPDATE OF provider_calendar_id, recurrence_id, recurrence_value_type
+            ON calendar_recurrence_objects
+            WHEN OLD.provider_calendar_id IS NOT NEW.provider_calendar_id
+              OR OLD.recurrence_id IS NOT NEW.recurrence_id
+              OR OLD.recurrence_value_type IS NOT NEW.recurrence_value_type
+            BEGIN
+                SELECT RAISE(ABORT, 'recurrence_id is immutable');
+            END;
+            CREATE TRIGGER test_recurrence_account_insert
+            BEFORE INSERT ON calendar_recurrence_objects
+            WHEN NOT EXISTS (
+                SELECT 1 FROM calendar_events
+                WHERE id = NEW.event_id AND account_id = NEW.account_id
+            ) OR (
+                NEW.local_series_event_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM calendar_events
+                    WHERE id = NEW.local_series_event_id
+                      AND account_id = NEW.account_id
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'recurrence objects cannot cross accounts');
+            END;
             CREATE TABLE calendar_invitation_recurrence (
                 event_id TEXT PRIMARY KEY REFERENCES calendar_events(id) ON DELETE CASCADE,
                 recurrence_rule TEXT NOT NULL
@@ -995,7 +1307,9 @@ mod tests {
                 cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO accounts (id, display_name, email, provider, username, password)
-            VALUES ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass');
+            VALUES
+                ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass'),
+                ('acc2', 'Other', 'other@example.com', 'generic', 'other', 'pass');
             ",
         )
         .unwrap();
@@ -1025,6 +1339,249 @@ mod tests {
             remote_id: remote_id.map(|s| s.to_string()),
             etag: None,
         }
+    }
+
+    fn recurrence_seed(occurrence_id: &str, recurrence_id: &str) -> RecurrenceIdentitySeed {
+        RecurrenceIdentitySeed {
+            local_series_event_id: None,
+            provider_calendar_id: Some("provider-calendar".into()),
+            provider_series_id: Some("provider-series".into()),
+            provider_occurrence_id: Some(occurrence_id.into()),
+            recurrence_id: Some(recurrence_id.into()),
+            recurrence_timezone: Some("Europe/Stockholm".into()),
+            recurrence_value_type: Some(RecurrenceValueType::DateTime),
+            occurrence: OccurrenceFields {
+                title: "Occurrence title".into(),
+                description: Some("Occurrence description".into()),
+                location: Some("Occurrence room".into()),
+                start_time: "2026-04-07T17:00:00Z".into(),
+                end_time: "2026-04-07T18:00:00Z".into(),
+                all_day: false,
+                timezone: Some("Europe/Helsinki".into()),
+            },
+            provider_native_data: Some("provider payload".into()),
+            provider_revision: Some("revision-1".into()),
+            kind: RecurrenceObjectKind::Occurrence,
+        }
+    }
+
+    #[test]
+    fn transactional_recurrence_ingestion_inserts_and_refreshes_stable_objects() {
+        let conn = setup_db();
+        let event = make_event("incoming", "First", Some("remote-event"));
+        let seed = recurrence_seed("provider-occurrence", "2026-04-07T17:00:00Z");
+
+        let event_id =
+            upsert_event_by_remote_id_with_recurrence(&conn, &event, std::slice::from_ref(&seed))
+                .unwrap();
+        assert_eq!(event_id, "incoming");
+        let first = super::super::calendar_recurrence::get_by_event_id(&conn, &event_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(first.object_id.starts_with("recurrence-"));
+        assert!(!first.object_id.contains("provider-occurrence"));
+
+        let mut refreshed_event = event.clone();
+        refreshed_event.id = "discarded-incoming-id".into();
+        refreshed_event.title = "Refreshed".into();
+        let mut refreshed_seed = seed;
+        refreshed_seed.provider_revision = Some("revision-2".into());
+        refreshed_seed.occurrence.end_time = "2026-04-07T19:00:00Z".into();
+        refreshed_seed.occurrence.title = "Changed occurrence".into();
+        let reconciled_id =
+            upsert_event_by_remote_id_with_recurrence(&conn, &refreshed_event, &[refreshed_seed])
+                .unwrap();
+
+        assert_eq!(reconciled_id, "incoming");
+        assert_eq!(get_event(&conn, "incoming").unwrap().title, "Refreshed");
+        let refreshed = super::super::calendar_recurrence::get_by_event_id(&conn, "incoming")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(refreshed.object_id, first.object_id);
+        assert_eq!(refreshed.provider_revision.as_deref(), Some("revision-2"));
+        assert_eq!(refreshed.occurrence.end_time, "2026-04-07T19:00:00Z");
+        assert_eq!(refreshed.occurrence.title, "Changed occurrence");
+
+        let mut exception = identity_seed(&refreshed);
+        exception.kind = RecurrenceObjectKind::Exception;
+        upsert_event_by_remote_id_with_recurrence(&conn, &refreshed_event, &[exception]).unwrap();
+        let transitioned = super::super::calendar_recurrence::get_by_event_id(&conn, "incoming")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(transitioned.object_id, first.object_id);
+        assert_eq!(transitioned.kind, RecurrenceObjectKind::Exception);
+    }
+
+    #[test]
+    fn transactional_recurrence_ingestion_authoritatively_removes_owned_objects() {
+        let conn = setup_db();
+        let event = make_event("event", "First", Some("remote-event"));
+        let first = recurrence_seed("occurrence-1", "2026-04-07T17:00:00Z");
+        let mut second = recurrence_seed("occurrence-2", "2026-04-14T17:00:00Z");
+        second.occurrence.start_time = "2026-04-14T17:00:00Z".into();
+        second.occurrence.end_time = "2026-04-14T18:00:00Z".into();
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, &[first.clone(), second]).unwrap();
+
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+        assert_eq!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, &[first]).unwrap();
+        assert_eq!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+                .unwrap()
+                .len(),
+            1
+        );
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, &[]).unwrap();
+        assert!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transactional_recurrence_ingestion_returns_reconciled_local_event_id() {
+        let conn = setup_db();
+        let mut local = make_event("local", "Local", None);
+        local.uid = Some("shared-uid@example.com".into());
+        insert_event(&conn, &local).unwrap();
+
+        let mut provider = make_event("incoming", "Provider", Some("remote-event"));
+        provider.uid = local.uid;
+        let final_id = upsert_event_by_remote_id_with_recurrence(
+            &conn,
+            &provider,
+            &[recurrence_seed(
+                "provider-occurrence",
+                "2026-04-07T17:00:00Z",
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(final_id, "local");
+        assert!(get_event(&conn, "incoming").is_err());
+        assert_eq!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "local")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn transactional_recurrence_ingestion_rolls_back_invalid_duplicate_and_cross_account_seeds() {
+        let conn = setup_db();
+        let original = make_event("event", "Original", Some("remote-event"));
+        upsert_event_by_remote_id(&conn, &original).unwrap();
+        let mut update = original.clone();
+        update.title = "Must roll back".into();
+
+        let mut invalid = recurrence_seed("invalid", "2026-04-07T17:00:00Z");
+        invalid.recurrence_id = None;
+        assert!(upsert_event_by_remote_id_with_recurrence(&conn, &update, &[invalid]).is_err());
+        assert_eq!(get_event(&conn, "event").unwrap().title, "Original");
+
+        let duplicate = recurrence_seed("duplicate", "2026-04-07T17:00:00Z");
+        assert!(upsert_event_by_remote_id_with_recurrence(
+            &conn,
+            &update,
+            &[duplicate.clone(), duplicate],
+        )
+        .is_err());
+        assert_eq!(get_event(&conn, "event").unwrap().title, "Original");
+
+        let mut other_master = make_event("other-master", "Other", None);
+        other_master.account_id = "acc2".into();
+        insert_event(&conn, &other_master).unwrap();
+        let mut cross_account = recurrence_seed("cross-account", "2026-04-07T17:00:00Z");
+        cross_account.local_series_event_id = Some("other-master".into());
+        assert!(
+            upsert_event_by_remote_id_with_recurrence(&conn, &update, &[cross_account]).is_err()
+        );
+        assert_eq!(get_event(&conn, "event").unwrap().title, "Original");
+    }
+
+    #[test]
+    fn transactional_recurrence_ingestion_rolls_back_database_failure() {
+        let conn = setup_db();
+        let event = make_event("event", "Original", Some("remote-event"));
+        upsert_event_by_remote_id(&conn, &event).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_recurrence_ingestion
+             BEFORE INSERT ON calendar_recurrence_objects
+             BEGIN SELECT RAISE(ABORT, 'injected recurrence failure'); END;",
+        )
+        .unwrap();
+        let mut update = event.clone();
+        update.title = "Must roll back".into();
+
+        assert!(upsert_event_by_remote_id_with_recurrence(
+            &conn,
+            &update,
+            &[recurrence_seed("occurrence", "2026-04-07T17:00:00Z")],
+        )
+        .is_err());
+        assert_eq!(get_event(&conn, "event").unwrap().title, "Original");
+    }
+
+    #[test]
+    fn provider_occurrence_cannot_move_to_another_original_position() {
+        let conn = setup_db();
+        let event = make_event("event", "Original", Some("remote-event"));
+        let first = recurrence_seed("stable-occurrence", "2026-04-07T17:00:00Z");
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, std::slice::from_ref(&first))
+            .unwrap();
+        let original_object = super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut moved = first;
+        moved.recurrence_id = Some("2026-04-14T17:00:00Z".into());
+        moved.occurrence.start_time = "2026-04-14T17:00:00Z".into();
+        moved.occurrence.end_time = "2026-04-14T18:00:00Z".into();
+        let mut update = event;
+        update.title = "Must roll back".into();
+
+        assert!(upsert_event_by_remote_id_with_recurrence(&conn, &update, &[moved]).is_err());
+        assert_eq!(get_event(&conn, "event").unwrap().title, "Original");
+        assert_eq!(
+            super::super::calendar_recurrence::get_by_event_id(&conn, "event").unwrap(),
+            vec![original_object]
+        );
+    }
+
+    #[test]
+    fn provider_calendar_is_part_of_the_deterministic_recurrence_identity() {
+        let conn = setup_db();
+        let event = make_event("event", "Original", Some("remote-event"));
+        let first = recurrence_seed("stable-occurrence", "2026-04-07T17:00:00Z");
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, std::slice::from_ref(&first))
+            .unwrap();
+        let first_id = super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .object_id;
+
+        let mut other_calendar = first;
+        other_calendar.provider_calendar_id = Some("other-provider-calendar".into());
+        upsert_event_by_remote_id_with_recurrence(&conn, &event, &[other_calendar]).unwrap();
+        let second_id = super::super::calendar_recurrence::get_by_event_id(&conn, "event")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .object_id;
+
+        assert_ne!(first_id, second_id);
     }
 
     #[test]

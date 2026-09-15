@@ -1,7 +1,11 @@
 //! Google calendar backend (Calendar API v3 with OAuth2).
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
+};
 use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::db::accounts::AccountFull;
@@ -13,8 +17,8 @@ use crate::mail::google::{
 
 use super::{
     BusyPeriod, CalendarBackend, CalendarBackendCtx, CalendarCapability, ParticipantSchedule,
-    ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome, RemoteRsvpPolicy,
-    RemoteRsvpRequest,
+    ParticipantScheduleRequest, PushedEvent, RemoteOccurrenceUpdate, RemoteOccurrenceUpdateOutcome,
+    RemoteRsvpOutcome, RemoteRsvpPolicy, RemoteRsvpRequest,
 };
 
 pub struct GoogleCalendarBackend;
@@ -53,24 +57,15 @@ async fn refresh_recurrence(
         .list_events_full(remote_calendar_id, &time_min, &time_max)
         .await?
     {
-        EventsPage::Page(data) => data,
+        EventsPage::Events(data) => data,
         EventsPage::SyncTokenExpired => {
             return Err(Error::Other(
                 "Google recurrence metadata read returned HTTP 410 without a sync token".into(),
             ));
         }
     };
-    let events = match data.get("items") {
-        None => return Ok(()),
-        Some(serde_json::Value::Array(events)) => events,
-        Some(_) => {
-            return Err(Error::Other(
-                "Google recurrence metadata items must be an array".into(),
-            ))
-        }
-    };
     let conn = db.writer().await;
-    for event in events {
+    for event in &data.items {
         // A cancelled resource may contain only its ID. Its missing recurrence
         // fields are not positive standalone evidence, nor is this a deletion
         // stream: the normal incremental read applies cancellation tombstones.
@@ -84,12 +79,21 @@ async fn refresh_recurrence(
         let Some(remote_id) = event["id"].as_str() else {
             continue;
         };
-        conn.execute(
-            "UPDATE calendar_events SET recurrence_kind = ?1
-             WHERE account_id = ?2 AND calendar_id = ?3 AND remote_id = ?4
-               AND recurrence_kind = 'unknown'",
-            rusqlite::params![kind.as_str(), account_id, calendar_id, remote_id],
-        )?;
+        let local_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM calendar_events
+                 WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3
+                   AND recurrence_kind = 'unknown'",
+                rusqlite::params![account_id, calendar_id, remote_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(local_id) = local_id else {
+            continue;
+        };
+        let mut cached = db::calendar::get_event(&conn, &local_id)?;
+        cached.recurrence_kind = kind;
+        upsert_google_event(&conn, event, &cached, remote_calendar_id)?;
     }
     Ok(())
 }
@@ -102,6 +106,223 @@ fn google_response_status(status: Option<&str>) -> String {
         _ => "needs-action",
     }
     .to_string()
+}
+
+fn google_recurrence_seed(
+    source: &serde_json::Value,
+    event: &CalendarEvent,
+    provider_calendar_id: &str,
+) -> Option<RecurrenceIdentitySeed> {
+    let native_data = serde_json::to_string(source).ok()?;
+    let revision = source["etag"].as_str().map(str::to_string);
+    let seed = match event.recurrence_kind {
+        RecurrenceKind::Series => RecurrenceIdentitySeed {
+            local_series_event_id: None,
+            provider_calendar_id: Some(provider_calendar_id.to_string()),
+            provider_series_id: Some(source["id"].as_str()?.to_string()),
+            provider_occurrence_id: None,
+            recurrence_id: None,
+            recurrence_timezone: None,
+            recurrence_value_type: None,
+            occurrence: occurrence_fields(event),
+            provider_native_data: Some(native_data),
+            provider_revision: revision,
+            kind: RecurrenceObjectKind::Master,
+        },
+        RecurrenceKind::Occurrence => {
+            let (recurrence_id, value_type, recurrence_timezone) = google_original_start(source)?;
+            RecurrenceIdentitySeed {
+                local_series_event_id: None,
+                provider_calendar_id: Some(provider_calendar_id.to_string()),
+                provider_series_id: Some(source["recurringEventId"].as_str()?.to_string()),
+                provider_occurrence_id: Some(source["id"].as_str()?.to_string()),
+                recurrence_id: Some(recurrence_id),
+                recurrence_timezone,
+                recurrence_value_type: Some(value_type),
+                occurrence: occurrence_fields(event),
+                provider_native_data: Some(native_data),
+                provider_revision: revision,
+                kind: RecurrenceObjectKind::Occurrence,
+            }
+        }
+        RecurrenceKind::Unknown | RecurrenceKind::Standalone => return None,
+    };
+    seed.validate().ok()?;
+    Some(seed)
+}
+
+fn occurrence_fields(event: &CalendarEvent) -> OccurrenceFields {
+    OccurrenceFields {
+        title: event.title.clone(),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        start_time: event.start_time.clone(),
+        end_time: event.end_time.clone(),
+        all_day: event.all_day,
+        timezone: event.timezone.clone(),
+    }
+}
+
+fn google_original_start(
+    source: &serde_json::Value,
+) -> Option<(String, RecurrenceValueType, Option<String>)> {
+    let original = source.get("originalStartTime")?.as_object()?;
+    let (recurrence_id, value_type) = match (
+        original.get("date").and_then(serde_json::Value::as_str),
+        original.get("dateTime").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(date), None) if !date.is_empty() => (date.into(), RecurrenceValueType::Date),
+        (None, Some(datetime)) if !datetime.is_empty() => {
+            (datetime.into(), RecurrenceValueType::DateTime)
+        }
+        _ => return None,
+    };
+    let timezone = match original.get("timeZone") {
+        None => None,
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        _ => return None,
+    };
+    Some((recurrence_id, value_type, timezone))
+}
+
+fn canonical_google_occurrence(
+    source: &serde_json::Value,
+    account: &AccountFull,
+    current: &CalendarEvent,
+) -> Result<CalendarEvent> {
+    if google_recurrence_kind(source) != RecurrenceKind::Occurrence {
+        return Err(Error::Sync(
+            "Google returned an unclassified canonical occurrence; reconciliation required".into(),
+        ));
+    }
+    let title = source["summary"].as_str().ok_or_else(|| {
+        Error::Sync(
+            "Google canonical occurrence omitted its summary; reconciliation required".into(),
+        )
+    })?;
+    let start_timezone = source["start"]["timeZone"].as_str().map(str::to_string);
+    let (start_time, all_day) = match (
+        source["start"]["date"].as_str(),
+        source["start"]["dateTime"].as_str(),
+    ) {
+        (Some(date), None) => (date.to_string(), true),
+        (None, Some(datetime)) => (
+            crate::calendar::timezone::to_utc(datetime, start_timezone.as_deref().unwrap_or("")),
+            false,
+        ),
+        _ => {
+            return Err(Error::Sync(
+                "Google canonical occurrence has an invalid start; reconciliation required".into(),
+            ));
+        }
+    };
+    let end_time = match (
+        source["end"]["date"].as_str(),
+        source["end"]["dateTime"].as_str(),
+    ) {
+        (Some(date), None) if all_day => date.to_string(),
+        (None, Some(datetime)) if !all_day => crate::calendar::timezone::to_utc(
+            datetime,
+            source["end"]["timeZone"].as_str().unwrap_or(""),
+        ),
+        _ => {
+            return Err(Error::Sync(
+                "Google canonical occurrence has an invalid end; reconciliation required".into(),
+            ));
+        }
+    };
+    let (attendees_json, my_status) = if source.get("attendees").is_some() {
+        parse_google_attendees(source, &account.email, true)
+    } else {
+        (current.attendees_json.clone(), current.my_status.clone())
+    };
+    let organizer_email = if source.get("organizer").is_some() {
+        parse_google_organizer(source, &account.email, true)
+    } else {
+        current.organizer_email.clone()
+    };
+    let optional_string = |name: &str| -> Result<Option<String>> {
+        match source.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(Error::Sync(format!(
+                "Google canonical occurrence has an invalid {name}; reconciliation required"
+            ))),
+        }
+    };
+
+    Ok(CalendarEvent {
+        id: current.id.clone(),
+        account_id: current.account_id.clone(),
+        calendar_id: current.calendar_id.clone(),
+        uid: if source.get("iCalUID").is_some() {
+            optional_string("iCalUID")?
+        } else {
+            current.uid.clone()
+        },
+        title: title.into(),
+        description: optional_string("description")?,
+        location: optional_string("location")?,
+        start_time,
+        end_time,
+        all_day,
+        timezone: start_timezone,
+        recurrence_rule: current.recurrence_rule.clone(),
+        recurrence_kind: RecurrenceKind::Occurrence,
+        organizer_email,
+        attendees_json,
+        my_status,
+        source_message_id: current.source_message_id.clone(),
+        ical_data: current.ical_data.clone(),
+        remote_id: Some(
+            source["id"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::Sync(
+                        "Google canonical occurrence omitted its ID; reconciliation required"
+                            .into(),
+                    )
+                })?
+                .into(),
+        ),
+        etag: Some(
+            source["etag"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::Sync(
+                        "Google canonical occurrence omitted its ETag; reconciliation required"
+                            .into(),
+                    )
+                })?
+                .into(),
+        ),
+    })
+}
+
+fn upsert_google_event(
+    conn: &rusqlite::Connection,
+    source: &serde_json::Value,
+    event: &CalendarEvent,
+    provider_calendar_id: &str,
+) -> Result<()> {
+    match event.recurrence_kind {
+        RecurrenceKind::Standalone => {
+            db::calendar::upsert_event_by_remote_id_with_recurrence(conn, event, &[]).map(|_| ())
+        }
+        RecurrenceKind::Series | RecurrenceKind::Occurrence => {
+            if let Some(seed) = google_recurrence_seed(source, event, provider_calendar_id) {
+                db::calendar::upsert_event_by_remote_id_with_recurrence(conn, event, &[seed])
+                    .map(|_| ())
+            } else {
+                log::warn!(
+                    "sync_calendars_google: recurrence identity extraction failed for {}",
+                    source["id"].as_str().unwrap_or("<unknown>")
+                );
+                db::calendar::upsert_event_by_remote_id(conn, event)
+            }
+        }
+        RecurrenceKind::Unknown => db::calendar::upsert_event_by_remote_id(conn, event),
+    }
 }
 
 /// Convert Google attendees to the provider-neutral representation and pick
@@ -271,7 +492,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
         };
 
         let events_data = match page {
-            Ok(EventsPage::Page(data)) => data,
+            Ok(EventsPage::Events(data)) => data,
             Ok(EventsPage::SyncTokenExpired) => {
                 // syncToken expired — clear it and retry with full sync on next cycle
                 log::info!(
@@ -296,8 +517,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
             }
         };
 
-        let events = events_data["items"].as_array();
-        let count = events.map(|e| e.len()).unwrap_or(0);
+        let count = events_data.items.len();
         log::info!(
             "sync_calendars_google: fetched {} events for calendar {}",
             count,
@@ -305,16 +525,9 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
         );
 
         let mut conn = db.writer().await;
-        let mut server_event_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut server_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(events) = events {
-            for ev in events {
+        {
+            for ev in &events_data.items {
                 let event_id_remote = ev["id"].as_str().unwrap_or_default();
-                server_event_ids.insert(event_id_remote.to_string());
-                if let Some(uid) = ev["iCalUID"].as_str() {
-                    server_uids.insert(uid.to_string());
-                }
 
                 // Incremental sync: cancelled events should be deleted locally
                 if ev["status"].as_str() == Some("cancelled") {
@@ -408,7 +621,7 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                     etag: ev["etag"].as_str().map(|s| s.to_string()),
                 };
 
-                if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                if let Err(e) = upsert_google_event(&conn, ev, &cal_event, remote_cal_id) {
                     log::error!("sync_calendars_google: upsert event failed: {}", e);
                 }
             }
@@ -418,94 +631,19 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
         drop(conn);
 
         // Save nextSyncToken for incremental sync next time
-        if let Some(next_token) = events_data["nextSyncToken"].as_str() {
-            let conn = db.writer().await;
-            conn.execute(
-                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                rusqlite::params![sync_key, next_token],
-            )
-            .ok();
-            log::debug!(
-                "sync_calendars_google: saved syncToken for calendar {}",
-                remote_cal_id
-            );
-        }
+        let conn = db.writer().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![sync_key, events_data.next_sync_token],
+        )
+        .ok();
+        log::debug!(
+            "sync_calendars_google: saved syncToken for calendar {}",
+            remote_cal_id
+        );
 
-        // During full sync (no syncToken), reconcile: delete local events
-        // whose remote_id no longer appears on the server. Incremental sync
-        // handles deletions via "status: cancelled" (see above).
-        // Bootstrapping legacy unknown rows remains non-destructive: a bounded
-        // initial read can omit them. Incremental cancellations are always
-        // consumed above, independently of the metadata recovery pass.
-        if !has_unknown_events && existing_token.is_none() && !server_event_ids.is_empty() {
-            let mut conn = db.writer().await;
-            let local_events: Vec<(String, String)> = conn
-                .prepare(
-                    "SELECT ce.id, ce.remote_id FROM calendar_events ce
-                     JOIN calendars c ON ce.calendar_id = c.id
-                     WHERE ce.account_id = ?1 AND ce.remote_id IS NOT NULL AND ce.remote_id != ''
-                     AND c.remote_id = ?2",
-                )
-                .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![account_id, remote_cal_id], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            let mut deleted_ids = Vec::new();
-            for (local_id, remote_id) in &local_events {
-                if !server_event_ids.contains(remote_id) {
-                    deleted_ids.push(local_id.clone());
-                }
-            }
-            // Also remove orphan events (no remote_id) by matching UID
-            if !server_uids.is_empty() {
-                let orphans: Vec<(String, String)> = conn
-                    .prepare(
-                        "SELECT ce.id, ce.uid FROM calendar_events ce
-                         JOIN calendars c ON ce.calendar_id = c.id
-                         WHERE ce.account_id = ?1 AND (ce.remote_id IS NULL OR ce.remote_id = '')
-                         AND ce.uid IS NOT NULL AND c.remote_id = ?2",
-                    )
-                    .map(|mut stmt| {
-                        stmt.query_map(rusqlite::params![account_id, remote_cal_id], |row| {
-                            Ok((row.get(0)?, row.get(1)?))
-                        })
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                        .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                for (local_id, uid) in &orphans {
-                    if !server_uids.contains(uid) {
-                        deleted_ids.push(local_id.clone());
-                    }
-                }
-            }
-            let deleted = if deleted_ids.is_empty() {
-                0
-            } else {
-                match conn.transaction() {
-                    Ok(transaction) => {
-                        match db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
-                        {
-                            Ok(result) if transaction.commit().is_ok() => result.deleted,
-                            _ => 0,
-                        }
-                    }
-                    Err(_) => 0,
-                }
-            };
-            if deleted > 0 {
-                log::info!(
-                    "sync_calendars_google: removed {} server-deleted events from '{}'",
-                    deleted,
-                    remote_cal_id
-                );
-            }
-        }
+        // The initial list is time-bounded, so absence cannot prove deletion.
+        // Incremental sync supplies explicit cancelled tombstones above.
     }
 
     log::info!(
@@ -615,6 +753,130 @@ impl CalendarBackend for GoogleCalendarBackend {
                 })
                 .collect(),
         ))
+    }
+
+    async fn update_recurrence_occurrence(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        request: &RemoteOccurrenceUpdate,
+    ) -> Result<RemoteOccurrenceUpdateOutcome> {
+        request.desired.validate()?;
+        let provider_calendar_id = request
+            .trusted_identity
+            .provider_calendar_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Other(
+                    "Google occurrence update requires a trusted provider calendar ID".into(),
+                )
+            })?;
+        request.trusted_identity.validate()?;
+        if !matches!(
+            request.trusted_identity.kind,
+            RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+        ) || request.trusted_identity.account_id != account.id
+            || request.trusted_identity.event_id != request.current_event.id
+            || request.current_event.account_id != account.id
+            || request.current_event.recurrence_kind != RecurrenceKind::Occurrence
+            || request.current_event.remote_id.as_deref() != Some(request.target_id.as_str())
+            || request.trusted_identity.provider_occurrence_id.as_deref()
+                != Some(request.target_id.as_str())
+        {
+            return Err(Error::Other(
+                "Google occurrence update requires a trusted detached occurrence identity".into(),
+            ));
+        }
+        let expected_etag = request
+            .expected_provider_revision
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Sync(
+                    "Google occurrence update requires an ETag; sync before retrying".into(),
+                )
+            })?;
+        if request.trusted_identity.provider_revision.as_deref() != Some(expected_etag) {
+            return Err(Error::Sync(
+                "Google occurrence ETag is stale; sync before retrying".into(),
+            ));
+        }
+        let native: serde_json::Value = serde_json::from_str(
+            request
+                .trusted_identity
+                .provider_native_data
+                .as_deref()
+                .ok_or_else(|| {
+                    Error::Other("Google occurrence identity has no provider native data".into())
+                })?,
+        )
+        .map_err(|_| Error::Other("Google occurrence provider native data is invalid".into()))?;
+        let native_original = google_original_start(&native).ok_or_else(|| {
+            Error::Other("Google occurrence provider native identity is incomplete".into())
+        })?;
+        if google_recurrence_kind(&native) != RecurrenceKind::Occurrence
+            || native["id"].as_str() != Some(request.target_id.as_str())
+            || native["etag"].as_str() != Some(expected_etag)
+            || native["recurringEventId"].as_str()
+                != request.trusted_identity.provider_series_id.as_deref()
+            || Some(native_original.0.as_str()) != request.trusted_identity.recurrence_id.as_deref()
+            || Some(native_original.1) != request.trusted_identity.recurrence_value_type
+            || native_original.2 != request.trusted_identity.recurrence_timezone
+        {
+            return Err(Error::Other(
+                "Google occurrence provider native identity does not match the trusted target"
+                    .into(),
+            ));
+        }
+
+        let canonical_source = ctx
+            .services
+            .google_client(&account.id)
+            .await?
+            .patch_recurrence_occurrence(
+                provider_calendar_id,
+                &request.target_id,
+                expected_etag,
+                &request.patch,
+                &request.desired,
+                &native,
+            )
+            .await?;
+        let canonical =
+            canonical_google_occurrence(&canonical_source, account, &request.current_event)?;
+        let mut replacement =
+            google_recurrence_seed(&canonical_source, &canonical, provider_calendar_id)
+                .ok_or_else(|| {
+                    Error::Sync(
+                    "Google returned an invalid recurrence identity after the occurrence update; \
+                 reconciliation required"
+                        .into(),
+                )
+                })?;
+        if replacement.provider_calendar_id != request.trusted_identity.provider_calendar_id
+            || replacement.provider_series_id != request.trusted_identity.provider_series_id
+            || replacement.provider_occurrence_id != request.trusted_identity.provider_occurrence_id
+            || replacement.recurrence_id != request.trusted_identity.recurrence_id
+            || replacement.recurrence_timezone != request.trusted_identity.recurrence_timezone
+            || replacement.recurrence_value_type != request.trusted_identity.recurrence_value_type
+        {
+            return Err(Error::Sync(
+                "Google changed immutable recurrence identity during the occurrence update; \
+                 reconciliation required"
+                    .into(),
+            ));
+        }
+        replacement.local_series_event_id = request.trusted_identity.local_series_event_id.clone();
+        replacement.kind = RecurrenceObjectKind::Exception;
+        replacement.validate()?;
+        let occurrence = replacement.occurrence.clone();
+        Ok(RemoteOccurrenceUpdateOutcome {
+            replacement_identity: replacement,
+            occurrence,
+            canonical_event: Some(canonical),
+            canonical_recurrence_objects: None,
+        })
     }
 
     /// REST sync with a CalDAV fallback: accounts configured before
@@ -1066,15 +1328,33 @@ pub(super) mod sync_testutil {
         serve_requests("PATCH", vec![(200, response)]).await
     }
 
+    pub(crate) async fn serve_occurrence_responses(
+        responses: Vec<(&'static str, u16, serde_json::Value)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_method_responses(responses).await
+    }
+
     async fn serve_requests(
         method: &'static str,
         responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        serve_method_responses(
+            responses
+                .into_iter()
+                .map(|(status, body)| (method, status, body))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn serve_method_responses(
+        responses: Vec<(&'static str, u16, serde_json::Value)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let root = format!("http://{}/calendar-api", listener.local_addr().unwrap());
         let captured = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for (status, body) in responses {
+            for (method, status, body) in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -1338,10 +1618,433 @@ mod creation_tests {
 }
 
 #[cfg(test)]
+mod occurrence_update_tests {
+    use super::sync_testutil::{
+        serve_occurrence_responses, services, services_with_credentials, setup_db,
+    };
+    use super::{CalendarBackend, CalendarBackendCtx, GoogleCalendarBackend};
+    use crate::backend::calendar::RemoteOccurrenceUpdate;
+    use crate::backend::testutil::{account, event};
+    use crate::calendar::recurrence_identity::{
+        OccurrenceFields, RecurrenceIdentity, RecurrenceObjectKind, RecurrenceValueType,
+        UpdateOccurrenceInput,
+    };
+    use crate::calendar::{Attendee, RecurrenceKind};
+    use crate::error::Error;
+    use serde_json::json;
+
+    fn provider_event(etag: &str, fields: &OccurrenceFields) -> serde_json::Value {
+        let boundary = |value: &str| {
+            if fields.all_day {
+                json!({"date": value})
+            } else {
+                json!({"dateTime": value, "timeZone": "UTC"})
+            }
+        };
+        json!({
+            "id": "remote-occurrence",
+            "etag": etag,
+            "iCalUID": "series@example.test",
+            "summary": fields.title,
+            "description": fields.description,
+            "location": fields.location,
+            "start": boundary(&fields.start_time),
+            "end": boundary(&fields.end_time),
+            "recurringEventId": "remote-series",
+            "originalStartTime": if fields.all_day {
+                json!({"date": "2026-09-15", "timeZone": "UTC"})
+            } else {
+                json!({"dateTime": "2026-09-15T09:00:00Z", "timeZone": "UTC"})
+            },
+            "organizer": {"email": "u@example.com", "self": true},
+            "attendees": [{
+                "email": "u@example.com", "self": true, "responseStatus": "accepted"
+            }]
+        })
+    }
+
+    fn request(all_day: bool) -> RemoteOccurrenceUpdate {
+        let current_fields = OccurrenceFields {
+            title: "Original".into(),
+            description: Some("Original description".into()),
+            location: Some("Original room".into()),
+            start_time: if all_day {
+                "2026-09-15".into()
+            } else {
+                "2026-09-15T09:00:00Z".into()
+            },
+            end_time: if all_day {
+                "2026-09-16".into()
+            } else {
+                "2026-09-15T10:00:00Z".into()
+            },
+            all_day,
+            timezone: (!all_day).then(|| "UTC".into()),
+        };
+        let native = provider_event("old-etag", &current_fields);
+        let mut current = event();
+        current.uid = Some("series@example.test".into());
+        current.title = current_fields.title.clone();
+        current.description = current_fields.description.clone();
+        current.location = current_fields.location.clone();
+        current.start_time = current_fields.start_time.clone();
+        current.end_time = current_fields.end_time.clone();
+        current.all_day = all_day;
+        current.timezone = current_fields.timezone.clone();
+        current.recurrence_kind = RecurrenceKind::Occurrence;
+        current.organizer_email = Some("u@example.com".into());
+        current.attendees_json = Some(
+            serde_json::to_string(&[Attendee {
+                email: "u@example.com".into(),
+                name: None,
+                status: "accepted".into(),
+                is_self: Some(true),
+            }])
+            .unwrap(),
+        );
+        current.my_status = Some("accepted".into());
+        current.remote_id = Some("remote-occurrence".into());
+        current.etag = Some("old-etag".into());
+        let desired = OccurrenceFields {
+            title: "Canonical override".into(),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            start_time: if all_day {
+                "2026-09-17".into()
+            } else {
+                "2026-09-15T11:00:00Z".into()
+            },
+            end_time: if all_day {
+                "2026-09-18".into()
+            } else {
+                "2026-09-15T12:00:00Z".into()
+            },
+            all_day,
+            timezone: (!all_day).then(|| "UTC".into()),
+        };
+        RemoteOccurrenceUpdate {
+            target_id: "remote-occurrence".into(),
+            expected_provider_revision: Some("old-etag".into()),
+            trusted_identity: RecurrenceIdentity {
+                object_id: "recurrence-object".into(),
+                account_id: "acc1".into(),
+                event_id: current.id.clone(),
+                local_series_event_id: Some("local-series".into()),
+                provider_calendar_id: Some("team/calendar@example.com".into()),
+                provider_series_id: Some("remote-series".into()),
+                provider_occurrence_id: Some("remote-occurrence".into()),
+                recurrence_id: Some(if all_day {
+                    "2026-09-15".into()
+                } else {
+                    "2026-09-15T09:00:00Z".into()
+                }),
+                recurrence_timezone: Some("UTC".into()),
+                recurrence_value_type: Some(if all_day {
+                    RecurrenceValueType::Date
+                } else {
+                    RecurrenceValueType::DateTime
+                }),
+                occurrence: current_fields,
+                provider_native_data: Some(native.to_string()),
+                provider_revision: Some("old-etag".into()),
+                kind: RecurrenceObjectKind::Occurrence,
+            },
+            current_event: current,
+            patch: UpdateOccurrenceInput {
+                title: Some(desired.title.clone()),
+                description: desired.description.clone(),
+                location: desired.location.clone(),
+                start_time: Some(desired.start_time.clone()),
+                end_time: Some(desired.end_time.clone()),
+                all_day: None,
+                timezone: None,
+            },
+            desired,
+        }
+    }
+
+    #[tokio::test]
+    async fn secondary_calendar_patch_is_encoded_and_returns_canonical_exception() {
+        let (_directory, db) = setup_db().await;
+        let request = request(false);
+        let canonical = provider_event("new-etag", &request.desired);
+        let (root, captured) =
+            serve_occurrence_responses(vec![("PATCH", 200, canonical.clone())]).await;
+        let outcome = GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &request,
+            )
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 1, "complete PATCH response must avoid GET");
+        assert!(requests[0].starts_with(
+            "PATCH /calendar-api/calendars/team%2Fcalendar%40example.com/events/remote-occurrence?sendUpdates=none "
+        ));
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("if-match: old-etag\r\n"));
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["description"], "");
+        assert_eq!(body["location"], "");
+        assert_eq!(body["start"]["dateTime"], "2026-09-15T11:00:00Z");
+        for forbidden in [
+            "attendees",
+            "recurrence",
+            "organizer",
+            "id",
+            "iCalUID",
+            "recurringEventId",
+            "originalStartTime",
+        ] {
+            assert!(body.get(forbidden).is_none(), "{forbidden}");
+        }
+        assert_eq!(
+            outcome.replacement_identity.kind,
+            RecurrenceObjectKind::Exception
+        );
+        assert_eq!(
+            outcome.replacement_identity.provider_revision.as_deref(),
+            Some("new-etag")
+        );
+        assert_eq!(
+            outcome.replacement_identity.provider_calendar_id.as_deref(),
+            Some("team/calendar@example.com")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                outcome
+                    .replacement_identity
+                    .provider_native_data
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap(),
+            canonical
+        );
+        assert_eq!(outcome.occurrence, request.desired);
+        assert!(outcome.canonical_recurrence_objects.is_none());
+        let event = outcome.canonical_event.unwrap();
+        assert_eq!(event.id, request.current_event.id);
+        assert_eq!(event.calendar_id, "cal1");
+        assert_eq!(event.remote_id.as_deref(), Some("remote-occurrence"));
+        assert_eq!(event.etag.as_deref(), Some("new-etag"));
+        assert_eq!(event.uid, request.current_event.uid);
+        assert_eq!(event.organizer_email, request.current_event.organizer_email);
+        assert_eq!(event.attendees_json, request.current_event.attendees_json);
+    }
+
+    #[tokio::test]
+    async fn incomplete_patch_response_gets_canonical_all_day_event_from_same_target() {
+        let (_directory, db) = setup_db().await;
+        let request = request(true);
+        let canonical = provider_event("new-etag", &request.desired);
+        let (root, captured) = serve_occurrence_responses(vec![
+            ("PATCH", 200, json!({"id": "remote-occurrence"})),
+            ("GET", 200, canonical),
+        ])
+        .await;
+        let outcome = GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &request,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        assert!(requests[1].starts_with(
+            "GET /calendar-api/calendars/team%2Fcalendar%40example.com/events/remote-occurrence HTTP/1.1"
+        ));
+        assert_eq!(outcome.occurrence.start_time, "2026-09-17");
+        assert_eq!(outcome.occurrence.end_time, "2026-09-18");
+        assert!(outcome.occurrence.all_day);
+    }
+
+    #[tokio::test]
+    async fn time_only_patch_omits_text_and_preserves_native_timezones() {
+        let (_directory, db) = setup_db().await;
+        let mut request = request(false);
+        request.desired.title = request.trusted_identity.occurrence.title.clone();
+        request.desired.description = request.trusted_identity.occurrence.description.clone();
+        request.desired.location = request.trusted_identity.occurrence.location.clone();
+        request.patch = UpdateOccurrenceInput {
+            start_time: Some(request.desired.start_time.clone()),
+            end_time: Some(request.desired.end_time.clone()),
+            ..Default::default()
+        };
+        let mut native: serde_json::Value = serde_json::from_str(
+            request
+                .trusted_identity
+                .provider_native_data
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        native["start"]["timeZone"] = json!("Europe/Stockholm");
+        native["end"]["timeZone"] = json!("Europe/Stockholm");
+        request.trusted_identity.provider_native_data = Some(native.to_string());
+        let canonical = provider_event("new-etag", &request.desired);
+        let (root, captured) = serve_occurrence_responses(vec![("PATCH", 200, canonical)]).await;
+
+        GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &request,
+            )
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "start": {
+                    "dateTime": "2026-09-15T11:00:00Z",
+                    "timeZone": "Europe/Stockholm"
+                },
+                "end": {
+                    "dateTime": "2026-09-15T12:00:00Z",
+                    "timeZone": "Europe/Stockholm"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn title_only_patch_does_not_rewrite_boundaries() {
+        let (_directory, db) = setup_db().await;
+        let mut request = request(false);
+        request.desired = request.trusted_identity.occurrence.clone();
+        request.desired.title = "Renamed occurrence".into();
+        request.patch = UpdateOccurrenceInput {
+            title: Some(request.desired.title.clone()),
+            ..Default::default()
+        };
+        let canonical = provider_event("new-etag", &request.desired);
+        let (root, captured) = serve_occurrence_responses(vec![("PATCH", 200, canonical)]).await;
+
+        GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &request,
+            )
+            .await
+            .unwrap();
+
+        let requests = captured.await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body, json!({"summary": "Renamed occurrence"}));
+    }
+
+    #[tokio::test]
+    async fn stale_patch_and_untrusted_native_identity_fail_without_local_mutation() {
+        let (_directory, db) = setup_db().await;
+        let stale_request = request(false);
+        let (root, captured) =
+            serve_occurrence_responses(vec![("PATCH", 412, json!({"error": "stale"}))]).await;
+        let error = GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &stale_request,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Sync(message) if message.contains("sync before retrying")));
+        assert_eq!(captured.await.unwrap().len(), 1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let mut mismatched = stale_request;
+        let mut native: serde_json::Value = serde_json::from_str(
+            mismatched
+                .trusted_identity
+                .provider_native_data
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        native["recurringEventId"] = json!("different-series");
+        mismatched.trusted_identity.provider_native_data = Some(native.to_string());
+        let error = GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services_with_credentials(&root, false),
+                },
+                &account("calendar", "google"),
+                &mismatched,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the trusted target"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+
+        let request = request(false);
+        let mut changed_identity = provider_event("new-etag", &request.desired);
+        changed_identity["originalStartTime"]["dateTime"] = json!("2026-09-22T09:00:00Z");
+        let (root, captured) =
+            serve_occurrence_responses(vec![("PATCH", 200, changed_identity)]).await;
+        let error = GoogleCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+                &request,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Sync(message) if message.contains("immutable recurrence identity")
+        ));
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod recurrence_sync_tests {
     use super::sync_testutil::{cache_event, serve_responses, services, setup_db};
-    use super::{needs_recurrence_refresh, sync_google, CalendarBackendCtx};
-    use crate::backend::testutil::account;
+    use super::{
+        google_recurrence_seed, needs_recurrence_refresh, sync_google, CalendarBackendCtx,
+    };
+    use crate::backend::testutil::{account, event};
+    use crate::calendar::recurrence_identity::{
+        OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
+    };
     use crate::calendar::RecurrenceKind;
     use crate::db;
     use rusqlite::OptionalExtension;
@@ -1384,6 +2087,305 @@ mod recurrence_sync_tests {
             "start": {"dateTime": "2026-09-14T09:00:00Z"},
             "end": {"dateTime": "2026-09-14T10:00:00Z"}
         })
+    }
+
+    fn trusted_seed(provider_occurrence_id: &str) -> RecurrenceIdentitySeed {
+        RecurrenceIdentitySeed {
+            local_series_event_id: None,
+            provider_calendar_id: Some("primary".into()),
+            provider_series_id: Some(format!("trusted-series-{provider_occurrence_id}")),
+            provider_occurrence_id: Some(provider_occurrence_id.into()),
+            recurrence_id: Some("2026-09-14T09:00:00Z".into()),
+            recurrence_timezone: Some("UTC".into()),
+            recurrence_value_type: Some(RecurrenceValueType::DateTime),
+            occurrence: OccurrenceFields {
+                title: "Cached event".into(),
+                description: None,
+                location: None,
+                start_time: "2026-09-14T09:00:00Z".into(),
+                end_time: "2026-09-14T10:00:00Z".into(),
+                all_day: false,
+                timezone: Some("UTC".into()),
+            },
+            provider_native_data: Some("trusted provider data".into()),
+            provider_revision: Some("trusted revision".into()),
+            kind: RecurrenceObjectKind::Occurrence,
+        }
+    }
+
+    #[test]
+    fn recurrence_seed_preserves_google_identity_values() {
+        let mut normalized = event();
+        normalized.start_time = "2026-09-15".into();
+        normalized.end_time = "2026-09-16".into();
+        normalized.all_day = true;
+        normalized.recurrence_kind = RecurrenceKind::Occurrence;
+        let all_day = json!({
+            "id": "all-day-occurrence",
+            "recurringEventId": "all-day-master",
+            "originalStartTime": {
+                "date": "2026-09-08",
+                "timeZone": "Europe/Stockholm"
+            },
+            "etag": "all-day-etag"
+        });
+        let seed = google_recurrence_seed(&all_day, &normalized, "primary").unwrap();
+        assert_eq!(seed.provider_calendar_id.as_deref(), Some("primary"));
+        assert_eq!(seed.recurrence_id.as_deref(), Some("2026-09-08"));
+        assert_eq!(seed.recurrence_value_type, Some(RecurrenceValueType::Date));
+        assert_eq!(
+            seed.recurrence_timezone.as_deref(),
+            Some("Europe/Stockholm")
+        );
+        assert_eq!(seed.occurrence.start_time, "2026-09-15");
+        assert_eq!(seed.occurrence.end_time, "2026-09-16");
+
+        normalized.start_time = "2026-09-15T07:30:00Z".into();
+        normalized.end_time = "2026-09-15T08:30:00Z".into();
+        normalized.all_day = false;
+        let timed = json!({
+            "id": "timed-occurrence",
+            "recurringEventId": "timed-master",
+            "originalStartTime": {
+                "dateTime": "2026-09-08T09:30:00+02:00",
+                "timeZone": "Europe/Stockholm"
+            }
+        });
+        let seed = google_recurrence_seed(&timed, &normalized, "primary").unwrap();
+        assert_eq!(
+            seed.recurrence_id.as_deref(),
+            Some("2026-09-08T09:30:00+02:00")
+        );
+        assert_eq!(
+            seed.recurrence_value_type,
+            Some(RecurrenceValueType::DateTime)
+        );
+
+        normalized.recurrence_kind = RecurrenceKind::Series;
+        let master = json!({
+            "id": "master",
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+            "etag": "master-etag",
+            "providerOnly": {"preserved": true}
+        });
+        let seed = google_recurrence_seed(&master, &normalized, "primary").unwrap();
+        assert_eq!(seed.kind, RecurrenceObjectKind::Master);
+        assert_eq!(seed.provider_calendar_id.as_deref(), Some("primary"));
+        assert_eq!(seed.provider_series_id.as_deref(), Some("master"));
+        assert!(seed.recurrence_id.is_none());
+        assert_eq!(seed.provider_revision.as_deref(), Some("master-etag"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                seed.provider_native_data.as_deref().unwrap()
+            )
+            .unwrap(),
+            master
+        );
+
+        normalized.recurrence_kind = RecurrenceKind::Occurrence;
+        assert!(google_recurrence_seed(
+            &json!({"id": "partial", "recurringEventId": "master"}),
+            &normalized,
+            "primary"
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_ingests_stable_identity_and_fails_closed_for_malformed_data() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            for id in ["standalone", "malformed"] {
+                cache_event(&conn, id, Some(id));
+                let cached = db::calendar::get_event(&conn, id).unwrap();
+                db::calendar::upsert_event_by_remote_id_with_recurrence(
+                    &conn,
+                    &cached,
+                    &[trusted_seed(&format!("trusted-{id}"))],
+                )
+                .unwrap();
+            }
+        }
+
+        let master = json!({
+            "id": "master",
+            "iCalUID": "master@example.test",
+            "summary": "Master",
+            "start": {"dateTime": "2026-09-15T09:00:00+02:00"},
+            "end": {"dateTime": "2026-09-15T10:00:00+02:00"},
+            "recurrence": ["RRULE:FREQ=WEEKLY"],
+            "etag": "master-etag",
+            "providerOnly": {"preserved": true}
+        });
+        let all_day = json!({
+            "id": "all-day",
+            "iCalUID": "master@example.test",
+            "summary": "All day occurrence",
+            "start": {"date": "2026-09-22"},
+            "end": {"date": "2026-09-23"},
+            "recurringEventId": "master",
+            "originalStartTime": {
+                "date": "2026-09-22",
+                "timeZone": "Europe/Stockholm"
+            },
+            "etag": "all-day-etag"
+        });
+        let timed = json!({
+            "id": "timed",
+            "iCalUID": "master@example.test",
+            "summary": "Timed occurrence",
+            "description": "Exception description",
+            "location": "Exception room",
+            "start": {"dateTime": "2026-09-29T11:00:00+02:00"},
+            "end": {"dateTime": "2026-09-29T12:00:00+02:00"},
+            "recurringEventId": "master",
+            "originalStartTime": {
+                "dateTime": "2026-09-29T09:00:00+02:00",
+                "timeZone": "Europe/Stockholm"
+            },
+            "etag": "timed-etag",
+            "providerOnly": [1, 2, 3]
+        });
+        let standalone = remote_event("standalone");
+        let mut malformed = remote_event("malformed");
+        malformed["recurringEventId"] = json!("master");
+        let calendars = json!({
+            "items": [{"id": "primary", "summary": "Calendar", "primary": true}]
+        });
+        let items = vec![
+            master.clone(),
+            all_day.clone(),
+            timed.clone(),
+            standalone,
+            malformed,
+        ];
+        let (root, captured) = serve_responses(vec![
+            (200, calendars.clone()),
+            (
+                200,
+                json!({"items": items.clone(), "nextSyncToken": "token-1"}),
+            ),
+            (200, calendars),
+            (200, json!({"items": items, "nextSyncToken": "token-2"})),
+        ])
+        .await;
+        let provider_services = services(&root);
+        let ctx = CalendarBackendCtx {
+            db: &db,
+            services: &provider_services,
+        };
+        let account = account("calendar", "google");
+        sync_google(&ctx, &account).await.unwrap();
+        let first_object_ids: Vec<String> = {
+            let conn = db.reader();
+            ["master", "all-day", "timed"]
+                .iter()
+                .map(|remote_id| {
+                    conn.query_row(
+                        "SELECT recurrence.object_id
+                         FROM calendar_recurrence_objects recurrence
+                         JOIN calendar_events event ON event.id = recurrence.event_id
+                         WHERE event.remote_id = ?1",
+                        [remote_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        sync_google(&ctx, &account).await.unwrap();
+        let requests = captured.await.unwrap();
+        assert_events_query(&requests[1], None);
+        assert_events_query(&requests[3], Some("token-1"));
+
+        let conn = db.reader();
+        let identities = ["master", "all-day", "timed"]
+            .iter()
+            .map(|remote_id| {
+                conn.query_row(
+                    "SELECT event.id FROM calendar_events event WHERE event.remote_id = ?1",
+                    [remote_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|event_id| {
+                    db::calendar_recurrence::get_by_event_id(&conn, &event_id)
+                        .unwrap()
+                        .pop()
+                        .unwrap()
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| identity.object_id.clone())
+                .collect::<Vec<_>>(),
+            first_object_ids
+        );
+        assert_eq!(identities[0].kind, RecurrenceObjectKind::Master);
+        assert!(identities
+            .iter()
+            .all(|identity| identity.provider_calendar_id.as_deref() == Some("primary")));
+        assert_eq!(identities[0].occurrence.start_time, "2026-09-15T07:00:00Z");
+        assert_eq!(identities[1].recurrence_id.as_deref(), Some("2026-09-22"));
+        assert_eq!(
+            identities[1].recurrence_value_type,
+            Some(RecurrenceValueType::Date)
+        );
+        assert_eq!(
+            identities[2].recurrence_id.as_deref(),
+            Some("2026-09-29T09:00:00+02:00")
+        );
+        assert_eq!(identities[2].occurrence.title, "Timed occurrence");
+        assert_eq!(
+            identities[2].occurrence.description.as_deref(),
+            Some("Exception description")
+        );
+        assert_eq!(
+            identities[2].occurrence.location.as_deref(),
+            Some("Exception room")
+        );
+        assert_eq!(identities[2].occurrence.start_time, "2026-09-29T09:00:00Z");
+        assert_eq!(
+            identities[2].provider_revision.as_deref(),
+            Some("timed-etag")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                identities[2].provider_native_data.as_deref().unwrap()
+            )
+            .unwrap(),
+            timed
+        );
+        let standalone_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = 'standalone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            db::calendar_recurrence::get_by_event_id(&conn, &standalone_id)
+                .unwrap()
+                .is_empty()
+        );
+        let malformed_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = 'malformed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let malformed_identity = db::calendar_recurrence::get_by_event_id(&conn, &malformed_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            malformed_identity.provider_revision.as_deref(),
+            Some("trusted revision")
+        );
     }
 
     #[tokio::test]
@@ -1680,6 +2682,98 @@ mod recurrence_sync_tests {
                 .optional()
                 .unwrap();
             assert_eq!(saved.as_deref(), token);
+        }
+    }
+
+    #[tokio::test]
+    async fn later_incremental_page_failure_never_applies_partial_changes() {
+        for status in [500, 410] {
+            let (_dir, db) = setup_db().await;
+            {
+                let conn = db.writer().await;
+                cache_event(&conn, "cancelled", Some("cancelled"));
+                conn.execute(
+                    "UPDATE calendar_events SET recurrence_kind = 'standalone'
+                     WHERE id = 'cancelled'",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, 'old-token')",
+                    [SYNC_KEY],
+                )
+                .unwrap();
+            }
+            let (root, captured) = serve_responses(vec![
+                (
+                    200,
+                    json!({"items": [{"id": "primary", "summary": "Calendar"}]}),
+                ),
+                (
+                    200,
+                    json!({
+                        "items": [
+                            {"id": "cancelled", "status": "cancelled"},
+                            remote_event("partial-new")
+                        ],
+                        "nextPageToken": "next-page"
+                    }),
+                ),
+                (status, json!({"error": "injected later-page failure"})),
+            ])
+            .await;
+
+            sync_google(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "google"),
+            )
+            .await
+            .unwrap();
+
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_events_query(&requests[1], Some("old-token"));
+            assert_events_query(&requests[2], Some("old-token"));
+            let second_query = url::Url::parse(&format!(
+                "http://localhost{}",
+                requests[2].split_whitespace().nth(1).unwrap()
+            ))
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(second_query["pageToken"], "next-page");
+
+            let conn = db.reader();
+            assert!(db::calendar::get_event(&conn, "cancelled").is_ok());
+            let partial_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM calendar_events
+                     WHERE remote_id = 'partial-new'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(partial_count, 0);
+            let token: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    [SYNC_KEY],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                token.as_deref(),
+                if status == 410 {
+                    None
+                } else {
+                    Some("old-token")
+                }
+            );
         }
     }
 

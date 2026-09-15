@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod ical;
 pub mod recurrence;
+#[allow(dead_code)]
+pub mod recurrence_identity;
 pub mod timezone;
 
 /// Recurrence classification supplied by a provider or known local creation.

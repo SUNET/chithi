@@ -3,13 +3,19 @@
 use async_trait::async_trait;
 
 use crate::calendar::ical;
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
+};
 use crate::calendar::{attendee_status_for_email, CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
 use crate::mail::caldav::{CalDavClient, CalDavConfig, CalDavEvent};
 
-use super::{get_unpushed_events, CalendarBackend, CalendarBackendCtx, PushedEvent};
+use super::{
+    get_unpushed_events, CalendarBackend, CalendarBackendCtx, PushedEvent, RemoteOccurrenceUpdate,
+    RemoteOccurrenceUpdateOutcome,
+};
 
 pub struct CalDavCalendarBackend;
 
@@ -273,21 +279,34 @@ fn is_personal_editable_property(line: &str) -> bool {
     })
 }
 
-/// Map the selected component, retaining the classification of its full resource.
-fn from_caldav_event(
+struct ParsedCalDavResource {
+    event: CalendarEvent,
+    /// `None` means recurrence identity was not trustworthy and must not
+    /// replace identity learned by an earlier provider read.
+    recurrence_seeds: Option<Vec<RecurrenceIdentitySeed>>,
+}
+
+/// Map a complete CalDAV resource and derive recurrence identity only from
+/// explicit, validated provider properties.
+fn parse_caldav_resource(
     event: &CalDavEvent,
     account: &AccountFull,
     calendar_id: &str,
-) -> Option<CalendarEvent> {
-    let parsed = ical::parse_ical_data(&event.ical_data);
-    let invite = parsed.first()?;
+    provider_calendar_id: &str,
+) -> Option<ParsedCalDavResource> {
+    let parsed = ical::parse_ical_data_with_recurrence(&event.ical_data);
+    let representative = parsed
+        .iter()
+        .find(|component| component.invite.recurrence_kind == RecurrenceKind::Series)
+        .or_else(|| parsed.first())?;
+    let invite = &representative.invite;
     let attendees_json = if invite.attendees.is_empty() {
         None
     } else {
         Some(serde_json::to_string(&invite.attendees).unwrap_or_else(|_| "[]".to_string()))
     };
 
-    Some(CalendarEvent {
+    let cal_event = CalendarEvent {
         id: uuid::Uuid::new_v4().to_string(),
         account_id: account.id.clone(),
         calendar_id: calendar_id.to_string(),
@@ -311,7 +330,230 @@ fn from_caldav_event(
         ical_data: Some(event.ical_data.clone()),
         remote_id: Some(event.href.clone()),
         etag: Some(event.etag.clone()),
+    };
+    let recurrence_seeds = recurrence_seeds(event, provider_calendar_id, &parsed);
+    Some(ParsedCalDavResource {
+        event: cal_event,
+        recurrence_seeds,
     })
+}
+
+/// Map only the display event for callers that do not ingest recurrence rows.
+#[cfg(test)]
+fn from_caldav_event(
+    event: &CalDavEvent,
+    account: &AccountFull,
+    calendar_id: &str,
+    provider_calendar_id: &str,
+) -> Option<CalendarEvent> {
+    parse_caldav_resource(event, account, calendar_id, provider_calendar_id)
+        .map(|parsed| parsed.event)
+}
+
+fn recurrence_seeds(
+    resource: &CalDavEvent,
+    provider_calendar_id: &str,
+    components: &[ical::ParsedIcalEvent],
+) -> Option<Vec<RecurrenceIdentitySeed>> {
+    recurrence_seeds_from_parts(
+        &resource.ical_data,
+        Some(&resource.etag),
+        &resource.href,
+        provider_calendar_id,
+        components,
+    )
+}
+
+fn recurrence_seeds_from_parts(
+    ical_data: &str,
+    provider_revision: Option<&str>,
+    provider_series_id: &str,
+    provider_calendar_id: &str,
+    components: &[ical::ParsedIcalEvent],
+) -> Option<Vec<RecurrenceIdentitySeed>> {
+    if components.len() == 1 && components[0].invite.recurrence_kind == RecurrenceKind::Standalone {
+        return Some(Vec::new());
+    }
+
+    let uid = &components.first()?.invite.uid;
+    if components.iter().any(|component| {
+        component.invite.uid != *uid
+            || matches!(
+                component.invite.recurrence_kind,
+                RecurrenceKind::Standalone | RecurrenceKind::Unknown
+            )
+    }) {
+        return None;
+    }
+
+    let masters = components
+        .iter()
+        .filter(|component| component.invite.recurrence_kind == RecurrenceKind::Series)
+        .count();
+    if masters > 1 {
+        return None;
+    }
+
+    let mut seeds = Vec::with_capacity(components.len());
+    for component in components {
+        let occurrence = occurrence_fields(&component.invite)?;
+        let seed = match component.invite.recurrence_kind {
+            RecurrenceKind::Series => RecurrenceIdentitySeed {
+                local_series_event_id: None,
+                provider_calendar_id: Some(provider_calendar_id.to_string()),
+                provider_series_id: Some(provider_series_id.to_string()),
+                provider_occurrence_id: None,
+                recurrence_id: None,
+                recurrence_timezone: None,
+                recurrence_value_type: None,
+                occurrence,
+                provider_native_data: Some(ical_data.to_string()),
+                provider_revision: provider_revision.map(str::to_owned),
+                kind: RecurrenceObjectKind::Master,
+            },
+            RecurrenceKind::Occurrence => {
+                let recurrence_id = component.recurrence_id.as_ref()?;
+                RecurrenceIdentitySeed {
+                    local_series_event_id: None,
+                    provider_calendar_id: Some(provider_calendar_id.to_string()),
+                    provider_series_id: Some(provider_series_id.to_string()),
+                    provider_occurrence_id: None,
+                    recurrence_id: Some(recurrence_id.raw_value.clone()),
+                    recurrence_timezone: recurrence_id.timezone.clone(),
+                    recurrence_value_type: Some(recurrence_id.value_type),
+                    occurrence,
+                    provider_native_data: Some(ical_data.to_string()),
+                    provider_revision: provider_revision.map(str::to_owned),
+                    kind: if component.explicitly_cancelled {
+                        RecurrenceObjectKind::Exclusion
+                    } else {
+                        RecurrenceObjectKind::Exception
+                    },
+                }
+            }
+            RecurrenceKind::Standalone | RecurrenceKind::Unknown => return None,
+        };
+        if seed.validate().is_err() {
+            return None;
+        }
+        seeds.push(seed);
+    }
+    Some(seeds)
+}
+
+fn occurrence_fields(invite: &ical::ParsedInvite) -> Option<OccurrenceFields> {
+    if invite.all_day {
+        let start = chrono::NaiveDate::parse_from_str(&invite.dtstart, "%Y-%m-%d").ok()?;
+        let mut end = chrono::NaiveDate::parse_from_str(&invite.dtend, "%Y-%m-%d").ok()?;
+        if end == start {
+            end = start.succ_opt()?;
+        }
+        if end <= start {
+            return None;
+        }
+        return Some(OccurrenceFields {
+            title: invite
+                .summary
+                .clone()
+                .unwrap_or_else(|| "(No title)".to_string()),
+            description: invite.description.clone(),
+            location: invite.location.clone(),
+            start_time: start.format("%Y-%m-%d").to_string(),
+            end_time: end.format("%Y-%m-%d").to_string(),
+            all_day: true,
+            timezone: invite.timezone.clone(),
+        });
+    }
+
+    let start = chrono::DateTime::parse_from_rfc3339(&invite.dtstart).ok()?;
+    let end = chrono::DateTime::parse_from_rfc3339(&invite.dtend).ok()?;
+    if end <= start {
+        return None;
+    }
+    Some(OccurrenceFields {
+        title: invite
+            .summary
+            .clone()
+            .unwrap_or_else(|| "(No title)".to_string()),
+        description: invite.description.clone(),
+        location: invite.location.clone(),
+        start_time: start
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        end_time: end
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        all_day: false,
+        timezone: invite.timezone.clone(),
+    })
+}
+
+fn validate_occurrence_update<'a>(
+    account: &AccountFull,
+    request: &'a RemoteOccurrenceUpdate,
+) -> Result<(
+    &'a str,
+    &'a str,
+    RecurrenceValueType,
+    Option<&'a str>,
+    &'a str,
+)> {
+    request.trusted_identity.validate()?;
+    request.desired.validate()?;
+    let identity = &request.trusted_identity;
+    if !matches!(
+        identity.kind,
+        RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+    ) || identity.account_id != account.id
+        || identity.event_id != request.current_event.id
+        || request.current_event.account_id != account.id
+        || request.current_event.recurrence_kind != RecurrenceKind::Series
+        || request.current_event.remote_id.as_deref() != Some(request.target_id.as_str())
+        || identity.provider_series_id.as_deref() != Some(request.target_id.as_str())
+        || identity.provider_occurrence_id.is_some()
+    {
+        return Err(Error::Other(
+            "CalDAV THIS-OCCURRENCE requires a trusted embedded exception resource".into(),
+        ));
+    }
+    let etag = request
+        .expected_provider_revision
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or_else(|| {
+            Error::Sync("CalDAV occurrence has no expected ETag; sync before retrying".into())
+        })?;
+    if identity.provider_revision.as_deref() != Some(etag) {
+        return Err(Error::Sync(
+            "CalDAV occurrence ETag contradicts its trusted identity; reconciliation required"
+                .into(),
+        ));
+    }
+    let uid = request
+        .current_event
+        .uid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Other("CalDAV occurrence resource has no UID".into()))?;
+    let recurrence_id = identity
+        .recurrence_id
+        .as_deref()
+        .ok_or_else(|| Error::Other("CalDAV occurrence has no RECURRENCE-ID".into()))?;
+    let value_type = identity
+        .recurrence_value_type
+        .ok_or_else(|| Error::Other("CalDAV occurrence has no recurrence value type".into()))?;
+    let native = identity
+        .provider_native_data
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Other("CalDAV occurrence has no complete native VCALENDAR".into()))?;
+    Ok((
+        uid,
+        recurrence_id,
+        value_type,
+        identity.recurrence_timezone.as_deref(),
+        native,
+    ))
 }
 
 /// Connect with the account's DAV coordinates.
@@ -418,15 +660,24 @@ impl CalendarBackend for CalDavCalendarBackend {
             for ev in &caldav_events {
                 // Reparse even with an unchanged etag: legacy rows need source
                 // classification, and the shared upsert persists it on refresh.
-                let Some(cal_event) = from_caldav_event(ev, account, local_cal_id) else {
+                let Some(parsed) = parse_caldav_resource(ev, account, local_cal_id, &cal.href)
+                else {
                     log::debug!(
                         "sync_calendars: could not parse iCal data for event href={}",
                         ev.href
                     );
                     continue;
                 };
+                let cal_event = parsed.event;
 
-                if let Err(e) = db::calendar::upsert_event_by_remote_id(&conn, &cal_event) {
+                let result = match parsed.recurrence_seeds {
+                    Some(seeds) => db::calendar::upsert_event_by_remote_id_with_recurrence(
+                        &conn, &cal_event, &seeds,
+                    )
+                    .map(|_| ()),
+                    None => db::calendar::upsert_event_by_remote_id(&conn, &cal_event),
+                };
+                if let Err(e) = result {
                     log::error!(
                         "sync_calendars: failed to upsert CalDAV event '{}': {}",
                         cal_event.title,
@@ -544,6 +795,113 @@ impl CalendarBackend for CalDavCalendarBackend {
         }))
     }
 
+    async fn update_recurrence_occurrence(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        request: &RemoteOccurrenceUpdate,
+    ) -> Result<RemoteOccurrenceUpdateOutcome> {
+        let (uid, recurrence_id, value_type, recurrence_timezone, native) =
+            validate_occurrence_update(account, request)?;
+        let updated = ical::rewrite_recurrence_occurrence(
+            native,
+            uid,
+            recurrence_id,
+            value_type,
+            recurrence_timezone,
+            &request.patch,
+            &request.desired,
+        )
+        .map_err(Error::Other)?;
+        let etag = request.expected_provider_revision.as_deref().unwrap();
+        let client = connect(ctx, account).await?;
+        client
+            .put_event_at_href(&request.target_id, &updated, Some(etag))
+            .await?;
+        let canonical = client
+            .get_event_at_href(&request.target_id)
+            .await
+            .map_err(|error| {
+                Error::Sync(format!(
+                    "CalDAV accepted the occurrence update but canonical GET failed; reconciliation required: {error}"
+                ))
+            })?;
+        ical::select_recurrence_occurrence(
+            &canonical.ical_data,
+            uid,
+            recurrence_id,
+            value_type,
+            recurrence_timezone,
+        )
+        .map_err(|error| {
+            Error::Sync(format!(
+                "CalDAV accepted the occurrence update but its canonical resource cannot be reconciled: {error}"
+            ))
+        })?;
+        let components = ical::parse_ical_data_with_recurrence(&canonical.ical_data);
+        let provider_calendar_id = request
+            .trusted_identity
+            .provider_calendar_id
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Sync(
+                    "CalDAV canonical occurrence has no provider calendar identity; reconciliation required"
+                        .into(),
+                )
+            })?;
+        let mut canonical_recurrence_objects = recurrence_seeds_from_parts(
+            &canonical.ical_data,
+            canonical.etag.as_deref(),
+            &request.target_id,
+            provider_calendar_id,
+            &components,
+        )
+        .filter(|seeds| !seeds.is_empty())
+        .ok_or_else(|| {
+            Error::Sync(
+                "CalDAV accepted the occurrence update but its complete canonical recurrence set is invalid; reconciliation required"
+                    .into(),
+            )
+        })?;
+        for seed in &mut canonical_recurrence_objects {
+            seed.local_series_event_id = request.trusted_identity.local_series_event_id.clone();
+        }
+        let matches: Vec<&RecurrenceIdentitySeed> = canonical_recurrence_objects
+            .iter()
+            .filter(|seed| {
+                seed.local_series_event_id == request.trusted_identity.local_series_event_id
+                    && seed.provider_calendar_id == request.trusted_identity.provider_calendar_id
+                    && seed.provider_series_id == request.trusted_identity.provider_series_id
+                    && seed.provider_occurrence_id
+                        == request.trusted_identity.provider_occurrence_id
+                    && seed.recurrence_id == request.trusted_identity.recurrence_id
+                    && seed.recurrence_timezone == request.trusted_identity.recurrence_timezone
+                    && seed.recurrence_value_type == request.trusted_identity.recurrence_value_type
+            })
+            .collect();
+        let [replacement_identity] = matches.as_slice() else {
+            return Err(Error::Sync(
+                "CalDAV canonical recurrence set must contain exactly one matching immutable occurrence identity; reconciliation required"
+                    .into(),
+            ));
+        };
+        if replacement_identity.kind != RecurrenceObjectKind::Exception {
+            return Err(Error::Sync(
+                "CalDAV canonical selected occurrence is not an exception; reconciliation required"
+                    .into(),
+            ));
+        }
+        let replacement_identity = (*replacement_identity).clone();
+        let occurrence = replacement_identity.occurrence.clone();
+        replacement_identity.validate()?;
+        Ok(RemoteOccurrenceUpdateOutcome {
+            replacement_identity,
+            occurrence,
+            canonical_event: None,
+            canonical_recurrence_objects: Some(canonical_recurrence_objects),
+        })
+    }
+
     async fn push_updated_invitation_copy(
         &self,
         ctx: &CalendarBackendCtx<'_>,
@@ -600,6 +958,7 @@ impl CalendarBackend for CalDavCalendarBackend {
 mod recurrence_tests {
     use super::*;
     use crate::backend::testutil::{account, event, temp_pool};
+    use crate::calendar::recurrence_identity::{RecurrenceIdentity, UpdateOccurrenceInput};
     use crate::calendar::RecurrenceKind;
     use crate::db;
     use crate::db::pool::DbPool;
@@ -614,7 +973,8 @@ mod recurrence_tests {
     fn component(properties: &str) -> String {
         format!(
             "BEGIN:VEVENT\nUID:shared\nDTSTAMP:20260901T120000Z\n\
-             DTSTART:20260913T100000Z\nSUMMARY:Visible event\n{properties}END:VEVENT\n"
+             DTSTART:20260913T100000Z\nDTEND:20260913T110000Z\n\
+             SUMMARY:Visible event\n{properties}END:VEVENT\n"
         )
     }
 
@@ -818,6 +1178,333 @@ mod recurrence_tests {
             .unwrap()
     }
 
+    fn occurrence_update_request(native: String) -> RemoteOccurrenceUpdate {
+        let occurrence = OccurrenceFields {
+            title: "Visible event".into(),
+            description: None,
+            location: None,
+            start_time: "2026-09-13T10:00:00Z".into(),
+            end_time: "2026-09-13T11:00:00Z".into(),
+            all_day: false,
+            timezone: None,
+        };
+        let mut current = event();
+        current.uid = Some("shared".into());
+        current.remote_id = Some("/calendar/event.ics".into());
+        current.recurrence_kind = RecurrenceKind::Series;
+        current.start_time = occurrence.start_time.clone();
+        current.end_time = occurrence.end_time.clone();
+        RemoteOccurrenceUpdate {
+            target_id: "/calendar/event.ics".into(),
+            expected_provider_revision: Some("\"old-etag\"".into()),
+            trusted_identity: RecurrenceIdentity {
+                object_id: "exception-object".into(),
+                account_id: "acc1".into(),
+                event_id: current.id.clone(),
+                local_series_event_id: Some(current.id.clone()),
+                provider_calendar_id: Some("/collections/work/".into()),
+                provider_series_id: Some("/calendar/event.ics".into()),
+                provider_occurrence_id: None,
+                recurrence_id: Some("20260920T100000Z".into()),
+                recurrence_timezone: None,
+                recurrence_value_type: Some(RecurrenceValueType::DateTime),
+                occurrence,
+                provider_native_data: Some(native),
+                provider_revision: Some("\"old-etag\"".into()),
+                kind: RecurrenceObjectKind::Exception,
+            },
+            current_event: current,
+            patch: UpdateOccurrenceInput {
+                title: Some("Requested title".into()),
+                description: Some(String::new()),
+                location: Some(String::new()),
+                start_time: Some("2026-09-20T12:00:00Z".into()),
+                end_time: Some("2026-09-20T13:30:00Z".into()),
+                all_day: None,
+                timezone: None,
+            },
+            desired: OccurrenceFields {
+                title: "Requested title".into(),
+                description: Some(String::new()),
+                location: Some(String::new()),
+                start_time: "2026-09-20T12:00:00Z".into(),
+                end_time: "2026-09-20T13:30:00Z".into(),
+                all_day: false,
+                timezone: None,
+            },
+        }
+    }
+
+    fn occurrence_resource(properties: &str) -> String {
+        resource(&format!(
+            "{}{}",
+            component("RRULE:FREQ=WEEKLY\nX-MASTER:keep\n"),
+            component(&format!(
+                "RECURRENCE-ID:20260920T100000Z\nDESCRIPTION:Old\nLOCATION:Old\n{properties}"
+            ))
+        ))
+        .ical_data
+    }
+
+    fn occurrence_sibling() -> String {
+        component("RECURRENCE-ID:20260927T100000Z\nX-SIBLING:original\n")
+    }
+
+    fn occurrence_resource_with_sibling(properties: &str) -> String {
+        resource(&format!(
+            "{}{}{}",
+            component("RRULE:FREQ=WEEKLY\nX-MASTER:keep\n"),
+            component(&format!(
+                "RECURRENCE-ID:20260920T100000Z\nDESCRIPTION:Old\nLOCATION:Old\n{properties}"
+            )),
+            occurrence_sibling(),
+        ))
+        .ical_data
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_uses_if_match_then_ingests_canonical_get() {
+        let native =
+            occurrence_resource_with_sibling("ATTENDEE:mailto:guest@example.test\nX-KEEP:value\n");
+        let canonical = native
+            .replace("SUMMARY:Visible event", "SUMMARY:Canonical title")
+            .replace("DTSTART:20260913T100000Z", "DTSTART:20260920T121500Z")
+            .replace("DTEND:20260913T110000Z", "DTEND:20260920T134500Z")
+            .replace("X-SIBLING:original", "X-SIBLING:canonical");
+        let (root, captured) = serve_dav(vec![
+            ("PUT", 204, String::new()),
+            ("GET", 200, canonical.clone()),
+        ])
+        .await;
+        let mut caldav_account = account("calendar", "caldav");
+        caldav_account.caldav_url = root;
+        let (_dir, db) = temp_pool();
+        let services = injected_services();
+        let request = occurrence_update_request(native);
+        let outcome = CalDavCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &caldav_account,
+                &request,
+            )
+            .await
+            .unwrap();
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
+        assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
+        let put_body = requests[0].split_once("\r\n\r\n").unwrap().1;
+        assert!(put_body.contains("SUMMARY:Requested title\n"));
+        assert!(!put_body.contains("DESCRIPTION:Old"));
+        assert!(!put_body.contains("LOCATION:Old"));
+        assert!(put_body.contains("ATTENDEE:mailto:guest@example.test"));
+        assert!(put_body.contains("X-KEEP:value"));
+        assert!(put_body.contains("X-MASTER:keep"));
+        assert!(requests[1].starts_with("GET /calendar/event.ics HTTP/1.1\r\n"));
+        assert_eq!(outcome.occurrence.title, "Canonical title");
+        assert_eq!(outcome.occurrence.start_time, "2026-09-20T12:15:00Z");
+        assert_eq!(outcome.occurrence.end_time, "2026-09-20T13:45:00Z");
+        assert_eq!(
+            outcome.replacement_identity.provider_native_data.as_deref(),
+            Some(canonical.as_str())
+        );
+        assert_eq!(
+            outcome.replacement_identity.provider_revision.as_deref(),
+            Some("\"uploaded-etag\"")
+        );
+        assert_eq!(
+            outcome.replacement_identity.provider_calendar_id,
+            request.trusted_identity.provider_calendar_id
+        );
+        assert_ne!(
+            outcome.replacement_identity.provider_calendar_id,
+            Some(request.target_id.clone())
+        );
+        assert!(outcome.canonical_event.is_none());
+        let seeds = outcome.canonical_recurrence_objects.unwrap();
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds.iter().all(|seed| {
+            seed.provider_native_data.as_deref() == Some(canonical.as_str())
+                && seed.provider_revision.as_deref() == Some("\"uploaded-etag\"")
+        }));
+        assert!(seeds.iter().any(|seed| {
+            seed.recurrence_id.as_deref() == Some("20260927T100000Z")
+                && seed.occurrence.title == "Canonical title"
+        }));
+    }
+
+    #[tokio::test]
+    async fn canonical_override_removal_and_etag_forms_are_preserved() {
+        for etag in ["\"strong-etag\"", "W/\"weak-etag\""] {
+            let native = occurrence_resource_with_sibling("");
+            let canonical = native.replace(&occurrence_sibling(), "");
+            let (root, captured) = serve_dav_with_etag(
+                vec![("PUT", 204, String::new()), ("GET", 200, canonical.clone())],
+                Some(etag),
+            )
+            .await;
+            let mut caldav_account = account("calendar", "caldav");
+            caldav_account.caldav_url = root;
+            let (_dir, db) = temp_pool();
+            let services = injected_services();
+            let mut request = occurrence_update_request(native);
+            request.expected_provider_revision = Some(etag.into());
+            request.trusted_identity.provider_revision = Some(etag.into());
+
+            let outcome = CalDavCalendarBackend
+                .update_recurrence_occurrence(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services,
+                    },
+                    &caldav_account,
+                    &request,
+                )
+                .await
+                .unwrap();
+            let requests = captured.await.unwrap();
+            assert!(requests[0].contains(&format!("if-match: {etag}\r\n")));
+            assert_eq!(
+                outcome.replacement_identity.provider_revision.as_deref(),
+                Some(etag)
+            );
+            let seeds = outcome.canonical_recurrence_objects.unwrap();
+            assert_eq!(seeds.len(), 2);
+            assert!(seeds.iter().all(|seed| {
+                seed.provider_native_data.as_deref() == Some(canonical.as_str())
+                    && seed.provider_revision.as_deref() == Some(etag)
+                    && seed.recurrence_id.as_deref() != Some("20260927T100000Z")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_preserves_missing_canonical_etag_as_none() {
+        let native = occurrence_resource("");
+        let canonical = native.replace("SUMMARY:Visible event", "SUMMARY:Canonical");
+        let (root, captured) = serve_dav_with_etag(
+            vec![("PUT", 204, String::new()), ("GET", 200, canonical)],
+            None,
+        )
+        .await;
+        let mut caldav_account = account("calendar", "caldav");
+        caldav_account.caldav_url = root;
+        let (_dir, db) = temp_pool();
+        let services = injected_services();
+        let request = occurrence_update_request(native);
+        let outcome = CalDavCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &caldav_account,
+                &request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.await.unwrap().len(), 2);
+        assert_eq!(outcome.replacement_identity.provider_revision, None);
+        assert!(outcome
+            .canonical_recurrence_objects
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|seed| seed.provider_revision.is_none()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        caldav_account.caldav_url = format!("http://{}/dav/", listener.local_addr().unwrap());
+        let mut next = request;
+        next.expected_provider_revision = None;
+        next.trusted_identity = outcome
+            .replacement_identity
+            .bind("acc1", next.current_event.id.clone(), "exception-object")
+            .unwrap();
+        let error = CalDavCalendarBackend
+            .update_recurrence_occurrence(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &caldav_account,
+                &next,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Sync(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_maps_conflicts_to_stale_sync_error() {
+        let native = occurrence_resource("");
+        for status in [409, 412] {
+            let (root, captured) = serve_dav(vec![("PUT", status, "stale".into())]).await;
+            let mut caldav_account = account("calendar", "caldav");
+            caldav_account.caldav_url = root;
+            let (_dir, db) = temp_pool();
+            let services = injected_services();
+            let error = CalDavCalendarBackend
+                .update_recurrence_occurrence(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services,
+                    },
+                    &caldav_account,
+                    &occurrence_update_request(native.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Sync(_)));
+            assert!(error.to_string().contains("reconciliation required"));
+            assert_eq!(captured.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_ambiguous_and_range_resources_fail_before_io() {
+        for native in [
+            occurrence_resource("RECURRENCE-ID:20260920T100000Z\n"),
+            occurrence_resource("").replace(
+                "RECURRENCE-ID:20260920T100000Z",
+                "RECURRENCE-ID;RANGE=THISANDFUTURE:20260920T100000Z",
+            ),
+            occurrence_resource("")
+                .trim_end_matches("END:VCALENDAR\n")
+                .into(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}/dav/", listener.local_addr().unwrap());
+            let mut caldav_account = account("calendar", "caldav");
+            caldav_account.caldav_url = root;
+            let (_dir, db) = temp_pool();
+            let services = injected_services();
+            assert!(CalDavCalendarBackend
+                .update_recurrence_occurrence(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services,
+                    },
+                    &caldav_account,
+                    &occurrence_update_request(native),
+                )
+                .await
+                .is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn initial_series_put_preserves_proof_until_real_provider_read() {
         let (_dir, db) = upload_db().await;
@@ -860,7 +1547,8 @@ mod recurrence_tests {
             "<d:response><d:href>{}</d:href><d:propstat><d:prop>\
              <d:getetag>\"uploaded-etag\"</d:getetag>\
              <c:calendar-data><![CDATA[{provider_source}]]></c:calendar-data>\
-             </d:prop></d:propstat></d:response>",
+             </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\
+             </d:response>",
             attached.remote_id.as_ref().unwrap()
         );
         let (root, captured) = serve_dav(sync_responses(&report)).await;
@@ -874,10 +1562,77 @@ mod recurrence_tests {
             Some(provider_source.as_str())
         );
         assert_eq!(refreshed.remote_id, attached.remote_id);
-        assert_eq!(refreshed.etag.as_deref(), Some("uploaded-etag"));
+        assert_eq!(refreshed.etag.as_deref(), Some("\"uploaded-etag\""));
         assert!(db::calendar_invitation::validated_series_rule(&conn, &refreshed).is_err());
         assert_eq!(proof_count(&conn), 0);
         assert!(get_unpushed_events(&conn, "acc1").unwrap().is_empty());
+    }
+
+    async fn insert_synced_series(db: &DbPool) -> (CalendarEvent, Vec<RecurrenceIdentity>) {
+        let account = account("calendar", "caldav");
+        let resource = resource(&format!(
+            "{}{}",
+            component("RRULE:FREQ=WEEKLY\n"),
+            component("RECURRENCE-ID:20260920T100000Z\n")
+        ));
+        let parsed = parse_caldav_resource(&resource, &account, "cal1", "/calendar/").unwrap();
+        let event_id = {
+            let conn = db.writer().await;
+            db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &parsed.event,
+                parsed.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap()
+        };
+        let conn = db.reader();
+        (
+            db::calendar::get_event(&conn, &event_id).unwrap(),
+            db::calendar_recurrence::get_by_event_id(&conn, &event_id).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_report_fetch_or_parse_preserves_rows_and_identities() {
+        for (status, body) in [
+            (500, "server error".to_string()),
+            (207, "<d:multistatus xmlns:d=\"DAV:\">".to_string()),
+            (207, "<not-multistatus/>".to_string()),
+        ] {
+            let (_dir, db) = upload_db().await;
+            let (before, identities_before) = insert_synced_series(&db).await;
+            let mut responses = sync_responses("");
+            responses[3] = ("REPORT", status, body);
+            let (root, captured) = serve_dav(responses).await;
+
+            sync_at(&db, &root).await.unwrap();
+            assert_eq!(captured.await.unwrap().len(), 4);
+            assert_eq!(
+                db::calendar::get_event(&db.reader(), &before.id).unwrap(),
+                before
+            );
+            assert_eq!(
+                db::calendar_recurrence::get_by_event_id(&db.reader(), &before.id).unwrap(),
+                identities_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_empty_report_deletes_absent_rows_and_identities() {
+        let (_dir, db) = upload_db().await;
+        let (before, identities_before) = insert_synced_series(&db).await;
+        assert!(!identities_before.is_empty());
+        let (root, captured) = serve_dav(sync_responses("")).await;
+
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        assert!(db::calendar::get_event(&db.reader(), &before.id).is_err());
+        assert!(
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &before.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1341,12 +2096,13 @@ mod recurrence_tests {
         for (components, kind) in [
             (standalone.clone(), RecurrenceKind::Standalone),
             (format!("{master}{occurrence}"), RecurrenceKind::Series),
-            (format!("{occurrence}{master}"), RecurrenceKind::Occurrence),
+            (format!("{occurrence}{master}"), RecurrenceKind::Series),
             (format!("{standalone}{occurrence}"), RecurrenceKind::Unknown),
             (format!("{standalone}{standalone}"), RecurrenceKind::Unknown),
         ] {
             let resource = resource(&components);
-            let event = from_caldav_event(&resource, &account, "calendar-1").unwrap();
+            let event =
+                from_caldav_event(&resource, &account, "calendar-1", "/collections/work/").unwrap();
             assert_eq!(event.recurrence_kind, kind);
             assert_eq!(
                 event.ical_data.as_deref(),
@@ -1355,6 +2111,212 @@ mod recurrence_tests {
             assert_eq!(event.remote_id.as_deref(), Some(resource.href.as_str()));
             assert_eq!(event.title, "Visible event");
         }
+    }
+
+    #[test]
+    fn caldav_recurrence_seeds_preserve_resource_and_raw_positions() {
+        let master = component("RRULE:FREQ=WEEKLY\n");
+        let utc = component("RECURRENCE-ID:20260920T100000Z\n");
+        let floating = component("RECURRENCE-ID:20260927T100000\n");
+        let zoned = component(
+            "RECURRENCE-ID;TZID=Europe/Stockholm;RANGE=THISANDFUTURE:\
+             20261004T100000\nSTATUS:CANCELLED\n",
+        );
+        let resource = resource(&format!("{master}{utc}{floating}{zoned}"));
+        let account = account("calendar", "caldav");
+        let parsed =
+            parse_caldav_resource(&resource, &account, "calendar-1", "/collections/work/").unwrap();
+        let seeds = parsed.recurrence_seeds.unwrap();
+
+        assert_eq!(parsed.event.recurrence_kind, RecurrenceKind::Series);
+        assert_eq!(
+            parsed.event.remote_id.as_deref(),
+            Some(resource.href.as_str())
+        );
+        assert_eq!(parsed.event.etag.as_deref(), Some(resource.etag.as_str()));
+        assert_eq!(
+            parsed.event.ical_data.as_deref(),
+            Some(resource.ical_data.as_str())
+        );
+        assert_eq!(seeds.len(), 4);
+        assert_eq!(seeds[0].kind, RecurrenceObjectKind::Master);
+        assert_eq!(
+            seeds[0].provider_series_id.as_deref(),
+            Some(resource.href.as_str())
+        );
+        assert_eq!(seeds[0].occurrence.title, "Visible event");
+        assert_eq!(seeds[0].occurrence.start_time, "2026-09-13T10:00:00Z");
+        for seed in &seeds {
+            assert_eq!(
+                seed.provider_calendar_id.as_deref(),
+                Some("/collections/work/")
+            );
+            assert_ne!(seed.provider_calendar_id, seed.provider_series_id);
+            assert_eq!(
+                seed.provider_native_data.as_deref(),
+                Some(resource.ical_data.as_str())
+            );
+            assert_eq!(
+                seed.provider_revision.as_deref(),
+                Some(resource.etag.as_str())
+            );
+            assert_eq!(seed.provider_occurrence_id, None);
+        }
+        assert_eq!(seeds[1].recurrence_id.as_deref(), Some("20260920T100000Z"));
+        assert_eq!(seeds[1].recurrence_timezone, None);
+        assert_eq!(seeds[1].kind, RecurrenceObjectKind::Exception);
+        assert_eq!(seeds[2].recurrence_id.as_deref(), Some("20260927T100000"));
+        assert_eq!(seeds[2].recurrence_timezone, None);
+        assert_eq!(seeds[3].recurrence_id.as_deref(), Some("20261004T100000"));
+        assert_eq!(
+            seeds[3].recurrence_timezone.as_deref(),
+            Some("Europe/Stockholm")
+        );
+        assert_eq!(seeds[3].kind, RecurrenceObjectKind::Exclusion);
+        assert!(seeds[3]
+            .provider_native_data
+            .as_deref()
+            .unwrap()
+            .contains("RANGE=THISANDFUTURE"));
+    }
+
+    #[test]
+    fn caldav_date_identity_standalone_clear_and_malformed_fail_closed() {
+        let date = CalDavEvent {
+            ical_data: "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Chithi//EN\n\
+                        BEGIN:VEVENT\nUID:shared\nDTSTAMP:20260901T120000Z\n\
+                        RECURRENCE-ID;VALUE=DATE:20260920\n\
+                        DTSTART;VALUE=DATE:20260921\n\
+                        SUMMARY:Moved\nEND:VEVENT\nEND:VCALENDAR\n"
+                .into(),
+            ..resource("")
+        };
+        let account = account("calendar", "caldav");
+        let parsed =
+            parse_caldav_resource(&date, &account, "calendar-1", "/collections/work/").unwrap();
+        let seeds = parsed.recurrence_seeds.unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].recurrence_id.as_deref(), Some("20260920"));
+        assert_eq!(
+            seeds[0].recurrence_value_type,
+            Some(crate::calendar::recurrence_identity::RecurrenceValueType::Date)
+        );
+        assert_eq!(seeds[0].occurrence.title, "Moved");
+        assert_eq!(seeds[0].occurrence.start_time, "2026-09-21");
+        assert_eq!(seeds[0].occurrence.end_time, "2026-09-22");
+        assert!(seeds[0].occurrence.all_day);
+        assert_eq!(seeds[0].kind, RecurrenceObjectKind::Exception);
+
+        let standalone = resource(&component(""));
+        assert!(
+            parse_caldav_resource(&standalone, &account, "calendar-1", "/collections/work/")
+                .unwrap()
+                .recurrence_seeds
+                .unwrap()
+                .is_empty()
+        );
+
+        for malformed in [
+            "RECURRENCE-ID;VALUE=DATE;VALUE=DATE:20260920\n",
+            "RECURRENCE-ID;TZID=:20260920T100000\n",
+            "RECURRENCE-ID:20260920T100000Z\nRECURRENCE-ID:20260927T100000Z\n",
+        ] {
+            let malformed = resource(&component(malformed));
+            let parsed =
+                parse_caldav_resource(&malformed, &account, "calendar-1", "/collections/work/")
+                    .unwrap();
+            assert_eq!(parsed.event.recurrence_kind, RecurrenceKind::Unknown);
+            assert!(parsed.recurrence_seeds.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn caldav_identity_refresh_is_stable_and_only_standalone_clears() {
+        let (_directory, db) = upload_db().await;
+        let account = account("calendar", "caldav");
+        let mut recurring = resource(&format!(
+            "{}{}",
+            component("RRULE:FREQ=WEEKLY\n"),
+            component("RECURRENCE-ID:20260920T100000Z\n")
+        ));
+
+        let first =
+            parse_caldav_resource(&recurring, &account, "cal1", "/collections/work/").unwrap();
+        let first_event_id = {
+            let conn = db.writer().await;
+            db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &first.event,
+                first.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap()
+        };
+        let original =
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &first_event_id).unwrap();
+        assert_eq!(original.len(), 2);
+
+        recurring.etag = "refreshed-etag".into();
+        let refresh =
+            parse_caldav_resource(&recurring, &account, "cal1", "/collections/work/").unwrap();
+        {
+            let conn = db.writer().await;
+            let reconciled = db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &refresh.event,
+                refresh.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reconciled, first_event_id);
+        }
+        let refreshed =
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &first_event_id).unwrap();
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|identity| &identity.object_id)
+                .collect::<Vec<_>>(),
+            original
+                .iter()
+                .map(|identity| &identity.object_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(refreshed
+            .iter()
+            .all(|identity| identity.provider_revision.as_deref() == Some("refreshed-etag")));
+
+        let malformed = resource(&component(
+            "RECURRENCE-ID:20260920T100000Z\nRECURRENCE-ID:20260927T100000Z\n",
+        ));
+        let malformed =
+            parse_caldav_resource(&malformed, &account, "cal1", "/collections/work/").unwrap();
+        assert!(malformed.recurrence_seeds.is_none());
+        {
+            let conn = db.writer().await;
+            db::calendar::upsert_event_by_remote_id(&conn, &malformed.event).unwrap();
+        }
+        assert_eq!(
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &first_event_id).unwrap(),
+            refreshed
+        );
+
+        let standalone = resource(&component(""));
+        let standalone =
+            parse_caldav_resource(&standalone, &account, "cal1", "/collections/work/").unwrap();
+        assert!(standalone.recurrence_seeds.as_ref().unwrap().is_empty());
+        {
+            let conn = db.writer().await;
+            db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &standalone.event,
+                standalone.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &first_event_id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1378,11 +2340,13 @@ mod recurrence_tests {
         )
         .unwrap();
         let resource = resource(&component(""));
-        let mut legacy = from_caldav_event(&resource, &account, &calendar_id).unwrap();
+        let mut legacy =
+            from_caldav_event(&resource, &account, &calendar_id, "/collections/work/").unwrap();
         legacy.recurrence_kind = RecurrenceKind::Unknown;
         db::calendar::upsert_event_by_remote_id(&conn, &legacy).unwrap();
 
-        let refreshed = from_caldav_event(&resource, &account, &calendar_id).unwrap();
+        let refreshed =
+            from_caldav_event(&resource, &account, &calendar_id, "/collections/work/").unwrap();
         assert_eq!(legacy.etag, refreshed.etag);
         db::calendar::upsert_event_by_remote_id(&conn, &refreshed).unwrap();
         let stored: (String, String, String) = conn
