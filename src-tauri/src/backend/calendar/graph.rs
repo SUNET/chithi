@@ -2,11 +2,12 @@
 
 use async_trait::async_trait;
 
-use crate::calendar::CalendarEvent;
+use crate::calendar::recurrence_identity::{RecurrenceObjectKind, RecurrenceValueType};
+use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::db::calendar::NewCalendar;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mail::graph::{
     event_patch_to_graph_json, event_to_graph_json, invitation_copy_patch_to_graph_json,
 };
@@ -14,8 +15,9 @@ use crate::provider::GraphTokenPurpose;
 
 use super::{
     BusyPeriod, CalendarBackend, CalendarBackendCtx, CalendarCapability, InviteReplyDelivery,
-    ParticipantSchedule, ParticipantScheduleRequest, PushedEvent, RemoteRsvpOutcome,
-    RemoteRsvpPolicy, RemoteRsvpRequest, RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+    ParticipantSchedule, ParticipantScheduleRequest, PushedEvent, RemoteOccurrenceUpdate,
+    RemoteOccurrenceUpdateOutcome, RemoteRsvpOutcome, RemoteRsvpPolicy, RemoteRsvpRequest,
+    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
 };
 
 pub struct GraphCalendarBackend;
@@ -300,113 +302,63 @@ impl CalendarBackend for GraphCalendarBackend {
                 gc.name
             );
 
-            let mut conn = db.writer().await;
-            let server_ids: std::collections::HashSet<String> =
-                calendar_events.iter().map(|e| e.id.clone()).collect();
+            let conn = db.writer().await;
 
             for ge in &calendar_events {
-                let existing = conn.query_row(
-                    "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-                    rusqlite::params![account_id, ge.id],
-                    |row| row.get::<_, String>(0),
-                );
-
-                match existing {
-                    Ok(local_id) => {
-                        // Update in place. Also re-pin calendar_id in case
-                        // the event moved between calendars on the server.
-                        let transaction = conn.transaction()?;
-                        transaction.execute(
-                            "UPDATE calendar_events SET title = ?1, start_time = ?2, end_time = ?3,
-                             all_day = ?4, location = ?5, organizer_email = ?6, attendees_json = ?7,
-                             description = ?8, timezone = ?9, my_status = ?10, calendar_id = ?11,
-                             recurrence_kind = ?12
-                             WHERE id = ?13",
-                            rusqlite::params![
-                                ge.subject,
-                                ge.start,
-                                ge.end,
-                                ge.all_day,
-                                ge.location,
-                                ge.organizer_email,
-                                ge.attendees_json,
-                                ge.body_preview,
-                                ge.timezone,
-                                ge.my_status,
-                                local_cal_id,
-                                ge.recurrence_kind.as_str(),
-                                local_id,
-                            ],
+                let recurrence_rule = if ge
+                    .recurrence_seeds
+                    .as_ref()
+                    .is_some_and(|seeds| seeds.is_empty())
+                {
+                    None
+                } else {
+                    // The bounded Graph view does not provide an RFC 5545 rule.
+                    // Preserve existing trusted series evidence unless Graph has
+                    // authoritatively classified the object as standalone.
+                    conn.query_row(
+                        "SELECT recurrence_rule FROM calendar_events
+                         WHERE account_id = ?1 AND remote_id = ?2",
+                        rusqlite::params![account_id, ge.id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten()
+                };
+                let event = CalendarEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    account_id: account_id.to_string(),
+                    calendar_id: local_cal_id.clone(),
+                    uid: ge.ical_uid.clone(),
+                    title: ge.subject.clone(),
+                    description: ge.body_preview.clone(),
+                    location: ge.location.clone(),
+                    start_time: ge.start.clone(),
+                    end_time: ge.end.clone(),
+                    all_day: ge.all_day,
+                    timezone: ge.timezone.clone(),
+                    recurrence_rule,
+                    recurrence_kind: ge.recurrence_kind,
+                    organizer_email: ge.organizer_email.clone(),
+                    attendees_json: ge.attendees_json.clone(),
+                    my_status: ge.my_status.clone(),
+                    source_message_id: None,
+                    ical_data: None,
+                    remote_id: Some(ge.id.clone()),
+                    etag: None,
+                };
+                match &ge.recurrence_seeds {
+                    Some(seeds) => {
+                        db::calendar::upsert_event_by_remote_id_with_recurrence(
+                            &conn, &event, seeds,
                         )?;
-                        db::calendar_invitation::invalidate(&transaction, &local_id)?;
-                        transaction.commit()?;
                     }
-                    Err(_) => {
-                        let event = CalendarEvent {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            account_id: account_id.to_string(),
-                            calendar_id: local_cal_id.clone(),
-                            uid: ge.ical_uid.clone(),
-                            title: ge.subject.clone(),
-                            description: ge.body_preview.clone(),
-                            location: ge.location.clone(),
-                            start_time: ge.start.clone(),
-                            end_time: ge.end.clone(),
-                            all_day: ge.all_day,
-                            timezone: ge.timezone.clone(),
-                            recurrence_rule: None,
-                            recurrence_kind: ge.recurrence_kind,
-                            organizer_email: ge.organizer_email.clone(),
-                            attendees_json: ge.attendees_json.clone(),
-                            my_status: ge.my_status.clone(),
-                            source_message_id: None,
-                            ical_data: None,
-                            remote_id: Some(ge.id.clone()),
-                            etag: None,
-                        };
-                        let transaction = conn.transaction()?;
-                        db::calendar::insert_event(&transaction, &event)?;
-                        db::calendar_invitation::invalidate(&transaction, &event.id)?;
-                        transaction.commit()?;
-                    }
+                    None => db::calendar::upsert_event_by_remote_id(&conn, &event)?,
                 }
             }
 
-            // Per-calendar reconciliation: drop events that this calendar
-            // used to carry but that the server no longer returns. Scoped
-            // to calendar_id so a deletion in one calendar doesn't wipe
-            // events still present in another.
-            let local_events: Vec<(String, String)> = conn
-                .prepare(
-                    "SELECT id, remote_id FROM calendar_events
-                     WHERE account_id = ?1 AND calendar_id = ?2
-                       AND remote_id IS NOT NULL AND remote_id != ''",
-                )?
-                .query_map(rusqlite::params![account_id, local_cal_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            let deleted_ids: Vec<String> = local_events
-                .iter()
-                .filter(|(_, remote_id)| !server_ids.contains(remote_id))
-                .map(|(local_id, _)| local_id.clone())
-                .collect();
-            let mut deleted = 0;
-            if !deleted_ids.is_empty() {
-                let transaction = conn.transaction()?;
-                deleted =
-                    db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)?.deleted;
-                transaction.commit()?;
-            }
-            if deleted > 0 {
-                log::info!(
-                    "sync_calendars_graph: removed {} server-deleted events from '{}'",
-                    deleted,
-                    gc.name
-                );
-            }
+            // calendarView is bounded to the requested dates. Absence from
+            // this response says nothing about events outside that window (or
+            // deleted events); only a delta/tombstone feed can prove deletion.
         }
 
         log::info!("sync_calendars_graph: completed for account {}", account_id);
@@ -460,6 +412,75 @@ impl CalendarBackend for GraphCalendarBackend {
             .await?;
         let patch = event_patch_to_graph_json(event);
         client.update_event(remote_id, &patch).await
+    }
+
+    async fn update_recurrence_occurrence(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        request: &RemoteOccurrenceUpdate,
+    ) -> Result<RemoteOccurrenceUpdateOutcome> {
+        let (provider_calendar_id, etag, series_id, original_start) =
+            validate_occurrence_update(account, request)?;
+        let refreshed = ctx
+            .services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
+            .update_recurrence_occurrence(
+                &request.target_id,
+                provider_calendar_id,
+                etag,
+                series_id,
+                original_start,
+                &request.patch,
+                &request.desired,
+            )
+            .await?;
+        let mut replacement = refreshed
+            .recurrence_seeds
+            .as_ref()
+            .and_then(|seeds| seeds.first())
+            .cloned()
+            .ok_or_else(|| {
+                Error::Sync(
+                    "Graph occurrence update returned no replacement identity; reconciliation required"
+                        .into(),
+                )
+            })?;
+        replacement.provider_calendar_id = request.trusted_identity.provider_calendar_id.clone();
+        replacement.local_series_event_id = request.trusted_identity.local_series_event_id.clone();
+        replacement.recurrence_timezone = request.trusted_identity.recurrence_timezone.clone();
+        replacement.validate()?;
+        let replacement_etag = replacement.provider_revision.clone();
+
+        let canonical = CalendarEvent {
+            id: request.current_event.id.clone(),
+            account_id: request.current_event.account_id.clone(),
+            calendar_id: request.current_event.calendar_id.clone(),
+            uid: refreshed.ical_uid,
+            title: refreshed.subject,
+            description: refreshed.body_preview,
+            location: refreshed.location,
+            start_time: refreshed.start,
+            end_time: refreshed.end,
+            all_day: refreshed.all_day,
+            timezone: refreshed.timezone,
+            recurrence_rule: request.current_event.recurrence_rule.clone(),
+            recurrence_kind: RecurrenceKind::Occurrence,
+            organizer_email: refreshed.organizer_email,
+            attendees_json: refreshed.attendees_json,
+            my_status: refreshed.my_status,
+            source_message_id: request.current_event.source_message_id.clone(),
+            ical_data: request.current_event.ical_data.clone(),
+            remote_id: Some(request.target_id.clone()),
+            etag: replacement_etag,
+        };
+        Ok(RemoteOccurrenceUpdateOutcome {
+            occurrence: replacement.occurrence.clone(),
+            replacement_identity: replacement,
+            canonical_event: Some(canonical),
+            canonical_recurrence_objects: None,
+        })
     }
 
     async fn push_updated_invitation_copy(
@@ -534,6 +555,189 @@ impl CalendarBackend for GraphCalendarBackend {
             );
         }
         Ok(())
+    }
+}
+
+fn validate_occurrence_update<'a>(
+    account: &AccountFull,
+    request: &'a RemoteOccurrenceUpdate,
+) -> Result<(&'a str, &'a str, &'a str, &'a str)> {
+    let identity = &request.trusted_identity;
+    identity.validate()?;
+    request.desired.validate()?;
+    if !matches!(
+        identity.kind,
+        RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+    ) || identity.recurrence_value_type != Some(RecurrenceValueType::DateTime)
+        || request.current_event.recurrence_kind != RecurrenceKind::Occurrence
+        || identity.account_id != account.id
+        || identity.event_id != request.current_event.id
+        || request.current_event.account_id != account.id
+        || request.current_event.remote_id.as_deref() != Some(request.target_id.as_str())
+        || identity.provider_occurrence_id.as_deref() != Some(request.target_id.as_str())
+    {
+        return Err(Error::Other(
+            "Graph THIS-OCCURRENCE target is not a trusted immutable occurrence".into(),
+        ));
+    }
+    let etag = request
+        .expected_provider_revision
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or(Error::UnsupportedCapability {
+            protocol: "graph",
+            capability: "THIS-OCCURRENCE update without @odata.etag",
+        })?;
+    if identity.provider_revision.as_deref() != Some(etag) {
+        return Err(Error::Other(
+            "Graph occurrence revision does not match its trusted identity".into(),
+        ));
+    }
+    let provider_calendar_id = identity
+        .provider_calendar_id
+        .as_deref()
+        .ok_or_else(|| Error::Other("Graph occurrence has no calendar identity".into()))?;
+    let series_id = identity
+        .provider_series_id
+        .as_deref()
+        .ok_or_else(|| Error::Other("Graph occurrence has no series identity".into()))?;
+    let original_start = identity
+        .recurrence_id
+        .as_deref()
+        .ok_or_else(|| Error::Other("Graph occurrence has no originalStart identity".into()))?;
+    let native: serde_json::Value = serde_json::from_str(
+        identity
+            .provider_native_data
+            .as_deref()
+            .ok_or_else(|| Error::Other("Graph occurrence has no native identity data".into()))?,
+    )
+    .map_err(|error| Error::Other(format!("Invalid Graph occurrence identity data: {error}")))?;
+    let expected_type = match identity.kind {
+        RecurrenceObjectKind::Occurrence => "occurrence",
+        RecurrenceObjectKind::Exception => "exception",
+        _ => unreachable!(),
+    };
+    if native["id"].as_str() != Some(request.target_id.as_str())
+        || native["type"].as_str() != Some(expected_type)
+        || native["seriesMasterId"].as_str() != Some(series_id)
+        || native["originalStart"].as_str() != Some(original_start)
+        || native["@odata.etag"].as_str() != Some(etag)
+    {
+        return Err(Error::Other(
+            "Graph occurrence identity does not match its native immutable identity".into(),
+        ));
+    }
+    Ok((provider_calendar_id, etag, series_id, original_start))
+}
+
+#[cfg(test)]
+mod occurrence_validation_tests {
+    use super::validate_occurrence_update;
+    use crate::backend::calendar::RemoteOccurrenceUpdate;
+    use crate::backend::testutil::{account, event};
+    use crate::calendar::recurrence_identity::{
+        OccurrenceFields, RecurrenceIdentity, RecurrenceObjectKind, RecurrenceValueType,
+        UpdateOccurrenceInput,
+    };
+    use crate::calendar::RecurrenceKind;
+
+    fn request() -> RemoteOccurrenceUpdate {
+        let fields = OccurrenceFields {
+            title: "Occurrence".into(),
+            description: Some("Description".into()),
+            location: Some("Room".into()),
+            start_time: "2026-09-15T10:00:00Z".into(),
+            end_time: "2026-09-15T11:00:00Z".into(),
+            all_day: false,
+            timezone: Some("UTC".into()),
+        };
+        let mut current = event();
+        current.remote_id = Some("immutable-occurrence".into());
+        current.recurrence_kind = RecurrenceKind::Occurrence;
+        RemoteOccurrenceUpdate {
+            target_id: "immutable-occurrence".into(),
+            expected_provider_revision: Some("etag-1".into()),
+            trusted_identity: RecurrenceIdentity {
+                object_id: "object".into(),
+                account_id: "acc1".into(),
+                event_id: current.id.clone(),
+                local_series_event_id: None,
+                provider_calendar_id: Some("provider-calendar".into()),
+                provider_series_id: Some("immutable-master".into()),
+                provider_occurrence_id: Some("immutable-occurrence".into()),
+                recurrence_id: Some("2026-09-15T09:00:00.0000000Z".into()),
+                recurrence_timezone: Some("UTC".into()),
+                recurrence_value_type: Some(RecurrenceValueType::DateTime),
+                occurrence: fields.clone(),
+                provider_native_data: Some(
+                    serde_json::json!({
+                        "id": "immutable-occurrence",
+                        "type": "occurrence",
+                        "seriesMasterId": "immutable-master",
+                        "originalStart": "2026-09-15T09:00:00.0000000Z",
+                        "@odata.etag": "etag-1"
+                    })
+                    .to_string(),
+                ),
+                provider_revision: Some("etag-1".into()),
+                kind: RecurrenceObjectKind::Occurrence,
+            },
+            current_event: current,
+            patch: UpdateOccurrenceInput::default(),
+            desired: fields,
+        }
+    }
+
+    #[test]
+    fn occurrence_write_requires_an_odata_etag() {
+        let mut request = request();
+        request.expected_provider_revision = None;
+        request.trusted_identity.provider_revision = None;
+
+        let error =
+            validate_occurrence_update(&account("calendar", "graph"), &request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::UnsupportedCapability { .. }
+        ));
+    }
+
+    #[test]
+    fn occurrence_write_uses_the_provider_calendar_not_the_local_uuid() {
+        let mut request = request();
+        request.current_event.calendar_id = "local-calendar-uuid".into();
+
+        let (provider_calendar_id, _, _, _) =
+            validate_occurrence_update(&account("calendar", "graph"), &request).unwrap();
+
+        assert_eq!(provider_calendar_id, "provider-calendar");
+        assert_ne!(provider_calendar_id, request.current_event.calendar_id);
+    }
+
+    #[test]
+    fn occurrence_write_rejects_any_native_identity_mismatch() {
+        for field in [
+            "id",
+            "type",
+            "seriesMasterId",
+            "originalStart",
+            "@odata.etag",
+        ] {
+            let mut request = request();
+            let mut native: serde_json::Value = serde_json::from_str(
+                request
+                    .trusted_identity
+                    .provider_native_data
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap();
+            native[field] = serde_json::json!("different");
+            request.trusted_identity.provider_native_data = Some(native.to_string());
+
+            assert!(validate_occurrence_update(&account("calendar", "graph"), &request).is_err());
+        }
     }
 }
 
@@ -688,7 +892,10 @@ mod recurrence_sync_tests {
         cache_event, serve_responses, services, setup_db,
     };
     use crate::backend::testutil::account;
-    use crate::calendar::RecurrenceKind;
+    use crate::calendar::{
+        recurrence_identity::{RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType},
+        RecurrenceKind,
+    };
     use crate::db;
     use serde_json::json;
 
@@ -696,6 +903,8 @@ mod recurrence_sync_tests {
         let mut event = json!({
             "id": id,
             "iCalUId": format!("uid-{id}@example.test"),
+            "@odata.etag": "revision-1",
+            "changeKey": "native-change-key",
             "subject": "Refreshed event",
             "start": {"dateTime": "2026-09-14T09:00:00", "timeZone": "UTC"},
             "end": {"dateTime": "2026-09-14T10:00:00", "timeZone": "UTC"}
@@ -786,11 +995,11 @@ mod recurrence_sync_tests {
                 RecurrenceKind::Standalone,
             ),
             (
-                json!({"type": "occurrence", "seriesMasterId": "master", "recurrence": null}),
+                json!({"type": "occurrence", "seriesMasterId": "master", "originalStart": "2026-09-14T09:00:00Z", "recurrence": null}),
                 RecurrenceKind::Occurrence,
             ),
             (
-                json!({"type": "exception", "seriesMasterId": "master", "recurrence": null}),
+                json!({"type": "exception", "seriesMasterId": "master", "originalStart": "2026-09-14T09:00:00Z", "recurrence": null}),
                 RecurrenceKind::Occurrence,
             ),
             (
@@ -816,7 +1025,13 @@ mod recurrence_sync_tests {
             }
             let (root, captured) = serve_responses(vec![
                 (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
-                (200, json!({"value": [remote_event("remote", &metadata), remote_event("new", &metadata)]})),
+                (200, {
+                    let mut new_metadata = metadata.clone();
+                    if new_metadata.get("originalStart").is_some() {
+                        new_metadata["originalStart"] = json!("2026-09-15T09:00:00Z");
+                    }
+                    json!({"value": [remote_event("remote", &metadata), remote_event("new", &new_metadata)]})
+                }),
             ]).await;
             GraphCalendarBackend
                 .sync(
@@ -877,5 +1092,244 @@ mod recurrence_sync_tests {
         let after =
             serde_json::to_value(db::calendar::get_event(&db.reader(), "cached").unwrap()).unwrap();
         assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn recurring_identity_is_stable_across_refreshes() {
+        let (_dir, db) = setup_db().await;
+        let metadata = json!({
+            "type": "exception",
+            "seriesMasterId": "immutable-master",
+            "originalStart": "2026-09-14T09:00:00.0000000Z",
+            "recurrence": null
+        });
+        let first = remote_event("immutable-exception", &metadata);
+        let mut second = first.clone();
+        second["@odata.etag"] = json!("revision-2");
+        second["subject"] = json!("Second refresh");
+        let calendar = json!({
+            "value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendar.clone()),
+            (200, json!({"value": [first]})),
+            (200, calendar),
+            (200, json!({"value": [second]})),
+        ])
+        .await;
+        let provider_services = services(&root);
+        let ctx = CalendarBackendCtx {
+            db: &db,
+            services: &provider_services,
+        };
+        let account = account("calendar", "graph");
+
+        GraphCalendarBackend.sync(&ctx, &account).await.unwrap();
+        let first_identity = {
+            let conn = db.reader();
+            let event = conn
+                .query_row(
+                    "SELECT id FROM calendar_events WHERE remote_id = 'immutable-exception'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            db::calendar_recurrence::get_by_event_id(&conn, &event)
+                .unwrap()
+                .remove(0)
+        };
+        GraphCalendarBackend.sync(&ctx, &account).await.unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        let identities =
+            db::calendar_recurrence::get_by_event_id(&conn, &first_identity.event_id).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].object_id, first_identity.object_id);
+        assert_eq!(
+            identities[0].provider_revision.as_deref(),
+            Some("revision-2")
+        );
+        assert_eq!(
+            identities[0].recurrence_id.as_deref(),
+            Some("2026-09-14T09:00:00.0000000Z")
+        );
+        let native: serde_json::Value =
+            serde_json::from_str(identities[0].provider_native_data.as_deref().unwrap()).unwrap();
+        assert_eq!(native["subject"], "Second refresh");
+    }
+
+    #[tokio::test]
+    async fn same_series_id_in_two_provider_calendars_does_not_collide() {
+        let (_dir, db) = setup_db().await;
+        let metadata = json!({
+            "type": "occurrence",
+            "seriesMasterId": "shared-series-id",
+            "originalStart": "2026-09-14T09:00:00Z",
+            "recurrence": null
+        });
+        let calendars = json!({
+            "value": [
+                {"id": "remote-calendar-a", "name": "A", "isDefaultCalendar": true},
+                {"id": "remote-calendar-b", "name": "B", "isDefaultCalendar": false}
+            ]
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendars),
+            (
+                200,
+                json!({"value": [remote_event("occurrence-a", &metadata)]}),
+            ),
+            (
+                200,
+                json!({"value": [remote_event("occurrence-b", &metadata)]}),
+            ),
+        ])
+        .await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 3);
+        let conn = db.reader();
+        for provider_calendar_id in ["remote-calendar-a", "remote-calendar-b"] {
+            let identities = db::calendar_recurrence::list_series_objects(
+                &conn,
+                "acc1",
+                None,
+                Some(provider_calendar_id),
+                Some("shared-series-id"),
+            )
+            .unwrap();
+            assert_eq!(identities.len(), 1);
+            assert_eq!(
+                identities[0].provider_calendar_id.as_deref(),
+                Some(provider_calendar_id)
+            );
+            let local_calendar_id: String = conn
+                .query_row(
+                    "SELECT calendar_id FROM calendar_events WHERE id = ?1",
+                    [&identities[0].event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_ne!(local_calendar_id, provider_calendar_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_calendar_view_absence_does_not_delete_local_events() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            cache_event(&conn, "outside-window", Some("remote-outside-window"));
+        }
+        let (root, captured) = serve_responses(vec![
+            (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
+            (200, json!({"value": []})),
+        ])
+        .await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 2);
+        assert!(db::calendar::get_event(&db.reader(), "outside-window").is_ok());
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_preserves_identity_until_proven_standalone() {
+        let (_dir, db) = setup_db().await;
+        let event_id = {
+            let conn = db.writer().await;
+            cache_event(&conn, "cached", Some("immutable-event"));
+            let event = db::calendar::get_event(&conn, "cached").unwrap();
+            let seed = RecurrenceIdentitySeed {
+                local_series_event_id: None,
+                provider_calendar_id: Some("primary".into()),
+                provider_series_id: Some("immutable-master".into()),
+                provider_occurrence_id: Some("immutable-event".into()),
+                recurrence_id: Some("2026-09-14T09:00:00Z".into()),
+                recurrence_timezone: Some("UTC".into()),
+                recurrence_value_type: Some(RecurrenceValueType::DateTime),
+                occurrence: crate::calendar::recurrence_identity::OccurrenceFields {
+                    title: event.title.clone(),
+                    description: event.description.clone(),
+                    location: event.location.clone(),
+                    start_time: event.start_time.clone(),
+                    end_time: event.end_time.clone(),
+                    all_day: event.all_day,
+                    timezone: event.timezone.clone(),
+                },
+                provider_native_data: Some("{\"trusted\":true}".into()),
+                provider_revision: Some("trusted-revision".into()),
+                kind: RecurrenceObjectKind::Occurrence,
+            };
+            db::calendar::upsert_event_by_remote_id_with_recurrence(&conn, &event, &[seed]).unwrap()
+        };
+        let malformed = json!({
+            "type": "exception",
+            "seriesMasterId": "immutable-master",
+            "recurrence": null
+        });
+        let standalone = json!({
+            "type": "singleInstance",
+            "seriesMasterId": null,
+            "recurrence": null
+        });
+        let calendar = json!({
+            "value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendar.clone()),
+            (
+                200,
+                json!({"value": [remote_event("immutable-event", &malformed)]}),
+            ),
+            (200, calendar),
+            (
+                200,
+                json!({"value": [remote_event("immutable-event", &standalone)]}),
+            ),
+        ])
+        .await;
+        let provider_services = services(&root);
+        let ctx = CalendarBackendCtx {
+            db: &db,
+            services: &provider_services,
+        };
+        let account = account("calendar", "graph");
+
+        GraphCalendarBackend.sync(&ctx, &account).await.unwrap();
+        let preserved = db::calendar_recurrence::get_by_event_id(&db.reader(), &event_id).unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(
+            preserved[0].provider_revision.as_deref(),
+            Some("trusted-revision")
+        );
+
+        GraphCalendarBackend.sync(&ctx, &account).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        assert!(
+            db::calendar_recurrence::get_by_event_id(&db.reader(), &event_id)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

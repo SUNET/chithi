@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 
-use super::{Attendee, RecurrenceKind};
+use super::{
+    recurrence_identity::{OccurrenceFields, RecurrenceValueType, UpdateOccurrenceInput},
+    Attendee, RecurrenceKind,
+};
 
 /// A parsed calendar invite extracted from an email or raw iCalendar text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,8 +27,30 @@ pub struct ParsedInvite {
     #[serde(default)]
     pub recurrence_kind: RecurrenceKind,
     pub sequence: u32,
-    #[serde(skip_serializing)]
+    #[serde(default, skip_serializing)]
     pub ical_raw: String, // Original iCalendar text
+}
+
+/// Lossless recurrence position metadata for one VEVENT.
+///
+/// `raw_value` is deliberately not converted to UTC or ISO 8601: together
+/// with its value type and TZID it is the immutable provider position needed
+/// to address the original occurrence on a later mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedRecurrenceId {
+    pub raw_value: String,
+    pub value_type: RecurrenceValueType,
+    pub timezone: Option<String>,
+    pub range: Option<String>,
+}
+
+/// A parsed event plus recurrence metadata that is safe to use as identity.
+/// A VEVENT with a RECURRENCE-ID but no `recurrence_id` failed validation.
+#[derive(Debug, Clone)]
+pub struct ParsedIcalEvent {
+    pub invite: ParsedInvite,
+    pub recurrence_id: Option<ParsedRecurrenceId>,
+    pub explicitly_cancelled: bool,
 }
 
 /// One logical event from an iCalendar resource. A recurring master and all
@@ -247,6 +272,422 @@ fn build_personal_calendar(parts: &SplitCalendar, event_indices: &[usize]) -> St
     format!("{}\r\n", lines.join("\r\n"))
 }
 
+/// Rewrite the editable fields of exactly one explicit recurrence exception.
+/// All matching is against the immutable RECURRENCE-ID, never DTSTART.
+pub fn rewrite_recurrence_occurrence(
+    ical_text: &str,
+    uid: &str,
+    recurrence_id: &str,
+    value_type: RecurrenceValueType,
+    recurrence_timezone: Option<&str>,
+    patch: &UpdateOccurrenceInput,
+    desired: &OccurrenceFields,
+) -> Result<String, String> {
+    desired.validate().map_err(|error| error.to_string())?;
+    let parts = split_calendar_components(ical_text)?;
+    let parsed = parse_ical_data_with_recurrence(ical_text);
+    if parsed.len() != parts.events.len() {
+        return Err("The complete VCALENDAR could not be parsed safely".into());
+    }
+
+    let matches: Vec<usize> = parsed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, component)| {
+            let identity = component.recurrence_id.as_ref()?;
+            (component.invite.uid == uid
+                && identity.raw_value == recurrence_id
+                && identity.value_type == value_type
+                && identity.timezone.as_deref() == recurrence_timezone)
+                .then_some(index)
+        })
+        .collect();
+    let [selected] = matches.as_slice() else {
+        return Err("The VCALENDAR must contain exactly one matching recurrence exception".into());
+    };
+    if parsed[*selected]
+        .recurrence_id
+        .as_ref()
+        .and_then(|identity| identity.range.as_deref())
+        .is_some()
+    {
+        return Err("RANGE=THISANDFUTURE cannot be edited as one occurrence".into());
+    }
+
+    let (lines, physical_lines, line_ending) = unfolded_ical_lines(ical_text);
+    let ranges = top_level_event_ranges(&lines)?;
+    if ranges.len() != parsed.len() {
+        return Err("The VCALENDAR event structure could not be matched safely".into());
+    }
+    let (start, end) = ranges[*selected];
+    validate_rewrite_target(&lines[start + 1..end], uid)?;
+    let use_duration = top_level_property_count(&lines[start + 1..end], "DURATION") == 1;
+    let rewrite_times = patch.start_time.is_some()
+        || patch.end_time.is_some()
+        || patch.all_day.is_some()
+        || patch.timezone.is_some();
+    let replacement = occurrence_content_lines(patch, desired, rewrite_times, use_duration)?;
+
+    let mut output = Vec::with_capacity(lines.len() + replacement.len());
+    let mut nested_depth = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let inside = index > start && index < end;
+        if inside
+            && nested_depth == 0
+            && should_rewrite_occurrence_property(line, patch, rewrite_times)
+        {
+            continue;
+        }
+        if index == end {
+            output.extend(replacement.iter().cloned());
+        }
+        output.extend(physical_lines[index].iter().cloned());
+        if inside && component_marker(line.trim(), "BEGIN").is_some() {
+            nested_depth += 1;
+        } else if inside && component_marker(line.trim(), "END").is_some() {
+            nested_depth = nested_depth.saturating_sub(1);
+        }
+    }
+    Ok(format!("{}{line_ending}", output.join(line_ending)))
+}
+
+/// Select exactly one parsed exception from a complete VCALENDAR.
+pub fn select_recurrence_occurrence(
+    ical_text: &str,
+    uid: &str,
+    recurrence_id: &str,
+    value_type: RecurrenceValueType,
+    recurrence_timezone: Option<&str>,
+) -> Result<ParsedIcalEvent, String> {
+    let parts = split_calendar_components(ical_text)?;
+    let parsed = parse_ical_data_with_recurrence(ical_text);
+    if parsed.len() != parts.events.len() {
+        return Err("The complete VCALENDAR could not be parsed safely".into());
+    }
+    let matches: Vec<usize> = parsed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, component)| {
+            (component.invite.uid == uid
+                && component.recurrence_id.as_ref().is_some_and(|identity| {
+                    identity.raw_value == recurrence_id
+                        && identity.value_type == value_type
+                        && identity.timezone.as_deref() == recurrence_timezone
+                }))
+            .then_some(index)
+        })
+        .collect();
+    let [selected] = matches.as_slice() else {
+        return Err(
+            "The canonical VCALENDAR must contain exactly one matching recurrence exception".into(),
+        );
+    };
+    let event = &parts.events[*selected];
+    if event.len() < 2 {
+        return Err("The canonical recurrence exception is incomplete".into());
+    }
+    validate_rewrite_target(&event[1..event.len() - 1], uid)?;
+    if parsed[*selected]
+        .recurrence_id
+        .as_ref()
+        .and_then(|identity| identity.range.as_deref())
+        .is_some()
+    {
+        return Err("The canonical recurrence exception has RANGE=THISANDFUTURE".into());
+    }
+    Ok(parsed[*selected].clone())
+}
+
+fn unfolded_ical_lines(ical_text: &str) -> (Vec<String>, Vec<Vec<String>>, &'static str) {
+    let line_ending = if ical_text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let normalized = ical_text
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n");
+    let mut lines: Vec<String> = Vec::new();
+    let mut physical_lines: Vec<Vec<String>> = Vec::new();
+    for line in normalized.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(previous) = lines.last_mut() {
+                previous.push_str(&line[1..]);
+                physical_lines.last_mut().unwrap().push(line.to_string());
+            } else {
+                lines.push(line.to_string());
+                physical_lines.push(vec![line.to_string()]);
+            }
+        } else {
+            lines.push(line.to_string());
+            physical_lines.push(vec![line.to_string()]);
+        }
+    }
+    (lines, physical_lines, line_ending)
+}
+
+fn top_level_event_ranges(lines: &[String]) -> Result<Vec<(usize, usize)>, String> {
+    let mut depth = 0usize;
+    let mut event_start = None;
+    let mut ranges = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(name) = component_marker(trimmed, "BEGIN") {
+            if depth == 1 && name.eq_ignore_ascii_case("VEVENT") {
+                event_start = Some(index);
+            }
+            depth += 1;
+        } else if let Some(name) = component_marker(trimmed, "END") {
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| "The VCALENDAR has an unmatched END component".to_string())?;
+            if depth == 1 && name.eq_ignore_ascii_case("VEVENT") {
+                ranges.push((
+                    event_start
+                        .take()
+                        .ok_or_else(|| "The VCALENDAR has an unmatched VEVENT end".to_string())?,
+                    index,
+                ));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+fn validate_rewrite_target(lines: &[String], uid: &str) -> Result<(), String> {
+    if top_level_property_count(lines, "UID") != 1
+        || top_level_property_count(lines, "RECURRENCE-ID") != 1
+        || top_level_property_count(lines, "DTSTART") != 1
+        || top_level_property_count(lines, "SUMMARY") > 1
+        || top_level_property_count(lines, "DESCRIPTION") > 1
+        || top_level_property_count(lines, "LOCATION") > 1
+    {
+        return Err("The matching VEVENT has ambiguous or incomplete properties".into());
+    }
+    let dtend = top_level_property_count(lines, "DTEND");
+    let duration = top_level_property_count(lines, "DURATION");
+    if (dtend, duration) != (1, 0) && (dtend, duration) != (0, 1) {
+        return Err("The matching VEVENT must contain exactly one DTEND or DURATION".into());
+    }
+    let parsed_uid = lines.iter().find_map(|line| {
+        (property_name(line).is_some_and(|name| name.eq_ignore_ascii_case("UID")))
+            .then(|| line.split_once(':').map(|(_, value)| value))
+            .flatten()
+    });
+    if parsed_uid != Some(uid) {
+        return Err("The matching VEVENT UID is not exact".into());
+    }
+    Ok(())
+}
+
+fn top_level_property_count(lines: &[String], expected: &str) -> usize {
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    for line in lines {
+        let trimmed = line.trim();
+        if component_marker(trimmed, "BEGIN").is_some() {
+            depth += 1;
+        } else if component_marker(trimmed, "END").is_some() {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0
+            && property_name(trimmed).is_some_and(|name| name.eq_ignore_ascii_case(expected))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn should_rewrite_occurrence_property(
+    line: &str,
+    patch: &UpdateOccurrenceInput,
+    rewrite_times: bool,
+) -> bool {
+    property_name(line).is_some_and(|name| {
+        (name.eq_ignore_ascii_case("SUMMARY") && patch.title.is_some())
+            || (name.eq_ignore_ascii_case("DESCRIPTION") && patch.description.is_some())
+            || (name.eq_ignore_ascii_case("LOCATION") && patch.location.is_some())
+            || (rewrite_times
+                && ["DTSTART", "DTEND", "DURATION"]
+                    .iter()
+                    .any(|expected| name.eq_ignore_ascii_case(expected)))
+    })
+}
+
+fn occurrence_content_lines(
+    patch: &UpdateOccurrenceInput,
+    desired: &OccurrenceFields,
+    rewrite_times: bool,
+    use_duration: bool,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    if patch.title.is_some() {
+        lines.extend(fold_ical_content_line(&format!(
+            "SUMMARY:{}",
+            ical_text_value(&desired.title)
+        )));
+    }
+    if patch.description.is_some() {
+        if let Some(description) = desired
+            .description
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            lines.extend(fold_ical_content_line(&format!(
+                "DESCRIPTION:{}",
+                ical_text_value(description)
+            )));
+        }
+    }
+    if patch.location.is_some() {
+        if let Some(location) = desired
+            .location
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            lines.extend(fold_ical_content_line(&format!(
+                "LOCATION:{}",
+                ical_text_value(location)
+            )));
+        }
+    }
+    if rewrite_times {
+        let (dtstart, dtend, duration) = occurrence_times(desired, use_duration)?;
+        lines.extend(fold_ical_content_line(&dtstart));
+        if let Some(duration) = duration {
+            lines.extend(fold_ical_content_line(&format!("DURATION:{duration}")));
+        } else {
+            lines.extend(fold_ical_content_line(&dtend));
+        }
+    }
+    Ok(lines)
+}
+
+fn occurrence_times(
+    desired: &OccurrenceFields,
+    use_duration: bool,
+) -> Result<(String, String, Option<String>), String> {
+    if desired.all_day {
+        let start = chrono::NaiveDate::parse_from_str(&desired.start_time, "%Y-%m-%d")
+            .map_err(|_| "Invalid all-day DTSTART".to_string())?;
+        let end = chrono::NaiveDate::parse_from_str(&desired.end_time, "%Y-%m-%d")
+            .map_err(|_| "Invalid all-day DTEND".to_string())?;
+        let duration = use_duration.then(|| format!("P{}D", (end - start).num_days()));
+        return Ok((
+            format!("DTSTART;VALUE=DATE:{}", start.format("%Y%m%d")),
+            format!("DTEND;VALUE=DATE:{}", end.format("%Y%m%d")),
+            duration,
+        ));
+    }
+
+    let start = chrono::DateTime::parse_from_rfc3339(&desired.start_time)
+        .map_err(|_| "Invalid timed DTSTART".to_string())?;
+    let end = chrono::DateTime::parse_from_rfc3339(&desired.end_time)
+        .map_err(|_| "Invalid timed DTEND".to_string())?;
+    let format_time = |value: chrono::DateTime<chrono::FixedOffset>| -> Result<String, String> {
+        if let Some(timezone) = desired.timezone.as_deref() {
+            let resolved = crate::calendar::timezone::windows_to_iana(timezone)
+                .unwrap_or(timezone)
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| format!("Unsupported occurrence timezone '{timezone}'"))?;
+            Ok(value
+                .with_timezone(&resolved)
+                .format("%Y%m%dT%H%M%S")
+                .to_string())
+        } else {
+            Ok(value
+                .with_timezone(&chrono::Utc)
+                .format("%Y%m%dT%H%M%SZ")
+                .to_string())
+        }
+    };
+    let parameter = desired
+        .timezone
+        .as_deref()
+        .map(|timezone| format!(";TZID={}", ical_parameter_value(timezone)))
+        .unwrap_or_default();
+    let duration = use_duration.then(|| ical_duration(end.signed_duration_since(start)));
+    Ok((
+        format!("DTSTART{parameter}:{}", format_time(start)?),
+        format!("DTEND{parameter}:{}", format_time(end)?),
+        duration,
+    ))
+}
+
+fn ical_duration(duration: chrono::Duration) -> String {
+    let mut seconds = duration.num_seconds();
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+    let mut value = "P".to_string();
+    if days > 0 {
+        value.push_str(&format!("{days}D"));
+    }
+    if hours > 0 || minutes > 0 || seconds > 0 || days == 0 {
+        value.push('T');
+        if hours > 0 {
+            value.push_str(&format!("{hours}H"));
+        }
+        if minutes > 0 {
+            value.push_str(&format!("{minutes}M"));
+        }
+        if seconds > 0 || (hours == 0 && minutes == 0) {
+            value.push_str(&format!("{seconds}S"));
+        }
+    }
+    value
+}
+
+fn ical_text_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            ';' => escaped.push_str("\\;"),
+            ',' => escaped.push_str("\\,"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                escaped.push_str("\\n");
+            }
+            '\n' => escaped.push_str("\\n"),
+            ch if ch.is_control() => escaped.push(' '),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn fold_ical_content_line(line: &str) -> Vec<String> {
+    let mut remaining = line;
+    let mut folded = Vec::new();
+    let mut first = true;
+    while !remaining.is_empty() {
+        let limit = if first { 75 } else { 74 };
+        let mut end = remaining.len().min(limit);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        while end < remaining.len() {
+            let next = remaining[end..].chars().next().unwrap().len_utf8();
+            if end + next > limit {
+                break;
+            }
+            end += next;
+        }
+        let prefix = if first { "" } else { " " };
+        folded.push(format!("{prefix}{}", &remaining[..end]));
+        remaining = &remaining[end..];
+        first = false;
+    }
+    folded
+}
+
 /// Parse calendar invites from a raw RFC 5322 email message.
 ///
 /// Scans all MIME parts for `text/calendar` content type, then parses each
@@ -301,6 +742,14 @@ pub fn parse_ical_from_email(raw_message: &[u8]) -> Vec<ParsedInvite> {
 
 /// Parse raw iCalendar text and extract all VEVENT components as `ParsedInvite`s.
 pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
+    parse_ical_data_with_recurrence(ical_text)
+        .into_iter()
+        .map(|event| event.invite)
+        .collect()
+}
+
+/// Parse iCalendar while retaining validated RECURRENCE-ID metadata.
+pub fn parse_ical_data_with_recurrence(ical_text: &str) -> Vec<ParsedIcalEvent> {
     let mut invites = Vec::new();
 
     // Normalize line endings and unfold continuation lines.
@@ -345,6 +794,8 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
         }
 
         let method = find_property_value(vcal, "METHOD").unwrap_or_else(|| "REQUEST".to_string());
+        let calendar_cancelled = single_property(vcal, "METHOD")
+            .is_some_and(|property| property.val.as_str().eq_ignore_ascii_case("CANCEL"));
         // Every row retains the entire resource, including sibling components.
         // A row without an RRULE is not necessarily independently mutable.
         let single_resource = components.len() == 1
@@ -411,23 +862,33 @@ pub fn parse_ical_data(ical_text: &str) -> Vec<ParsedInvite> {
             // Parse ATTENDEEs
             let attendees = parse_attendees(vevent);
 
-            invites.push(ParsedInvite {
-                method: method.clone(),
-                uid,
-                summary,
-                description,
-                location,
-                dtstart,
-                dtend,
-                all_day,
-                timezone,
-                organizer_email,
-                organizer_name,
-                attendees,
-                recurrence_rule,
-                recurrence_kind: classify_vevent(vevent, single_resource && event_count == 1),
-                sequence,
-                ical_raw: ical_text.to_string(),
+            let recurrence_id =
+                single_property(vevent, "RECURRENCE-ID").and_then(parse_recurrence_id_property);
+            let explicitly_cancelled = calendar_cancelled
+                || single_property(vevent, "STATUS").is_some_and(|property| {
+                    property.val.as_str().eq_ignore_ascii_case("CANCELLED")
+                });
+            invites.push(ParsedIcalEvent {
+                invite: ParsedInvite {
+                    method: method.clone(),
+                    uid,
+                    summary,
+                    description,
+                    location,
+                    dtstart,
+                    dtend,
+                    all_day,
+                    timezone,
+                    organizer_email,
+                    organizer_name,
+                    attendees,
+                    recurrence_rule,
+                    recurrence_kind: classify_vevent(vevent, single_resource && event_count == 1),
+                    sequence,
+                    ical_raw: ical_text.to_string(),
+                },
+                recurrence_id,
+                explicitly_cancelled,
             });
         }
     }
@@ -518,18 +979,33 @@ fn classify_vevent(
 /// Validate DATE/DATE-TIME syntax and parameters before trusting an instance id.
 /// Omitted VALUE means DATE-TIME; a date-only value must explicitly say DATE.
 fn valid_ical_date_property(property: &icalendar::parser::Property<'_>) -> bool {
+    parse_ical_date_property(property).is_some()
+}
+
+fn parse_recurrence_id_property(
+    property: &icalendar::parser::Property<'_>,
+) -> Option<ParsedRecurrenceId> {
+    let (value_type, timezone, range) = parse_ical_date_property(property)?;
+    Some(ParsedRecurrenceId {
+        raw_value: property.val.as_str().to_string(),
+        value_type,
+        timezone,
+        range,
+    })
+}
+
+fn parse_ical_date_property(
+    property: &icalendar::parser::Property<'_>,
+) -> Option<(RecurrenceValueType, Option<String>, Option<String>)> {
     let mut value_type = None;
     let mut timezone = None;
     let mut range = None;
     for parameter in &property.params {
-        let Some(value) = parameter
+        let value = parameter
             .val
             .as_ref()
             .map(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-        else {
-            return false;
-        };
+            .filter(|v| !v.is_empty())?;
         let slot = match parameter.key.as_str().to_ascii_uppercase().as_str() {
             "VALUE" => &mut value_type,
             "TZID" => &mut timezone,
@@ -537,30 +1013,32 @@ fn valid_ical_date_property(property: &icalendar::parser::Property<'_>) -> bool 
             _ => continue,
         };
         if slot.replace(value).is_some() {
-            return false;
+            return None;
         }
     }
     if range.is_some_and(|value| !value.eq_ignore_ascii_case("THISANDFUTURE")) {
-        return false;
+        return None;
     }
     let value = property.val.as_str();
     if !value.is_ascii() {
-        return false;
+        return None;
     }
-    match value_type
+    let value_type = match value_type
         .unwrap_or("DATE-TIME")
         .to_ascii_uppercase()
         .as_str()
     {
-        "DATE" => {
-            timezone.is_none()
+        "DATE"
+            if timezone.is_none()
                 && value.len() == 8
                 && value.bytes().all(|byte| byte.is_ascii_digit())
-                && chrono::NaiveDate::parse_from_str(value, "%Y%m%d").is_ok()
+                && chrono::NaiveDate::parse_from_str(value, "%Y%m%d").is_ok() =>
+        {
+            RecurrenceValueType::Date
         }
         "DATE-TIME" => {
             let local = value.strip_suffix('Z').unwrap_or(value);
-            !(value.ends_with('Z') && timezone.is_some())
+            if !(value.ends_with('Z') && timezone.is_some())
                 && local.len() == 15
                 && local.bytes().enumerate().all(|(i, byte)| {
                     if i == 8 {
@@ -570,9 +1048,19 @@ fn valid_ical_date_property(property: &icalendar::parser::Property<'_>) -> bool 
                     }
                 })
                 && chrono::NaiveDateTime::parse_from_str(local, "%Y%m%dT%H%M%S").is_ok()
+            {
+                RecurrenceValueType::DateTime
+            } else {
+                return None;
+            }
         }
-        _ => false,
-    }
+        _ => return None,
+    };
+    Some((
+        value_type,
+        timezone.map(str::to_string),
+        range.map(str::to_string),
+    ))
 }
 
 /// Validate a positive RFC 5545 duration without relying on the tolerant viewer.
@@ -1380,6 +1868,386 @@ END:VCALENDAR\r\n";
                 "{property}"
             );
         }
+    }
+
+    #[test]
+    fn recurrence_id_exposes_raw_value_type_timezone_and_range() {
+        for (property, value_type, timezone, range, raw_value) in [
+            (
+                "RECURRENCE-ID;VALUE=DATE:20260920\n",
+                RecurrenceValueType::Date,
+                None,
+                None,
+                "20260920",
+            ),
+            (
+                "RECURRENCE-ID:20260920T100000Z\n",
+                RecurrenceValueType::DateTime,
+                None,
+                None,
+                "20260920T100000Z",
+            ),
+            (
+                "RECURRENCE-ID;VALUE=DATE-TIME:20260920T100000\n",
+                RecurrenceValueType::DateTime,
+                None,
+                None,
+                "20260920T100000",
+            ),
+            (
+                "RECURRENCE-ID;TZID=Europe/Stockholm;RANGE=THISANDFUTURE:20260920T100000\n",
+                RecurrenceValueType::DateTime,
+                Some("Europe/Stockholm"),
+                Some("THISANDFUTURE"),
+                "20260920T100000",
+            ),
+        ] {
+            let raw = recurrence_calendar(&recurrence_event("instance", property));
+            let parsed = parse_ical_data_with_recurrence(&raw);
+            let identity = parsed[0].recurrence_id.as_ref().unwrap();
+            assert_eq!(identity.raw_value, raw_value);
+            assert_eq!(identity.value_type, value_type);
+            assert_eq!(identity.timezone.as_deref(), timezone);
+            assert_eq!(identity.range.as_deref(), range);
+            assert_eq!(parsed[0].invite.recurrence_kind, RecurrenceKind::Occurrence);
+        }
+
+        for property in [
+            "RECURRENCE-ID;VALUE=DATE;VALUE=DATE:20260920\n",
+            "RECURRENCE-ID;TZID=:20260920T100000\n",
+            "RECURRENCE-ID:20260920T100000Z\nRECURRENCE-ID:20260927T100000Z\n",
+        ] {
+            let raw = recurrence_calendar(&recurrence_event("instance", property));
+            let parsed = parse_ical_data_with_recurrence(&raw);
+            assert_eq!(parsed[0].invite.recurrence_kind, RecurrenceKind::Unknown);
+            assert_eq!(parsed[0].recurrence_id, None);
+        }
+    }
+
+    fn occurrence_fields(all_day: bool) -> OccurrenceFields {
+        OccurrenceFields {
+            title: "Changed, title; with \\ slash and a long UTF-8 value åäö repeated repeatedly"
+                .into(),
+            description: Some("Line one\nLine two, semicolon; slash \\".into()),
+            location: Some("Room, 2; north".into()),
+            start_time: if all_day {
+                "2026-09-22".into()
+            } else {
+                "2026-09-22T08:15:00Z".into()
+            },
+            end_time: if all_day {
+                "2026-09-24".into()
+            } else {
+                "2026-09-22T09:45:00Z".into()
+            },
+            all_day,
+            timezone: None,
+        }
+    }
+
+    fn full_occurrence_patch(all_day: bool) -> UpdateOccurrenceInput {
+        let fields = occurrence_fields(all_day);
+        UpdateOccurrenceInput {
+            title: Some(fields.title),
+            description: fields.description,
+            location: fields.location,
+            start_time: Some(fields.start_time),
+            end_time: Some(fields.end_time),
+            all_day: Some(fields.all_day),
+            timezone: fields.timezone,
+        }
+    }
+
+    #[test]
+    fn occurrence_rewrite_matches_exact_identity_and_isolates_component() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TZ-VENDOR:keep\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:shared\r\nDTSTAMP:20260901T120000Z\r\n\
+DTSTART:20260913T100000Z\r\nDTEND:20260913T110000Z\r\n\
+RRULE:FREQ=WEEKLY\r\nSUMMARY:Master\r\nX-MASTER:keep\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:shared\r\nDTSTAMP:20260901T120000Z\r\n\
+RECURRENCE-ID:20260920T\r\n 100000Z\r\nDTSTART:20260920T100000Z\r\n\
+DTEND:20260920T110000Z\r\nSUMMARY:Old\r\nDESCRIPTION:Old\r\n\
+LOCATION:Old\r\nATTENDEE:mailto:guest@example.test\r\n\
+ORGANIZER:mailto:owner@example.test\r\nRDATE:20260921T100000Z\r\n\
+EXDATE:20260927T100000Z\r\nX-VENDOR:keep\r\nBEGIN:VALARM\r\n\
+DESCRIPTION:Alarm text\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:shared\r\nDTSTAMP:20260901T120000Z\r\n\
+RECURRENCE-ID:20260927T100000Z\r\nDTSTART:20260927T100000Z\r\n\
+DTEND:20260927T110000Z\r\nSUMMARY:Sibling\r\nEND:VEVENT\r\n\
+BEGIN:VTODO\r\nUID:todo\r\nX-TODO:keep\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let rewritten = rewrite_recurrence_occurrence(
+            raw,
+            "shared",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &full_occurrence_patch(false),
+            &occurrence_fields(false),
+        )
+        .unwrap();
+
+        assert!(rewritten.ends_with("\r\n"));
+        assert!(!rewritten.replace("\r\n", "").contains('\n'));
+        for retained in [
+            "SUMMARY:Master",
+            "SUMMARY:Sibling",
+            "DESCRIPTION:Alarm text",
+            "ATTENDEE:mailto:guest@example.test",
+            "ORGANIZER:mailto:owner@example.test",
+            "RDATE:20260921T100000Z",
+            "EXDATE:20260927T100000Z",
+            "X-VENDOR:keep",
+            "X-TODO:keep",
+        ] {
+            assert!(rewritten.contains(retained), "missing {retained}");
+        }
+        assert!(rewritten.contains("RECURRENCE-ID:20260920T\r\n 100000Z\r\n"));
+        assert!(rewritten.contains("DESCRIPTION:Line one\\nLine two\\, semicolon\\; slash \\\\"));
+        assert!(rewritten.contains("LOCATION:Room\\, 2\\; north"));
+        assert!(
+            rewritten.contains("\r\n "),
+            "generated summary should be folded"
+        );
+        assert_eq!(
+            parse_ical_data(&rewritten)
+                .iter()
+                .filter(|event| event.summary.as_deref() == Some("Sibling"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sparse_occurrence_rewrite_preserves_unpatched_content_lines() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\nUID:sparse\r\nDTSTAMP:20260901T120000Z\r\n\
+RECURRENCE-ID;TZID=Europe/Stockholm:20260920T100000\r\n\
+DTSTART;TZID=Europe/Stockholm:20260920T100000\r\n\
+DTEND;TZID=Europe/Stockholm:20260920T110000\r\n\
+SUMMARY;LANGUAGE=en:Visible event\r\nDESCRIPTION;LANGUAGE=en:Old text\r\n\
+LOCATION;LANGUAGE=en:Old room\r\nX-NATIVE;VALUE=TEXT:keep\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let desired = OccurrenceFields {
+            title: "Visible event".into(),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            start_time: "2026-09-20T08:00:00Z".into(),
+            end_time: "2026-09-20T09:00:00Z".into(),
+            all_day: false,
+            timezone: Some("Europe/Stockholm".into()),
+        };
+        let rewritten = rewrite_recurrence_occurrence(
+            raw,
+            "sparse",
+            "20260920T100000",
+            RecurrenceValueType::DateTime,
+            Some("Europe/Stockholm"),
+            &UpdateOccurrenceInput {
+                description: Some(String::new()),
+                location: Some(String::new()),
+                ..Default::default()
+            },
+            &desired,
+        )
+        .unwrap();
+
+        for unchanged in [
+            "DTSTART;TZID=Europe/Stockholm:20260920T100000\r\n",
+            "DTEND;TZID=Europe/Stockholm:20260920T110000\r\n",
+            "SUMMARY;LANGUAGE=en:Visible event\r\n",
+            "X-NATIVE;VALUE=TEXT:keep\r\n",
+        ] {
+            assert!(rewritten.contains(unchanged), "changed {unchanged:?}");
+        }
+        assert!(!rewritten.contains("DESCRIPTION"));
+        assert!(!rewritten.contains("LOCATION"));
+    }
+
+    #[test]
+    fn sparse_temporal_rewrite_updates_coherent_pair_only() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\nUID:sparse-time\r\nDTSTAMP:20260901T120000Z\r\n\
+RECURRENCE-ID:20260920T100000Z\r\nDTSTART:20260920T100000Z\r\n\
+DURATION:PT1H\r\nSUMMARY;LANGUAGE=en:Visible event\r\n\
+DESCRIPTION;LANGUAGE=en:Old text\r\nLOCATION;LANGUAGE=en:Old room\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let desired = OccurrenceFields {
+            title: "Visible event".into(),
+            description: Some("Old text".into()),
+            location: Some("Old room".into()),
+            start_time: "2026-09-20T12:00:00Z".into(),
+            end_time: "2026-09-20T13:30:00Z".into(),
+            all_day: false,
+            timezone: None,
+        };
+        let rewritten = rewrite_recurrence_occurrence(
+            raw,
+            "sparse-time",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &UpdateOccurrenceInput {
+                start_time: Some(desired.start_time.clone()),
+                ..Default::default()
+            },
+            &desired,
+        )
+        .unwrap();
+
+        assert!(rewritten.contains("DTSTART:20260920T120000Z\r\n"));
+        assert!(rewritten.contains("DURATION:PT1H30M\r\n"));
+        for unchanged in [
+            "SUMMARY;LANGUAGE=en:Visible event\r\n",
+            "DESCRIPTION;LANGUAGE=en:Old text\r\n",
+            "LOCATION;LANGUAGE=en:Old room\r\n",
+        ] {
+            assert!(rewritten.contains(unchanged), "changed {unchanged:?}");
+        }
+    }
+
+    #[test]
+    fn occurrence_rewrite_matches_date_floating_zoned_and_utc_without_inference() {
+        for (property, value_type, timezone, all_day) in [
+            (
+                "RECURRENCE-ID;VALUE=DATE:20260920",
+                RecurrenceValueType::Date,
+                None,
+                true,
+            ),
+            (
+                "RECURRENCE-ID:20260920T100000",
+                RecurrenceValueType::DateTime,
+                None,
+                false,
+            ),
+            (
+                "RECURRENCE-ID;TZID=Europe/Stockholm:20260920T100000",
+                RecurrenceValueType::DateTime,
+                Some("Europe/Stockholm"),
+                false,
+            ),
+            (
+                "RECURRENCE-ID:20260920T100000Z",
+                RecurrenceValueType::DateTime,
+                None,
+                false,
+            ),
+        ] {
+            let times = if all_day {
+                "DTSTART;VALUE=DATE:20260921\r\nDTEND;VALUE=DATE:20260922"
+            } else {
+                "DTSTART:20260921T100000Z\r\nDTEND:20260921T110000Z"
+            };
+            let raw = format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+                 BEGIN:VEVENT\r\nUID:exact\r\nDTSTAMP:20260901T120000Z\r\n\
+                 {property}\r\n{times}\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            let recurrence_id = property.split_once(':').unwrap().1;
+            let rewritten = rewrite_recurrence_occurrence(
+                &raw,
+                "exact",
+                recurrence_id,
+                value_type,
+                timezone,
+                &full_occurrence_patch(all_day),
+                &occurrence_fields(all_day),
+            )
+            .unwrap();
+            assert!(rewritten.contains(property));
+            assert!(rewritten.contains("SUMMARY:Changed\\, title\\;"));
+        }
+    }
+
+    #[test]
+    fn occurrence_rewrite_rejects_range_ambiguity_and_malformed_before_output() {
+        let event = |identity: &str| {
+            format!(
+                "BEGIN:VEVENT\r\nUID:shared\r\nDTSTAMP:20260901T120000Z\r\n\
+                 {identity}\r\nDTSTART:20260920T100000Z\r\n\
+                 DTEND:20260920T110000Z\r\nSUMMARY:Old\r\nEND:VEVENT\r\n"
+            )
+        };
+        let calendar = |events: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+                 {events}END:VCALENDAR\r\n"
+            )
+        };
+        let range = calendar(&event("RECURRENCE-ID;RANGE=THISANDFUTURE:20260920T100000Z"));
+        assert!(rewrite_recurrence_occurrence(
+            &range,
+            "shared",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &full_occurrence_patch(false),
+            &occurrence_fields(false),
+        )
+        .unwrap_err()
+        .contains("RANGE"));
+
+        let duplicate = event("RECURRENCE-ID:20260920T100000Z");
+        let duplicate = calendar(&format!("{duplicate}{duplicate}"));
+        assert!(rewrite_recurrence_occurrence(
+            &duplicate,
+            "shared",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &full_occurrence_patch(false),
+            &occurrence_fields(false),
+        )
+        .is_err());
+
+        let malformed = calendar(&event(
+            "RECURRENCE-ID:20260920T100000Z\r\nRECURRENCE-ID:20260920T100000Z",
+        ));
+        assert!(rewrite_recurrence_occurrence(
+            &malformed,
+            "shared",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &full_occurrence_patch(false),
+            &occurrence_fields(false),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn occurrence_rewrite_preserves_duration_representation() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\nUID:duration\r\nDTSTAMP:20260901T120000Z\r\n\
+RECURRENCE-ID:20260920T100000Z\r\nDTSTART:20260920T100000Z\r\n\
+DURATION:PT1H\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let rewritten = rewrite_recurrence_occurrence(
+            raw,
+            "duration",
+            "20260920T100000Z",
+            RecurrenceValueType::DateTime,
+            None,
+            &full_occurrence_patch(false),
+            &occurrence_fields(false),
+        )
+        .unwrap();
+        assert!(rewritten.contains("DURATION:PT1H30M\r\n"));
+        assert!(!rewritten.contains("DTEND"));
+        let parsed = parse_ical_data(&rewritten);
+        assert_eq!(parsed[0].dtstart, "2026-09-22T08:15:00Z");
+        assert_eq!(parsed[0].dtend, "2026-09-22T09:45:00+00:00");
+    }
+
+    #[test]
+    fn parsed_invite_legacy_json_does_not_require_recurrence_identity() {
+        let raw = recurrence_calendar(&recurrence_event("standalone", ""));
+        let invite = parse_ical_data(&raw).remove(0);
+        let mut json = serde_json::to_value(&invite).unwrap();
+        assert!(json.get("recurrence_id").is_none());
+        json.as_object_mut().unwrap().remove("recurrence_kind");
+        let decoded: ParsedInvite = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.recurrence_kind, RecurrenceKind::Unknown);
     }
 
     #[test]

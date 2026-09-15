@@ -14,6 +14,9 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceIdentity, RecurrenceIdentitySeed, UpdateOccurrenceInput,
+};
 use crate::calendar::CalendarEvent;
 use crate::db::accounts::AccountFull;
 use crate::db::pool::DbPool;
@@ -141,6 +144,30 @@ pub struct RemoteRsvpRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRsvpOutcome {
     pub remote_id: Option<String>,
+}
+
+/// Trusted provider-neutral input for one occurrence update. This is an
+/// internal contract and intentionally does not implement `Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOccurrenceUpdate {
+    pub target_id: String,
+    pub expected_provider_revision: Option<String>,
+    /// Immutable identity, including the provider-calendar scope.
+    pub trusted_identity: RecurrenceIdentity,
+    pub current_event: CalendarEvent,
+    /// Original sparse user patch. Providers must emit only these properties.
+    pub patch: UpdateOccurrenceInput,
+    pub desired: OccurrenceFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOccurrenceUpdateOutcome {
+    pub replacement_identity: RecurrenceIdentitySeed,
+    pub occurrence: OccurrenceFields,
+    pub canonical_event: Option<CalendarEvent>,
+    /// Complete nonempty master/override/exclusion set parsed from an embedded
+    /// resource. Detached resources must return `None`.
+    pub canonical_recurrence_objects: Option<Vec<RecurrenceIdentitySeed>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +349,18 @@ pub trait CalendarBackend: Send + Sync {
         _request: &RemoteRsvpRequest,
     ) -> Result<CalendarCapability<RemoteRsvpOutcome>> {
         Ok(CalendarCapability::Unsupported)
+    }
+
+    async fn update_recurrence_occurrence(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _request: &RemoteOccurrenceUpdate,
+    ) -> Result<RemoteOccurrenceUpdateOutcome> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "THIS-OCCURRENCE update",
+        })
     }
 
     async fn push_attendee_responses(

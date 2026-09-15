@@ -110,6 +110,140 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_account_remote
             ON calendar_events(account_id, remote_id);
 
+        CREATE TABLE IF NOT EXISTS calendar_recurrence_objects (
+            object_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL REFERENCES calendar_events(id) ON DELETE CASCADE,
+            local_series_event_id TEXT REFERENCES calendar_events(id) ON DELETE SET NULL,
+            provider_calendar_id TEXT,
+            provider_series_id TEXT,
+            provider_occurrence_id TEXT,
+            recurrence_id TEXT,
+            recurrence_timezone TEXT,
+            recurrence_value_type TEXT,
+            effective_title TEXT NOT NULL,
+            effective_description TEXT,
+            effective_location TEXT,
+            effective_start TEXT NOT NULL,
+            effective_end TEXT NOT NULL,
+            effective_all_day INTEGER NOT NULL,
+            effective_timezone TEXT,
+            provider_native_data TEXT,
+            provider_revision TEXT,
+            object_kind TEXT NOT NULL,
+            CHECK (object_id != '' AND account_id != '' AND event_id != ''),
+            CHECK (effective_all_day IN (0, 1)),
+            CHECK (object_kind IN ('master', 'occurrence', 'exception', 'exclusion')),
+            CHECK (recurrence_value_type IS NULL OR
+                   recurrence_value_type IN ('date', 'date-time')),
+            CHECK (
+                ((provider_series_id IS NOT NULL OR
+                  provider_occurrence_id IS NOT NULL) AND
+                 provider_calendar_id IS NOT NULL AND
+                 length(trim(provider_calendar_id)) > 0 AND
+                 instr(provider_calendar_id, char(0)) = 0 AND
+                 provider_calendar_id NOT GLOB
+                    ('*[' || char(1) || '-' || char(31) ||
+                     char(127) || '-' || char(159) || ']*'))
+                OR
+                (provider_series_id IS NULL AND
+                 provider_occurrence_id IS NULL AND
+                 provider_calendar_id IS NULL)
+            ),
+            CHECK ((object_kind = 'master' AND recurrence_id IS NULL AND
+                    recurrence_value_type IS NULL) OR
+                   (object_kind != 'master' AND recurrence_id IS NOT NULL AND
+                    recurrence_value_type IS NOT NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_calendar_recurrence_event
+            ON calendar_recurrence_objects(event_id);
+        CREATE INDEX IF NOT EXISTS idx_calendar_recurrence_local_series
+            ON calendar_recurrence_objects(local_series_event_id);
+        CREATE INDEX IF NOT EXISTS idx_calendar_recurrence_provider_series
+            ON calendar_recurrence_objects(
+                account_id, provider_calendar_id, provider_series_id
+            );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_recurrence_local_position
+            ON calendar_recurrence_objects(
+                local_series_event_id, recurrence_value_type, recurrence_id
+            )
+            WHERE local_series_event_id IS NOT NULL AND recurrence_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_recurrence_provider_position
+            ON calendar_recurrence_objects(
+                account_id, provider_calendar_id, provider_series_id,
+                recurrence_value_type, recurrence_id
+            )
+            WHERE provider_calendar_id IS NOT NULL AND
+                  provider_series_id IS NOT NULL AND recurrence_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_recurrence_provider_occurrence
+            ON calendar_recurrence_objects(
+                account_id, provider_calendar_id, provider_occurrence_id
+            )
+            WHERE provider_calendar_id IS NOT NULL AND
+                  provider_occurrence_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_recurrence_event_master
+            ON calendar_recurrence_objects(event_id)
+            WHERE object_kind = 'master';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_recurrence_provider_master
+            ON calendar_recurrence_objects(
+                account_id, provider_calendar_id, provider_series_id
+            )
+            WHERE object_kind = 'master' AND provider_calendar_id IS NOT NULL AND
+                  provider_series_id IS NOT NULL;
+
+        -- A recurrence position identifies the object and cannot be reinterpreted.
+        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_id_immutable
+        BEFORE UPDATE OF provider_calendar_id, recurrence_id, recurrence_value_type
+        ON calendar_recurrence_objects
+        WHEN OLD.provider_calendar_id IS NOT NEW.provider_calendar_id
+          OR OLD.recurrence_id IS NOT NEW.recurrence_id
+          OR OLD.recurrence_value_type IS NOT NEW.recurrence_value_type
+        BEGIN
+            SELECT RAISE(ABORT, 'recurrence identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_account_insert
+        BEFORE INSERT ON calendar_recurrence_objects
+        WHEN NOT EXISTS (
+            SELECT 1 FROM calendar_events
+            WHERE id = NEW.event_id AND account_id = NEW.account_id
+        ) OR (
+            NEW.local_series_event_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM calendar_events
+                WHERE id = NEW.local_series_event_id
+                  AND account_id = NEW.account_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'recurrence objects cannot cross accounts');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_account_update
+        BEFORE UPDATE OF account_id, event_id, local_series_event_id
+        ON calendar_recurrence_objects
+        WHEN NOT EXISTS (
+            SELECT 1 FROM calendar_events
+            WHERE id = NEW.event_id AND account_id = NEW.account_id
+        ) OR (
+            NEW.local_series_event_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM calendar_events
+                WHERE id = NEW.local_series_event_id
+                  AND account_id = NEW.account_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'recurrence objects cannot cross accounts');
+        END;
+
+        -- SET NULL preserves provider-backed objects; local-only objects have
+        -- no durable series identity after their local master disappears.
+        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_prune_local_series
+        BEFORE DELETE ON calendar_events
+        BEGIN
+            DELETE FROM calendar_recurrence_objects
+            WHERE local_series_event_id = OLD.id AND provider_series_id IS NULL;
+        END;
+
         CREATE TABLE IF NOT EXISTS calendars (
             id TEXT PRIMARY KEY,
             account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -353,6 +487,31 @@ fn initialize_calendar_event_state(conn: &Connection) -> Result<()> {
 
          CREATE TRIGGER IF NOT EXISTS calendar_event_revision_meeting_delete
          AFTER DELETE ON meet_meetings BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = OLD.event_id;
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id = OLD.event_id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_recurrence_insert
+         AFTER INSERT ON calendar_recurrence_objects BEGIN
+             DELETE FROM calendar_event_revisions WHERE event_id = NEW.event_id;
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events WHERE id = NEW.event_id;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_recurrence_update
+         AFTER UPDATE ON calendar_recurrence_objects BEGIN
+             DELETE FROM calendar_event_revisions
+                 WHERE event_id IN (OLD.event_id, NEW.event_id);
+             INSERT INTO calendar_event_revisions (event_id)
+                 SELECT id FROM calendar_events
+                 WHERE id IN (OLD.event_id, NEW.event_id);
+         END;
+
+         -- During an owning-event cascade the SELECT yields no row; the root
+         -- delete trigger also removes any token allocated earlier in cascade.
+         CREATE TRIGGER IF NOT EXISTS calendar_event_revision_recurrence_delete
+         AFTER DELETE ON calendar_recurrence_objects BEGIN
              DELETE FROM calendar_event_revisions WHERE event_id = OLD.event_id;
              INSERT INTO calendar_event_revisions (event_id)
                  SELECT id FROM calendar_events WHERE id = OLD.event_id;
@@ -1054,6 +1213,98 @@ pub fn set_migration(conn: &Connection, key: &str) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recurrence_identity_schema_is_empty_preserving_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recurrence-identity.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            seed_recovery_account(&conn);
+            insert_recovery_row(&conn, "legacy-event", None, Some("provider-event"));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM calendar_recurrence_objects",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            conn.execute_batch(
+                "INSERT INTO calendar_recurrence_objects
+                     (object_id, account_id, event_id, provider_calendar_id,
+                       provider_series_id,
+                       recurrence_id, recurrence_value_type, effective_title,
+                       effective_start, effective_end, effective_all_day,
+                       object_kind)
+                 VALUES ('occurrence', 'account', 'legacy-event',
+                          'provider-calendar', 'provider-series',
+                          '2026-09-15', 'date',
+                          'Occurrence', '2026-09-15', '2026-09-16', 1,
+                         'occurrence');",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM calendar_recurrence_objects",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            for index in [
+                "idx_calendar_recurrence_event",
+                "idx_calendar_recurrence_local_series",
+                "idx_calendar_recurrence_provider_series",
+                "idx_calendar_recurrence_local_position",
+                "idx_calendar_recurrence_provider_position",
+                "idx_calendar_recurrence_provider_occurrence",
+                "idx_calendar_recurrence_event_master",
+                "idx_calendar_recurrence_provider_master",
+            ] {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE type = 'index' AND name = ?1",
+                        [index],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    1,
+                    "{index}"
+                );
+            }
+            for trigger in [
+                "calendar_recurrence_id_immutable",
+                "calendar_recurrence_prune_local_series",
+                "calendar_recurrence_account_insert",
+                "calendar_recurrence_account_update",
+                "calendar_event_revision_recurrence_insert",
+                "calendar_event_revision_recurrence_update",
+                "calendar_event_revision_recurrence_delete",
+            ] {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE type = 'trigger' AND name = ?1",
+                        [trigger],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    1,
+                    "{trigger}"
+                );
+            }
+        }
+    }
 
     fn recovery_ics(uid: &str, recurrence: &str) -> String {
         format!(

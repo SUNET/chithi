@@ -2,9 +2,14 @@
 //! (RFC 8984 JSCalendar).
 
 use crate::calendar::recurrence::{faithful_local_recurrence_rules, valid_local_datetime};
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
+    UpdateOccurrenceInput,
+};
 use crate::calendar::RecurrenceKind;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::{JmapConfig, JmapConnection};
 
@@ -36,6 +41,12 @@ pub struct JmapCalendarEvent {
     pub uid: Option<String>,
     pub organizer_email: Option<String>,
     pub attendees_json: Option<String>,
+    #[serde(default)]
+    pub native_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_state: Option<String>,
+    #[serde(skip)]
+    pub(crate) recurrence_seeds: Option<Vec<RecurrenceIdentitySeed>>,
 }
 
 impl JmapCalendarEvent {
@@ -64,6 +75,9 @@ impl JmapCalendarEvent {
             uid: event.uid.clone(),
             organizer_email: event.organizer_email.clone(),
             attendees_json: event.attendees_json.clone(),
+            native_json: None,
+            response_state: None,
+            recurrence_seeds: None,
         };
         wire.creation_recurrence_rules()?;
         Ok(wire)
@@ -149,25 +163,131 @@ impl JmapCalendarEvent {
             "recurrenceOverrides": null,
         }))
     }
+
+    pub(crate) fn occurrence_update_patch(
+        recurrence_id: Option<&str>,
+        changed: &UpdateOccurrenceInput,
+        desired: &OccurrenceFields,
+    ) -> serde_json::Value {
+        occurrence_update_patch(recurrence_id, changed, desired)
+    }
 }
 
 /// Fetch the provider's complete native JSCalendar Event representation.
 /// JMAP Calendars §5.7 defines omitted `properties` to return stored properties;
 /// listing names from different schema versions risks RFC 8620 §5.1 rejection.
-fn calendar_events_request(account_id: &str) -> serde_json::Value {
+const CALENDAR_EVENT_QUERY_PAGE_SIZE: usize = 500;
+const CALENDAR_EVENT_MAX_PAGES: usize = 100;
+const CALENDAR_EVENT_MAX_IDS: usize = 50_000;
+const CALENDAR_EVENT_MAX_GET_CHUNK: usize = 500;
+
+fn calendar_event_query_request(
+    account_id: &str,
+    position: usize,
+    limit: usize,
+    call_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
-        "methodCalls": [
-            ["CalendarEvent/query", {
-                "accountId": account_id,
-                "limit": 1000
-            }, "q1"],
-            ["CalendarEvent/get", {
-                "#ids": { "resultOf": "q1", "name": "CalendarEvent/query", "path": "/ids" },
-                "accountId": account_id
-            }, "g1"]
-        ]
+        "methodCalls": [["CalendarEvent/query", {
+            "accountId": account_id,
+            "position": position,
+            "limit": limit,
+            "calculateTotal": true
+        }, call_id]]
     })
+}
+
+fn calendar_events_get_request(account_id: &str, ids: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["CalendarEvent/get", {
+            "accountId": account_id,
+            "ids": ids
+        }, "g1"]]
+    })
+}
+
+fn method_response<'a>(
+    response: &'a serde_json::Value,
+    method_name: &str,
+    call_id: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    let responses = response["methodResponses"].as_array().ok_or_else(|| {
+        Error::Sync(format!(
+            "JMAP {method_name} response omitted methodResponses"
+        ))
+    })?;
+    if responses.len() != 1 {
+        return Err(Error::Sync(format!(
+            "JMAP {method_name} returned an unexpected number of method responses"
+        )));
+    }
+    let response = responses[0]
+        .as_array()
+        .filter(|response| response.len() == 3);
+    let response = response.ok_or_else(|| {
+        Error::Sync(format!(
+            "JMAP {method_name} returned a malformed method response"
+        ))
+    })?;
+    if response[0].as_str() != Some(method_name) || response[2].as_str() != Some(call_id) {
+        return Err(Error::Sync(format!(
+            "JMAP {method_name} response correlation failed"
+        )));
+    }
+    response[1]
+        .as_object()
+        .ok_or_else(|| Error::Sync(format!("JMAP {method_name} response body is malformed")))
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+fn event_calendar_ids(event: &serde_json::Value) -> Result<Vec<String>> {
+    let memberships = event["calendarIds"]
+        .as_object()
+        .ok_or_else(|| Error::Sync("JMAP CalendarEvent object has malformed calendarIds".into()))?;
+    let mut ids = Vec::new();
+    for (id, member) in memberships {
+        if !valid_identifier(id) || !member.is_boolean() {
+            return Err(Error::Sync(
+                "JMAP CalendarEvent object has malformed calendarIds".into(),
+            ));
+        }
+        if member.as_bool() == Some(true) {
+            ids.push(id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return Err(Error::Sync(
+            "JMAP CalendarEvent object has no calendar membership".into(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn validate_event_object(event: &serde_json::Value) -> Result<String> {
+    if !event.is_object() || event["@type"].as_str() != Some("Event") {
+        return Err(Error::Sync(
+            "JMAP CalendarEvent/get returned a malformed event object".into(),
+        ));
+    }
+    let id = event["id"]
+        .as_str()
+        .filter(|id| valid_identifier(id))
+        .ok_or_else(|| Error::Sync("JMAP CalendarEvent object has no valid id".into()))?;
+    if !event["uid"].as_str().is_some_and(valid_identifier)
+        || !event["title"].is_string()
+        || event_calendar_ids(event).is_err()
+        || occurrence_fields(event, None, None).is_none()
+    {
+        return Err(Error::Sync(format!(
+            "JMAP CalendarEvent object {id} is malformed"
+        )));
+    }
+    Ok(id.to_string())
 }
 
 /// Classify the native provider object before lossy DTO/RRULE conversion.
@@ -326,6 +446,507 @@ fn valid_recurrence_rule(rule: &serde_json::Value) -> bool {
         )
 }
 
+#[derive(Clone, Copy)]
+struct EventDuration {
+    days: i64,
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+fn parse_event_duration(value: &str) -> Option<EventDuration> {
+    let value = value.strip_prefix('P')?;
+    if value.is_empty() || !value.is_ascii() {
+        return None;
+    }
+    let mut duration = EventDuration {
+        days: 0,
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    let mut number = String::new();
+    let mut in_time = false;
+    let mut saw_value = false;
+    let mut saw_time_value = false;
+    let mut last_rank = 0;
+    for character in value.chars() {
+        if character.is_ascii_digit() || character == '.' {
+            number.push(character);
+            continue;
+        }
+        if character == 'T' {
+            if in_time || !number.is_empty() {
+                return None;
+            }
+            in_time = true;
+            continue;
+        }
+        if number.is_empty() {
+            return None;
+        }
+        let rank = match (in_time, character) {
+            (false, 'W') => 0,
+            (false, 'D') => 1,
+            (true, 'H') => 2,
+            (true, 'M') => 3,
+            (true, 'S') => 4,
+            _ => return None,
+        };
+        if saw_value && rank <= last_rank {
+            return None;
+        }
+        last_rank = rank;
+        saw_value = true;
+        saw_time_value |= in_time;
+        if character == 'S' && number.contains('.') {
+            let (whole, fraction) = number.split_once('.')?;
+            if whole.is_empty()
+                || fraction.is_empty()
+                || fraction.len() > 9
+                || fraction.ends_with('0')
+            {
+                return None;
+            }
+            duration.seconds = duration.seconds.checked_add(whole.parse().ok()?)?;
+            let nanos = format!("{fraction:0<9}").parse::<i64>().ok()?;
+            duration.nanoseconds = nanos;
+        } else {
+            if number.contains('.') {
+                return None;
+            }
+            let amount = number.parse::<i64>().ok()?;
+            match character {
+                'W' => duration.days = duration.days.checked_add(amount.checked_mul(7)?)?,
+                'D' => duration.days = duration.days.checked_add(amount)?,
+                'H' => {
+                    duration.seconds = duration.seconds.checked_add(amount.checked_mul(3600)?)?
+                }
+                'M' => duration.seconds = duration.seconds.checked_add(amount.checked_mul(60)?)?,
+                'S' => duration.seconds = duration.seconds.checked_add(amount)?,
+                _ => unreachable!(),
+            }
+        }
+        number.clear();
+    }
+    if !saw_value || !number.is_empty() || (in_time && !saw_time_value) {
+        return None;
+    }
+    Some(duration)
+}
+
+fn effective_range(
+    start: &str,
+    timezone: Option<&str>,
+    duration: &str,
+) -> Option<(String, String)> {
+    use chrono::{SecondsFormat, TimeZone};
+
+    if !valid_local_datetime(start) {
+        return None;
+    }
+    let duration = parse_event_duration(duration)?;
+    let local = chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+    let end_local_date = local.checked_add_signed(chrono::Duration::try_days(duration.days)?)?;
+    let to_utc = |local| match timezone {
+        Some(timezone) => {
+            let timezone = timezone.parse::<chrono_tz::Tz>().ok()?;
+            match timezone.from_local_datetime(&local) {
+                chrono::LocalResult::Single(value) => Some(value.with_timezone(&chrono::Utc)),
+                _ => None,
+            }
+        }
+        None => Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            local,
+            chrono::Utc,
+        )),
+    };
+    let start = to_utc(local)?;
+    let end = to_utc(end_local_date)?
+        .checked_add_signed(chrono::Duration::try_seconds(duration.seconds)?)?
+        .checked_add_signed(chrono::Duration::nanoseconds(duration.nanoseconds))?;
+    if end <= start {
+        return None;
+    }
+    Some((
+        start.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        end.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+    ))
+}
+
+fn patched_string<'a>(
+    base: Option<&'a str>,
+    patch: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<Option<&'a str>> {
+    match patch.get(name) {
+        None => Some(base),
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(value)) => Some(Some(value)),
+        Some(_) => None,
+    }
+}
+
+fn location_name(value: Option<&serde_json::Value>) -> Option<Option<String>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(value) => {
+            let locations = value.as_object()?;
+            let name = locations
+                .values()
+                .find_map(|location| location.get("name").and_then(serde_json::Value::as_str));
+            Some(name.map(str::to_string))
+        }
+    }
+}
+
+fn occurrence_fields(
+    event: &serde_json::Value,
+    patch: Option<&serde_json::Map<String, serde_json::Value>>,
+    recurrence_id: Option<&str>,
+) -> Option<OccurrenceFields> {
+    let empty = serde_json::Map::new();
+    let patch = patch.unwrap_or(&empty);
+    let title = patched_string(
+        event.get("title").and_then(serde_json::Value::as_str),
+        patch,
+        "title",
+    )??;
+    let description = patched_string(
+        event.get("description").and_then(serde_json::Value::as_str),
+        patch,
+        "description",
+    )?
+    .filter(|description| !description.is_empty())
+    .map(str::to_string);
+    let location = match patch.get("locations") {
+        Some(value) => location_name(Some(value))?,
+        None => location_name(event.get("locations"))?,
+    };
+    let start = patched_string(
+        recurrence_id.or_else(|| event.get("start").and_then(serde_json::Value::as_str)),
+        patch,
+        "start",
+    )??;
+    let timezone = patched_string(
+        event.get("timeZone").and_then(serde_json::Value::as_str),
+        patch,
+        "timeZone",
+    )?;
+    let duration = patched_string(
+        event.get("duration").and_then(serde_json::Value::as_str),
+        patch,
+        "duration",
+    )??;
+    let all_day = match patch.get("showWithoutTime") {
+        Some(value) => value.as_bool()?,
+        None => event
+            .get("showWithoutTime")
+            .map_or(Some(false), serde_json::Value::as_bool)?,
+    };
+    let (start_time, end_time) = if all_day {
+        let duration = parse_event_duration(duration)?;
+        if duration.seconds != 0 || duration.nanoseconds != 0 || duration.days <= 0 {
+            return None;
+        }
+        let start = chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+        let end = start.checked_add_signed(chrono::Duration::try_days(duration.days)?)?;
+        (
+            start.date().format("%Y-%m-%d").to_string(),
+            end.date().format("%Y-%m-%d").to_string(),
+        )
+    } else {
+        effective_range(start, timezone, duration)?
+    };
+    let fields = OccurrenceFields {
+        title: title.to_string(),
+        description,
+        location,
+        start_time,
+        end_time,
+        all_day,
+        timezone: timezone.map(str::to_string),
+    };
+    fields.validate().ok()?;
+    Some(fields)
+}
+
+fn sole_calendar_id(event: &serde_json::Value) -> Option<&str> {
+    let calendar_ids = event.get("calendarIds")?.as_object()?;
+    let mut membership = None;
+    for (id, value) in calendar_ids {
+        if id.trim().is_empty() || id.chars().any(char::is_control) {
+            return None;
+        }
+        match value.as_bool()? {
+            true if membership.is_some() => return None,
+            true => membership = Some(id.as_str()),
+            false => {}
+        }
+    }
+    membership
+}
+
+fn recurrence_seeds(
+    event: &serde_json::Value,
+    kind: RecurrenceKind,
+    native: &str,
+    state: Option<&str>,
+) -> Option<Vec<RecurrenceIdentitySeed>> {
+    let revision = state.map(str::to_string);
+    if kind == RecurrenceKind::Unknown {
+        return None;
+    }
+    let provider_calendar_id = sole_calendar_id(event)?.to_string();
+    if kind == RecurrenceKind::Standalone {
+        return Some(Vec::new());
+    }
+
+    let event_id = event["id"].as_str()?;
+    let event_start = event["start"].as_str()?;
+    let event_timezone = match event.get("timeZone") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str()?),
+    };
+    let event_occurrence = occurrence_fields(event, None, None)?;
+
+    if kind == RecurrenceKind::Occurrence {
+        let provider_series_id = event["baseEventId"].as_str()?;
+        let recurrence_id = event["recurrenceId"].as_str()?;
+        let recurrence_timezone = match event.get("recurrenceIdTimeZone") {
+            None => event_timezone,
+            Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_str()?),
+        };
+        let object_kind = if event["excluded"].as_bool() == Some(true) {
+            RecurrenceObjectKind::Exclusion
+        } else if recurrence_id != event_start || recurrence_timezone != event_timezone {
+            RecurrenceObjectKind::Exception
+        } else {
+            RecurrenceObjectKind::Occurrence
+        };
+        let seed = RecurrenceIdentitySeed {
+            local_series_event_id: None,
+            provider_calendar_id: Some(provider_calendar_id),
+            provider_series_id: Some(provider_series_id.to_string()),
+            provider_occurrence_id: Some(event_id.to_string()),
+            recurrence_id: Some(recurrence_id.to_string()),
+            recurrence_timezone: recurrence_timezone.map(str::to_string),
+            recurrence_value_type: Some(RecurrenceValueType::DateTime),
+            occurrence: event_occurrence,
+            provider_native_data: Some(native.to_string()),
+            provider_revision: revision,
+            kind: object_kind,
+        };
+        seed.validate().ok()?;
+        return Some(vec![seed]);
+    }
+
+    let mut seeds = vec![RecurrenceIdentitySeed {
+        local_series_event_id: None,
+        provider_calendar_id: Some(provider_calendar_id.clone()),
+        provider_series_id: Some(event_id.to_string()),
+        provider_occurrence_id: None,
+        recurrence_id: None,
+        recurrence_timezone: None,
+        recurrence_value_type: None,
+        occurrence: event_occurrence,
+        provider_native_data: Some(native.to_string()),
+        provider_revision: revision.clone(),
+        kind: RecurrenceObjectKind::Master,
+    }];
+    if let Some(overrides) = event
+        .get("recurrenceOverrides")
+        .filter(|value| !value.is_null())
+    {
+        for (recurrence_id, value) in overrides.as_object()? {
+            let patch = value.as_object()?;
+            let recurrence_timezone = match patch.get("recurrenceIdTimeZone") {
+                None => event_timezone,
+                Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_str()?),
+            };
+            let seed = RecurrenceIdentitySeed {
+                local_series_event_id: None,
+                provider_calendar_id: Some(provider_calendar_id.clone()),
+                provider_series_id: Some(event_id.to_string()),
+                provider_occurrence_id: None,
+                recurrence_id: Some(recurrence_id.clone()),
+                recurrence_timezone: recurrence_timezone.map(str::to_string),
+                recurrence_value_type: Some(RecurrenceValueType::DateTime),
+                occurrence: occurrence_fields(event, Some(patch), Some(recurrence_id))?,
+                provider_native_data: Some(native.to_string()),
+                provider_revision: revision.clone(),
+                kind: if patch.get("excluded").and_then(serde_json::Value::as_bool) == Some(true) {
+                    RecurrenceObjectKind::Exclusion
+                } else if patch.is_empty() {
+                    RecurrenceObjectKind::Occurrence
+                } else {
+                    RecurrenceObjectKind::Exception
+                },
+            };
+            seed.validate().ok()?;
+            seeds.push(seed);
+        }
+    }
+    seeds.first()?.validate().ok()?;
+    Some(seeds)
+}
+
+fn patch_path_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+pub(crate) fn occurrence_update_patch(
+    recurrence_id: Option<&str>,
+    changed: &UpdateOccurrenceInput,
+    desired: &OccurrenceFields,
+) -> serde_json::Value {
+    let embedded = recurrence_id.is_some();
+    let prefix = recurrence_id
+        .map(|id| format!("recurrenceOverrides/{}/", patch_path_segment(id)))
+        .unwrap_or_default();
+    let mut patch = serde_json::Map::new();
+    let mut insert = |name: &str, value| {
+        patch.insert(format!("{prefix}{name}"), value);
+    };
+    if changed.title.is_some() {
+        insert("title", serde_json::json!(desired.title));
+    }
+    if changed.description.is_some() {
+        insert(
+            "description",
+            desired
+                .description
+                .as_deref()
+                .filter(|description| !description.is_empty())
+                .map_or_else(
+                    || {
+                        if embedded {
+                            serde_json::json!("")
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    },
+                    |value| serde_json::json!(value),
+                ),
+        );
+    }
+    if changed.location.is_some() {
+        let locations = desired
+            .location
+            .as_deref()
+            .filter(|location| !location.is_empty())
+            .map(|location| {
+                serde_json::json!({
+                    "loc1": {"@type": "Location", "name": location}
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+        insert("locations", locations);
+    }
+
+    let all_day_changed = changed.all_day.is_some();
+    let start_changed =
+        changed.start_time.is_some() || changed.timezone.is_some() || all_day_changed;
+    let duration_changed =
+        changed.start_time.is_some() || changed.end_time.is_some() || all_day_changed;
+    if start_changed {
+        let start = if desired.all_day {
+            format!("{}T00:00:00", desired.start_time)
+        } else if let Some(timezone) = desired.timezone.as_deref() {
+            crate::mail::caldav::utc_to_local(&desired.start_time, timezone)
+        } else {
+            desired.start_time.trim_end_matches('Z').to_string()
+        };
+        insert("start", serde_json::json!(start));
+    }
+    if duration_changed {
+        insert(
+            "duration",
+            serde_json::json!(compute_duration(&desired.start_time, &desired.end_time)),
+        );
+    }
+    if changed.timezone.is_some() || all_day_changed {
+        insert("timeZone", serde_json::json!(desired.timezone));
+    }
+    if all_day_changed {
+        insert("showWithoutTime", serde_json::json!(desired.all_day));
+    }
+    serde_json::Value::Object(patch)
+}
+
+fn occurrence_update_request(
+    account_id: &str,
+    event_id: &str,
+    expected_state: &str,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let mut update = serde_json::Map::new();
+    update.insert(event_id.to_string(), patch.clone());
+    serde_json::json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["CalendarEvent/set", {
+            "accountId": account_id,
+            "ifInState": expected_state,
+            "sendSchedulingMessages": false,
+            "update": update
+        }, "u1"]]
+    })
+}
+
+fn calendar_event_get_request(account_id: &str, event_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:calendars"],
+        "methodCalls": [["CalendarEvent/get", {
+            "accountId": account_id,
+            "ids": [event_id]
+        }, "g1"]]
+    })
+}
+
+fn occurrence_update_state(response: &serde_json::Value, event_id: &str) -> Result<String> {
+    let method = &response["methodResponses"][0];
+    if method[0].as_str() == Some("error") && method[1]["type"].as_str() == Some("stateMismatch") {
+        return Err(Error::Sync(
+            "JMAP CalendarEvent state changed; reconciliation required".into(),
+        ));
+    }
+    if method[0].as_str() != Some("CalendarEvent/set") {
+        return Err(Error::Sync(
+            "Invalid JMAP CalendarEvent/set response; reconciliation required".into(),
+        ));
+    }
+    if let Some(error) = method[1]["notUpdated"][event_id].as_object() {
+        let error_type = error
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let description = error
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown error");
+        if error_type == "stateMismatch" {
+            return Err(Error::Sync(
+                "JMAP CalendarEvent state changed; reconciliation required".into(),
+            ));
+        }
+        return Err(Error::Other(format!(
+            "JMAP update calendar occurrence failed: {description}"
+        )));
+    }
+    if method[1]["updated"].get(event_id).is_none() {
+        return Err(Error::Sync(
+            "JMAP did not confirm the occurrence update; reconciliation required".into(),
+        ));
+    }
+    method[1]["newState"]
+        .as_str()
+        .filter(|state| !state.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Error::Sync("JMAP CalendarEvent/set omitted newState; reconciliation required".into())
+        })
+}
+
 impl JmapConnection {
     /// List all JMAP calendars for the account.
     pub async fn list_jmap_calendars(&self, config: &JmapConfig) -> Result<Vec<JmapCalendar>> {
@@ -463,56 +1084,240 @@ impl JmapConnection {
         Ok(())
     }
 
-    /// Fetch calendar events, optionally filtered by calendar_id.
-    /// Uses CalendarEvent/query + CalendarEvent/get with JSCalendar format.
+    /// Fetch a complete, stable account-wide CalendarEvent snapshot.
+    ///
+    /// The second and third tuple members identify calendars and remote events
+    /// for which absence-based reconciliation is unsafe because the local row
+    /// model cannot represent multiple calendar memberships.
     pub async fn fetch_calendar_events(
         &self,
         config: &JmapConfig,
-        calendar_id: Option<&str>,
-    ) -> Result<Vec<JmapCalendarEvent>> {
-        log::debug!("JMAP fetching calendar events (calendar={:?})", calendar_id);
+    ) -> Result<(Vec<JmapCalendarEvent>, HashSet<String>, HashSet<String>)> {
+        log::debug!("JMAP fetching complete calendar event snapshot");
 
-        // Note: Stalwart doesn't support "inCalendars" filter, so we fetch all
-        // events and filter by calendarIds client-side.
-        let request = calendar_events_request(&self.account_id);
-
-        let resp = self.api_request(&request, config).await?;
-        log::debug!(
-            "JMAP CalendarEvent response: {}",
-            serde_json::to_string(&resp).unwrap_or_default()
-        );
-
-        // Check if the query returned an error
-        if resp["methodResponses"][0][0].as_str() == Some("error") {
-            let desc = resp["methodResponses"][0][1]["description"]
-                .as_str()
-                .unwrap_or("Unknown");
-            log::error!("JMAP CalendarEvent/query error: {}", desc);
-            return Ok(vec![]);
-        }
-
-        // The get response might be at index 1 or could be missing if query returned no IDs
-        let events_json = match resp["methodResponses"][1][1]["list"].as_array() {
-            Some(list) => list.clone(),
-            None => {
-                log::debug!("JMAP CalendarEvent/get returned no list, possibly empty");
-                return Ok(vec![]);
+        let mut ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut query_state = None;
+        let mut expected_total = None;
+        for page in 0..CALENDAR_EVENT_MAX_PAGES {
+            let position = ids.len();
+            let request = calendar_event_query_request(
+                &self.account_id,
+                position,
+                CALENDAR_EVENT_QUERY_PAGE_SIZE,
+                "q1",
+            );
+            let response = self.api_request(&request, config).await?;
+            let body = method_response(&response, "CalendarEvent/query", "q1")?;
+            if body.get("accountId").and_then(serde_json::Value::as_str)
+                != Some(self.account_id.as_str())
+            {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query returned the wrong accountId".into(),
+                ));
             }
+            let state = body
+                .get("queryState")
+                .and_then(serde_json::Value::as_str)
+                .filter(|state| !state.is_empty())
+                .ok_or_else(|| Error::Sync("JMAP CalendarEvent/query omitted queryState".into()))?;
+            if query_state
+                .as_deref()
+                .is_some_and(|expected| expected != state)
+            {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent query state changed while paging".into(),
+                ));
+            }
+            query_state.get_or_insert_with(|| state.to_string());
+            let response_position = body
+                .get("position")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|position| usize::try_from(position).ok())
+                .ok_or_else(|| {
+                    Error::Sync("JMAP CalendarEvent/query omitted a valid position".into())
+                })?;
+            if response_position != position {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query returned a repeated or unexpected position".into(),
+                ));
+            }
+            let total = body
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|total| usize::try_from(total).ok())
+                .ok_or_else(|| {
+                    Error::Sync("JMAP CalendarEvent/query omitted a valid total".into())
+                })?;
+            if total > CALENDAR_EVENT_MAX_IDS {
+                return Err(Error::Sync(format!(
+                    "JMAP CalendarEvent snapshot exceeds the {CALENDAR_EVENT_MAX_IDS} object limit"
+                )));
+            }
+            if expected_total.is_some_and(|expected| expected != total) {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent query total changed while paging".into(),
+                ));
+            }
+            expected_total.get_or_insert(total);
+            let page_ids = body
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Sync("JMAP CalendarEvent/query omitted ids".into()))?;
+            if page_ids.len() > CALENDAR_EVENT_QUERY_PAGE_SIZE {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query exceeded the requested page limit".into(),
+                ));
+            }
+            if page_ids.is_empty() && ids.len() < total {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query returned a nonadvancing page".into(),
+                ));
+            }
+            for id in page_ids {
+                let id = id
+                    .as_str()
+                    .filter(|id| valid_identifier(id))
+                    .ok_or_else(|| {
+                        Error::Sync("JMAP CalendarEvent/query returned a malformed id".into())
+                    })?;
+                if !seen_ids.insert(id.to_string()) {
+                    return Err(Error::Sync(
+                        "JMAP CalendarEvent/query repeated an event id".into(),
+                    ));
+                }
+                ids.push(id.to_string());
+            }
+            if ids.len() > total {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query returned more ids than total".into(),
+                ));
+            }
+            if ids.len() == total {
+                break;
+            }
+            if page + 1 == CALENDAR_EVENT_MAX_PAGES {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/query exceeded the page limit".into(),
+                ));
+            }
+        }
+        let query_state = query_state.ok_or_else(|| {
+            Error::Sync("JMAP CalendarEvent/query produced no snapshot state".into())
+        })?;
+
+        let advertised_get_limit = if self.max_objects_in_get == 0 {
+            CALENDAR_EVENT_MAX_GET_CHUNK
+        } else {
+            self.max_objects_in_get
         };
+        let get_chunk_size = advertised_get_limit.min(CALENDAR_EVENT_MAX_GET_CHUNK);
+        let mut events_json = Vec::with_capacity(ids.len());
+        let mut returned_ids = HashSet::new();
+        let mut get_state = None;
+        for chunk in ids.chunks(get_chunk_size) {
+            let request = calendar_events_get_request(&self.account_id, chunk);
+            let response = self.api_request(&request, config).await?;
+            let body = method_response(&response, "CalendarEvent/get", "g1")?;
+            if body.get("accountId").and_then(serde_json::Value::as_str)
+                != Some(self.account_id.as_str())
+            {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/get returned the wrong accountId".into(),
+                ));
+            }
+            let state = body
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .filter(|state| !state.is_empty())
+                .ok_or_else(|| Error::Sync("JMAP CalendarEvent/get omitted state".into()))?;
+            if get_state
+                .as_deref()
+                .is_some_and(|expected| expected != state)
+            {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent state changed while reading the snapshot".into(),
+                ));
+            }
+            get_state.get_or_insert_with(|| state.to_string());
+            let not_found = body
+                .get("notFound")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Sync("JMAP CalendarEvent/get omitted notFound".into()))?;
+            if !not_found.is_empty() {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/get reported missing queried objects".into(),
+                ));
+            }
+            let list = body
+                .get("list")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Sync("JMAP CalendarEvent/get omitted list".into()))?;
+            if list.len() != chunk.len() {
+                return Err(Error::Sync(
+                    "JMAP CalendarEvent/get omitted queried objects".into(),
+                ));
+            }
+            let expected: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+            for event in list {
+                let id = validate_event_object(event)?;
+                if !expected.contains(id.as_str()) || !returned_ids.insert(id) {
+                    return Err(Error::Sync(
+                        "JMAP CalendarEvent/get returned duplicate or unexpected objects".into(),
+                    ));
+                }
+                events_json.push(event.clone());
+            }
+        }
+        if returned_ids.len() != ids.len() {
+            return Err(Error::Sync(
+                "JMAP CalendarEvent/get did not complete the queried snapshot".into(),
+            ));
+        }
+        let recheck_request = calendar_event_query_request(&self.account_id, 0, 0, "q2");
+        let recheck_response = self.api_request(&recheck_request, config).await?;
+        let recheck = method_response(&recheck_response, "CalendarEvent/query", "q2")?;
+        if recheck.get("accountId").and_then(serde_json::Value::as_str)
+            != Some(self.account_id.as_str())
+            || recheck
+                .get("queryState")
+                .and_then(serde_json::Value::as_str)
+                != Some(query_state.as_str())
+            || recheck.get("position").and_then(serde_json::Value::as_u64) != Some(0)
+            || recheck.get("total").and_then(serde_json::Value::as_u64)
+                != expected_total.map(|total| total as u64)
+            || !recheck
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        {
+            return Err(Error::Sync(
+                "JMAP CalendarEvent query changed before snapshot completion".into(),
+            ));
+        }
+        let response_state = get_state.as_deref();
 
         let mut events = Vec::new();
+        let mut ambiguous_calendars = HashSet::new();
+        let mut ambiguous_events = HashSet::new();
         for ev in events_json {
+            let memberships = event_calendar_ids(&ev)?;
+            if memberships.len() != 1 {
+                ambiguous_calendars.extend(memberships);
+                ambiguous_events.insert(ev["id"].as_str().expect("validated id").to_string());
+                continue;
+            }
             let recurrence_kind = classify_recurrence(&ev);
-            let id = ev["id"].as_str().unwrap_or("").to_string();
-            let title = ev["title"].as_str().unwrap_or("(No title)").to_string();
+            let native_data = serde_json::to_string(&ev)
+                .map_err(|error| Error::Other(format!("Invalid CalendarEvent JSON: {error}")))?;
+            let recurrence_seeds =
+                recurrence_seeds(&ev, recurrence_kind, &native_data, response_state);
+            let id = ev["id"].as_str().expect("validated id").to_string();
+            let title = ev["title"].as_str().expect("validated title").to_string();
             let description = ev["description"].as_str().map(|s| s.to_string());
             let uid = ev["uid"].as_str().map(|s| s.to_string());
 
-            // calendarIds is a map { "cal-id": true, ... } — pick the first key
-            let cal_id = ev["calendarIds"]
-                .as_object()
-                .and_then(|m| m.keys().next().cloned())
-                .unwrap_or_default();
+            let cal_id = memberships[0].clone();
 
             // Location: JSCalendar uses "locations" as a map { id: { name: "..." } }
             let location = ev["locations"]
@@ -644,21 +1449,14 @@ impl JmapConnection {
                 uid,
                 organizer_email,
                 attendees_json,
+                native_json: Some(ev),
+                response_state: response_state.map(str::to_string),
+                recurrence_seeds,
             });
         }
 
-        // Client-side filter by calendar if requested
-        let filtered = if let Some(cal_id) = calendar_id {
-            events
-                .into_iter()
-                .filter(|e| e.calendar_id == cal_id)
-                .collect()
-        } else {
-            events
-        };
-
-        log::info!("JMAP fetched {} calendar events", filtered.len());
-        Ok(filtered)
+        log::info!("JMAP fetched {} unambiguous calendar events", events.len());
+        Ok((events, ambiguous_calendars, ambiguous_events))
     }
 
     /// Create a calendar event on the server via CalendarEvent/set.
@@ -814,6 +1612,59 @@ impl JmapConnection {
             )));
         }
         Ok(())
+    }
+
+    /// Atomically update an event at a known state and read its complete
+    /// canonical JSCalendar object after the successful write.
+    pub(crate) async fn update_calendar_occurrence(
+        &self,
+        config: &JmapConfig,
+        event_id: &str,
+        expected_state: &str,
+        patch: &serde_json::Value,
+    ) -> Result<(String, serde_json::Value, Vec<RecurrenceIdentitySeed>)> {
+        let request = occurrence_update_request(&self.account_id, event_id, expected_state, patch);
+        let response = self.api_request(&request, config).await?;
+        let new_state = occurrence_update_state(&response, event_id)?;
+
+        let get = calendar_event_get_request(&self.account_id, event_id);
+        let response = self.api_request(&get, config).await?;
+        let method = &response["methodResponses"][0];
+        if method[0].as_str() != Some("CalendarEvent/get") {
+            return Err(Error::Sync(
+                "Canonical JMAP CalendarEvent/get failed; reconciliation required".into(),
+            ));
+        }
+        if method[1]["state"].as_str() != Some(new_state.as_str()) {
+            return Err(Error::Sync(
+                "JMAP CalendarEvent state changed before canonical read; reconciliation required"
+                    .into(),
+            ));
+        }
+        let list = method[1]["list"].as_array().ok_or_else(|| {
+            Error::Sync(
+                "Canonical JMAP CalendarEvent/get omitted its list; reconciliation required".into(),
+            )
+        })?;
+        if list.len() != 1 || list[0]["id"].as_str() != Some(event_id) {
+            return Err(Error::Sync(
+                "Canonical JMAP event identity changed; reconciliation required".into(),
+            ));
+        }
+        let native_event = list[0].clone();
+        let native = serde_json::to_string(&native_event).map_err(|error| {
+            Error::Sync(format!(
+                "Canonical JMAP event could not be stored; reconciliation required: {error}"
+            ))
+        })?;
+        let kind = classify_recurrence(&native_event);
+        let recurrence_seeds = recurrence_seeds(&native_event, kind, &native, Some(&new_state))
+            .ok_or_else(|| {
+                Error::Sync(
+                    "Canonical JMAP recurrence data is incomplete; reconciliation required".into(),
+                )
+            })?;
+        Ok((new_state, native_event, recurrence_seeds))
     }
 
     /// Update a participant's status on a calendar event via JMAP patch.
@@ -1045,8 +1896,12 @@ fn parse_iso8601_duration_seconds(dur: &str) -> i64 {
 #[cfg(test)]
 mod recurrence_tests {
     use super::{
-        calendar_events_request, classify_recurrence, faithful_local_recurrence_rules,
-        JmapCalendarEvent,
+        calendar_event_query_request, calendar_events_get_request, classify_recurrence,
+        faithful_local_recurrence_rules, occurrence_update_patch, occurrence_update_request,
+        occurrence_update_state, recurrence_seeds, JmapCalendarEvent,
+    };
+    use crate::calendar::recurrence_identity::{
+        OccurrenceFields, RecurrenceObjectKind, RecurrenceValueType, UpdateOccurrenceInput,
     };
     use crate::calendar::RecurrenceKind;
     use serde_json::{json, Value};
@@ -1057,8 +1912,305 @@ mod recurrence_tests {
             "id": "event-1",
             "uid": "uid-1",
             "calendarIds": {"calendar-1": true},
-            "start": "2026-09-13T10:00:00"
+            "title": "Master title",
+            "start": "2026-09-13T10:00:00",
+            "duration": "PT1H"
         })
+    }
+
+    fn seeds(
+        event: &Value,
+        state: &str,
+    ) -> Option<Vec<crate::calendar::recurrence_identity::RecurrenceIdentitySeed>> {
+        let native = serde_json::to_string(event).unwrap();
+        recurrence_seeds(event, classify_recurrence(event), &native, Some(state))
+    }
+
+    #[test]
+    fn native_master_and_override_seeds_preserve_identity_state_and_complete_event() {
+        let mut event = event();
+        event["timeZone"] = json!("Europe/Stockholm");
+        event["duration"] = json!("PT1H");
+        event["description"] = json!("Master description");
+        event["locations"] = json!({"master": {"name": "Master room"}});
+        event["recurrenceRules"] = json!([{"frequency": "weekly"}]);
+        event["recurrenceOverrides"] = json!({
+            "2026-09-20T10:00:00": {
+                "title": "Override title",
+                "description": "Override description",
+                "locations": {"override": {"name": "Override room"}},
+                "start": "2026-09-20T12:00:00",
+                "duration": "PT30M"
+            },
+            "2026-09-27T10:00:00": {"excluded": true},
+            "2026-10-04T10:00:00": {}
+        });
+
+        let seeds = seeds(&event, "state-7").unwrap();
+        assert_eq!(seeds.len(), 4);
+        assert!(seeds
+            .iter()
+            .all(|seed| seed.provider_calendar_id.as_deref() == Some("calendar-1")));
+        let master = &seeds[0];
+        assert_eq!(master.kind, RecurrenceObjectKind::Master);
+        assert_eq!(master.provider_calendar_id.as_deref(), Some("calendar-1"));
+        assert_eq!(master.provider_series_id.as_deref(), Some("event-1"));
+        assert_eq!(master.provider_revision.as_deref(), Some("state-7"));
+        assert_eq!(
+            serde_json::from_str::<Value>(master.provider_native_data.as_deref().unwrap()).unwrap(),
+            event
+        );
+
+        let moved = &seeds[1];
+        assert_eq!(moved.kind, RecurrenceObjectKind::Exception);
+        assert_eq!(moved.provider_calendar_id.as_deref(), Some("calendar-1"));
+        assert_eq!(moved.provider_occurrence_id, None);
+        assert_eq!(moved.recurrence_id.as_deref(), Some("2026-09-20T10:00:00"));
+        assert_eq!(
+            moved.recurrence_timezone.as_deref(),
+            Some("Europe/Stockholm")
+        );
+        assert_eq!(
+            moved.recurrence_value_type,
+            Some(RecurrenceValueType::DateTime)
+        );
+        assert_eq!(master.occurrence.title, "Master title");
+        assert_eq!(
+            master.occurrence.description.as_deref(),
+            Some("Master description")
+        );
+        assert_eq!(master.occurrence.location.as_deref(), Some("Master room"));
+        assert_eq!(moved.occurrence.title, "Override title");
+        assert_eq!(
+            moved.occurrence.description.as_deref(),
+            Some("Override description")
+        );
+        assert_eq!(moved.occurrence.location.as_deref(), Some("Override room"));
+        assert_eq!(moved.occurrence.start_time, "2026-09-20T10:00:00Z");
+        assert_eq!(moved.occurrence.end_time, "2026-09-20T10:30:00Z");
+        assert_eq!(
+            moved.occurrence.timezone.as_deref(),
+            Some("Europe/Stockholm")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(moved.provider_native_data.as_deref().unwrap()).unwrap(),
+            event
+        );
+        assert!(seeds.iter().all(|seed| {
+            serde_json::from_str::<Value>(seed.provider_native_data.as_deref().unwrap()).unwrap()
+                == event
+        }));
+        assert_eq!(seeds[2].kind, RecurrenceObjectKind::Exclusion);
+        assert_eq!(seeds[2].occurrence.start_time, "2026-09-27T08:00:00Z");
+        assert_eq!(seeds[3].kind, RecurrenceObjectKind::Occurrence);
+        assert_eq!(seeds[3].occurrence.start_time, "2026-10-04T08:00:00Z");
+    }
+
+    #[test]
+    fn occurrence_patch_escapes_identity_and_excludes_immutable_and_scheduling_fields() {
+        let fields = OccurrenceFields {
+            title: "Changed".into(),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            start_time: "2026-09-20T10:00:00Z".into(),
+            end_time: "2026-09-20T11:30:00Z".into(),
+            all_day: false,
+            timezone: Some("Europe/Stockholm".into()),
+        };
+        let changed = UpdateOccurrenceInput {
+            title: Some(fields.title.clone()),
+            description: Some(String::new()),
+            location: Some(String::new()),
+            start_time: Some(fields.start_time.clone()),
+            end_time: Some(fields.end_time.clone()),
+            all_day: Some(fields.all_day),
+            timezone: Some(fields.timezone.clone().unwrap()),
+        };
+        let patch = occurrence_update_patch(Some("id/with~marker"), &changed, &fields);
+        let object = patch.as_object().unwrap();
+        let prefix = "recurrenceOverrides/id~1with~0marker/";
+        assert_eq!(object[&format!("{prefix}title")], "Changed");
+        assert_eq!(object[&format!("{prefix}description")], "");
+        assert_eq!(object[&format!("{prefix}locations")], json!({}));
+        assert_eq!(object[&format!("{prefix}start")], "2026-09-20T12:00:00");
+        assert_eq!(object[&format!("{prefix}duration")], "PT1H30M");
+        assert!(object.keys().all(|key| {
+            !key.contains("participants")
+                && !key.contains("recurrenceRules")
+                && !key.contains("excludedRecurrenceRules")
+                && !key.ends_with("uid")
+                && !key.contains("relatedTo")
+                && !key.contains("baseEventId")
+                && !key.contains("recurrenceIdTimeZone")
+        }));
+
+        let detached = occurrence_update_patch(None, &changed, &fields);
+        assert!(detached["description"].is_null());
+        assert_eq!(detached["locations"], json!({}));
+    }
+
+    #[test]
+    fn sparse_occurrence_patch_preserves_unmodified_native_fields() {
+        let desired = OccurrenceFields {
+            title: "Changed".into(),
+            description: Some("Preserved description".into()),
+            location: Some("Flattened projection must not replace native locations".into()),
+            start_time: "2026-09-20T08:00:00Z".into(),
+            end_time: "2026-09-20T09:00:00Z".into(),
+            all_day: false,
+            timezone: Some("Europe/Stockholm".into()),
+        };
+        let changed = UpdateOccurrenceInput {
+            title: Some("Changed".into()),
+            ..UpdateOccurrenceInput::default()
+        };
+        assert_eq!(
+            occurrence_update_patch(Some("occurrence"), &changed, &desired),
+            json!({"recurrenceOverrides/occurrence/title": "Changed"})
+        );
+
+        let changed = UpdateOccurrenceInput {
+            end_time: Some(desired.end_time.clone()),
+            ..UpdateOccurrenceInput::default()
+        };
+        assert_eq!(
+            occurrence_update_patch(None, &changed, &desired),
+            json!({"duration": "PT1H"})
+        );
+    }
+
+    #[test]
+    fn occurrence_set_uses_expected_state_and_requires_new_state() {
+        let request = occurrence_update_request(
+            "account",
+            "event",
+            "expected-state",
+            &json!({"title": "Changed"}),
+        );
+        let set = &request["methodCalls"][0][1];
+        assert_eq!(set["ifInState"], "expected-state");
+        assert_eq!(set["sendSchedulingMessages"], false);
+        assert_eq!(set["update"]["event"]["title"], "Changed");
+
+        let response = json!({"methodResponses": [["CalendarEvent/set", {
+            "updated": {"event": null}, "newState": "new-state"
+        }, "u1"]]});
+        assert_eq!(
+            occurrence_update_state(&response, "event").unwrap(),
+            "new-state"
+        );
+        let missing = json!({"methodResponses": [["CalendarEvent/set", {
+            "updated": {"event": null}
+        }, "u1"]]});
+        assert!(matches!(
+            occurrence_update_state(&missing, "event"),
+            Err(crate::error::Error::Sync(_))
+        ));
+    }
+
+    #[test]
+    fn occurrence_set_state_mismatch_requires_reconciliation() {
+        for response in [
+            json!({"methodResponses": [["error", {
+                "type": "stateMismatch"
+            }, "u1"]]}),
+            json!({"methodResponses": [["CalendarEvent/set", {
+                "notUpdated": {"event": {"type": "stateMismatch"}}
+            }, "u1"]]}),
+        ] {
+            let error = occurrence_update_state(&response, "event").unwrap_err();
+            assert!(matches!(error, crate::error::Error::Sync(_)));
+            assert!(error.to_string().contains("reconciliation"));
+        }
+    }
+
+    #[test]
+    fn detached_seed_uses_immutable_provider_identity_and_native_semantics() {
+        let mut event = event();
+        event["id"] = json!("projected-9");
+        event["baseEventId"] = json!("series-3");
+        event["recurrenceId"] = json!("2026-09-20T10:00:00");
+        event["recurrenceIdTimeZone"] = json!("Europe/Stockholm");
+        event["timeZone"] = json!("Europe/Stockholm");
+        event["start"] = json!("2026-09-20T11:00:00");
+        event["duration"] = json!("PT1H");
+
+        let detached_seeds = seeds(&event, "state-8").unwrap();
+        assert_eq!(detached_seeds.len(), 1);
+        let seed = &detached_seeds[0];
+        assert_eq!(seed.kind, RecurrenceObjectKind::Exception);
+        assert_eq!(seed.provider_calendar_id.as_deref(), Some("calendar-1"));
+        assert_eq!(seed.provider_series_id.as_deref(), Some("series-3"));
+        assert_eq!(seed.provider_occurrence_id.as_deref(), Some("projected-9"));
+        assert_eq!(seed.recurrence_id.as_deref(), Some("2026-09-20T10:00:00"));
+        assert_eq!(seed.provider_revision.as_deref(), Some("state-8"));
+        assert_eq!(
+            serde_json::from_str::<Value>(seed.provider_native_data.as_deref().unwrap()).unwrap(),
+            event
+        );
+
+        event["start"] = event["recurrenceId"].clone();
+        assert_eq!(
+            seeds(&event, "state-9").unwrap()[0].kind,
+            RecurrenceObjectKind::Occurrence
+        );
+        event["excluded"] = json!(true);
+        assert_eq!(
+            seeds(&event, "state-10").unwrap()[0].kind,
+            RecurrenceObjectKind::Exclusion
+        );
+    }
+
+    #[test]
+    fn malformed_ranges_fail_closed_and_positive_standalone_clears() {
+        let standalone = event();
+        assert_eq!(seeds(&standalone, "state").unwrap(), Vec::new());
+
+        let mut malformed = event();
+        malformed["recurrenceRules"] = json!([{"frequency": "weekly"}]);
+        malformed["duration"] = json!("not-a-duration");
+        assert_eq!(classify_recurrence(&malformed), RecurrenceKind::Series);
+        assert!(seeds(&malformed, "state").is_none());
+
+        malformed["duration"] = json!("P9223372036854775807D");
+        assert!(seeds(&malformed, "state").is_none());
+
+        malformed["duration"] = json!("PT1H");
+        malformed["recurrenceOverrides"] = json!({
+            "2026-09-20T10:00:00": {"timeZone": "Not/AZone"}
+        });
+        assert!(seeds(&malformed, "state").is_none());
+    }
+
+    #[test]
+    fn recurrence_seeds_require_exactly_one_true_calendar_membership() {
+        let mut recurring = event();
+        recurring["recurrenceRules"] = json!([{"frequency": "weekly"}]);
+
+        recurring["calendarIds"] = json!({
+            "calendar-1": true,
+            "calendar-2": true
+        });
+        assert!(seeds(&recurring, "state").is_none());
+
+        recurring["calendarIds"] = json!({
+            "calendar-1": true,
+            "not-a-membership": false
+        });
+        let authoritative = seeds(&recurring, "state").unwrap();
+        assert!(authoritative
+            .iter()
+            .all(|seed| { seed.provider_calendar_id.as_deref() == Some("calendar-1") }));
+
+        let mut standalone = event();
+        standalone["calendarIds"] = json!({
+            "calendar-1": true,
+            "calendar-2": true
+        });
+        assert!(seeds(&standalone, "state").is_none());
+
+        standalone["calendarIds"] = json!({" ": true});
+        assert!(seeds(&standalone, "state").is_none());
     }
 
     #[test]
@@ -1148,15 +2300,17 @@ mod recurrence_tests {
 
     #[test]
     fn get_requests_native_events_without_a_version_specific_property_list() {
-        let request = calendar_events_request("account-1");
-        let calls = &request["methodCalls"];
-        assert_eq!(calls[0][0], "CalendarEvent/query");
-        assert_eq!(calls[0][1]["limit"], 1000);
-        assert!(calls[0][1].get("expandRecurrences").is_none());
-        assert_eq!(calls[1][0], "CalendarEvent/get");
-        let get = &calls[1][1];
+        let query = calendar_event_query_request("account-1", 500, 500, "q1");
+        assert_eq!(query["methodCalls"][0][0], "CalendarEvent/query");
+        assert_eq!(query["methodCalls"][0][1]["position"], 500);
+        assert_eq!(query["methodCalls"][0][1]["limit"], 500);
+        assert!(query["methodCalls"][0][1]
+            .get("expandRecurrences")
+            .is_none());
+        let request = calendar_events_get_request("account-1", &["event-1".into()]);
+        let get = &request["methodCalls"][0][1];
         assert_eq!(get["accountId"], "account-1");
-        assert_eq!(get["#ids"]["path"], "/ids");
+        assert_eq!(get["ids"], json!(["event-1"]));
         assert!(get.get("recurrenceOverridesBefore").is_none());
         assert!(get.get("recurrenceOverridesAfter").is_none());
         assert!(get.get("properties").is_none());

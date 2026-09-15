@@ -200,6 +200,117 @@ mod connect_tests {
             Some("Basic dXNlcjpwYXNz")
         );
     }
+
+    #[tokio::test]
+    async fn report_etags_flow_unchanged_to_if_match() {
+        for etag in ["\"tag\"", "W/\"tag\""] {
+            let xml = format!(
+                "<d:multistatus xmlns:d=\"DAV:\" \
+                 xmlns:c=\"urn:ietf:params:xml:ns:caldav\">\
+                 <d:response><d:href>/collections/work/event.ics</d:href>\
+                 <d:propstat><d:prop><d:getetag>{etag}</d:getetag>\
+                 <c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\n\
+                 UID:event\nEND:VEVENT\nEND:VCALENDAR</c:calendar-data>\
+                 </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\
+                 </d:response></d:multistatus>"
+            );
+            let parsed = parse_events_from_xml(&xml).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].etag, etag);
+
+            let (base, request_rx) = dav_server("").await;
+            let client = client_with_base(&base);
+            client
+                .put_event_at_href(&parsed[0].href, &parsed[0].ical_data, Some(&parsed[0].etag))
+                .await
+                .unwrap();
+            let request = request_rx.await.unwrap();
+            assert_eq!(header(&request, "if-match"), Some(etag));
+        }
+    }
+
+    fn report_response(href: &str, etag: &str, data: &str) -> String {
+        format!(
+            "<d:response><d:href>{href}</d:href><d:propstat><d:prop>\
+             <d:getetag>{etag}</d:getetag><c:calendar-data>{data}</c:calendar-data>\
+             </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        )
+    }
+
+    fn report_multistatus(body: &str) -> String {
+        format!(
+            "<d:multistatus xmlns:d=\"DAV:\" \
+             xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{body}</d:multistatus>"
+        )
+    }
+
+    #[test]
+    fn report_parser_distinguishes_valid_empty_from_invalid_xml_or_root() {
+        assert!(parse_events_from_xml(&report_multistatus(""))
+            .unwrap()
+            .is_empty());
+        assert!(parse_events_from_xml("<d:multistatus xmlns:d=\"DAV:\">").is_err());
+        assert!(parse_events_from_xml("<multistatus/>").is_err());
+        assert!(parse_events_from_xml("<d:response xmlns:d=\"DAV:\"/>").is_err());
+    }
+
+    #[test]
+    fn report_parser_rejects_partial_or_ambiguous_resources() {
+        let data = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:event\nEND:VEVENT\nEND:VCALENDAR";
+        let good = report_response("/calendar/event.ics", "&quot;tag&quot;", data);
+        let failed = good.replace("HTTP/1.1 200 OK", "HTTP/1.1 404 Not Found");
+        let missing_href = good.replace("/calendar/event.ics", "");
+        let missing_etag = good.replace("<d:getetag>&quot;tag&quot;</d:getetag>", "");
+        let empty_etag = good.replace("&quot;tag&quot;", "");
+        let missing_data = good.replace(&format!("<c:calendar-data>{data}</c:calendar-data>"), "");
+        let empty_data = good.replace(data, "");
+        let missing_status = good.replace("<d:status>HTTP/1.1 200 OK</d:status>", "");
+
+        for response in [
+            failed,
+            missing_href,
+            missing_etag,
+            empty_etag,
+            missing_data,
+            empty_data,
+            missing_status,
+        ] {
+            assert!(parse_events_from_xml(&report_multistatus(&response)).is_err());
+        }
+
+        let duplicate = format!("{good}{good}");
+        assert!(parse_events_from_xml(&report_multistatus(&duplicate)).is_err());
+
+        let conflicting_propstat = good.replace(
+            "</d:response>",
+            "<d:propstat><d:prop><d:getetag>&quot;other&quot;</d:getetag>\
+             </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+        );
+        assert!(parse_events_from_xml(&report_multistatus(&conflicting_propstat)).is_err());
+
+        let mixed = format!(
+            "{}{}",
+            report_response("/calendar/other.ics", "&quot;other&quot;", data),
+            good.replace("HTTP/1.1 200 OK", "HTTP/1.1 500 Error")
+        );
+        assert!(parse_events_from_xml(&report_multistatus(&mixed)).is_err());
+
+        let wrong_namespace = good
+            .replace("<d:response>", "<x:response xmlns:x=\"urn:x\">")
+            .replace("</d:response>", "</x:response>");
+        assert!(parse_events_from_xml(&report_multistatus(&wrong_namespace)).is_err());
+    }
+
+    #[test]
+    fn report_parser_preserves_strong_and_weak_etags_exactly() {
+        let data = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:event\nEND:VEVENT\nEND:VCALENDAR";
+        for etag in ["&quot;strong tag&quot;", "W/&quot;weak tag&quot;"] {
+            let xml = report_multistatus(&report_response("/calendar/event.ics", etag, data));
+            let events = parse_events_from_xml(&xml).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].etag, etag.replace("&quot;", "\""));
+        }
+    }
 }
 
 /// A CalDAV client that holds an HTTP client and connection details.
@@ -239,6 +350,13 @@ pub struct PushedCalDavEvent {
     pub href: String,
     pub etag: Option<String>,
     pub uid: String,
+}
+
+/// Canonical calendar object returned by a direct DAV GET.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievedCalDavEvent {
+    pub ical_data: String,
+    pub etag: Option<String>,
 }
 
 // XML payloads below use these namespace URIs:
@@ -458,7 +576,16 @@ impl CalDavClient {
             )));
         }
 
-        let events = parse_events_from_xml(&body);
+        let events = parse_events_from_xml(&body)?;
+        let mut resolved_hrefs = std::collections::HashSet::new();
+        for event in &events {
+            let resolved = self.resolve_url(&event.href)?;
+            if !resolved_hrefs.insert(resolved) {
+                return Err(Error::Other(
+                    "CalDAV REPORT contained duplicate resource hrefs".to_string(),
+                ));
+            }
+        }
         log::info!(
             "caldav: fetched {} events from {}",
             events.len(),
@@ -506,6 +633,16 @@ impl CalDavClient {
             .map_err(|e| Error::Other(format!("CalDAV PUT failed: {}", e)))?;
 
         let status = resp.status();
+        if if_match.is_some() && (status.as_u16() == 409 || status.as_u16() == 412) {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "(no body)".to_string());
+            return Err(Error::Sync(format!(
+                "CalDAV conditional write is stale; reconciliation required ({status}): {}",
+                body.chars().take(500).collect::<String>()
+            )));
+        }
         if !status.is_success() {
             let body = resp
                 .text()
@@ -527,6 +664,35 @@ impl CalDavClient {
 
         log::info!("caldav: PUT success, etag={etag:?}");
         Ok(etag)
+    }
+
+    /// Retrieve the canonical representation of one calendar object.
+    pub async fn get_event_at_href(&self, event_href: &str) -> Result<RetrievedCalDavEvent> {
+        let event_url = self.resolve_url(event_href)?;
+        log::debug!("caldav: GET canonical event from {}", event_url);
+        let resp = self
+            .apply_auth(self.http.get(&event_url))
+            .header(reqwest::header::ACCEPT, "text/calendar")
+            .send()
+            .await
+            .map_err(|error| Error::Other(format!("CalDAV GET failed: {error}")))?;
+        let status = resp.status();
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let ical_data = resp
+            .text()
+            .await
+            .map_err(|error| Error::Other(format!("CalDAV GET read failed: {error}")))?;
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "CalDAV GET returned {status}: {}",
+                ical_data.chars().take(500).collect::<String>()
+            )));
+        }
+        Ok(RetrievedCalDavEvent { ical_data, etag })
     }
 
     /// DELETE an event from the server.
@@ -907,30 +1073,164 @@ fn parse_calendars_from_xml(xml: &str) -> Vec<CalDavCalendar> {
     calendars
 }
 
-/// Parse events from a REPORT calendar-query multistatus XML response.
-fn parse_events_from_xml(xml: &str) -> Vec<CalDavEvent> {
-    let mut events = Vec::new();
-    let doc = match uppsala::parse(xml) {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!("caldav: XML parse error in events: {:?}", e);
-            return events;
-        }
+const DAV_NAMESPACE: &str = "DAV:";
+const CALDAV_NAMESPACE: &str = "urn:ietf:params:xml:ns:caldav";
+
+fn direct_elements(
+    doc: &Document,
+    node_id: NodeId,
+    namespace: &str,
+    local_name: &str,
+) -> Vec<NodeId> {
+    doc.children(node_id)
+        .into_iter()
+        .filter(|child_id| {
+            matches!(
+                doc.node_kind(*child_id),
+                Some(NodeKind::Element(element))
+                    if element.name.matches(Some(namespace), local_name)
+            )
+        })
+        .collect()
+}
+
+fn required_text(
+    doc: &Document,
+    parent: NodeId,
+    namespace: &str,
+    local_name: &str,
+    resource: &str,
+) -> Result<String> {
+    let elements = direct_elements(doc, parent, namespace, local_name);
+    let [element] = elements.as_slice() else {
+        return Err(Error::Other(format!(
+            "CalDAV REPORT resource {resource} must contain exactly one {local_name}"
+        )));
     };
-    let root = doc.root();
-    let responses = find_elements(&doc, root, "response");
+    let value = doc.text_content_deep(*element).trim().to_string();
+    if value.is_empty() || value.chars().any(char::is_control) && local_name != "calendar-data" {
+        return Err(Error::Other(format!(
+            "CalDAV REPORT resource {resource} has an invalid {local_name}"
+        )));
+    }
+    Ok(value)
+}
 
-    for response in &responses {
-        let href = find_text_in(&doc, *response, "href").unwrap_or_default();
-        let etag = find_text_in(&doc, *response, "getetag")
-            .map(|e| e.trim_matches('"').to_string())
-            .unwrap_or_default();
-        let ical_data = find_text_in(&doc, *response, "calendar-data").unwrap_or_default();
+fn successful_dav_status(status: &str) -> bool {
+    let mut parts = status.split_ascii_whitespace();
+    parts
+        .next()
+        .filter(|version| version.starts_with("HTTP/"))
+        .and_then(|_| parts.next())
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
+}
 
-        if ical_data.is_empty() {
-            continue;
+/// Parse a complete REPORT calendar-query multistatus snapshot.
+fn parse_events_from_xml(xml: &str) -> Result<Vec<CalDavEvent>> {
+    let doc = uppsala::parse(xml)
+        .map_err(|error| Error::Other(format!("CalDAV REPORT XML parse failed: {error}")))?;
+    let document_elements: Vec<NodeId> = doc
+        .children(doc.root())
+        .into_iter()
+        .filter(|node_id| matches!(doc.node_kind(*node_id), Some(NodeKind::Element(_))))
+        .collect();
+    let [root] = document_elements.as_slice() else {
+        return Err(Error::Other(
+            "CalDAV REPORT XML must have one document element".to_string(),
+        ));
+    };
+    if !matches!(
+        doc.node_kind(*root),
+        Some(NodeKind::Element(element))
+            if element.name.matches(Some(DAV_NAMESPACE), "multistatus")
+    ) {
+        return Err(Error::Other(
+            "CalDAV REPORT XML root must be DAV:multistatus".to_string(),
+        ));
+    }
+    if doc.children(*root).into_iter().any(|node_id| {
+        matches!(
+            doc.node_kind(node_id),
+            Some(NodeKind::Element(element))
+                if element.name.local_name.as_ref() == "response"
+                    && !element.name.matches(Some(DAV_NAMESPACE), "response")
+        )
+    }) {
+        return Err(Error::Other(
+            "CalDAV REPORT contains a response outside the DAV namespace".to_string(),
+        ));
+    }
+
+    let mut events = Vec::new();
+    let mut hrefs = std::collections::HashSet::new();
+    for response in direct_elements(&doc, *root, DAV_NAMESPACE, "response") {
+        let href = required_text(&doc, response, DAV_NAMESPACE, "href", "(unknown)")?;
+        if !hrefs.insert(href.clone()) {
+            return Err(Error::Other(format!(
+                "CalDAV REPORT contained duplicate href '{href}'"
+            )));
         }
 
+        let response_statuses = direct_elements(&doc, response, DAV_NAMESPACE, "status");
+        let propstats = direct_elements(&doc, response, DAV_NAMESPACE, "propstat");
+        if !response_statuses.is_empty() || propstats.is_empty() {
+            return Err(Error::Other(format!(
+                "CalDAV REPORT resource '{href}' has conflicting or missing DAV status"
+            )));
+        }
+
+        let mut etag = None;
+        let mut ical_data = None;
+        for propstat in propstats {
+            let status = required_text(&doc, propstat, DAV_NAMESPACE, "status", &href)?;
+            if !successful_dav_status(&status) {
+                return Err(Error::Other(format!(
+                    "CalDAV REPORT resource '{href}' has unsuccessful propstat: {status}"
+                )));
+            }
+            let props = direct_elements(&doc, propstat, DAV_NAMESPACE, "prop");
+            let [props] = props.as_slice() else {
+                return Err(Error::Other(format!(
+                    "CalDAV REPORT resource '{href}' has malformed propstat"
+                )));
+            };
+            for node_id in direct_elements(&doc, *props, DAV_NAMESPACE, "getetag") {
+                if etag.is_some() {
+                    return Err(Error::Other(format!(
+                        "CalDAV REPORT resource '{href}' has conflicting ETags"
+                    )));
+                }
+                let value = doc.text_content_deep(node_id).trim().to_string();
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    return Err(Error::Other(format!(
+                        "CalDAV REPORT resource '{href}' has an invalid ETag"
+                    )));
+                }
+                etag = Some(value);
+            }
+            for node_id in direct_elements(&doc, *props, CALDAV_NAMESPACE, "calendar-data") {
+                if ical_data.is_some() {
+                    return Err(Error::Other(format!(
+                        "CalDAV REPORT resource '{href}' has conflicting calendar-data"
+                    )));
+                }
+                let value = doc.text_content_deep(node_id).trim().to_string();
+                if value.is_empty() {
+                    return Err(Error::Other(format!(
+                        "CalDAV REPORT resource '{href}' has empty calendar-data"
+                    )));
+                }
+                ical_data = Some(value);
+            }
+        }
+        let etag = etag
+            .ok_or_else(|| Error::Other(format!("CalDAV REPORT resource '{href}' has no ETag")))?;
+        let ical_data = ical_data.ok_or_else(|| {
+            Error::Other(format!(
+                "CalDAV REPORT resource '{href}' has no calendar-data"
+            ))
+        })?;
         let uid = extract_uid_from_ical(&ical_data).unwrap_or_else(|| href.clone());
         events.push(CalDavEvent {
             href,
@@ -939,8 +1239,7 @@ fn parse_events_from_xml(xml: &str) -> Vec<CalDavEvent> {
             ical_data,
         });
     }
-
-    events
+    Ok(events)
 }
 
 /// Extract the UID from raw iCalendar text.

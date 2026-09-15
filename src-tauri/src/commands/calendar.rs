@@ -4,10 +4,15 @@ use tauri::State;
 use crate::backend::calendar::{
     AttendeeResponseUpdate, CalendarBackend, CalendarBackendCtx, CalendarCapability,
     EventCreationTarget, InviteReplyDelivery, InviteResponse, ParticipantSchedule,
-    ParticipantScheduleRequest, RecurringImportFidelity, RemoteRsvpPolicy, RemoteRsvpRequest,
-    RoomAvailability, RoomAvailabilityRequest, RoomSuggestion,
+    ParticipantScheduleRequest, RecurringImportFidelity, RemoteOccurrenceUpdate,
+    RemoteOccurrenceUpdateOutcome, RemoteRsvpPolicy, RemoteRsvpRequest, RoomAvailability,
+    RoomAvailabilityRequest, RoomSuggestion,
 };
 use crate::calendar::ical::{self, ParsedInvite};
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceIdentity, RecurrenceMutationPlan, RecurrenceMutationScope,
+    RecurrenceObjectKind, RecurrenceObjectSummary, UpdateOccurrenceInput, UpdatedOccurrence,
+};
 use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::commands::sync_cmd::try_acquire_sync_guard;
 use crate::db;
@@ -476,6 +481,757 @@ pub async fn get_events(
 #[tauri::command]
 pub fn get_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<CalendarEvent> {
     db::calendar::get_event(&state.db.reader(), &event_id)
+}
+
+#[tauri::command]
+pub async fn get_event_recurrence_objects(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<Vec<RecurrenceObjectSummary>> {
+    get_event_recurrence_objects_inner(&state, &event_id).await
+}
+
+async fn get_event_recurrence_objects_inner(
+    state: &AppState,
+    event_id: &str,
+) -> Result<Vec<RecurrenceObjectSummary>> {
+    let initial_account_id = db::calendar::get_event(&state.db.reader(), event_id)?.account_id;
+    let account_lock = state.account_lifecycle.acquire(&initial_account_id);
+    let _account_guard = account_lock.lock().await;
+
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    let event = db::calendar::get_event(&transaction, event_id)?;
+    if event.account_id != initial_account_id {
+        return Err(crate::error::Error::Other(
+            "Event ownership changed while waiting to discover recurrence objects".into(),
+        ));
+    }
+    let summaries = recurrence_object_summaries(&transaction, &event)?;
+    transaction.commit()?;
+    Ok(summaries)
+}
+
+fn recurrence_object_summaries(
+    conn: &rusqlite::Connection,
+    event: &CalendarEvent,
+) -> Result<Vec<RecurrenceObjectSummary>> {
+    if conn.is_autocommit() {
+        return Err(crate::error::Error::Other(
+            "Recurrence discovery requires a database transaction".into(),
+        ));
+    }
+    let mut identities = db::calendar_recurrence::get_by_event_id(conn, &event.id)?;
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    if matches!(
+        event.recurrence_kind,
+        RecurrenceKind::Standalone | RecurrenceKind::Unknown
+    ) {
+        return Err(crate::error::Error::Other(
+            "Event and recurrence object classifications are contradictory".into(),
+        ));
+    }
+    for identity in &identities {
+        if identity.event_id != event.id || identity.account_id != event.account_id {
+            return Err(crate::error::Error::Other(
+                "Recurrence object does not belong to the selected event and account".into(),
+            ));
+        }
+        if event.recurrence_kind == RecurrenceKind::Occurrence
+            && !matches!(
+                identity.kind,
+                RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+            )
+        {
+            return Err(crate::error::Error::Other(
+                "Event and recurrence object classifications are contradictory".into(),
+            ));
+        }
+    }
+
+    identities.sort_by(|left, right| {
+        recurrence_discovery_kind_rank(left.kind)
+            .cmp(&recurrence_discovery_kind_rank(right.kind))
+            .then_with(|| left.occurrence.start_time.cmp(&right.occurrence.start_time))
+            .then_with(|| left.recurrence_id.cmp(&right.recurrence_id))
+            .then_with(|| left.object_id.cmp(&right.object_id))
+    });
+    Ok(identities
+        .into_iter()
+        .map(|identity| RecurrenceObjectSummary::from_identity(identity, &event.calendar_id))
+        .collect())
+}
+
+fn recurrence_discovery_kind_rank(kind: RecurrenceObjectKind) -> u8 {
+    match kind {
+        RecurrenceObjectKind::Master => 0,
+        RecurrenceObjectKind::Occurrence
+        | RecurrenceObjectKind::Exception
+        | RecurrenceObjectKind::Exclusion => 1,
+    }
+}
+
+#[tauri::command]
+pub async fn plan_event_recurrence_mutation(
+    state: State<'_, AppState>,
+    event_id: String,
+    recurrence_object_id: String,
+    scope: RecurrenceMutationScope,
+) -> Result<RecurrenceMutationPlan> {
+    plan_event_recurrence_mutation_inner(&state, &event_id, &recurrence_object_id, scope).await
+}
+
+async fn plan_event_recurrence_mutation_inner(
+    state: &AppState,
+    event_id: &str,
+    recurrence_object_id: &str,
+    scope: RecurrenceMutationScope,
+) -> Result<RecurrenceMutationPlan> {
+    let initial_account_id = db::calendar::get_event(&state.db.reader(), event_id)?.account_id;
+    let account_lock = state.account_lifecycle.acquire(&initial_account_id);
+    let _account_guard = account_lock.lock().await;
+
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    let event = db::calendar::get_event(&transaction, event_id)?;
+    if event.account_id != initial_account_id {
+        return Err(crate::error::Error::Other(
+            "Event ownership changed while waiting to plan recurrence mutation".into(),
+        ));
+    }
+    let backend =
+        calendar_backend_for_account(&transaction, &event.account_id)?.ok_or_else(|| {
+            crate::error::Error::Other("Account has no enabled calendar backend binding".into())
+        })?;
+    let plan = build_recurrence_mutation_plan(
+        &transaction,
+        event,
+        recurrence_object_id,
+        scope,
+        backend.protocol(),
+    )?;
+    transaction.commit()?;
+    Ok(plan)
+}
+
+/// Build a plan inside the caller's transaction. This helper never locks or
+/// commits, so write commands can revalidate without recursively locking.
+fn build_recurrence_mutation_plan(
+    conn: &rusqlite::Connection,
+    event: CalendarEvent,
+    recurrence_object_id: &str,
+    scope: RecurrenceMutationScope,
+    protocol: &str,
+) -> Result<RecurrenceMutationPlan> {
+    if conn.is_autocommit() {
+        return Err(crate::error::Error::Other(
+            "Recurrence mutation planning requires a database transaction".into(),
+        ));
+    }
+    let identity = db::calendar_recurrence::get_by_object_id(conn, recurrence_object_id)?
+        .ok_or_else(|| {
+            crate::error::Error::Other(
+                "Recurrence object is missing or belongs to a legacy unlinked event".into(),
+            )
+        })?;
+    if identity.event_id != event.id || identity.account_id != event.account_id {
+        return Err(crate::error::Error::Other(
+            "Recurrence object does not belong to the selected event and account".into(),
+        ));
+    }
+    validate_recurrence_plan_classification(&event, &identity, protocol, scope)?;
+
+    let expected_local_revision = db::calendar_revision::get(conn, &event.id)?;
+    let (remote_target_id, expected_provider_revision) = match scope {
+        RecurrenceMutationScope::ThisOccurrence => {
+            let target = match nonempty(identity.provider_occurrence_id.as_deref()) {
+                Some(target) => target.to_owned(),
+                None if matches!(protocol, "caldav" | "jmap") => {
+                    nonempty(event.remote_id.as_deref())
+                        .ok_or_else(|| {
+                            crate::error::Error::Other(
+                                "Embedded recurrence resource has no remote identity".into(),
+                            )
+                        })?
+                        .to_owned()
+                }
+                None => {
+                    return Err(crate::error::Error::Other(
+                        "Recurrence occurrence has no provider occurrence identity".into(),
+                    ));
+                }
+            };
+            (target, identity.provider_revision.clone())
+        }
+        RecurrenceMutationScope::EntireSeries => {
+            let (target, master) = resolve_series_plan_target(conn, &event, &identity)?;
+            (target, master.provider_revision)
+        }
+    };
+
+    if remote_target_id.chars().any(char::is_control) {
+        return Err(crate::error::Error::Other(
+            "Remote recurrence target must contain no control characters".into(),
+        ));
+    }
+    Ok(RecurrenceMutationPlan {
+        scope,
+        recurrence_object_id: identity.object_id,
+        event_id: event.id,
+        account_id: event.account_id,
+        calendar_id: event.calendar_id,
+        object_kind: identity.kind,
+        local_series_event_id: identity.local_series_event_id,
+        provider_calendar_id: identity.provider_calendar_id,
+        provider_series_id: identity.provider_series_id,
+        provider_occurrence_id: identity.provider_occurrence_id,
+        recurrence_id: identity.recurrence_id,
+        recurrence_timezone: identity.recurrence_timezone,
+        recurrence_value_type: identity.recurrence_value_type,
+        occurrence: identity.occurrence,
+        expected_provider_revision,
+        expected_local_revision,
+        backend_protocol: protocol.to_owned(),
+        remote_target_id,
+    })
+}
+
+#[tauri::command]
+pub async fn update_event_recurrence_occurrence(
+    state: State<'_, AppState>,
+    event_id: String,
+    recurrence_object_id: String,
+    expected_local_revision: i64,
+    expected_provider_revision: Option<String>,
+    expected_backend_protocol: String,
+    expected_remote_target_id: String,
+    update: UpdateOccurrenceInput,
+) -> Result<UpdatedOccurrence> {
+    update_event_recurrence_occurrence_inner(
+        &state,
+        event_id,
+        recurrence_object_id,
+        expected_local_revision,
+        expected_provider_revision,
+        expected_backend_protocol,
+        expected_remote_target_id,
+        update,
+        None,
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct OccurrenceUpdateSnapshot {
+    event: CalendarEvent,
+    identity: RecurrenceIdentity,
+    owned_recurrence_objects: Vec<RecurrenceIdentity>,
+    local_revision: i64,
+}
+
+async fn update_event_recurrence_occurrence_inner(
+    state: &AppState,
+    event_id: String,
+    recurrence_object_id: String,
+    expected_local_revision: i64,
+    expected_provider_revision: Option<String>,
+    expected_backend_protocol: String,
+    expected_remote_target_id: String,
+    update: UpdateOccurrenceInput,
+    backend_override: Option<&dyn CalendarBackend>,
+) -> Result<UpdatedOccurrence> {
+    let initial_account_id = db::calendar::get_event(&state.db.reader(), &event_id)?.account_id;
+    let account_lock = state.account_lifecycle.acquire(&initial_account_id);
+    let _account_guard = account_lock.lock().await;
+
+    let (snapshot, account, request, backend) = {
+        let mut conn = state.db.writer().await;
+        let transaction = conn.transaction()?;
+        let event = db::calendar::get_event(&transaction, &event_id)?;
+        if event.account_id != initial_account_id {
+            return Err(crate::error::Error::Other(
+                "Event ownership changed while waiting to update its occurrence".into(),
+            ));
+        }
+        let backend = match backend_override {
+            Some(backend) => backend,
+            None => {
+                calendar_backend_for_account(&transaction, &event.account_id)?.ok_or_else(|| {
+                    crate::error::Error::Other(
+                        "Account has no enabled calendar backend binding".into(),
+                    )
+                })?
+            }
+        };
+        let plan = build_recurrence_mutation_plan(
+            &transaction,
+            event.clone(),
+            &recurrence_object_id,
+            RecurrenceMutationScope::ThisOccurrence,
+            backend.protocol(),
+        )?;
+        if plan.expected_local_revision != expected_local_revision
+            || plan.expected_provider_revision != expected_provider_revision
+            || plan.backend_protocol != expected_backend_protocol
+            || plan.remote_target_id != expected_remote_target_id
+        {
+            return Err(crate::error::Error::Other(
+                "Recurrence mutation plan is stale; refresh before trying again".into(),
+            ));
+        }
+        let identity =
+            db::calendar_recurrence::get_by_object_id(&transaction, &recurrence_object_id)?
+                .ok_or_else(|| {
+                    crate::error::Error::Other("Recurrence object disappeared".into())
+                })?;
+        let desired = apply_occurrence_update(&identity, update.clone())?;
+        let account = db::accounts::get_account_full(&transaction, &event.account_id)?;
+        let snapshot = OccurrenceUpdateSnapshot {
+            event: event.clone(),
+            identity: identity.clone(),
+            owned_recurrence_objects: db::calendar_recurrence::get_by_event_id(
+                &transaction,
+                &event.id,
+            )?,
+            local_revision: plan.expected_local_revision,
+        };
+        let mut current_occurrence = event;
+        apply_occurrence_fields_to_event(&mut current_occurrence, &identity.occurrence);
+        let request = RemoteOccurrenceUpdate {
+            target_id: plan.remote_target_id,
+            expected_provider_revision: plan.expected_provider_revision,
+            trusted_identity: identity,
+            current_event: current_occurrence,
+            patch: update,
+            desired,
+        };
+        transaction.commit()?;
+        (snapshot, account, request, backend)
+    };
+
+    let outcome = backend
+        .update_recurrence_occurrence(&calendar_backend_ctx(state), &account, &request)
+        .await?;
+    persist_remote_occurrence_update(state, &snapshot, outcome)
+        .await
+        .map_err(|error| {
+            crate::error::Error::Sync(format!(
+                "Remote occurrence update succeeded but local persistence failed; reconciliation required: {error}"
+            ))
+        })
+}
+
+fn apply_occurrence_update(
+    identity: &RecurrenceIdentity,
+    update: UpdateOccurrenceInput,
+) -> Result<OccurrenceFields> {
+    if update
+        .title
+        .as_deref()
+        .is_some_and(|title| title.trim().is_empty())
+    {
+        return Err(crate::error::Error::Other(
+            "occurrence title must be non-empty".into(),
+        ));
+    }
+    let fields = OccurrenceFields {
+        title: update
+            .title
+            .unwrap_or_else(|| identity.occurrence.title.clone()),
+        description: update
+            .description
+            .or_else(|| identity.occurrence.description.clone()),
+        location: update
+            .location
+            .or_else(|| identity.occurrence.location.clone()),
+        start_time: update
+            .start_time
+            .unwrap_or_else(|| identity.occurrence.start_time.clone()),
+        end_time: update
+            .end_time
+            .unwrap_or_else(|| identity.occurrence.end_time.clone()),
+        all_day: update.all_day.unwrap_or(identity.occurrence.all_day),
+        timezone: update
+            .timezone
+            .or_else(|| identity.occurrence.timezone.clone()),
+    };
+    fields.validate()?;
+    Ok(fields)
+}
+
+async fn persist_remote_occurrence_update(
+    state: &AppState,
+    snapshot: &OccurrenceUpdateSnapshot,
+    outcome: RemoteOccurrenceUpdateOutcome,
+) -> Result<UpdatedOccurrence> {
+    outcome.replacement_identity.validate()?;
+    outcome.occurrence.validate()?;
+    validate_replacement_identity(&snapshot.identity, &outcome)?;
+
+    let detached = snapshot.event.recurrence_kind == RecurrenceKind::Occurrence;
+    let (mut canonical, canonical_recurrence_objects) = match (
+        detached,
+        outcome.canonical_event,
+        outcome.canonical_recurrence_objects,
+    ) {
+        (true, Some(event), None) => (Some(event), None),
+        (true, None, _) => {
+            return Err(crate::error::Error::Other(
+                "Detached occurrence update did not return a canonical event".into(),
+            ));
+        }
+        (true, Some(_), Some(_)) => {
+            return Err(crate::error::Error::Other(
+                "Detached occurrence update must not return embedded recurrence objects".into(),
+            ));
+        }
+        (false, Some(_), _) => {
+            return Err(crate::error::Error::Other(
+                "Embedded occurrence update must not replace the series event".into(),
+            ));
+        }
+        (false, None, Some(seeds)) if !seeds.is_empty() => {
+            validate_canonical_recurrence_objects(
+                &snapshot.identity,
+                &outcome.replacement_identity,
+                &seeds,
+            )?;
+            (None, Some(seeds))
+        }
+        (false, None, _) => {
+            return Err(crate::error::Error::Other(
+                "Embedded occurrence update requires a complete canonical recurrence object set"
+                    .into(),
+            ));
+        }
+    };
+    if let Some(event) = canonical.as_ref() {
+        validate_canonical_occurrence(&snapshot.event, event, &outcome.occurrence)?;
+    }
+
+    let mut conn = state.db.writer().await;
+    let transaction = conn.transaction()?;
+    let current_event = db::calendar::get_event(&transaction, &snapshot.event.id)?;
+    let current_identity =
+        db::calendar_recurrence::get_by_object_id(&transaction, &snapshot.identity.object_id)?;
+    let current_recurrence_objects =
+        db::calendar_recurrence::get_by_event_id(&transaction, &snapshot.event.id)?;
+    if current_event != snapshot.event
+        || db::calendar_revision::get(&transaction, &snapshot.event.id)? != snapshot.local_revision
+        || current_identity.as_ref() != Some(&snapshot.identity)
+        || current_recurrence_objects != snapshot.owned_recurrence_objects
+    {
+        return Err(crate::error::Error::Other(
+            "Calendar occurrence changed after the remote update".into(),
+        ));
+    }
+
+    if let Some(provider_event) = canonical.as_mut() {
+        provider_event.id = snapshot.event.id.clone();
+        provider_event.account_id = snapshot.event.account_id.clone();
+        provider_event.calendar_id = snapshot.event.calendar_id.clone();
+        db::calendar::update_event(&transaction, provider_event)?;
+    }
+    let replacement = if let Some(seeds) = canonical_recurrence_objects.as_deref() {
+        db::calendar::replace_event_recurrence_objects(
+            &transaction,
+            &snapshot.identity.account_id,
+            &snapshot.identity.event_id,
+            seeds,
+        )?;
+        db::calendar_recurrence::get_by_object_id(&transaction, &snapshot.identity.object_id)?
+            .ok_or_else(|| {
+                crate::error::Error::Other(
+                    "Canonical recurrence replacement lost the selected occurrence".into(),
+                )
+            })?
+    } else {
+        let replacement = outcome.replacement_identity.bind(
+            &snapshot.identity.account_id,
+            &snapshot.identity.event_id,
+            &snapshot.identity.object_id,
+        )?;
+        db::calendar_recurrence::upsert(&transaction, &replacement)?;
+        replacement
+    };
+    let local_revision = db::calendar_revision::get(&transaction, &snapshot.event.id)?;
+    transaction.commit()?;
+
+    let fields = replacement.occurrence.clone();
+    Ok(UpdatedOccurrence {
+        event_id: snapshot.event.id.clone(),
+        recurrence_object_id: replacement.object_id,
+        fields,
+        local_revision,
+        kind: replacement.kind,
+        provider_revision: replacement.provider_revision,
+    })
+}
+
+fn validate_canonical_recurrence_objects(
+    selected: &RecurrenceIdentity,
+    replacement: &crate::calendar::recurrence_identity::RecurrenceIdentitySeed,
+    seeds: &[crate::calendar::recurrence_identity::RecurrenceIdentitySeed],
+) -> Result<()> {
+    let mut positions = std::collections::HashSet::new();
+    let mut occurrence_ids = std::collections::HashSet::new();
+    let mut selected_matches = 0;
+
+    for seed in seeds {
+        seed.validate()?;
+        if seed.local_series_event_id != selected.local_series_event_id
+            || seed.provider_calendar_id != selected.provider_calendar_id
+            || seed.provider_series_id != selected.provider_series_id
+        {
+            return Err(crate::error::Error::Other(
+                "Canonical recurrence set contains an unrelated object".into(),
+            ));
+        }
+
+        let position = (seed.recurrence_value_type, seed.recurrence_id.as_deref());
+        if !positions.insert(position) {
+            return Err(crate::error::Error::Other(
+                "Canonical recurrence set contains a duplicate immutable position".into(),
+            ));
+        }
+        if let Some(occurrence_id) = seed.provider_occurrence_id.as_deref() {
+            if !occurrence_ids.insert(occurrence_id) {
+                return Err(crate::error::Error::Other(
+                    "Canonical recurrence set contains a duplicate provider occurrence ID".into(),
+                ));
+            }
+        }
+
+        if seed_matches_immutable_identity(seed, selected) {
+            selected_matches += 1;
+            if seed != replacement {
+                return Err(crate::error::Error::Other(
+                    "Selected canonical recurrence object contradicts its replacement".into(),
+                ));
+            }
+        }
+    }
+
+    if selected_matches != 1 {
+        return Err(crate::error::Error::Other(
+            "Canonical recurrence set must contain exactly one selected occurrence".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn seed_matches_immutable_identity(
+    seed: &crate::calendar::recurrence_identity::RecurrenceIdentitySeed,
+    identity: &RecurrenceIdentity,
+) -> bool {
+    seed.local_series_event_id == identity.local_series_event_id
+        && seed.provider_calendar_id == identity.provider_calendar_id
+        && seed.provider_series_id == identity.provider_series_id
+        && seed.provider_occurrence_id == identity.provider_occurrence_id
+        && seed.recurrence_id == identity.recurrence_id
+        && seed.recurrence_timezone == identity.recurrence_timezone
+        && seed.recurrence_value_type == identity.recurrence_value_type
+}
+
+fn validate_replacement_identity(
+    current: &RecurrenceIdentity,
+    outcome: &RemoteOccurrenceUpdateOutcome,
+) -> Result<()> {
+    let replacement = &outcome.replacement_identity;
+    let allowed_kind = matches!(
+        (current.kind, replacement.kind),
+        (
+            RecurrenceObjectKind::Occurrence,
+            RecurrenceObjectKind::Occurrence
+        ) | (
+            RecurrenceObjectKind::Occurrence,
+            RecurrenceObjectKind::Exception
+        ) | (
+            RecurrenceObjectKind::Exception,
+            RecurrenceObjectKind::Occurrence
+        ) | (
+            RecurrenceObjectKind::Exception,
+            RecurrenceObjectKind::Exception
+        )
+    );
+    if !allowed_kind
+        || replacement.local_series_event_id != current.local_series_event_id
+        || replacement.provider_calendar_id != current.provider_calendar_id
+        || replacement.provider_series_id != current.provider_series_id
+        || replacement.provider_occurrence_id != current.provider_occurrence_id
+        || replacement.recurrence_id != current.recurrence_id
+        || replacement.recurrence_timezone != current.recurrence_timezone
+        || replacement.recurrence_value_type != current.recurrence_value_type
+    {
+        return Err(crate::error::Error::Other(
+            "Provider returned a different immutable recurrence identity".into(),
+        ));
+    }
+    if replacement.occurrence != outcome.occurrence {
+        return Err(crate::error::Error::Other(
+            "Provider recurrence content does not match its occurrence projection".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_occurrence(
+    current: &CalendarEvent,
+    canonical: &CalendarEvent,
+    occurrence: &OccurrenceFields,
+) -> Result<()> {
+    if canonical.id != current.id
+        || canonical.account_id != current.account_id
+        || canonical.calendar_id != current.calendar_id
+        || canonical.uid != current.uid
+        || canonical.recurrence_rule != current.recurrence_rule
+        || canonical.recurrence_kind != RecurrenceKind::Occurrence
+        || canonical.organizer_email != current.organizer_email
+        || canonical.attendees_json != current.attendees_json
+        || canonical.my_status != current.my_status
+        || canonical.source_message_id != current.source_message_id
+        || canonical.remote_id != current.remote_id
+        || occurrence_fields_from_event(canonical) != *occurrence
+    {
+        return Err(crate::error::Error::Other(
+            "Provider returned a contradictory canonical occurrence".into(),
+        ));
+    }
+    occurrence.validate()
+}
+
+fn occurrence_fields_from_event(event: &CalendarEvent) -> OccurrenceFields {
+    OccurrenceFields {
+        title: event.title.clone(),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        start_time: event.start_time.clone(),
+        end_time: event.end_time.clone(),
+        all_day: event.all_day,
+        timezone: event.timezone.clone(),
+    }
+}
+
+fn apply_occurrence_fields_to_event(event: &mut CalendarEvent, fields: &OccurrenceFields) {
+    event.title = fields.title.clone();
+    event.description = fields.description.clone();
+    event.location = fields.location.clone();
+    event.start_time = fields.start_time.clone();
+    event.end_time = fields.end_time.clone();
+    event.all_day = fields.all_day;
+    event.timezone = fields.timezone.clone();
+}
+
+fn validate_recurrence_plan_classification(
+    event: &CalendarEvent,
+    identity: &crate::calendar::recurrence_identity::RecurrenceIdentity,
+    protocol: &str,
+    scope: RecurrenceMutationScope,
+) -> Result<()> {
+    if identity.kind == RecurrenceObjectKind::Exclusion {
+        return Err(crate::error::Error::Other(
+            "Excluded recurrence instances cannot be mutation targets".into(),
+        ));
+    }
+    if identity.kind == RecurrenceObjectKind::Master
+        && scope != RecurrenceMutationScope::EntireSeries
+    {
+        return Err(crate::error::Error::Other(
+            "A recurrence master can only target the entire series".into(),
+        ));
+    }
+    if identity.kind != RecurrenceObjectKind::Master
+        && (identity.recurrence_id.is_none() || identity.recurrence_value_type.is_none())
+    {
+        return Err(crate::error::Error::Other(
+            "Occurrence mutation requires an immutable recurrence ID and value type".into(),
+        ));
+    }
+
+    let detached_occurrence = matches!(
+        identity.kind,
+        RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+    ) && event.recurrence_kind == RecurrenceKind::Occurrence;
+    let embedded_occurrence = matches!(
+        identity.kind,
+        RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+    ) && event.recurrence_kind == RecurrenceKind::Series
+        && identity.provider_occurrence_id.is_none()
+        && matches!(protocol, "caldav" | "jmap");
+    let master = identity.kind == RecurrenceObjectKind::Master
+        && event.recurrence_kind == RecurrenceKind::Series;
+    if !master && !detached_occurrence && !embedded_occurrence {
+        return Err(crate::error::Error::Other(
+            "Event and recurrence object classifications are contradictory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_series_plan_target(
+    conn: &rusqlite::Connection,
+    event: &CalendarEvent,
+    identity: &crate::calendar::recurrence_identity::RecurrenceIdentity,
+) -> Result<(
+    String,
+    crate::calendar::recurrence_identity::RecurrenceIdentity,
+)> {
+    let local_series_event_id = if identity.kind == RecurrenceObjectKind::Master {
+        Some(identity.event_id.as_str())
+    } else {
+        identity.local_series_event_id.as_deref()
+    };
+    if let Some(local_id) = local_series_event_id {
+        let local_event = db::calendar::get_event(conn, local_id)?;
+        if local_event.account_id != event.account_id {
+            return Err(crate::error::Error::Other(
+                "Local recurrence series belongs to another account".into(),
+            ));
+        }
+    }
+    let master = db::calendar_recurrence::resolve_master(
+        conn,
+        &event.account_id,
+        local_series_event_id,
+        identity.provider_calendar_id.as_deref(),
+        identity.provider_series_id.as_deref(),
+    )?
+    .ok_or_else(|| {
+        crate::error::Error::Other("No exact recurrence series master could be resolved".into())
+    })?;
+    let master_event = db::calendar::get_event(conn, &master.event_id)?;
+    if master_event.account_id != event.account_id
+        || master_event.recurrence_kind != RecurrenceKind::Series
+    {
+        return Err(crate::error::Error::Other(
+            "Resolved recurrence master is not a series in the selected account".into(),
+        ));
+    }
+
+    let provider_target = nonempty(identity.provider_series_id.as_deref());
+    let local_target = nonempty(master_event.remote_id.as_deref());
+    if local_series_event_id.is_some() && local_target.is_none() {
+        return Err(crate::error::Error::Other(
+            "Local recurrence series event has no remote identity".into(),
+        ));
+    }
+    if let (Some(provider), Some(local)) = (provider_target, local_target) {
+        if provider != local {
+            return Err(crate::error::Error::Other(
+                "Local and provider series identities resolve to different remote targets".into(),
+            ));
+        }
+    }
+    let target = provider_target.or(local_target).ok_or_else(|| {
+        crate::error::Error::Other("Recurrence series has no remote identity".into())
+    })?;
+    Ok((target.to_owned(), master))
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// List all calendar invites for an account — events where the account is
@@ -4164,6 +4920,1365 @@ mod occurrence_safety_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calendar::recurrence_identity::{
+        RecurrenceIdentity, RecurrenceIdentitySeed, RecurrenceValueType,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum OccurrenceBackendMode {
+        Success,
+        SparsePatch,
+        Unsupported,
+        RemoteFailure,
+        ImmutableMismatch,
+        LocalRace,
+        UnrelatedCanonicalSet,
+        DuplicatePositionCanonicalSet,
+        DuplicateOccurrenceCanonicalSet,
+        MissingSelectedCanonicalSet,
+        DetachedCanonicalSet,
+    }
+
+    struct MockOccurrenceBackend {
+        calls: AtomicUsize,
+        mode: OccurrenceBackendMode,
+        protocol: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl CalendarBackend for MockOccurrenceBackend {
+        fn protocol(&self) -> &'static str {
+            self.protocol
+        }
+
+        async fn sync(
+            &self,
+            _ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        fn validate_event_creation(
+            &self,
+            _event: &CalendarEvent,
+            _remote_calendar_id: &str,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn push_created_event(
+            &self,
+            _ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+            _event: &CalendarEvent,
+            _remote_calendar_id: &str,
+        ) -> Result<Option<crate::backend::calendar::PushedEvent>> {
+            unreachable!()
+        }
+
+        async fn push_deleted_event(
+            &self,
+            _ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+            _remote_id: &str,
+            _remote_calendar_id: &str,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn push_calendar_rename(
+            &self,
+            _ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+            _remote_id: &str,
+            _name: &str,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn push_calendar_color(
+            &self,
+            _ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+            _remote_id: &str,
+            _color: &str,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn update_recurrence_occurrence(
+            &self,
+            ctx: &CalendarBackendCtx<'_>,
+            _account: &db::accounts::AccountFull,
+            request: &RemoteOccurrenceUpdate,
+        ) -> Result<RemoteOccurrenceUpdateOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, OccurrenceBackendMode::Unsupported) {
+                return Err(crate::error::Error::UnsupportedCapability {
+                    protocol: self.protocol(),
+                    capability: "THIS-OCCURRENCE update",
+                });
+            }
+            if matches!(self.mode, OccurrenceBackendMode::RemoteFailure) {
+                return Err(crate::error::Error::Other("injected remote failure".into()));
+            }
+            if matches!(self.mode, OccurrenceBackendMode::SparsePatch) {
+                assert_eq!(
+                    request.patch,
+                    UpdateOccurrenceInput {
+                        title: Some("Sparse title".into()),
+                        timezone: Some("Europe/Paris".into()),
+                        ..Default::default()
+                    }
+                );
+            }
+            if matches!(self.mode, OccurrenceBackendMode::LocalRace) {
+                ctx.db.writer().await.execute(
+                    "UPDATE calendar_events SET title = title WHERE id = ?1",
+                    [&request.current_event.id],
+                )?;
+            }
+            let identity = &request.trusted_identity;
+            let mut replacement = RecurrenceIdentitySeed {
+                local_series_event_id: identity.local_series_event_id.clone(),
+                provider_calendar_id: identity.provider_calendar_id.clone(),
+                provider_series_id: identity.provider_series_id.clone(),
+                provider_occurrence_id: identity.provider_occurrence_id.clone(),
+                recurrence_id: identity.recurrence_id.clone(),
+                recurrence_timezone: identity.recurrence_timezone.clone(),
+                recurrence_value_type: identity.recurrence_value_type,
+                occurrence: request.desired.clone(),
+                provider_native_data: Some("replacement-native-data".into()),
+                provider_revision: Some("replacement-revision".into()),
+                kind: RecurrenceObjectKind::Exception,
+            };
+            if matches!(self.mode, OccurrenceBackendMode::ImmutableMismatch) {
+                replacement.provider_calendar_id = Some("different-calendar".into());
+            }
+            let canonical_event =
+                (request.current_event.recurrence_kind == RecurrenceKind::Occurrence).then(|| {
+                    let mut event = request.current_event.clone();
+                    event.title = request.desired.title.clone();
+                    event.description = request.desired.description.clone();
+                    event.location = request.desired.location.clone();
+                    event.start_time = request.desired.start_time.clone();
+                    event.end_time = request.desired.end_time.clone();
+                    event.all_day = request.desired.all_day;
+                    event.timezone = request.desired.timezone.clone();
+                    event.etag = Some("replacement-revision".into());
+                    event
+                });
+            let mut canonical_recurrence_objects =
+                (request.current_event.recurrence_kind == RecurrenceKind::Series).then(|| {
+                    db::calendar_recurrence::get_by_event_id(
+                        &ctx.db.reader(),
+                        &request.current_event.id,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .filter(|identity| identity.object_id != "removed-object")
+                    .map(|identity| {
+                        let mut seed = recurrence_identity_seed(&identity);
+                        seed.provider_native_data = Some("replacement-native-data".into());
+                        seed.provider_revision = Some("replacement-revision".into());
+                        if identity.object_id == request.trusted_identity.object_id {
+                            replacement.clone()
+                        } else {
+                            seed
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                });
+            match self.mode {
+                OccurrenceBackendMode::UnrelatedCanonicalSet => {
+                    canonical_recurrence_objects.as_mut().unwrap()[0].provider_series_id =
+                        Some("unrelated-resource.ics".into());
+                }
+                OccurrenceBackendMode::DuplicatePositionCanonicalSet => {
+                    canonical_recurrence_objects
+                        .as_mut()
+                        .unwrap()
+                        .push(replacement.clone());
+                }
+                OccurrenceBackendMode::DuplicateOccurrenceCanonicalSet => {
+                    let seeds = canonical_recurrence_objects.as_mut().unwrap();
+                    seeds[0].provider_occurrence_id = Some("duplicate-occurrence".into());
+                    seeds[1].provider_occurrence_id = Some("duplicate-occurrence".into());
+                }
+                OccurrenceBackendMode::MissingSelectedCanonicalSet => {
+                    canonical_recurrence_objects
+                        .as_mut()
+                        .unwrap()
+                        .retain(|seed| !seed_matches_immutable_identity(seed, identity));
+                }
+                OccurrenceBackendMode::DetachedCanonicalSet => {
+                    canonical_recurrence_objects = Some(vec![replacement.clone()]);
+                }
+                _ => {}
+            }
+            Ok(RemoteOccurrenceUpdateOutcome {
+                replacement_identity: replacement,
+                occurrence: request.desired.clone(),
+                canonical_event,
+                canonical_recurrence_objects,
+            })
+        }
+    }
+
+    fn recurrence_identity_seed(identity: &RecurrenceIdentity) -> RecurrenceIdentitySeed {
+        RecurrenceIdentitySeed {
+            local_series_event_id: identity.local_series_event_id.clone(),
+            provider_calendar_id: identity.provider_calendar_id.clone(),
+            provider_series_id: identity.provider_series_id.clone(),
+            provider_occurrence_id: identity.provider_occurrence_id.clone(),
+            recurrence_id: identity.recurrence_id.clone(),
+            recurrence_timezone: identity.recurrence_timezone.clone(),
+            recurrence_value_type: identity.recurrence_value_type,
+            occurrence: identity.occurrence.clone(),
+            provider_native_data: identity.provider_native_data.clone(),
+            provider_revision: identity.provider_revision.clone(),
+            kind: identity.kind,
+        }
+    }
+
+    async fn recurrence_plan_state(protocol: &str) -> (tempfile::TempDir, AppState) {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_path_buf()).unwrap();
+        {
+            let conn = state.db.writer().await;
+            conn.execute_batch(
+                "INSERT INTO accounts (id, display_name, email, username)
+                 VALUES
+                    ('account', 'Account', 'account@example.test', 'account@example.test'),
+                    ('other', 'Other', 'other@example.test', 'other@example.test');
+                 INSERT INTO calendars (id, account_id, name, remote_id)
+                 VALUES
+                    ('calendar', 'account', 'Calendar', 'remote-calendar'),
+                    ('other-calendar', 'other', 'Other', 'other-calendar');",
+            )
+            .unwrap();
+            db::service_bindings::insert(
+                &conn,
+                &db::service_bindings::ServiceBinding {
+                    id: "calendar-binding".into(),
+                    account_id: "account".into(),
+                    service: "calendar".into(),
+                    protocol: protocol.into(),
+                    enabled: true,
+                    sync_interval_seconds: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+        }
+        (directory, state)
+    }
+
+    fn recurrence_plan_event(
+        id: &str,
+        account_id: &str,
+        kind: RecurrenceKind,
+        remote_id: Option<&str>,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            id: id.into(),
+            account_id: account_id.into(),
+            calendar_id: if account_id == "account" {
+                "calendar".into()
+            } else {
+                "other-calendar".into()
+            },
+            uid: Some(format!("{id}@example.test")),
+            title: id.into(),
+            description: None,
+            location: None,
+            start_time: "2026-09-15T10:00:00Z".into(),
+            end_time: "2026-09-15T11:00:00Z".into(),
+            all_day: false,
+            timezone: Some("UTC".into()),
+            recurrence_rule: (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into()),
+            recurrence_kind: kind,
+            organizer_email: None,
+            attendees_json: None,
+            my_status: None,
+            source_message_id: None,
+            ical_data: None,
+            remote_id: remote_id.map(str::to_owned),
+            etag: None,
+        }
+    }
+
+    fn recurrence_plan_identity(
+        object_id: &str,
+        event_id: &str,
+        kind: RecurrenceObjectKind,
+        local_series_event_id: Option<&str>,
+        provider_series_id: Option<&str>,
+        provider_occurrence_id: Option<&str>,
+    ) -> RecurrenceIdentity {
+        let occurrence = kind != RecurrenceObjectKind::Master;
+        let provider_identity = provider_series_id.is_some() || provider_occurrence_id.is_some();
+        RecurrenceIdentity {
+            object_id: object_id.into(),
+            account_id: "account".into(),
+            event_id: event_id.into(),
+            local_series_event_id: local_series_event_id.map(str::to_owned),
+            provider_calendar_id: provider_identity.then(|| "provider-calendar".into()),
+            provider_series_id: provider_series_id.map(str::to_owned),
+            provider_occurrence_id: provider_occurrence_id.map(str::to_owned),
+            recurrence_id: occurrence.then(|| format!("2026-09-15T10:00:00Z#{object_id}")),
+            recurrence_timezone: occurrence.then(|| "UTC".into()),
+            recurrence_value_type: occurrence.then_some(RecurrenceValueType::DateTime),
+            occurrence: OccurrenceFields {
+                title: format!("Effective {object_id}"),
+                description: Some("Effective description".into()),
+                location: Some("Effective room".into()),
+                start_time: "2026-09-15T10:00:00Z".into(),
+                end_time: "2026-09-15T11:00:00Z".into(),
+                all_day: false,
+                timezone: Some("Europe/Helsinki".into()),
+            },
+            provider_native_data: Some("secret-native-payload".into()),
+            provider_revision: Some(format!("revision-{object_id}")),
+            kind,
+        }
+    }
+
+    async fn insert_plan_event(state: &AppState, event: &CalendarEvent) {
+        db::calendar::insert_event(&*state.db.writer().await, event).unwrap();
+    }
+
+    async fn insert_plan_identity(state: &AppState, identity: &RecurrenceIdentity) {
+        db::calendar_recurrence::upsert(&*state.db.writer().await, identity).unwrap();
+    }
+
+    fn occurrence_update() -> UpdateOccurrenceInput {
+        UpdateOccurrenceInput {
+            title: Some("Updated occurrence".into()),
+            description: Some(String::new()),
+            location: Some("Room 2".into()),
+            start_time: Some("2026-09-15T12:00:00Z".into()),
+            end_time: Some("2026-09-15T13:00:00Z".into()),
+            all_day: None,
+            timezone: Some("Europe/Stockholm".into()),
+        }
+    }
+
+    async fn occurrence_fixture(
+        protocol: &str,
+        embedded: bool,
+    ) -> (tempfile::TempDir, AppState, RecurrenceMutationPlan) {
+        let (directory, state) = recurrence_plan_state(protocol).await;
+        let event = recurrence_plan_event(
+            "occurrence-event",
+            "account",
+            if embedded {
+                RecurrenceKind::Series
+            } else {
+                RecurrenceKind::Occurrence
+            },
+            Some(if embedded {
+                "resource.ics"
+            } else {
+                "remote-occurrence"
+            }),
+        );
+        insert_plan_event(&state, &event).await;
+        let mut identity = recurrence_plan_identity(
+            "occurrence-object",
+            "occurrence-event",
+            RecurrenceObjectKind::Occurrence,
+            None,
+            Some(if embedded {
+                "resource.ics"
+            } else {
+                "remote-series"
+            }),
+            (!embedded).then_some("provider-occurrence"),
+        );
+        if embedded {
+            identity.kind = RecurrenceObjectKind::Exception;
+            identity.occurrence.title = "Embedded exception".into();
+            identity.occurrence.description = Some("Exception description".into());
+            identity.occurrence.location = Some("Exception room".into());
+            identity.occurrence.timezone = Some("America/Toronto".into());
+        }
+        insert_plan_identity(&state, &identity).await;
+        if embedded {
+            for (object_id, kind) in [
+                ("master-object", RecurrenceObjectKind::Master),
+                ("sibling-object", RecurrenceObjectKind::Exception),
+                ("removed-object", RecurrenceObjectKind::Exclusion),
+            ] {
+                insert_plan_identity(
+                    &state,
+                    &recurrence_plan_identity(
+                        object_id,
+                        "occurrence-event",
+                        kind,
+                        None,
+                        Some("resource.ics"),
+                        None,
+                    ),
+                )
+                .await;
+            }
+        }
+        let plan = plan_event_recurrence_mutation_inner(
+            &state,
+            "occurrence-event",
+            "occurrence-object",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .unwrap();
+        (directory, state, plan)
+    }
+
+    async fn run_occurrence_update(
+        state: &AppState,
+        plan: &RecurrenceMutationPlan,
+        update: UpdateOccurrenceInput,
+        backend: &dyn CalendarBackend,
+    ) -> Result<UpdatedOccurrence> {
+        update_event_recurrence_occurrence_inner(
+            state,
+            plan.event_id.clone(),
+            plan.recurrence_object_id.clone(),
+            plan.expected_local_revision,
+            plan.expected_provider_revision.clone(),
+            plan.backend_protocol.clone(),
+            plan.remote_target_id.clone(),
+            update,
+            Some(backend),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recurrence_discovery_is_owned_complete_safe_and_deterministic() {
+        let (_directory, state) = recurrence_plan_state("caldav").await;
+        let series = recurrence_plan_event(
+            "series-event",
+            "account",
+            RecurrenceKind::Series,
+            Some("resource.ics"),
+        );
+        let detached = recurrence_plan_event(
+            "detached-event",
+            "account",
+            RecurrenceKind::Occurrence,
+            Some("remote-detached"),
+        );
+        insert_plan_event(&state, &series).await;
+        insert_plan_event(&state, &detached).await;
+
+        let master = recurrence_plan_identity(
+            "master-object",
+            "series-event",
+            RecurrenceObjectKind::Master,
+            None,
+            Some("resource.ics"),
+            None,
+        );
+        let mut later = recurrence_plan_identity(
+            "later-override",
+            "series-event",
+            RecurrenceObjectKind::Exception,
+            None,
+            Some("resource.ics"),
+            None,
+        );
+        later.occurrence.start_time = "2026-09-17T10:00:00Z".into();
+        later.occurrence.end_time = "2026-09-17T11:00:00Z".into();
+        let mut earlier = recurrence_plan_identity(
+            "earlier-override",
+            "series-event",
+            RecurrenceObjectKind::Occurrence,
+            None,
+            Some("resource.ics"),
+            None,
+        );
+        earlier.occurrence.start_time = "2026-09-16T10:00:00Z".into();
+        earlier.occurrence.end_time = "2026-09-16T11:00:00Z".into();
+        let sibling = recurrence_plan_identity(
+            "detached-object",
+            "detached-event",
+            RecurrenceObjectKind::Occurrence,
+            Some("series-event"),
+            Some("resource.ics"),
+            Some("remote-detached"),
+        );
+        for identity in [&later, &sibling, &master, &earlier] {
+            insert_plan_identity(&state, identity).await;
+        }
+
+        let summaries = get_event_recurrence_objects_inner(&state, "series-event")
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["master-object", "earlier-override", "later-override"]
+        );
+        assert!(summaries.iter().all(|summary| {
+            summary.event_id == "series-event"
+                && summary.account_id == "account"
+                && summary.calendar_id == "calendar"
+                && summary.provider_calendar_id.as_deref() == Some("provider-calendar")
+                && summary.provider_series_id.as_deref() == Some("resource.ics")
+        }));
+        assert_eq!(summaries[1].occurrence.title, "Effective earlier-override");
+        assert_eq!(
+            summaries[1].provider_revision.as_deref(),
+            Some("revision-earlier-override")
+        );
+        let serialized = serde_json::to_value(&summaries).unwrap();
+        assert!(!serialized.to_string().contains("secret-native-payload"));
+        assert!(serialized
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|summary| summary.get("provider_native_data").is_none()));
+
+        let detached_summaries = get_event_recurrence_objects_inner(&state, "detached-event")
+            .await
+            .unwrap();
+        assert_eq!(detached_summaries.len(), 1);
+        assert_eq!(detached_summaries[0].object_id, "detached-object");
+    }
+
+    #[tokio::test]
+    async fn recurrence_discovery_returns_legacy_empty_and_rejects_contradictions() {
+        let (_directory, state) = recurrence_plan_state("google").await;
+        for event in [
+            recurrence_plan_event(
+                "legacy-series",
+                "account",
+                RecurrenceKind::Series,
+                Some("legacy-series"),
+            ),
+            recurrence_plan_event(
+                "standalone",
+                "account",
+                RecurrenceKind::Standalone,
+                Some("standalone"),
+            ),
+            recurrence_plan_event(
+                "unknown",
+                "account",
+                RecurrenceKind::Unknown,
+                Some("unknown"),
+            ),
+            recurrence_plan_event(
+                "owned-series",
+                "account",
+                RecurrenceKind::Series,
+                Some("owned-series"),
+            ),
+        ] {
+            insert_plan_event(&state, &event).await;
+        }
+        assert!(get_event_recurrence_objects_inner(&state, "legacy-series")
+            .await
+            .unwrap()
+            .is_empty());
+
+        for (event_id, object_id) in [
+            ("standalone", "standalone-object"),
+            ("unknown", "unknown-object"),
+        ] {
+            insert_plan_identity(
+                &state,
+                &recurrence_plan_identity(
+                    object_id,
+                    event_id,
+                    RecurrenceObjectKind::Occurrence,
+                    Some("legacy-series"),
+                    Some("legacy-series"),
+                    Some(object_id),
+                ),
+            )
+            .await;
+            assert!(get_event_recurrence_objects_inner(&state, event_id)
+                .await
+                .is_err());
+        }
+
+        insert_plan_identity(
+            &state,
+            &recurrence_plan_identity(
+                "ownership-object",
+                "owned-series",
+                RecurrenceObjectKind::Master,
+                None,
+                Some("owned-series"),
+                None,
+            ),
+        )
+        .await;
+        let conn = state.db.writer().await;
+        conn.execute_batch("DROP TRIGGER calendar_recurrence_account_update")
+            .unwrap();
+        conn.execute(
+            "UPDATE calendar_recurrence_objects SET account_id = 'other'
+             WHERE object_id = 'ownership-object'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(get_event_recurrence_objects_inner(&state, "owned-series")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn occurrence_update_rejects_stale_plans_before_provider_io() {
+        let (_directory, state, plan) = occurrence_fixture("google", false).await;
+        let backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::Success,
+            protocol: "google",
+        };
+        let mut stale_local = plan.clone();
+        stale_local.expected_local_revision += 1;
+        assert!(
+            run_occurrence_update(&state, &stale_local, occurrence_update(), &backend)
+                .await
+                .is_err()
+        );
+        let mut stale_provider = plan.clone();
+        stale_provider.expected_provider_revision = None;
+        assert!(
+            run_occurrence_update(&state, &stale_provider, occurrence_update(), &backend)
+                .await
+                .is_err()
+        );
+        let changed_protocol_backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::Success,
+            protocol: "graph",
+        };
+        assert!(run_occurrence_update(
+            &state,
+            &plan,
+            occurrence_update(),
+            &changed_protocol_backend
+        )
+        .await
+        .is_err());
+        assert_eq!(changed_protocol_backend.calls.load(Ordering::SeqCst), 0);
+
+        let mut stale_target = plan.clone();
+        state
+            .db
+            .writer()
+            .await
+            .execute(
+                "UPDATE calendar_recurrence_objects
+                 SET provider_occurrence_id = 'replacement-target'
+                 WHERE object_id = 'occurrence-object'",
+                [],
+            )
+            .unwrap();
+        stale_target.expected_local_revision =
+            db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap();
+        assert!(
+            run_occurrence_update(&state, &stale_target, occurrence_update(), &backend)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_or_failed_remote_occurrence_update_does_not_write_locally() {
+        for mode in [
+            OccurrenceBackendMode::Unsupported,
+            OccurrenceBackendMode::RemoteFailure,
+        ] {
+            let backend = MockOccurrenceBackend {
+                calls: AtomicUsize::new(0),
+                mode,
+                protocol: "google",
+            };
+            let (_directory, state, plan) = occurrence_fixture("google", false).await;
+            let before_event = db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap();
+            let before_identity = db::calendar_recurrence::get_by_object_id(
+                &state.db.reader(),
+                &plan.recurrence_object_id,
+            )
+            .unwrap();
+            assert!(
+                run_occurrence_update(&state, &plan, occurrence_update(), &backend)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap(),
+                before_event
+            );
+            assert_eq!(
+                db::calendar_recurrence::get_by_object_id(
+                    &state.db.reader(),
+                    &plan.recurrence_object_id
+                )
+                .unwrap(),
+                before_identity
+            );
+            assert_eq!(
+                db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap(),
+                plan.expected_local_revision
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_occurrence_success_persists_canonical_event_and_identity() {
+        let (_directory, state, plan) = occurrence_fixture("google", false).await;
+        let backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::Success,
+            protocol: "google",
+        };
+        let result = run_occurrence_update(&state, &plan, occurrence_update(), &backend)
+            .await
+            .unwrap();
+        let event = db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap();
+        let identity = db::calendar_recurrence::get_by_object_id(
+            &state.db.reader(),
+            &plan.recurrence_object_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.title, "Updated occurrence");
+        assert_eq!(event.description.as_deref(), Some(""));
+        assert_eq!(event.remote_id.as_deref(), Some("remote-occurrence"));
+        assert_eq!(identity.object_id, plan.recurrence_object_id);
+        assert_eq!(identity.kind, RecurrenceObjectKind::Exception);
+        assert_eq!(result.fields, occurrence_fields_from_event(&event));
+        assert_eq!(identity.occurrence, result.fields);
+        assert_eq!(
+            result.local_revision,
+            db::calendar_revision::get(&state.db.reader(), &event.id).unwrap()
+        );
+        assert!(result.local_revision > plan.expected_local_revision);
+    }
+
+    #[tokio::test]
+    async fn remote_occurrence_update_receives_the_original_sparse_patch() {
+        let (_directory, state, plan) = occurrence_fixture("google", false).await;
+        let backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::SparsePatch,
+            protocol: "google",
+        };
+        let patch = UpdateOccurrenceInput {
+            title: Some("Sparse title".into()),
+            timezone: Some("Europe/Paris".into()),
+            ..Default::default()
+        };
+
+        let result = run_occurrence_update(&state, &plan, patch, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.fields.title, "Sparse title");
+        assert_eq!(result.fields.description, plan.occurrence.description);
+        assert_eq!(result.fields.location, plan.occurrence.location);
+        assert_eq!(result.fields.start_time, plan.occurrence.start_time);
+        assert_eq!(result.fields.end_time, plan.occurrence.end_time);
+        assert_eq!(result.fields.all_day, plan.occurrence.all_day);
+        assert_eq!(result.fields.timezone.as_deref(), Some("Europe/Paris"));
+    }
+
+    #[tokio::test]
+    async fn embedded_occurrence_success_does_not_overwrite_master_event() {
+        let (_directory, state, plan) = occurrence_fixture("caldav", true).await;
+        let before = db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap();
+        let before_objects =
+            db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id).unwrap();
+        let backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::Success,
+            protocol: "caldav",
+        };
+        let update = UpdateOccurrenceInput {
+            start_time: Some("2026-09-15T12:00:00Z".into()),
+            end_time: Some("2026-09-15T13:00:00Z".into()),
+            ..Default::default()
+        };
+        let result = run_occurrence_update(&state, &plan, update, &backend)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap(),
+            before
+        );
+        assert_eq!(result.fields.title, "Embedded exception");
+        assert_eq!(
+            result.fields.description.as_deref(),
+            Some("Exception description")
+        );
+        assert_eq!(result.fields.location.as_deref(), Some("Exception room"));
+        assert_eq!(result.fields.timezone.as_deref(), Some("America/Toronto"));
+        assert_eq!(result.fields.start_time, "2026-09-15T12:00:00Z");
+        let stored = db::calendar_recurrence::get_by_object_id(
+            &state.db.reader(),
+            &plan.recurrence_object_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.occurrence, result.fields);
+        assert_eq!(result.kind, RecurrenceObjectKind::Exception);
+        assert!(result.local_revision > plan.expected_local_revision);
+
+        let stored_objects =
+            db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id).unwrap();
+        assert_eq!(stored_objects.len(), before_objects.len() - 1);
+        assert!(
+            db::calendar_recurrence::get_by_object_id(&state.db.reader(), "removed-object")
+                .unwrap()
+                .is_none()
+        );
+        for object_id in ["master-object", "sibling-object", "occurrence-object"] {
+            let previous = before_objects
+                .iter()
+                .find(|identity| identity.object_id == object_id)
+                .unwrap();
+            let refreshed = stored_objects
+                .iter()
+                .find(|identity| identity.object_id == object_id)
+                .unwrap();
+            assert_eq!(refreshed.object_id, previous.object_id);
+            assert_eq!(
+                refreshed.provider_revision.as_deref(),
+                Some("replacement-revision")
+            );
+            assert_eq!(
+                refreshed.provider_native_data.as_deref(),
+                Some("replacement-native-data")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_embedded_canonical_sets_require_reconciliation_without_writes() {
+        for mode in [
+            OccurrenceBackendMode::UnrelatedCanonicalSet,
+            OccurrenceBackendMode::DuplicatePositionCanonicalSet,
+            OccurrenceBackendMode::DuplicateOccurrenceCanonicalSet,
+            OccurrenceBackendMode::MissingSelectedCanonicalSet,
+        ] {
+            let (_directory, state, plan) = occurrence_fixture("caldav", true).await;
+            let before_event = db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap();
+            let before_objects =
+                db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id)
+                    .unwrap();
+            let before_revision =
+                db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap();
+            let backend = MockOccurrenceBackend {
+                calls: AtomicUsize::new(0),
+                mode,
+                protocol: "caldav",
+            };
+
+            let error = run_occurrence_update(
+                &state,
+                &plan,
+                UpdateOccurrenceInput {
+                    title: Some("Remote success".into()),
+                    ..Default::default()
+                },
+                &backend,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(error, crate::error::Error::Sync(_)));
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap(),
+                before_event
+            );
+            assert_eq!(
+                db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id)
+                    .unwrap(),
+                before_objects
+            );
+            assert_eq!(
+                db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap(),
+                before_revision
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_occurrence_rejects_a_canonical_recurrence_set_without_writes() {
+        let (_directory, state, plan) = occurrence_fixture("google", false).await;
+        let before_event = db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap();
+        let before_objects =
+            db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id).unwrap();
+        let before_revision =
+            db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap();
+        let backend = MockOccurrenceBackend {
+            calls: AtomicUsize::new(0),
+            mode: OccurrenceBackendMode::DetachedCanonicalSet,
+            protocol: "google",
+        };
+
+        let error = run_occurrence_update(&state, &plan, occurrence_update(), &backend)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::Sync(_)));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db::calendar::get_event(&state.db.reader(), &plan.event_id).unwrap(),
+            before_event
+        );
+        assert_eq!(
+            db::calendar_recurrence::get_by_event_id(&state.db.reader(), &plan.event_id).unwrap(),
+            before_objects
+        );
+        assert_eq!(
+            db::calendar_revision::get(&state.db.reader(), &plan.event_id).unwrap(),
+            before_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_remote_identity_and_post_remote_race_require_reconciliation() {
+        for mode in [
+            OccurrenceBackendMode::ImmutableMismatch,
+            OccurrenceBackendMode::LocalRace,
+        ] {
+            let (_directory, state, plan) = occurrence_fixture("google", false).await;
+            let before_identity = db::calendar_recurrence::get_by_object_id(
+                &state.db.reader(),
+                &plan.recurrence_object_id,
+            )
+            .unwrap();
+            let backend = MockOccurrenceBackend {
+                calls: AtomicUsize::new(0),
+                mode,
+                protocol: "google",
+            };
+            let error = run_occurrence_update(&state, &plan, occurrence_update(), &backend)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, crate::error::Error::Sync(_)));
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                db::calendar_recurrence::get_by_object_id(
+                    &state.db.reader(),
+                    &plan.recurrence_object_id
+                )
+                .unwrap(),
+                before_identity
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_update_input_has_no_series_scope_or_forbidden_fields() {
+        let parsed = serde_json::from_value::<UpdateOccurrenceInput>(serde_json::json!({
+            "title": "Occurrence",
+            "scope": "entire-series",
+            "calendar_id": "other",
+            "recurrence_rule": "FREQ=DAILY",
+            "attendees": []
+        }));
+        assert!(parsed.is_err());
+    }
+
+    #[tokio::test]
+    async fn recurrence_plans_enforce_scope_matrix_and_choose_remote_targets() {
+        let (_directory, state) = recurrence_plan_state("google").await;
+        let master = recurrence_plan_event(
+            "master-event",
+            "account",
+            RecurrenceKind::Series,
+            Some("remote-master"),
+        );
+        let occurrence = recurrence_plan_event(
+            "occurrence-event",
+            "account",
+            RecurrenceKind::Occurrence,
+            Some("remote-occurrence"),
+        );
+        insert_plan_event(&state, &master).await;
+        insert_plan_event(&state, &occurrence).await;
+        insert_plan_identity(
+            &state,
+            &recurrence_plan_identity(
+                "master-object",
+                "master-event",
+                RecurrenceObjectKind::Master,
+                None,
+                Some("remote-master"),
+                None,
+            ),
+        )
+        .await;
+        insert_plan_identity(
+            &state,
+            &recurrence_plan_identity(
+                "occurrence-object",
+                "occurrence-event",
+                RecurrenceObjectKind::Occurrence,
+                Some("master-event"),
+                Some("remote-master"),
+                Some("provider-occurrence"),
+            ),
+        )
+        .await;
+
+        assert!(plan_event_recurrence_mutation_inner(
+            &state,
+            "master-event",
+            "master-object",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .is_err());
+        let master_plan = plan_event_recurrence_mutation_inner(
+            &state,
+            "master-event",
+            "master-object",
+            RecurrenceMutationScope::EntireSeries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(master_plan.remote_target_id, "remote-master");
+
+        let occurrence_plan = plan_event_recurrence_mutation_inner(
+            &state,
+            "occurrence-event",
+            "occurrence-object",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(occurrence_plan.remote_target_id, "provider-occurrence");
+        assert_eq!(
+            occurrence_plan.provider_calendar_id.as_deref(),
+            Some("provider-calendar")
+        );
+        assert_eq!(occurrence_plan.backend_protocol, "google");
+        assert_eq!(
+            occurrence_plan.occurrence.title,
+            "Effective occurrence-object"
+        );
+        let first_revision = occurrence_plan.expected_local_revision;
+        assert_eq!(
+            occurrence_plan.expected_provider_revision.as_deref(),
+            Some("revision-occurrence-object")
+        );
+        assert!(serde_json::to_value(&occurrence_plan)
+            .unwrap()
+            .get("provider_native_data")
+            .is_none());
+
+        let series_plan = plan_event_recurrence_mutation_inner(
+            &state,
+            "occurrence-event",
+            "occurrence-object",
+            RecurrenceMutationScope::EntireSeries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(series_plan.remote_target_id, "remote-master");
+        assert_eq!(
+            series_plan.expected_provider_revision.as_deref(),
+            Some("revision-master-object")
+        );
+
+        state
+            .db
+            .writer()
+            .await
+            .execute(
+                "UPDATE calendar_events SET title = title WHERE id = 'occurrence-event'",
+                [],
+            )
+            .unwrap();
+        let refreshed = plan_event_recurrence_mutation_inner(
+            &state,
+            "occurrence-event",
+            "occurrence-object",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .unwrap();
+        assert!(refreshed.expected_local_revision > first_revision);
+    }
+
+    #[tokio::test]
+    async fn embedded_occurrence_plan_targets_owning_resource() {
+        let (_directory, state) = recurrence_plan_state("caldav").await;
+        let event = recurrence_plan_event(
+            "embedded-event",
+            "account",
+            RecurrenceKind::Series,
+            Some("resource.ics"),
+        );
+        insert_plan_event(&state, &event).await;
+        for identity in [
+            recurrence_plan_identity(
+                "embedded-master",
+                "embedded-event",
+                RecurrenceObjectKind::Master,
+                None,
+                Some("resource.ics"),
+                None,
+            ),
+            recurrence_plan_identity(
+                "embedded-exception",
+                "embedded-event",
+                RecurrenceObjectKind::Exception,
+                None,
+                Some("resource.ics"),
+                None,
+            ),
+        ] {
+            insert_plan_identity(&state, &identity).await;
+        }
+        let plan = plan_event_recurrence_mutation_inner(
+            &state,
+            "embedded-event",
+            "embedded-exception",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.remote_target_id, "resource.ics");
+        state
+            .db
+            .writer()
+            .await
+            .execute(
+                "UPDATE calendar_events SET remote_id = NULL WHERE id = 'embedded-event'",
+                [],
+            )
+            .unwrap();
+        assert!(plan_event_recurrence_mutation_inner(
+            &state,
+            "embedded-event",
+            "embedded-exception",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn recurrence_planning_rejects_untrusted_or_conflicting_identity() {
+        let (_directory, state) = recurrence_plan_state("google").await;
+        for event in [
+            recurrence_plan_event(
+                "master-a",
+                "account",
+                RecurrenceKind::Series,
+                Some("remote-a"),
+            ),
+            recurrence_plan_event(
+                "master-b",
+                "account",
+                RecurrenceKind::Series,
+                Some("remote-b"),
+            ),
+            recurrence_plan_event(
+                "occurrence",
+                "account",
+                RecurrenceKind::Occurrence,
+                Some("remote-occurrence"),
+            ),
+            recurrence_plan_event(
+                "unknown",
+                "account",
+                RecurrenceKind::Unknown,
+                Some("remote-unknown"),
+            ),
+            recurrence_plan_event(
+                "standalone",
+                "account",
+                RecurrenceKind::Standalone,
+                Some("remote-standalone"),
+            ),
+            recurrence_plan_event(
+                "other-event",
+                "other",
+                RecurrenceKind::Series,
+                Some("other-master"),
+            ),
+        ] {
+            insert_plan_event(&state, &event).await;
+        }
+        for identity in [
+            recurrence_plan_identity(
+                "master-a-object",
+                "master-a",
+                RecurrenceObjectKind::Master,
+                None,
+                Some("remote-a"),
+                None,
+            ),
+            recurrence_plan_identity(
+                "master-b-object",
+                "master-b",
+                RecurrenceObjectKind::Master,
+                None,
+                Some("remote-b"),
+                None,
+            ),
+            recurrence_plan_identity(
+                "conflict",
+                "occurrence",
+                RecurrenceObjectKind::Occurrence,
+                Some("master-a"),
+                Some("remote-b"),
+                Some("remote-conflict"),
+            ),
+            recurrence_plan_identity(
+                "excluded",
+                "occurrence",
+                RecurrenceObjectKind::Exclusion,
+                Some("master-a"),
+                Some("remote-a"),
+                Some("remote-excluded"),
+            ),
+            recurrence_plan_identity(
+                "unknown-object",
+                "unknown",
+                RecurrenceObjectKind::Occurrence,
+                Some("master-a"),
+                Some("remote-a"),
+                Some("remote-unknown"),
+            ),
+            recurrence_plan_identity(
+                "standalone-object",
+                "standalone",
+                RecurrenceObjectKind::Occurrence,
+                Some("master-a"),
+                Some("remote-a"),
+                Some("remote-standalone"),
+            ),
+        ] {
+            insert_plan_identity(&state, &identity).await;
+        }
+        state
+            .db
+            .writer()
+            .await
+            .execute_batch("DROP TRIGGER calendar_recurrence_account_insert")
+            .unwrap();
+        insert_plan_identity(
+            &state,
+            &recurrence_plan_identity(
+                "cross-account-series",
+                "occurrence",
+                RecurrenceObjectKind::Occurrence,
+                Some("other-event"),
+                Some("remote-a"),
+                Some("remote-cross-account"),
+            ),
+        )
+        .await;
+
+        for (event_id, object_id, scope) in [
+            (
+                "occurrence",
+                "conflict",
+                RecurrenceMutationScope::EntireSeries,
+            ),
+            (
+                "occurrence",
+                "excluded",
+                RecurrenceMutationScope::ThisOccurrence,
+            ),
+            (
+                "unknown",
+                "unknown-object",
+                RecurrenceMutationScope::ThisOccurrence,
+            ),
+            (
+                "standalone",
+                "standalone-object",
+                RecurrenceMutationScope::ThisOccurrence,
+            ),
+            (
+                "master-a",
+                "conflict",
+                RecurrenceMutationScope::EntireSeries,
+            ),
+            (
+                "occurrence",
+                "cross-account-series",
+                RecurrenceMutationScope::EntireSeries,
+            ),
+            (
+                "occurrence",
+                "missing",
+                RecurrenceMutationScope::ThisOccurrence,
+            ),
+        ] {
+            assert!(
+                plan_event_recurrence_mutation_inner(&state, event_id, object_id, scope)
+                    .await
+                    .is_err()
+            );
+        }
+
+        state
+            .db
+            .writer()
+            .await
+            .execute_batch("DROP TRIGGER calendar_recurrence_account_update")
+            .unwrap();
+        state
+            .db
+            .writer()
+            .await
+            .execute(
+                "UPDATE calendar_recurrence_objects SET account_id = 'other'
+                 WHERE object_id = 'unknown-object'",
+                [],
+            )
+            .unwrap();
+        assert!(plan_event_recurrence_mutation_inner(
+            &state,
+            "unknown",
+            "unknown-object",
+            RecurrenceMutationScope::ThisOccurrence,
+        )
+        .await
+        .is_err());
+
+        state
+            .db
+            .writer()
+            .await
+            .execute(
+                "UPDATE service_bindings SET enabled = 0
+                 WHERE id = 'calendar-binding'",
+                [],
+            )
+            .unwrap();
+        assert!(plan_event_recurrence_mutation_inner(
+            &state,
+            "master-a",
+            "master-a-object",
+            RecurrenceMutationScope::EntireSeries,
+        )
+        .await
+        .is_err());
+    }
 
     fn import_group(ical: &str) -> ical::IcalEventGroup {
         ical::parse_ical_event_groups(ical)
