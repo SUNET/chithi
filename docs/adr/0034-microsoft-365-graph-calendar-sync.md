@@ -35,11 +35,10 @@ persists `recurrence_kind` on both inserts and refreshes of existing rows:
 
 The existing bounded `calendarView` reread can reclassify legacy rows that
 it returns; it does not guarantee recovery of every unknown row.
-[ADR 0052](0052-calendar-occurrence-mutation-safety.md) governs the shared
-desktop/mobile controls and backend guards: ordinary Edit/Delete/Move is
-available only for confirmed standalone events. Series, provider instances
-and exceptions remain viewable but read-only for those actions. Dragging
-an occurrence to another calendar no longer operates on its series master.
+The shared [calendar mutation safety invariants](0050-provider-backend-traits.md#calendar-mutation-safety)
+require backend-authoritative selection and scope. Provider instances and
+exceptions retain their occurrence identity; dragging an occurrence to
+another calendar cannot implicitly authorize a series-master mutation.
 
 This amendment adds recurrence evidence and mutation guards, without an
 occurrence/series editor, exception-sync engine or new provider CRUD
@@ -81,14 +80,14 @@ O365 branch (`provider == "o365"`) added to:
 ### Known limitations
 - **RSVP not wired** — `rsvp_event()` method exists but the calendar RSVP command doesn't have an O365 branch yet
 - **Recurring events** — individual instances show via `calendarView`;
-  ordinary edits, deletes and moves of series/occurrences are blocked under
-  ADR 0052
+  mutation eligibility depends on authoritative recurrence identity, scope
+  and provider capabilities, not the expanded display row
 - **No delta sync** — re-fetches full 6-month window each time. Graph's `/me/calendarView/delta` could optimize this
 - **Multiple calendars** — events assigned to default calendar only. Non-default calendar events won't be correctly categorized
 
 ## Consequences
-- O365 users can view and create calendar events; ordinary edits, deletes
-  and moves require confirmed standalone classification under ADR 0052
+- O365 users can view and create calendar events; edits, deletes and moves
+  require backend validation of the selected identity and mutation scope
 - Calendar shows events at correct local times (UTC stored, converted for display)
 - Token infrastructure handles the two-resource-server complexity transparently
 - Future: RSVP wiring, delta sync, and multi-calendar support can be added incrementally
