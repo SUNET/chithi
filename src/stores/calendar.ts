@@ -1,9 +1,15 @@
 import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import type { Calendar, CalendarEvent, NewEventInput } from "@/lib/types";
-import { expandRRule, isOccurrenceId, occurrenceId, parseRRule } from "@/lib/rrule";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import type {
+  Calendar, CalendarEdit, CalendarEvent, CalendarOccurrence, NewEventInput,
+} from "@/lib/types";
+import {
+  expandRRule, isOccurrenceId, masterEventId, occurrenceId, parseRRule,
+} from "@/lib/rrule";
+import {
+  calendarEditSupport, calendarMutationSupport,
+} from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
@@ -322,6 +328,88 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
+  function sameOccurrenceTime(left: string, right: string, allDay: boolean) {
+    if (allDay) return left.slice(0, 10) === right.slice(0, 10);
+    const leftTime = Date.parse(left);
+    const rightTime = Date.parse(right);
+    return Number.isFinite(leftTime) && leftTime === rightTime;
+  }
+
+  function selectedOriginalStart(event: CalendarEvent): string | null {
+    if (!isOccurrenceId(event.id)) return null;
+    const master = masterEventId(event.id);
+    return event.id.slice(master.length + 1);
+  }
+
+  function matchingOccurrence(
+    event: CalendarEvent,
+    occurrences: CalendarOccurrence[],
+  ): CalendarOccurrence {
+    const originalStart = selectedOriginalStart(event);
+    const matches = occurrences.filter((occurrence) => {
+      const effectiveTimeMatches = sameOccurrenceTime(
+        occurrence.fields.start_time, event.start_time, event.all_day,
+      ) && sameOccurrenceTime(
+        occurrence.fields.end_time, event.end_time, event.all_day,
+      );
+      if (originalStart && occurrence.selection.original_start) {
+        return sameOccurrenceTime(
+          occurrence.selection.original_start, originalStart, event.all_day,
+        ) && effectiveTimeMatches;
+      }
+      return occurrence.event_id === event.id && effectiveTimeMatches;
+    });
+    if (matches.length !== 1) {
+      throw new Error(
+        "The selected occurrence could not be identified uniquely. Refresh and try again.",
+      );
+    }
+    return matches[0];
+  }
+
+  async function updateOccurrence(
+    event: CalendarEvent,
+    edit: CalendarEdit,
+  ): Promise<void> {
+    const support = calendarEditSupport(event);
+    if (!support.supported || !support.occurrence) {
+      throw new Error(support.reason || "The selected event is not an occurrence.");
+    }
+    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+      throw new Error("The selected occurrence has invalid dates.");
+    }
+    start.setUTCDate(start.getUTCDate() - 2);
+    end.setUTCDate(end.getUTCDate() + 2);
+    const view = await api.readCalendarEventSet(
+      anchorId, start.toISOString(), end.toISOString(), 200,
+    );
+    const occurrence = matchingOccurrence(event, view.page.occurrences);
+    const plan = await api.planCalendarAction({
+      selection: occurrence.selection,
+      scope: "this-occurrence",
+      edit,
+      destination_calendar_id: null,
+      reset_exceptions: false,
+    });
+    if (plan.requires.replacement_meeting_identity ||
+      plan.requires.reset_exceptions) {
+      throw new Error("This occurrence edit requires unsupported confirmation.");
+    }
+    const result = await api.executeCalendarAction(plan.operation_id, {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    });
+    if (result.stage !== "completed") {
+      throw new Error(
+        "The occurrence edit needs reconciliation before it can be shown.",
+      );
+    }
+    await fetchEvents({ refreshSelected: false });
+  }
+
   function getEventMutationSupport(eventId: string) {
     // Preserve the requested identity even when no cached row exists.
     return calendarMutationSupport(
@@ -495,6 +583,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     getCachedEvent,
     createEvent,
     updateEvent,
+    updateOccurrence,
     getEventMutationSupport,
     moveEventToCalendar,
     deleteEvent,

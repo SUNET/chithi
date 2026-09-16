@@ -460,6 +460,18 @@ async fn plan_action(state: &AppState, input: CalendarActionInput) -> Result<Cal
     plan_with_backends(state, input, None).await
 }
 
+fn ensure_safe_occurrence_edit(
+    source: &store::Snapshot,
+    scope: RecurrenceMutationScope,
+) -> Result<()> {
+    if scope == RecurrenceMutationScope::ThisOccurrence && source.set.has_attendees()? {
+        return Err(invalid(
+            "editing one occurrence of a meeting with attendees is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
 async fn plan_with_backends(
     state: &AppState,
     input: CalendarActionInput,
@@ -484,6 +496,7 @@ async fn plan_with_backends(
     .await;
     store::ensure_current(&state.db.reader(), &initial)?;
     let source = hydrate_with_backends(state, &initial.anchor.id, backends).await?;
+    ensure_safe_occurrence_edit(&source, input.scope)?;
     let desired = desired_set(&source.set, &input)?;
     let target = target.filter(|target| target.calendar_id != source.anchor.calendar_id);
     let requirements = CalendarConfirmations {
@@ -900,6 +913,7 @@ async fn execute_with_backends(
     if operation.stage == CalendarActionStage::Completed {
         return Ok(result(&operation));
     }
+    ensure_safe_occurrence_edit(&operation.source, operation.input.scope)?;
     if operation.input.reset_exceptions
         && !operation.source.set.overrides.is_empty()
         && !confirmations.reset_exceptions

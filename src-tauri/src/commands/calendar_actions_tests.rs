@@ -1197,6 +1197,94 @@ async fn generated_database_selection_plans_and_executes_one_occurrence() {
 }
 
 #[tokio::test]
+async fn attendee_occurrence_is_rejected_before_operation_is_persisted() {
+    let (_directory, state, _, _) = fixture(None, None, false).await;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        let event = db::calendar::get_event(&tx, "source-event").unwrap();
+        let mut set = store::local_set(&tx, &event).unwrap();
+        set.event.attendees_json =
+            Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
+        store::persist_embedded(&tx, &event, &set).unwrap();
+        tx.commit().unwrap();
+    }
+    let view = read_event_set(&state, "source-event", "2026-09-14", "2026-09-20", 10, None)
+        .await
+        .unwrap();
+    let before: i64 = state
+        .db
+        .reader()
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_action_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let error = plan_action(
+        &state,
+        CalendarActionInput {
+            selection: view.page.occurrences[0].selection.clone(),
+            scope: RecurrenceMutationScope::ThisOccurrence,
+            edit: CalendarEdit {
+                title: Some("Must not publish".into()),
+                ..Default::default()
+            },
+            destination_calendar_id: None,
+            reset_exceptions: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("meeting with attendees"));
+    let after: i64 = state
+        .db
+        .reader()
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_action_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn persisted_attendee_occurrence_plan_is_rejected_before_execution() {
+    let (_directory, state, mut operation, remote) = fixture(None, None, false).await;
+    operation.input.scope = RecurrenceMutationScope::ThisOccurrence;
+    operation.source.set.event.attendees_json =
+        Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
+    let conn = state.db.writer().await;
+    store::save_operation(&conn, &operation).unwrap();
+    drop(conn);
+
+    let error = execute(
+        &state,
+        &operation.id,
+        &CalendarConfirmations {
+            replacement_meeting_identity: true,
+            reset_exceptions: false,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("meeting with attendees"));
+    let remote = remote.lock().unwrap();
+    assert_eq!(remote.update_count, 0);
+    assert_eq!(remote.create_count, 0);
+    assert_eq!(remote.delete_count, 0);
+    drop(remote);
+    assert_eq!(
+        store::load_operation(&state.db.reader(), &operation.id)
+            .unwrap()
+            .stage,
+        CalendarActionStage::Planned
+    );
+}
+
+#[tokio::test]
 async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_positions() {
     let (_directory, state, operation, _) = fixture(Some("jmap"), Some("caldav"), false).await;
     let page = list_occurrences(

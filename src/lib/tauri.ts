@@ -399,6 +399,28 @@ export async function updateEvent(
   return invoke("update_event", { eventId, event });
 }
 
+export async function readCalendarEventSet(
+  eventId: string,
+  start: string,
+  end: string,
+  limit = 200,
+): Promise<import("./types").CalendarEventSetView> {
+  return invoke("read_calendar_event_set", { eventId, start, end, limit });
+}
+
+export async function planCalendarAction(
+  input: import("./types").CalendarActionInput,
+): Promise<import("./types").CalendarActionPlan> {
+  return invoke("plan_calendar_action", { input });
+}
+
+export async function executeCalendarAction(
+  operationId: string,
+  confirmations: import("./types").CalendarConfirmations,
+): Promise<import("./types").CalendarActionResult> {
+  return invoke("execute_calendar_action", { operationId, confirmations });
+}
+
 export async function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }

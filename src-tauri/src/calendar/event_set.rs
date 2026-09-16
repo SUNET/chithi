@@ -46,6 +46,26 @@ pub struct CalendarEventSet {
 }
 
 impl CalendarEventSet {
+    /// Whether any live component has recipients whose scheduling semantics
+    /// must be preserved. This validates private participant provenance rather
+    /// than trusting the renderer-safe attendee projection alone.
+    pub(crate) fn has_attendees(&self) -> Result<bool> {
+        if !self.semantic_content(None)?.attendees.is_empty() {
+            return Ok(true);
+        }
+        for key in self
+            .overrides
+            .iter()
+            .filter(|item| item.event.is_some())
+            .map(|item| item.original_start.as_str())
+        {
+            if !self.semantic_content(Some(key))?.attendees.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Freeze native format and roles before changing fields or original positions.
     pub(crate) fn capture_content(&mut self) -> Result<()> {
         if self.content.is_some() {

@@ -28,7 +28,9 @@ import { message } from "@tauri-apps/plugin-dialog";
 import type { CalendarEvent } from "@/lib/types";
 import { occurrenceId } from "@/lib/rrule";
 import { formatInTimezone } from "@/lib/datetime";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarEditSupport, calendarMutationSupport,
+} from "@/lib/calendar-mutation-support";
 import { useToasts } from "@/lib/toast";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
 import { useAccountsStore } from "@/stores/accounts";
@@ -190,7 +192,11 @@ describe("calendar mutation safety", () => {
     for (const selector of [".btn-edit", ".btn-danger"]) {
       const button = wrapper.get(selector);
       expect(button.attributes("disabled")).toBeDefined();
-      expect(wrapper.get(`#${button.attributes("aria-describedby")}`).text()).toBe(reason);
+      const description = wrapper.get(`#${button.attributes("aria-describedby")}`).text();
+      const expected = selector === ".btn-edit"
+        ? calendarEditSupport(selected).reason
+        : reason;
+      expect(description).toContain(expected);
     }
     const vm = wrapper.vm as unknown as {
       startEditing(): void; saveEdit(): Promise<void>; handleDelete(): Promise<void>;
@@ -200,6 +206,38 @@ describe("calendar mutation safety", () => {
     await vm.handleDelete();
     expect(wrapper.find(".edit-mode").exists()).toBe(false);
     expectNoMutations();
+  });
+
+  it("edits one attendee-free occurrence while delete remains blocked", async () => {
+    const selected = event({
+      id: occurrenceId("master", new Date("2026-09-08T09:00:00Z")),
+      recurrence_kind: "occurrence",
+      recurrence_rule: "FREQ=WEEKLY",
+      attendees_json: null,
+    });
+    const store = setup(selected);
+    const updateOccurrence = vi
+      .spyOn(store, "updateOccurrence")
+      .mockResolvedValue(undefined);
+    const wrapper = detail();
+
+    expect(wrapper.get(".btn-edit").attributes("disabled")).toBeUndefined();
+    expect(wrapper.get(".btn-danger").attributes("disabled")).toBeDefined();
+    await wrapper.get(".btn-edit").trigger("click");
+    expect(wrapper.get('[data-testid="event-detail-calendar"]').attributes("disabled"))
+      .toBeDefined();
+    await wrapper.get('[data-testid="event-form-title"]')
+      .setValue("Only this occurrence");
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+
+    expect(updateOccurrence).toHaveBeenCalledOnce();
+    expect(updateOccurrence.mock.calls[0][0]).toEqual(selected);
+    expect(updateOccurrence.mock.calls[0][1]).toMatchObject({
+      title: "Only this occurrence",
+    });
+    expect(updateOccurrence.mock.calls[0][1]).not.toHaveProperty("recurrence_rule");
+    expect(api.updateEvent).not.toHaveBeenCalled();
   });
 
   it.each(["unknown", "occurrence", "series"] as const)("closes an open editor when refresh changes metadata to %s", async (kind) => {

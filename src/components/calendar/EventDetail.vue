@@ -4,7 +4,9 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarEditSupport, calendarMutationSupport,
+} from "@/lib/calendar-mutation-support";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import type { Calendar, CalendarEvent } from "@/lib/types";
@@ -30,6 +32,17 @@ const event = computed(() => {
 const mutationSupport = computed(() =>
   calendarStore.getEventMutationSupport(event.value?.id ?? ""),
 );
+const editSupport = computed(() => calendarEditSupport(event.value));
+const mutationNotice = computed(() => {
+  if (editSupport.value.supported && editSupport.value.occurrence) {
+    return "Only this occurrence can be edited. Deleting or moving recurring events remains unavailable.";
+  }
+  if (editSupport.value.reason && mutationSupport.value.reason &&
+    editSupport.value.reason !== mutationSupport.value.reason) {
+    return `${editSupport.value.reason} ${mutationSupport.value.reason}`;
+  }
+  return editSupport.value.reason ?? mutationSupport.value.reason;
+});
 const mutationReasonId = useId();
 
 const editing = ref(false);
@@ -42,7 +55,11 @@ watch(() => calendarStore.selectedEvent?.id, () => {
   selectionVersion++;
 }, { flush: "sync" });
 
-watch([() => event.value?.id, () => mutationSupport.value.reason], () => {
+watch([
+  () => event.value?.id,
+  () => editSupport.value.reason,
+  () => mutationSupport.value.reason,
+], () => {
   editing.value = false;
   editingEventId.value = null;
   error.value = null;
@@ -115,7 +132,7 @@ function statusClass(status: string | null): string {
 }
 
 function startEditing() {
-  if (saving.value || !event.value || !mutationSupport.value.supported) return;
+  if (saving.value || !event.value || !editSupport.value.supported) return;
   const current = event.value;
   editTitle.value = current.title;
   editStartDate.value = getDateInTimezone(current.start_time, uiStore.displayTimezone);
@@ -148,19 +165,40 @@ async function refreshMutationTarget(eventId: string, purpose: "attendee notific
 
 async function saveEdit() {
   if (saving.value || !editing.value || !event.value ||
-    editingEventId.value !== event.value.id || !mutationSupport.value.supported) return;
+    editingEventId.value !== event.value.id || !editSupport.value.supported) return;
   const original = event.value;
   const version = selectionVersion;
   const targetCalendarId = editCalendarId.value;
   saving.value = true;
   error.value = null;
   try {
+    const occurrenceEdit = editSupport.value.occurrence;
     const startISO = editAllDay.value
-      ? `${editStartDate.value}T00:00:00Z`
+      ? occurrenceEdit ? editStartDate.value : `${editStartDate.value}T00:00:00Z`
       : localInputToUTC(editStartDate.value, editStartTime.value, uiStore.displayTimezone);
     const endISO = editAllDay.value
-      ? `${editEndDate.value}T23:59:59Z`
+      ? occurrenceEdit ? editEndDate.value : `${editEndDate.value}T23:59:59Z`
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
+
+    if (occurrenceEdit) {
+      if (targetCalendarId !== original.calendar_id) {
+        throw new Error("Moving a recurring occurrence is not supported yet.");
+      }
+      await calendarStore.updateOccurrence(original, {
+        title: editTitle.value,
+        description: editDescription.value,
+        location: editLocation.value,
+        start_time: startISO,
+        end_time: endISO,
+        all_day: editAllDay.value,
+        timezone: original.timezone || "",
+      });
+      if (isCurrentSelection(original.id, version)) {
+        editing.value = false;
+        emit("close");
+      }
+      return;
+    }
 
     await calendarStore.updateEvent(original.id, {
       account_id: original.account_id,
@@ -272,8 +310,8 @@ async function handleDelete() {
       </div>
 
       <div v-if="error" class="detail-error">{{ error }}</div>
-      <p v-if="!mutationSupport.supported" :id="mutationReasonId" class="mutation-reason">
-        {{ mutationSupport.reason }}
+      <p v-if="mutationNotice" :id="mutationReasonId" class="mutation-reason">
+        {{ mutationNotice }}
       </p>
 
       <!-- View mode -->
@@ -365,7 +403,7 @@ async function handleDelete() {
         </div>
         <div class="edit-group">
           <label>Calendar</label>
-          <select v-model="editCalendarId" data-testid="event-detail-calendar">
+          <select v-model="editCalendarId" :disabled="editSupport.occurrence" data-testid="event-detail-calendar">
             <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
               {{ calendarLabel(cal) }}
             </option>
@@ -383,11 +421,11 @@ async function handleDelete() {
 
       <div class="detail-footer">
         <template v-if="!editing">
-          <button class="btn-edit" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="startEditing">Edit</button>
+          <button class="btn-edit" :disabled="saving || !editSupport.supported" :aria-describedby="editSupport.reason ? mutationReasonId : undefined" @click="startEditing">Edit</button>
           <button class="btn-danger" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="handleDelete" data-testid="event-form-delete">Delete</button>
         </template>
         <template v-else>
-          <button class="btn-save" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="saveEdit" data-testid="event-form-save">
+          <button class="btn-save" :disabled="saving || !editSupport.supported" :aria-describedby="editSupport.reason ? mutationReasonId : undefined" @click="saveEdit" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Save" }}
           </button>
           <button class="btn-cancel" @click="editing = false">Cancel</button>
