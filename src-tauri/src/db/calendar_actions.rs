@@ -77,23 +77,7 @@ pub(crate) struct Destination {
 }
 
 pub(crate) fn account_route(conn: &Connection, account_id: &str) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let account = super::accounts::get_account_full(conn, account_id)?;
-    let route = encode(&(
-        &account.id,
-        &account.username,
-        &account.email,
-        &account.auth_method,
-        &account.jmap_url,
-        &account.caldav_url,
-        &account.jmap_auth_method,
-        &account.oidc_token_endpoint,
-        &account.oidc_client_id,
-        account.calendar_binding(),
-        account.enabled,
-        account.calendar_sync_enabled,
-    ))?;
-    Ok(format!("{:x}", Sha256::digest(route)))
+    super::accounts::calendar_route_fingerprint(conn, account_id)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
