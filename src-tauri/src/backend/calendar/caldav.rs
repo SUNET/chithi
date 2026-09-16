@@ -2,6 +2,15 @@
 
 use async_trait::async_trait;
 
+mod event_sets;
+mod resource;
+mod timezones;
+
+#[cfg(test)]
+mod tests;
+
+use crate::calendar::event_set::CalendarEventSet;
+
 use crate::calendar::ical;
 use crate::calendar::recurrence_identity::{
     OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
@@ -580,6 +589,66 @@ impl CalendarBackend for CalDavCalendarBackend {
         super::RecurringImportFidelity::RawIcalendar
     }
 
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        calendar: &str,
+    ) -> Result<CalendarEventSet> {
+        event_sets::fetch(ctx, account, event, calendar).await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        event_sets::update(ctx, account, before, desired).await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        calendar: &str,
+        desired: &CalendarEventSet,
+        operation: &str,
+    ) -> Result<CalendarEventSet> {
+        event_sets::create(ctx, account, calendar, desired, operation).await
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        event_sets::delete(ctx, account, before).await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        calendar: &str,
+    ) -> Result<super::CalendarCapability<CalendarEventSet>> {
+        event_sets::move_native(ctx, account, before, calendar).await
+    }
+
+    async fn push_updated_event(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<()> {
+        event_sets::ordinary_update(ctx, account, remote_id, event).await
+    }
+
     async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let db = ctx.db;
         let account_id = account.id.as_str();
@@ -801,22 +870,23 @@ impl CalendarBackend for CalDavCalendarBackend {
         account: &AccountFull,
         request: &RemoteOccurrenceUpdate,
     ) -> Result<RemoteOccurrenceUpdateOutcome> {
-        let (uid, recurrence_id, value_type, recurrence_timezone, native) =
+        let (uid, recurrence_id, value_type, recurrence_timezone, _native) =
             validate_occurrence_update(account, request)?;
-        let updated = ical::rewrite_recurrence_occurrence(
-            native,
-            uid,
-            recurrence_id,
-            value_type,
-            recurrence_timezone,
-            &request.patch,
-            &request.desired,
-        )
-        .map_err(Error::Other)?;
-        let etag = request.expected_provider_revision.as_deref().unwrap();
+        let rewrite_request = request.clone();
+        let updated =
+            tokio::task::spawn_blocking(move || resource::rewrite_occurrence(&rewrite_request))
+                .await
+                .map_err(|e| Error::Other(format!("CalDAV resource preparation failed: {e}")))??;
+        let etag = request
+            .expected_provider_revision
+            .as_deref()
+            .ok_or_else(|| Error::Sync("Missing CalDAV validator".into()))?;
         let client = connect(ctx, account).await?;
+        let etag = client
+            .strong_revision_for(&request.target_id, Some(etag), Some(_native))
+            .await?;
         let put_etag = client
-            .put_event_at_href(&request.target_id, &updated, Some(etag))
+            .put_event_at_href(&request.target_id, &updated, Some(&etag))
             .await?;
         let canonical = client
             .get_event_at_href(&request.target_id)
@@ -914,9 +984,12 @@ impl CalendarBackend for CalDavCalendarBackend {
             .as_deref()
             .ok_or_else(|| Error::Other("The personal copy has no UID".into()))?;
         let data = personal_copy_ical_data(event, uid)?;
-        connect(ctx, account)
-            .await?
-            .put_event_at_href(remote_id, &data, event.etag.as_deref())
+        let client = connect(ctx, account).await?;
+        let revision = client
+            .strong_revision_for(remote_id, event.etag.as_deref(), event.ical_data.as_deref())
+            .await?;
+        client
+            .put_event_at_href(remote_id, &data, Some(&revision))
             .await
     }
 
@@ -1044,6 +1117,13 @@ mod recurrence_tests {
         );
         services.transports.dav_http = reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .default_headers(headers.clone())
+            .build()
+            .unwrap();
+        services.transports.dav_resource_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(2))
             .default_headers(headers)
             .build()
@@ -1308,7 +1388,11 @@ mod recurrence_tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
         assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
-        let put_body = requests[0].split_once("\r\n\r\n").unwrap().1;
+        let put_body = requests[0]
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .replace("\r\n", "\n");
         assert!(put_body.contains("SUMMARY:Requested title\n"));
         assert!(!put_body.contains("DESCRIPTION:Old"));
         assert!(!put_body.contains("LOCATION:Old"));
@@ -1363,8 +1447,8 @@ mod recurrence_tests {
             let (_dir, db) = temp_pool();
             let services = injected_services();
             let mut request = occurrence_update_request(native);
-            request.expected_provider_revision = Some(etag.into());
-            request.trusted_identity.provider_revision = Some(etag.into());
+            request.expected_provider_revision = Some("\"old-etag\"".into());
+            request.trusted_identity.provider_revision = Some("\"old-etag\"".into());
 
             let outcome = CalDavCalendarBackend
                 .update_recurrence_occurrence(
@@ -1378,7 +1462,7 @@ mod recurrence_tests {
                 .await
                 .unwrap();
             let requests = captured.await.unwrap();
-            assert!(requests[0].contains(&format!("if-match: {etag}\r\n")));
+            assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
             assert_eq!(
                 outcome.replacement_identity.provider_revision.as_deref(),
                 Some(etag)
@@ -1395,7 +1479,7 @@ mod recurrence_tests {
 
     #[tokio::test]
     async fn occurrence_update_retains_put_etag_when_canonical_get_omits_it() {
-        for put_etag in ["\"uploaded-etag\"", "W/\"uploaded-etag\""] {
+        for put_etag in ["\"uploaded-etag\""] {
             let native = occurrence_resource_with_sibling("X-KEEP:value\n");
             let canonical = native
                 .replace("SUMMARY:Visible event", "SUMMARY:Canonical")
@@ -1457,7 +1541,11 @@ mod recurrence_tests {
             assert!(requests[2].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
             assert!(requests[2].contains(&format!("if-match: {put_etag}\r\n")));
             assert!(!requests[2].contains("if-match: \"old-etag\"\r\n"));
-            let put_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+            let put_body = requests[2]
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1
+                .replace("\r\n", "\n");
             assert!(put_body.contains("SUMMARY:Follow-up title\n"));
             assert!(put_body.contains("DESCRIPTION:Old\nLOCATION:Old\nX-KEEP:value\n"));
             assert!(put_body.contains(

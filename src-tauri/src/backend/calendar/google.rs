@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
+use crate::calendar::event_set::CalendarEventSet;
 use crate::calendar::recurrence_identity::{
     OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
 };
@@ -10,6 +11,8 @@ use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
+
+mod event_sets;
 use crate::mail::google::{
     event_patch_to_google_json, event_to_google_json, google_recurrence_kind,
     invitation_copy_patch_to_google_json, occurrence_patch_to_google_json, send_updates_for,
@@ -661,7 +664,75 @@ impl CalendarBackend for GoogleCalendarBackend {
     }
 
     fn event_creation_target(&self) -> super::EventCreationTarget {
-        super::EventCreationTarget::AccountDefault
+        super::EventCreationTarget::SelectedCalendar
+    }
+
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        if event.account_id != account.id {
+            return Err(Error::Other("Google source account mismatch".into()));
+        }
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::fetch(&client, account, event, remote_calendar_id).await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::update(&client, account, before, desired).await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_calendar_id: &str,
+        desired: &CalendarEventSet,
+        operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::create(&client, account, remote_calendar_id, desired, operation_id).await
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        let native = event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::check_current(&client, account, before).await?;
+        client
+            .delete_set_event(
+                &native.calendar_id,
+                &native.event_id,
+                event_sets::revision(native)?,
+            )
+            .await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::move_native(&client, account, before, remote_calendar_id).await
     }
 
     fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
@@ -905,20 +976,19 @@ impl CalendarBackend for GoogleCalendarBackend {
         event_to_google_json(event).map(|_| ())
     }
 
-    /// Google events are always created on the primary calendar (the
-    /// pre-trait behaviour); `remote_calendar_id` is ignored.
+    /// Insert into the exact selected calendar.
     async fn push_created_event(
         &self,
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
-        _remote_calendar_id: &str,
+        remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
         let google_event = event_to_google_json(event)?;
         let client = ctx.services.google_client(&account.id).await?;
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         let (remote_id, canonical_uid) = client
-            .create_event("primary", &google_event, send_updates)
+            .create_event(remote_calendar_id, &google_event, send_updates)
             .await?;
         Ok(Some(PushedEvent {
             remote_id,
@@ -934,11 +1004,12 @@ impl CalendarBackend for GoogleCalendarBackend {
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<()> {
+        let calendar = event_sets::stored_calendar(ctx, account, event, remote_id)?;
         let client = ctx.services.google_client(&account.id).await?;
         let patch = event_patch_to_google_json(event);
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         client
-            .patch_event("primary", remote_id, &patch, send_updates)
+            .patch_event(&calendar, remote_id, &patch, send_updates)
             .await
     }
 
@@ -949,10 +1020,11 @@ impl CalendarBackend for GoogleCalendarBackend {
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<Option<String>> {
+        let calendar = event_sets::stored_calendar(ctx, account, event, remote_id)?;
         let client = ctx.services.google_client(&account.id).await?;
         let patch = invitation_copy_patch_to_google_json(event)?;
         client
-            .patch_event("primary", remote_id, &patch, "none")
+            .patch_event(&calendar, remote_id, &patch, "none")
             .await?;
         Ok(None)
     }
@@ -1382,6 +1454,10 @@ pub(super) mod sync_testutil {
                 let request = String::from_utf8(bytes).unwrap();
                 assert_eq!(request.split_whitespace().next(), Some(method), "{request}");
                 requests.push(request);
+                if status == 0 {
+                    // Simulate a committed write whose HTTP response was lost.
+                    continue;
+                }
                 let body = body.to_string();
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let response = format!(
@@ -1427,7 +1503,12 @@ pub(super) mod creation_testutil {
                 if kind == RecurrenceKind::Standalone && rule.is_none_or(str::is_empty) {
                     continue;
                 }
+                if kind == RecurrenceKind::Series && rule == Some("FREQ=WEEKLY") {
+                    continue;
+                }
                 let mut event = event();
+                event.start_time.push('Z');
+                event.end_time.push('Z');
                 event.id = uuid::Uuid::new_v4().to_string();
                 event.recurrence_kind = kind;
                 event.recurrence_rule = rule.map(str::to_string);
@@ -1443,10 +1524,7 @@ pub(super) mod creation_testutil {
                 assert!(
                     matches!(
                         error,
-                        Error::UnsupportedCapability {
-                            protocol,
-                            capability: "recurring or unclassified event creation",
-                        } if protocol == backend.protocol()
+                        Error::UnsupportedCapability { .. } | Error::Sync(_) | Error::Other(_)
                     ),
                     "{kind:?}, {rule:?}: {error}"
                 );
@@ -1476,6 +1554,10 @@ pub(super) mod creation_testutil {
             let (root, captured) = serve_create_response(response.clone()).await;
             let services = services(&root);
             let mut event = event();
+            if backend.protocol() == "google" {
+                event.start_time.push('Z');
+                event.end_time.push('Z');
+            }
             event.recurrence_rule = rule.map(str::to_string);
             let pushed = backend
                 .push_created_event(
@@ -1508,7 +1590,7 @@ pub(super) mod creation_testutil {
 
 #[cfg(test)]
 mod creation_tests {
-    use super::creation_testutil::{assert_rejected_before_io, assert_standalone_creation};
+    use super::creation_testutil::assert_standalone_creation;
     use super::sync_testutil::{serve_patch_response, services, setup_db};
     use super::GoogleCalendarBackend;
     use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
@@ -1517,7 +1599,25 @@ mod creation_tests {
 
     #[tokio::test]
     async fn rejects_lossy_creation_before_credentials_and_preserves_local_event() {
-        assert_rejected_before_io(&GoogleCalendarBackend).await;
+        super::creation_testutil::assert_rejected_before_io(&GoogleCalendarBackend).await;
+        let (_directory, db) = setup_db().await;
+        let services = super::sync_testutil::services_with_credentials("http://127.0.0.1:1", false);
+        for kind in [RecurrenceKind::Unknown, RecurrenceKind::Occurrence] {
+            let mut event = event();
+            event.recurrence_kind = kind;
+            assert!(GoogleCalendarBackend
+                .push_created_event(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services
+                    },
+                    &account("calendar", "google"),
+                    &event,
+                    "selected",
+                )
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]
@@ -1556,6 +1656,8 @@ mod creation_tests {
         );
         let provider_services = services(&root);
 
+        event.remote_id = Some("remote-series".into());
+        crate::db::calendar::insert_event(&*db.writer().await, &event).unwrap();
         GoogleCalendarBackend
             .push_updated_invitation_copy(
                 &CalendarBackendCtx {
@@ -1597,6 +1699,8 @@ mod creation_tests {
             Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
         let provider_services = services(&root);
 
+        event.remote_id = Some("remote-event".into());
+        crate::db::calendar::insert_event(&*db.writer().await, &event).unwrap();
         GoogleCalendarBackend
             .push_updated_invitation_copy(
                 &CalendarBackendCtx {

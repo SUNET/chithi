@@ -62,7 +62,7 @@ fn duration_minutes_between(start: &str, end: &str) -> u32 {
 // Input types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NewEventInput {
     pub account_id: String,
     pub calendar_id: String,
@@ -103,7 +103,7 @@ pub struct UpdateEventInput {
 
 /// Frontend-supplied copy of metadata returned from `meet_create_url`.
 /// The backend accepts it only when it exactly matches a pending lifecycle.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetBindingInput {
     pub lifecycle_id: String,
     pub account_id: String,
@@ -120,7 +120,7 @@ pub struct MeetBindingInput {
 /// account's resolved meet provider stops an attacker from forging
 /// e.g. a Zoom protocol entry against a Talk account and causing
 /// Chithi to PATCH/DELETE arbitrary meetings.
-fn claim_meet_binding(
+pub(crate) fn claim_meet_binding(
     conn: &rusqlite::Connection,
     event_id: &str,
     b: &MeetBindingInput,
@@ -128,6 +128,13 @@ fn claim_meet_binding(
     let pending = matching_pending_meeting(conn, b)?;
     validate_pending_provider(conn, &pending)?;
     transfer_pending_meeting(conn, event_id, b, pending)
+}
+
+pub(crate) fn validate_pending_meet_binding(
+    conn: &rusqlite::Connection,
+    binding: &MeetBindingInput,
+) -> Result<()> {
+    validate_pending_provider(conn, &matching_pending_meeting(conn, binding)?)
 }
 
 fn validate_pending_provider(
@@ -228,7 +235,7 @@ fn replace_meet_binding_ownership(
                 || old.protocol != binding.protocol
                 || old.meeting_id != binding.meeting_id =>
         {
-            Some(queue_meeting_cleanup(conn, old)?)
+            queue_meeting_cleanup(conn, old)?
         }
         _ => None,
     };
@@ -239,7 +246,21 @@ fn replace_meet_binding_ownership(
 fn queue_meeting_cleanup(
     conn: &rusqlite::Connection,
     binding: db::meet_meetings::MeetMeeting,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    let shared: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meet_meetings WHERE event_id != ?1
+         AND account_id = ?2 AND protocol = ?3 AND meeting_id = ?4)",
+        rusqlite::params![
+            binding.event_id,
+            binding.account_id,
+            binding.protocol,
+            binding.meeting_id
+        ],
+        |row| row.get(0),
+    )?;
+    if shared {
+        return Ok(None);
+    }
     let lifecycle_id = uuid::Uuid::new_v4().to_string();
     db::meet_pending_meetings::insert(
         conn,
@@ -253,7 +274,7 @@ fn queue_meeting_cleanup(
             cleanup_requested: true,
         },
     )?;
-    Ok(lifecycle_id)
+    Ok(Some(lifecycle_id))
 }
 
 fn pending_matches_binding(
@@ -474,13 +495,18 @@ pub async fn get_events(
     let events =
         db::calendar::list_events(&conn, &account_id, calendar_id.as_deref(), &start, &end)?;
     log::debug!("get_events: found {} events", events.len());
-    Ok(events)
+    Ok(events.into_iter().map(renderer_event).collect())
+}
+
+fn renderer_event(mut event: CalendarEvent) -> CalendarEvent {
+    event.ical_data = None;
+    event
 }
 
 /// Refresh one selected event independently of the current displayed date range.
 #[tauri::command]
 pub fn get_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<CalendarEvent> {
-    db::calendar::get_event(&state.db.reader(), &event_id)
+    db::calendar::get_event(&state.db.reader(), &event_id).map(renderer_event)
 }
 
 #[tauri::command]
@@ -625,6 +651,7 @@ fn build_recurrence_mutation_plan(
     scope: RecurrenceMutationScope,
     protocol: &str,
 ) -> Result<RecurrenceMutationPlan> {
+    db::calendar_actions::ensure_unclaimed(conn, &event.id)?;
     if conn.is_autocommit() {
         return Err(crate::error::Error::Other(
             "Recurrence mutation planning requires a database transaction".into(),
@@ -1261,7 +1288,13 @@ pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Res
         account_id,
         invites.len()
     );
-    Ok(invites)
+    Ok(invites
+        .into_iter()
+        .map(|mut invite| {
+            invite.event = renderer_event(invite.event);
+            invite
+        })
+        .collect())
 }
 
 /// Mark a stored invitation as handled locally without sending an RSVP.
@@ -1279,6 +1312,19 @@ pub async fn mark_invite_managed(
 
 #[tauri::command]
 pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
+    if event
+        .recurrence_rule
+        .as_deref()
+        .is_some_and(|rule| !rule.is_empty())
+    {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        return super::calendar_actions::create_completed(&state, event, &operation_id)
+            .await
+            .map(|result| result.event_id)
+            .map_err(|error| {
+                crate::error::Error::Other(format!("Calendar creation {operation_id}: {error}"))
+            });
+    }
     create_event_inner(&state, event, None).await
 }
 
@@ -1883,6 +1929,7 @@ fn checked_mutation_target(
 ) -> Result<CalendarEvent> {
     let event = db::calendar::get_event(conn, event_id)?;
     event.ensure_mutable()?;
+    db::calendar_actions::ensure_unclaimed(conn, event_id)?;
     if let Some(expected) = expected {
         if conn.is_autocommit() {
             return Err(crate::error::Error::Other(
@@ -6423,18 +6470,30 @@ mod tests {
             is_subscribed: true,
         };
 
-        for protocol in ["google", "graph"] {
+        for protocol in ["google", "graph", "jmap", "caldav"] {
             let backend = crate::backend::calendar::for_protocol(protocol);
-            assert!(import_target_error(&calendar, backend).is_some());
-            calendar.is_default = true;
-            assert!(import_target_error(&calendar, backend).is_none());
-            calendar.is_default = false;
+            for is_default in [false, true] {
+                calendar.is_default = is_default;
+                calendar.remote_id = Some("remote-calendar".into());
+                assert!(
+                    import_target_error(&calendar, backend).is_none(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = false;
+                assert!(
+                    import_target_error(&calendar, backend).is_some(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = true;
+                for remote_id in [None, Some(String::new())] {
+                    calendar.remote_id = remote_id;
+                    assert!(
+                        import_target_error(&calendar, backend).is_some(),
+                        "{protocol}"
+                    );
+                }
+            }
         }
-
-        let caldav = crate::backend::calendar::for_protocol("caldav");
-        assert!(import_target_error(&calendar, caldav).is_none());
-        calendar.remote_id = None;
-        assert!(import_target_error(&calendar, caldav).is_some());
     }
 
     #[test]

@@ -2748,10 +2748,23 @@ async fn standalone_notification_accepts_empty_recipients_and_preserves_event_me
 async fn unsupported_creation_preserves_all_events_and_pending_meeting_ownership() {
     let fixture = Fixture::new().await;
     fixture.calendar_protocol("google").await;
+    db::service_bindings::insert(
+        &*fixture.state.db.writer().await,
+        &db::service_bindings::ServiceBinding {
+            id: "meet-zoom".into(),
+            account_id: "account-a".into(),
+            service: "meet".into(),
+            protocol: "zoom".into(),
+            enabled: true,
+            sync_interval_seconds: None,
+            config_json: "{}".into(),
+        },
+    )
+    .unwrap();
     let existing = stored_event("existing", RecurrenceKind::Standalone, None);
     fixture.insert(&existing).await;
     let binding = fixture.attach_meeting_and_pending(&existing).await;
-    let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY"));
+    let mut input = new_event("account-a", "source", Some("FREQ=WEEKLY;COUNT=0"));
     input.meet_binding = Some(binding);
     let before = fixture.snapshot();
     let error = create_event_inner(&fixture.state, input, None)
@@ -2860,7 +2873,8 @@ mod jmap_creation {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Exercise the command's immediate provider push with the injected HTTP
-    /// clients. Only discovery and CalendarEvent/set are accepted by this peer.
+    /// clients. Validate snapshot, conditional create, canonical read, and optional
+    /// rollback deletion in order; pause only once the create reaches the server.
     struct CreationServer {
         root: String,
         task: tokio::task::JoinHandle<JsonValue>,
@@ -2890,8 +2904,28 @@ mod jmap_creation {
             let base = root.clone();
             let task = tokio::spawn(async move {
                 let mut created = JsonValue::Null;
-                let request_count = if expect_delete { 4 } else { 2 };
-                for request_index in 0..request_count {
+                assert!(!expect_delete || succeeds);
+                let mut steps = vec![
+                    "mail-discovery",
+                    "calendar-discovery",
+                    "query",
+                    "snapshot-state",
+                    "query-check",
+                    "create",
+                ];
+                if succeeds {
+                    steps.push("canonical-create");
+                }
+                if expect_delete {
+                    steps.extend([
+                        "mail-discovery",
+                        "calendar-discovery",
+                        "before-delete",
+                        "delete",
+                        "canonical-delete",
+                    ]);
+                }
+                for step in steps {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut bytes = Vec::new();
                     let mut chunk = [0; 4096];
@@ -2917,17 +2951,24 @@ mod jmap_creation {
                         assert!(count > 0);
                         bytes.extend_from_slice(&chunk[..count]);
                     }
-                    let response = if request_index % 2 == 0 {
+                    let response = if step.ends_with("discovery") {
                         assert!(headers.starts_with("GET /.well-known/jmap "), "{headers}");
                         json!({
                             "apiUrl": format!("{base}/jmap/api"),
                             "downloadUrl": format!("{base}/download/{{blobId}}"),
                             "uploadUrl": format!("{base}/upload/{{accountId}}"),
-                            "primaryAccounts": {"urn:ietf:params:jmap:mail": "remote-account"},
-                            "accounts": {"remote-account": {"accountCapabilities": {
-                                "urn:ietf:params:jmap:mail": {},
-                                "urn:ietf:params:jmap:calendars": {}
-                            }}}
+                            "primaryAccounts": {
+                                "urn:ietf:params:jmap:mail": "mail-account",
+                                "urn:ietf:params:jmap:calendars": "remote-account"
+                            },
+                            "accounts": {
+                                "mail-account": {"accountCapabilities": {
+                                    "urn:ietf:params:jmap:mail": {}
+                                }},
+                                "remote-account": {"accountCapabilities": {
+                                    "urn:ietf:params:jmap:calendars": {}
+                                }}
+                            }
                         })
                     } else {
                         assert!(headers.starts_with("POST /jmap/api "), "{headers}");
@@ -2936,25 +2977,106 @@ mod jmap_creation {
                                 .unwrap();
                         let calls = request["methodCalls"].as_array().unwrap();
                         assert_eq!(calls.len(), 1);
-                        assert_eq!(calls[0][0], "CalendarEvent/set");
-                        let result = if request_index == 1 {
-                            created = calls[0][1]["create"]["new1"].clone();
-                            assert!(created.is_object());
-                            if let Some((ready, release)) = pause.take() {
-                                ready.send(()).unwrap();
-                                release.await.unwrap();
+                        let args = &calls[0][1];
+                        assert_eq!(args["accountId"], "remote-account", "{step}");
+                        let (method, result) = match step {
+                            "query" | "query-check" => {
+                                assert_eq!(args["position"], 0);
+                                if step == "query-check" {
+                                    assert_eq!(args["limit"], 0);
+                                } else {
+                                    assert!(args["limit"].as_u64().unwrap() > 0);
+                                }
+                                (
+                                    "CalendarEvent/query",
+                                    json!({
+                                        "accountId": "remote-account", "queryState": "query-0",
+                                        "position": 0, "total": 0, "ids": []
+                                    }),
+                                )
                             }
-                            if succeeds {
-                                json!({"created": {"new1": {"id": "immediate-remote-series"}}})
-                            } else {
-                                json!({"notCreated": {"new1": {"type": "forbidden"}}})
+                            "snapshot-state" => {
+                                assert_eq!(args["ids"], json!([]));
+                                (
+                                    "CalendarEvent/get",
+                                    json!({
+                                        "accountId": "remote-account", "state": "data-0",
+                                        "list": [], "notFound": []
+                                    }),
+                                )
                             }
-                        } else {
-                            assert_eq!(calls[0][1]["destroy"], json!(["immediate-remote-series"]));
-                            json!({"destroyed": ["immediate-remote-series"]})
+                            "create" => {
+                                assert_eq!(calls[0][0], "CalendarEvent/set");
+                                assert_eq!(args["ifInState"], "data-0");
+                                assert_eq!(args["sendSchedulingMessages"], false);
+                                assert_eq!(args["update"], json!({}));
+                                assert_eq!(args["destroy"], json!([]));
+                                assert_eq!(args["create"].as_object().unwrap().len(), 1);
+                                created = args["create"]["new1"].clone();
+                                assert_eq!(created["@type"], "Event");
+                                assert_eq!(
+                                    created["calendarIds"],
+                                    json!({"remote-calendar": true})
+                                );
+                                assert!(!created["uid"].as_str().unwrap().is_empty());
+                                assert!(created.get("id").is_none());
+                                if let Some((ready, release)) = pause.take() {
+                                    ready.send(()).unwrap();
+                                    release.await.unwrap();
+                                }
+                                let mut result = json!({
+                                    "accountId": "remote-account", "oldState": "data-0",
+                                    "newState": if succeeds { "data-1" } else { "data-0" }
+                                });
+                                if succeeds {
+                                    result["created"] =
+                                        json!({"new1": {"id": "immediate-remote-series"}});
+                                } else {
+                                    result["notCreated"] = json!({"new1": {"type": "forbidden"}});
+                                }
+                                ("CalendarEvent/set", result)
+                            }
+                            "canonical-create" | "before-delete" => {
+                                assert_eq!(args["ids"], json!(["immediate-remote-series"]));
+                                let mut canonical = created.clone();
+                                canonical["id"] = json!("immediate-remote-series");
+                                (
+                                    "CalendarEvent/get",
+                                    json!({
+                                        "accountId": "remote-account", "state": "data-1",
+                                        "list": [canonical], "notFound": []
+                                    }),
+                                )
+                            }
+                            "delete" => {
+                                assert_eq!(args["ifInState"], "data-1");
+                                assert_eq!(args["sendSchedulingMessages"], false);
+                                assert_eq!(args["create"], json!({}));
+                                assert_eq!(args["update"], json!({}));
+                                assert_eq!(args["destroy"], json!(["immediate-remote-series"]));
+                                (
+                                    "CalendarEvent/set",
+                                    json!({
+                                        "accountId": "remote-account", "oldState": "data-1",
+                                        "newState": "data-2", "destroyed": ["immediate-remote-series"]
+                                    }),
+                                )
+                            }
+                            "canonical-delete" => {
+                                assert_eq!(args["ids"], json!(["immediate-remote-series"]));
+                                (
+                                    "CalendarEvent/get",
+                                    json!({
+                                        "accountId": "remote-account", "state": "data-2",
+                                        "list": [], "notFound": ["immediate-remote-series"]
+                                    }),
+                                )
+                            }
+                            _ => unreachable!("{step}"),
                         };
-                        json!({"methodResponses": [["CalendarEvent/set", result, calls[0][2]]],
-                            "sessionState": "state"})
+                        assert_eq!(calls[0][0], method, "{step}");
+                        json!({"methodResponses": [[method, result, calls[0][2]]],
+                            "sessionState": "session-not-data"})
                     };
                     let body = response.to_string();
                     stream.write_all(format!(
@@ -2965,6 +3087,13 @@ mod jmap_creation {
                 created
             });
             Self { root, task }
+        }
+
+        async fn finish(&mut self) -> JsonValue {
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.task)
+                .await
+                .expect("all expected creation/rollback requests must arrive")
+                .unwrap()
         }
     }
 
@@ -3030,7 +3159,7 @@ mod jmap_creation {
         .unwrap();
         let event = fixture.event(&id);
         assert_eq!(event.remote_id.as_deref(), Some("immediate-remote-series"));
-        let wire = (&mut server.task).await.unwrap();
+        let wire = server.finish().await;
         assert_eq!(wire["calendarIds"], json!({"remote-calendar": true}));
         assert_eq!(wire["recurrenceRules"][0]["frequency"], "weekly");
         assert_eq!(wire["recurrenceRules"][0]["count"], 3);
@@ -3227,7 +3356,7 @@ mod jmap_creation {
                 assert_eq!(&fixture.snapshot(), expected, "{race}, {succeeds}");
                 assert_eq!(after_change.meetings, before.meetings);
                 assert_eq!(after_change.pending, before.pending);
-                (&mut server.task).await.unwrap();
+                server.finish().await;
             }
         }
     }
@@ -3255,7 +3384,7 @@ mod jmap_creation {
             );
             assert_eq!(copy.title, source.title);
             assert!(db::calendar::get_event(&fixture.state.db.reader(), &source.id).is_err());
-            (&mut server.task).await.unwrap();
+            server.finish().await;
         }
     }
 

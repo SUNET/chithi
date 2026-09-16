@@ -15,12 +15,14 @@ use crate::mail::search::build_graph_kql;
 use crate::message::{normalize_message_id, SearchHit, SearchQuery};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod event_set;
+
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 
 const CALENDAR_EVENT_SELECT: &str = "id,subject,body,bodyPreview,start,end,location,isAllDay,\
     organizer,attendees,iCalUId,responseStatus,isCancelled,type,seriesMasterId,originalStart,\
-    recurrence,@odata.etag,changeKey,lastModifiedDateTime";
+    recurrence,changeKey,lastModifiedDateTime";
 
 /// Graph JSON batching allows at most 20 sub-requests per `$batch` call.
 const BATCH_SIZE: usize = 20;
@@ -1251,8 +1253,26 @@ impl GraphClient {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let resp = build()
-                .send()
+            let mut request = build()
+                .build()
+                .map_err(|e| Error::Other(format!("Graph {what} request failed: {e}")))?;
+            let calendar_request = request.url().path_segments().is_some_and(|mut segments| {
+                segments.any(|segment| {
+                    matches!(
+                        segment,
+                        "events" | "calendars" | "calendar" | "calendarView"
+                    )
+                })
+            });
+            if calendar_request && !request.headers().contains_key("Prefer") {
+                request.headers_mut().insert(
+                    "Prefer",
+                    reqwest::header::HeaderValue::from_static("IdType=\"ImmutableId\""),
+                );
+            }
+            let resp = self
+                .http
+                .execute(request)
                 .await
                 .map_err(|e| Error::Other(format!("Graph {} failed: {}", what, e)))?;
             let code = resp.status().as_u16();
@@ -2435,9 +2455,10 @@ impl GraphClient {
         loop {
             let resp: serde_json::Value = match next_path.take() {
                 Some(path) => {
+                    let path = self.calendar_set_url(&path)?;
                     let resp = self
                         .http
-                        .get(&path)
+                        .get(path)
                         .bearer_auth(&self.access_token)
                         .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
                         .send()
@@ -2536,18 +2557,25 @@ impl GraphClient {
     /// Create a calendar event. Returns (graph_id, iCalUid).
     pub async fn create_event(
         &self,
+        calendar_id: &str,
         event: &serde_json::Value,
     ) -> Result<(String, Option<String>)> {
-        let resp = self.post_json("/me/events", event).await?;
-        let id = resp["id"].as_str().unwrap_or("").to_string();
+        let path = event_set::collection_path(calendar_id)?;
+        let resp = self
+            .calendar_set_request(reqwest::Method::POST, &path, &[], Some(event), None)
+            .await?;
+        let id = event_set::required_string(&resp, "id")?.to_owned();
         let ical_uid = resp["iCalUId"].as_str().map(|s| s.to_string());
         Ok((id, ical_uid))
     }
 
     /// Update a calendar event.
     pub async fn update_event(&self, event_id: &str, updates: &serde_json::Value) -> Result<()> {
-        self.patch_json(&format!("/me/events/{}", event_id), updates)
-            .await
+        self.patch_json(
+            &format!("/me/events/{}", urlencoding::encode(event_id)),
+            updates,
+        )
+        .await
     }
 
     /// Conditionally update one immutable recurrence instance, then read back
@@ -2653,7 +2681,8 @@ impl GraphClient {
 
     /// Delete a calendar event.
     pub async fn delete_event(&self, event_id: &str) -> Result<()> {
-        self.delete(&format!("/me/events/{}", event_id)).await
+        self.delete(&format!("/me/events/{}", urlencoding::encode(event_id)))
+            .await
     }
 
     /// Find an event by its iCalUId. Returns the Graph event ID if found.
@@ -3965,19 +3994,6 @@ fn nearest_outlook_color(hex: &str) -> &'static str {
 // Payload builders (pure — unit-tested below)
 // ---------------------------------------------------------------------------
 
-/// Graph start/end object. All-day events must be midnight-anchored
-/// (`isAllDay` requires `T00:00:00` boundaries).
-fn graph_time_json(timestamp: &str, all_day: bool) -> serde_json::Value {
-    if all_day {
-        serde_json::json!({
-            "dateTime": format!("{}T00:00:00", timestamp.split('T').next().unwrap_or_default()),
-            "timeZone": "UTC",
-        })
-    } else {
-        serde_json::json!({"dateTime": timestamp, "timeZone": "UTC"})
-    }
-}
-
 fn recurring_graph_time(
     timestamp: &str,
     all_day: bool,
@@ -3986,16 +4002,15 @@ fn recurring_graph_time(
     use chrono::TimeZone as _;
 
     if all_day {
-        let date = chrono::NaiveDate::parse_from_str(
-            timestamp.split('T').next().unwrap_or_default(),
-            "%Y-%m-%d",
-        )
-        .map_err(|_| Error::Other("Recurring all-day event has an invalid date".into()))?;
+        let date = chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d")
+            .map_err(|_| Error::Other("Recurring all-day event has an invalid date".into()))?;
         let local = date
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| Error::Other("Recurring all-day event has an invalid time".into()))?;
+        let timezone = timezone.unwrap_or("UTC");
+        event_set::zone(timezone)?;
         return Ok((
-            serde_json::json!({"dateTime": local.format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"}),
+            serde_json::json!({"dateTime": local.format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": timezone}),
             local,
         ));
     }
@@ -4013,9 +4028,12 @@ fn recurring_graph_time(
         ))
     })?;
     let local = tz.from_utc_datetime(&instant.naive_utc()).naive_local();
+    if tz.from_local_datetime(&local).single().is_none() {
+        return Err(Error::Other("Graph dateTimeTimeZone cannot safely encode an ambiguous local wall time; choose an unambiguous time or UTC".into()));
+    }
     Ok((
         serde_json::json!({
-            "dateTime": local.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "dateTime": local.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
             "timeZone": timezone,
         }),
         local,
@@ -4070,6 +4088,12 @@ fn graph_recurrence_json(
     start: chrono::NaiveDateTime,
 ) -> Result<serde_json::Value> {
     use chrono::Datelike as _;
+
+    if let Some(rule) = event.recurrence_rule.as_deref() {
+        if let Ok(rule) = crate::calendar::simple_recurrence::normalize_rule(rule, event) {
+            return event_set::recurrence_json(event, start, &rule);
+        }
+    }
 
     let rule = event
         .recurrence_rule
@@ -4182,18 +4206,19 @@ fn graph_recurrence_json(
     Ok(serde_json::json!({"pattern": pattern, "range": range}))
 }
 
-/// Graph payload for creating an event. Includes the attendee list plus
-/// the organizer as an attendee with `response: organizer` — Exchange
-/// needs it to render the organizer row correctly. Recurring creation is
+/// Graph payload for creating an event. Graph assigns the organizer from the
+/// destination calendar; a source organizer is not an extra guest. Recurring creation is
 /// limited to the subset that can be represented without changing semantics.
 pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> Result<serde_json::Value> {
+    crate::calendar::event_set::event_fields(event).validate()?;
     let (start, end, recurrence) = match event.recurrence_kind {
         RecurrenceKind::Standalone
             if event.recurrence_rule.as_deref().is_none_or(str::is_empty) =>
         {
             (
-                graph_time_json(&event.start_time, event.all_day),
-                graph_time_json(&event.end_time, event.all_day),
+                recurring_graph_time(&event.start_time, event.all_day, event.timezone.as_deref())?
+                    .0,
+                recurring_graph_time(&event.end_time, event.all_day, event.timezone.as_deref())?.0,
                 None,
             )
         }
@@ -4241,29 +4266,20 @@ pub fn event_to_graph_json(event: &crate::calendar::CalendarEvent) -> Result<ser
         graph_event["location"] = serde_json::json!({"displayName": loc});
     }
     if let Some(ref att_json) = event.attendees_json {
-        if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
-            let mut graph_atts: Vec<serde_json::Value> = atts
-                .iter()
-                .filter_map(|a| {
-                    a["email"].as_str().map(|e| {
-                        serde_json::json!({
-                            "emailAddress": {"address": e, "name": a["name"].as_str().unwrap_or("")},
-                            "type": "required",
-                        })
-                    })
-                })
-                .collect();
-            // Add the organizer as an attendee with isOrganizer=true
-            if let Some(ref org_email) = event.organizer_email {
-                graph_atts.push(serde_json::json!({
-                    "emailAddress": {"address": org_email, "name": ""},
+        let atts = serde_json::from_str::<Vec<serde_json::Value>>(att_json)
+            .map_err(|error| Error::Other(format!("Invalid Graph attendees: {error}")))?;
+        let graph_atts: Vec<serde_json::Value> = atts
+            .iter()
+            .map(|a| {
+                let e = event_set::required_string(a, "email")?;
+                Ok(serde_json::json!({
+                    "emailAddress": {"address": e, "name": a["name"].as_str().unwrap_or("")},
                     "type": "required",
-                    "status": {"response": "organizer"},
-                }));
-            }
-            if !graph_atts.is_empty() {
-                graph_event["attendees"] = serde_json::json!(graph_atts);
-            }
+                }))
+            })
+            .collect::<Result<_>>()?;
+        if !graph_atts.is_empty() {
+            graph_event["attendees"] = serde_json::json!(graph_atts);
         }
     }
     Ok(graph_event)
@@ -5646,20 +5662,23 @@ mod builder_tests {
 
     #[test]
     fn all_day_event_is_midnight_anchored() {
-        let v = event_to_graph_json(&event(true, None)).unwrap();
+        let mut event = event(true, None);
+        assert!(event_to_graph_json(&event).is_err());
+        event.start_time = "2026-07-14".into();
+        event.end_time = "2026-07-15".into();
+        let v = event_to_graph_json(&event).unwrap();
         assert_eq!(v["start"]["dateTime"], "2026-07-14T00:00:00");
         assert_eq!(v["isAllDay"], true);
     }
 
     #[test]
-    fn create_appends_organizer_as_attendee() {
+    fn create_does_not_invent_an_organizer_attendee() {
         let v = event_to_graph_json(&event(false, Some(r#"[{"email":"a@x.org","name":"A"}]"#)))
             .unwrap();
         let atts = v["attendees"].as_array().unwrap();
-        assert_eq!(atts.len(), 2);
+        assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["emailAddress"]["address"], "a@x.org");
-        assert_eq!(atts[1]["emailAddress"]["address"], "me@example.org");
-        assert_eq!(atts[1]["status"]["response"], "organizer");
+        assert!(atts[0].get("status").is_none());
     }
 
     #[test]

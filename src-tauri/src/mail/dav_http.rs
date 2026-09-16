@@ -34,3 +34,17 @@ pub fn build_dav_client() -> Result<Client> {
         .build()
         .map_err(|e| Error::Other(format!("Failed to create DAV HTTP client: {}", e)))
 }
+
+/// Exact resource reads and conditional writes must not follow redirects to a
+/// different resource or turn a write into a GET. Discovery uses the DAV client
+/// above so configured well-known endpoints can still redirect normally.
+pub fn build_dav_resource_client() -> Result<Client> {
+    Client::builder()
+        .redirect(redirect::Policy::none())
+        .connect_timeout(DAV_CONNECT_TIMEOUT)
+        .timeout(DAV_REQUEST_TIMEOUT)
+        .gzip(true)
+        .deflate(true)
+        .build()
+        .map_err(|error| Error::Other(format!("Failed to create DAV resource client: {error}")))
+}

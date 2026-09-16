@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
+use crate::calendar::event_set::CalendarEventSet;
 use crate::calendar::recurrence_identity::{RecurrenceObjectKind, RecurrenceValueType};
 use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -31,7 +32,83 @@ impl CalendarBackend for GraphCalendarBackend {
     }
 
     fn event_creation_target(&self) -> super::EventCreationTarget {
-        super::EventCreationTarget::AccountDefault
+        super::EventCreationTarget::SelectedCalendar
+    }
+
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        if event.account_id != account.id {
+            return Err(Error::Other(
+                "Graph event belongs to another account".into(),
+            ));
+        }
+        let id = event
+            .remote_id
+            .as_deref()
+            .ok_or_else(|| Error::Other("Graph event has no remote identity".into()))?;
+        ctx.services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
+            .fetch_calendar_event_set(remote_calendar_id, id, event)
+            .await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        ctx.services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
+            .update_calendar_event_set(&account.id, before, desired)
+            .await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_calendar_id: &str,
+        desired: &CalendarEventSet,
+        operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        ctx.services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
+            .create_calendar_event_set(&account.id, remote_calendar_id, desired, operation_id)
+            .await
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        ctx.services
+            .graph_client(&account.id, GraphTokenPurpose::Baseline)
+            .await?
+            .delete_calendar_event_set(&account.id, before)
+            .await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _before: &CalendarEventSet,
+        _remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        // The Graph v1.0 event resource has no move action.
+        Ok(CalendarCapability::Unsupported)
     }
 
     fn recurring_import_fidelity(&self) -> super::RecurringImportFidelity {
@@ -328,19 +405,18 @@ impl CalendarBackend for GraphCalendarBackend {
         Ok(())
     }
 
-    fn validate_event_creation(&self, event: &CalendarEvent, _: &str) -> Result<()> {
+    fn validate_event_creation(&self, event: &CalendarEvent, calendar: &str) -> Result<()> {
+        crate::mail::graph::event_set::collection_path(calendar)?;
         event_to_graph_json(event).map(|_| ())
     }
 
-    /// Created on the account's default calendar (Graph resolves it);
-    /// `remote_calendar_id` is ignored. Graph sends invite emails
-    /// automatically when attendees are present.
+    /// Graph sends invitations itself, in the exact selected calendar.
     async fn push_created_event(
         &self,
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
-        _remote_calendar_id: &str,
+        remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
         let graph_event = event_to_graph_json(event)?;
         let client = ctx
@@ -354,7 +430,9 @@ impl CalendarBackend for GraphCalendarBackend {
             "create_event: O365 graph_event JSON: {}",
             serde_json::to_string_pretty(&graph_event).unwrap_or_default()
         );
-        let (remote_id, ical_uid) = client.create_event(&graph_event).await?;
+        let (remote_id, ical_uid) = client
+            .create_event(remote_calendar_id, &graph_event)
+            .await?;
         Ok(Some(PushedEvent {
             remote_id,
             canonical_uid: ical_uid,
@@ -795,9 +873,8 @@ mod occurrence_validation_tests {
 #[cfg(test)]
 mod creation_tests {
     use super::GraphCalendarBackend;
-    use crate::backend::calendar::google::{
-        creation_testutil::assert_standalone_creation,
-        sync_testutil::{serve_create_response, serve_patch_response, services, setup_db},
+    use crate::backend::calendar::google::sync_testutil::{
+        serve_create_response, serve_patch_response, services, setup_db,
     };
     use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
     use crate::backend::testutil::{account, event};
@@ -805,13 +882,43 @@ mod creation_tests {
 
     #[tokio::test]
     async fn publishes_confirmed_standalone_creation() {
-        assert_standalone_creation(
-            &GraphCalendarBackend,
-            serde_json::json!({"id": "created-event", "iCalUId": "canonical@example.test"}),
-            "/calendar-api/me/events",
-            "subject",
-        )
-        .await;
+        for rule in [None, Some("")] {
+            let (_directory, db) = setup_db().await;
+            let (root, captured) = serve_create_response(
+                serde_json::json!({"id": "created-event", "iCalUId": "canonical@example.test"}),
+            )
+            .await;
+            let services = services(&root);
+            let mut event = event();
+            event.start_time = "2026-09-14T09:00:00Z".into();
+            event.end_time = "2026-09-14T10:00:00Z".into();
+            event.recurrence_rule = rule.map(str::to_owned);
+            let created = GraphCalendarBackend
+                .push_created_event(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services,
+                    },
+                    &account("calendar", "graph"),
+                    &event,
+                    "primary",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(created.remote_id, "created-event");
+            assert_eq!(
+                created.canonical_uid.as_deref(),
+                Some("canonical@example.test")
+            );
+            let requests = captured.await.unwrap();
+            assert!(requests[0]
+                .starts_with("POST /calendar-api/me/calendars/primary/events HTTP/1.1\r\n"));
+            let payload: serde_json::Value =
+                serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(payload.get("recurrence").is_none());
+            assert_eq!(payload["subject"], event.title);
+        }
     }
 
     #[tokio::test]
@@ -1056,16 +1163,16 @@ mod recurrence_sync_tests {
                 )
                 .unwrap()
             };
-            let (last_root, last_captured) = serve_responses(vec![(status, last_page)]).await;
-            let (root, captured) = serve_responses(vec![
+            let (root, captured) = crate::mail::graph::event_set::tests::serve_json(|root| vec![
                 (200, primary_calendar()),
                 (200, json!({
                     "value": [
                         {"id": "cancelled", "isCancelled": true, "iCalUId": "cancelled-uid@example.test"},
                         remote_event("live", &json!({"type": "singleInstance", "seriesMasterId": null, "recurrence": null}))
                     ],
-                    "@odata.nextLink": last_root
+                    "@odata.nextLink": format!("{root}/me/calendars/primary/calendarView?$skip=1")
                 })),
+                (status, last_page),
             ])
             .await;
             let result = GraphCalendarBackend
@@ -1083,8 +1190,7 @@ mod recurrence_sync_tests {
                 assert!(matches!(error, crate::error::Error::Sync(_)));
                 assert!(error.to_string().contains("Calendar"));
             }
-            assert_eq!(captured.await.unwrap().len(), 2);
-            assert_eq!(last_captured.await.unwrap().len(), 1);
+            assert_eq!(captured.await.unwrap().len(), 3);
             let conn = db.reader();
             assert_eq!(
                 db::calendar::get_event(&conn, "cancelled").is_err(),

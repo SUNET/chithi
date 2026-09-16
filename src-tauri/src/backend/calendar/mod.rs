@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::event_set::CalendarEventSet;
 use crate::calendar::recurrence_identity::{
     OccurrenceFields, RecurrenceIdentity, RecurrenceIdentitySeed, UpdateOccurrenceInput,
 };
@@ -215,6 +216,82 @@ pub trait CalendarBackend: Send + Sync {
     /// Protocol discriminator stored on the calendar service binding
     /// (`service_bindings.protocol`).
     fn protocol(&self) -> &'static str;
+
+    /// Read the authoritative standalone event or complete series containing
+    /// `event`, including modified/cancelled occurrences outside any view window.
+    /// Native data is private and must not be projected directly into IPC.
+    async fn fetch_event_set(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _event: &CalendarEvent,
+        _remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "calendar event-set read",
+        })
+    }
+
+    /// Apply only the semantic differences between two complete snapshots,
+    /// using the original native revisions, then return canonical provider data.
+    /// Retained native fields must not be replaced by a reconstructed DTO.
+    async fn update_event_set(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _before: &CalendarEventSet,
+        _desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "calendar event-set update",
+        })
+    }
+
+    /// Create in the exact selected calendar. `operation_id` is a persisted
+    /// idempotency identity; retry must reconcile, not blindly create a duplicate.
+    /// Source provider identifiers in `desired` are never destination targets.
+    async fn create_event_set(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _remote_calendar_id: &str,
+        _desired: &CalendarEventSet,
+        _operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "calendar event-set creation",
+        })
+    }
+
+    /// Conditionally remove the source of a verified transfer. This is not a
+    /// renderer-facing recurring-delete capability.
+    async fn delete_event_set(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _before: &CalendarEventSet,
+    ) -> Result<()> {
+        Err(crate::error::Error::UnsupportedCapability {
+            protocol: self.protocol(),
+            capability: "calendar transfer source removal",
+        })
+    }
+
+    /// A native calendar move, when available under this account's credentials.
+    /// Unsupported must have no remote side effects. Ambiguous transport failures
+    /// must be errors, never an invitation to fall back to copy/delete.
+    async fn move_event_set_native(
+        &self,
+        _ctx: &CalendarBackendCtx<'_>,
+        _account: &AccountFull,
+        _before: &CalendarEventSet,
+        _remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        Ok(CalendarCapability::Unsupported)
+    }
 
     /// How the command should deliver the generated iTIP reply.
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
@@ -561,11 +638,9 @@ mod registry_tests {
     }
 }
 
-/// Per-provider semantics ADR 0050 calls load-bearing. The fixture
-/// account has no credentials or server URLs, so any I/O attempt fails
-/// before the network — which is exactly what these tests lean on:
-/// deferred/no-op paths must succeed without I/O, swallowing backends
-/// must turn the failure into `Ok`, propagating backends into `Err`.
+/// Per-provider semantics ADR 0050 calls load-bearing. Localhost peers verify
+/// immediate writes and remote failures; unconfigured accounts exercise each
+/// provider's credential-error and unsupported-capability contracts.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
@@ -652,20 +727,241 @@ mod contract_tests {
         assert!(request.starts_with("PUT /calendar/contract-uid.ics HTTP/1.1\r\n"));
     }
 
-    /// JMAP and CalDAV do not push event updates (trait default
-    /// no-op). An override that starts pushing would hit the missing
-    /// server config and fail this test.
+    async fn update_request(stream: &mut tokio::net::TcpStream) -> (String, String) {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                return (
+                    headers,
+                    String::from_utf8(bytes[end + 4..end + 4 + length].to_vec()).unwrap(),
+                );
+            }
+        }
+    }
+
+    /// Ordinary updates must reach the selected remote resource, use its current
+    /// revision, and propagate both rejected writes and failed canonical reads.
     #[tokio::test]
-    async fn jmap_and_caldav_do_not_push_event_updates() {
-        let (_dir, db) = temp_pool();
-        jmap::JmapCalendarBackend
-            .push_updated_event(&ctx(&db), &account("calendar", "jmap"), "r1", &event())
-            .await
-            .unwrap();
-        caldav::CalDavCalendarBackend
-            .push_updated_event(&ctx(&db), &account("calendar", "caldav"), "r1", &event())
-            .await
-            .unwrap();
+    async fn jmap_and_caldav_push_event_updates_and_propagate_remote_errors() {
+        use serde_json::{json, Value};
+
+        for protocol in ["jmap", "caldav"] {
+            for outcome in ["success", "conflict", "canonical-error"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let root = format!("http://{}", listener.local_addr().unwrap());
+                let base = root.clone();
+                let server = tokio::spawn(async move {
+                    let mut native = json!({
+                        "@type": "Event", "id": "r1", "uid": "contract-uid",
+                        "calendarIds": {"remote-calendar": true}, "title": "Standup",
+                        "start": "2026-07-16T10:00:00", "duration": "PT30M",
+                        "timeZone": "UTC", "showWithoutTime": false,
+                        "x-native": "preserved"
+                    });
+                    let mut ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                        PRODID:-//Contract//EN\r\nBEGIN:VEVENT\r\nUID:contract-uid\r\n\
+                        DTSTAMP:20260701T100000Z\r\nDTSTART:20260716T100000Z\r\n\
+                        DTEND:20260716T103000Z\r\nSUMMARY:Standup\r\n\
+                        X-NATIVE:preserved\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                        .to_string();
+                    let mut steps = Vec::new();
+                    if protocol == "jmap" {
+                        steps.extend(["discovery", "discovery"]);
+                    }
+                    steps.extend(["get", "update"]);
+                    if outcome != "conflict" {
+                        steps.push("canonical");
+                    }
+                    for step in steps {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let (headers, body) = update_request(&mut stream).await;
+                        let mut status = "200 OK";
+                        let mut etag = "";
+                        let response = if protocol == "jmap" {
+                            if step == "discovery" {
+                                assert!(headers.starts_with("GET /.well-known/jmap "));
+                                json!({
+                                    "apiUrl": format!("{base}/api"),
+                                    "downloadUrl": format!("{base}/download"),
+                                    "uploadUrl": format!("{base}/upload"),
+                                    "primaryAccounts": {
+                                        "urn:ietf:params:jmap:mail": "mail-account",
+                                        "urn:ietf:params:jmap:calendars": "calendar-account"
+                                    },
+                                    "accounts": {
+                                        "mail-account": {"accountCapabilities": {
+                                            "urn:ietf:params:jmap:mail": {}
+                                        }},
+                                        "calendar-account": {"accountCapabilities": {
+                                            "urn:ietf:params:jmap:calendars": {}
+                                        }}
+                                    }
+                                })
+                                .to_string()
+                            } else {
+                                assert!(headers.starts_with("POST /api "));
+                                let request: Value = serde_json::from_str(&body).unwrap();
+                                let calls = request["methodCalls"].as_array().unwrap();
+                                assert_eq!(calls.len(), 1);
+                                let call = &calls[0];
+                                let args = &call[1];
+                                assert_eq!(args["accountId"], "calendar-account");
+                                let (method, result) = if step == "update" {
+                                    assert_eq!(call[0], "CalendarEvent/set");
+                                    assert_eq!(args["ifInState"], "data-0");
+                                    assert_eq!(args["sendSchedulingMessages"], false);
+                                    assert_eq!(args["create"], json!({}));
+                                    assert_eq!(args["destroy"], json!([]));
+                                    assert_eq!(args["update"], json!({"r1": {"title": "Updated"}}));
+                                    if outcome == "conflict" {
+                                        ("error", json!({"type": "stateMismatch"}))
+                                    } else {
+                                        native["title"] = args["update"]["r1"]["title"].clone();
+                                        (
+                                            "CalendarEvent/set",
+                                            json!({
+                                                "accountId": "calendar-account", "oldState": "data-0",
+                                                "newState": "data-1", "updated": {"r1": null}
+                                            }),
+                                        )
+                                    }
+                                } else {
+                                    assert_eq!(call[0], "CalendarEvent/get");
+                                    assert_eq!(args["ids"], json!(["r1"]));
+                                    (
+                                        "CalendarEvent/get",
+                                        json!({
+                                            "accountId": "calendar-account",
+                                            "state": if step == "get" { "data-0" } else { "data-1" },
+                                            "list": [native], "notFound": []
+                                        }),
+                                    )
+                                };
+                                json!({"methodResponses": [[method, result, call[2]]],
+                                    "sessionState": "session-not-data"})
+                                .to_string()
+                            }
+                        } else if step == "update" {
+                            assert!(headers.starts_with("PUT /calendar/r1.ics "));
+                            assert!(headers.to_ascii_lowercase().contains("if-match: \"v1\""));
+                            assert!(body.contains("SUMMARY:Updated\r\n"));
+                            assert!(body.contains("UID:contract-uid\r\n"));
+                            assert!(body.contains("X-NATIVE:preserved\r\n"));
+                            if outcome == "conflict" {
+                                status = "412 Precondition Failed";
+                            } else {
+                                status = "204 No Content";
+                                ical = body;
+                            }
+                            String::new()
+                        } else {
+                            assert!(headers.starts_with("GET /calendar/r1.ics "));
+                            etag = if step == "get" {
+                                "ETag: \"v1\"\r\n"
+                            } else {
+                                "ETag: \"v2\"\r\n"
+                            };
+                            ical.clone()
+                        };
+                        if step == "canonical" && outcome == "canonical-error" {
+                            status = "500 Internal Server Error";
+                        }
+                        stream.write_all(format!(
+                            "HTTP/1.1 {status}\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                            response.len(),
+                        ).as_bytes()).await.unwrap();
+                    }
+                });
+
+                let (_dir, db) = temp_pool();
+                let mut account = account("calendar", protocol);
+                account.jmap_url = root.clone();
+                account.jmap_auth_method = "basic".into();
+                account.caldav_url = root;
+                let (remote_calendar, remote_id) = if protocol == "jmap" {
+                    ("remote-calendar", "r1")
+                } else {
+                    ("/calendar/", "/calendar/r1.ics")
+                };
+                let desired = CalendarEvent {
+                    title: "Updated".into(),
+                    uid: Some("contract-uid".into()),
+                    remote_id: Some(remote_id.into()),
+                    start_time: "2026-07-16T10:00:00Z".into(),
+                    end_time: "2026-07-16T10:30:00Z".into(),
+                    timezone: Some("UTC".into()),
+                    ..event()
+                };
+                {
+                    let conn = db.writer().await;
+                    crate::db::schema::initialize(&conn).unwrap();
+                    conn.execute(
+                        "INSERT INTO accounts (id, display_name, email, username)
+                         VALUES (?1, 'Test', 'u@example.com', 'u@example.com')",
+                        [&account.id],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO calendars (id, account_id, name, remote_id)
+                         VALUES (?1, ?2, 'Selected calendar', ?3)",
+                        rusqlite::params![desired.calendar_id, account.id, remote_calendar],
+                    )
+                    .unwrap();
+                }
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                    .unwrap();
+                let mut services = ProviderServices::production().unwrap();
+                services.transports.jmap_discovery_http = http.clone();
+                services.transports.jmap_api_http = http.clone();
+                services.transports.dav_http = http;
+                let result = for_protocol(protocol)
+                    .unwrap()
+                    .push_updated_event(
+                        &CalendarBackendCtx {
+                            db: &db,
+                            services: &services,
+                        },
+                        &account,
+                        remote_id,
+                        &desired,
+                    )
+                    .await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                    .await
+                    .expect("ordinary update must complete the expected remote request sequence")
+                    .unwrap();
+                if outcome == "success" {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    let expected = match (protocol, outcome) {
+                        (_, "canonical-error") => "500",
+                        ("jmap", _) => "stateMismatch",
+                        _ => "412",
+                    };
+                    assert!(error.contains(expected), "{protocol}, {outcome}: {error}");
+                }
+            }
+        }
     }
 
     /// Google color pushes swallow a missing OAuth token — the local

@@ -94,6 +94,10 @@ mod connect_tests {
     fn client_with_base(base: &str) -> CalDavClient {
         CalDavClient {
             http: reqwest::Client::new(),
+            exact_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             base_url: base.to_string(),
             auth: DavAuth {
                 username: "u".into(),
@@ -161,14 +165,21 @@ mod connect_tests {
     }
 
     #[tokio::test]
-    async fn connect_with_client_rejects_http_url() {
+    async fn connect_rejects_http_url() {
         let cfg = CalDavConfig {
             caldav_url: "http://example.com/dav/".into(),
             username: "u".into(),
             password: "p".into(),
             email: "u@example.com".into(),
         };
-        let msg = err_msg(CalDavClient::connect_with_client(&cfg, reqwest::Client::new()).await);
+        let msg = err_msg(
+            CalDavClient::connect_with_clients(
+                &cfg,
+                reqwest::Client::new(),
+                crate::mail::dav_http::build_dav_resource_client().unwrap(),
+            )
+            .await,
+        );
         assert!(msg.contains("https"), "expected scheme error, got: {}", msg);
     }
 
@@ -182,9 +193,13 @@ mod connect_tests {
             password: "pass".into(),
             email: "user@example.com".into(),
         };
-        let client = CalDavClient::connect_with_client(&config, injected_client())
-            .await
-            .unwrap();
+        let client = CalDavClient::connect_with_clients(
+            &config,
+            injected_client(),
+            crate::mail::dav_http::build_dav_resource_client().unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert!(client
             .discover_principal()
@@ -198,6 +213,51 @@ mod connect_tests {
         assert_eq!(
             header(&request, "authorization"),
             Some("Basic dXNlcjpwYXNz")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_transport_never_follows_a_write_redirect() {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}/", source.local_addr().unwrap());
+        let destination = format!("http://{}/wrong.ics", target.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = source.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let client = CalDavClient::connect_with_clients(
+            &CalDavConfig {
+                caldav_url: root,
+                username: "u".into(),
+                password: "p".into(),
+                email: "u@example.org".into(),
+            },
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(client
+            .put_event_at_href("event.ics", "", Some("\"v1\""))
+            .await
+            .is_err());
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
         );
     }
 
@@ -218,12 +278,17 @@ mod connect_tests {
             assert_eq!(parsed.len(), 1);
             assert_eq!(parsed[0].etag, etag);
 
+            if etag.starts_with("W/") {
+                assert!(require_strong_etag(Some(etag)).is_err());
+                continue;
+            }
+
             let (base, request_rx) = dav_server("").await;
             let client = client_with_base(&base);
             client
                 .put_event_at_href(&parsed[0].href, &parsed[0].ical_data, Some(&parsed[0].etag))
                 .await
-                .unwrap();
+                .expect_err("a multistatus is not a successful atomic PUT");
             let request = request_rx.await.unwrap();
             assert_eq!(header(&request, "if-match"), Some(etag));
         }
@@ -316,6 +381,7 @@ mod connect_tests {
 /// A CalDAV client that holds an HTTP client and connection details.
 pub struct CalDavClient {
     http: reqwest::Client,
+    exact_http: reqwest::Client,
     base_url: String,
     auth: DavAuth,
 }
@@ -369,8 +435,13 @@ pub struct RetrievedCalDavEvent {
 // ---------------------------------------------------------------------------
 
 impl CalDavClient {
-    /// Create a CalDAV client using the provided HTTP client.
-    pub async fn connect_with_client(config: &CalDavConfig, http: reqwest::Client) -> Result<Self> {
+    /// Keep discovery redirects separate from exact resource operations. The
+    /// `exact_http` transport must use `reqwest::redirect::Policy::none()`.
+    pub async fn connect_with_clients(
+        config: &CalDavConfig,
+        http: reqwest::Client,
+        exact_http: reqwest::Client,
+    ) -> Result<Self> {
         let auth = DavAuth {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -388,6 +459,7 @@ impl CalDavClient {
 
         Ok(Self {
             http,
+            exact_http,
             base_url,
             auth,
         })
@@ -552,7 +624,7 @@ impl CalDavClient {
 
         let resp = self
             .apply_auth(
-                self.http
+                self.exact_http
                     .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), &url),
             )
             .header("Depth", "1")
@@ -563,6 +635,11 @@ impl CalDavClient {
             .map_err(|e| Error::Other(format!("CalDAV REPORT failed: {}", e)))?;
 
         let status = resp.status();
+        if resp.url().as_str() != url {
+            return Err(Error::Sync(
+                "CalDAV REPORT redirected away from the selected calendar".into(),
+            ));
+        }
         let body = resp
             .text()
             .await
@@ -621,11 +698,14 @@ impl CalDavClient {
         log::info!("caldav: PUT event to {}", event_url);
 
         let mut request = self
-            .apply_auth(self.http.put(&event_url))
+            .apply_auth(self.exact_http.put(&event_url))
             .header("Content-Type", "text/calendar; charset=utf-8")
             .body(ical_data.to_string());
         if let Some(etag) = if_match {
+            require_strong_etag(Some(etag))?;
             request = request.header(reqwest::header::IF_MATCH, etag);
+        } else {
+            request = request.header(reqwest::header::IF_NONE_MATCH, "*");
         }
         let resp = request
             .send()
@@ -633,6 +713,11 @@ impl CalDavClient {
             .map_err(|e| Error::Other(format!("CalDAV PUT failed: {}", e)))?;
 
         let status = resp.status();
+        if resp.url().as_str() != event_url {
+            return Err(Error::Sync(
+                "CalDAV PUT redirected; outcome requires reconciliation".into(),
+            ));
+        }
         if if_match.is_some() && (status.as_u16() == 409 || status.as_u16() == 412) {
             let body = resp
                 .text()
@@ -643,7 +728,7 @@ impl CalDavClient {
                 body.chars().take(500).collect::<String>()
             )));
         }
-        if !status.is_success() {
+        if !matches!(status.as_u16(), 200 | 201 | 204) {
             let body = resp
                 .text()
                 .await
@@ -671,12 +756,17 @@ impl CalDavClient {
         let event_url = self.resolve_url(event_href)?;
         log::debug!("caldav: GET canonical event from {}", event_url);
         let resp = self
-            .apply_auth(self.http.get(&event_url))
+            .apply_auth(self.exact_http.get(&event_url))
             .header(reqwest::header::ACCEPT, "text/calendar")
             .send()
             .await
             .map_err(|error| Error::Other(format!("CalDAV GET failed: {error}")))?;
         let status = resp.status();
+        if resp.url().as_str() != event_url || status.as_u16() != 200 {
+            return Err(Error::Sync(format!(
+                "CalDAV canonical GET did not return the exact resource ({status})"
+            )));
+        }
         let etag = resp
             .headers()
             .get(reqwest::header::ETAG)
@@ -695,19 +785,46 @@ impl CalDavClient {
         Ok(RetrievedCalDavEvent { ical_data, etag })
     }
 
+    /// Upgrade weak/missing metadata only against the identical original body.
+    pub async fn strong_revision_for(
+        &self,
+        href: &str,
+        revision: Option<&str>,
+        expected_data: Option<&str>,
+    ) -> Result<String> {
+        if let Ok(etag) = require_strong_etag(revision) {
+            return Ok(etag.to_owned());
+        }
+        let fresh = self.get_event_at_href(href).await?;
+        let etag = require_strong_etag(fresh.etag.as_deref())?;
+        if expected_data != Some(fresh.ical_data.as_str()) {
+            return Err(Error::Sync("CalDAV resource changed or its original representation is unavailable; refresh before retry".into()));
+        }
+        Ok(etag.to_owned())
+    }
+
     /// DELETE an event from the server.
     pub async fn delete_event(&self, event_href: &str) -> Result<()> {
+        let current = self.get_event_at_href(event_href).await?;
+        self.delete_event_if_match(event_href, require_strong_etag(current.etag.as_deref())?)
+            .await
+    }
+
+    /// Delete exactly the representation previously read by the caller.
+    pub async fn delete_event_if_match(&self, event_href: &str, etag: &str) -> Result<()> {
+        require_strong_etag(Some(etag))?;
         let url = self.resolve_url(event_href)?;
         log::info!("caldav: DELETE event at {}", url);
 
         let resp = self
-            .apply_auth(self.http.delete(&url))
+            .apply_auth(self.exact_http.delete(&url))
+            .header(reqwest::header::IF_MATCH, etag)
             .send()
             .await
             .map_err(|e| Error::Other(format!("CalDAV DELETE failed: {}", e)))?;
 
         let status = resp.status();
-        if !status.is_success() && status.as_u16() != 204 {
+        if resp.url().as_str() != url || !matches!(status.as_u16(), 200 | 204) {
             let body = resp
                 .text()
                 .await
@@ -721,6 +838,79 @@ impl CalDavClient {
 
         log::info!("caldav: DELETE success");
         Ok(())
+    }
+
+    /// Compare relative and absolute DAV addresses in the authenticated origin.
+    pub(crate) fn same_resource_href(&self, left: &str, right: &str) -> Result<bool> {
+        Ok(self.resolve_url(left)? == self.resolve_url(right)?)
+    }
+
+    /// Validate an exact direct-child object in the selected collection.
+    pub fn validate_resource_href(&self, calendar: &str, href: &str) -> Result<()> {
+        let collection = self.resolve_url(calendar)?;
+        let object = self.resolve_url(href)?;
+        let collection = url::Url::parse(&collection).map_err(|e| Error::Other(e.to_string()))?;
+        let object = url::Url::parse(&object).map_err(|e| Error::Other(e.to_string()))?;
+        let prefix = format!("{}/", collection.path().trim_end_matches('/'));
+        let child = object.path().strip_prefix(&prefix).unwrap_or("");
+        if collection.query().is_some()
+            || collection.fragment().is_some()
+            || object.query().is_some()
+            || object.fragment().is_some()
+            || !object.username().is_empty()
+            || object.password().is_some()
+            || child.is_empty()
+            || child.contains('/')
+            || child.to_ascii_lowercase().contains("%2f")
+            || child.to_ascii_lowercase().contains("%5c")
+        {
+            return Err(Error::Other(
+                "CalDAV resource is outside the selected calendar".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// RFC 4918 MOVE. Only explicit method rejection is safe to fall back from.
+    pub async fn move_event_if_match(
+        &self,
+        source: &str,
+        destination: &str,
+        etag: &str,
+    ) -> Result<bool> {
+        require_strong_etag(Some(etag))?;
+        let source = self.resolve_url(source)?;
+        let destination = self.resolve_url(destination)?;
+        if source == destination {
+            return Err(Error::Other("CalDAV MOVE source equals destination".into()));
+        }
+        let response = self
+            .apply_auth(self.exact_http.request(
+                reqwest::Method::from_bytes(b"MOVE").map_err(|e| Error::Other(e.to_string()))?,
+                &source,
+            ))
+            .header("Destination", destination)
+            .header("Overwrite", "F")
+            .header(reqwest::header::IF_MATCH, etag)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::Sync(format!(
+                    "CalDAV MOVE outcome unknown; reconcile before retry: {e}"
+                ))
+            })?;
+        if response.url().as_str() != source {
+            return Err(Error::Sync(
+                "CalDAV MOVE redirected; outcome requires reconciliation".into(),
+            ));
+        }
+        match response.status().as_u16() {
+            201 | 204 => Ok(true),
+            405 | 501 => Ok(false),
+            status => Err(Error::Sync(format!(
+                "CalDAV MOVE returned {status}; no copy/delete fallback is safe"
+            ))),
+        }
     }
 
     /// PROPPATCH the `{DAV:}displayname` property to rename a calendar.
@@ -887,6 +1077,24 @@ impl CalDavClient {
     fn resolve_url(&self, href: &str) -> Result<String> {
         resolve_dav_url(&self.base_url, href, "CalDAV")
     }
+}
+
+/// RFC 9110 If-Match uses strong comparison. Weak validators remain read metadata.
+pub(crate) fn require_strong_etag(etag: Option<&str>) -> Result<&str> {
+    etag.filter(|tag| {
+        tag.len() >= 2
+            && tag.starts_with('"')
+            && tag.ends_with('"')
+            && tag.as_bytes()[1..tag.len() - 1]
+                .iter()
+                .all(|b| *b == 0x21 || (0x23..=0x7e).contains(b) || *b >= 0x80)
+    })
+    .ok_or_else(|| {
+        Error::Sync(
+            "CalDAV server did not provide a strong ETag; conditional modification is unavailable"
+                .into(),
+        )
+    })
 }
 
 /// Resolve a DAV href without allowing authenticated requests to change origin.

@@ -253,13 +253,16 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'recurrence objects cannot cross accounts');
         END;
 
-        -- SET NULL preserves provider-backed objects; local-only objects have
+        -- Retire owned objects before FK cleanup can unlink their self-reference.
+        -- Surviving provider-backed objects may unlink; local-only objects have
         -- no durable series identity after their local master disappears.
-        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_prune_local_series
+        DROP TRIGGER IF EXISTS calendar_recurrence_prune_local_series;
+        CREATE TRIGGER calendar_recurrence_prune_local_series
         BEFORE DELETE ON calendar_events
         BEGIN
             DELETE FROM calendar_recurrence_objects
-            WHERE local_series_event_id = OLD.id AND provider_series_id IS NULL;
+            WHERE event_id = OLD.id
+               OR (local_series_event_id = OLD.id AND provider_series_id IS NULL);
         END;
 
         CREATE TABLE IF NOT EXISTS calendars (
@@ -432,6 +435,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     // Migrations for existing databases
     run_migrations(conn)?;
     initialize_calendar_event_state(conn)?;
+    super::calendar_actions::initialize(conn)?;
 
     Ok(())
 }

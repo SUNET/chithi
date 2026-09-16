@@ -237,6 +237,10 @@ fn single_unpushed_event_by_uid(
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
            AND (remote_id IS NULL OR remote_id = '')
+           AND NOT EXISTS (SELECT 1 FROM calendar_action_creations creation WHERE creation.event_id = calendar_events.id)
+           AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
+           AND NOT EXISTS (SELECT 1 FROM calendar_action_sets owned WHERE owned.event_id = calendar_events.id)
+           AND NOT EXISTS (SELECT 1 FROM calendar_action_claims claim WHERE claim.event_id = calendar_events.id)
          LIMIT 2",
     )?;
     let mut candidates = stmt
@@ -393,6 +397,9 @@ pub(crate) fn upsert_event_by_remote_id_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     event: &CalendarEvent,
 ) -> Result<()> {
+    if super::calendar_actions::ingest_owned(transaction, event, &[])?.is_some() {
+        return Ok(());
+    }
     upsert_provider_event(transaction, event).map(|_| ())
 }
 
@@ -432,6 +439,12 @@ pub(crate) fn upsert_event_by_remote_id_with_recurrence_in_transaction(
         }
     }
 
+    if let Some(owner) =
+        super::calendar_actions::ingest_owned(transaction, event, recurrence_seeds)?
+    {
+        return Ok(owner);
+    }
+
     let event_id = upsert_provider_event(transaction, event)?;
     replace_event_recurrence_objects(transaction, &event.account_id, &event_id, recurrence_seeds)?;
     Ok(event_id)
@@ -445,8 +458,8 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<Str
                         organizer_email,
                         EXISTS(SELECT 1 FROM calendar_invitation_sources source
                                WHERE source.event_id = calendar_events.id)
-                 FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-                params![event.account_id, remote_id],
+                 FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2 AND calendar_id = ?3",
+                params![event.account_id, remote_id, event.calendar_id],
                 |row| {
                     Ok(ExistingEventForSync {
                         id: row.get(0)?,
@@ -797,6 +810,7 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
+               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
                AND ((start_time < ?4 AND end_time > ?3)
                     OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
@@ -810,6 +824,7 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
                AND ((start_time < ?3 AND end_time > ?2)
                     OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
@@ -1330,6 +1345,10 @@ mod tests {
                 created_at TEXT NOT NULL,
                 cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE calendar_action_creations (event_id TEXT);
+            CREATE TABLE calendar_action_members (event_id TEXT);
+            CREATE TABLE calendar_action_sets (event_id TEXT);
+            CREATE TABLE calendar_action_claims (event_id TEXT);
             INSERT INTO accounts (id, display_name, email, provider, username, password)
             VALUES
                 ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass'),
