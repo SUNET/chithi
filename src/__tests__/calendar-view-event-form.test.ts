@@ -11,6 +11,9 @@ vi.mock("@/lib/tauri", () => ({
   meetDiscardPending: vi.fn().mockResolvedValue(undefined),
   createEvent: vi.fn().mockResolvedValue("event"),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
   listCalendars: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn(),
@@ -74,6 +77,43 @@ describe("CalendarView responsive event form lifecycle", () => {
     ];
     useUiStore().displayTimezone = "UTC";
     usePlatformStore().width = 1280;
+  });
+
+  it("renders cached events before starting network sync", async () => {
+    const calendarStore = useCalendarStore();
+    let resolveEvents!: () => void;
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockImplementation(
+      () => new Promise<void>((resolve) => { resolveEvents = resolve; }),
+    );
+    const sync = vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    const start = vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+
+    const wrapper = mount(CalendarView, {
+      global: {
+        stubs: {
+          CalendarSidebar: true,
+          WeekView: true,
+          MonthView: true,
+          EventDetail: true,
+          MobileAppBar: true,
+          MobileIconButton: true,
+          EventForm: true,
+        },
+      },
+    });
+    await flushPromises();
+
+    expect(calendarStore.fetchEvents).toHaveBeenCalledOnce();
+    expect(sync).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+
+    resolveEvents();
+    await flushPromises();
+
+    expect(sync).toHaveBeenCalledOnce();
+    expect(start).toHaveBeenCalledOnce();
+    wrapper.unmount();
   });
 
   it("preserves a pending meeting when the responsive branch switches", async () => {

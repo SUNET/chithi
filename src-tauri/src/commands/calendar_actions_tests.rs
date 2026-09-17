@@ -744,6 +744,7 @@ async fn fixture(
         canonical: None,
         source_after: None,
         native_move: false,
+        auto_resume: false,
     };
     store::insert_operation(&tx, &operation).unwrap();
     tx.commit().unwrap();
@@ -1323,6 +1324,12 @@ async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_pos
     {
         let conn = state.db.writer().await;
         db::calendar::upsert_event_by_remote_id(&conn, &operation.source.anchor).unwrap();
+        conn.execute(
+            "INSERT INTO calendar_action_members(event_id, owner_event_id)
+             VALUES ('source-event', 'source-event')",
+            [],
+        )
+        .unwrap();
     }
     let page = list_occurrences(
         &state,
@@ -1336,6 +1343,150 @@ async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_pos
     .unwrap();
     assert!(page.occurrences.is_empty());
     assert_eq!(page.needs_hydration, ["source-event"]);
+}
+
+#[tokio::test]
+async fn dirty_graph_set_remains_coherent_for_display_only() {
+    let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
+    {
+        let conn = state.db.writer().await;
+        db::calendar::upsert_event_by_remote_id(&conn, &operation.source.anchor).unwrap();
+    }
+
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-20".into(),
+        10,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.occurrences.len(), 3);
+    assert_eq!(page.needs_hydration, ["source-event"]);
+    assert!(store::latest_snapshot(&state.db.reader(), "source-event")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn atomic_occurrence_plan_rehydrates_after_intermediate_sync() {
+    let (_directory, state, operation, remote) = fixture(Some("jmap"), None, false).await;
+    {
+        let conn = state.db.writer().await;
+        db::calendar::upsert_event_by_remote_id(&conn, &operation.source.anchor).unwrap();
+    }
+    assert!(store::load_snapshot(
+        &state.db.reader(),
+        &operation.source.token,
+        &operation.source.anchor.id,
+    )
+    .is_err());
+    let expected =
+        event_fields(&selected_event(&operation.source.set, Some("2026-09-14")).unwrap());
+    let backend = Fake {
+        protocol: "jmap",
+        remote: remote.clone(),
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+
+    let plan = plan_occurrence_with_backends(
+        &state,
+        "source-event".into(),
+        "2026-09-14".into(),
+        expected,
+        CalendarEdit {
+            title: Some("Atomic edit".into()),
+            ..CalendarEdit::default()
+        },
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+
+    let planned = store::load_operation(&state.db.reader(), &plan.operation_id).unwrap();
+    assert_eq!(planned.stage, CalendarActionStage::Planned);
+    assert!(planned.auto_resume);
+    assert_eq!(planned.input.scope, RecurrenceMutationScope::ThisOccurrence);
+    assert_eq!(
+        planned.input.selection.original_start.as_deref(),
+        Some("2026-09-14")
+    );
+    assert_eq!(planned.desired.overrides.len(), 2);
+    let claims: i64 = state
+        .db
+        .reader()
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_action_claims WHERE operation_id = ?1",
+            [&plan.operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claims, planned.source.members.len() as i64);
+    assert_eq!(remote.lock().unwrap().fetched_ids.len(), 1);
+    assert_eq!(remote.lock().unwrap().update_count, 0);
+
+    let result = execute_with_backends(
+        &state,
+        &plan.operation_id,
+        &CalendarConfirmations::default(),
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stage, CalendarActionStage::Completed);
+    assert_eq!(remote.lock().unwrap().fetched_ids.len(), 1);
+    assert_eq!(remote.lock().unwrap().update_count, 1);
+}
+
+#[tokio::test]
+async fn atomic_occurrence_plan_rejects_stale_display_before_claiming() {
+    let (_directory, state, operation, remote) = fixture(Some("jmap"), None, false).await;
+    let mut expected =
+        event_fields(&selected_event(&operation.source.set, Some("2026-09-14")).unwrap());
+    expected.title = "Stale title".into();
+    let backend = Fake {
+        protocol: "jmap",
+        remote,
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+    let before: i64 = state
+        .db
+        .reader()
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_action_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let error = plan_occurrence_with_backends(
+        &state,
+        "source-event".into(),
+        "2026-09-14".into(),
+        expected,
+        CalendarEdit {
+            title: Some("Unsafe overwrite".into()),
+            ..CalendarEdit::default()
+        },
+        Some(&backends),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("changed remotely"));
+    let after: i64 = state
+        .db
+        .reader()
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_action_operations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, before);
 }
 
 #[tokio::test]
@@ -1781,6 +1932,7 @@ async fn expanded_whole_and_occurrence_moves_retire_all_source_addresses() {
                 .await
                 .unwrap();
             store::save_snapshot(&*state.db.writer().await, &source).unwrap();
+            let fetches_before_plan = remote.lock().unwrap().fetched_ids.len();
             let plan = plan_with_backends(
                 &state,
                 CalendarActionInput {
@@ -1798,6 +1950,11 @@ async fn expanded_whole_and_occurrence_moves_retire_all_source_addresses() {
             )
             .await
             .unwrap();
+            assert_eq!(
+                remote.lock().unwrap().fetched_ids.len(),
+                fetches_before_plan,
+                "{protocol} {scope:?}"
+            );
             let outcome = execute_with_backends(
                 &state,
                 &plan.operation_id,
@@ -1862,92 +2019,284 @@ async fn expanded_whole_and_occurrence_moves_retire_all_source_addresses() {
 }
 
 #[tokio::test]
-async fn update_response_loss_and_local_commit_failure_resume_without_reapplying_provider_write() {
+async fn update_response_loss_reconciles_without_reapplying_provider_write() {
     for protocol in ["google", "graph", "jmap", "caldav"] {
-        for lose_response in [false, true] {
-            let (directory, state, mut operation, remote) =
-                fixture(Some(protocol), Some(protocol), false).await;
-            operation.destination = None;
-            operation.input.destination_calendar_id = None;
-            operation.desired.mark_description_plain(None).unwrap();
-            operation.desired.event.title = "Recovered edit".into();
-            operation.desired.event.description =
-                Some("Updated <agenda> & notes; one, two\\three\nNext".into());
-            checkpoint(&state, &operation).await.unwrap();
-            let backend = Fake {
-                protocol,
-                remote: remote.clone(),
-            };
-            let backends: [&dyn CalendarBackend; 1] = [&backend];
-            if lose_response {
-                remote.lock().unwrap().lose_update_response = true;
-            } else {
-                state.db.writer().await.execute_batch("CREATE TRIGGER fail_action_commit BEFORE UPDATE ON calendar_events BEGIN SELECT RAISE(ABORT, 'simulated commit failure'); END;").unwrap();
-            }
-            assert!(execute_with_backends(
-                &state,
-                &operation.id,
-                &CalendarConfirmations::default(),
-                Some(&backends)
-            )
-            .await
-            .is_err());
-            assert_eq!(remote.lock().unwrap().update_count, 1);
-            {
-                let data = remote.lock().unwrap();
-                let canonical = &data.sets[&("source".into(), "source-calendar".into())];
-                assert_native_projections(canonical);
-                assert!(semantic_eq(canonical, &operation.desired), "{protocol}");
-            }
-            assert_eq!(
-                db::calendar::get_event(&state.db.reader(), "source-event")
-                    .unwrap()
-                    .title,
-                "Standup"
-            );
-            if !lose_response {
-                state
-                    .db
-                    .writer()
-                    .await
-                    .execute_batch("DROP TRIGGER fail_action_commit;")
-                    .unwrap();
-            }
-            {
-                let conn = state.db.writer().await;
-                let canonical = remote
-                    .lock()
-                    .unwrap()
-                    .sets
-                    .get(&("source".into(), "source-calendar".into()))
-                    .unwrap()
-                    .event
-                    .clone();
-                db::calendar::upsert_event_by_remote_id(&conn, &canonical).unwrap();
-                let mut unrelated = operation.source.anchor.clone();
-                unrelated.id = "unrelated-sync-event".into();
-                unrelated.remote_id = Some("unrelated-native-id".into());
-                db::calendar::insert_event(&conn, &unrelated).unwrap();
-            }
-            drop(state);
-            let state = AppState::new(directory.path().to_path_buf()).unwrap();
-            let result = execute_with_backends(
-                &state,
-                &operation.id,
-                &CalendarConfirmations::default(),
-                Some(&backends),
-            )
-            .await
+        let (_directory, state, mut operation, remote) =
+            fixture(Some(protocol), Some(protocol), false).await;
+        operation.destination = None;
+        operation.input.destination_calendar_id = None;
+        operation.desired.mark_description_plain(None).unwrap();
+        operation.desired.event.title = "Recovered edit".into();
+        operation.desired.event.description =
+            Some("Updated <agenda> & notes; one, two\\three\nNext".into());
+        checkpoint(&state, &operation).await.unwrap();
+        remote.lock().unwrap().lose_update_response = true;
+        let backend = Fake {
+            protocol,
+            remote: remote.clone(),
+        };
+        let backends: [&dyn CalendarBackend; 1] = [&backend];
+
+        let result = execute_with_backends(
+            &state,
+            &operation.id,
+            &CalendarConfirmations::default(),
+            Some(&backends),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.stage, CalendarActionStage::Completed);
+        assert_eq!(remote.lock().unwrap().update_count, 1);
+        assert_eq!(
+            db::calendar::get_event(&state.db.reader(), "source-event")
+                .unwrap()
+                .title,
+            "Recovered edit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn applying_update_recovers_after_authoritative_read_projects_remote_result() {
+    let (_directory, state, mut operation, remote) =
+        fixture(Some("graph"), Some("graph"), false).await;
+    operation.destination = None;
+    operation.input.destination_calendar_id = None;
+    operation.desired.event.title = "Recovered edit".into();
+    operation.stage = CalendarActionStage::Applying;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::claim_operation(&tx, &operation).unwrap();
+        store::save_operation(&tx, &operation).unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let mut canonical = operation.desired.clone();
+        canonical.native.as_mut().unwrap().revision = Some("updated".into());
+        canonical.event.etag = Some("updated".into());
+        refresh_native(&mut canonical, "graph");
+        remote
+            .lock()
+            .unwrap()
+            .sets
+            .insert(("source".into(), "source-calendar".into()), canonical);
+    }
+    let backend = Fake {
+        protocol: "graph",
+        remote: remote.clone(),
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+
+    let result = execute_with_backends(
+        &state,
+        &operation.id,
+        &CalendarConfirmations::default(),
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stage, CalendarActionStage::Completed);
+    assert_eq!(remote.lock().unwrap().update_count, 0);
+    assert_eq!(
+        db::calendar::get_event(&state.db.reader(), "source-event")
+            .unwrap()
+            .title,
+        "Recovered edit"
+    );
+}
+
+#[tokio::test]
+async fn pending_update_repairs_unchanged_description_provenance() {
+    let (_directory, _state, mut operation, _remote) =
+        fixture(Some("graph"), Some("graph"), false).await;
+    operation.destination = None;
+    operation.input.destination_calendar_id = None;
+    operation.input.scope = RecurrenceMutationScope::ThisOccurrence;
+    operation.source.set.event.description = Some("<b>Rich agenda</b>".into());
+    operation.source.set.native.as_mut().unwrap().data =
+        native_data("graph", &operation.source.set.event, "text/html");
+    operation.input.edit.description = operation.source.set.event.description.clone();
+    operation.desired = desired_set(&operation.source.set, &operation.input).unwrap();
+    operation
+        .desired
+        .mark_description_plain(operation.input.selection.original_start.as_deref())
+        .unwrap();
+    let corrected = desired_set(&operation.source.set, &operation.input).unwrap();
+
+    assert!(!semantic_eq(&operation.desired, &corrected));
+    assert!(repair_unchanged_description_intent(&mut operation).unwrap());
+    assert!(semantic_eq(&operation.desired, &corrected));
+    assert!(!repair_unchanged_description_intent(&mut operation).unwrap());
+}
+
+#[tokio::test]
+async fn applying_update_rebases_unchanged_remote_source_before_retry() {
+    let (_directory, state, mut operation, remote) =
+        fixture(Some("graph"), Some("graph"), false).await;
+    operation.destination = None;
+    operation.input.destination_calendar_id = None;
+    operation.desired.event.title = "Retried edit".into();
+    operation.stage = CalendarActionStage::Applying;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::claim_operation(&tx, &operation).unwrap();
+        store::save_operation(&tx, &operation).unwrap();
+        tx.commit().unwrap();
+    }
+    let backend = Fake {
+        protocol: "graph",
+        remote: remote.clone(),
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+
+    let result = execute_with_backends(
+        &state,
+        &operation.id,
+        &CalendarConfirmations::default(),
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stage, CalendarActionStage::Completed);
+    assert_eq!(remote.lock().unwrap().update_count, 1);
+    assert_eq!(
+        db::calendar::get_event(&state.db.reader(), "source-event")
+            .unwrap()
+            .title,
+        "Retried edit"
+    );
+}
+
+#[tokio::test]
+async fn applying_update_rejects_unrelated_remote_change_without_write() {
+    let (_directory, state, mut operation, remote) =
+        fixture(Some("graph"), Some("graph"), false).await;
+    operation.destination = None;
+    operation.input.destination_calendar_id = None;
+    operation.desired.event.title = "Unsafe overwrite".into();
+    operation.stage = CalendarActionStage::Applying;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::claim_operation(&tx, &operation).unwrap();
+        store::save_operation(&tx, &operation).unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let mut data = remote.lock().unwrap();
+        let current = data
+            .sets
+            .get_mut(&("source".into(), "source-calendar".into()))
             .unwrap();
-            assert_eq!(result.stage, CalendarActionStage::Completed);
-            assert_eq!(remote.lock().unwrap().update_count, 1);
-            assert_eq!(
-                db::calendar::get_event(&state.db.reader(), "source-event")
-                    .unwrap()
-                    .title,
-                "Recovered edit"
-            );
+        current.event.title = "Unrelated remote change".into();
+        current.event.etag = Some("conflict".into());
+        current.native.as_mut().unwrap().revision = Some("conflict".into());
+        refresh_native(current, "graph");
+    }
+    let backend = Fake {
+        protocol: "graph",
+        remote: remote.clone(),
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+
+    let error = execute_with_backends(
+        &state,
+        &operation.id,
+        &CalendarConfirmations::default(),
+        Some(&backends),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("selection is stale"));
+    assert_eq!(remote.lock().unwrap().update_count, 0);
+}
+
+#[tokio::test]
+async fn local_commit_failure_resumes_without_reapplying_provider_write() {
+    for protocol in ["google", "graph", "jmap", "caldav"] {
+        let (directory, state, mut operation, remote) =
+            fixture(Some(protocol), Some(protocol), false).await;
+        operation.destination = None;
+        operation.input.destination_calendar_id = None;
+        operation.desired.mark_description_plain(None).unwrap();
+        operation.desired.event.title = "Recovered edit".into();
+        operation.desired.event.description =
+            Some("Updated <agenda> & notes; one, two\\three\nNext".into());
+        checkpoint(&state, &operation).await.unwrap();
+        let backend = Fake {
+            protocol,
+            remote: remote.clone(),
+        };
+        let backends: [&dyn CalendarBackend; 1] = [&backend];
+        state.db.writer().await.execute_batch("CREATE TRIGGER fail_action_commit BEFORE UPDATE ON calendar_events BEGIN SELECT RAISE(ABORT, 'simulated commit failure'); END;").unwrap();
+
+        assert!(execute_with_backends(
+            &state,
+            &operation.id,
+            &CalendarConfirmations::default(),
+            Some(&backends)
+        )
+        .await
+        .is_err());
+        assert_eq!(remote.lock().unwrap().update_count, 1);
+        {
+            let data = remote.lock().unwrap();
+            let canonical = &data.sets[&("source".into(), "source-calendar".into())];
+            assert_native_projections(canonical);
+            assert!(semantic_eq(canonical, &operation.desired), "{protocol}");
         }
+        assert_eq!(
+            db::calendar::get_event(&state.db.reader(), "source-event")
+                .unwrap()
+                .title,
+            "Standup"
+        );
+        state
+            .db
+            .writer()
+            .await
+            .execute_batch("DROP TRIGGER fail_action_commit;")
+            .unwrap();
+        {
+            let conn = state.db.writer().await;
+            let canonical = remote
+                .lock()
+                .unwrap()
+                .sets
+                .get(&("source".into(), "source-calendar".into()))
+                .unwrap()
+                .event
+                .clone();
+            db::calendar::upsert_event_by_remote_id(&conn, &canonical).unwrap();
+            let mut unrelated = operation.source.anchor.clone();
+            unrelated.id = "unrelated-sync-event".into();
+            unrelated.remote_id = Some("unrelated-native-id".into());
+            db::calendar::insert_event(&conn, &unrelated).unwrap();
+        }
+        drop(state);
+        let state = AppState::new(directory.path().to_path_buf()).unwrap();
+        let result = execute_with_backends(
+            &state,
+            &operation.id,
+            &CalendarConfirmations::default(),
+            Some(&backends),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stage, CalendarActionStage::Completed);
+        assert_eq!(remote.lock().unwrap().update_count, 1);
+        assert_eq!(
+            db::calendar::get_event(&state.db.reader(), "source-event")
+                .unwrap()
+                .title,
+            "Recovered edit"
+        );
     }
 }
 

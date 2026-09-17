@@ -19,6 +19,7 @@ export type CalendarViewMode = "day" | "week" | "month";
 export const useCalendarStore = defineStore("calendar", () => {
   const calendars = ref<Calendar[]>([]);
   const events = ref<CalendarEvent[]>([]);
+  const projectedEvents = ref<CalendarEvent[] | null>(null);
   const viewMode = ref<CalendarViewMode>("week");
   const currentDate = ref(new Date().toISOString().split("T")[0]); // YYYY-MM-DD
   const loading = ref(false);
@@ -29,6 +30,7 @@ export const useCalendarStore = defineStore("calendar", () => {
   const singleEventRequests = new Map<string, symbol>();
 
   watch(events, () => {
+    projectedEvents.value = null;
     singleEventCache.value.clear();
     singleEventRequests.clear();
   }, { flush: "sync" });
@@ -71,7 +73,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     const range = getDateRange();
     const rangeStart = new Date(range.start);
     const rangeEnd = new Date(range.end);
-    const result: CalendarEvent[] = [];
 
     // Drop events whose calendar isn't in the (subscribed-only)
     // calendar list. Without this filter, events linger from
@@ -81,45 +82,77 @@ export const useCalendarStore = defineStore("calendar", () => {
     // sidebar.
     const visibleCalendarIds = new Set(calendars.value.map((c) => c.id));
 
-    for (const e of events.value) {
-      if (!visibleCalendarIds.has(e.calendar_id)) continue;
-      if (hiddenCalendarIds.value.includes(e.calendar_id)) continue;
+    if (projectedEvents.value) {
+      return projectedEvents.value.filter((event) =>
+        visibleCalendarIds.has(event.calendar_id) &&
+        !hiddenCalendarIds.value.includes(event.calendar_id));
+    }
+    return expandRawEvents(events.value, rangeStart, rangeEnd)
+      .filter((event) =>
+        visibleCalendarIds.has(event.calendar_id) &&
+        !hiddenCalendarIds.value.includes(event.calendar_id));
+  });
 
-      if (e.recurrence_rule) {
-        // Keep unsupported JSCalendar rules in their raw form for a lossless
-        // JMAP round-trip. Show their master once rather than inventing
-        // incorrect occurrences from constraints this expander cannot honour.
-        if (!parseRRule(e.recurrence_rule)) {
-          result.push(e);
+  function expandRawEvents(
+    source: CalendarEvent[],
+    rangeStart: Date,
+    rangeEnd: Date,
+  ): CalendarEvent[] {
+    const result: CalendarEvent[] = [];
+    for (const event of source) {
+      if (event.recurrence_rule) {
+        // Unsupported JSCalendar rules stay as one raw master rather than being
+        // expanded into an incorrect schedule.
+        if (!parseRRule(event.recurrence_rule)) {
+          result.push(event);
           continue;
         }
-        // Expand RRULE into occurrences
-        const occurrences = expandRRule(
-          e.recurrence_rule,
-          new Date(e.start_time),
-          new Date(e.end_time),
+        for (const occurrence of expandRRule(
+          event.recurrence_rule,
+          new Date(event.start_time),
+          new Date(event.end_time),
           rangeStart,
           rangeEnd,
-        );
-        for (const occ of occurrences) {
+        )) {
           result.push({
-            ...e,
-            // Display-only identity; never substitute the master for a mutation.
-            id: occurrenceId(e.id, occ.start),
+            ...event,
+            id: occurrenceId(event.id, occurrence.start),
             recurrence_kind: "occurrence",
-            start_time: occ.start.toISOString(),
-            end_time: occ.end.toISOString(),
+            start_time: occurrence.start.toISOString(),
+            end_time: occurrence.end.toISOString(),
           });
         }
-      } else {
-        if (new Date(e.start_time) <= rangeEnd && new Date(e.end_time) >= rangeStart) {
-          result.push(e);
-        }
+      } else if (
+        new Date(event.start_time) <= rangeEnd &&
+        new Date(event.end_time) >= rangeStart
+      ) {
+        result.push(event);
       }
     }
-
     return result;
-  });
+  }
+
+  function occurrenceEvent(
+    occurrence: CalendarOccurrence,
+    master: CalendarEvent,
+  ): CalendarEvent {
+    const originalStart = occurrence.selection.original_start;
+    const originalDate = originalStart ? new Date(originalStart) : null;
+    if (originalDate && !Number.isFinite(originalDate.getTime())) {
+      throw new Error("Calendar occurrence has an invalid original position.");
+    }
+    return {
+      ...master,
+      ...occurrence.fields,
+      id: originalDate
+        ? occurrenceId(occurrence.event_id, originalDate)
+        : occurrence.event_id,
+      recurrence_kind: originalStart
+        ? "occurrence"
+        : occurrence.recurrence_kind,
+      recurrence_rule: occurrence.recurrence_rule,
+    };
+  }
 
   function getDateRange(): { start: string; end: string } {
     const d = new Date(currentDate.value);
@@ -232,10 +265,56 @@ export const useCalendarStore = defineStore("calendar", () => {
             }),
         ),
       );
+      const occurrencePages = await Promise.all(
+        accountsStore.accounts.map((account) =>
+          api.listCalendarOccurrences(
+            account.id,
+            null,
+            range.start,
+            range.end,
+            2000,
+          )),
+      );
+      if (occurrencePages.some((page) => page.has_more)) {
+        throw new Error(
+          "The visible calendar range exceeds the occurrence display limit.",
+        );
+      }
+      const rawEvents = results.flat();
+      const masters = new Map(rawEvents.map((event) => [event.id, event]));
+      const projected: CalendarEvent[] = [];
+      const projectedIds = new Set<string>();
+      const projectedMasters = new Set<string>();
+      const needsHydration = new Set<string>();
+      for (const page of occurrencePages) {
+        for (const id of page.needs_hydration) needsHydration.add(id);
+        for (const occurrence of page.occurrences) {
+          projectedMasters.add(occurrence.event_id);
+          const master = masters.get(occurrence.event_id);
+          if (!master) {
+            throw new Error(
+              "Calendar occurrence has no matching local master event.",
+            );
+          }
+          const event = occurrenceEvent(occurrence, master);
+          if (projectedIds.has(event.id)) {
+            throw new Error("Calendar occurrence projection contains duplicate IDs.");
+          }
+          projectedIds.add(event.id);
+          projected.push(event);
+        }
+      }
+      projected.push(...expandRawEvents(
+        rawEvents.filter((event) =>
+          needsHydration.has(event.id) && !projectedMasters.has(event.id)),
+        new Date(range.start),
+        new Date(range.end),
+      ));
       // An exact read may have completed while the range request was pending.
       const selectedId = selectedEvent.value?.id;
       const hadSingleEvent = selectedId && singleEventCache.value.has(selectedId);
-      events.value = results.flat();
+      events.value = rawEvents;
+      projectedEvents.value = projected;
       if (refreshSelected && selectedId && hadSingleEvent) {
         try {
           await refreshSingleEvent(selectedId);
@@ -328,43 +407,46 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
-  function sameOccurrenceTime(left: string, right: string, allDay: boolean) {
-    if (allDay) return left.slice(0, 10) === right.slice(0, 10);
-    const leftTime = Date.parse(left);
-    const rightTime = Date.parse(right);
-    return Number.isFinite(leftTime) && leftTime === rightTime;
-  }
-
   function selectedOriginalStart(event: CalendarEvent): string | null {
     if (!isOccurrenceId(event.id)) return null;
     const master = masterEventId(event.id);
-    return event.id.slice(master.length + 1);
+    const encoded = event.id.slice(master.length + 1);
+    return event.all_day ? encoded.slice(0, 10) : encoded;
   }
 
-  function matchingOccurrence(
+  async function resumePendingOccurrenceAction(
     event: CalendarEvent,
-    occurrences: CalendarOccurrence[],
-  ): CalendarOccurrence {
-    const originalStart = selectedOriginalStart(event);
-    const matches = occurrences.filter((occurrence) => {
-      const effectiveTimeMatches = sameOccurrenceTime(
-        occurrence.fields.start_time, event.start_time, event.all_day,
-      ) && sameOccurrenceTime(
-        occurrence.fields.end_time, event.end_time, event.all_day,
-      );
-      if (originalStart && occurrence.selection.original_start) {
-        return sameOccurrenceTime(
-          occurrence.selection.original_start, originalStart, event.all_day,
-        ) && effectiveTimeMatches;
-      }
-      return occurrence.event_id === event.id && effectiveTimeMatches;
-    });
-    if (matches.length !== 1) {
+    anchorId: string,
+  ): Promise<boolean> {
+    const pending = (await api.listPendingCalendarActions(event.account_id))
+      .filter((action) =>
+        action.event_id === anchorId &&
+        (action.stage !== "planned" || action.auto_resume === true));
+    if (pending.length === 0) return false;
+    if (pending.length !== 1) {
       throw new Error(
-        "The selected occurrence could not be identified uniquely. Refresh and try again.",
+        "Multiple unfinished calendar actions own this event. " +
+        "Resolve them before editing it again.",
       );
     }
-    return matches[0];
+    const action = pending[0];
+    if (action.requires.replacement_meeting_identity ||
+      action.requires.reset_exceptions) {
+      throw new Error(
+        "The unfinished calendar action requires confirmation before recovery.",
+      );
+    }
+    const result = await api.executeCalendarAction(action.operation_id, {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    });
+    if (result.stage !== "completed") {
+      throw new Error(
+        "The unfinished occurrence edit still needs reconciliation.",
+      );
+    }
+    await fetchEvents({ refreshSelected: false });
+    return true;
   }
 
   async function updateOccurrence(
@@ -376,24 +458,27 @@ export const useCalendarStore = defineStore("calendar", () => {
       throw new Error(support.reason || "The selected event is not an occurrence.");
     }
     const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
-    const start = new Date(event.start_time);
-    const end = new Date(event.end_time);
-    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
-      throw new Error("The selected occurrence has invalid dates.");
+    if (await resumePendingOccurrenceAction(event, anchorId)) return;
+    const originalStart = selectedOriginalStart(event);
+    if (!originalStart) {
+      throw new Error(
+        "The selected occurrence has no trusted original position. Refresh and try again.",
+      );
     }
-    start.setUTCDate(start.getUTCDate() - 2);
-    end.setUTCDate(end.getUTCDate() + 2);
-    const view = await api.readCalendarEventSet(
-      anchorId, start.toISOString(), end.toISOString(), 200,
-    );
-    const occurrence = matchingOccurrence(event, view.page.occurrences);
-    const plan = await api.planCalendarAction({
-      selection: occurrence.selection,
-      scope: "this-occurrence",
+    const plan = await api.planCalendarOccurrenceAction(
+      anchorId,
+      originalStart,
+      {
+        title: event.title,
+        description: event.description,
+        location: event.location,
+        start_time: event.start_time,
+        end_time: event.end_time,
+        all_day: event.all_day,
+        timezone: event.timezone,
+      },
       edit,
-      destination_calendar_id: null,
-      reset_exceptions: false,
-    });
+    );
     if (plan.requires.replacement_meeting_identity ||
       plan.requires.reset_exceptions) {
       throw new Error("This occurrence edit requires unsupported confirmation.");

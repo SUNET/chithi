@@ -15,6 +15,9 @@ vi.mock("@/lib/tauri", () => ({
   saveAttachment: vi.fn().mockResolvedValue(undefined),
   listCalendars: vi.fn(),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
 }));
 
 vi.mock("@/lib/compose-window", () => ({

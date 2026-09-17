@@ -92,6 +92,8 @@ pub(crate) struct Operation {
     pub canonical: Option<CalendarEventSet>,
     pub source_after: Option<CalendarEventSet>,
     pub native_move: bool,
+    #[serde(default)]
+    pub auto_resume: bool,
 }
 
 pub(crate) fn initialize(conn: &Connection) -> Result<()> {
@@ -191,7 +193,14 @@ pub(crate) fn event_version(conn: &Connection, event: CalendarEvent) -> Result<E
 }
 
 pub(crate) fn ensure_current(conn: &Connection, snapshot: &Snapshot) -> Result<()> {
-    if calendar_revision(conn, &snapshot.anchor.calendar_id)? != snapshot.calendar_revision {
+    let current_calendar_revision = calendar_revision(conn, &snapshot.anchor.calendar_id)?;
+    if current_calendar_revision != snapshot.calendar_revision {
+        log::warn!(
+            "Calendar action snapshot revision changed: event_id={} calendar_id={} expected_revision={} current_revision={current_calendar_revision}",
+            snapshot.anchor.id,
+            snapshot.anchor.calendar_id,
+            snapshot.calendar_revision
+        );
         return Err(invalid("calendar contents changed; refresh before editing"));
     }
     if invitation_source(conn, &snapshot.anchor.id)? != snapshot.invitation_source {
@@ -338,6 +347,77 @@ fn snapshot_for_set(conn: &Connection, event_id: &str, set: CalendarEventSet) ->
     Ok(snapshot)
 }
 
+/// Reconstruct a clean local projection for a claimed operation whose remote
+/// effect may already have been imported. Planned actions never use this path.
+pub(crate) fn recovery_snapshot(
+    conn: &Connection,
+    operation: &Operation,
+) -> Result<Option<Snapshot>> {
+    if operation.stage == CalendarActionStage::Planned || operation.destination.is_some() {
+        return Ok(None);
+    }
+    let owner = owner_id(conn, &operation.source.anchor.id)?;
+    let Some(set) = owned_set(conn, &owner)? else {
+        log::warn!(
+            "Calendar action recovery projection is absent or dirty: operation_id={} owner_event_id={owner}",
+            operation.id
+        );
+        return Ok(None);
+    };
+    let snapshot = snapshot_for_set(conn, &operation.source.anchor.id, set)?;
+    if snapshot.anchor.account_id != operation.source.anchor.account_id
+        || snapshot.anchor.calendar_id != operation.source.anchor.calendar_id
+        || snapshot.remote_calendar_id != operation.source.remote_calendar_id
+        || snapshot.account_route != operation.source.account_route
+        || snapshot.invitation_source != operation.source.invitation_source
+    {
+        log::warn!(
+            "Calendar action recovery projection changed routing or provenance: operation_id={}",
+            operation.id
+        );
+        return Ok(None);
+    }
+    let current: std::collections::HashSet<_> = snapshot
+        .members
+        .iter()
+        .map(|member| member.event.id.as_str())
+        .collect();
+    let expected: std::collections::HashSet<_> = operation
+        .source
+        .members
+        .iter()
+        .map(|member| member.event.id.as_str())
+        .collect();
+    if current != expected {
+        log::warn!(
+            "Calendar action recovery member set changed: operation_id={} current_members={} expected_members={} current_is_subset={} expected_is_subset={}",
+            operation.id,
+            current.len(),
+            expected.len(),
+            current.is_subset(&expected),
+            expected.is_subset(&current)
+        );
+        return Ok(None);
+    }
+    for event_id in current {
+        let claim: Option<String> = conn
+            .query_row(
+                "SELECT operation_id FROM calendar_action_claims WHERE event_id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if claim.as_deref() != Some(operation.id.as_str()) {
+            log::warn!(
+                "Calendar action recovery member is not exclusively claimed: operation_id={} event_id={event_id}",
+                operation.id
+            );
+            return Ok(None);
+        }
+    }
+    Ok(Some(snapshot))
+}
+
 pub(crate) fn owner_id(conn: &Connection, event_id: &str) -> Result<String> {
     Ok(conn
         .query_row(
@@ -355,6 +435,24 @@ fn owned_set(conn: &Connection, event_id: &str) -> Result<Option<CalendarEventSe
             "SELECT s.data FROM calendar_action_sets s JOIN calendar_event_revisions r ON r.event_id = s.event_id
              WHERE s.event_id = ?1 AND s.dirty = 0 AND s.revision = r.revision",
             [event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    data.map(|data| decode(&data)).transpose()
+}
+
+/// Last complete provider set for display only. A dirty set is not proof for
+/// planning or mutation, but remains more coherent than expanding its master
+/// while dropping all known exceptions.
+pub(crate) fn display_owned_set(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<CalendarEventSet>> {
+    let owner = owner_id(conn, event_id)?;
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data FROM calendar_action_sets WHERE event_id = ?1",
+            [owner],
             |row| row.get(0),
         )
         .optional()?;
@@ -433,10 +531,28 @@ fn address(
     owner: &str,
     retired: bool,
 ) -> Result<()> {
+    address_identity(
+        conn,
+        &event.account_id,
+        &event.calendar_id,
+        remote,
+        owner,
+        retired,
+    )
+}
+
+fn address_identity(
+    conn: &Connection,
+    account_id: &str,
+    calendar_id: &str,
+    remote: &str,
+    owner: &str,
+    retired: bool,
+) -> Result<()> {
     conn.execute("INSERT INTO calendar_action_addresses(account_id, calendar_id, remote_id, owner_event_id, retired)
         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(account_id, calendar_id, remote_id)
         DO UPDATE SET owner_event_id = excluded.owner_event_id, retired = excluded.retired",
-        params![event.account_id, event.calendar_id, remote, owner, retired])?;
+        params![account_id, calendar_id, remote, owner, retired])?;
     Ok(())
 }
 
@@ -477,6 +593,11 @@ pub(crate) fn persist_source(
             event
         }
     };
+    conn.execute(
+        "DELETE FROM calendar_action_members
+         WHERE event_id = ?1 AND owner_event_id = ?1",
+        [&owner.id],
+    )?;
     for member in &members {
         if member.event.id == owner.id {
             continue;
@@ -588,6 +709,24 @@ pub(crate) fn ingest_owned(
     event: &CalendarEvent,
     seeds: &[RecurrenceIdentitySeed],
 ) -> Result<Option<String>> {
+    ingest_owned_identity(
+        conn,
+        &event.account_id,
+        &event.calendar_id,
+        event.remote_id.as_deref(),
+        seeds,
+    )
+}
+
+/// Route a provider identity before provider-specific cache reconciliation can
+/// attach that identity to a second local row.
+pub(crate) fn ingest_owned_identity(
+    conn: &Connection,
+    account_id: &str,
+    calendar_id: &str,
+    remote_id: Option<&str>,
+    seeds: &[RecurrenceIdentitySeed],
+) -> Result<Option<String>> {
     let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'calendar_action_addresses')", [], |row| row.get(0))?;
     if !exists {
         return Ok(None);
@@ -595,14 +734,14 @@ pub(crate) fn ingest_owned(
     let claimed: Option<String> = conn.query_row(
         "SELECT e.id FROM calendar_action_claims claim JOIN calendar_events e ON e.id = claim.event_id
          WHERE e.account_id = ?1 AND e.calendar_id = ?2 AND e.remote_id = ?3",
-        params![event.account_id, event.calendar_id, event.remote_id], |row| row.get(0),
+        params![account_id, calendar_id, remote_id], |row| row.get(0),
     ).optional()?;
     if claimed.is_some() {
         return Ok(claimed);
     }
     let mut remotes = Vec::new();
-    if let Some(remote) = &event.remote_id {
-        remotes.push(remote.as_str());
+    if let Some(remote) = remote_id {
+        remotes.push(remote);
     }
     remotes.extend(
         seeds
@@ -613,17 +752,17 @@ pub(crate) fn ingest_owned(
         let claimed_series: Option<String> = conn.query_row(
             "SELECT operation.event_id FROM calendar_action_operations operation
              WHERE operation.completed = 0 AND operation.account_id = ?1
-               AND json_extract(operation.data, '$.source.anchor.calendar_id') = ?2
-               AND json_extract(operation.data, '$.source.set.native.event_id') = ?3
-               AND EXISTS (SELECT 1 FROM calendar_action_claims claim WHERE claim.operation_id = operation.operation_id)",
-            params![event.account_id, event.calendar_id, remote], |row| row.get(0),
+                AND json_extract(operation.data, '$.source.anchor.calendar_id') = ?2
+                AND json_extract(operation.data, '$.source.set.native.event_id') = ?3
+                AND EXISTS (SELECT 1 FROM calendar_action_claims claim WHERE claim.operation_id = operation.operation_id)",
+            params![account_id, calendar_id, remote], |row| row.get(0),
         ).optional()?;
         if claimed_series.is_some() {
             return Ok(claimed_series);
         }
         let ownership: Option<(String, bool)> = conn.query_row(
             "SELECT owner_event_id, retired FROM calendar_action_addresses WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
-            params![event.account_id, event.calendar_id, remote], |row| Ok((row.get(0)?, row.get(1)?)),
+            params![account_id, calendar_id, remote], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         if let Some((owner, retired)) = ownership {
             if !retired {
@@ -636,8 +775,8 @@ pub(crate) fn ingest_owned(
                     [&owner],
                 )?;
                 conn.execute("DELETE FROM calendar_action_snapshots WHERE event_id = ?1 OR event_id IN (SELECT event_id FROM calendar_action_members WHERE owner_event_id = ?1)", [&owner])?;
-                if let Some(remote) = &event.remote_id {
-                    address(conn, event, remote, &owner, false)?;
+                if let Some(remote) = remote_id {
+                    address_identity(conn, account_id, calendar_id, remote, &owner, false)?;
                 }
             }
             return Ok(Some(owner));
@@ -1054,6 +1193,7 @@ mod tests {
             canonical: None,
             source_after: None,
             native_move: false,
+            auto_resume: false,
         }
     }
 

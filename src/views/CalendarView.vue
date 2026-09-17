@@ -369,22 +369,30 @@ onMounted(() => {
       ? accountsStore.fetchAccounts()
       : Promise.resolve();
 
-  ready
-    .then(() => calendarStore.fetchCalendars())
-    .catch((e) => console.error("fetchCalendars error:", e));
-  ready
-    .then(() => calendarStore.fetchEvents())
-    .catch((e) => console.error("fetchEvents error:", e));
+  const localReady = ready.then(async () => {
+    const [calendars, events] = await Promise.allSettled([
+      calendarStore.fetchCalendars(),
+      calendarStore.fetchEvents(),
+    ]);
+    if (calendars.status === "rejected") {
+      console.error("fetchCalendars error:", calendars.reason);
+    }
+    if (events.status === "rejected") {
+      console.error("fetchEvents error:", events.reason);
+    }
+  });
 
-  // Initial sync + start independent interval (5 min).
+  // Render the SQLite cache before network sync can take provider lifecycle
+  // locks. Sync completion emits calendar-changed and refreshes this view.
+  // Then start the independent interval (5 min).
   // The interval is intentionally NOT cleared on unmount — it keeps
   // calendars fresh in the background for the lifetime of the app,
   // matching how mail sync runs continuously. The calendar store's
   // stopCalendarSync() is available if explicit teardown is needed.
-  ready
+  localReady
     .then(() => calendarStore.syncCalendars())
     .catch((e) => console.error("Calendar sync error:", e));
-  ready
+  localReady
     .then(() => calendarStore.startCalendarSync())
     .catch((e) => console.error("startCalendarSync error:", e));
 });

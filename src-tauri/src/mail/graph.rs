@@ -429,6 +429,55 @@ mod endpoint_tests {
         }
     }
 
+    #[tokio::test]
+    async fn calendar_inventory_follows_every_page_and_requires_consistent_ids() {
+        let (root, captured) = serve_many(|root| {
+            vec![
+                format!(
+                    r#"{{"value":[{{"id":"primary","name":"Calendar","color":"auto","isDefaultCalendar":true}}],"@odata.nextLink":"{root}/me/calendars?$skiptoken=next"}}"#
+                ),
+                r#"{"value":[
+                    {"id":"primary","name":"Calendar","color":"auto","isDefaultCalendar":true},
+                    {"id":"shared","name":"Shared","color":"lightBlue","isDefaultCalendar":false}
+                ]}"#
+                    .into(),
+            ]
+        })
+        .await;
+
+        let calendars = test_client(&root).list_calendars().await.unwrap();
+
+        assert_eq!(calendars.len(), 2);
+        assert_eq!(calendars[0].id, "primary");
+        assert_eq!(calendars[1].id, "shared");
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("prefer: idtype=\"immutableid\"\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_inventory_rejects_conflicting_duplicate_ids() {
+        let (root, captured) = serve_many(|root| {
+            vec![
+                format!(
+                    r#"{{"value":[{{"id":"same","name":"First","color":"auto","isDefaultCalendar":false}}],"@odata.nextLink":"{root}/page-2"}}"#
+                ),
+                r#"{"value":[{"id":"same","name":"Second","color":"auto","isDefaultCalendar":false}]}"#
+                    .into(),
+            ]
+        })
+        .await;
+
+        let error = test_client(&root).list_calendars().await.unwrap_err();
+
+        assert!(error.to_string().contains("conflicting duplicate ID"));
+        assert_eq!(captured.await.unwrap().len(), 2);
+    }
+
     fn canonical_occurrence() -> serde_json::Value {
         serde_json::json!({
             "id": "immutable-occurrence",
@@ -2167,24 +2216,91 @@ impl GraphClient {
     // Calendar
     // -----------------------------------------------------------------------
 
-    /// List all calendars for the signed-in user.
+    /// List every calendar for the signed-in user.
+    ///
+    /// Calendar sync treats this as an authoritative inventory, so partial or
+    /// ambiguous responses must fail rather than making absent calendars look
+    /// deleted.
     pub async fn list_calendars(&self) -> Result<Vec<GraphCalendar>> {
-        let resp = self
+        let mut page = self
             .get(
                 "/me/calendars",
                 &[("$select", "id,name,color,isDefaultCalendar")],
             )
             .await?;
-        let items = resp["value"].as_array().cloned().unwrap_or_default();
-        Ok(items
-            .iter()
-            .map(|c| GraphCalendar {
-                id: c["id"].as_str().unwrap_or("").to_string(),
-                name: c["name"].as_str().unwrap_or("Calendar").to_string(),
-                color: graph_color_to_hex(c["color"].as_str().unwrap_or("")),
-                is_default: c["isDefaultCalendar"].as_bool().unwrap_or(false),
-            })
-            .collect())
+        let mut calendars = Vec::new();
+        let mut positions = std::collections::HashMap::new();
+        let mut continuations = std::collections::HashSet::new();
+
+        loop {
+            let values = page
+                .get("value")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Sync("Graph calendars response `value` must be an array".into())
+                })?;
+            for value in values {
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| Error::Sync("Graph calendar has no non-empty ID".into()))?;
+                let name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Calendar");
+                let is_default = value
+                    .get("isDefaultCalendar")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let calendar = GraphCalendar {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    color: graph_color_to_hex(
+                        value
+                            .get("color")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                    ),
+                    is_default,
+                };
+                if let Some(position) = positions.get(id).copied() {
+                    if calendars.get(position) != Some(&calendar) {
+                        return Err(Error::Sync(format!(
+                            "Graph calendars response contains conflicting duplicate ID {id:?}"
+                        )));
+                    }
+                } else {
+                    positions.insert(calendar.id.clone(), calendars.len());
+                    calendars.push(calendar);
+                }
+            }
+
+            match page.get("@odata.nextLink") {
+                None | Some(serde_json::Value::Null) => break,
+                Some(serde_json::Value::String(next)) if !next.trim().is_empty() => {
+                    if !continuations.insert(next.clone()) {
+                        return Err(Error::Sync(
+                            "Graph calendars response repeats a continuation URL".into(),
+                        ));
+                    }
+                    page = self.get_absolute(next).await?;
+                }
+                Some(serde_json::Value::String(_)) => {
+                    return Err(Error::Sync(
+                        "Graph calendars response `@odata.nextLink` must not be empty".into(),
+                    ));
+                }
+                Some(_) => {
+                    return Err(Error::Sync(
+                        "Graph calendars response `@odata.nextLink` must be a string or null"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(calendars)
     }
 
     /// List meeting rooms for O365 event creation via the beta room-list API.
@@ -3073,7 +3189,7 @@ pub struct GraphDraftMessage {
     pub body_text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphCalendar {
     pub id: String,
     pub name: String,

@@ -6,6 +6,9 @@ vi.mock("@/lib/tauri", () => ({
   listCalendars: vi.fn().mockResolvedValue([]),
   listRoomSuggestions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
@@ -43,7 +46,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
-import { isOccurrenceId, masterEventId } from "@/lib/rrule";
+import { isOccurrenceId, masterEventId, occurrenceId } from "@/lib/rrule";
 import type { CalendarEvent } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
@@ -303,6 +306,82 @@ describe("Calendar store", () => {
           store.visibleEvents.find((e) => e.id === occ.id),
         ).toBeDefined();
       }
+    });
+
+    it("renders a cached moved occurrence while hydration is needed", async () => {
+      const store = setupRecurring();
+      const master = store.events[0];
+      const original = "2026-08-25T09:00:00.000Z";
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [{
+          selection: {
+            event_id: master.id,
+            token: "snapshot",
+            original_start: original,
+          },
+          event_id: master.id,
+          account_id: master.account_id,
+          calendar_id: master.calendar_id,
+          fields: {
+            title: master.title,
+            description: master.description,
+            location: master.location,
+            start_time: "2026-08-25T11:00:00Z",
+            end_time: "2026-08-25T12:00:00Z",
+            all_day: master.all_day,
+            timezone: master.timezone,
+          },
+          recurrence_kind: "series",
+          recurrence_rule: master.recurrence_rule,
+          is_exception: true,
+        }],
+        has_more: false,
+        needs_hydration: [master.id],
+      });
+
+      await store.fetchEvents();
+
+      expect(store.events).toEqual([master]);
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.visibleEvents[0]).toMatchObject({
+        id: occurrenceId(master.id, new Date(original)),
+        start_time: "2026-08-25T11:00:00Z",
+        end_time: "2026-08-25T12:00:00Z",
+        recurrence_kind: "occurrence",
+      });
+    });
+
+    it("uses local expansion only for series needing hydration", async () => {
+      const store = setupRecurring();
+      const master = store.events[0];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [],
+        has_more: false,
+        needs_hydration: [master.id],
+      });
+
+      await store.fetchEvents();
+
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.visibleEvents[0].start_time)
+        .toBe("2026-08-25T09:00:00.000Z");
+    });
+
+    it("keeps the previous display when projection exceeds its bound", async () => {
+      const store = setupRecurring();
+      const previous = [...store.events];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [],
+        has_more: true,
+        needs_hydration: [],
+      });
+
+      await expect(store.fetchEvents()).rejects.toThrow("display limit");
+
+      expect(store.events).toEqual(previous);
     });
 
     it("rejects master and occurrence deletion without clearing selection", async () => {

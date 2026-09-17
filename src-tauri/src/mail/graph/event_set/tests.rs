@@ -2,6 +2,45 @@ use super::*;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+async fn accept_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = socket.read(&mut chunk).await.unwrap();
+        assert!(n > 0);
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    (socket, String::from_utf8(bytes).unwrap())
+}
+
+async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+
 async fn server(
     build: impl FnOnce(&str) -> Vec<(u16, Value)>,
 ) -> (GraphClient, tokio::task::JoinHandle<Vec<String>>) {
@@ -29,33 +68,10 @@ pub(crate) async fn serve_json(
         let mut requests = Vec::new();
         let mut posted: Option<Value> = None;
         for (status, body) in responses {
-            let (mut socket, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            let (mut socket, request) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), accept_request(&listener))
                     .await
-                    .unwrap()
                     .unwrap();
-            let mut bytes = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&chunk[..n]);
-                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (key, value) = line.split_once(':')?;
-                            key.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= end + 4 + length {
-                        break;
-                    }
-                }
-            }
-            let request = String::from_utf8(bytes).unwrap();
             if request.starts_with("POST ") {
                 posted = Some(self::body(&request));
             }
@@ -79,7 +95,7 @@ pub(crate) async fn serve_json(
             } else {
                 body.to_string().replace("ROOT", &root)
             };
-            socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            respond(&mut socket, status, &body).await;
         }
         requests
     });
@@ -124,6 +140,22 @@ fn snapshot(value: &Value) -> CalendarEventSet {
 
 fn body(request: &str) -> Value {
     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+fn request_event_id(request: &str) -> &str {
+    request
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
 }
 
 fn headers(requests: &[String]) {
@@ -213,6 +245,108 @@ async fn resolves_instance_to_master_and_reads_all_exception_pages_outside_view(
         "2028-09-16T09:00:00Z"
     );
     headers(&captured.await.unwrap());
+}
+
+#[tokio::test]
+async fn exception_details_use_four_bounded_concurrent_reads() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/graph", listener.local_addr().unwrap());
+    let client = GraphClient::with_client(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        "secret-test-token",
+        super::super::GraphEndpoints::new(&root, &root),
+    );
+    let mut source = master();
+    source["recurrence"]["range"]["numberOfOccurrences"] = json!(7);
+    source["exceptionOccurrences"] = json!([
+        {"id": "exception-0"},
+        {"id": "exception-1"},
+        {"id": "exception-2"},
+        {"id": "exception-3"},
+        {"id": "exception-4"}
+    ]);
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, request) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), accept_request(&listener))
+                    .await
+                    .unwrap();
+            requests.push(request);
+            respond(&mut socket, 200, &source.to_string()).await;
+        }
+
+        let mut first_wave = Vec::new();
+        for _ in 0..EXCEPTION_READ_CONCURRENCY {
+            first_wave.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), accept_request(&listener))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                accept_request(&listener),
+            )
+            .await
+            .is_err(),
+            "more than four exception reads were in flight"
+        );
+        for (mut socket, request) in first_wave {
+            let id = request_event_id(&request);
+            let index = id
+                .strip_prefix("exception-")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let value = exception(id, &format!("2026-09-{:02}T09:00:00Z", index + 15));
+            requests.push(request);
+            respond(&mut socket, 200, &value.to_string()).await;
+        }
+
+        let (mut socket, request) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), accept_request(&listener))
+                .await
+                .unwrap();
+        let id = request_event_id(&request);
+        let value = exception(id, "2026-09-19T09:00:00Z");
+        requests.push(request);
+        respond(&mut socket, 200, &value.to_string()).await;
+
+        let (mut socket, request) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), accept_request(&listener))
+                .await
+                .unwrap();
+        requests.push(request);
+        respond(&mut socket, 200, &source.to_string()).await;
+        requests
+    });
+
+    let set = client
+        .fetch_calendar_event_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap();
+
+    assert_eq!(set.overrides.len(), 5);
+    assert_eq!(
+        set.overrides
+            .iter()
+            .filter_map(|item| item.native.as_ref().map(|native| native.event_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            "exception-0",
+            "exception-1",
+            "exception-2",
+            "exception-3",
+            "exception-4"
+        ]
+    );
+    headers(&task.await.unwrap());
 }
 
 #[tokio::test]

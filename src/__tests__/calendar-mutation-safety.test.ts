@@ -9,6 +9,9 @@ vi.mock("@/lib/tauri", () => ({
   moveEventToCalendar: vi.fn().mockResolvedValue("moved-event"),
   createEvent: vi.fn().mockResolvedValue("created-event"),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
   getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
   listAccounts: vi.fn().mockResolvedValue([]),
@@ -987,6 +990,11 @@ describe("real responsive calendar selection", () => {
   it.each([500, 1280])("keeps first/later occurrence IDs and local times at width %s", async (width) => {
     const master = event({ recurrence_kind: "series", recurrence_rule: "FREQ=DAILY;COUNT=3" });
     const store = setup(master);
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
+      occurrences: [],
+      has_more: false,
+      needs_hydration: [master.id],
+    });
     store.selectEvent(null);
     usePlatformStore().width = width;
     const wrapper = calendarView();

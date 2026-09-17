@@ -147,6 +147,7 @@ pub fn run() {
             commands::calendar_actions::list_calendar_occurrences,
             commands::calendar_actions::read_calendar_event_set,
             commands::calendar_actions::plan_calendar_action,
+            commands::calendar_actions::plan_calendar_occurrence_action,
             commands::calendar_actions::execute_calendar_action,
             commands::calendar_actions::get_calendar_action,
             commands::calendar_actions::list_pending_calendar_actions,

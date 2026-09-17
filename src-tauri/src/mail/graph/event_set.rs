@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{
     DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
 };
+use futures::{stream, StreamExt, TryStreamExt};
 use reqwest::Method;
 use serde_json::{json, Value};
 
@@ -23,6 +24,9 @@ const RECUR_PROPERTY: &str = "Binary {00062002-0000-0000-C000-000000000046} Id 0
 const OP_PROPERTY: &str =
     "String {77f84316-463d-49ec-ae0c-247e05f13645} Name ChithiCalendarOperation";
 const EXTRA_SELECT: &str = "originalStartTimeZone,originalEndTimeZone,occurrenceId,transactionId,categories,importance,sensitivity,showAs,isReminderOn,reminderMinutesBeforeStart,responseRequested,hideAttendees,locations,isOnlineMeeting,onlineMeeting";
+/// Outlook permits four concurrent requests per app and mailbox. Keeping the
+/// bound here also lets each request retain the client's normal retry policy.
+const EXCEPTION_READ_CONCURRENCY: usize = 4;
 
 fn invalid(message: impl std::fmt::Display) -> Error {
     Error::Sync(format!(
@@ -549,19 +553,28 @@ impl GraphClient {
                 .ok_or_else(|| invalid("missing authoritative exceptionOccurrences"))?;
             let page = json!({"value": exceptions, "@odata.nextLink": master.get("exceptionOccurrences@odata.nextLink").cloned().unwrap_or(Value::Null)});
             let scope = format!("{}/exceptionOccurrences", event_path(calendar, master_id)?);
-            for reference in self.set_pages(page, &scope).await? {
-                let value = self
-                    .set_get(calendar, required_string(&reference, "id")?, false)
-                    .await?;
+            let ids = self
+                .set_pages(page, &scope)
+                .await?
+                .into_iter()
+                .map(|reference| Ok(required_string(&reference, "id")?.to_owned()))
+                .collect::<Result<Vec<_>>>()?;
+            let series = &result.event;
+            let overrides = stream::iter(ids.into_iter().map(|id| async move {
+                let value = self.set_get(calendar, &id, false).await?;
                 if value["type"] != "exception" || value["seriesMasterId"] != master_id {
                     return Err(invalid("exception belongs to a different master"));
                 }
-                result.overrides.push(CalendarOverride {
-                    original_start: original(&result.event, &value)?,
+                Ok(CalendarOverride {
+                    original_start: original(series, &value)?,
                     event: Some(canonical(&value, template, calendar)?),
                     native: Some(native(&value, calendar)?),
-                });
-            }
+                })
+            }))
+            .buffered(EXCEPTION_READ_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+            result.overrides.extend(overrides);
             let cancelled = master["cancelledOccurrences"]
                 .as_array()
                 .ok_or_else(|| invalid("missing authoritative cancelledOccurrences"))?;

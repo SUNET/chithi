@@ -12,7 +12,7 @@ use crate::db::calendar::NewCalendar;
 use crate::error::{Error, Result};
 use crate::mail::graph::{
     event_patch_to_graph_json, event_to_graph_json, invitation_copy_patch_to_graph_json,
-    GraphCalendarItem,
+    GraphCalendar, GraphCalendarItem,
 };
 use crate::provider::GraphTokenPurpose;
 
@@ -349,6 +349,7 @@ impl CalendarBackend for GraphCalendarBackend {
         let end =
             (now + chrono::Duration::days(90)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut failures = Vec::new();
+        let mut complete_views = Vec::new();
 
         for gc in &graph_calendars {
             let Some((local_cal_id, subscribed)) = remote_to_local.get(&gc.id) else {
@@ -380,17 +381,30 @@ impl CalendarBackend for GraphCalendarBackend {
                 calendar_events.len(),
                 gc.name
             );
+            let observed_remote_ids = calendar_events
+                .iter()
+                .map(|item| match item {
+                    GraphCalendarItem::Live(event) => event.id.clone(),
+                    GraphCalendarItem::Cancelled(tombstone) => tombstone.remote_id().to_owned(),
+                })
+                .collect();
 
             let mut conn = db.writer().await;
-            if let Err(error) =
-                reconcile_calendar_events(&mut conn, account_id, local_cal_id, calendar_events)
-            {
+            if let Err(error) = reconcile_calendar_events(
+                &mut conn,
+                account_id,
+                local_cal_id,
+                &gc.id,
+                calendar_events,
+            ) {
                 log::error!(
                     "sync_calendars_graph: reconciliation for '{}' failed: {}",
                     gc.name,
                     error
                 );
                 failures.push(format!("{}: {error}", gc.name));
+            } else {
+                complete_views.push((local_cal_id.clone(), observed_remote_ids));
             }
         }
         if !failures.is_empty() {
@@ -399,6 +413,50 @@ impl CalendarBackend for GraphCalendarBackend {
                 failures.len(),
                 failures.join("; ")
             )));
+        }
+
+        {
+            let mut conn = db.writer().await;
+            let transaction = conn.transaction()?;
+            for (local_calendar_id, observed_remote_ids) in &complete_views {
+                retire_absent_graph_view_rows(
+                    &transaction,
+                    account_id,
+                    local_calendar_id,
+                    &start,
+                    &end,
+                    observed_remote_ids,
+                )?;
+            }
+            transaction.commit()?;
+        }
+
+        let authoritative_calendars = graph_calendars
+            .iter()
+            .map(|calendar| {
+                remote_to_local
+                    .get(&calendar.id)
+                    .map(|(local_id, _)| (calendar, local_id.as_str()))
+                    .ok_or_else(|| {
+                        Error::Sync(format!(
+                            "Graph calendar {:?} has no local mapping",
+                            calendar.id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let retired = {
+            let mut conn = db.writer().await;
+            retire_stale_graph_calendars(&mut conn, account_id, &authoritative_calendars)?
+        };
+        for (name, remote_id, migrated_events, deleted_events) in retired {
+            log::info!(
+                "sync_calendars_graph: retired stale calendar '{}' ({}) after migrating {} local events and deleting {} cached events",
+                name,
+                remote_id,
+                migrated_events,
+                deleted_events
+            );
         }
 
         log::info!("sync_calendars_graph: completed for account {}", account_id);
@@ -605,6 +663,7 @@ fn reconcile_calendar_events(
     conn: &mut rusqlite::Connection,
     account_id: &str,
     local_calendar_id: &str,
+    provider_calendar_id: &str,
     items: Vec<GraphCalendarItem>,
 ) -> Result<()> {
     let mut live = Vec::new();
@@ -618,6 +677,17 @@ fn reconcile_calendar_events(
 
     let transaction = conn.transaction()?;
     for tombstone in cancelled {
+        reconcile_graph_event_identity(
+            &transaction,
+            account_id,
+            local_calendar_id,
+            provider_calendar_id,
+            tombstone.remote_id(),
+            None,
+            None,
+            None,
+            None,
+        )?;
         db::calendar_event_deletion::delete_calendar_events_by_remote_id(
             &transaction,
             account_id,
@@ -626,6 +696,38 @@ fn reconcile_calendar_events(
         )?;
     }
     for ge in live {
+        let recurrence_seeds = ge.recurrence_seeds.as_deref().unwrap_or(&[]);
+        if let Some(owner_id) = db::calendar_actions::ingest_owned_identity(
+            &transaction,
+            account_id,
+            local_calendar_id,
+            Some(&ge.id),
+            recurrence_seeds,
+        )? {
+            retire_action_owned_graph_cache_rows(
+                &transaction,
+                account_id,
+                local_calendar_id,
+                &owner_id,
+                &ge.id,
+                ge.ical_uid.as_deref(),
+                Some(&ge.start),
+                Some(&ge.end),
+                Some(ge.recurrence_kind),
+            )?;
+            continue;
+        }
+        reconcile_graph_event_identity(
+            &transaction,
+            account_id,
+            local_calendar_id,
+            provider_calendar_id,
+            &ge.id,
+            ge.ical_uid.as_deref(),
+            Some(&ge.start),
+            Some(&ge.end),
+            Some(ge.recurrence_kind),
+        )?;
         let recurrence_rule = if ge
             .recurrence_seeds
             .as_ref()
@@ -681,9 +783,384 @@ fn reconcile_calendar_events(
         }
     }
 
-    // calendarView is bounded. Absence never proves deletion, including for rows
-    // outside the window; only explicit isCancelled tombstones are reconciled.
     transaction.commit()?;
+    Ok(())
+}
+
+/// A complete calendarView is authoritative only for concrete instances whose
+/// persisted intervals overlap its bounds. Series masters, unknown legacy
+/// classifications, local-only rows, and events outside the view are retained.
+fn retire_absent_graph_view_rows(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    local_calendar_id: &str,
+    view_start: &str,
+    view_end: &str,
+    observed_remote_ids: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let candidates = {
+        let mut statement = conn.prepare(
+            "SELECT id, remote_id FROM calendar_events
+             WHERE account_id = ?1 AND calendar_id = ?2
+               AND remote_id IS NOT NULL AND trim(remote_id) != ''
+               AND recurrence_kind IN ('standalone', 'occurrence')
+               AND julianday(start_time) < julianday(?4)
+               AND julianday(end_time) > julianday(?3)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![account_id, local_calendar_id, view_start, view_end],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (event_id, remote_id) in candidates {
+        if observed_remote_ids.contains(&remote_id) {
+            continue;
+        }
+        ensure_disposable_graph_duplicate(conn, &event_id)?;
+        db::calendar_event_deletion::delete_event(conn, &event_id)?;
+        log::info!(
+            "Graph sync retired event {} absent from complete bounded view",
+            event_id
+        );
+    }
+    Ok(())
+}
+
+/// Retire provider-backed calendar caches absent from Graph's complete
+/// inventory. Unpushed local events are moved only when name and default status
+/// identify exactly one current destination; provider identities are never
+/// inferred from display metadata.
+fn retire_stale_graph_calendars<'a>(
+    conn: &mut rusqlite::Connection,
+    account_id: &str,
+    authoritative_calendars: &[(&'a GraphCalendar, &'a str)],
+) -> Result<Vec<(String, String, usize, usize)>> {
+    let authoritative_ids = authoritative_calendars
+        .iter()
+        .map(|(calendar, _)| calendar.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let stale = {
+        let mut statement = conn.prepare(
+            "SELECT id, name, is_default, remote_id FROM calendars
+             WHERE account_id = ?1 AND remote_id IS NOT NULL AND remote_id != ''
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, _, _, remote_id)| !authoritative_ids.contains(remote_id.as_str()))
+            .collect::<Vec<_>>();
+        rows
+    };
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let transaction = conn.transaction()?;
+    let mut retired = Vec::with_capacity(stale.len());
+    for (calendar_id, name, is_default, remote_id) in stale {
+        let owns_calendar_action_state: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM calendar_action_addresses
+                 WHERE account_id = ?1 AND calendar_id = ?2
+             )",
+            rusqlite::params![account_id, calendar_id],
+            |row| row.get(0),
+        )?;
+        if owns_calendar_action_state {
+            return Err(Error::Sync(format!(
+                "Stale Graph calendar {calendar_id:?} has calendar action state and cannot be retired automatically"
+            )));
+        }
+
+        let unpushed_event_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM calendar_events
+                 WHERE account_id = ?1 AND calendar_id = ?2
+                   AND (remote_id IS NULL OR trim(remote_id) = '')
+                 ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map(rusqlite::params![account_id, calendar_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let migrated_events = unpushed_event_ids.len();
+        if !unpushed_event_ids.is_empty() {
+            let destinations = authoritative_calendars
+                .iter()
+                .filter(|(calendar, _)| {
+                    calendar.name.as_str() == name.as_str() && calendar.is_default == is_default
+                })
+                .map(|(_, local_id)| *local_id)
+                .collect::<Vec<_>>();
+            let [destination_calendar_id] = destinations.as_slice() else {
+                return Err(Error::Sync(format!(
+                    "Stale Graph calendar {calendar_id:?} has {} local events but {} exact current calendar matches",
+                    unpushed_event_ids.len(),
+                    destinations.len()
+                )));
+            };
+            for event_id in &unpushed_event_ids {
+                ensure_graph_event_can_move(&transaction, event_id)?;
+                let updated = transaction.execute(
+                    "UPDATE calendar_events SET calendar_id = ?1
+                     WHERE id = ?2 AND account_id = ?3 AND calendar_id = ?4",
+                    rusqlite::params![destination_calendar_id, event_id, account_id, calendar_id],
+                )?;
+                if updated != 1 {
+                    return Err(Error::Sync(format!(
+                        "Local event {event_id:?} changed during stale Graph calendar migration"
+                    )));
+                }
+            }
+        }
+
+        let event_ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM calendar_events WHERE calendar_id = ?1 ORDER BY id")?;
+            let rows = statement
+                .query_map([&calendar_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for event_id in &event_ids {
+            ensure_disposable_graph_duplicate(&transaction, event_id)?;
+        }
+        let deleted =
+            db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
+        db::calendar::delete_calendar_row(&transaction, &calendar_id)?;
+        retired.push((name, remote_id, migrated_events, deleted.deleted));
+    }
+    transaction.commit()?;
+    Ok(retired)
+}
+
+/// Older Chithi versions assigned account-wide calendarView results to the
+/// default calendar and persisted a different Graph ID format. Prefer the
+/// current immutable ID, then use Graph's cross-calendar iCalUId together with
+/// the exact occurrence interval and kind to identify that historical row.
+/// Existing duplicates are retired only when they have no local ownership
+/// state that would be unsafe to discard.
+fn reconcile_graph_event_identity(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    local_calendar_id: &str,
+    provider_calendar_id: &str,
+    remote_id: &str,
+    ical_uid: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    recurrence_kind: Option<RecurrenceKind>,
+) -> Result<()> {
+    let rows = graph_event_identity_rows(
+        conn,
+        account_id,
+        local_calendar_id,
+        remote_id,
+        ical_uid,
+        start,
+        end,
+        recurrence_kind,
+    )?;
+    let Some((survivor_id, survivor_calendar_id, survivor_remote_id)) = rows.first() else {
+        return Ok(());
+    };
+
+    for (duplicate_id, _, _) in rows.iter().skip(1) {
+        ensure_disposable_graph_duplicate(conn, duplicate_id)?;
+        db::calendar_event_deletion::delete_event(conn, duplicate_id)?;
+        log::info!(
+            "Graph sync reconciled stale duplicate {} for immutable event {}",
+            duplicate_id,
+            remote_id
+        );
+    }
+
+    if survivor_calendar_id != local_calendar_id || survivor_remote_id != remote_id {
+        ensure_graph_event_can_move(conn, survivor_id)?;
+        conn.execute(
+            "UPDATE calendar_events SET calendar_id = ?1, remote_id = ?2 WHERE id = ?3",
+            rusqlite::params![local_calendar_id, remote_id, survivor_id],
+        )?;
+        conn.execute(
+            "UPDATE calendar_recurrence_objects
+             SET provider_calendar_id = ?1,
+                 provider_occurrence_id = CASE
+                     WHEN provider_occurrence_id = ?2 THEN ?3
+                     ELSE provider_occurrence_id
+                 END,
+                 provider_series_id = CASE
+                     WHEN provider_series_id = ?2 THEN ?3
+                     ELSE provider_series_id
+                 END
+             WHERE event_id = ?4",
+            rusqlite::params![
+                provider_calendar_id,
+                survivor_remote_id,
+                remote_id,
+                survivor_id
+            ],
+        )?;
+        log::info!(
+            "Graph sync reconciled event {} to its authoritative ID and calendar",
+            remote_id
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_event_identity_rows(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    local_calendar_id: &str,
+    remote_id: &str,
+    ical_uid: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    recurrence_kind: Option<RecurrenceKind>,
+) -> Result<Vec<(String, String, String)>> {
+    let ical_uid = ical_uid.filter(|uid| !uid.is_empty());
+    let mut stmt = conn.prepare(
+        "SELECT id, calendar_id, remote_id FROM calendar_events
+         WHERE account_id = ?1 AND (
+             remote_id = ?2 OR (
+                 ?4 IS NOT NULL AND uid = ?4 AND start_time = ?5 AND end_time = ?6
+                 AND recurrence_kind = ?7
+                 AND remote_id IS NOT NULL AND remote_id != ''
+             )
+         )
+         ORDER BY CASE WHEN remote_id = ?2 THEN 0 ELSE 1 END,
+                  CASE WHEN calendar_id = ?3 THEN 0 ELSE 1 END,
+                  updated_at DESC, id",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![
+                account_id,
+                remote_id,
+                local_calendar_id,
+                ical_uid,
+                start,
+                end,
+                recurrence_kind.map(RecurrenceKind::as_str),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retire_action_owned_graph_cache_rows(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    local_calendar_id: &str,
+    owner_id: &str,
+    remote_id: &str,
+    ical_uid: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    recurrence_kind: Option<RecurrenceKind>,
+) -> Result<()> {
+    let rows = graph_event_identity_rows(
+        conn,
+        account_id,
+        local_calendar_id,
+        remote_id,
+        ical_uid,
+        start,
+        end,
+        recurrence_kind,
+    )?;
+    for (event_id, _, _) in rows {
+        if db::calendar_actions::owner_id(conn, &event_id)? == owner_id {
+            continue;
+        }
+        ensure_disposable_graph_duplicate(conn, &event_id)?;
+        db::calendar_event_deletion::delete_event(conn, &event_id)?;
+        log::info!(
+            "Graph sync retired action-owned cache duplicate {} for event {}",
+            event_id,
+            remote_id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_graph_event_can_move(conn: &rusqlite::Connection, event_id: &str) -> Result<()> {
+    let owns_action_state: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM calendar_action_sets WHERE event_id = ?1
+             UNION ALL SELECT 1 FROM calendar_action_members
+                 WHERE event_id = ?1 OR owner_event_id = ?1
+             UNION ALL SELECT 1 FROM calendar_action_addresses WHERE owner_event_id = ?1
+             UNION ALL SELECT 1 FROM calendar_action_claims WHERE event_id = ?1
+             UNION ALL SELECT 1 FROM calendar_action_operations
+                 WHERE event_id = ?1 AND completed = 0
+             UNION ALL SELECT 1 FROM calendar_action_creations
+                 WHERE event_id = ?1 AND completed = 0
+         )",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    if owns_action_state {
+        return Err(Error::Sync(format!(
+            "Graph event {event_id:?} changed calendars while calendar action state owns it"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_disposable_graph_duplicate(conn: &rusqlite::Connection, event_id: &str) -> Result<()> {
+    ensure_graph_event_can_move(conn, event_id)?;
+    let owns_local_state: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM calendar_invitation_sources WHERE event_id = ?1
+             UNION ALL SELECT 1 FROM meet_meetings WHERE event_id = ?1
+             UNION ALL SELECT 1 FROM calendar_action_operations
+                 WHERE event_id = ?1 AND completed = 0
+             UNION ALL SELECT 1 FROM calendar_action_creations
+                 WHERE event_id = ?1 AND completed = 0
+             UNION ALL SELECT 1 FROM calendar_events
+                  WHERE id = ?1 AND (
+                      remote_id IS NULL
+                      OR trim(remote_id) = ''
+                      OR pending_rsvp_status IS NOT NULL
+                      OR manually_managed_at IS NOT NULL
+                      OR source_message_id IS NOT NULL
+                      OR ical_data IS NOT NULL
+                 )
+         )",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    if owns_local_state {
+        return Err(Error::Sync(format!(
+            "Graph event {event_id:?} has local state and cannot be retired automatically"
+        )));
+    }
     Ok(())
 }
 
@@ -1123,6 +1600,75 @@ mod recurrence_sync_tests {
         .unwrap()
     }
 
+    fn cache_action_owned_occurrence(conn: &rusqlite::Connection, protected: bool) {
+        cache_event(conn, "series-owner", Some("immutable-master"));
+        cache_event(conn, "projected-member", None);
+        cache_event(conn, "stale-provider-cache", Some("legacy-occurrence"));
+        conn.execute(
+            "UPDATE calendar_events
+             SET uid = 'uid-immutable-occurrence@example.test',
+                 recurrence_kind = 'occurrence'
+             WHERE id IN ('projected-member', 'stale-provider-cache')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calendar_events
+             SET uid = 'series@example.test', recurrence_kind = 'series',
+                 recurrence_rule = 'FREQ=DAILY'
+             WHERE id = 'series-owner'",
+            [],
+        )
+        .unwrap();
+        let revision = db::calendar_revision::get(conn, "series-owner").unwrap();
+        conn.execute(
+            "INSERT INTO calendar_action_sets(event_id, data, revision, dirty)
+             VALUES ('series-owner', '{}', ?1, 0)",
+            [revision],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_action_members
+                 (event_id, owner_event_id, original_start)
+             VALUES (
+                 'projected-member', 'series-owner',
+                 '2026-09-14T09:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_action_addresses
+                 (account_id, calendar_id, remote_id, owner_event_id, retired)
+             VALUES (
+                 'acc1', 'cal1', 'immutable-occurrence', 'series-owner', 0
+             )",
+            [],
+        )
+        .unwrap();
+        if protected {
+            conn.execute(
+                "INSERT INTO meet_meetings
+                     (event_id, account_id, protocol, meeting_id, join_url)
+                 VALUES (
+                     'stale-provider-cache', 'acc1', 'zoom', 'protected',
+                     'https://example.test/join'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    fn occurrence_metadata() -> serde_json::Value {
+        json!({
+            "type": "occurrence",
+            "seriesMasterId": "immutable-master",
+            "originalStart": "2026-09-14T09:00:00Z",
+            "recurrence": null
+        })
+    }
+
     #[tokio::test]
     async fn complete_paginated_batch_reconciles_cancellations_and_live_events_together() {
         for (status, last_page, succeeds) in [
@@ -1356,6 +1902,343 @@ mod recurrence_sync_tests {
         let conn = db.reader();
         assert!(db::calendar::get_event(&conn, "cancelled").is_err());
         assert_eq!(pending_cleanup_count(&conn), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_inventory_retires_legacy_calendar_and_its_series_master() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, remote_id, is_subscribed)
+                 VALUES ('legacy-calendar', 'acc1', 'Calendar', 'legacy-id', 1),
+                        ('local-calendar', 'acc1', 'Local only', NULL, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events
+                    (id, account_id, calendar_id, uid, title, start_time, end_time,
+                     recurrence_rule, recurrence_kind, remote_id)
+                 VALUES (
+                    'legacy-series', 'acc1', 'legacy-calendar', 'series@example.test',
+                    'Lunch', '2026-09-14T12:00:00Z', '2026-09-14T13:00:00Z',
+                    'FREQ=DAILY', 'series', 'legacy-series-id'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let calendars = json!({
+            "value": [
+                {"id": "primary", "name": "Calendar", "isDefaultCalendar": true},
+                {"id": "second-live", "name": "Calendar", "isDefaultCalendar": false}
+            ]
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendars),
+            (200, json!({"value": []})),
+            (200, json!({"value": []})),
+        ])
+        .await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 3);
+        let conn = db.reader();
+        let calendars: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT name, remote_id FROM calendars WHERE account_id = 'acc1'
+                 ORDER BY remote_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            calendars,
+            vec![
+                ("Local only".into(), None),
+                ("Calendar".into(), Some("primary".into())),
+                ("Calendar".into(), Some("second-live".into())),
+            ]
+        );
+        assert!(db::calendar::get_event(&conn, "legacy-series").is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_refresh_never_retires_absent_calendars() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, remote_id, is_subscribed)
+                 VALUES ('legacy-calendar', 'acc1', 'Legacy', 'legacy-id', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let (root, captured) = serve_responses(vec![
+            (200, primary_calendar()),
+            (500, json!({"error": "injected failure"})),
+        ])
+        .await;
+
+        let result = GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(captured.await.unwrap().len(), 2);
+        assert!(db::calendar::get_calendar(&db.reader(), "legacy-calendar").is_ok());
+    }
+
+    #[tokio::test]
+    async fn protected_stale_calendar_fails_closed_without_partial_cleanup() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, remote_id, is_subscribed)
+                 VALUES
+                    ('a-disposable-calendar', 'acc1', 'Disposable', 'old-a', 1),
+                    ('z-protected-calendar', 'acc1', 'Protected', 'old-z', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events
+                    (id, account_id, calendar_id, title, start_time, end_time, remote_id)
+                 VALUES
+                    ('disposable', 'acc1', 'a-disposable-calendar', 'Disposable',
+                     '2026-09-14T08:00:00Z', '2026-09-14T09:00:00Z', 'old-a-event'),
+                    ('protected', 'acc1', 'z-protected-calendar', 'Protected',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z', 'old-z-event')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meet_meetings
+                    (event_id, account_id, protocol, meeting_id, join_url)
+                 VALUES (
+                    'protected', 'acc1', 'zoom', 'meeting',
+                    'https://example.test/join'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let (root, captured) =
+            serve_responses(vec![(200, primary_calendar()), (200, json!({"value": []}))]).await;
+
+        let error = GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("local state"));
+        assert_eq!(captured.await.unwrap().len(), 2);
+        let conn = db.reader();
+        assert!(db::calendar::get_calendar(&conn, "a-disposable-calendar").is_ok());
+        assert!(db::calendar::get_calendar(&conn, "z-protected-calendar").is_ok());
+        assert!(db::calendar::get_event(&conn, "disposable").is_ok());
+        assert!(db::calendar::get_event(&conn, "protected").is_ok());
+        assert!(db::meet_meetings::get(&conn, "protected")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn unpushed_event_moves_to_unique_current_calendar_before_retirement() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, is_default, remote_id, is_subscribed)
+                 VALUES ('legacy-calendar', 'acc1', 'Calendar', 1, 'legacy-id', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events
+                    (id, account_id, calendar_id, title, start_time, end_time,
+                     source_message_id, ical_data)
+                 VALUES (
+                    'local-draft', 'acc1', 'legacy-calendar', 'Local draft',
+                    '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z',
+                    'source-message', 'BEGIN:VCALENDAR'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let (root, captured) =
+            serve_responses(vec![(200, primary_calendar()), (200, json!({"value": []}))]).await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 2);
+        let conn = db.reader();
+        assert!(db::calendar::get_calendar(&conn, "legacy-calendar").is_err());
+        let migrated = db::calendar::get_event(&conn, "local-draft").unwrap();
+        assert_eq!(migrated.calendar_id, "cal1");
+        assert_eq!(
+            migrated.source_message_id.as_deref(),
+            Some("source-message")
+        );
+        assert_eq!(migrated.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_current_calendar_match_keeps_stale_local_events() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, is_default, remote_id, is_subscribed)
+                 VALUES ('legacy-calendar', 'acc1', 'Shared', 0, 'legacy-id', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events
+                    (id, account_id, calendar_id, title, start_time, end_time)
+                 VALUES (
+                    'local-draft', 'acc1', 'legacy-calendar', 'Local draft',
+                    '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let calendars = json!({"value": [
+            {"id": "primary", "name": "Calendar", "isDefaultCalendar": true},
+            {"id": "shared-a", "name": "Shared", "isDefaultCalendar": false},
+            {"id": "shared-b", "name": "Shared", "isDefaultCalendar": false}
+        ]});
+        let (root, captured) = serve_responses(vec![
+            (200, calendars),
+            (200, json!({"value": []})),
+            (200, json!({"value": []})),
+            (200, json!({"value": []})),
+        ])
+        .await;
+
+        let error = GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("2 exact current calendar matches"));
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        assert!(db::calendar::get_calendar(&conn, "legacy-calendar").is_ok());
+        assert_eq!(
+            db::calendar::get_event(&conn, "local-draft")
+                .unwrap()
+                .calendar_id,
+            "legacy-calendar"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_action_prevents_local_event_calendar_migration() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, is_default, remote_id, is_subscribed)
+                 VALUES ('legacy-calendar', 'acc1', 'Calendar', 1, 'legacy-id', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_events
+                    (id, account_id, calendar_id, title, start_time, end_time)
+                 VALUES (
+                    'local-draft', 'acc1', 'legacy-calendar', 'Local draft',
+                    '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_action_operations
+                    (operation_id, account_id, event_id, data, completed)
+                 VALUES ('operation', 'acc1', 'local-draft', '{}', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let (root, captured) =
+            serve_responses(vec![(200, primary_calendar()), (200, json!({"value": []}))]).await;
+
+        let error = GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("calendar action state"));
+        assert_eq!(captured.await.unwrap().len(), 2);
+        let conn = db.reader();
+        assert!(db::calendar::get_calendar(&conn, "legacy-calendar").is_ok());
+        assert_eq!(
+            db::calendar::get_event(&conn, "local-draft")
+                .unwrap()
+                .calendar_id,
+            "legacy-calendar"
+        );
     }
 
     #[tokio::test]
@@ -1671,15 +2554,181 @@ mod recurrence_sync_tests {
     }
 
     #[tokio::test]
-    async fn bounded_calendar_view_absence_does_not_delete_local_events() {
+    async fn immutable_event_is_rehomed_instead_of_duplicated() {
         let (_dir, db) = setup_db().await;
         {
             let conn = db.writer().await;
-            cache_event(&conn, "outside-window", Some("remote-outside-window"));
+            cache_event(&conn, "stale-local-row", Some("legacy-event-id"));
+            conn.execute(
+                "UPDATE calendar_events
+                 SET uid = 'uid-immutable-event@example.test',
+                     recurrence_kind = 'standalone'
+                 WHERE id = 'stale-local-row'",
+                [],
+            )
+            .unwrap();
+            cache_event(&conn, "same-looking-other", Some("other-event-id"));
+            conn.execute(
+                "UPDATE calendar_events
+                 SET title = 'Refreshed event', recurrence_kind = 'standalone'
+                 WHERE id = 'same-looking-other'",
+                [],
+            )
+            .unwrap();
+        }
+        let calendars = json!({
+            "value": [
+                {"id": "primary", "name": "Primary", "isDefaultCalendar": true},
+                {"id": "secondary", "name": "Secondary", "isDefaultCalendar": false}
+            ]
+        });
+        let standalone = json!({
+            "type": "singleInstance", "seriesMasterId": null, "recurrence": null
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendars),
+            (
+                200,
+                json!({"value": [remote_event("other-event-id", &standalone)]}),
+            ),
+            (
+                200,
+                json!({"value": [remote_event("immutable-event", &standalone)]}),
+            ),
+        ])
+        .await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 3);
+        let conn = db.reader();
+        let secondary: String = conn
+            .query_row(
+                "SELECT id FROM calendars WHERE account_id = 'acc1' AND remote_id = 'secondary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, calendar_id FROM calendar_events WHERE account_id = 'acc1'
+                 AND uid = 'uid-immutable-event@example.test'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![("stale-local-row".into(), secondary)]);
+        assert_eq!(
+            db::calendar::get_event(&conn, "stale-local-row")
+                .unwrap()
+                .remote_id
+                .as_deref(),
+            Some("immutable-event")
+        );
+        assert!(db::calendar::get_event(&conn, "same-looking-other").is_ok());
+    }
+
+    #[tokio::test]
+    async fn existing_immutable_event_duplicates_are_reconciled() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            conn.execute(
+                "INSERT INTO calendars
+                    (id, account_id, name, remote_id, is_subscribed)
+                 VALUES ('secondary-local', 'acc1', 'Secondary', 'secondary', 1)",
+                [],
+            )
+            .unwrap();
+            cache_event(&conn, "stale-local-row", Some("immutable-event"));
+            cache_event(&conn, "authoritative-local-row", Some("immutable-event"));
+            conn.execute(
+                "UPDATE calendar_events SET calendar_id = 'secondary-local'
+                 WHERE id = 'authoritative-local-row'",
+                [],
+            )
+            .unwrap();
+        }
+        let calendars = json!({
+            "value": [
+                {"id": "primary", "name": "Primary", "isDefaultCalendar": true},
+                {"id": "secondary", "name": "Secondary", "isDefaultCalendar": false}
+            ]
+        });
+        let standalone = json!({
+            "type": "singleInstance", "seriesMasterId": null, "recurrence": null
+        });
+        let (root, captured) = serve_responses(vec![
+            (200, calendars),
+            (200, json!({"value": []})),
+            (
+                200,
+                json!({"value": [remote_event("immutable-event", &standalone)]}),
+            ),
+        ])
+        .await;
+
+        GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.await.unwrap().len(), 3);
+        let conn = db.reader();
+        let rows: Vec<String> = conn
+            .prepare(
+                "SELECT id FROM calendar_events
+                 WHERE account_id = 'acc1' AND remote_id = 'immutable-event'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec!["authoritative-local-row"]);
+        assert_eq!(
+            db::calendar::get_event(&conn, "authoritative-local-row")
+                .unwrap()
+                .title,
+            "Refreshed event"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_owned_event_retires_stale_provider_cache_before_reconciliation() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            cache_action_owned_occurrence(&conn, false);
         }
         let (root, captured) = serve_responses(vec![
-            (200, json!({"value": [{"id": "primary", "name": "Calendar", "isDefaultCalendar": true}]})),
-            (200, json!({"value": []})),
+            (200, primary_calendar()),
+            (
+                200,
+                json!({
+                    "value": [remote_event(
+                        "immutable-occurrence",
+                        &occurrence_metadata()
+                    )]
+                }),
+            ),
         ])
         .await;
 
@@ -1695,7 +2744,259 @@ mod recurrence_sync_tests {
             .unwrap();
 
         assert_eq!(captured.await.unwrap().len(), 2);
-        assert!(db::calendar::get_event(&db.reader(), "outside-window").is_ok());
+        let conn = db.reader();
+        assert!(db::calendar::get_event(&conn, "stale-provider-cache").is_err());
+        assert!(db::calendar::get_event(&conn, "series-owner").is_ok());
+        assert!(db::calendar::get_event(&conn, "projected-member").is_ok());
+        assert_eq!(
+            db::calendar::get_event(&conn, "projected-member")
+                .unwrap()
+                .remote_id,
+            None
+        );
+        assert!(conn
+            .query_row(
+                "SELECT dirty FROM calendar_action_sets
+                 WHERE event_id = 'series-owner'",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events
+                 WHERE remote_id IN ('legacy-occurrence', 'immutable-occurrence')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_action_owned_cache_duplicate_rolls_back_routing() {
+        let (_dir, db) = setup_db().await;
+        {
+            let conn = db.writer().await;
+            cache_action_owned_occurrence(&conn, true);
+        }
+        let (root, captured) = serve_responses(vec![
+            (200, primary_calendar()),
+            (
+                200,
+                json!({
+                    "value": [remote_event(
+                        "immutable-occurrence",
+                        &occurrence_metadata()
+                    )]
+                }),
+            ),
+        ])
+        .await;
+
+        let error = GraphCalendarBackend
+            .sync(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services(&root),
+                },
+                &account("calendar", "graph"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("local state"), "{error}");
+        assert_eq!(captured.await.unwrap().len(), 2);
+        let conn = db.reader();
+        assert!(db::calendar::get_event(&conn, "stale-provider-cache").is_ok());
+        assert!(db::meet_meetings::get(&conn, "stale-provider-cache")
+            .unwrap()
+            .is_some());
+        assert!(!conn
+            .query_row(
+                "SELECT dirty FROM calendar_action_sets
+                 WHERE event_id = 'series-owner'",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn protected_duplicate_rolls_back_prior_cleanup() {
+        let (_dir, db) = setup_db().await;
+        let mut conn = db.writer().await;
+        conn.execute(
+            "INSERT INTO calendars
+                (id, account_id, name, remote_id, is_subscribed)
+             VALUES ('secondary-local', 'acc1', 'Secondary', 'secondary', 1)",
+            [],
+        )
+        .unwrap();
+        for id in ["authoritative", "a-disposable", "z-protected"] {
+            cache_event(&conn, id, Some("immutable-event"));
+        }
+        conn.execute(
+            "UPDATE calendar_events SET calendar_id = 'secondary-local'
+             WHERE id = 'authoritative'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES (
+                'z-protected', 'acc1', 'zoom', 'meeting',
+                'https://example.test/join'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let result = {
+            let transaction = conn.transaction().unwrap();
+            let result = super::reconcile_graph_event_identity(
+                &transaction,
+                "acc1",
+                "secondary-local",
+                "secondary",
+                "immutable-event",
+                None,
+                None,
+                None,
+                None,
+            );
+            drop(transaction);
+            result
+        };
+
+        assert!(result.unwrap_err().to_string().contains("local state"));
+        let ids: Vec<String> = conn
+            .prepare(
+                "SELECT id FROM calendar_events
+                 WHERE account_id = 'acc1' AND remote_id = 'immutable-event'
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["a-disposable", "authoritative", "z-protected"]);
+        assert!(db::meet_meetings::get(&conn, "z-protected")
+            .unwrap()
+            .is_some());
+        assert_eq!(pending_cleanup_count(&conn), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_view_absence_retires_only_authoritative_instances() {
+        let (_dir, db) = setup_db().await;
+        let mut conn = db.writer().await;
+        for (id, remote_id, kind) in [
+            ("seen", Some("seen-remote"), "occurrence"),
+            ("absent-occurrence", Some("absent-occurrence"), "occurrence"),
+            ("absent-standalone", Some("absent-standalone"), "standalone"),
+            ("series-master", Some("series-master"), "series"),
+            ("unknown", Some("unknown"), "unknown"),
+            ("outside-window", Some("outside-window"), "occurrence"),
+            ("local-only", None, "occurrence"),
+        ] {
+            cache_event(&conn, id, remote_id);
+            conn.execute(
+                "UPDATE calendar_events SET recurrence_kind = ?1 WHERE id = ?2",
+                rusqlite::params![kind, id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE calendar_events
+             SET start_time = '2025-01-01T09:00:00Z',
+                 end_time = '2025-01-01T10:00:00Z'
+             WHERE id = 'outside-window'",
+            [],
+        )
+        .unwrap();
+        let observed = std::collections::HashSet::from(["seen-remote".to_owned()]);
+        let transaction = conn.transaction().unwrap();
+
+        super::retire_absent_graph_view_rows(
+            &transaction,
+            "acc1",
+            "cal1",
+            "2026-09-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+            &observed,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        for id in ["absent-occurrence", "absent-standalone"] {
+            assert!(db::calendar::get_event(&conn, id).is_err(), "{id}");
+        }
+        for id in [
+            "seen",
+            "series-master",
+            "unknown",
+            "outside-window",
+            "local-only",
+        ] {
+            assert!(db::calendar::get_event(&conn, id).is_ok(), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_bounded_view_absence_rolls_back_prior_writes() {
+        let (_dir, db) = setup_db().await;
+        let mut conn = db.writer().await;
+        cache_event(&conn, "stale-protected", Some("stale-remote"));
+        cache_event(&conn, "prior-write", Some("seen-remote"));
+        conn.execute(
+            "UPDATE calendar_events SET recurrence_kind = 'occurrence'
+             WHERE id = 'stale-protected'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meet_meetings
+                 (event_id, account_id, protocol, meeting_id, join_url)
+             VALUES (
+                 'stale-protected', 'acc1', 'zoom', 'protected',
+                 'https://example.test/join'
+             )",
+            [],
+        )
+        .unwrap();
+        let observed = std::collections::HashSet::from(["seen-remote".to_owned()]);
+        let transaction = conn.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE calendar_events SET title = 'Changed'
+                 WHERE id = 'prior-write'",
+                [],
+            )
+            .unwrap();
+
+        let result = super::retire_absent_graph_view_rows(
+            &transaction,
+            "acc1",
+            "cal1",
+            "2026-09-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+            &observed,
+        );
+        drop(transaction);
+
+        assert!(result.unwrap_err().to_string().contains("local state"));
+        assert_eq!(
+            db::calendar::get_event(&conn, "prior-write").unwrap().title,
+            "Cached event"
+        );
+        assert!(db::calendar::get_event(&conn, "stale-protected").is_ok());
+        assert!(db::meet_meetings::get(&conn, "stale-protected")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

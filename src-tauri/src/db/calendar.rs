@@ -810,7 +810,9 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
-               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
+               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
+                               WHERE member.event_id = calendar_events.id
+                                 AND member.owner_event_id != calendar_events.id)
                AND ((start_time < ?4 AND end_time > ?3)
                     OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
@@ -824,7 +826,9 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
+               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
+                               WHERE member.event_id = calendar_events.id
+                                 AND member.owner_event_id != calendar_events.id)
                AND ((start_time < ?3 AND end_time > ?2)
                     OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
              ORDER BY start_time ASC",
@@ -1346,7 +1350,10 @@ mod tests {
                 cleanup_requested INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE calendar_action_creations (event_id TEXT);
-            CREATE TABLE calendar_action_members (event_id TEXT);
+            CREATE TABLE calendar_action_members (
+                event_id TEXT,
+                owner_event_id TEXT NOT NULL
+            );
             CREATE TABLE calendar_action_sets (event_id TEXT);
             CREATE TABLE calendar_action_claims (event_id TEXT);
             INSERT INTO accounts (id, display_name, email, provider, username, password)
@@ -2598,6 +2605,41 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].title, "Morning");
         assert_eq!(events[1].title, "Evening");
+    }
+
+    #[test]
+    fn list_events_keeps_self_owned_master_and_hides_child() {
+        let conn = setup_db();
+        let owner = CalendarEvent {
+            start_time: "2026-04-07T10:00:00Z".into(),
+            end_time: "2026-04-07T11:00:00Z".into(),
+            ..make_event("owner", "Owner", None)
+        };
+        let child = CalendarEvent {
+            start_time: "2026-04-07T12:00:00Z".into(),
+            end_time: "2026-04-07T13:00:00Z".into(),
+            ..make_event("child", "Child", None)
+        };
+        insert_event(&conn, &owner).unwrap();
+        insert_event(&conn, &child).unwrap();
+        conn.execute(
+            "INSERT INTO calendar_action_members(event_id, owner_event_id)
+             VALUES ('owner', 'owner'), ('child', 'owner')",
+            [],
+        )
+        .unwrap();
+
+        let events = list_events(
+            &conn,
+            "acc1",
+            None,
+            "2026-04-07T00:00:00Z",
+            "2026-04-08T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "owner");
     }
 
     #[test]

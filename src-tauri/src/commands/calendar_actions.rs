@@ -7,8 +7,12 @@ use tauri::State;
 
 use crate::backend::calendar::{self as providers, CalendarBackendCtx, CalendarCapability};
 use crate::calendar::actions::*;
-use crate::calendar::event_set::{event_fields, CalendarEventSet, CalendarOverride};
-use crate::calendar::recurrence_identity::{RecurrenceMutationScope, RecurrenceObjectKind};
+use crate::calendar::event_set::{
+    canonical_position, event_fields, CalendarEventSet, CalendarOverride,
+};
+use crate::calendar::recurrence_identity::{
+    OccurrenceFields, RecurrenceMutationScope, RecurrenceObjectKind,
+};
 use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::db::{self, calendar_actions as store};
 use crate::error::Result;
@@ -227,6 +231,34 @@ async fn hydrate_with_backends(
     Ok(snapshot)
 }
 
+fn persist_hydrated_source(
+    conn: &rusqlite::Connection,
+    mut snapshot: store::Snapshot,
+) -> Result<store::Snapshot> {
+    store::ensure_current(conn, &snapshot)?;
+    let owner = store::persist_source(conn, &snapshot, &snapshot.set)?;
+    store::cache_canonical(conn, owner, &snapshot.set)?;
+    snapshot.anchor = db::calendar::get_event(conn, &snapshot.anchor.id)?;
+    snapshot.members = store::set_members(conn, &snapshot.anchor, &snapshot.set)?;
+    snapshot.calendar_revision = store::calendar_revision(conn, &snapshot.anchor.calendar_id)?;
+    Ok(snapshot)
+}
+
+/// Refresh and persist an authoritative event set while the caller holds the
+/// account lifecycle guard.
+async fn refresh_source_snapshot(
+    state: &AppState,
+    event_id: &str,
+    backends: Option<&[&dyn providers::CalendarBackend]>,
+) -> Result<store::Snapshot> {
+    let snapshot = hydrate_with_backends(state, event_id, backends).await?;
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    let snapshot = persist_hydrated_source(&tx, snapshot)?;
+    tx.commit()?;
+    Ok(snapshot)
+}
+
 #[tauri::command]
 pub async fn read_calendar_event_set(
     state: State<'_, AppState>,
@@ -235,7 +267,15 @@ pub async fn read_calendar_event_set(
     end: String,
     limit: usize,
 ) -> Result<CalendarEventSetView> {
-    read_event_set(&state, &event_id, &start, &end, limit, None).await
+    log::debug!("Calendar action read starting: event_id={event_id}");
+    let result = read_event_set(&state, &event_id, &start, &end, limit, None).await;
+    match &result {
+        Ok(_) => log::debug!("Calendar action read completed: event_id={event_id}"),
+        Err(error) => {
+            log::warn!("Calendar action read failed: event_id={event_id} error={error}")
+        }
+    }
+    result
 }
 
 async fn read_event_set(
@@ -249,15 +289,10 @@ async fn read_event_set(
     window(start, end, limit)?;
     let account_id = db::calendar::get_event(&state.db.reader(), event_id)?.account_id;
     let _guards = account_guards(state, &account_id, None).await;
-    let mut snapshot = hydrate_with_backends(state, event_id, backends).await?;
+    let snapshot = hydrate_with_backends(state, event_id, backends).await?;
     let mut conn = state.db.writer().await;
     let tx = conn.transaction()?;
-    store::ensure_current(&tx, &snapshot)?;
-    let owner = store::persist_source(&tx, &snapshot, &snapshot.set)?;
-    store::cache_canonical(&tx, owner, &snapshot.set)?;
-    snapshot.anchor = db::calendar::get_event(&tx, &snapshot.anchor.id)?;
-    snapshot.members = store::set_members(&tx, &snapshot.anchor, &snapshot.set)?;
-    snapshot.calendar_revision = store::calendar_revision(&tx, &snapshot.anchor.calendar_id)?;
+    let snapshot = persist_hydrated_source(&tx, snapshot)?;
     let view = event_set_view(
         &snapshot.set,
         &snapshot.anchor,
@@ -294,7 +329,6 @@ async fn list_occurrences(
     limit: usize,
 ) -> Result<CalendarOccurrencePage> {
     window(&start, &end, limit)?;
-    let _guards = account_guards(state, &account_id, None).await;
     let mut conn = state.db.writer().await;
     let tx = conn.transaction()?;
     if let Some(id) = &calendar_id {
@@ -306,7 +340,9 @@ async fn list_occurrences(
         let mut stmt = tx.prepare(
             "SELECT event.id FROM calendar_events event JOIN calendars calendar ON calendar.id = event.calendar_id
              WHERE event.account_id = ?1 AND (?2 IS NULL OR event.calendar_id = ?2) AND calendar.is_subscribed = 1
-               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = event.id)
+               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
+                               WHERE member.event_id = event.id
+                                 AND member.owner_event_id != event.id)
                AND ((julianday(event.start_time) < julianday(?4) AND julianday(event.end_time) > julianday(?3))
                  OR event.recurrence_kind = 'series')
              ORDER BY event.start_time, event.id LIMIT 2001")?;
@@ -360,6 +396,35 @@ async fn list_occurrences(
                         .then(a.event_id.cmp(&b.event_id))
                 });
                 page.occurrences.truncate(limit);
+            } else if let Some(set) = store::display_owned_set(&tx, &id)? {
+                let members: HashSet<_> = store::set_members(&tx, &anchor, &set)?
+                    .into_iter()
+                    .map(|member| member.event.id)
+                    .collect();
+                page.occurrences
+                    .retain(|row| !members.contains(&row.event_id));
+                page.needs_hydration
+                    .retain(|event_id| !members.contains(event_id));
+                projected_members.extend(members);
+                let projected = project(
+                    &set,
+                    &anchor,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &start,
+                    &end,
+                    limit,
+                )?;
+                page.has_more |= projected.has_more;
+                page.occurrences.extend(projected.occurrences);
+                page.has_more |= page.occurrences.len() > limit;
+                page.occurrences.sort_by(|a, b| {
+                    a.fields
+                        .start_time
+                        .cmp(&b.fields.start_time)
+                        .then(a.event_id.cmp(&b.event_id))
+                });
+                page.occurrences.truncate(limit);
+                page.needs_hydration.push(id);
             } else {
                 page.needs_hydration.push(id);
             }
@@ -453,7 +518,78 @@ pub async fn plan_calendar_action(
     state: State<'_, AppState>,
     input: CalendarActionInput,
 ) -> Result<CalendarActionPlan> {
-    plan_action(&state, input).await
+    let event_id = input.selection.event_id.clone();
+    log::debug!("Calendar action plan starting: event_id={event_id}");
+    let result = plan_action(&state, input).await;
+    match &result {
+        Ok(plan) => log::debug!(
+            "Calendar action plan completed: event_id={event_id} operation_id={}",
+            plan.operation_id
+        ),
+        Err(error) => {
+            log::warn!("Calendar action plan failed: event_id={event_id} error={error}")
+        }
+    }
+    result
+}
+
+/// Hydrate, verify, and claim an occurrence edit under one account lock. The
+/// expected fields bind the action to exactly what the user edited while
+/// avoiding a stale snapshot window between separate read and plan commands.
+#[tauri::command]
+pub async fn plan_calendar_occurrence_action(
+    state: State<'_, AppState>,
+    event_id: String,
+    original_start: String,
+    expected: OccurrenceFields,
+    edit: CalendarEdit,
+) -> Result<CalendarActionPlan> {
+    plan_occurrence_with_backends(&state, event_id, original_start, expected, edit, None).await
+}
+
+async fn plan_occurrence_with_backends(
+    state: &AppState,
+    event_id: String,
+    original_start: String,
+    expected: OccurrenceFields,
+    edit: CalendarEdit,
+    backends: Option<&[&dyn providers::CalendarBackend]>,
+) -> Result<CalendarActionPlan> {
+    let account_id = db::calendar::get_event(&state.db.reader(), &event_id)?.account_id;
+    let _guards = account_guards(state, &account_id, None).await;
+    let snapshot = hydrate_with_backends(state, &event_id, backends).await?;
+    let original_start = canonical_position(&snapshot.set.event, &original_start)?;
+    let selected = selected_event(&snapshot.set, Some(&original_start))?;
+    if normalized_fields(event_fields(&selected))? != normalized_fields(expected)? {
+        return Err(invalid(
+            "selected occurrence changed remotely; refresh before editing",
+        ));
+    }
+
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    let source = persist_hydrated_source(&tx, snapshot)?;
+    let input = CalendarActionInput {
+        selection: CalendarSelection {
+            event_id: source.anchor.id.clone(),
+            token: source.token.clone(),
+            original_start: Some(original_start),
+        },
+        scope: RecurrenceMutationScope::ThisOccurrence,
+        edit,
+        destination_calendar_id: None,
+        reset_exceptions: false,
+    };
+    let plan = persist_plan(&tx, source, input, None)?;
+    let mut operation = store::load_operation(&tx, &plan.operation_id)?;
+    // This specialized path has no confirmation gate. Claim it before
+    // returning and mark the planned intent resumable if the renderer exits
+    // before its immediate execute call.
+    operation.auto_resume = true;
+    store::claim_operation(&tx, &operation)?;
+    store::save_operation(&tx, &operation)?;
+    tx.commit()?;
+    Ok(plan)
 }
 
 async fn plan_action(state: &AppState, input: CalendarActionInput) -> Result<CalendarActionPlan> {
@@ -477,10 +613,10 @@ async fn plan_with_backends(
     input: CalendarActionInput,
     backends: Option<&[&dyn providers::CalendarBackend]>,
 ) -> Result<CalendarActionPlan> {
-    let (initial, target) = {
+    let (account_id, target) = {
         let conn = state.db.reader();
         (
-            store::load_snapshot(&conn, &input.selection.token, &input.selection.event_id)?,
+            db::calendar::get_event(&conn, &input.selection.event_id)?.account_id,
             input
                 .destination_calendar_id
                 .as_deref()
@@ -490,12 +626,41 @@ async fn plan_with_backends(
     };
     let _guards = account_guards(
         state,
-        &initial.anchor.account_id,
+        &account_id,
         target.as_ref().map(|target| target.account_id.as_str()),
     )
     .await;
-    store::ensure_current(&state.db.reader(), &initial)?;
-    let source = hydrate_with_backends(state, &initial.anchor.id, backends).await?;
+    let initial = store::load_snapshot(
+        &state.db.reader(),
+        &input.selection.token,
+        &input.selection.event_id,
+    )?;
+    let reusable = match initial.remote_calendar_id.as_deref() {
+        None => initial.set.native.is_none(),
+        Some(remote_calendar_id) => initial
+            .set
+            .native
+            .as_ref()
+            .is_some_and(|native| native.calendar_id == remote_calendar_id),
+    };
+    let source = if reusable {
+        initial
+    } else {
+        hydrate_with_backends(state, &initial.anchor.id, backends).await?
+    };
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    let plan = persist_plan(&tx, source, input, target)?;
+    tx.commit()?;
+    Ok(plan)
+}
+
+fn persist_plan(
+    conn: &rusqlite::Connection,
+    source: store::Snapshot,
+    input: CalendarActionInput,
+    target: Option<store::Destination>,
+) -> Result<CalendarActionPlan> {
     ensure_safe_occurrence_edit(&source, input.scope)?;
     let desired = desired_set(&source.set, &input)?;
     let target = target.filter(|target| target.calendar_id != source.anchor.calendar_id);
@@ -520,14 +685,12 @@ async fn plan_with_backends(
         canonical: None,
         source_after: None,
         native_move: false,
+        auto_resume: false,
     };
-    let mut conn = state.db.writer().await;
-    let tx = conn.transaction()?;
     if let Some(target) = &operation.destination {
-        ensure_destination(&tx, target)?;
+        ensure_destination(conn, target)?;
     }
-    store::insert_operation(&tx, &operation)?;
-    tx.commit()?;
+    store::insert_operation(conn, &operation)?;
     Ok(CalendarActionPlan {
         operation_id: operation.id,
         requires: requirements,
@@ -577,6 +740,7 @@ fn result(operation: &store::Operation) -> CalendarActionResult {
                 && operation.input.reset_exceptions
                 && !operation.source.set.overrides.is_empty(),
         },
+        auto_resume: operation.stage != CalendarActionStage::Completed && operation.auto_resume,
     }
 }
 
@@ -634,6 +798,7 @@ impl Creation {
                 CalendarActionStage::Applying
             },
             requires: CalendarConfirmations::default(),
+            auto_resume: false,
         }
     }
 
@@ -858,17 +1023,242 @@ pub async fn execute_calendar_action(
     operation_id: String,
     confirmations: CalendarConfirmations,
 ) -> Result<CalendarActionResult> {
+    log::debug!("Calendar action execute starting: operation_id={operation_id}");
     let creation = store::creation_data(&state.db.reader(), &operation_id)?;
-    if let Some(data) = creation {
+    let result = if let Some(data) = creation {
         let creation: Creation = store::decode(&data)?;
-        return create_completed(&state, store::decode(&creation.request)?, &operation_id).await;
+        create_completed(&state, store::decode(&creation.request)?, &operation_id).await
+    } else {
+        execute(&state, &operation_id, &confirmations).await
+    };
+    match &result {
+        Ok(outcome) => log::debug!(
+            "Calendar action execute completed: operation_id={operation_id} stage={:?}",
+            outcome.stage
+        ),
+        Err(error) => {
+            let stage = store::load_operation(&state.db.reader(), &operation_id)
+                .map(|operation| format!("{:?}", operation.stage))
+                .unwrap_or_else(|_| "unknown".into());
+            log::warn!(
+                "Calendar action execute failed: operation_id={operation_id} stage={stage} error={error}"
+            );
+        }
     }
-    execute(&state, &operation_id, &confirmations).await
+    result
 }
 
 async fn checkpoint(state: &AppState, operation: &store::Operation) -> Result<()> {
     let conn = state.db.writer().await;
     store::save_operation(&conn, operation)
+}
+
+enum OperationCurrency {
+    Current,
+    Rebased,
+    Recovered(Box<CalendarEventSet>),
+}
+
+fn recovery_difference_summary(
+    left: &CalendarEventSet,
+    right: &CalendarEventSet,
+    selected_key: Option<&str>,
+) -> String {
+    let fields = match (
+        selected_event(left, selected_key).map(|event| event_fields(&event)),
+        selected_event(right, selected_key).map(|event| event_fields(&event)),
+    ) {
+        (Ok(left), Ok(right)) => format!(
+            "selected_exists=true title={} description={} location={} start={} end={} all_day={} timezone={}",
+            left.title == right.title,
+            left.description == right.description,
+            left.location == right.location,
+            left.start_time == right.start_time,
+            left.end_time == right.end_time,
+            left.all_day == right.all_day,
+            left.timezone == right.timezone
+        ),
+        _ => "selected_exists=false".to_string(),
+    };
+    let selected_content = match (
+        left.semantic_content(selected_key),
+        right.semantic_content(selected_key),
+    ) {
+        (Ok(left), Ok(right)) => left.equivalent(&right).unwrap_or(false),
+        _ => false,
+    };
+    let left_keys: std::collections::BTreeSet<_> = left
+        .overrides
+        .iter()
+        .map(|item| item.original_start.as_str())
+        .collect();
+    let right_keys: std::collections::BTreeSet<_> = right
+        .overrides
+        .iter()
+        .map(|item| item.original_start.as_str())
+        .collect();
+    format!(
+        "{fields} selected_content={selected_content} recurrence_kind={} recurrence_rule_literal={} override_keys={} left_overrides={} right_overrides={}",
+        left.event.recurrence_kind == right.event.recurrence_kind,
+        left.event.recurrence_rule == right.event.recurrence_rule,
+        left_keys == right_keys,
+        left_keys.len(),
+        right_keys.len()
+    )
+}
+
+/// Repair operations written by versions that treated an unchanged description
+/// field as an explicit conversion from rich text to plain text.
+fn repair_unchanged_description_intent(operation: &mut store::Operation) -> Result<bool> {
+    if operation.input.edit.description.is_none() {
+        return Ok(false);
+    }
+    let key = operation.input.selection.original_start.as_deref();
+    let source = selected_event(&operation.source.set, key)?;
+    let desired = selected_event(&operation.desired, key)?;
+    if source.description != desired.description {
+        return Ok(false);
+    }
+    let mut corrected = desired_set(&operation.source.set, &operation.input)?;
+    let mut persisted_without_content = operation.desired.clone();
+    persisted_without_content.content = None;
+    let corrected_content = corrected.content.take();
+    if persisted_without_content != corrected {
+        return Err(invalid(
+            "persisted calendar action intent changed outside description provenance",
+        ));
+    }
+    if operation.desired.content == corrected_content {
+        return Ok(false);
+    }
+    operation.desired.content = corrected_content;
+    log::info!(
+        "Calendar action repaired unchanged description provenance: operation_id={}",
+        operation.id
+    );
+    Ok(true)
+}
+
+fn ensure_operation_current_or_recover_projected(
+    conn: &rusqlite::Connection,
+    operation: &mut store::Operation,
+) -> Result<OperationCurrency> {
+    let stale = match store::ensure_operation_current(conn, operation) {
+        Ok(()) => return Ok(OperationCurrency::Current),
+        Err(error) => error,
+    };
+    let Some(current) = store::recovery_snapshot(conn, operation)? else {
+        log::warn!(
+            "Calendar action recovery has no exclusively claimed clean projection: operation_id={}",
+            operation.id
+        );
+        return Err(stale);
+    };
+    current.set.validate()?;
+    if !same_event_identity(&operation.source.set, &current.set) {
+        log::warn!(
+            "Calendar action recovery projection changed provider identity: operation_id={}",
+            operation.id
+        );
+        return Err(stale);
+    }
+    let recovered = semantic_eq(&current.set, &operation.desired);
+    let rebased = semantic_eq(&current.set, &operation.source.set);
+    if !recovered && !rebased {
+        log::warn!(
+            "Calendar action recovery projection matches neither source nor desired state: operation_id={}",
+            operation.id
+        );
+        return Err(stale);
+    }
+    operation.source.anchor = current.anchor;
+    operation.source.members = current.members;
+    operation.source.remote_calendar_id = current.remote_calendar_id;
+    operation.source.account_route = current.account_route;
+    operation.source.invitation_source = current.invitation_source;
+    operation.source.calendar_revision = current.calendar_revision;
+    if recovered {
+        log::info!(
+            "Calendar action accepted its clean projected provider result for recovery: operation_id={}",
+            operation.id
+        );
+        Ok(OperationCurrency::Recovered(Box::new(current.set)))
+    } else {
+        log::info!(
+            "Calendar action rebased onto its unchanged authoritative source: operation_id={}",
+            operation.id
+        );
+        operation.source.set = current.set;
+        Ok(OperationCurrency::Rebased)
+    }
+}
+
+async fn update_or_reconcile(
+    state: &AppState,
+    operation: &store::Operation,
+    account: &db::accounts::AccountFull,
+    backend: &dyn providers::CalendarBackend,
+) -> Result<CalendarEventSet> {
+    match backend
+        .update_event_set(
+            &context(state),
+            account,
+            &operation.source.set,
+            &operation.desired,
+        )
+        .await
+    {
+        Ok(canonical) => Ok(canonical),
+        Err(update_error) => {
+            log::warn!(
+                "Calendar action provider update returned an ambiguous error; checking authoritative state: operation_id={} protocol={} error={update_error}",
+                operation.id,
+                backend.protocol()
+            );
+            let remote_calendar_id = operation
+                .source
+                .remote_calendar_id
+                .as_deref()
+                .ok_or_else(|| invalid("missing source calendar"))?;
+            match backend
+                .fetch_event_set(
+                    &context(state),
+                    account,
+                    &operation.source.set.event,
+                    remote_calendar_id,
+                )
+                .await
+            {
+                Ok(current)
+                    if same_event_identity(&operation.source.set, &current)
+                        && semantic_eq(&current, &operation.desired) =>
+                {
+                    log::info!(
+                        "Calendar action reconciled an acknowledged provider update: operation_id={} protocol={}",
+                        operation.id,
+                        backend.protocol()
+                    );
+                    Ok(current)
+                }
+                Ok(_) => {
+                    log::warn!(
+                        "Calendar action provider state did not confirm the failed update: operation_id={} protocol={}",
+                        operation.id,
+                        backend.protocol()
+                    );
+                    Err(update_error)
+                }
+                Err(reconcile_error) => {
+                    log::warn!(
+                        "Calendar action could not read provider state after a failed update: operation_id={} protocol={} error={reconcile_error}",
+                        operation.id,
+                        backend.protocol()
+                    );
+                    Err(update_error)
+                }
+            }
+        }
+    }
 }
 
 async fn execute(
@@ -913,6 +1303,7 @@ async fn execute_with_backends(
     if operation.stage == CalendarActionStage::Completed {
         return Ok(result(&operation));
     }
+    let repaired_description_intent = repair_unchanged_description_intent(&mut operation)?;
     ensure_safe_occurrence_edit(&operation.source, operation.input.scope)?;
     if operation.input.reset_exceptions
         && !operation.source.set.overrides.is_empty()
@@ -929,15 +1320,66 @@ async fn execute_with_backends(
             "replacement meeting identity confirmation is required",
         ));
     }
+    if operation.stage != CalendarActionStage::Planned
+        && operation.destination.is_none()
+        && operation.canonical.is_none()
+        && operation
+            .source
+            .remote_calendar_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    {
+        log::info!(
+            "Calendar action refreshing authoritative source before uncertain update recovery: operation_id={}",
+            operation.id
+        );
+        let refreshed =
+            refresh_source_snapshot(state, &operation.source.anchor.id, backends).await?;
+        log::info!(
+            "Calendar action authoritative refresh completed: operation_id={} identity_matches={} source_matches={} desired_matches={} source_members={} refreshed_members={}",
+            operation.id,
+            same_event_identity(&operation.source.set, &refreshed.set),
+            semantic_eq(&operation.source.set, &refreshed.set),
+            semantic_eq(&operation.desired, &refreshed.set),
+            operation.source.members.len(),
+            refreshed.members.len()
+        );
+        if !semantic_eq(&operation.source.set, &refreshed.set)
+            && !semantic_eq(&operation.desired, &refreshed.set)
+        {
+            let selected_key = operation.input.selection.original_start.as_deref();
+            log::warn!(
+                "Calendar action source/current difference: operation_id={} {}",
+                operation.id,
+                recovery_difference_summary(&operation.source.set, &refreshed.set, selected_key)
+            );
+            log::warn!(
+                "Calendar action desired/current difference: operation_id={} {}",
+                operation.id,
+                recovery_difference_summary(&operation.desired, &refreshed.set, selected_key)
+            );
+        }
+    }
     {
         let mut conn = state.db.writer().await;
         let tx = conn.transaction()?;
-        store::ensure_operation_current(&tx, &operation)?;
+        let currency = ensure_operation_current_or_recover_projected(&tx, &mut operation)?;
         if let Some(target) = &operation.destination {
             ensure_destination(&tx, target)?;
         }
         if operation.stage != CalendarActionStage::Planned {
             store::claim_operation(&tx, &operation)?;
+        }
+        match currency {
+            OperationCurrency::Current if repaired_description_intent => {
+                store::save_operation(&tx, &operation)?
+            }
+            OperationCurrency::Current => {}
+            OperationCurrency::Rebased => store::save_operation(&tx, &operation)?,
+            OperationCurrency::Recovered(canonical) => {
+                operation.canonical = Some(*canonical);
+                store::save_operation(&tx, &operation)?;
+            }
         }
         tx.commit()?;
     }
@@ -983,7 +1425,9 @@ async fn execute_with_backends(
             return Ok(result(&operation));
         }
     }
-    if operation.canonical.is_none() {
+    let source_verified_by_atomic_plan =
+        was_planned && operation.auto_resume && operation.destination.is_none();
+    if operation.canonical.is_none() && !source_verified_by_atomic_plan {
         if let Some(backend) = source_backend {
             let current = backend
                 .fetch_event_set(
@@ -1014,95 +1458,100 @@ async fn execute_with_backends(
         {
             let mut conn = state.db.writer().await;
             let tx = conn.transaction()?;
-            store::ensure_operation_current(&tx, &operation)?;
+            if let OperationCurrency::Recovered(canonical) =
+                ensure_operation_current_or_recover_projected(&tx, &mut operation)?
+            {
+                operation.canonical = Some(*canonical);
+            }
             store::claim_operation(&tx, &operation)?;
             store::save_operation(&tx, &operation)?;
             tx.commit()?;
         }
-        if let Some(target) = operation.destination.clone() {
-            let target_account =
-                db::accounts::get_account_full(&state.db.reader(), &target.account_id)?;
-            let desired = transfer_set(&operation, &state.db.reader())?;
-            let native_eligible = operation.input.scope == RecurrenceMutationScope::EntireSeries
-                && target.account_id == operation.source.anchor.account_id
-                && semantic_eq(&operation.source.set, &operation.desired);
-            if native_eligible && was_planned {
-                if let (Some(backend), Some(remote)) =
-                    (source_backend, target.remote_calendar_id.as_deref())
-                {
-                    // Checkpoint identifies a possibly committed native move on restart.
-                    operation.native_move = true;
-                    checkpoint(state, &operation).await?;
-                    match backend
-                        .move_event_set_native(
-                            &context(state),
-                            &account,
-                            &operation.source.set,
-                            remote,
-                        )
-                        .await?
+        if operation.canonical.is_none() {
+            if let Some(target) = operation.destination.clone() {
+                let target_account =
+                    db::accounts::get_account_full(&state.db.reader(), &target.account_id)?;
+                let desired = transfer_set(&operation, &state.db.reader())?;
+                let native_eligible = operation.input.scope
+                    == RecurrenceMutationScope::EntireSeries
+                    && target.account_id == operation.source.anchor.account_id
+                    && semantic_eq(&operation.source.set, &operation.desired);
+                if native_eligible && was_planned {
+                    if let (Some(backend), Some(remote)) =
+                        (source_backend, target.remote_calendar_id.as_deref())
                     {
-                        CalendarCapability::Supported(set) => {
-                            verify_created(&set, &operation.desired, remote, backend.protocol())?;
-                            operation.canonical = Some(set);
-                        }
-                        CalendarCapability::Unsupported => {
-                            operation.native_move = false;
-                            checkpoint(state, &operation).await?;
+                        // Checkpoint identifies a possibly committed native move on restart.
+                        operation.native_move = true;
+                        checkpoint(state, &operation).await?;
+                        match backend
+                            .move_event_set_native(
+                                &context(state),
+                                &account,
+                                &operation.source.set,
+                                remote,
+                            )
+                            .await?
+                        {
+                            CalendarCapability::Supported(set) => {
+                                verify_created(
+                                    &set,
+                                    &operation.desired,
+                                    remote,
+                                    backend.protocol(),
+                                )?;
+                                operation.canonical = Some(set);
+                            }
+                            CalendarCapability::Unsupported => {
+                                operation.native_move = false;
+                                checkpoint(state, &operation).await?;
+                            }
                         }
                     }
                 }
-            }
-            if operation.native_move && operation.canonical.is_none() {
-                operation.stage = CalendarActionStage::Reconciling;
-                checkpoint(state, &operation).await?;
-                return Ok(result(&operation));
-            }
-            if operation.canonical.is_none() {
-                operation.canonical = Some(if let Some(remote) = &target.remote_calendar_id {
-                    let backend = backend_for(&target_account, backends)?;
-                    let canonical = backend
-                        .create_event_set(
-                            &context(state),
-                            &target_account,
-                            remote,
-                            &desired,
-                            &operation.id,
-                        )
-                        .await?;
-                    verify_created(&canonical, &desired, remote, backend.protocol())?;
-                    canonical
-                } else {
-                    desired
-                });
-            }
-            operation
-                .canonical
-                .as_ref()
-                .ok_or_else(|| invalid("destination result missing"))?
-                .validate()?;
-            operation.stage = CalendarActionStage::DestinationVerified;
-            checkpoint(state, &operation).await?;
-        } else {
-            operation.canonical = Some(match source_backend {
-                Some(backend) => {
-                    backend
-                        .update_event_set(
-                            &context(state),
-                            &account,
-                            &operation.source.set,
-                            &operation.desired,
-                        )
-                        .await?
+                if operation.native_move && operation.canonical.is_none() {
+                    operation.stage = CalendarActionStage::Reconciling;
+                    checkpoint(state, &operation).await?;
+                    return Ok(result(&operation));
                 }
-                None => operation.desired.clone(),
-            });
-            operation
-                .canonical
-                .as_ref()
-                .ok_or_else(|| invalid("update result missing"))?
-                .validate()?;
-            checkpoint(state, &operation).await?;
+                if operation.canonical.is_none() {
+                    operation.canonical = Some(if let Some(remote) = &target.remote_calendar_id {
+                        let backend = backend_for(&target_account, backends)?;
+                        let canonical = backend
+                            .create_event_set(
+                                &context(state),
+                                &target_account,
+                                remote,
+                                &desired,
+                                &operation.id,
+                            )
+                            .await?;
+                        verify_created(&canonical, &desired, remote, backend.protocol())?;
+                        canonical
+                    } else {
+                        desired
+                    });
+                }
+                operation
+                    .canonical
+                    .as_ref()
+                    .ok_or_else(|| invalid("destination result missing"))?
+                    .validate()?;
+                operation.stage = CalendarActionStage::DestinationVerified;
+                checkpoint(state, &operation).await?;
+            } else {
+                operation.canonical = Some(match source_backend {
+                    Some(backend) => {
+                        update_or_reconcile(state, &operation, &account, backend).await?
+                    }
+                    None => operation.desired.clone(),
+                });
+                operation
+                    .canonical
+                    .as_ref()
+                    .ok_or_else(|| invalid("update result missing"))?
+                    .validate()?;
+                checkpoint(state, &operation).await?;
+            }
         }
     }
     if operation.destination.is_some() && !operation.native_move {
@@ -1264,19 +1713,19 @@ fn transfer_set(
 async fn commit_operation(state: &AppState, operation: &mut store::Operation) -> Result<()> {
     let canonical = operation
         .canonical
-        .as_ref()
+        .clone()
         .ok_or_else(|| invalid("missing canonical result"))?;
     let expected = if operation.destination.is_some() {
         transfer_set(operation, &state.db.reader())?
     } else {
         operation.desired.clone()
     };
-    if !semantic_eq(canonical, &expected) {
+    if !semantic_eq(&canonical, &expected) {
         return Err(invalid(
             "provider result differs from the complete intended set",
         ));
     }
-    if operation.destination.is_none() && !same_event_identity(&operation.source.set, canonical) {
+    if operation.destination.is_none() && !same_event_identity(&operation.source.set, &canonical) {
         return Err(invalid(
             "provider update replaced the meeting identity without confirmation",
         ));
@@ -1314,7 +1763,7 @@ async fn commit_operation(state: &AppState, operation: &mut store::Operation) ->
     }
     let mut conn = state.db.writer().await;
     let tx = conn.transaction()?;
-    store::ensure_operation_current(&tx, operation)?;
+    let _ = ensure_operation_current_or_recover_projected(&tx, operation)?;
     if let Some(target) = &operation.destination {
         ensure_destination(&tx, target)?;
         let mut event = canonical.event.clone();
@@ -1323,7 +1772,7 @@ async fn commit_operation(state: &AppState, operation: &mut store::Operation) ->
         event.calendar_id = target.calendar_id.clone();
         event.source_message_id = operation.source.anchor.source_message_id.clone();
         db::calendar::insert_event(&tx, &event)?;
-        store::persist_embedded(&tx, &event, canonical)?;
+        store::persist_embedded(&tx, &event, &canonical)?;
         copy_references(
             &tx,
             &operation.source.anchor.id,
@@ -1352,10 +1801,10 @@ async fn commit_operation(state: &AppState, operation: &mut store::Operation) ->
         } else {
             store::retire_source(&tx, &operation.source, &event)?;
         }
-        store::cache_canonical(&tx, db::calendar::get_event(&tx, &event.id)?, canonical)?;
+        store::cache_canonical(&tx, db::calendar::get_event(&tx, &event.id)?, &canonical)?;
     } else {
-        let owner = store::persist_source(&tx, &operation.source, canonical)?;
-        store::cache_canonical(&tx, owner, canonical)?;
+        let owner = store::persist_source(&tx, &operation.source, &canonical)?;
+        store::cache_canonical(&tx, owner, &canonical)?;
     }
     operation.stage = CalendarActionStage::Completed;
     store::save_operation(&tx, operation)?;

@@ -444,6 +444,12 @@ impl GraphClient {
                 .instance_at(calendar, &current, &target.original_start)
                 .await?;
             let path = event_path(calendar, &native.event_id)?;
+            log::debug!(
+                "Graph calendar action resolved occurrence: calendar_id={} series_id={} occurrence_id={}",
+                calendar,
+                resource.event_id,
+                native.event_id
+            );
             let etag = native
                 .revision
                 .as_deref()
@@ -469,10 +475,35 @@ impl GraphClient {
                 self.calendar_set_request(Method::DELETE, &path, &[], None, Some(etag))
                     .await?;
             }
+            log::debug!(
+                "Graph calendar action occurrence mutation accepted: calendar_id={} series_id={} occurrence_id={}",
+                calendar,
+                resource.event_id,
+                native.event_id
+            );
             // The next instance revision must come from the post-mutation master.
-            current = self
+            current = match self
                 .fetch_calendar_event_set(calendar, &resource.event_id, &current.event)
-                .await?;
+                .await
+            {
+                Ok(current) => {
+                    log::debug!(
+                        "Graph calendar action canonical re-fetch completed: calendar_id={} series_id={}",
+                        calendar,
+                        resource.event_id
+                    );
+                    current
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Graph calendar action canonical re-fetch failed after occurrence mutation: calendar_id={} series_id={} occurrence_id={} error={error}",
+                        calendar,
+                        resource.event_id,
+                        native.event_id
+                    );
+                    return Err(error);
+                }
+            };
         }
         Ok(current)
     }

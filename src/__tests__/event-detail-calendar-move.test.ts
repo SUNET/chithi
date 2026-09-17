@@ -8,6 +8,9 @@ vi.mock("@/lib/tauri", () => ({
   createEvent: vi.fn().mockResolvedValue("evt-new"),
   moveEventToCalendar: vi.fn().mockResolvedValue("evt-new"),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
   getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
   listAccounts: vi.fn().mockResolvedValue([]),

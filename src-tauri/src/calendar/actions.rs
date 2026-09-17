@@ -136,6 +136,7 @@ pub struct CalendarActionResult {
     pub stage: CalendarActionStage,
     pub event_id: String,
     pub requires: CalendarConfirmations,
+    pub auto_resume: bool,
 }
 
 pub(crate) fn invalid(message: &str) -> Error {
@@ -415,7 +416,9 @@ pub(crate) fn desired_set(
             .clone()
             .ok_or_else(|| invalid("an occurrence position is required"))?;
         let mut event = selected;
+        let previous_description = event.description.clone();
         apply_patch(&mut event, &input.edit)?;
+        let description_changed = event.description != previous_description;
         event.recurrence_rule = None;
         event.recurrence_kind = RecurrenceKind::Occurrence;
         if let Some(exception) = desired
@@ -431,7 +434,7 @@ pub(crate) fn desired_set(
                 native: None,
             });
         }
-        if input.edit.description.is_some() {
+        if description_changed {
             desired.mark_description_plain(Some(&key))?;
         }
     } else {
@@ -475,9 +478,11 @@ pub(crate) fn desired_set(
                 )?);
             }
         }
+        let previous_description = desired.event.description.clone();
         apply_patch(&mut desired.event, &master_edit)?;
+        let description_changed = desired.event.description != previous_description;
         let mut inheriting_descriptions = std::collections::HashSet::new();
-        if input.edit.description.is_some() {
+        if description_changed {
             for item in &before.overrides {
                 if item
                     .event
@@ -851,7 +856,7 @@ fn rules_equivalent(a: &CalendarEvent, b: &CalendarEvent) -> Result<bool> {
             .all(|o| boundary(&o.original_start).is_ok_and(|start| start < lo)))
 }
 
-fn normalized_fields(mut fields: OccurrenceFields) -> Result<OccurrenceFields> {
+pub(crate) fn normalized_fields(mut fields: OccurrenceFields) -> Result<OccurrenceFields> {
     fields.validate()?;
     fields.description = fields.description.filter(|value| !value.is_empty());
     fields.location = fields.location.filter(|value| !value.is_empty());
@@ -1367,6 +1372,7 @@ mod tests {
                 RecurrenceMutationScope::ThisOccurrence,
                 CalendarEdit {
                     title: Some("New title".into()),
+                    description: source.event.description.clone(),
                     ..Default::default()
                 },
             ),
@@ -1376,6 +1382,20 @@ mod tests {
             copied.description_content_type(Some(key)).unwrap(),
             "text/html"
         );
+        let whole = desired_set(
+            &source,
+            &input(
+                key,
+                RecurrenceMutationScope::EntireSeries,
+                CalendarEdit {
+                    title: Some("New title".into()),
+                    description: source.event.description.clone(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(whole.description_content_type(None).unwrap(), "text/html");
         let edited = desired_set(
             &source,
             &input(

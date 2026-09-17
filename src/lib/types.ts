@@ -420,6 +420,7 @@ export interface CalendarActionResult {
     "source-removal-pending" | "reconciling" | "completed";
   event_id: string;
   requires: CalendarConfirmations;
+  auto_resume?: boolean;
 }
 
 export interface Attendee {

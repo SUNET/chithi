@@ -6,18 +6,19 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 vi.mock("@/lib/tauri", () => ({
-  readCalendarEventSet: vi.fn(),
-  planCalendarAction: vi.fn(),
+  planCalendarOccurrenceAction: vi.fn(),
   executeCalendarAction: vi.fn(),
+  listPendingCalendarActions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [],
+  }),
   listCalendars: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
 }));
 
 import * as api from "@/lib/tauri";
-import type {
-  CalendarEvent, CalendarEventSetView, CalendarOccurrence,
-} from "@/lib/types";
+import type { CalendarEvent, CalendarOccurrence } from "@/lib/types";
 import { calendarEditSupport } from "@/lib/calendar-mutation-support";
 import { useAccountsStore } from "@/stores/accounts";
 import { useCalendarStore } from "@/stores/calendar";
@@ -73,20 +74,6 @@ function occurrence(patch: Partial<CalendarOccurrence> = {}): CalendarOccurrence
   };
 }
 
-function view(occurrences = [occurrence()]): CalendarEventSetView {
-  return {
-    master: occurrence({
-      selection: {
-        event_id: "master",
-        token: "selection-token",
-        original_start: null,
-      },
-    }),
-    page: { occurrences, has_more: false, needs_hydration: [] },
-    exception_count: 0,
-  };
-}
-
 beforeEach(() => {
   setActivePinia(createPinia());
   vi.clearAllMocks();
@@ -105,8 +92,8 @@ beforeEach(() => {
     has_contacts_binding: false,
     meet_protocol: "",
   }];
-  vi.mocked(api.readCalendarEventSet).mockResolvedValue(view());
-  vi.mocked(api.planCalendarAction).mockResolvedValue({
+  vi.mocked(api.listPendingCalendarActions).mockResolvedValue([]);
+  vi.mocked(api.planCalendarOccurrenceAction).mockResolvedValue({
     operation_id: "operation",
     requires: {
       replacement_meeting_identity: false,
@@ -133,21 +120,97 @@ describe("safe occurrence editing", () => {
 
     await store.updateOccurrence(selected, { title: "Only this one" });
 
-    expect(api.readCalendarEventSet).toHaveBeenCalledWith(
-      "master", expect.any(String), expect.any(String), 200,
+    expect(api.planCalendarOccurrenceAction).toHaveBeenCalledWith(
+      "master",
+      "2026-09-15T09:00:00.000Z",
+      {
+        title: "Standup",
+        description: null,
+        location: null,
+        start_time: "2026-09-15T09:00:00.000Z",
+        end_time: "2026-09-15T09:30:00.000Z",
+        all_day: false,
+        timezone: "UTC",
+      },
+      { title: "Only this one" },
     );
-    expect(api.planCalendarAction).toHaveBeenCalledWith({
-      selection: occurrence().selection,
-      scope: "this-occurrence",
-      edit: { title: "Only this one" },
-      destination_calendar_id: null,
-      reset_exceptions: false,
-    });
     expect(api.executeCalendarAction).toHaveBeenCalledWith("operation", {
       replacement_meeting_identity: false,
       reset_exceptions: false,
     });
     expect(api.getEvents).toHaveBeenCalled();
+  });
+
+  it("resumes an applying occurrence edit before reading a stale selection", async () => {
+    vi.mocked(api.listPendingCalendarActions).mockResolvedValue([{
+      operation_id: "pending-operation",
+      stage: "applying",
+      event_id: "master",
+      requires: {
+        replacement_meeting_identity: false,
+        reset_exceptions: false,
+      },
+    }]);
+
+    const store = useCalendarStore();
+    await store.updateOccurrence(event(), {
+      start_time: "2026-09-15T10:00:00.000Z",
+      end_time: "2026-09-15T10:30:00.000Z",
+    });
+
+    expect(api.executeCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "pending-operation",
+      {
+        replacement_meeting_identity: false,
+        reset_exceptions: false,
+      },
+    );
+    expect(api.planCalendarOccurrenceAction).not.toHaveBeenCalled();
+    expect(api.getEvents).toHaveBeenCalled();
+  });
+
+  it("resumes a claimed atomic plan after a renderer interruption", async () => {
+    vi.mocked(api.listPendingCalendarActions).mockResolvedValue([{
+      operation_id: "pending-operation",
+      stage: "planned",
+      event_id: "master",
+      auto_resume: true,
+      requires: {
+        replacement_meeting_identity: false,
+        reset_exceptions: false,
+      },
+    }]);
+
+    await useCalendarStore().updateOccurrence(event(), {
+      title: "Resume atomic plan",
+    });
+
+    expect(api.executeCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "pending-operation",
+      {
+        replacement_meeting_identity: false,
+        reset_exceptions: false,
+      },
+    );
+    expect(api.planCalendarOccurrenceAction).not.toHaveBeenCalled();
+  });
+
+  it("does not resume an action that still requires confirmation", async () => {
+    vi.mocked(api.listPendingCalendarActions).mockResolvedValue([{
+      operation_id: "pending-operation",
+      stage: "applying",
+      event_id: "master",
+      requires: {
+        replacement_meeting_identity: true,
+        reset_exceptions: false,
+      },
+    }]);
+
+    await expect(
+      useCalendarStore().updateOccurrence(event(), { title: "Unsafe recovery" }),
+    ).rejects.toThrow("requires confirmation");
+    expect(api.executeCalendarAction).not.toHaveBeenCalled();
+    expect(api.planCalendarOccurrenceAction).not.toHaveBeenCalled();
   });
 
   it("rejects attendee-bearing occurrences before backend reads", async () => {
@@ -159,39 +222,57 @@ describe("safe occurrence editing", () => {
     await expect(
       store.updateOccurrence(selected, { title: "Unsafe" }),
     ).rejects.toThrow("meeting with attendees");
-    expect(api.readCalendarEventSet).not.toHaveBeenCalled();
-    expect(api.planCalendarAction).not.toHaveBeenCalled();
+    expect(api.planCalendarOccurrenceAction).not.toHaveBeenCalled();
   });
 
-  it("fails closed when an occurrence selection is ambiguous", async () => {
-    const store = useCalendarStore();
-    vi.mocked(api.readCalendarEventSet).mockResolvedValue(
-      view([occurrence(), occurrence({ is_exception: true })]),
-    );
-
+  it("fails closed without a trusted synthetic original position", async () => {
     await expect(
-      store.updateOccurrence(event(), { title: "Ambiguous" }),
-    ).rejects.toThrow("identified uniquely");
-    expect(api.planCalendarAction).not.toHaveBeenCalled();
+      useCalendarStore().updateOccurrence(
+        event({ id: "detached-occurrence" }),
+        { title: "Ambiguous" },
+      ),
+    ).rejects.toThrow("no trusted original position");
+    expect(api.planCalendarOccurrenceAction).not.toHaveBeenCalled();
   });
 
-  it("does not map a stale generated slot onto a moved exception", async () => {
+  it("binds a moved exception to its original slot and displayed fields", async () => {
     const store = useCalendarStore();
-    vi.mocked(api.readCalendarEventSet).mockResolvedValue(view([
-      occurrence({
-        fields: {
-          ...occurrence().fields,
-          start_time: "2026-09-16T09:00:00Z",
-          end_time: "2026-09-16T09:30:00Z",
-        },
-        is_exception: true,
+    const moved = event({
+      start_time: "2026-09-16T09:00:00.000Z",
+      end_time: "2026-09-16T09:30:00.000Z",
+    });
+
+    await store.updateOccurrence(moved, { title: "Moved slot" });
+
+    expect(api.planCalendarOccurrenceAction).toHaveBeenCalledWith(
+      "master",
+      "2026-09-15T09:00:00.000Z",
+      expect.objectContaining({
+        start_time: "2026-09-16T09:00:00.000Z",
+        end_time: "2026-09-16T09:30:00.000Z",
       }),
-    ]));
+      { title: "Moved slot" },
+    );
+  });
 
-    await expect(
-      store.updateOccurrence(event(), { title: "Wrong slot" }),
-    ).rejects.toThrow("identified uniquely");
-    expect(api.planCalendarAction).not.toHaveBeenCalled();
+  it("preserves an all-day occurrence's date-valued original position", async () => {
+    await useCalendarStore().updateOccurrence(event({
+      id: "master_2026-09-15T00:00:00.000Z",
+      start_time: "2026-09-15",
+      end_time: "2026-09-16",
+      all_day: true,
+    }), { title: "All day" });
+
+    expect(api.planCalendarOccurrenceAction).toHaveBeenCalledWith(
+      "master",
+      "2026-09-15",
+      expect.objectContaining({
+        start_time: "2026-09-15",
+        end_time: "2026-09-16",
+        all_day: true,
+      }),
+      { title: "All day" },
+    );
   });
 
   it("keeps series masters blocked while allowing attendee-free occurrences", () => {
