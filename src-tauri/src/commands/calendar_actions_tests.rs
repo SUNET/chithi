@@ -1490,6 +1490,97 @@ async fn atomic_occurrence_plan_rejects_stale_display_before_claiming() {
 }
 
 #[tokio::test]
+async fn completed_caldav_occurrence_survives_sync_and_legacy_restart() {
+    let (_directory, state, operation, remote) = fixture(Some("caldav"), None, false).await;
+    let expected =
+        event_fields(&selected_event(&operation.source.set, Some("2026-09-14")).unwrap());
+    let backend = Fake {
+        protocol: "caldav",
+        remote,
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+    let plan = plan_occurrence_with_backends(
+        &state,
+        "source-event".into(),
+        "2026-09-14".into(),
+        expected,
+        CalendarEdit {
+            title: Some("Durable CalDAV edit".into()),
+            ..CalendarEdit::default()
+        },
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+    execute_with_backends(
+        &state,
+        &plan.operation_id,
+        &CalendarConfirmations::default(),
+        Some(&backends),
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = state.db.writer().await;
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calendar_action_sets
+                 WHERE event_id = 'source-event' AND dirty = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+        db::calendar::upsert_event_by_remote_id(&conn, &operation.source.anchor).unwrap();
+    }
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-20".into(),
+        10,
+    )
+    .await
+    .unwrap();
+    assert!(page.occurrences.iter().any(|occurrence| {
+        occurrence.selection.original_start.as_deref() == Some("2026-09-14")
+            && occurrence.fields.title == "Durable CalDAV edit"
+    }));
+    assert_eq!(page.needs_hydration, ["source-event"]);
+
+    {
+        let conn = state.db.writer().await;
+        conn.execute(
+            "DELETE FROM calendar_action_sets WHERE event_id = 'source-event'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM calendar_action_snapshots WHERE event_id = 'source-event'",
+            [],
+        )
+        .unwrap();
+    }
+    let recovered = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-20".into(),
+        10,
+    )
+    .await
+    .unwrap();
+    assert!(recovered.occurrences.iter().any(|occurrence| {
+        occurrence.selection.original_start.as_deref() == Some("2026-09-14")
+            && occurrence.fields.title == "Durable CalDAV edit"
+    }));
+    assert_eq!(recovered.needs_hydration, ["source-event"]);
+}
+
+#[tokio::test]
 async fn remote_creation_lost_response_has_no_deferred_row_and_recovers_after_restart() {
     let (directory, state, _, remote) = fixture(Some("jmap"), Some("caldav"), false).await;
     remote.lock().unwrap().lose_create_response = true;

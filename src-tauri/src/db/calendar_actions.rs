@@ -459,6 +459,35 @@ pub(crate) fn display_owned_set(
     data.map(|data| decode(&data)).transpose()
 }
 
+/// Last provider-verified result from a completed in-place action. This is a
+/// display-only bridge for operations completed before recurring sets were
+/// stored durably; callers must still require hydration before mutation.
+pub(crate) fn completed_canonical_for_display(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<CalendarEventSet>> {
+    let mut stmt = conn.prepare(
+        "SELECT data FROM calendar_action_operations
+         WHERE event_id = ?1 AND completed = 1
+         ORDER BY created_at DESC, operation_id DESC LIMIT 10",
+    )?;
+    let rows = stmt
+        .query_map([event_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for data in rows {
+        let operation: Operation = decode(&data)?;
+        if operation.stage == CalendarActionStage::Completed
+            && operation.destination.is_none()
+            && operation.source.anchor.id == event_id
+        {
+            if let Some(set) = operation.canonical {
+                return Ok(Some(set));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Membership is determined by exact addresses and explicit recurrence identity,
 /// including historical projections outside the current display window.
 pub(crate) fn set_members(
@@ -631,7 +660,10 @@ pub(crate) fn persist_source(
         )?;
     }
     persist_embedded(conn, &owner, set)?;
-    if members.len() > 1 || source.anchor.recurrence_kind == RecurrenceKind::Occurrence {
+    if set.event.recurrence_kind == RecurrenceKind::Series
+        || members.len() > 1
+        || source.anchor.recurrence_kind == RecurrenceKind::Occurrence
+    {
         save_owned_set(conn, &owner, set)?;
     }
     super::calendar::get_event(conn, &owner.id)

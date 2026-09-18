@@ -396,37 +396,43 @@ async fn list_occurrences(
                         .then(a.event_id.cmp(&b.event_id))
                 });
                 page.occurrences.truncate(limit);
-            } else if let Some(set) = store::display_owned_set(&tx, &id)? {
-                let members: HashSet<_> = store::set_members(&tx, &anchor, &set)?
-                    .into_iter()
-                    .map(|member| member.event.id)
-                    .collect();
-                page.occurrences
-                    .retain(|row| !members.contains(&row.event_id));
-                page.needs_hydration
-                    .retain(|event_id| !members.contains(event_id));
-                projected_members.extend(members);
-                let projected = project(
-                    &set,
-                    &anchor,
-                    &uuid::Uuid::new_v4().to_string(),
-                    &start,
-                    &end,
-                    limit,
-                )?;
-                page.has_more |= projected.has_more;
-                page.occurrences.extend(projected.occurrences);
-                page.has_more |= page.occurrences.len() > limit;
-                page.occurrences.sort_by(|a, b| {
-                    a.fields
-                        .start_time
-                        .cmp(&b.fields.start_time)
-                        .then(a.event_id.cmp(&b.event_id))
-                });
-                page.occurrences.truncate(limit);
-                page.needs_hydration.push(id);
             } else {
-                page.needs_hydration.push(id);
+                let display_set = match store::display_owned_set(&tx, &id)? {
+                    Some(set) => Some(set),
+                    None => store::completed_canonical_for_display(&tx, &id)?,
+                };
+                if let Some(set) = display_set {
+                    let members: HashSet<_> = store::set_members(&tx, &anchor, &set)?
+                        .into_iter()
+                        .map(|member| member.event.id)
+                        .collect();
+                    page.occurrences
+                        .retain(|row| !members.contains(&row.event_id));
+                    page.needs_hydration
+                        .retain(|event_id| !members.contains(event_id));
+                    projected_members.extend(members);
+                    let projected = project(
+                        &set,
+                        &anchor,
+                        &uuid::Uuid::new_v4().to_string(),
+                        &start,
+                        &end,
+                        limit,
+                    )?;
+                    page.has_more |= projected.has_more;
+                    page.occurrences.extend(projected.occurrences);
+                    page.has_more |= page.occurrences.len() > limit;
+                    page.occurrences.sort_by(|a, b| {
+                        a.fields
+                            .start_time
+                            .cmp(&b.fields.start_time)
+                            .then(a.event_id.cmp(&b.event_id))
+                    });
+                    page.occurrences.truncate(limit);
+                    page.needs_hydration.push(id);
+                } else {
+                    page.needs_hydration.push(id);
+                }
             }
             continue;
         }
