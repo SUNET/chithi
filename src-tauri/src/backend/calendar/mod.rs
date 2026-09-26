@@ -484,15 +484,19 @@ pub fn for_protocol(protocol: &str) -> Option<&'static dyn CalendarBackend> {
         .find(|backend| backend.protocol() == protocol)
 }
 
-/// Local events that have never been pushed (no remote_id). Shared by
-/// the JMAP and CalDAV syncs' push pass.
+/// Local events that have never been pushed (no remote_id). Members of a
+/// canonical provider set have no independent address and must not be uploaded.
+/// Shared by the JMAP and CalDAV syncs' push pass.
 pub(crate) fn get_unpushed_events(
     conn: &rusqlite::Connection,
     account_id: &str,
 ) -> Result<Vec<CalendarEvent>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM calendar_events
-         WHERE account_id = ?1 AND (remote_id IS NULL OR remote_id = '')",
+        "SELECT event.id FROM calendar_events event
+         WHERE event.account_id = ?1 AND (event.remote_id IS NULL OR event.remote_id = '')
+           AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
+                           WHERE member.event_id = event.id
+                             AND member.owner_event_id != event.id)",
     )?;
     let ids = stmt
         .query_map(rusqlite::params![account_id], |row| row.get::<_, String>(0))?
@@ -557,6 +561,38 @@ mod registry_tests {
                 (event.recurrence_kind == RecurrenceKind::Series).then_some("FREQ=WEEKLY")
             );
         }
+    }
+
+    #[test]
+    fn canonical_members_are_not_unpushed_events() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.com', 'test@example.com');
+             INSERT INTO calendars (id, account_id, name)
+             VALUES ('calendar', 'account', 'Calendar');",
+        )
+        .unwrap();
+        for id in ["local", "detached", "master"] {
+            let event = CalendarEvent {
+                id: id.into(),
+                account_id: "account".into(),
+                calendar_id: "calendar".into(),
+                remote_id: (id == "master").then(|| "master.ics".into()),
+                ..crate::backend::testutil::event()
+            };
+            crate::db::calendar::insert_event(&conn, &event).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO calendar_action_members(event_id, owner_event_id)
+             VALUES ('detached', 'master')",
+            [],
+        )
+        .unwrap();
+        let unpushed = get_unpushed_events(&conn, "account").unwrap();
+        assert_eq!(unpushed.len(), 1);
+        assert_eq!(unpushed[0].id, "local");
     }
 
     fn account(calendar_protocol: &str, caldav_url: &str) -> AccountFull {

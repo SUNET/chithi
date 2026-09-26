@@ -592,7 +592,131 @@ pub(crate) fn persist_source(
     source: &Snapshot,
     set: &CalendarEventSet,
 ) -> Result<CalendarEvent> {
-    let members = set_members(conn, &source.anchor, &source.set)?;
+    persist_verified_set(conn, &source.anchor, &source.set, set)
+}
+
+/// Sync may verify a complete provider set without a renderer selection token.
+/// Keep ingestion, membership and the canonical cache in the caller's transaction.
+pub(crate) fn persist_synced_caldav_set(
+    tx: &rusqlite::Transaction<'_>,
+    resources: &[(&CalendarEvent, &[RecurrenceIdentitySeed])],
+    set: &CalendarEventSet,
+) -> Result<bool> {
+    if tx.is_autocommit()
+        || resources.is_empty()
+        || set.native.as_ref().is_none_or(|native| {
+            native.protocol != "caldav"
+                || set.event.remote_id.as_deref() != Some(native.event_id.as_str())
+        })
+    {
+        return Err(invalid("sync requires a complete CalDAV source"));
+    }
+    set.validate()?;
+    let master = set.native.as_ref().expect("checked native CalDAV source");
+    let claimed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_action_claims claim
+         JOIN calendar_events event ON event.id = claim.event_id
+         WHERE event.account_id = ?1 AND event.calendar_id = ?2
+           AND (event.uid = ?3 OR event.remote_id = ?4))",
+        params![
+            set.event.account_id,
+            set.event.calendar_id,
+            set.event.uid,
+            master.event_id
+        ],
+        |row| row.get(0),
+    )?;
+    if claimed {
+        return Ok(false);
+    }
+    for (event, seeds) in resources {
+        if event.account_id != set.event.account_id
+            || event.calendar_id != set.event.calendar_id
+            || event.uid != set.event.uid
+        {
+            return Err(invalid("sync resource belongs to another series"));
+        }
+        super::calendar::upsert_event_by_remote_id_with_recurrence_in_transaction(
+            tx, event, seeds,
+        )?;
+    }
+    let anchor_id: String = tx.query_row(
+        "SELECT id FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
+        params![set.event.account_id, set.event.calendar_id, master.event_id],
+        |row| row.get(0),
+    )?;
+    let anchor = super::calendar::get_event(tx, &anchor_id)?;
+    let owner = persist_verified_set(tx, &anchor, set, set)?;
+    let mut active = std::collections::HashSet::from([master.event_id.as_str()]);
+    for native in set.overrides.iter().filter_map(|item| item.native.as_ref()) {
+        active.insert(native.event_id.as_str());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT remote_id FROM calendar_action_addresses
+         WHERE account_id = ?1 AND calendar_id = ?2 AND owner_event_id = ?3 AND retired = 0",
+    )?;
+    let addresses = stmt
+        .query_map(
+            params![owner.account_id, owner.calendar_id, owner.id],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for remote in addresses {
+        if !active.contains(remote.as_str()) {
+            tx.execute(
+                "DELETE FROM calendar_action_addresses WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3 AND owner_event_id = ?4 AND retired = 0",
+                params![owner.account_id, owner.calendar_id, remote, owner.id],
+            )?;
+        }
+    }
+    Ok(true)
+}
+
+/// Delete missing CalDAV owners with their addressless detached rows. A claim
+/// keeps the whole set intact until its in-progress action is resolved.
+pub(crate) fn delete_missing_caldav_events(
+    tx: &rusqlite::Transaction<'_>,
+    missing_owners: &[String],
+) -> Result<usize> {
+    let mut deleted = 0;
+    for owner in missing_owners {
+        let mut members = vec![owner.clone()];
+        let mut stmt = tx.prepare(
+            "SELECT event_id FROM calendar_action_members WHERE owner_event_id = ?1 AND event_id != ?1",
+        )?;
+        members.extend(
+            stmt.query_map([owner], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        let mut claimed = false;
+        for id in &members {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM calendar_action_claims WHERE event_id = ?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            claimed |= active;
+        }
+        if claimed {
+            log::info!("sync_calendars: deferred deletion of claimed CalDAV owner={owner}");
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM calendar_action_addresses WHERE owner_event_id = ?1 AND retired = 0",
+            [owner],
+        )?;
+        deleted += super::calendar_event_deletion::delete_events(tx, &members)?.deleted;
+    }
+    Ok(deleted)
+}
+
+fn persist_verified_set(
+    conn: &Connection,
+    anchor: &CalendarEvent,
+    source_set: &CalendarEventSet,
+    set: &CalendarEventSet,
+) -> Result<CalendarEvent> {
+    let members = set_members(conn, anchor, source_set)?;
     let owner = match &set.native {
         Some(native) => members
             .iter()
@@ -603,7 +727,7 @@ pub(crate) fn persist_source(
             .map(|member| member.event.clone()),
         None => Some(super::calendar::get_event(
             conn,
-            &owner_id(conn, &source.anchor.id)?,
+            &owner_id(conn, &anchor.id)?,
         )?),
     };
     let owner = match owner {
@@ -611,11 +735,11 @@ pub(crate) fn persist_source(
         None => {
             let mut event = set.event.clone();
             event.id = uuid::Uuid::new_v4().to_string();
-            event.account_id = source.anchor.account_id.clone();
-            event.calendar_id = source.anchor.calendar_id.clone();
-            event.source_message_id = source.anchor.source_message_id.clone();
+            event.account_id = anchor.account_id.clone();
+            event.calendar_id = anchor.calendar_id.clone();
+            event.source_message_id = anchor.source_message_id.clone();
             super::calendar::insert_event(conn, &event)?;
-            if let Some(mut binding) = super::meet_meetings::get(conn, &source.anchor.id)? {
+            if let Some(mut binding) = super::meet_meetings::get(conn, &anchor.id)? {
                 binding.event_id = event.id.clone();
                 super::meet_meetings::upsert(conn, &binding)?;
             }
@@ -662,7 +786,7 @@ pub(crate) fn persist_source(
     persist_embedded(conn, &owner, set)?;
     if set.event.recurrence_kind == RecurrenceKind::Series
         || members.len() > 1
-        || source.anchor.recurrence_kind == RecurrenceKind::Occurrence
+        || anchor.recurrence_kind == RecurrenceKind::Occurrence
     {
         save_owned_set(conn, &owner, set)?;
     }
