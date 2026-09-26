@@ -12,7 +12,7 @@ vi.mock("@/lib/tauri", () => ({
   createEvent: vi.fn().mockResolvedValue("event"),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
-    occurrences: [], has_more: false, needs_hydration: [],
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
   listCalendars: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
@@ -189,6 +189,32 @@ describe("CalendarView responsive event form lifecycle", () => {
       expect(wrapper.find(`[data-testid=cal-month-cell-${day}]`).exists()).toBe(true);
       expect(wrapper.find(`[data-testid=cal-event-${id}]`).exists()).toBe(true);
     }
+    wrapper.unmount();
+  });
+
+  it("keeps the incomplete-series warning visible and offers verification", async () => {
+    const calendarStore = useCalendarStore();
+    calendarStore.viewMode = "month";
+    calendarStore.unresolvedOccurrences = [{ event_id: "child", calendar_id: "calendar" }];
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
+    vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+    const verify = vi.spyOn(calendarStore, "repairIncompleteOccurrences").mockResolvedValue();
+    const wrapper = mount(CalendarView, {
+      global: { stubs: {
+        CalendarSidebar: true, WeekView: true, MonthView: true,
+        EventDetail: true, MobileAppBar: true, MobileIconButton: true,
+        EventForm: true,
+      } },
+    });
+    await flushPromises();
+    const warning = wrapper.find(".calendar-incomplete");
+    expect(warning.attributes("role")).toBe("alert");
+    expect(warning.text()).toContain("Affected series are hidden until verified");
+    await warning.find("button").trigger("click");
+    expect(verify).toHaveBeenCalledOnce();
+    expect(wrapper.find(".calendar-incomplete").exists()).toBe(true);
     wrapper.unmount();
   });
 

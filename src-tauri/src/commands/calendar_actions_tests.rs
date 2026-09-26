@@ -1346,6 +1346,165 @@ async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_pos
 }
 
 #[tokio::test]
+async fn identityless_detached_row_withholds_its_series_but_not_other_events() {
+    let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
+    {
+        let conn = state.db.writer().await;
+        let child = CalendarEvent {
+            id: "unresolved-child".into(),
+            uid: operation.source.anchor.uid.clone(),
+            remote_id: Some("remote-child".into()),
+            recurrence_kind: RecurrenceKind::Occurrence,
+            recurrence_rule: None,
+            start_time: "2026-09-15".into(),
+            end_time: "2026-09-16".into(),
+            ..operation.source.anchor.clone()
+        };
+        db::calendar::insert_event(&conn, &child).unwrap();
+        let other = CalendarEvent {
+            id: "other-event".into(),
+            uid: Some("other-uid".into()),
+            remote_id: None,
+            recurrence_kind: RecurrenceKind::Standalone,
+            recurrence_rule: None,
+            start_time: "2026-09-15".into(),
+            end_time: "2026-09-16".into(),
+            ..operation.source.anchor.clone()
+        };
+        db::calendar::insert_event(&conn, &other).unwrap();
+    }
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-20".into(),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.unresolved.len(), 1);
+    assert_eq!(page.unresolved[0].event_id, "unresolved-child");
+    assert_eq!(page.unresolved[0].calendar_id, "source-calendar");
+    assert_eq!(page.occurrences.len(), 1);
+    assert_eq!(page.occurrences[0].event_id, "other-event");
+    assert!(page.needs_hydration.is_empty());
+    assert!(
+        store::latest_snapshot(&state.db.reader(), "unresolved-child")
+            .unwrap()
+            .is_none()
+    );
+
+    // Without a UID, even the child's series cannot be identified. Keep
+    // unrelated standalone events, but do not guess which master to expand.
+    {
+        let conn = state.db.writer().await;
+        conn.execute(
+            "UPDATE calendar_events SET uid = NULL WHERE id = 'unresolved-child'",
+            [],
+        )
+        .unwrap();
+    }
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-20".into(),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.unresolved.len(), 1);
+    assert_eq!(page.occurrences.len(), 1);
+    assert_eq!(page.occurrences[0].event_id, "other-event");
+}
+
+#[tokio::test]
+async fn unresolved_child_is_repaired_only_by_an_exact_verified_provider_override() {
+    let (_directory, state, operation, remote) = fixture(Some("graph"), None, false).await;
+    let mut child = CalendarEvent {
+        id: "unresolved-child".into(),
+        uid: operation.source.anchor.uid.clone(),
+        remote_id: Some("remote-child".into()),
+        recurrence_kind: RecurrenceKind::Occurrence,
+        recurrence_rule: None,
+        start_time: "2026-09-19".into(),
+        end_time: "2026-09-21".into(),
+        ..operation.source.anchor.clone()
+    };
+    {
+        let conn = state.db.writer().await;
+        db::calendar::insert_event(&conn, &child).unwrap();
+    }
+    let backend = Fake {
+        protocol: "graph",
+        remote: remote.clone(),
+    };
+    let backends: [&dyn CalendarBackend; 1] = [&backend];
+    let failure = repair_unresolved_occurrence(&state, &child.id, Some(&backends))
+        .await
+        .unwrap_err();
+    assert!(failure
+        .to_string()
+        .contains("did not verify the detached occurrence"));
+    assert_eq!(
+        store::owner_id(&state.db.reader(), &child.id).unwrap(),
+        child.id
+    );
+
+    let mut verified = operation.source.set.clone();
+    child.title = "Moved occurrence".into();
+    verified.overrides.push(CalendarOverride {
+        original_start: "2026-09-15".into(),
+        event: Some(child.clone()),
+        native: None,
+    });
+    refresh_native(&mut verified, "graph");
+    let moved = verified
+        .overrides
+        .iter_mut()
+        .find(|item| item.original_start == "2026-09-15")
+        .unwrap();
+    moved.native.as_mut().unwrap().event_id = "remote-child".into();
+    remote
+        .lock()
+        .unwrap()
+        .sets
+        .insert(("source".into(), "source-calendar".into()), verified);
+    assert!(
+        repair_unresolved_occurrence(&state, &child.id, Some(&backends),)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store::owner_id(&state.db.reader(), &child.id).unwrap(),
+        "source-event"
+    );
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-09-14".into(),
+        "2026-09-22".into(),
+        20,
+    )
+    .await
+    .unwrap();
+    assert!(page.unresolved.is_empty());
+    assert!(page.occurrences.iter().any(|item| {
+        item.event_id == "source-event"
+            && item.selection.original_start.as_deref() == Some("2026-09-15")
+            && item.fields.start_time == "2026-09-19"
+    }));
+    assert!(
+        !repair_unresolved_occurrence(&state, &child.id, Some(&backends))
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn dirty_graph_set_remains_coherent_for_display_only() {
     let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
     {

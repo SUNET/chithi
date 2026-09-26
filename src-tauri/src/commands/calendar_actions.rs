@@ -306,6 +306,71 @@ async fn read_event_set(
     Ok(view)
 }
 
+/// Retry an incomplete detached row only through an exact, provider-verified
+/// event set. The original recurrence slot is never inferred from its DTSTART.
+#[tauri::command]
+pub async fn repair_calendar_occurrence(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<bool> {
+    repair_unresolved_occurrence(&state, &event_id, None).await
+}
+
+async fn repair_unresolved_occurrence(
+    state: &AppState,
+    event_id: &str,
+    backends: Option<&[&dyn providers::CalendarBackend]>,
+) -> Result<bool> {
+    let anchor = db::calendar::get_event(&state.db.reader(), event_id)?;
+    let _guards = account_guards(state, &anchor.account_id, None).await;
+    let already_resolved = {
+        let conn = state.db.reader();
+        store::owner_id(&conn, event_id)? != event_id
+            || anchor.recurrence_kind != RecurrenceKind::Occurrence
+            || db::calendar_recurrence::get_by_event_id(&conn, event_id)?
+                .iter()
+                .any(|identity| {
+                    matches!(
+                        identity.kind,
+                        RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+                    )
+                })
+    };
+    if already_resolved {
+        return Ok(false);
+    }
+    let snapshot = hydrate_with_backends(state, event_id, backends).await?;
+    let remote = anchor
+        .remote_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("unresolved occurrence has no provider address"))?;
+    if snapshot.anchor != anchor
+        || snapshot.set.event.recurrence_kind != RecurrenceKind::Series
+        || snapshot.set.event.uid.is_none()
+        || snapshot.set.event.uid != anchor.uid
+        || !snapshot.set.overrides.iter().any(|item| {
+            item.native
+                .as_ref()
+                .is_some_and(|native| native.event_id == remote)
+        })
+    {
+        return Err(invalid(
+            "provider did not verify the detached occurrence in its series",
+        ));
+    }
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    persist_hydrated_source(&tx, snapshot)?;
+    if store::owner_id(&tx, event_id)? == event_id {
+        return Err(invalid(
+            "verified occurrence was not attached to its master",
+        ));
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Bounded database-only projection. Detached provider instances stay anchored
 /// to their existing event IDs; planning hydrates their real master separately.
 #[tauri::command]
@@ -356,13 +421,71 @@ async fn list_occurrences(
         occurrences: Vec::new(),
         has_more: ids.len() > 2000,
         needs_hydration: Vec::new(),
+        unresolved: Vec::new(),
     };
-    let mut projected_members = HashSet::new();
-    for id in ids.into_iter().take(2000) {
-        if projected_members.contains(&id) {
+    // Inspect the whole selected page before projecting any master. An
+    // identityless child may sort after its master; projecting first would
+    // present a generated original slot without knowing its moved exception.
+    let anchors = ids
+        .into_iter()
+        .take(2000)
+        .map(|id| db::calendar::get_event(&tx, &id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut ambiguous = HashSet::new();
+    let mut calendars_with_unknown_uid = HashSet::new();
+    let mut unresolved_ids = HashSet::new();
+    for anchor in &anchors {
+        if anchor.recurrence_kind != RecurrenceKind::Occurrence {
             continue;
         }
-        let anchor = db::calendar::get_event(&tx, &id)?;
+        let identities = db::calendar_recurrence::get_by_event_id(&tx, &anchor.id)?;
+        if !identities.iter().any(|identity| {
+            matches!(
+                identity.kind,
+                RecurrenceObjectKind::Occurrence | RecurrenceObjectKind::Exception
+            )
+        }) {
+            ambiguous.insert((anchor.calendar_id.clone(), anchor.uid.clone()));
+            if anchor.uid.is_none() {
+                calendars_with_unknown_uid.insert(anchor.calendar_id.clone());
+            }
+            unresolved_ids.insert(anchor.id.clone());
+            page.unresolved
+                .push(crate::calendar::actions::UnresolvedCalendarOccurrence {
+                    event_id: anchor.id.clone(),
+                    calendar_id: anchor.calendar_id.clone(),
+                });
+        }
+    }
+    if !page.unresolved.is_empty() {
+        log::warn!(
+            "Calendar projection has {} unresolved detached row(s) for account {}; affected series withheld",
+            page.unresolved.len(),
+            account_id
+        );
+    }
+    let mut projected_members = HashSet::new();
+    for anchor in anchors {
+        if projected_members.contains(&anchor.id) {
+            continue;
+        }
+        if unresolved_ids.contains(&anchor.id) {
+            continue;
+        }
+        if anchor.uid.is_some()
+            && ambiguous.contains(&(anchor.calendar_id.clone(), anchor.uid.clone()))
+        {
+            continue;
+        }
+        if calendars_with_unknown_uid.contains(&anchor.calendar_id)
+            && matches!(
+                anchor.recurrence_kind,
+                RecurrenceKind::Series | RecurrenceKind::Occurrence | RecurrenceKind::Unknown
+            )
+        {
+            continue;
+        }
+        let id = anchor.id.clone();
         let calendar = db::calendar::get_calendar(&tx, &anchor.calendar_id)?;
         if matches!(
             anchor.recurrence_kind,

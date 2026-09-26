@@ -7,8 +7,9 @@ vi.mock("@/lib/tauri", () => ({
   listRoomSuggestions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
-    occurrences: [], has_more: false, needs_hydration: [],
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
+  repairCalendarOccurrence: vi.fn().mockResolvedValue(false),
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
@@ -285,6 +286,55 @@ describe("Calendar store", () => {
     });
   });
 
+  it("shows verified events and keeps an explicit warning for unresolved series", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.calendars = [makeCalendar("cal1", "Work")];
+    store.currentDate = "2026-09-15";
+    const master = makeEvent("master", "Series", "2026-09-14T10:00:00Z",
+      "2026-09-14T11:00:00Z", { uid: "same-uid", recurrence_rule: "FREQ=DAILY" });
+    const child = {
+      ...makeEvent("child", "Moved", "2026-09-15T12:00:00Z",
+        "2026-09-15T13:00:00Z", { uid: "same-uid" }),
+      recurrence_kind: "occurrence" as const,
+    };
+    const other = makeEvent("other", "Other", "2026-09-15T15:00:00Z",
+      "2026-09-15T16:00:00Z");
+    vi.mocked(api.getEvents).mockResolvedValue([master, child, other]);
+    const page = {
+      occurrences: [{
+        selection: { event_id: other.id, token: "safe", original_start: null },
+        event_id: other.id, account_id: other.account_id,
+        calendar_id: other.calendar_id,
+        fields: {
+          title: other.title, description: other.description, location: other.location,
+          start_time: other.start_time, end_time: other.end_time,
+          all_day: other.all_day, timezone: other.timezone,
+        },
+        recurrence_kind: "standalone" as const, recurrence_rule: null,
+        is_exception: false,
+      }],
+      has_more: false, needs_hydration: [],
+      unresolved: [{ event_id: child.id, calendar_id: child.calendar_id }],
+    };
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue(page);
+    await store.fetchEvents();
+    expect(store.visibleEvents.map((event) => event.id)).toEqual([other.id]);
+    expect(store.unresolvedOccurrences).toEqual(page.unresolved);
+    expect(store.loadError).toBeNull();
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(api.repairCalendarOccurrence).mockRejectedValueOnce(new Error("unverified"));
+      await store.repairIncompleteOccurrences();
+      expect(api.repairCalendarOccurrence).toHaveBeenCalledWith(child.id);
+      expect(store.visibleEvents.map((event) => event.id)).toEqual([other.id]);
+      expect(store.unresolvedOccurrences).toEqual(page.unresolved);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   describe("recurring occurrences (unclickable-event regression)", () => {
     // Synthetic display identities remain selectable but cannot be mutated.
     function setupRecurring() {
@@ -350,7 +400,7 @@ describe("Calendar store", () => {
           is_exception: true,
         }],
         has_more: false,
-        needs_hydration: [master.id],
+        needs_hydration: [master.id], unresolved: [],
       });
 
       await store.fetchEvents();
@@ -372,7 +422,7 @@ describe("Calendar store", () => {
       vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
         occurrences: [],
         has_more: false,
-        needs_hydration: [master.id],
+        needs_hydration: [master.id], unresolved: [],
       });
 
       await store.fetchEvents();
@@ -389,7 +439,7 @@ describe("Calendar store", () => {
       vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
         occurrences: [],
         has_more: true,
-        needs_hydration: [],
+        needs_hydration: [], unresolved: [],
       });
 
       await expect(store.fetchEvents()).rejects.toThrow("display limit");
@@ -501,7 +551,7 @@ describe("Calendar store", () => {
         .mockImplementationOnce(() => mayRead.promise)
         .mockImplementationOnce(() => juneRead.promise);
       vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
-        occurrences: [], has_more: false, needs_hydration: ["june"],
+        occurrences: [], has_more: false, needs_hydration: ["june"], unresolved: [],
       });
 
       store.goToDate("2026-05-07");

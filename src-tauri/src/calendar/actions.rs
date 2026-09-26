@@ -40,6 +40,15 @@ pub struct CalendarOccurrencePage {
     /// Cached provider masters whose complete finite set needs an authoritative
     /// read before generating positions. These IDs are ordinary event anchors.
     pub needs_hydration: Vec<String>,
+    /// Rows which cannot be placed without a verified original recurrence
+    /// position. Never treat these as standalone or generated occurrences.
+    pub unresolved: Vec<UnresolvedCalendarOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnresolvedCalendarOccurrence {
+    pub event_id: String,
+    pub calendar_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +260,7 @@ pub(crate) fn project(
     values.truncate(limit);
     Ok(CalendarOccurrencePage {
         needs_hydration: Vec::new(),
+        unresolved: Vec::new(),
         occurrences: values
             .into_iter()
             .map(

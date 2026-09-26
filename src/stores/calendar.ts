@@ -2,7 +2,8 @@ import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  Calendar, CalendarEdit, CalendarEvent, CalendarOccurrence, NewEventInput,
+  Calendar, CalendarEdit, CalendarEvent, CalendarOccurrence,
+  CalendarOccurrencePage, NewEventInput,
 } from "@/lib/types";
 import {
   expandRRule, isOccurrenceId, masterEventId, occurrenceId, parseRRule,
@@ -31,6 +32,9 @@ export const useCalendarStore = defineStore("calendar", () => {
   const eventsError = ref<string | null>(null);
   const calendarsError = ref<string | null>(null);
   const loadError = computed(() => calendarsError.value ?? eventsError.value);
+  const unresolvedOccurrences = ref<CalendarOccurrencePage["unresolved"]>([]);
+  const repairingOccurrences = ref(false);
+  let repairOffset = 0;
   const failedNavigation = ref<{ date: string; mode: CalendarViewMode } | null>(null);
   const pendingDisplay = ref<{ date: string; mode: CalendarViewMode } | null>(null);
   const displayDate = computed(() => pendingDisplay.value?.date ?? currentDate.value);
@@ -305,7 +309,9 @@ export const useCalendarStore = defineStore("calendar", () => {
       const projectedIds = new Set<string>();
       const projectedMasters = new Set<string>();
       const needsHydration = new Set<string>();
+      const unresolved = new Map<string, CalendarOccurrencePage["unresolved"][number]>();
       for (const page of occurrencePages) {
+        for (const row of page.unresolved) unresolved.set(row.event_id, row);
         for (const id of page.needs_hydration) needsHydration.add(id);
         for (const occurrence of page.occurrences) {
           projectedMasters.add(occurrence.event_id);
@@ -339,6 +345,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       const hadSingleEvent = selectedId && singleEventCache.value.has(selectedId);
       events.value = rawEvents;
       projectedEvents.value = projected;
+      unresolvedOccurrences.value = [...unresolved.values()];
       pendingDisplay.value = null;
       failedNavigation.value = null;
       if (refreshSelected && selectedId && hadSingleEvent) {
@@ -607,6 +614,30 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
+  /** User-triggered, bounded provider verification; never invents identities. */
+  async function repairIncompleteOccurrences() {
+    if (repairingOccurrences.value || unresolvedOccurrences.value.length === 0) return;
+    repairingOccurrences.value = true;
+    try {
+      const rows = unresolvedOccurrences.value;
+      const candidates = Array.from({ length: Math.min(5, rows.length) }, (_, index) =>
+        rows[(repairOffset + index) % rows.length]);
+      repairOffset = (repairOffset + candidates.length) % rows.length;
+      for (const row of candidates) {
+        try {
+          await api.repairCalendarOccurrence(row.event_id);
+        } catch (error) {
+          console.warn("Calendar occurrence verification failed:", row.event_id, error);
+        }
+      }
+      await fetchEvents({ refreshSelected: false });
+    } catch (error) {
+      console.error("Calendar occurrence refresh failed:", error);
+    } finally {
+      repairingOccurrences.value = false;
+    }
+  }
+
   function goToday() {
     goToDate(toDateInTimezone(new Date(), uiStore.displayTimezone));
   }
@@ -737,6 +768,8 @@ export const useCalendarStore = defineStore("calendar", () => {
     displayDate,
     loading,
     loadError,
+    unresolvedOccurrences,
+    repairingOccurrences,
     navigationPending,
     selectedEvent,
     singleEventCache,
@@ -756,6 +789,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     setViewMode,
     goToDate,
     retryNavigation,
+    repairIncompleteOccurrences,
     goToday,
     goPrev,
     goNext,

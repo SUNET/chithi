@@ -376,6 +376,8 @@ export interface CalendarOccurrencePage {
   occurrences: CalendarOccurrence[];
   has_more: boolean;
   needs_hydration: string[];
+  /** Unverified detached rows; never project or edit them as occurrences. */
+  unresolved: { event_id: string; calendar_id: string }[];
 }
 
 export interface CalendarEventSetView {

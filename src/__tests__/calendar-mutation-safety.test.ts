@@ -10,7 +10,7 @@ vi.mock("@/lib/tauri", () => ({
   createEvent: vi.fn().mockResolvedValue("created-event"),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
-    occurrences: [], has_more: false, needs_hydration: [],
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
   getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
@@ -993,7 +993,7 @@ describe("real responsive calendar selection", () => {
     vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
       occurrences: [],
       has_more: false,
-      needs_hydration: [master.id],
+      needs_hydration: [master.id], unresolved: [],
     });
     store.selectEvent(null);
     usePlatformStore().width = width;

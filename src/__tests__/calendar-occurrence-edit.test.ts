@@ -11,7 +11,7 @@ vi.mock("@/lib/tauri", () => ({
   listPendingCalendarActions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
-    occurrences: [], has_more: false, needs_hydration: [],
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
   listCalendars: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),

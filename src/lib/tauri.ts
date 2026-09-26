@@ -424,6 +424,10 @@ export async function listCalendarOccurrences(
   });
 }
 
+export async function repairCalendarOccurrence(eventId: string): Promise<boolean> {
+  return invoke("repair_calendar_occurrence", { eventId });
+}
+
 export async function planCalendarAction(
   input: import("./types").CalendarActionInput,
 ): Promise<import("./types").CalendarActionPlan> {

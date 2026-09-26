@@ -451,6 +451,13 @@ onMounted(() => {
       {{ calendarStore.loadError }}
       <button @click="calendarStore.retryNavigation()">Retry</button>
     </div>
+    <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
+      {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
+      Affected series are hidden until verified.
+      <button :disabled="calendarStore.repairingOccurrences" @click="calendarStore.repairIncompleteOccurrences()">
+        {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
+      </button>
+    </div>
 
     <!-- DAY VIEW -->
     <div v-if="calendarStore.displayViewMode === 'day'" ref="dayViewRef" class="day-view" :inert="calendarStore.navigationPending">
@@ -665,6 +672,13 @@ onMounted(() => {
         {{ calendarStore.loadError }}
         <button @click="calendarStore.retryNavigation()">Retry</button>
       </div>
+      <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
+        {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
+        Affected series are hidden until verified.
+        <button :disabled="calendarStore.repairingOccurrences" @click="calendarStore.repairIncompleteOccurrences()">
+          {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
+        </button>
+      </div>
       <div class="calendar-content" :inert="calendarStore.navigationPending">
         <WeekView
           v-if="calendarStore.displayViewMode === 'day' || calendarStore.displayViewMode === 'week'"
@@ -827,7 +841,8 @@ onMounted(() => {
 }
 
 .calendar-load-status,
-.calendar-load-error {
+.calendar-load-error,
+.calendar-incomplete {
   flex-shrink: 0;
   padding: 6px 14px;
   font-size: 12px;
@@ -835,14 +850,21 @@ onMounted(() => {
   color: var(--color-text-muted);
 }
 
-.calendar-load-error {
+.calendar-load-error,
+.calendar-incomplete {
   color: var(--color-text);
 }
 
-.calendar-load-error button {
+.calendar-load-error button,
+.calendar-incomplete button {
   margin-left: 8px;
   color: var(--color-accent);
   text-decoration: underline;
+}
+
+.calendar-incomplete button:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 /* ============================================================
