@@ -49,6 +49,19 @@ import { useAccountsStore } from "@/stores/accounts";
 import { isOccurrenceId, masterEventId, occurrenceId } from "@/lib/rrule";
 import type { CalendarEvent } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { monthGridDays, calendarDay } from "@/lib/calendar-days";
+import { useUiStore } from "@/stores/ui";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function settleNavigation(store: ReturnType<typeof useCalendarStore>) {
+  await vi.waitFor(() => expect(store.loading).toBe(false));
+}
 
 function setupAccounts() {
   const accountsStore = useAccountsStore();
@@ -456,6 +469,185 @@ describe("Calendar store", () => {
       store.viewMode = "month";
       store.goNext();
       expect(store.currentDate).toBe("2026-05-07");
+    });
+
+    it("clamps month-end navigation without skipping months", () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.viewMode = "month";
+      store.currentDate = "2026-01-31";
+      store.goNext();
+      expect(store.currentDate).toBe("2026-02-28");
+      store.currentDate = "2028-01-31";
+      store.goNext();
+      expect(store.currentDate).toBe("2028-02-29");
+      store.currentDate = "2026-05-31";
+      store.goPrev();
+      expect(store.currentDate).toBe("2026-04-30");
+    });
+
+    it("keeps the displayed month until its result commits and ignores older reads", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.currentDate = "2026-04-07";
+      store.viewMode = "month";
+      const april = makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z");
+      const june = makeEvent("june", "June", "2026-06-07T12:00:00Z", "2026-06-07T13:00:00Z");
+      store.events = [april];
+      const mayRead = deferred<CalendarEvent[]>();
+      const juneRead = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => mayRead.promise)
+        .mockImplementationOnce(() => juneRead.promise);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
+        occurrences: [], has_more: false, needs_hydration: ["june"],
+      });
+
+      store.goToDate("2026-05-07");
+      store.goToDate("2026-06-07");
+      expect(store.currentDate).toBe("2026-06-07");
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.navigationPending).toBe(true);
+
+      juneRead.resolve([june]);
+      await settleNavigation(store);
+      expect(store.displayDate).toBe("2026-06-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["june"]);
+      mayRead.resolve([april]);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(store.displayDate).toBe("2026-06-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["june"]);
+      expect(store.loading).toBe(false);
+    });
+
+    it("ignores stale failures and does not turn a failed month into an empty month", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.currentDate = "2026-04-07";
+      store.viewMode = "month";
+      const april = makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z");
+      store.events = [april];
+      const stale = deferred<CalendarEvent[]>();
+      const failed = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => stale.promise)
+        .mockImplementationOnce(() => failed.promise);
+      store.goToDate("2026-05-07");
+      store.goToDate("2026-06-07");
+      stale.reject(new Error("stale read failed"));
+      await Promise.resolve();
+      expect(store.loading).toBe(true);
+      expect(store.loadError).toBeNull();
+
+      failed.reject(new Error("database unavailable"));
+      await settleNavigation(store);
+      expect(store.currentDate).toBe("2026-04-07");
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.loadError).toMatch(/retry/i);
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      store.retryNavigation();
+      await settleNavigation(store);
+      expect(store.currentDate).toBe("2026-06-07");
+      expect(store.loadError).toBeNull();
+    });
+
+    it("keeps the latest same-range read and its loading state", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.viewMode = "month";
+      store.currentDate = "2026-04-07";
+      const oldRead = deferred<CalendarEvent[]>();
+      const newRead = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => oldRead.promise)
+        .mockImplementationOnce(() => newRead.promise);
+      const first = store.fetchEvents();
+      const second = store.fetchEvents();
+      oldRead.resolve([]);
+      await first;
+      expect(store.loading).toBe(true);
+      newRead.resolve([]);
+      await second;
+      expect(store.loading).toBe(false);
+    });
+
+    it("preserves the old month when its occurrence projection fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.viewMode = "month";
+      store.currentDate = "2026-04-07";
+      store.events = [makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z")];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      vi.mocked(api.listCalendarOccurrences).mockRejectedValueOnce(new Error("projection failed"));
+      store.goToDate("2026-05-07");
+      await settleNavigation(store);
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.loadError).toMatch(/retry/i);
+    });
+
+    it("does not replace subscribed calendars with a failed account read", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      const otherAccount = { ...useAccountsStore().accounts[0], id: "acc2" };
+      useAccountsStore().accounts.push(otherAccount);
+      vi.mocked(api.listCalendars)
+        .mockResolvedValueOnce([makeCalendar("new", "Other")])
+        .mockRejectedValueOnce(new Error("database unavailable"));
+      await expect(store.fetchCalendars()).rejects.toThrow("database unavailable");
+      expect(store.calendars.map((calendar) => calendar.id)).toEqual(["cal1"]);
+      expect(store.loadError).toMatch(/retry/i);
+    });
+
+    it("queries all visible desktop and mobile month cells in the display timezone", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const ui = useUiStore();
+      ui.weekStartDay = 1;
+      ui.displayTimezone = "Europe/Stockholm";
+      store.currentDate = "2026-05-15";
+      store.viewMode = "month";
+      await store.fetchEvents();
+      const desktop = monthGridDays(store.currentDate, 1);
+      const mobile = monthGridDays(store.currentDate, 0, true);
+      const days = [...desktop, ...mobile].map(calendarDay).sort();
+      const calls = vi.mocked(api.getEvents).mock.calls;
+      const [, start, end] = calls[calls.length - 1];
+      expect(start).toBe("2026-04-25T22:00:00.000Z");
+      expect(end).toBe("2026-06-06T21:59:59.999Z");
+      expect(days[0]).toBe("2026-04-26");
+      expect(days[days.length - 1]).toBe("2026-06-06");
+    });
+
+    it("treats civil month dates consistently across host timezones and DST", async () => {
+      try {
+        for (const timezone of ["America/Los_Angeles", "Europe/Stockholm"]) {
+          vi.stubEnv("TZ", timezone);
+          setActivePinia(createPinia());
+          setupAccounts();
+          const store = useCalendarStore();
+          store.viewMode = "month";
+          store.currentDate = "2026-03-31";
+          const days = monthGridDays(store.currentDate, 0, true).map(calendarDay);
+          expect(days[0]).toBe("2026-03-01");
+          expect(days[days.length - 1]).toBe("2026-04-11");
+          expect(new Set(days).size).toBe(42);
+          store.goNext();
+          expect(store.currentDate).toBe("2026-04-30");
+          expect(store.displayDate).toBe("2026-03-31");
+          await settleNavigation(store);
+        }
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
   });
 

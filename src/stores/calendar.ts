@@ -11,18 +11,33 @@ import {
   calendarEditSupport, calendarMutationSupport,
 } from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
+import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
+import { startOfDayUTC, toDateInTimezone } from "@/lib/datetime";
 import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
 
 export type CalendarViewMode = "day" | "week" | "month";
 
 export const useCalendarStore = defineStore("calendar", () => {
+  const uiStore = useUiStore();
   const calendars = ref<Calendar[]>([]);
   const events = ref<CalendarEvent[]>([]);
   const projectedEvents = ref<CalendarEvent[] | null>(null);
   const viewMode = ref<CalendarViewMode>("week");
-  const currentDate = ref(new Date().toISOString().split("T")[0]); // YYYY-MM-DD
+  // currentDate/viewMode are the requested target. While it loads, the grid
+  // keeps rendering the previous coherent date/mode with its old projection.
+  const currentDate = ref(toDateInTimezone(new Date(), uiStore.displayTimezone));
   const loading = ref(false);
+  const eventsError = ref<string | null>(null);
+  const calendarsError = ref<string | null>(null);
+  const loadError = computed(() => calendarsError.value ?? eventsError.value);
+  const failedNavigation = ref<{ date: string; mode: CalendarViewMode } | null>(null);
+  const pendingDisplay = ref<{ date: string; mode: CalendarViewMode } | null>(null);
+  const displayDate = computed(() => pendingDisplay.value?.date ?? currentDate.value);
+  const displayViewMode = computed(() => pendingDisplay.value?.mode ?? viewMode.value);
+  const navigationPending = computed(() => pendingDisplay.value !== null);
+  let rangeRequest = 0;
+  let calendarListRequest = 0;
   const selectedEvent = ref<CalendarEvent | null>(null);
   // Exact-ID detail/capability data is independent of the rendered date range.
   // Null revokes authorization while a refresh is pending or has failed.
@@ -36,7 +51,6 @@ export const useCalendarStore = defineStore("calendar", () => {
   }, { flush: "sync" });
 
   const accountsStore = useAccountsStore();
-  const uiStore = useUiStore();
 
   // Visible calendars (all by default). Persisted to localStorage so the
   // user's hide/show picks survive across sessions.
@@ -70,7 +84,7 @@ export const useCalendarStore = defineStore("calendar", () => {
 
   // Expand recurring events into individual occurrences for display
   const visibleEvents = computed(() => {
-    const range = getDateRange();
+    const range = getDateRange(displayDate.value, displayViewMode.value);
     const rangeStart = new Date(range.start);
     const rangeEnd = new Date(range.end);
 
@@ -154,17 +168,20 @@ export const useCalendarStore = defineStore("calendar", () => {
     };
   }
 
-  function getDateRange(): { start: string; end: string } {
-    const d = new Date(currentDate.value);
+  function getDateRange(
+    date = currentDate.value,
+    mode = viewMode.value,
+  ): { start: string; end: string } {
+    const d = parseCalendarDay(date);
     let start: Date;
     let end: Date;
 
-    if (viewMode.value === "day") {
+    if (mode === "day") {
       start = new Date(d);
       start.setHours(0, 0, 0, 0);
       end = new Date(d);
       end.setHours(23, 59, 59, 999);
-    } else if (viewMode.value === "week") {
+    } else if (mode === "week") {
       start = new Date(d);
       const offset = (d.getDay() - uiStore.weekStartDay + 7) % 7;
       start.setDate(d.getDate() - offset);
@@ -173,9 +190,17 @@ export const useCalendarStore = defineStore("calendar", () => {
       end.setDate(start.getDate() + 6);
       end.setHours(23, 59, 59, 999);
     } else {
-      // month
-      start = new Date(d.getFullYear(), d.getMonth(), 1);
-      end = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+      // Both month layouts show adjacent-month cells. Cover their union.
+      const desktop = monthGridDays(date, uiStore.weekStartDay);
+      const mobile = monthGridDays(date, 0, true);
+      const days = [...desktop, ...mobile].map(calendarDay).sort();
+      const last = parseCalendarDay(days[days.length - 1]);
+      last.setDate(last.getDate() + 1);
+      return {
+        start: new Date(startOfDayUTC(days[0], uiStore.displayTimezone)).toISOString(),
+        end: new Date(startOfDayUTC(calendarDay(last), uiStore.displayTimezone) - 1)
+          .toISOString(),
+      };
     }
 
     return {
@@ -224,47 +249,41 @@ export const useCalendarStore = defineStore("calendar", () => {
   }
 
   async function fetchCalendars() {
+    const request = ++calendarListRequest;
     // Ensure accounts are loaded
-    if (accountsStore.accounts.length === 0) {
-      await accountsStore.fetchAccounts();
+    try {
+      if (accountsStore.accounts.length === 0) {
+        await accountsStore.fetchAccounts();
+      }
+      if (request !== calendarListRequest) return;
+      if (accountsStore.accounts.length === 0) {
+        calendars.value = [];
+        calendarsError.value = null;
+        return;
+      }
+      // Fan out across accounts in parallel; incomplete reads cannot replace
+      // the subscribed list and hide all its events.
+      const results = await Promise.all(accountsStore.accounts.map((account) =>
+        api.listCalendars(account.id)));
+      if (request !== calendarListRequest) return;
+      calendars.value = results.flat().filter((c) => c.is_subscribed);
+      calendarsError.value = null;
+    } catch (error) {
+      if (request !== calendarListRequest) return;
+      calendarsError.value = "Could not load calendars. Please retry.";
+      throw error;
     }
-    if (accountsStore.accounts.length === 0) {
-      calendars.value = [];
-      return;
-    }
-    // Fan out across accounts in parallel — each api.listCalendars is a
-    // pure SQLite read, so the round-trip cost is mostly Tauri IPC.
-    // Serialized awaits here add up to hundreds of ms on nav.
-    const results = await Promise.all(
-      accountsStore.accounts.map((account) =>
-        api
-          .listCalendars(account.id)
-          .catch((e) => {
-            console.error("Failed to fetch calendars for", account.id, e);
-            return [] as Calendar[];
-          }),
-      ),
-    );
-    calendars.value = results
-      .flat()
-      .filter((c) => c.is_subscribed);
   }
 
   async function fetchEvents({ refreshSelected = true } = {}) {
+    const request = ++rangeRequest;
     loading.value = true;
+    eventsError.value = null;
     try {
       const range = getDateRange();
       // Same parallelization as fetchCalendars — purely local reads.
-      const results = await Promise.all(
-        accountsStore.accounts.map((account) =>
-          api
-            .getEvents(account.id, range.start, range.end)
-            .catch((e) => {
-              console.error("Failed to fetch events for", account.id, e);
-              return [] as CalendarEvent[];
-            }),
-        ),
-      );
+      const results = await Promise.all(accountsStore.accounts.map((account) =>
+        api.getEvents(account.id, range.start, range.end)));
       const occurrencePages = await Promise.all(
         accountsStore.accounts.map((account) =>
           api.listCalendarOccurrences(
@@ -310,11 +329,18 @@ export const useCalendarStore = defineStore("calendar", () => {
         new Date(range.start),
         new Date(range.end),
       ));
+      if (request !== rangeRequest) return;
+      const activeRange = getDateRange();
+      if (activeRange.start !== range.start || activeRange.end !== range.end) {
+        throw new Error("Calendar display range changed during the read. Please retry.");
+      }
       // An exact read may have completed while the range request was pending.
       const selectedId = selectedEvent.value?.id;
       const hadSingleEvent = selectedId && singleEventCache.value.has(selectedId);
       events.value = rawEvents;
       projectedEvents.value = projected;
+      pendingDisplay.value = null;
+      failedNavigation.value = null;
       if (refreshSelected && selectedId && hadSingleEvent) {
         try {
           await refreshSingleEvent(selectedId);
@@ -322,8 +348,22 @@ export const useCalendarStore = defineStore("calendar", () => {
           console.error("Failed to refresh selected calendar event:", error);
         }
       }
+    } catch (error) {
+      if (request === rangeRequest) {
+        if (pendingDisplay.value) {
+          failedNavigation.value = {
+            date: currentDate.value,
+            mode: viewMode.value,
+          };
+          currentDate.value = pendingDisplay.value.date;
+          viewMode.value = pendingDisplay.value.mode;
+          pendingDisplay.value = null;
+        }
+        eventsError.value = "Could not load calendar dates. Please retry.";
+      }
+      if (request === rangeRequest) throw error;
     } finally {
-      loading.value = false;
+      if (request === rangeRequest) loading.value = false;
     }
   }
 
@@ -532,33 +572,69 @@ export const useCalendarStore = defineStore("calendar", () => {
   }
 
   function setViewMode(mode: CalendarViewMode) {
-    viewMode.value = mode;
-    fetchEvents();
+    goToDate(currentDate.value, mode);
   }
 
-  function goToDate(date: string) {
+  function goToDate(date: string, mode = viewMode.value) {
+    if (pendingDisplay.value && date === displayDate.value && mode === displayViewMode.value) {
+      rangeRequest++;
+      currentDate.value = date;
+      viewMode.value = mode;
+      pendingDisplay.value = null;
+      loading.value = false;
+      eventsError.value = null;
+      return;
+    }
+    if (!pendingDisplay.value) {
+      pendingDisplay.value = { date: displayDate.value, mode: displayViewMode.value };
+    }
     currentDate.value = date;
-    fetchEvents();
+    viewMode.value = mode;
+    void fetchEvents().catch((error) =>
+      console.error("Calendar navigation failed:", error));
+  }
+
+  async function retryNavigation() {
+    try {
+      if (calendarsError.value) await fetchCalendars();
+      if (failedNavigation.value) {
+        goToDate(failedNavigation.value.date, failedNavigation.value.mode);
+      } else {
+        await fetchEvents();
+      }
+    } catch (error) {
+      console.error("Calendar retry failed:", error);
+    }
   }
 
   function goToday() {
-    goToDate(new Date().toISOString().split("T")[0]);
+    goToDate(toDateInTimezone(new Date(), uiStore.displayTimezone));
   }
 
   function goPrev() {
-    const d = new Date(currentDate.value);
+    const d = parseCalendarDay(currentDate.value);
     if (viewMode.value === "day") d.setDate(d.getDate() - 1);
     else if (viewMode.value === "week") d.setDate(d.getDate() - 7);
-    else d.setMonth(d.getMonth() - 1);
-    goToDate(d.toISOString().split("T")[0]);
+    else {
+      const day = d.getDate();
+      d.setDate(1);
+      d.setMonth(d.getMonth() - 1);
+      d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+    }
+    goToDate(calendarDay(d));
   }
 
   function goNext() {
-    const d = new Date(currentDate.value);
+    const d = parseCalendarDay(currentDate.value);
     if (viewMode.value === "day") d.setDate(d.getDate() + 1);
     else if (viewMode.value === "week") d.setDate(d.getDate() + 7);
-    else d.setMonth(d.getMonth() + 1);
-    goToDate(d.toISOString().split("T")[0]);
+    else {
+      const day = d.getDate();
+      d.setDate(1);
+      d.setMonth(d.getMonth() + 1);
+      d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+    }
+    goToDate(calendarDay(d));
   }
 
   function toggleCalendarVisibility(calendarId: string) {
@@ -631,7 +707,8 @@ export const useCalendarStore = defineStore("calendar", () => {
   let calendarDisposed = false;
   void listen<string>("calendar-changed", () => {
     if (calendarDisposed) return;
-    fetchCalendars().then(() => fetchEvents()).catch(() => {});
+    fetchCalendars().then(() => fetchEvents()).catch((error) =>
+      console.error("Calendar refresh failed:", error));
   })
     .then((unlisten) => {
       if (calendarDisposed) {
@@ -655,8 +732,12 @@ export const useCalendarStore = defineStore("calendar", () => {
     events,
     visibleEvents,
     viewMode,
+    displayViewMode,
     currentDate,
+    displayDate,
     loading,
+    loadError,
+    navigationPending,
     selectedEvent,
     singleEventCache,
     hiddenCalendarIds,
@@ -674,6 +755,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     deleteEvent,
     setViewMode,
     goToDate,
+    retryNavigation,
     goToday,
     goPrev,
     goNext,

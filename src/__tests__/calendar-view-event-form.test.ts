@@ -116,6 +116,82 @@ describe("CalendarView responsive event form lifecycle", () => {
     wrapper.unmount();
   });
 
+  it("keeps the previous month visible while its destination is loading", async () => {
+    const calendarStore = useCalendarStore();
+    calendarStore.currentDate = "2026-04-07";
+    calendarStore.viewMode = "month";
+    calendarStore.events = [{
+      id: "april", account_id: "calendar-account", calendar_id: "calendar",
+      uid: "april", title: "April event", description: null, location: null,
+      start_time: "2026-04-07T10:00:00Z", end_time: "2026-04-07T11:00:00Z",
+      all_day: false, timezone: null, recurrence_rule: null,
+      recurrence_kind: "standalone", organizer_email: null, attendees_json: null,
+      my_status: null, source_message_id: null,
+    }];
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
+    vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+    let resolveMay!: (events: []) => void;
+    const mayRead = new Promise<[]>((resolve) => { resolveMay = resolve; });
+    vi.mocked(api.getEvents).mockImplementation((id) =>
+      id === "calendar-account" ? mayRead : Promise.resolve([]));
+    const wrapper = mount(CalendarView, {
+      global: { stubs: {
+        CalendarSidebar: true, WeekView: true, EventDetail: true,
+        MobileAppBar: true, MobileIconButton: true, EventForm: true,
+      } },
+    });
+    await flushPromises();
+    expect(wrapper.find("[data-testid=cal-event-april]").exists()).toBe(true);
+
+    await wrapper.find("[data-testid=cal-btn-next]").trigger("click");
+    expect(wrapper.find(".current-date").text()).toBe("April 2026");
+    expect(wrapper.find("[role=status]").text()).toContain("Loading May 2026");
+    expect(wrapper.find("[data-testid=cal-month-cell-2026-04-07]").exists()).toBe(true);
+    expect(wrapper.find("[data-testid=cal-event-april]").exists()).toBe(true);
+    expect(wrapper.find(".calendar-content").attributes("inert")).toBeDefined();
+
+    resolveMay([]);
+    await flushPromises();
+    expect(wrapper.find(".current-date").text()).toBe("May 2026");
+    expect(wrapper.find("[role=status]").exists()).toBe(false);
+    expect(wrapper.find(".calendar-content").attributes("inert")).toBeUndefined();
+    expect(wrapper.find("[data-testid=cal-event-april]").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("renders events in leading and trailing cells of a six-week month", async () => {
+    const calendarStore = useCalendarStore();
+    calendarStore.currentDate = "2026-08-15";
+    calendarStore.viewMode = "month";
+    const event = (id: string, start: string) => ({
+      id, account_id: "calendar-account", calendar_id: "calendar", uid: id,
+      title: id, description: null, location: null,
+      start_time: `${start}T10:00:00Z`, end_time: `${start}T11:00:00Z`,
+      all_day: false, timezone: null, recurrence_rule: null,
+      recurrence_kind: "standalone" as const, organizer_email: null,
+      attendees_json: null, my_status: null, source_message_id: null,
+    });
+    calendarStore.events = [event("leading", "2026-07-26"), event("trailing", "2026-09-05")];
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
+    vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+    const wrapper = mount(CalendarView, {
+      global: { stubs: {
+        CalendarSidebar: true, WeekView: true, EventDetail: true,
+        MobileAppBar: true, MobileIconButton: true, EventForm: true,
+      } },
+    });
+    await flushPromises();
+    for (const [day, id] of [["2026-07-26", "leading"], ["2026-09-05", "trailing"]]) {
+      expect(wrapper.find(`[data-testid=cal-month-cell-${day}]`).exists()).toBe(true);
+      expect(wrapper.find(`[data-testid=cal-event-${id}]`).exists()).toBe(true);
+    }
+    wrapper.unmount();
+  });
+
   it("preserves a pending meeting when the responsive branch switches", async () => {
     vi.mocked(api.meetCreateUrl).mockResolvedValue({
       lifecycle_id: "lifecycle",
