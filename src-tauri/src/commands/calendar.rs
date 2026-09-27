@@ -305,6 +305,24 @@ pub async fn list_calendars(
 }
 
 #[tauri::command]
+pub async fn list_archived_graph_calendars(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<db::calendar::ArchivedGraphCalendar>> {
+    db::calendar::list_archived_graph_calendars(&state.db.reader(), &account_id)
+}
+
+#[tauri::command]
+pub async fn acknowledge_archived_graph_calendar(
+    state: State<'_, AppState>,
+    account_id: String,
+    calendar_id: String,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::calendar::acknowledge_archived_graph_calendar(&conn, &account_id, &calendar_id)
+}
+
+#[tauri::command]
 pub async fn create_calendar(state: State<'_, AppState>, calendar: NewCalendar) -> Result<String> {
     log::info!(
         "create_calendar: account={} name='{}'",
@@ -436,6 +454,7 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
     let cleanup_ids = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         let cleanup_ids =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?
                 .cleanup_lifecycle_ids;
@@ -458,6 +477,7 @@ pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: Strin
     let deletion = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
         let deletion =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
@@ -651,6 +671,7 @@ fn build_recurrence_mutation_plan(
     scope: RecurrenceMutationScope,
     protocol: &str,
 ) -> Result<RecurrenceMutationPlan> {
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
     db::calendar_actions::ensure_unclaimed(conn, &event.id)?;
     if conn.is_autocommit() {
         return Err(crate::error::Error::Other(
@@ -1928,6 +1949,7 @@ fn checked_mutation_target(
     expected: Option<&MoveSourceSnapshot>,
 ) -> Result<CalendarEvent> {
     let event = db::calendar::get_event(conn, event_id)?;
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
     event.ensure_mutable()?;
     db::calendar_actions::ensure_unclaimed(conn, event_id)?;
     if let Some(expected) = expected {
@@ -3664,6 +3686,14 @@ async fn apply_invite_response(
     let response = InviteResponse::try_from(response.as_str())?;
     let response_text = response.as_str();
     let backend = crate::backend::calendar::for_account(&account);
+    if backend.is_some_and(|provider| provider.protocol() == "graph") {
+        ensure_unique_local_graph_invite(
+            &state.db.reader(),
+            &account_id,
+            &invite_uid,
+            &invite.dtstart,
+        )?;
+    }
     let track_pending_rsvp = backend
         .map(|provider| provider.remote_rsvp_policy() != RemoteRsvpPolicy::RequiredBeforeLocal)
         .unwrap_or(true);
@@ -4000,6 +4030,32 @@ async fn apply_invite_response(
     use tauri::Emitter as _;
     app.emit("calendar-changed", account_id.as_str()).ok();
 
+    Ok(())
+}
+
+fn ensure_unique_local_graph_invite(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    uid: &str,
+    start: &str,
+) -> Result<()> {
+    let candidates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM calendar_events event
+         JOIN calendars calendar ON calendar.id = event.calendar_id
+         WHERE event.account_id = ?1 AND event.uid = ?2
+           AND calendar.is_archived = 0
+           AND (event.start_time = ?3 OR
+                (julianday(event.start_time) IS NOT NULL
+                 AND julianday(event.start_time) = julianday(?3)))",
+        rusqlite::params![account_id, uid, start],
+        |row| row.get(0),
+    )?;
+    if candidates > 1 {
+        return Err(crate::error::Error::Sync(
+            "Multiple local Graph invitations share this UID and start; refusing an ambiguous RSVP"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -4984,6 +5040,72 @@ mod tests {
         RecurrenceIdentity, RecurrenceIdentitySeed, RecurrenceValueType,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn archived_calendar_event_cannot_be_mutated_by_direct_id() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars (id, account_id, name, remote_id, is_archived)
+             VALUES ('old', 'account', 'Old', 'old-identity', 1);
+             INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time, remote_id)
+             VALUES ('retained', 'account', 'old', 'Retained',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z', 'old-event');",
+        )
+        .unwrap();
+        assert!(checked_mutation_target(&conn, "retained", None).is_err());
+        let transaction = conn.transaction().unwrap();
+        let retained = db::calendar::get_event(&transaction, "retained").unwrap();
+        assert!(build_recurrence_mutation_plan(
+            &transaction,
+            retained,
+            "old-occurrence",
+            RecurrenceMutationScope::ThisOccurrence,
+            "graph",
+        )
+        .is_err());
+        assert!(db::calendar::get_event(&transaction, "retained").is_ok());
+        assert!(db::calendar::get_calendar(&transaction, "old").is_err());
+    }
+
+    #[test]
+    fn graph_response_preflight_rejects_two_visible_local_copies() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars(id, account_id, name)
+             VALUES ('first', 'account', 'First'),
+                    ('second', 'account', 'Second');
+             INSERT INTO calendar_events
+                 (id, account_id, calendar_id, uid, title, start_time, end_time)
+             VALUES ('one', 'account', 'first', 'same-uid', 'One',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'),
+                    ('two', 'account', 'second', 'same-uid', 'Two',
+                     '2026-09-14T11:00:00+02:00', '2026-09-14T12:00:00+02:00');",
+        )
+        .unwrap();
+        assert!(ensure_unique_local_graph_invite(
+            &conn,
+            "account",
+            "same-uid",
+            "2026-09-14T09:00:00Z",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous RSVP"));
+        conn.execute(
+            "UPDATE calendars SET is_archived = 1 WHERE id = 'second'",
+            [],
+        )
+        .unwrap();
+        ensure_unique_local_graph_invite(&conn, "account", "same-uid", "2026-09-14T09:00:00Z")
+            .unwrap();
+    }
 
     #[derive(Clone, Copy)]
     enum OccurrenceBackendMode {

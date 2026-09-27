@@ -4,12 +4,16 @@ import { setActivePinia, createPinia } from "pinia";
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
+  acknowledgeArchivedGraphCalendar: vi.fn().mockResolvedValue(undefined),
   listRoomSuggestions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
     occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
-  repairCalendarOccurrence: vi.fn().mockResolvedValue(false),
+  repairCalendarOccurrence: vi.fn().mockResolvedValue({
+    repaired: false, retry_after_seconds: null,
+  }),
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
@@ -199,6 +203,123 @@ describe("Calendar store", () => {
 
       expect(store.calendars).toEqual([]);
     });
+
+    it("reports archived Graph data separately from live calendars", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const live = makeCalendar("current", "Calendar", "immutable");
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 245, replay_address_count: 2,
+        acknowledged: false,
+      };
+      vi.mocked(api.listCalendars).mockResolvedValueOnce([live]);
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+
+      await store.fetchCalendars();
+
+      expect(store.calendars).toEqual([live]);
+      expect(store.archivedGraphCalendars).toEqual([archived]);
+      expect(api.listArchivedGraphCalendars).toHaveBeenCalledWith("acc1");
+    });
+
+    it("does not hide live calendars when the archive notice read fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Old",
+        retained_event_count: 2, replay_address_count: 1,
+        acknowledged: false,
+      };
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+      await store.fetchCalendars();
+      vi.mocked(api.listCalendars).mockResolvedValueOnce([
+        makeCalendar("current", "Calendar"),
+      ]);
+      vi.mocked(api.listArchivedGraphCalendars).mockRejectedValueOnce(
+        new Error("unavailable"));
+
+      await store.fetchCalendars();
+
+      expect(store.calendars.map((calendar) => calendar.id)).toEqual(["current"]);
+      expect(store.archivedGraphCalendars).toEqual([archived]);
+      expect(store.archivedGraphCalendarsError).toContain("Could not check");
+    });
+
+    it("does not replace archived notice data with a stale request", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const firstLive = deferred<ReturnType<typeof makeCalendar>[]>();
+      const firstArchive = deferred<{
+        id: string; account_id: string; name: string;
+        retained_event_count: number; replay_address_count: number;
+        acknowledged: boolean;
+      }[]>();
+      vi.mocked(api.listCalendars).mockReturnValueOnce(firstLive.promise);
+      vi.mocked(api.listArchivedGraphCalendars)
+        .mockReturnValueOnce(firstArchive.promise);
+      const stale = store.fetchCalendars();
+      const current = {
+        id: "current", account_id: "acc1", name: "Current",
+        retained_event_count: 1, replay_address_count: 0,
+        acknowledged: false,
+      };
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([current]);
+      await store.fetchCalendars();
+      firstLive.resolve([]);
+      firstArchive.resolve([]);
+      await stale;
+
+      expect(store.archivedGraphCalendars).toEqual([current]);
+      expect(store.archivedGraphCalendarsError).toBeNull();
+    });
+
+    it("acknowledges only archived notices, not their retained data", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 26, replay_address_count: 173,
+        acknowledged: false,
+      };
+      store.archivedGraphCalendars = [archived];
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([
+        { ...archived, acknowledged: true },
+      ]);
+
+      await store.acknowledgeArchivedGraphCalendars();
+
+      expect(api.acknowledgeArchivedGraphCalendar).toHaveBeenCalledWith(
+        "acc1", "old");
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([]);
+      expect(store.archivedGraphCalendars).toEqual([
+        { ...archived, acknowledged: true },
+      ]);
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+      await store.fetchCalendars();
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([archived]);
+    });
+
+    it("keeps an archived warning when acknowledgment fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 26, replay_address_count: 173,
+        acknowledged: false,
+      };
+      store.archivedGraphCalendars = [archived];
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.mocked(api.acknowledgeArchivedGraphCalendar)
+        .mockRejectedValueOnce(new Error("write failed"));
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+
+      await store.acknowledgeArchivedGraphCalendars();
+
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([archived]);
+      expect(store.archivedGraphAcknowledgementError).toContain("Could not acknowledge");
+      consoleError.mockRestore();
+    });
   });
 
   describe("visibleEvents with hidden calendars", () => {
@@ -315,7 +436,7 @@ describe("Calendar store", () => {
         is_exception: false,
       }],
       has_more: false, needs_hydration: [],
-      unresolved: [{ event_id: child.id, calendar_id: child.calendar_id }],
+      unresolved: [{ event_id: child.id, calendar_id: child.calendar_id, account_id: child.account_id }],
     };
     vi.mocked(api.listCalendarOccurrences).mockResolvedValue(page);
     await store.fetchEvents();
@@ -333,6 +454,59 @@ describe("Calendar store", () => {
     } finally {
       warning.mockRestore();
     }
+  });
+
+  it("limits provider verification to one request and honors a throttle cooldown", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "first", calendar_id: "cal1", account_id: "acc1" },
+      { event_id: "second", calendar_id: "cal1", account_id: "acc1" },
+    ];
+    vi.mocked(api.repairCalendarOccurrence).mockResolvedValueOnce({
+      repaired: false, retry_after_seconds: 172_800,
+    });
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledOnce();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledWith("first");
+    expect(store.repairRetryAt).toBeGreaterThan(Date.now() + 86_400_000);
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledOnce();
+    expect(store.unresolvedOccurrences).toHaveLength(2);
+    store.$dispose();
+  });
+
+  it("throttling one account does not block verification of another", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "graph-child", calendar_id: "graph-cal", account_id: "graph-account" },
+      { event_id: "other-child", calendar_id: "other-cal", account_id: "other-account" },
+    ];
+    vi.mocked(api.repairCalendarOccurrence)
+      .mockResolvedValueOnce({ repaired: false, retry_after_seconds: 90 })
+      .mockResolvedValueOnce({ repaired: false, retry_after_seconds: null });
+    await store.repairIncompleteOccurrences();
+    expect(store.repairRetryAt).toBeNull();
+    await store.repairIncompleteOccurrences();
+    expect(vi.mocked(api.repairCalendarOccurrence).mock.calls.map(([id]) => id))
+      .toEqual(["graph-child", "other-child"]);
+    store.$dispose();
+  });
+
+  it("rechecks an already-resolved row instead of leaving a stale warning", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "resolved-elsewhere", calendar_id: "cal1", account_id: "acc1" },
+    ];
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+      occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+    });
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledWith("resolved-elsewhere");
+    expect(api.listCalendarOccurrences).toHaveBeenCalled();
+    expect(store.unresolvedOccurrences).toEqual([]);
   });
 
   describe("recurring occurrences (unclickable-event regression)", () => {
@@ -719,6 +893,17 @@ describe("Calendar store", () => {
       vi.mocked(api.syncCalendars).mockRejectedValueOnce(new Error("Network error"));
 
       await expect(store.syncCalendars()).resolves.not.toThrow();
+    });
+
+    it("honors Graph Retry-After before trying that account again", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      vi.mocked(api.syncCalendars).mockRejectedValueOnce(
+        "Graph throttled (429); retry after 3600 seconds",
+      );
+      await expect(store.syncCalendars("acc1")).rejects.toMatch(/429/);
+      await expect(store.syncCalendars("acc1")).rejects.toThrow("Retry-After");
+      expect(api.syncCalendars).toHaveBeenCalledOnce();
     });
   });
 

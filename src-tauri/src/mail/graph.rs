@@ -151,6 +151,7 @@ fn join_url(root: &str, path: &str) -> String {
 mod endpoint_tests {
     use super::{parse_graph_contact, GraphClient, GraphEndpoints};
     use crate::calendar::recurrence_identity::{OccurrenceFields, UpdateOccurrenceInput};
+    use crate::error::Error;
     use reqwest::header::{HeaderMap, HeaderValue};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -427,6 +428,95 @@ mod endpoint_tests {
                 .to_ascii_lowercase()
                 .contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn calendar_view_retries_a_throttled_first_page_with_identical_scope() {
+        let (root, captured) = serve_responses(|_| {
+            vec![
+                TestResponse {
+                    status: 429,
+                    retry_after: Some("0"),
+                    body: String::new(),
+                },
+                TestResponse::ok(r#"{"value":[]}"#),
+            ]
+        })
+        .await;
+        assert!(test_client(&root)
+            .list_events_for_calendar("calendar", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+            .await
+            .unwrap()
+            .is_empty());
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].lines().next(), requests[1].lines().next());
+        for request in requests {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("prefer: outlook.timezone=\"utc\", idtype=\"immutableid\"\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_view_continuation_returns_long_graph_throttle() {
+        let (root, captured) = serve_responses(|root| {
+            vec![
+                TestResponse::ok(format!(
+                    r#"{{"value":[],"@odata.nextLink":"{root}/page-2"}}"#,
+                )),
+                TestResponse {
+                    status: 429,
+                    retry_after: Some("3600"),
+                    body: String::new(),
+                },
+            ]
+        })
+        .await;
+        let error = test_client(&root)
+            .list_events_for_calendar("calendar", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::GraphThrottled {
+                retry_after_seconds: 3600
+            }
+        ));
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /injected/page-2 "));
+    }
+
+    #[tokio::test]
+    async fn graph_uid_lookup_never_selects_the_first_of_two_invites() {
+        let (root, captured) =
+            serve_many(|_| vec![r#"{"value":[{"id":"first"},{"id":"second"}]}"#.into()]).await;
+        let error = test_client(&root)
+            .find_event_by_ical_uid("same-uid")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Multiple Graph invitations"));
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("%24top=2"));
+    }
+
+    #[tokio::test]
+    async fn graph_uid_lookup_rejects_an_unread_continuation() {
+        let (root, captured) = serve_many(|root| {
+            vec![format!(
+                r#"{{"value":[{{"id":"first"}}],"@odata.nextLink":"{root}/page-2"}}"#,
+            )]
+        })
+        .await;
+        assert!(test_client(&root)
+            .find_event_by_ical_uid("same-uid")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple Graph invitations"));
+        assert_eq!(captured.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1326,14 +1416,29 @@ impl GraphClient {
                 .map_err(|e| Error::Other(format!("Graph {} failed: {}", what, e)))?;
             let code = resp.status().as_u16();
             let retryable = code == 429 || (retry_transient && matches!(code, 503 | 504));
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|value| {
+                    value.parse::<u64>().ok().or_else(|| {
+                        chrono::DateTime::parse_from_rfc2822(value)
+                            .ok()
+                            .map(|date| {
+                                (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                                    .num_seconds()
+                                    .max(1) as u64
+                            })
+                    })
+                });
             if retryable && attempt < MAX_ATTEMPTS {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(5)
-                    .min(MAX_RETRY_AFTER_SECS);
+                let retry_after = retry_after.unwrap_or(5).max(1);
+                if code == 429 && retry_after > MAX_RETRY_AFTER_SECS {
+                    return Err(Error::GraphThrottled {
+                        retry_after_seconds: retry_after,
+                    });
+                }
+                let retry_after = retry_after.min(MAX_RETRY_AFTER_SECS);
                 log::warn!(
                     "Graph {} returned {} (attempt {}/{}), retrying after {}s",
                     what,
@@ -1344,6 +1449,11 @@ impl GraphClient {
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
                 continue;
+            }
+            if code == 429 {
+                return Err(Error::GraphThrottled {
+                    retry_after_seconds: retry_after.unwrap_or(120).max(1),
+                });
             }
             return Ok(resp);
         }
@@ -2573,13 +2683,20 @@ impl GraphClient {
                 Some(path) => {
                     let path = self.calendar_set_url(&path)?;
                     let resp = self
-                        .http
-                        .get(path)
-                        .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
-                        .send()
-                        .await
-                        .map_err(|e| Error::Other(format!("Graph GET failed: {}", e)))?;
+                        .send_with_retry(
+                            || {
+                                self.http
+                                    .get(path.clone())
+                                    .bearer_auth(&self.access_token)
+                                    .header(
+                                        "Prefer",
+                                        "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"",
+                                    )
+                            },
+                            "calendar view continuation",
+                            true,
+                        )
+                        .await?;
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
@@ -2598,25 +2715,27 @@ impl GraphClient {
                         urlencoding::encode(calendar_id)
                     ));
                     let resp = self
-                        .http
-                        .get(&url)
-                        .bearer_auth(&self.access_token)
-                        .header("Prefer", "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"")
-                        .query(&[
-                            ("startDateTime", start),
-                            ("endDateTime", end),
-                            ("$select", CALENDAR_EVENT_SELECT),
-                            ("$top", "100"),
-                            ("$orderby", "start/dateTime"),
-                        ])
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            Error::Other(format!(
-                                "Graph GET /me/calendars/{}/calendarView failed: {}",
-                                calendar_id, e
-                            ))
-                        })?;
+                        .send_with_retry(
+                            || {
+                                self.http
+                                    .get(&url)
+                                    .bearer_auth(&self.access_token)
+                                    .header(
+                                        "Prefer",
+                                        "outlook.timezone=\"UTC\", IdType=\"ImmutableId\"",
+                                    )
+                                    .query(&[
+                                        ("startDateTime", start),
+                                        ("endDateTime", end),
+                                        ("$select", CALENDAR_EVENT_SELECT),
+                                        ("$top", "100"),
+                                        ("$orderby", "start/dateTime"),
+                                    ])
+                            },
+                            "calendar view",
+                            true,
+                        )
+                        .await?;
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if !status.is_success() {
@@ -2801,7 +2920,8 @@ impl GraphClient {
             .await
     }
 
-    /// Find an event by its iCalUId. Returns the Graph event ID if found.
+    /// Find an event by its iCalUId only when the account has one exact match.
+    /// Picking the first of two calendar copies could RSVP to the wrong event.
     pub async fn find_event_by_ical_uid(&self, ical_uid: &str) -> Result<Option<String>> {
         // Escape single quotes per OData rules to prevent filter injection.
         let escaped_uid = ical_uid.replace('\'', "''");
@@ -2809,14 +2929,32 @@ impl GraphClient {
         let resp = self
             .get(
                 "/me/events",
-                &[("$filter", filter.as_str()), ("$select", "id")],
+                &[
+                    ("$filter", filter.as_str()),
+                    ("$select", "id"),
+                    ("$top", "2"),
+                ],
             )
             .await?;
-        Ok(resp["value"]
+        let rows = resp["value"]
             .as_array()
-            .and_then(|a: &Vec<serde_json::Value>| a.first())
-            .and_then(|e: &serde_json::Value| e["id"].as_str())
-            .map(|s: &str| s.to_string()))
+            .ok_or_else(|| Error::Sync("Graph UID lookup returned no valid result array".into()))?;
+        if rows.len() > 1 || resp.get("@odata.nextLink").is_some_and(|v| !v.is_null()) {
+            return Err(Error::Sync(
+                "Multiple Graph invitations share this UID; an exact event must be selected before sending an RSVP".into()
+            ));
+        }
+        rows.first()
+            .map(|row| {
+                row["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        Error::Sync("Graph UID lookup returned an invalid event ID".into())
+                    })
+            })
+            .transpose()
     }
 
     /// RSVP to an event (accept, tentativelyAccept, or decline).

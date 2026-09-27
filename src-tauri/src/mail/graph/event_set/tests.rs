@@ -128,6 +128,226 @@ fn exception(id: &str, position: &str) -> Value {
     value
 }
 
+fn generated(id: &str, position: &str) -> Value {
+    let mut value = fixture(id);
+    value["type"] = json!("occurrence");
+    value["seriesMasterId"] = json!("master");
+    value["originalStart"] = json!(position);
+    value["start"]["dateTime"] = json!("2026-09-15T09:00:00");
+    value["end"]["dateTime"] = json!("2026-09-15T10:00:00");
+    // Graph can assign a distinct iCalUId to each series instance.
+    value["iCalUId"] = json!("child-uid");
+    value
+}
+
+#[tokio::test]
+async fn proves_generated_instance_without_creating_a_finite_override() {
+    let child = generated("child", "2026-09-15T09:00:00Z");
+    let parent = master();
+    let (client, captured) = server(|_| {
+        vec![
+            (200, child.clone()),
+            (200, parent.clone()),
+            (200, parent),
+            (200, child),
+        ]
+    })
+    .await;
+    let (set, proof) = client
+        .fetch_calendar_event_set_for_repair(
+            "selected",
+            "child",
+            &crate::backend::testutil::event(),
+        )
+        .await
+        .unwrap();
+    assert!(set.overrides.is_empty());
+    assert_eq!(set.event.uid.as_deref(), Some("uid"));
+    let proof = proof.unwrap();
+    assert_eq!(proof.kind, RecurrenceObjectKind::Occurrence);
+    assert_eq!(proof.original_start, "2026-09-15T09:00:00Z");
+    assert_eq!(proof.native.event_id, "child");
+    let requests = captured.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    headers(&requests);
+}
+
+#[tokio::test]
+async fn generated_instance_proof_rejects_moved_or_changed_children() {
+    let parent = master();
+    for child in [
+        {
+            let mut child = generated("child", "2026-09-15T09:00:00Z");
+            child["start"]["dateTime"] = json!("2026-09-15T11:00:00");
+            child
+        },
+        generated("child", "2026-09-20T09:00:00Z"),
+    ] {
+        let (client, captured) =
+            server(|_| vec![(200, child), (200, parent.clone()), (200, parent.clone())]).await;
+        assert!(client
+            .fetch_calendar_event_set_for_repair(
+                "selected",
+                "child",
+                &crate::backend::testutil::event(),
+            )
+            .await
+            .is_err());
+        assert_eq!(captured.await.unwrap().len(), 3);
+    }
+    let original = generated("child", "2026-09-15T09:00:00Z");
+    let mut changed = original.clone();
+    changed["@odata.etag"] = json!("W/\"new\"");
+    let (client, captured) = server(|_| {
+        vec![
+            (200, original),
+            (200, parent.clone()),
+            (200, parent),
+            (200, changed),
+        ]
+    })
+    .await;
+    assert!(client
+        .fetch_calendar_event_set_for_repair(
+            "selected",
+            "child",
+            &crate::backend::testutil::event(),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("child changed"));
+    assert_eq!(captured.await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn proves_exact_exception_but_keeps_unsupported_rule_unresolved() {
+    let child = exception("child", "2026-09-15T09:00:00Z");
+    let mut parent = master();
+    parent["exceptionOccurrences"] = json!([{"id": "child"}]);
+    let (client, captured) = server(|_| {
+        vec![
+            (200, child.clone()),
+            (200, parent.clone()),
+            (200, child.clone()),
+            (200, parent),
+            (200, child),
+        ]
+    })
+    .await;
+    let (set, proof) = client
+        .fetch_calendar_event_set_for_repair(
+            "selected",
+            "child",
+            &crate::backend::testutil::event(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set.overrides.len(), 1);
+    assert_eq!(proof.unwrap().kind, RecurrenceObjectKind::Exception);
+    assert_eq!(captured.await.unwrap().len(), 5);
+
+    let child = generated("child", "2026-09-15T09:00:00Z");
+    let mut unsupported = master();
+    unsupported["recurrence"]["pattern"]["type"] = json!("relativeMonthly");
+    let (client, captured) = server(|_| vec![(200, child), (200, unsupported)]).await;
+    assert!(client
+        .fetch_calendar_event_set_for_repair(
+            "selected",
+            "child",
+            &crate::backend::testutil::event(),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("lossless subset"));
+    assert_eq!(captured.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn exhausted_graph_throttle_reports_the_final_retry_after() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/graph", listener.local_addr().unwrap());
+    let client = GraphClient::with_client(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        "secret-test-token",
+        super::super::GraphEndpoints::new(&root, &root),
+    );
+    let task = tokio::spawn(async move {
+        for delay in ["0", "0", "42"] {
+            let (mut socket, request) = accept_request(&listener).await;
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer secret-test-token\r\n"));
+            socket.write_all(format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {delay}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let error = client
+        .calendar_set_request(
+            Method::GET,
+            "/me/calendars/selected/events/child",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::GraphThrottled {
+            retry_after_seconds: 42
+        }
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn long_graph_retry_after_is_returned_without_an_early_retry() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/graph", listener.local_addr().unwrap());
+    let client = GraphClient::with_client(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        "secret-test-token",
+        super::super::GraphEndpoints::new(&root, &root),
+    );
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = accept_request(&listener).await;
+        socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 172800\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                accept_request(&listener),
+            )
+            .await
+            .is_err(),
+            "a second request ignored the server's cooldown"
+        );
+    });
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.calendar_set_request(
+            Method::GET,
+            "/me/calendars/selected/events/child",
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::GraphThrottled {
+            retry_after_seconds: 172800
+        }
+    ));
+    task.await.unwrap();
+}
+
 fn snapshot(value: &Value) -> CalendarEventSet {
     let template = crate::backend::testutil::event();
     CalendarEventSet {

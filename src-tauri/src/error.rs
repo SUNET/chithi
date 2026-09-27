@@ -32,6 +32,10 @@ pub enum Error {
     #[error("Sync error: {0}")]
     Sync(String),
 
+    /// Safe, bounded provider cooldown exposed to calendar verification.
+    #[error("Graph throttled (429); retry after {retry_after_seconds} seconds")]
+    GraphThrottled { retry_after_seconds: u64 },
+
     #[error("Keyring error: {0}")]
     Keyring(String),
 

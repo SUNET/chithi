@@ -49,6 +49,7 @@ pub struct CalendarOccurrencePage {
 pub struct UnresolvedCalendarOccurrence {
     pub event_id: String,
     pub calendar_id: String,
+    pub account_id: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -53,6 +53,15 @@ pub enum CalendarCapability<T> {
     Unsupported,
 }
 
+/// Provider-verified membership for one exact detached resource. A generated
+/// occurrence remains part of its master, never a fabricated finite override.
+#[derive(Debug, Clone)]
+pub struct VerifiedOccurrenceMembership {
+    pub original_start: String,
+    pub native: crate::calendar::event_set::NativeCalendarResource,
+    pub kind: crate::calendar::recurrence_identity::RecurrenceObjectKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RoomSuggestion {
     pub name: String,
@@ -231,6 +240,20 @@ pub trait CalendarBackend: Send + Sync {
             protocol: self.protocol(),
             capability: "calendar event-set read",
         })
+    }
+
+    /// Full provider read plus optional proof of the selected detached row.
+    /// Other providers retain the exact-override check on the returned set.
+    async fn fetch_event_set_for_repair(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
+        self.fetch_event_set(ctx, account, event, remote_calendar_id)
+            .await
+            .map(|set| (set, None))
     }
 
     /// Apply only the semantic differences between two complete snapshots,

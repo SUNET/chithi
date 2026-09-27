@@ -319,6 +319,19 @@ export async function listCalendars(
   return invoke("list_calendars", { accountId });
 }
 
+export async function listArchivedGraphCalendars(
+  accountId: string,
+): Promise<import("./types").ArchivedGraphCalendar[]> {
+  return invoke("list_archived_graph_calendars", { accountId });
+}
+
+export async function acknowledgeArchivedGraphCalendar(
+  accountId: string,
+  calendarId: string,
+): Promise<void> {
+  return invoke("acknowledge_archived_graph_calendar", { accountId, calendarId });
+}
+
 export async function createCalendar(
   calendar: { account_id: string; name: string; color: string; is_default: boolean },
 ): Promise<string> {
@@ -424,7 +437,10 @@ export async function listCalendarOccurrences(
   });
 }
 
-export async function repairCalendarOccurrence(eventId: string): Promise<boolean> {
+export async function repairCalendarOccurrence(eventId: string): Promise<{
+  repaired: boolean;
+  retry_after_seconds: number | null;
+}> {
   return invoke("repair_calendar_occurrence", { eventId });
 }
 

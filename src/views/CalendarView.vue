@@ -13,6 +13,7 @@ import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-day
 import { getDateInTimezone } from "@/lib/datetime";
 import { useUiStore } from "@/stores/ui";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
+import ArchivedGraphNotice from "@/components/calendar/ArchivedGraphNotice.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
 import MonthView from "@/components/calendar/MonthView.vue";
 import EventDetail from "@/components/calendar/EventDetail.vue";
@@ -451,12 +452,23 @@ onMounted(() => {
       {{ calendarStore.loadError }}
       <button @click="calendarStore.retryNavigation()">Retry</button>
     </div>
+    <ArchivedGraphNotice
+      :calendars="calendarStore.unacknowledgedArchivedGraphCalendars"
+      :error="calendarStore.archivedGraphCalendarsError"
+      :acknowledgement-error="calendarStore.archivedGraphAcknowledgementError"
+      :acknowledging="calendarStore.acknowledgingArchivedGraphCalendars"
+      @retry="calendarStore.retryNavigation()"
+      @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
+    />
     <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
       {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
-      Affected series are hidden until verified.
-      <button :disabled="calendarStore.repairingOccurrences" @click="calendarStore.repairIncompleteOccurrences()">
+      Some recurring dates may be incomplete until verified.
+      <button :disabled="calendarStore.repairingOccurrences || calendarStore.repairRetryAt !== null" @click="calendarStore.repairIncompleteOccurrences()">
         {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
       </button>
+      <span v-if="calendarStore.repairRetryAt !== null">
+        Graph is throttling verification. Try again after {{ new Date(calendarStore.repairRetryAt).toLocaleString() }}.
+      </span>
     </div>
 
     <!-- DAY VIEW -->
@@ -672,12 +684,23 @@ onMounted(() => {
         {{ calendarStore.loadError }}
         <button @click="calendarStore.retryNavigation()">Retry</button>
       </div>
+      <ArchivedGraphNotice
+        :calendars="calendarStore.unacknowledgedArchivedGraphCalendars"
+        :error="calendarStore.archivedGraphCalendarsError"
+        :acknowledgement-error="calendarStore.archivedGraphAcknowledgementError"
+        :acknowledging="calendarStore.acknowledgingArchivedGraphCalendars"
+        @retry="calendarStore.retryNavigation()"
+        @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
+      />
       <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
         {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
-        Affected series are hidden until verified.
-        <button :disabled="calendarStore.repairingOccurrences" @click="calendarStore.repairIncompleteOccurrences()">
+        Some recurring dates may be incomplete until verified.
+        <button :disabled="calendarStore.repairingOccurrences || calendarStore.repairRetryAt !== null" @click="calendarStore.repairIncompleteOccurrences()">
           {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
         </button>
+        <span v-if="calendarStore.repairRetryAt !== null">
+          Graph is throttling verification. Try again after {{ new Date(calendarStore.repairRetryAt).toLocaleString() }}.
+        </span>
       </div>
       <div class="calendar-content" :inert="calendarStore.navigationPending">
         <WeekView

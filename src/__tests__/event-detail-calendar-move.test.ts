@@ -13,6 +13,7 @@ vi.mock("@/lib/tauri", () => ({
   }),
   getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
   listAccounts: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn().mockResolvedValue(undefined),

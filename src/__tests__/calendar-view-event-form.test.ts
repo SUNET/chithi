@@ -15,6 +15,8 @@ vi.mock("@/lib/tauri", () => ({
     occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
   }),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
+  acknowledgeArchivedGraphCalendar: vi.fn().mockResolvedValue(undefined),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn(),
 }));
@@ -195,7 +197,9 @@ describe("CalendarView responsive event form lifecycle", () => {
   it("keeps the incomplete-series warning visible and offers verification", async () => {
     const calendarStore = useCalendarStore();
     calendarStore.viewMode = "month";
-    calendarStore.unresolvedOccurrences = [{ event_id: "child", calendar_id: "calendar" }];
+    calendarStore.unresolvedOccurrences = [{
+      event_id: "child", calendar_id: "calendar", account_id: "calendar-account",
+    }];
     vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
     vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
     vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
@@ -211,10 +215,52 @@ describe("CalendarView responsive event form lifecycle", () => {
     await flushPromises();
     const warning = wrapper.find(".calendar-incomplete");
     expect(warning.attributes("role")).toBe("alert");
-    expect(warning.text()).toContain("Affected series are hidden until verified");
+    expect(warning.text()).toContain("Some recurring dates may be incomplete until verified");
     await warning.find("button").trigger("click");
     expect(verify).toHaveBeenCalledOnce();
     expect(wrapper.find(".calendar-incomplete").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("shows archived Graph data outside the sidebar on desktop and mobile", async () => {
+    const calendarStore = useCalendarStore();
+    calendarStore.archivedGraphCalendars = [{
+      id: "archived", account_id: "calendar-account", name: "Calendar",
+      retained_event_count: 245, replay_address_count: 3,
+      acknowledged: false,
+    }];
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
+    vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+    const wrapper = mount(CalendarView, {
+      global: { stubs: {
+        CalendarSidebar: true, WeekView: true, MonthView: true,
+        EventDetail: true, MobileAppBar: true, MobileIconButton: true,
+        EventForm: true,
+      } },
+    });
+    await flushPromises();
+    const notice = wrapper.get(".archived-graph-notice");
+    expect(notice.attributes("role")).toBe("alert");
+    expect(notice.text()).toContain("not shown in the live calendar");
+    expect(notice.text()).toContain("245 cached event(s)");
+    expect(notice.get("button").text()).toBe("Acknowledge");
+    expect(wrapper.findAll("calendar-sidebar-stub")).toHaveLength(1);
+
+    usePlatformStore().width = 500;
+    await nextTick();
+    expect(wrapper.findAll(".archived-graph-notice")).toHaveLength(1);
+    expect(wrapper.get(".archived-graph-notice").text()).toContain("245 cached event(s)");
+    vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([{
+      ...calendarStore.archivedGraphCalendars[0], acknowledged: true,
+    }]);
+    await wrapper.get(".archived-graph-notice button").trigger("click");
+    await flushPromises();
+    expect(api.acknowledgeArchivedGraphCalendar).toHaveBeenCalledWith(
+      "calendar-account", "archived");
+    expect(wrapper.find(".archived-graph-notice").exists()).toBe(false);
+    expect(calendarStore.archivedGraphCalendars).toHaveLength(1);
     wrapper.unmount();
   });
 

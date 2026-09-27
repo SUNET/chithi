@@ -23,6 +23,16 @@ pub struct Calendar {
     pub is_subscribed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivedGraphCalendar {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub retained_event_count: i64,
+    pub replay_address_count: i64,
+    pub acknowledged: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewCalendar {
     pub account_id: String,
@@ -52,7 +62,7 @@ pub fn list_calendars(conn: &Connection, account_id: &str) -> Result<Vec<Calenda
     let mut stmt = conn.prepare(
         "SELECT id, account_id, name, color, is_default, remote_id, is_subscribed
          FROM calendars
-         WHERE account_id = ?1
+         WHERE account_id = ?1 AND is_archived = 0
          ORDER BY is_default DESC, name ASC",
     )?;
     let rows = stmt
@@ -71,10 +81,71 @@ pub fn list_calendars(conn: &Connection, account_id: &str) -> Result<Vec<Calenda
     Ok(rows)
 }
 
+/// Archived Graph provider identities are retained for review, never for
+/// ordinary calendar selection or event editing.
+pub fn list_archived_graph_calendars(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<ArchivedGraphCalendar>> {
+    let mut stmt = conn.prepare(
+        "SELECT calendar.id, calendar.account_id, calendar.name,
+                (SELECT COUNT(*) FROM calendar_events event
+                 WHERE event.calendar_id = calendar.id),
+                 (SELECT COUNT(*) FROM calendar_action_addresses address
+                  WHERE address.calendar_id = calendar.id),
+                 calendar.archived_acknowledged_at IS NOT NULL
+         FROM calendars calendar
+         WHERE calendar.account_id = ?1 AND calendar.is_archived = 1
+           AND calendar.remote_id IS NOT NULL AND calendar.remote_id != ''
+           AND EXISTS (SELECT 1 FROM service_bindings binding
+                       WHERE binding.account_id = calendar.account_id
+                         AND binding.service = 'calendar'
+                         AND binding.protocol = 'graph')
+         ORDER BY calendar.name, calendar.id",
+    )?;
+    let rows = stmt
+        .query_map([account_id], |row| {
+            Ok(ArchivedGraphCalendar {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                name: row.get(2)?,
+                retained_event_count: row.get(3)?,
+                replay_address_count: row.get(4)?,
+                acknowledged: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Acknowledgment affects only the archive notice, not cached events or
+/// recurrence action ownership. Match the account and archived Graph binding.
+pub fn acknowledge_archived_graph_calendar(
+    conn: &Connection,
+    account_id: &str,
+    calendar_id: &str,
+) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE calendars SET archived_acknowledged_at =
+             COALESCE(archived_acknowledged_at, CURRENT_TIMESTAMP)
+         WHERE id = ?1 AND account_id = ?2 AND is_archived = 1
+           AND remote_id IS NOT NULL AND remote_id != ''
+           AND EXISTS (SELECT 1 FROM service_bindings binding
+                       WHERE binding.account_id = calendars.account_id
+                         AND binding.service = 'calendar'
+                         AND binding.protocol = 'graph')",
+        params![calendar_id, account_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::Other("Archived Graph calendar not found".into()));
+    }
+    Ok(())
+}
+
 pub fn get_calendar(conn: &Connection, id: &str) -> Result<Calendar> {
     conn.query_row(
         "SELECT id, account_id, name, color, is_default, remote_id, is_subscribed
-         FROM calendars WHERE id = ?1",
+         FROM calendars WHERE id = ?1 AND is_archived = 0",
         params![id],
         |row| {
             Ok(Calendar {
@@ -191,6 +262,27 @@ fn is_answered_status(status: Option<&str>) -> bool {
     matches!(status, Some("accepted" | "tentative" | "declined"))
 }
 
+fn is_invitation_for_account(event: &CalendarEvent, email: &str) -> bool {
+    if event.organizer_email.as_deref().is_none_or(str::is_empty)
+        || event
+            .organizer_email
+            .as_ref()
+            .is_some_and(|organizer| organizer.eq_ignore_ascii_case(email))
+    {
+        return false;
+    }
+    event.my_status.is_some()
+        || event
+            .attendees_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<Attendee>>(json).ok())
+            .is_some_and(|people| {
+                people
+                    .iter()
+                    .any(|person| person.email.eq_ignore_ascii_case(email))
+            })
+}
+
 fn attendees_with_status(
     attendees_json: Option<&str>,
     account_email: &str,
@@ -226,6 +318,7 @@ struct ExistingEventForSync {
 fn single_unpushed_event_by_uid(
     conn: &Connection,
     account_id: &str,
+    calendar_id: &str,
     uid: &str,
     start_time: &str,
 ) -> Result<Option<ExistingEventForSync>> {
@@ -235,7 +328,8 @@ fn single_unpushed_event_by_uid(
                 EXISTS(SELECT 1 FROM calendar_invitation_sources source
                        WHERE source.event_id = calendar_events.id)
          FROM calendar_events
-         WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
+          WHERE account_id = ?1 AND calendar_id = ?2
+            AND uid = ?3 AND start_time = ?4
            AND (remote_id IS NULL OR remote_id = '')
            AND NOT EXISTS (SELECT 1 FROM calendar_action_creations creation WHERE creation.event_id = calendar_events.id)
            AND NOT EXISTS (SELECT 1 FROM calendar_action_members member WHERE member.event_id = calendar_events.id)
@@ -244,7 +338,7 @@ fn single_unpushed_event_by_uid(
          LIMIT 2",
     )?;
     let mut candidates = stmt
-        .query_map(params![account_id, uid, start_time], |row| {
+        .query_map(params![account_id, calendar_id, uid, start_time], |row| {
             Ok(ExistingEventForSync {
                 id: row.get(0)?,
                 my_status: row.get(1)?,
@@ -474,10 +568,61 @@ fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<Str
             .optional()?;
 
         let unpushed_existing = if let Some(uid) = event.uid.as_deref() {
-            single_unpushed_event_by_uid(conn, &event.account_id, uid, &event.start_time)?
+            single_unpushed_event_by_uid(
+                conn,
+                &event.account_id,
+                &event.calendar_id,
+                uid,
+                &event.start_time,
+            )?
         } else {
             None
         };
+
+        if let Some(local) = &unpushed_existing {
+            let protected: bool = conn.query_row(
+                "SELECT manually_managed_at IS NOT NULL
+                     OR source_message_id IS NOT NULL
+                     OR ical_data IS NOT NULL
+                     OR pending_rsvp_status IS NOT NULL
+                     OR EXISTS(SELECT 1 FROM calendar_invitation_sources source
+                               WHERE source.event_id = calendar_events.id)
+                     OR EXISTS(SELECT 1 FROM meet_meetings binding
+                               WHERE binding.event_id = calendar_events.id)
+                 FROM calendar_events WHERE id = ?1",
+                [&local.id],
+                |row| row.get(0),
+            )?;
+            if protected {
+                let source = get_event(conn, &local.id)?;
+                let account_email: String = conn.query_row(
+                    "SELECT email FROM accounts WHERE id = ?1",
+                    [&event.account_id],
+                    |row| row.get(0),
+                )?;
+                if source.account_id != event.account_id
+                    || source.calendar_id != event.calendar_id
+                    || source.uid.as_deref().is_none_or(str::is_empty)
+                    || source.uid != event.uid
+                    || source.organizer_email.as_deref().is_none_or(str::is_empty)
+                    || !source
+                        .organizer_email
+                        .as_deref()
+                        .zip(event.organizer_email.as_deref())
+                        .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new))
+                    || source.start_time != event.start_time
+                    || source.end_time != event.end_time
+                    || source.recurrence_kind != event.recurrence_kind
+                    || !is_invitation_for_account(&source, &account_email)
+                    || !is_invitation_for_account(event, &account_email)
+                {
+                    return Err(Error::Sync(format!(
+                        "Locally handled invite {:?} cannot be reconciled to a different provider identity",
+                        local.id
+                    )));
+                }
+            }
+        }
 
         let existing = match (remote_existing, unpushed_existing) {
             (Some(remote), Some(local)) if remote.id != local.id => {
@@ -810,6 +955,9 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1 AND calendar_id = ?2
+               AND EXISTS (SELECT 1 FROM calendars calendar
+                           WHERE calendar.id = calendar_events.calendar_id
+                             AND calendar.is_archived = 0)
                AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
                                WHERE member.event_id = calendar_events.id
                                  AND member.owner_event_id != calendar_events.id)
@@ -826,6 +974,9 @@ pub fn list_events(
                     ical_data, remote_id, etag, recurrence_kind
              FROM calendar_events
              WHERE account_id = ?1
+               AND EXISTS (SELECT 1 FROM calendars calendar
+                           WHERE calendar.id = calendar_events.calendar_id
+                             AND calendar.is_archived = 0)
                AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
                                WHERE member.event_id = calendar_events.id
                                  AND member.owner_event_id != calendar_events.id)
@@ -871,10 +1022,13 @@ pub fn list_invites(
         "SELECT id, account_id, calendar_id, uid, title, description, location,
                 start_time, end_time, all_day, timezone, recurrence_rule,
                 organizer_email, attendees_json, my_status, source_message_id,
-                ical_data, remote_id, etag, recurrence_kind, manually_managed_at, created_at
-         FROM calendar_events
-         WHERE account_id = ?1
-           AND organizer_email IS NOT NULL
+                 ical_data, remote_id, etag, recurrence_kind, manually_managed_at, created_at
+          FROM calendar_events
+          WHERE account_id = ?1
+            AND EXISTS (SELECT 1 FROM calendars calendar
+                        WHERE calendar.id = calendar_events.calendar_id
+                          AND calendar.is_archived = 0)
+            AND organizer_email IS NOT NULL
            AND organizer_email != ''
            AND organizer_email <> ?2 COLLATE NOCASE
            AND (end_time > ?3
@@ -915,10 +1069,30 @@ pub fn list_invites(
     for invite in filtered {
         let key = invite
             .event
-            .uid
+            .remote_id
             .as_deref()
-            .filter(|uid| !uid.is_empty())
-            .map(|uid| format!("uid:{uid}:start:{}", invite.event.start_time))
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("provider:{}:{id}", invite.event.calendar_id))
+            .or_else(|| {
+                invite
+                    .event
+                    .uid
+                    .as_deref()
+                    .filter(|uid| !uid.is_empty())
+                    .map(|uid| {
+                        format!(
+                            "uid:{uid}:start:{}:calendar:{}:organizer:{}",
+                            invite.event.start_time,
+                            invite.event.calendar_id,
+                            invite
+                                .event
+                                .organizer_email
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_lowercase(),
+                        )
+                    })
+            })
             .unwrap_or_else(|| format!("id:{}", invite.event.id));
         let candidate_rank = invite_management_rank(&invite);
         match deduplicated.entry(key) {
@@ -948,7 +1122,10 @@ pub fn mark_invite_managed(conn: &Connection, account_id: &str, event_id: &str) 
     let rows = conn.execute(
         "UPDATE calendar_events
          SET manually_managed_at = COALESCE(manually_managed_at, CURRENT_TIMESTAMP)
-         WHERE id = ?1 AND account_id = ?2",
+         WHERE id = ?1 AND account_id = ?2
+           AND NOT EXISTS (SELECT 1 FROM calendars calendar
+                           WHERE calendar.id = calendar_events.calendar_id
+                             AND calendar.is_archived = 1)",
         params![event_id, account_id],
     )?;
     if rows == 0 {
@@ -1067,9 +1244,9 @@ pub fn get_event_by_uid(
                 ical_data, remote_id, etag, recurrence_kind
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2
-         ORDER BY
-            CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
-            CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
+          ORDER BY
+             CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
+             CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
             CASE WHEN source_message_id IS NOT NULL THEN 0 ELSE 1 END
          LIMIT 1",
         params![account_id, uid],
@@ -1129,9 +1306,9 @@ pub fn get_event_by_uid_and_start(
                 ical_data, remote_id, etag, recurrence_kind
          FROM calendar_events
          WHERE account_id = ?1 AND uid = ?2 AND start_time = ?3
-         ORDER BY
-            CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
-            CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
+          ORDER BY
+             CASE WHEN my_status IN ('accepted', 'tentative', 'declined') THEN 0 ELSE 1 END,
+             CASE WHEN manually_managed_at IS NOT NULL THEN 0 ELSE 1 END,
             CASE WHEN source_message_id IS NOT NULL THEN 0 ELSE 1 END
          LIMIT 1",
         params![account_id, uid, start_time],
@@ -1210,6 +1387,7 @@ mod tests {
                 is_default INTEGER DEFAULT 0,
                 remote_id TEXT,
                 is_subscribed INTEGER NOT NULL DEFAULT 1,
+                is_archived INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(account_id, remote_id)
             );
             CREATE TABLE calendar_events (
@@ -1361,6 +1539,35 @@ mod tests {
                 ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass'),
                 ('acc2', 'Other', 'other@example.com', 'generic', 'other', 'pass');
             ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn setup_db_with_calendar() -> Connection {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name)
+             VALUES ('cal1', 'acc1', 'Calendar')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn setup_archived_graph_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('acc1', 'Test', 'test@example.com', 'user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendars (id, account_id, name, remote_id)
+             VALUES ('cal1', 'acc1', 'Calendar', 'provider-calendar')",
+            [],
         )
         .unwrap();
         conn
@@ -1680,7 +1887,7 @@ mod tests {
             RecurrenceKind::Series,
             RecurrenceKind::Occurrence,
         ] {
-            let conn = setup_db();
+            let conn = setup_db_with_calendar();
             let mut event = make_event("event", "Invite", Some("remote-event"));
             event.recurrence_kind = kind;
             event.recurrence_rule = (kind == RecurrenceKind::Series).then(|| "FREQ=WEEKLY".into());
@@ -2055,7 +2262,7 @@ mod tests {
 
     #[test]
     fn test_list_invites_basic() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let since = "2026-01-01T00:00:00Z";
 
         // 1. A genuine invite: someone else organizes, we attend.
@@ -2115,6 +2322,194 @@ mod tests {
     }
 
     #[test]
+    fn marked_unpushed_invite_rejects_a_different_provider_organizer() {
+        let conn = setup_db_with_calendar();
+        let mut local = make_event("local", "Invite", None);
+        local.organizer_email = Some("original@example.test".into());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &local).unwrap();
+        mark_invite_managed(&conn, "acc1", &local.id).unwrap();
+        let incoming = CalendarEvent {
+            id: "provider".into(),
+            remote_id: Some("immutable-id".into()),
+            organizer_email: Some("different@example.test".into()),
+            ..local.clone()
+        };
+        let error = upsert_event_by_remote_id(&conn, &incoming).unwrap_err();
+        assert!(error.to_string().contains("different provider identity"));
+        let persisted: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT remote_id, manually_managed_at FROM calendar_events
+             WHERE id = 'local'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, None);
+        assert!(persisted.1.is_some());
+        assert!(get_event(&conn, "provider").is_err());
+    }
+
+    #[test]
+    fn marked_unpushed_invite_with_identical_provider_identity_keeps_its_marker() {
+        let conn = setup_db_with_calendar();
+        let mut local = make_event("local", "Invite", None);
+        local.organizer_email = Some("organizer@example.test".into());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &local).unwrap();
+        mark_invite_managed(&conn, "acc1", "local").unwrap();
+        let provider = CalendarEvent {
+            id: "remote".into(),
+            remote_id: Some("immutable-id".into()),
+            ..local.clone()
+        };
+        upsert_event_by_remote_id(&conn, &provider).unwrap();
+        let linked = get_event(&conn, "local").unwrap();
+        assert_eq!(linked.remote_id.as_deref(), Some("immutable-id"));
+        assert!(conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'local'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn marked_unpushed_invite_is_not_hidden_by_a_provider_without_recipient() {
+        let conn = setup_db_with_calendar();
+        let mut local = make_event("local", "Invite", None);
+        local.organizer_email = Some("organizer@example.test".into());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &local).unwrap();
+        mark_invite_managed(&conn, "acc1", "local").unwrap();
+        let incoming = CalendarEvent {
+            id: "remote".into(),
+            remote_id: Some("immutable-id".into()),
+            attendees_json: Some(attendees_json(&["someone@example.com"])),
+            ..local.clone()
+        };
+        let error = upsert_event_by_remote_id(&conn, &incoming).unwrap_err();
+        assert!(error.to_string().contains("different provider identity"));
+        assert!(get_event(&conn, "local").unwrap().remote_id.is_none());
+        assert!(conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'local'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn unmarked_mail_sourced_invite_is_not_adopted_by_a_collision() {
+        let conn = setup_db_with_calendar();
+        let mut local = make_event("local", "Invite", None);
+        local.organizer_email = Some("organizer@example.test".into());
+        local.attendees_json = Some(attendees_json(&["test@example.com"]));
+        local.source_message_id = Some("original-message".into());
+        insert_event(&conn, &local).unwrap();
+        let incoming = CalendarEvent {
+            id: "provider".into(),
+            remote_id: Some("immutable-id".into()),
+            organizer_email: Some("different@example.test".into()),
+            ..local.clone()
+        };
+        let error = upsert_event_by_remote_id(&conn, &incoming).unwrap_err();
+        assert!(error.to_string().contains("different provider identity"));
+        let preserved = get_event(&conn, "local").unwrap();
+        assert!(preserved.remote_id.is_none());
+        assert_eq!(
+            preserved.source_message_id.as_deref(),
+            Some("original-message")
+        );
+        assert!(get_event(&conn, "provider").is_err());
+    }
+
+    #[test]
+    fn archived_calendar_is_not_a_display_or_mutation_source() {
+        let conn = setup_archived_graph_db();
+        conn.execute(
+            "INSERT INTO service_bindings (id, account_id, service, protocol)
+             VALUES ('graph-binding', 'acc1', 'calendar', 'graph')",
+            [],
+        )
+        .unwrap();
+        let mut invite = make_event("archived-invite", "Old", Some("old-id"));
+        invite.organizer_email = Some("boss@example.com".into());
+        invite.attendees_json = Some(attendees_json(&["test@example.com"]));
+        insert_event(&conn, &invite).unwrap();
+        conn.execute("UPDATE calendars SET is_archived = 1 WHERE id = 'cal1'", [])
+            .unwrap();
+        assert!(list_calendars(&conn, "acc1").unwrap().is_empty());
+        assert!(get_calendar(&conn, "cal1").is_err());
+        assert!(list_events(
+            &conn,
+            "acc1",
+            None,
+            "2026-04-07T00:00:00Z",
+            "2026-04-08T00:00:00Z"
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            list_invites(&conn, "acc1", "test@example.com", "2026-04-01")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            get_event(&conn, &invite.id).is_ok(),
+            "local data is retained"
+        );
+        assert!(mark_invite_managed(&conn, "acc1", &invite.id).is_err());
+        let handled: Option<String> = conn
+            .query_row(
+                "SELECT manually_managed_at FROM calendar_events WHERE id = ?1",
+                [&invite.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(handled.is_none());
+        let archived = list_archived_graph_calendars(&conn, "acc1").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "cal1");
+        assert_eq!(archived[0].retained_event_count, 1);
+        assert!(!archived[0].acknowledged);
+        acknowledge_archived_graph_calendar(&conn, "acc1", "cal1").unwrap();
+        acknowledge_archived_graph_calendar(&conn, "acc1", "cal1").unwrap();
+        let acknowledged = list_archived_graph_calendars(&conn, "acc1").unwrap();
+        assert!(acknowledged[0].acknowledged);
+        assert!(get_event(&conn, &invite.id).is_ok());
+        assert!(acknowledge_archived_graph_calendar(&conn, "another-account", "cal1").is_err());
+        assert!(list_archived_graph_calendars(&conn, "another-account")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn archived_graph_notice_excludes_other_calendar_protocols() {
+        let conn = setup_archived_graph_db();
+        assert!(acknowledge_archived_graph_calendar(&conn, "acc1", "cal1").is_err());
+        conn.execute("UPDATE calendars SET is_archived = 1 WHERE id = 'cal1'", [])
+            .unwrap();
+        assert!(list_archived_graph_calendars(&conn, "acc1")
+            .unwrap()
+            .is_empty());
+        assert!(acknowledge_archived_graph_calendar(&conn, "acc1", "cal1").is_err());
+        conn.execute(
+            "INSERT INTO service_bindings (id, account_id, service, protocol)
+             VALUES ('caldav-binding', 'acc1', 'calendar', 'caldav')",
+            [],
+        )
+        .unwrap();
+        assert!(list_archived_graph_calendars(&conn, "acc1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn test_mark_invite_managed_rejects_the_wrong_account() {
         let conn = setup_db();
         insert_event(&conn, &make_event("inv1", "Team Sync", None)).unwrap();
@@ -2148,7 +2543,7 @@ mod tests {
 
     #[test]
     fn test_list_invites_accepts_provider_status_for_an_account_alias() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let mut invite = make_event("alias1", "Alias Invite", None);
         invite.organizer_email = Some("boss@example.com".to_string());
         invite.attendees_json = Some(attendees_json(&["alias@example.com"]));
@@ -2162,8 +2557,8 @@ mod tests {
     }
 
     #[test]
-    fn test_list_invites_prefers_answered_legacy_duplicate() {
-        let conn = setup_db();
+    fn invite_management_keeps_distinct_provider_ids_with_the_same_uid() {
+        let conn = setup_db_with_calendar();
         let uid = "legacy-duplicate@example.com";
 
         let mut unanswered = make_event("remote-row", "Invite", Some("remote-1"));
@@ -2183,9 +2578,12 @@ mod tests {
 
         let invites =
             list_invites(&conn, "acc1", "test@example.com", "2026-01-01T00:00:00Z").unwrap();
-        assert_eq!(invites.len(), 1);
-        assert_eq!(invites[0].event.id, "response-row");
-        assert_eq!(invites[0].event.my_status.as_deref(), Some("accepted"));
+        assert_eq!(invites.len(), 2);
+        assert!(invites
+            .iter()
+            .any(|invite| invite.event.id == "response-row"
+                && invite.event.my_status.as_deref() == Some("accepted")));
+        assert!(invites.iter().any(|invite| invite.event.id == "remote-row"));
 
         let status_row = get_event_by_uid(&conn, "acc1", uid).unwrap().unwrap();
         assert_eq!(status_row.id, "response-row");
@@ -2193,7 +2591,7 @@ mod tests {
 
     #[test]
     fn test_list_invites_keeps_distinct_recurring_occurrences() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let uid = "recurring@example.com";
 
         for (id, start, end) in [
@@ -2225,8 +2623,42 @@ mod tests {
     }
 
     #[test]
+    fn invite_management_keeps_separate_current_calendar_copies() {
+        let conn = setup_db_with_calendar();
+        conn.execute(
+            "INSERT INTO calendars(id, account_id, name, remote_id)
+             VALUES ('cal2', 'acc1', 'Second', 'provider-second')",
+            [],
+        )
+        .unwrap();
+        for (id, calendar, organizer) in [
+            ("first", "cal1", "boss@example.test"),
+            ("second", "cal2", "boss@example.test"),
+            ("third", "cal1", "different@example.test"),
+            ("fourth", "cal1", "boss@example.test"),
+        ] {
+            let mut event = make_event(id, "Invite", Some(id));
+            event.uid = Some("shared-invite@example.test".into());
+            event.calendar_id = calendar.into();
+            event.organizer_email = Some(organizer.into());
+            event.attendees_json = Some(attendees_json(&["test@example.com"]));
+            insert_event(&conn, &event).unwrap();
+        }
+        let invites = list_invites(&conn, "acc1", "test@example.com", "2026-01-01").unwrap();
+        assert_eq!(invites.len(), 4);
+        let ids: std::collections::HashSet<_> = invites
+            .iter()
+            .map(|invite| invite.event.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["first", "second", "third", "fourth"].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn test_list_invites_date_window() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let since = "2026-04-01T00:00:00Z";
 
         // Past non-recurring invite (ended before `since`) — excluded.
@@ -2386,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_reconciles_a_single_unpushed_uid_row() {
+    fn marked_unpushed_row_without_invitation_identity_cannot_be_adopted() {
         let conn = setup_db();
         let mut local = make_event("local", "Invite", None);
         local.recurrence_kind = RecurrenceKind::Unknown;
@@ -2403,7 +2835,8 @@ mod tests {
         synced.uid = local.uid.clone();
         synced.my_status = Some("needs-action".to_string());
         synced.attendees_json = Some(attendees_json(&["test@example.com"]));
-        upsert_event_by_remote_id(&conn, &synced).unwrap();
+        let error = upsert_event_by_remote_id(&conn, &synced).unwrap_err();
+        assert!(error.to_string().contains("different provider identity"));
 
         let count: i64 = conn
             .query_row(
@@ -2414,12 +2847,12 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
 
-        let reconciled = get_event(&conn, "local").unwrap();
-        assert_eq!(reconciled.recurrence_kind, RecurrenceKind::Occurrence);
-        assert_eq!(reconciled.remote_id.as_deref(), Some("remote-1"));
-        assert_eq!(reconciled.my_status.as_deref(), Some("accepted"));
-        assert_eq!(reconciled.source_message_id.as_deref(), Some("message-1"));
-        assert_eq!(reconciled.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
+        let retained = get_event(&conn, "local").unwrap();
+        assert_eq!(retained.recurrence_kind, RecurrenceKind::Unknown);
+        assert!(retained.remote_id.is_none());
+        assert_eq!(retained.my_status.as_deref(), Some("accepted"));
+        assert_eq!(retained.source_message_id.as_deref(), Some("message-1"));
+        assert_eq!(retained.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
         let managed_at: Option<String> = conn
             .query_row(
                 "SELECT manually_managed_at FROM calendar_events WHERE id = 'local'",
@@ -2461,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_repairs_an_existing_remote_and_unpushed_duplicate_pair() {
+    fn marked_personal_copy_without_provider_identity_proof_remains_intact() {
         let conn = setup_db();
         let uid = "duplicate-uid@example.com";
 
@@ -2516,7 +2949,8 @@ mod tests {
         synced.uid = Some(uid.to_string());
         synced.my_status = Some("needs-action".to_string());
         synced.attendees_json = Some(attendees_json(&["provider-copy@example.com"]));
-        upsert_event_by_remote_id(&conn, &synced).unwrap();
+        let error = upsert_event_by_remote_id(&conn, &synced).unwrap_err();
+        assert!(error.to_string().contains("different provider identity"));
 
         let count: i64 = conn
             .query_row(
@@ -2525,41 +2959,49 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
-        assert!(get_event(&conn, "local-row").is_err());
-
-        let repaired = get_event(&conn, "remote-row").unwrap();
-        assert_eq!(repaired.my_status.as_deref(), Some("accepted"));
-        assert!(repaired
-            .attendees_json
-            .as_deref()
-            .is_some_and(|attendees| attendees.contains("test@example.com")
-                && !attendees.contains("provider-copy@example.com")));
+        assert_eq!(count, 2);
+        let local = get_event(&conn, "local-row").unwrap();
+        assert!(local.remote_id.is_none());
         assert_eq!(
-            repaired.organizer_email.as_deref(),
+            local.organizer_email.as_deref(),
             Some("organizer@example.test")
         );
-        assert_eq!(repaired.source_message_id.as_deref(), Some("message-1"));
-        assert_eq!(repaired.ical_data.as_deref(), Some("BEGIN:VCALENDAR"));
-        assert_eq!(
-            crate::db::calendar_invitation_source::get(&conn, "remote-row")
-                .unwrap()
-                .unwrap()
-                .invitation_uid,
-            uid
-        );
-        let (managed_at, meeting_event_id): (Option<String>, String) = conn
+        let marker: Option<String> = conn
             .query_row(
-                "SELECT e.manually_managed_at, m.event_id
-                 FROM calendar_events e
-                 JOIN meet_meetings m ON m.event_id = e.id
-                 WHERE e.id = 'remote-row'",
+                "SELECT manually_managed_at FROM calendar_events WHERE id = 'local-row'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert!(managed_at.is_some());
-        assert_eq!(meeting_event_id, "remote-row");
+        assert!(marker.is_some());
+
+        let unchanged = get_event(&conn, "remote-row").unwrap();
+        assert_eq!(unchanged.my_status.as_deref(), Some("needs-action"));
+        assert!(unchanged
+            .attendees_json
+            .as_deref()
+            .is_some_and(|attendees| attendees.contains("test@example.com")));
+        assert!(unchanged.organizer_email.is_none());
+        assert!(unchanged.source_message_id.is_none());
+        assert!(
+            crate::db::calendar_invitation_source::get(&conn, "remote-row")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::db::calendar_invitation_source::get(&conn, "local-row")
+                .unwrap()
+                .is_some()
+        );
+        let meeting_event_id: String = conn
+            .query_row(
+                "SELECT event_id FROM meet_meetings
+                 WHERE event_id = 'local-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meeting_event_id, "local-row");
     }
 
     #[test]
@@ -2574,7 +3016,7 @@ mod tests {
 
     #[test]
     fn test_list_events_by_time_range() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let e1 = CalendarEvent {
             start_time: "2026-04-07T10:00:00Z".to_string(),
             end_time: "2026-04-07T11:00:00Z".to_string(),
@@ -2609,7 +3051,7 @@ mod tests {
 
     #[test]
     fn list_events_keeps_self_owned_master_and_hides_child() {
-        let conn = setup_db();
+        let conn = setup_db_with_calendar();
         let owner = CalendarEvent {
             start_time: "2026-04-07T10:00:00Z".into(),
             end_time: "2026-04-07T11:00:00Z".into(),

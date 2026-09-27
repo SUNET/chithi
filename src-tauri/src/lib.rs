@@ -140,6 +140,8 @@ pub fn run() {
             commands::filters::delete_filter,
             commands::filters::apply_filters_to_folder,
             commands::calendar::list_calendars,
+            commands::calendar::list_archived_graph_calendars,
+            commands::calendar::acknowledge_archived_graph_calendar,
             commands::calendar::create_calendar,
             commands::calendar::update_calendar,
             commands::calendar::delete_calendar,

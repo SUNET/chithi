@@ -15,7 +15,7 @@ use crate::calendar::recurrence_identity::{
 };
 use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::db::{self, calendar_actions as store};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::state::AppState;
 
 fn context(state: &AppState) -> CalendarBackendCtx<'_> {
@@ -87,6 +87,20 @@ async fn hydrate_with_backends(
     event_id: &str,
     backends: Option<&[&dyn providers::CalendarBackend]>,
 ) -> Result<store::Snapshot> {
+    hydrate_source(state, event_id, backends, false)
+        .await
+        .map(|(snapshot, _)| snapshot)
+}
+
+async fn hydrate_source(
+    state: &AppState,
+    event_id: &str,
+    backends: Option<&[&dyn providers::CalendarBackend]>,
+    prove_child: bool,
+) -> Result<(
+    store::Snapshot,
+    Option<providers::VerifiedOccurrenceMembership>,
+)> {
     let (anchor, account, calendar, mut versions, revision) = {
         let conn = state.db.reader();
         let anchor = db::calendar::get_event(&conn, event_id)?;
@@ -123,7 +137,7 @@ async fn hydrate_with_backends(
         let revision = store::calendar_revision(&conn, &anchor.calendar_id)?;
         (anchor, account, calendar, versions, revision)
     };
-    let set = if let Some(remote_calendar_id) =
+    let (set, membership) = if let Some(remote_calendar_id) =
         calendar.remote_id.as_deref().filter(|id| !id.is_empty())
     {
         let provider_anchor = db::calendar::get_event(
@@ -140,14 +154,28 @@ async fn hydrate_with_backends(
             ));
         }
         let backend = backend_for(&account, backends)?;
-        let set = backend
-            .fetch_event_set(
-                &context(state),
-                &account,
-                &provider_anchor,
-                remote_calendar_id,
+        let (set, membership) = if prove_child {
+            backend
+                .fetch_event_set_for_repair(
+                    &context(state),
+                    &account,
+                    &provider_anchor,
+                    remote_calendar_id,
+                )
+                .await?
+        } else {
+            (
+                backend
+                    .fetch_event_set(
+                        &context(state),
+                        &account,
+                        &provider_anchor,
+                        remote_calendar_id,
+                    )
+                    .await?,
+                None,
             )
-            .await?;
+        };
         let native = set
             .native
             .as_ref()
@@ -157,7 +185,7 @@ async fn hydrate_with_backends(
                 "provider returned a resource outside the selected calendar",
             ));
         }
-        set
+        (set, membership)
     } else {
         if anchor.remote_id.as_deref().is_some_and(|id| !id.is_empty()) {
             return Err(invalid(
@@ -168,7 +196,7 @@ async fn hydrate_with_backends(
             &state.db.reader(),
             &store::owner_id(&state.db.reader(), &anchor.id)?,
         )?;
-        store::local_set(&state.db.reader(), &owner)?
+        (store::local_set(&state.db.reader(), &owner)?, None)
     };
     set.validate()?;
     if let Some(master) = &set.native {
@@ -228,7 +256,7 @@ async fn hydrate_with_backends(
         remote_calendar_id: calendar.remote_id,
     };
     store::ensure_current(&state.db.reader(), &snapshot)?;
-    Ok(snapshot)
+    Ok((snapshot, membership))
 }
 
 fn persist_hydrated_source(
@@ -308,12 +336,30 @@ async fn read_event_set(
 
 /// Retry an incomplete detached row only through an exact, provider-verified
 /// event set. The original recurrence slot is never inferred from its DTSTART.
+#[derive(serde::Serialize)]
+pub struct CalendarRepairOutcome {
+    pub repaired: bool,
+    pub retry_after_seconds: Option<u64>,
+}
+
 #[tauri::command]
 pub async fn repair_calendar_occurrence(
     state: State<'_, AppState>,
     event_id: String,
-) -> Result<bool> {
-    repair_unresolved_occurrence(&state, &event_id, None).await
+) -> Result<CalendarRepairOutcome> {
+    match repair_unresolved_occurrence(&state, &event_id, None).await {
+        Ok(repaired) => Ok(CalendarRepairOutcome {
+            repaired,
+            retry_after_seconds: None,
+        }),
+        Err(Error::GraphThrottled {
+            retry_after_seconds,
+        }) => Ok(CalendarRepairOutcome {
+            repaired: false,
+            retry_after_seconds: Some(retry_after_seconds),
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 async fn repair_unresolved_occurrence(
@@ -339,21 +385,50 @@ async fn repair_unresolved_occurrence(
     if already_resolved {
         return Ok(false);
     }
-    let snapshot = hydrate_with_backends(state, event_id, backends).await?;
+    let (snapshot, membership) = hydrate_source(state, event_id, backends, true).await?;
     let remote = anchor
         .remote_id
         .as_deref()
         .filter(|id| !id.is_empty())
         .ok_or_else(|| invalid("unresolved occurrence has no provider address"))?;
+    let exact_override = snapshot.set.overrides.iter().any(|item| {
+        item.native
+            .as_ref()
+            .is_some_and(|native| native.event_id == remote)
+    });
+    let verified = match membership {
+        Some(proof) => {
+            proof.native.protocol == "graph"
+                && proof.native.event_id == remote
+                && snapshot.set.native.as_ref().is_some_and(|master| {
+                    master.protocol == proof.native.protocol
+                        && master.calendar_id == proof.native.calendar_id
+                })
+                && match proof.kind {
+                    RecurrenceObjectKind::Exception => snapshot.set.overrides.iter().any(|item| {
+                        item.original_start == proof.original_start
+                            && item.native.as_ref().is_some_and(|native| {
+                                native.event_id == proof.native.event_id
+                                    && native.revision == proof.native.revision
+                            })
+                    }),
+                    RecurrenceObjectKind::Occurrence => !snapshot
+                        .set
+                        .overrides
+                        .iter()
+                        .any(|item| item.original_start == proof.original_start),
+                    _ => false,
+                }
+        }
+        None => {
+            snapshot.set.event.uid.is_some()
+                && snapshot.set.event.uid == anchor.uid
+                && exact_override
+        }
+    };
     if snapshot.anchor != anchor
         || snapshot.set.event.recurrence_kind != RecurrenceKind::Series
-        || snapshot.set.event.uid.is_none()
-        || snapshot.set.event.uid != anchor.uid
-        || !snapshot.set.overrides.iter().any(|item| {
-            item.native
-                .as_ref()
-                .is_some_and(|native| native.event_id == remote)
-        })
+        || !verified
     {
         return Err(invalid(
             "provider did not verify the detached occurrence in its series",
@@ -404,7 +479,8 @@ async fn list_occurrences(
     let ids = {
         let mut stmt = tx.prepare(
             "SELECT event.id FROM calendar_events event JOIN calendars calendar ON calendar.id = event.calendar_id
-             WHERE event.account_id = ?1 AND (?2 IS NULL OR event.calendar_id = ?2) AND calendar.is_subscribed = 1
+              WHERE event.account_id = ?1 AND (?2 IS NULL OR event.calendar_id = ?2) AND calendar.is_subscribed = 1
+                AND calendar.is_archived = 0
                AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
                                WHERE member.event_id = event.id
                                  AND member.owner_event_id != event.id)
@@ -454,12 +530,13 @@ async fn list_occurrences(
                 .push(crate::calendar::actions::UnresolvedCalendarOccurrence {
                     event_id: anchor.id.clone(),
                     calendar_id: anchor.calendar_id.clone(),
+                    account_id: anchor.account_id.clone(),
                 });
         }
     }
     if !page.unresolved.is_empty() {
         log::warn!(
-            "Calendar projection has {} unresolved detached row(s) for account {}; affected series withheld",
+            "Calendar projection has {} unresolved detached row(s) for account {}; matching-UID series withheld, other series may be incomplete",
             page.unresolved.len(),
             account_id
         );

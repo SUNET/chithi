@@ -323,6 +323,15 @@ export interface Calendar {
   is_subscribed: boolean;
 }
 
+export interface ArchivedGraphCalendar {
+  id: string;
+  account_id: string;
+  name: string;
+  retained_event_count: number;
+  replay_address_count: number;
+  acknowledged: boolean;
+}
+
 export type RecurrenceKind = "unknown" | "standalone" | "series" | "occurrence";
 
 export interface CalendarEvent {
@@ -377,7 +386,7 @@ export interface CalendarOccurrencePage {
   has_more: boolean;
   needs_hydration: string[];
   /** Unverified detached rows; never project or edit them as occurrences. */
-  unresolved: { event_id: string; calendar_id: string }[];
+  unresolved: { event_id: string; calendar_id: string; account_id: string }[];
 }
 
 export interface CalendarEventSetView {

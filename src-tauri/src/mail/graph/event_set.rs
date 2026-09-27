@@ -16,7 +16,9 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::{GraphClient, CALENDAR_EVENT_SELECT};
+use crate::backend::calendar::VerifiedOccurrenceMembership;
 use crate::calendar::event_set::{CalendarEventSet, CalendarOverride, NativeCalendarResource};
+use crate::calendar::recurrence_identity::RecurrenceObjectKind;
 use crate::calendar::{simple_recurrence, CalendarEvent, RecurrenceKind};
 use crate::error::{Error, Result};
 
@@ -522,6 +524,28 @@ impl GraphClient {
         id: &str,
         template: &CalendarEvent,
     ) -> Result<CalendarEventSet> {
+        self.fetch_calendar_event_set_internal(calendar, id, template, false)
+            .await
+            .map(|(set, _)| set)
+    }
+
+    pub(crate) async fn fetch_calendar_event_set_for_repair(
+        &self,
+        calendar: &str,
+        id: &str,
+        template: &CalendarEvent,
+    ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
+        self.fetch_calendar_event_set_internal(calendar, id, template, true)
+            .await
+    }
+
+    async fn fetch_calendar_event_set_internal(
+        &self,
+        calendar: &str,
+        id: &str,
+        template: &CalendarEvent,
+        prove_child: bool,
+    ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
         let first = self.set_get(calendar, id, false).await?;
         let kind = super::graph_recurrence_kind(&first);
         let master_id = if kind == RecurrenceKind::Occurrence {
@@ -639,6 +663,74 @@ impl GraphClient {
             .overrides
             .sort_by(|a, b| a.original_start.cmp(&b.original_start));
         result.validate()?;
-        Ok(result)
+        let membership = if prove_child && kind == RecurrenceKind::Occurrence {
+            let original_start = original(&result.event, &first)?;
+            let first_event = canonical(&first, template, calendar)?;
+            let first_native = native(&first, calendar)?;
+            let child_type = required_string(&first, "type")?;
+            match child_type {
+                "exception" => {
+                    let override_item = result
+                        .overrides
+                        .iter()
+                        .find(|item| {
+                            item.original_start == original_start
+                                && item.native.as_ref().is_some_and(|source| {
+                                    source.event_id == first_native.event_id
+                                        && source.revision == first_native.revision
+                                })
+                        })
+                        .ok_or_else(|| {
+                            invalid("selected exception was not verified in the master")
+                        })?;
+                    if override_item
+                        .event
+                        .as_ref()
+                        .map(crate::calendar::event_set::event_fields)
+                        != Some(crate::calendar::event_set::event_fields(&first_event))
+                    {
+                        return Err(invalid("selected exception changed during the master read"));
+                    }
+                }
+                "occurrence" => {
+                    if result
+                        .overrides
+                        .iter()
+                        .any(|item| item.original_start == original_start)
+                        || simple_recurrence::resolve(&result.event, &original_start)?
+                            != crate::calendar::event_set::event_fields(&first_event)
+                    {
+                        return Err(invalid(
+                            "selected generated occurrence contradicts its master",
+                        ));
+                    }
+                }
+                _ => return Err(invalid("selected child has no supported recurrence kind")),
+            }
+            // Graph does not provide a transaction across instance GETs. Recheck
+            // the exact child after the master and its finite exceptions.
+            let fresh = self.set_get(calendar, id, false).await?;
+            if fresh["@odata.etag"] != first["@odata.etag"]
+                || fresh["seriesMasterId"] != first["seriesMasterId"]
+                || fresh["originalStart"] != first["originalStart"]
+                || fresh["type"] != first["type"]
+                || crate::calendar::event_set::event_fields(&canonical(&fresh, template, calendar)?)
+                    != crate::calendar::event_set::event_fields(&first_event)
+            {
+                return Err(invalid("selected child changed during the master read"));
+            }
+            Some(VerifiedOccurrenceMembership {
+                original_start,
+                native: native(&fresh, calendar)?,
+                kind: if child_type == "exception" {
+                    RecurrenceObjectKind::Exception
+                } else {
+                    RecurrenceObjectKind::Occurrence
+                },
+            })
+        } else {
+            None
+        };
+        Ok((result, membership))
     }
 }
