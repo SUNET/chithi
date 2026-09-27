@@ -323,6 +323,15 @@ export interface Calendar {
   is_subscribed: boolean;
 }
 
+export interface ArchivedGraphCalendar {
+  id: string;
+  account_id: string;
+  name: string;
+  retained_event_count: number;
+  replay_address_count: number;
+  acknowledged: boolean;
+}
+
 export type RecurrenceKind = "unknown" | "standalone" | "series" | "occurrence";
 
 export interface CalendarEvent {
@@ -343,6 +352,86 @@ export interface CalendarEvent {
   attendees_json: string | null;
   my_status: string | null;
   source_message_id: string | null;
+}
+
+export interface CalendarSelection {
+  event_id: string;
+  token: string;
+  original_start: string | null;
+}
+
+export interface CalendarOccurrenceFields {
+  title: string;
+  description: string | null;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  all_day: boolean;
+  timezone: string | null;
+}
+
+export interface CalendarOccurrence {
+  selection: CalendarSelection;
+  event_id: string;
+  account_id: string;
+  calendar_id: string;
+  fields: CalendarOccurrenceFields;
+  recurrence_kind: RecurrenceKind;
+  recurrence_rule: string | null;
+  is_exception: boolean;
+}
+
+export interface CalendarOccurrencePage {
+  occurrences: CalendarOccurrence[];
+  has_more: boolean;
+  needs_hydration: string[];
+  /** Unverified detached rows; never project or edit them as occurrences. */
+  unresolved: { event_id: string; calendar_id: string; account_id: string }[];
+}
+
+export interface CalendarEventSetView {
+  master: CalendarOccurrence;
+  page: CalendarOccurrencePage;
+  exception_count: number;
+}
+
+export interface CalendarEdit {
+  title?: string;
+  description?: string;
+  location?: string;
+  start_time?: string;
+  end_time?: string;
+  all_day?: boolean;
+  timezone?: string;
+  recurrence_rule?: string;
+}
+
+export interface CalendarActionInput {
+  selection: CalendarSelection;
+  scope: "this-occurrence" | "entire-series";
+  edit: CalendarEdit;
+  destination_calendar_id: string | null;
+  reset_exceptions: boolean;
+}
+
+export interface CalendarConfirmations {
+  replacement_meeting_identity: boolean;
+  reset_exceptions: boolean;
+}
+
+export interface CalendarActionPlan {
+  operation_id: string;
+  requires: CalendarConfirmations;
+  preview: CalendarOccurrenceFields;
+}
+
+export interface CalendarActionResult {
+  operation_id: string;
+  stage: "planned" | "applying" | "destination-verified" |
+    "source-removal-pending" | "reconciling" | "completed";
+  event_id: string;
+  requires: CalendarConfirmations;
+  auto_resume?: boolean;
 }
 
 export interface Attendee {

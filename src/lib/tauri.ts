@@ -319,6 +319,19 @@ export async function listCalendars(
   return invoke("list_calendars", { accountId });
 }
 
+export async function listArchivedGraphCalendars(
+  accountId: string,
+): Promise<import("./types").ArchivedGraphCalendar[]> {
+  return invoke("list_archived_graph_calendars", { accountId });
+}
+
+export async function acknowledgeArchivedGraphCalendar(
+  accountId: string,
+  calendarId: string,
+): Promise<void> {
+  return invoke("acknowledge_archived_graph_calendar", { accountId, calendarId });
+}
+
 export async function createCalendar(
   calendar: { account_id: string; name: string; color: string; is_default: boolean },
 ): Promise<string> {
@@ -397,6 +410,71 @@ export async function updateEvent(
   event: Partial<import("./types").NewEventInput>,
 ): Promise<void> {
   return invoke("update_event", { eventId, event });
+}
+
+export async function readCalendarEventSet(
+  eventId: string,
+  start: string,
+  end: string,
+  limit = 200,
+): Promise<import("./types").CalendarEventSetView> {
+  return invoke("read_calendar_event_set", { eventId, start, end, limit });
+}
+
+export async function listCalendarOccurrences(
+  accountId: string,
+  calendarId: string | null,
+  start: string,
+  end: string,
+  limit = 2000,
+): Promise<import("./types").CalendarOccurrencePage> {
+  return invoke("list_calendar_occurrences", {
+    accountId,
+    calendarId,
+    start,
+    end,
+    limit,
+  });
+}
+
+export async function repairCalendarOccurrence(eventId: string): Promise<{
+  repaired: boolean;
+  retry_after_seconds: number | null;
+}> {
+  return invoke("repair_calendar_occurrence", { eventId });
+}
+
+export async function planCalendarAction(
+  input: import("./types").CalendarActionInput,
+): Promise<import("./types").CalendarActionPlan> {
+  return invoke("plan_calendar_action", { input });
+}
+
+export async function planCalendarOccurrenceAction(
+  eventId: string,
+  originalStart: string,
+  expected: import("./types").CalendarOccurrenceFields,
+  edit: import("./types").CalendarEdit,
+): Promise<import("./types").CalendarActionPlan> {
+  return invoke("plan_calendar_occurrence_action", {
+    eventId,
+    originalStart,
+    expected,
+    edit,
+  });
+}
+
+export async function executeCalendarAction(
+  operationId: string,
+  confirmations: import("./types").CalendarConfirmations,
+): Promise<import("./types").CalendarActionResult> {
+  return invoke("execute_calendar_action", { operationId, confirmations });
+}
+
+export async function listPendingCalendarActions(
+  accountId: string,
+): Promise<import("./types").CalendarActionResult[]> {
+  return invoke("list_pending_calendar_actions", { accountId });
 }
 
 export async function deleteEvent(eventId: string): Promise<void> {

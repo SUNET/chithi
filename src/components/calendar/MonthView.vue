@@ -3,6 +3,7 @@ import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
 import { getDateInTimezone } from "@/lib/datetime";
+import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 
@@ -22,32 +23,12 @@ const calendarStore = useCalendarStore();
 const uiStore = useUiStore();
 
 const weeks = computed(() => {
-  const d = new Date(calendarStore.currentDate);
-  const year = d.getFullYear();
-  const month = d.getMonth();
-  const firstDay = new Date(year, month, 1);
-  const lastDay = new Date(year, month + 1, 0);
-
-  // Start from the configured week start day
-  const start = new Date(firstDay);
-  const offset = (start.getDay() - uiStore.weekStartDay + 7) % 7;
-  start.setDate(start.getDate() - offset);
-
-  const rows: Date[][] = [];
-  const current = new Date(start);
-  while (current <= lastDay || rows.length < 5) {
-    const week: Date[] = [];
-    for (let i = 0; i < 7; i++) {
-      week.push(new Date(current));
-      current.setDate(current.getDate() + 1);
-    }
-    rows.push(week);
-    if (rows.length >= 6) break;
-  }
-  return rows;
+  const days = monthGridDays(calendarStore.displayDate, uiStore.weekStartDay);
+  return Array.from({ length: days.length / 7 }, (_, week) =>
+    days.slice(week * 7, week * 7 + 7));
 });
 
-const currentMonth = computed(() => new Date(calendarStore.currentDate).getMonth());
+const currentMonth = computed(() => parseCalendarDay(calendarStore.displayDate).getMonth());
 
 function isToday(date: Date): boolean {
   return date.toDateString() === new Date().toDateString();
@@ -58,7 +39,7 @@ function isCurrentMonth(date: Date): boolean {
 }
 
 function getEventsForDay(date: Date) {
-  const dayStr = getDateInTimezone(date.toISOString(), uiStore.displayTimezone);
+  const dayStr = calendarDay(date);
   return calendarStore.visibleEvents.filter((e) => {
     const eStartDay = getDateInTimezone(e.start_time, uiStore.displayTimezone);
     const eEndDay = getDateInTimezone(e.end_time, uiStore.displayTimezone);
@@ -169,11 +150,11 @@ onUnmounted(() => {
 
 function onCellEnter(day: Date) {
   if (!canDrop.value) return;
-  dragOverDay.value = day.toISOString().split("T")[0];
+  dragOverDay.value = calendarDay(day);
 }
 
 function onCellLeave(day: Date) {
-  if (dragOverDay.value === day.toISOString().split("T")[0]) {
+  if (dragOverDay.value === calendarDay(day)) {
     dragOverDay.value = null;
   }
 }
@@ -213,15 +194,15 @@ function onCellDrop(day: Date) {
       <div v-for="(week, wi) in weeks" :key="wi" class="month-week">
         <div
           v-for="day in week"
-          :key="day.toISOString()"
+          :key="calendarDay(day)"
           class="month-cell"
           :class="{
             today: isToday(day),
             'other-month': !isCurrentMonth(day),
-            'drag-over': canDrop && dragOverDay === day.toISOString().split('T')[0],
+            'drag-over': canDrop && dragOverDay === calendarDay(day),
           }"
-          :data-testid="`cal-month-cell-${day.toISOString().split('T')[0]}`"
-          @click="emit('dateClick', day.toISOString().split('T')[0])"
+          :data-testid="`cal-month-cell-${calendarDay(day)}`"
+          @click="emit('dateClick', calendarDay(day))"
           @mouseenter="onCellEnter(day)"
           @mouseleave="onCellLeave(day)"
           @mouseup="onCellDrop(day)"

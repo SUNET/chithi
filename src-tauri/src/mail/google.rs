@@ -9,6 +9,9 @@ use crate::calendar::recurrence_identity::{OccurrenceFields, UpdateOccurrenceInp
 use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::error::{Error, Result};
 
+mod event_sets;
+pub(crate) use event_sets::event_set_content;
+
 const PEOPLE_PAGE_SIZE: usize = 1_000;
 const PEOPLE_PAGE_SIZE_PARAMETER: &str = "1000";
 const PEOPLE_BATCH_SIZE: usize = 200;
@@ -263,7 +266,7 @@ impl GoogleClient {
                 urlencoding::encode(calendar_id)
             )))
             .bearer_auth(&self.token)
-            .query(&[("singleEvents", "true"), ("maxResults", "500")])
+            .query(&[("maxResults", "500")])
     }
 
     /// Incremental events listing using a stored sync token.
@@ -326,6 +329,9 @@ impl GoogleClient {
 
         for page_number in 1..=MAX_EVENT_PAGES {
             let mut request = self.list_events_request(calendar_id).query(base_query);
+            if !base_query.iter().any(|(key, _)| *key == "singleEvents") {
+                request = request.query(&[("singleEvents", "true")]);
+            }
             if let Some(token) = page_token.as_deref() {
                 request = request.query(&[("pageToken", token)]);
             }
@@ -3049,45 +3055,30 @@ pub fn send_updates_for(attendees_json: Option<&str>) -> &'static str {
     }
 }
 
-/// Calendar v3 payload for creating an event. Includes the local UID
-/// as iCalUID and the attendee list, so Google sends invites and RSVP
-/// replies match back. Recurrence is not represented by this creation payload.
+/// Calendar v3 insert payload, including the supported editor recurrence rules.
+/// Insert generates a new iCalUID; importing an existing UID is a different API.
 pub fn event_to_google_json(event: &CalendarEvent) -> Result<serde_json::Value> {
-    if event.recurrence_kind != RecurrenceKind::Standalone
-        || event
-            .recurrence_rule
-            .as_deref()
-            .is_some_and(|rule| !rule.is_empty())
-    {
+    if !matches!(
+        event.recurrence_kind,
+        RecurrenceKind::Standalone | RecurrenceKind::Series
+    ) {
         return Err(Error::UnsupportedCapability {
             protocol: "google",
             capability: "recurring or unclassified event creation",
         });
     }
-    let mut google_event = serde_json::json!({
-        "summary": event.title,
-        "start": time_json(&event.start_time, event.all_day),
-        "end": time_json(&event.end_time, event.all_day),
-        "iCalUID": event.uid,
-    });
-    if let Some(ref desc) = event.description {
-        google_event["description"] = serde_json::json!(desc);
+    if event.recurrence_kind == RecurrenceKind::Series
+        && event
+            .ical_data
+            .as_deref()
+            .is_some_and(|raw| !crate::calendar::ical::is_rrule_only_series(raw))
+    {
+        return Err(Error::UnsupportedCapability {
+            protocol: "google",
+            capability: "ordinary creation with source-backed recurrence exceptions",
+        });
     }
-    if let Some(ref loc) = event.location {
-        google_event["location"] = serde_json::json!(loc);
-    }
-    if let Some(ref att_json) = event.attendees_json {
-        if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
-            let google_attendees: Vec<serde_json::Value> = atts
-                .iter()
-                .filter_map(|a| a["email"].as_str().map(|e| serde_json::json!({"email": e})))
-                .collect();
-            if !google_attendees.is_empty() {
-                google_event["attendees"] = serde_json::json!(google_attendees);
-            }
-        }
-    }
-    Ok(google_event)
+    event_set_content(event)
 }
 
 /// Calendar v3 payload for patching an event. Deliberately narrower
@@ -3296,8 +3287,18 @@ mod builder_tests {
             title: "Standup".into(),
             description: Some("daily".into()),
             location: None,
-            start_time: "2026-07-14T09:00:00Z".into(),
-            end_time: "2026-07-14T09:15:00Z".into(),
+            start_time: if all_day {
+                "2026-07-14"
+            } else {
+                "2026-07-14T09:00:00Z"
+            }
+            .into(),
+            end_time: if all_day {
+                "2026-07-15"
+            } else {
+                "2026-07-14T09:15:00Z"
+            }
+            .into(),
             all_day,
             timezone: None,
             recurrence_rule: None,
@@ -3317,7 +3318,7 @@ mod builder_tests {
         let v = event_to_google_json(&event(false, None)).unwrap();
         assert_eq!(v["start"]["dateTime"], "2026-07-14T09:00:00Z");
         assert!(v["start"]["date"].is_null());
-        assert_eq!(v["iCalUID"], "uid-1@chithi");
+        assert!(v.get("iCalUID").is_none());
     }
 
     #[test]
@@ -3325,25 +3326,27 @@ mod builder_tests {
         let v = event_to_google_json(&event(true, None)).unwrap();
         assert_eq!(v["start"]["date"], "2026-07-14");
         assert!(v["start"]["dateTime"].is_null());
-        assert_eq!(v["end"]["date"], "2026-07-14");
+        assert_eq!(v["end"]["date"], "2026-07-15");
     }
 
     #[test]
     fn attendees_map_to_email_objects() {
         let v = event_to_google_json(&event(
             false,
-            Some(r#"[{"email":"a@x.org","name":"A"},{"name":"no-email"}]"#),
+            Some(r#"[{"email":"a@x.org","name":"A","status":"accepted"}]"#),
         ))
         .unwrap();
         let atts = v["attendees"].as_array().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["email"], "a@x.org");
+        assert_eq!(atts[0]["displayName"], "A");
+        assert_eq!(atts[0]["responseStatus"], "accepted");
     }
 
     #[test]
-    fn empty_attendee_list_is_omitted() {
+    fn empty_attendee_list_is_explicit() {
         let v = event_to_google_json(&event(false, Some("[]"))).unwrap();
-        assert!(v["attendees"].is_null());
+        assert_eq!(v["attendees"], serde_json::json!([]));
     }
 
     #[test]

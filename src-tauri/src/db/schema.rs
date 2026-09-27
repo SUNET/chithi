@@ -110,6 +110,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_account_remote
             ON calendar_events(account_id, remote_id);
 
+
         CREATE TABLE IF NOT EXISTS calendar_recurrence_objects (
             object_id TEXT PRIMARY KEY,
             account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -253,13 +254,16 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             SELECT RAISE(ABORT, 'recurrence objects cannot cross accounts');
         END;
 
-        -- SET NULL preserves provider-backed objects; local-only objects have
+        -- Retire owned objects before FK cleanup can unlink their self-reference.
+        -- Surviving provider-backed objects may unlink; local-only objects have
         -- no durable series identity after their local master disappears.
-        CREATE TRIGGER IF NOT EXISTS calendar_recurrence_prune_local_series
+        DROP TRIGGER IF EXISTS calendar_recurrence_prune_local_series;
+        CREATE TRIGGER calendar_recurrence_prune_local_series
         BEFORE DELETE ON calendar_events
         BEGIN
             DELETE FROM calendar_recurrence_objects
-            WHERE local_series_event_id = OLD.id AND provider_series_id IS NULL;
+            WHERE event_id = OLD.id
+               OR (local_series_event_id = OLD.id AND provider_series_id IS NULL);
         END;
 
         CREATE TABLE IF NOT EXISTS calendars (
@@ -269,6 +273,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             color TEXT DEFAULT '#4285f4',
             is_default INTEGER DEFAULT 0,
             remote_id TEXT,
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            archived_acknowledged_at TEXT,
             UNIQUE(account_id, remote_id)
         );
 
@@ -432,6 +438,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     // Migrations for existing databases
     run_migrations(conn)?;
     initialize_calendar_event_state(conn)?;
+    super::calendar_actions::initialize(conn)?;
 
     Ok(())
 }
@@ -687,6 +694,22 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE calendars ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1;",
         )?;
+    }
+    let has_is_archived = conn
+        .prepare("SELECT is_archived FROM calendars LIMIT 0")
+        .is_ok();
+    if !has_is_archived {
+        log::info!("Migration: adding is_archived to calendars");
+        conn.execute_batch(
+            "ALTER TABLE calendars ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let has_archived_acknowledged_at = conn
+        .prepare("SELECT archived_acknowledged_at FROM calendars LIMIT 0")
+        .is_ok();
+    if !has_archived_acknowledged_at {
+        log::info!("Migration: adding archived_acknowledged_at to calendars");
+        conn.execute_batch("ALTER TABLE calendars ADD COLUMN archived_acknowledged_at TEXT;")?;
     }
 
     // Manual invite acknowledgement is local workflow state, separate from
@@ -1231,6 +1254,39 @@ pub fn set_migration(conn: &Connection, key: &str) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archived_calendar_acknowledgment_migrates_existing_archives() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calendars (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL,
+                color TEXT DEFAULT '#4285f4', is_default INTEGER DEFAULT 0,
+                remote_id TEXT, is_subscribed INTEGER NOT NULL DEFAULT 1,
+                is_archived INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(account_id, remote_id)
+             );",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Test', 'test@example.test', 'test');
+             INSERT INTO calendars (id, account_id, name, remote_id, is_archived)
+             VALUES ('old', 'account', 'Old', 'old-provider', 1);",
+        )
+        .unwrap();
+        initialize(&conn).unwrap();
+        let state: (bool, Option<String>) = conn
+            .query_row(
+                "SELECT is_archived, archived_acknowledged_at
+                 FROM calendars WHERE id = 'old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (true, None));
+    }
 
     #[test]
     fn recurrence_identity_schema_is_empty_preserving_and_idempotent() {

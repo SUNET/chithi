@@ -38,7 +38,14 @@ pub fn delete_events(conn: &Connection, event_ids: &[String]) -> Result<Deletion
                 (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
                  cleanup_requested)
              SELECT ?1, account_id, protocol, meeting_id, join_url, CURRENT_TIMESTAMP, 1
-             FROM meet_meetings WHERE event_id = ?2",
+             FROM meet_meetings binding WHERE event_id = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM meet_meetings shared
+                   WHERE shared.event_id != binding.event_id
+                     AND shared.account_id = binding.account_id
+                     AND shared.protocol = binding.protocol
+                     AND shared.meeting_id = binding.meeting_id
+               )",
             params![lifecycle_id, event_id],
         )?;
         let deleted = conn.execute(
@@ -175,6 +182,33 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn shared_transferred_meeting_is_queued_only_after_its_last_reference() {
+        let mut conn = connection();
+        insert_event(&conn, "source");
+        insert_event(&conn, "destination");
+        bind(&conn, "source");
+        conn.execute(
+            "INSERT INTO meet_meetings(event_id, account_id, protocol, meeting_id, join_url)
+             SELECT 'destination', account_id, protocol, meeting_id, join_url FROM meet_meetings WHERE event_id = 'source'", [],
+        ).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(delete_event(&tx, "source")
+            .unwrap()
+            .cleanup_lifecycle_ids
+            .is_empty());
+        assert_eq!(count(&tx, "meet_pending_meetings"), 0);
+        assert_eq!(
+            delete_event(&tx, "destination")
+                .unwrap()
+                .cleanup_lifecycle_ids
+                .len(),
+            1
+        );
+        tx.commit().unwrap();
+        assert_eq!(count(&conn, "meet_pending_meetings"), 1);
     }
 
     fn record_recurrence(conn: &Connection, event_id: &str) {

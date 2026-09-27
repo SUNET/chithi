@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod calendar;
+pub(crate) mod calendar_actions;
 pub mod calendar_event_deletion;
 pub(crate) mod calendar_invitation;
 pub(crate) mod calendar_invitation_source;

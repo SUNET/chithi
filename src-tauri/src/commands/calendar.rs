@@ -62,7 +62,7 @@ fn duration_minutes_between(start: &str, end: &str) -> u32 {
 // Input types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NewEventInput {
     pub account_id: String,
     pub calendar_id: String,
@@ -103,7 +103,7 @@ pub struct UpdateEventInput {
 
 /// Frontend-supplied copy of metadata returned from `meet_create_url`.
 /// The backend accepts it only when it exactly matches a pending lifecycle.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetBindingInput {
     pub lifecycle_id: String,
     pub account_id: String,
@@ -120,7 +120,7 @@ pub struct MeetBindingInput {
 /// account's resolved meet provider stops an attacker from forging
 /// e.g. a Zoom protocol entry against a Talk account and causing
 /// Chithi to PATCH/DELETE arbitrary meetings.
-fn claim_meet_binding(
+pub(crate) fn claim_meet_binding(
     conn: &rusqlite::Connection,
     event_id: &str,
     b: &MeetBindingInput,
@@ -128,6 +128,13 @@ fn claim_meet_binding(
     let pending = matching_pending_meeting(conn, b)?;
     validate_pending_provider(conn, &pending)?;
     transfer_pending_meeting(conn, event_id, b, pending)
+}
+
+pub(crate) fn validate_pending_meet_binding(
+    conn: &rusqlite::Connection,
+    binding: &MeetBindingInput,
+) -> Result<()> {
+    validate_pending_provider(conn, &matching_pending_meeting(conn, binding)?)
 }
 
 fn validate_pending_provider(
@@ -228,7 +235,7 @@ fn replace_meet_binding_ownership(
                 || old.protocol != binding.protocol
                 || old.meeting_id != binding.meeting_id =>
         {
-            Some(queue_meeting_cleanup(conn, old)?)
+            queue_meeting_cleanup(conn, old)?
         }
         _ => None,
     };
@@ -239,7 +246,21 @@ fn replace_meet_binding_ownership(
 fn queue_meeting_cleanup(
     conn: &rusqlite::Connection,
     binding: db::meet_meetings::MeetMeeting,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    let shared: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meet_meetings WHERE event_id != ?1
+         AND account_id = ?2 AND protocol = ?3 AND meeting_id = ?4)",
+        rusqlite::params![
+            binding.event_id,
+            binding.account_id,
+            binding.protocol,
+            binding.meeting_id
+        ],
+        |row| row.get(0),
+    )?;
+    if shared {
+        return Ok(None);
+    }
     let lifecycle_id = uuid::Uuid::new_v4().to_string();
     db::meet_pending_meetings::insert(
         conn,
@@ -253,7 +274,7 @@ fn queue_meeting_cleanup(
             cleanup_requested: true,
         },
     )?;
-    Ok(lifecycle_id)
+    Ok(Some(lifecycle_id))
 }
 
 fn pending_matches_binding(
@@ -281,6 +302,24 @@ pub async fn list_calendars(
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
     log::debug!("list_calendars: found {} calendars", calendars.len());
     Ok(calendars)
+}
+
+#[tauri::command]
+pub async fn list_archived_graph_calendars(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<db::calendar::ArchivedGraphCalendar>> {
+    db::calendar::list_archived_graph_calendars(&state.db.reader(), &account_id)
+}
+
+#[tauri::command]
+pub async fn acknowledge_archived_graph_calendar(
+    state: State<'_, AppState>,
+    account_id: String,
+    calendar_id: String,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::calendar::acknowledge_archived_graph_calendar(&conn, &account_id, &calendar_id)
 }
 
 #[tauri::command]
@@ -415,6 +454,7 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
     let cleanup_ids = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         let cleanup_ids =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?
                 .cleanup_lifecycle_ids;
@@ -437,6 +477,7 @@ pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: Strin
     let deletion = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
         let deletion =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
@@ -474,13 +515,18 @@ pub async fn get_events(
     let events =
         db::calendar::list_events(&conn, &account_id, calendar_id.as_deref(), &start, &end)?;
     log::debug!("get_events: found {} events", events.len());
-    Ok(events)
+    Ok(events.into_iter().map(renderer_event).collect())
+}
+
+fn renderer_event(mut event: CalendarEvent) -> CalendarEvent {
+    event.ical_data = None;
+    event
 }
 
 /// Refresh one selected event independently of the current displayed date range.
 #[tauri::command]
 pub fn get_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<CalendarEvent> {
-    db::calendar::get_event(&state.db.reader(), &event_id)
+    db::calendar::get_event(&state.db.reader(), &event_id).map(renderer_event)
 }
 
 #[tauri::command]
@@ -625,6 +671,8 @@ fn build_recurrence_mutation_plan(
     scope: RecurrenceMutationScope,
     protocol: &str,
 ) -> Result<RecurrenceMutationPlan> {
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
+    db::calendar_actions::ensure_unclaimed(conn, &event.id)?;
     if conn.is_autocommit() {
         return Err(crate::error::Error::Other(
             "Recurrence mutation planning requires a database transaction".into(),
@@ -1261,7 +1309,13 @@ pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Res
         account_id,
         invites.len()
     );
-    Ok(invites)
+    Ok(invites
+        .into_iter()
+        .map(|mut invite| {
+            invite.event = renderer_event(invite.event);
+            invite
+        })
+        .collect())
 }
 
 /// Mark a stored invitation as handled locally without sending an RSVP.
@@ -1279,6 +1333,19 @@ pub async fn mark_invite_managed(
 
 #[tauri::command]
 pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
+    if event
+        .recurrence_rule
+        .as_deref()
+        .is_some_and(|rule| !rule.is_empty())
+    {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        return super::calendar_actions::create_completed(&state, event, &operation_id)
+            .await
+            .map(|result| result.event_id)
+            .map_err(|error| {
+                crate::error::Error::Other(format!("Calendar creation {operation_id}: {error}"))
+            });
+    }
     create_event_inner(&state, event, None).await
 }
 
@@ -1882,7 +1949,9 @@ fn checked_mutation_target(
     expected: Option<&MoveSourceSnapshot>,
 ) -> Result<CalendarEvent> {
     let event = db::calendar::get_event(conn, event_id)?;
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
     event.ensure_mutable()?;
+    db::calendar_actions::ensure_unclaimed(conn, event_id)?;
     if let Some(expected) = expected {
         if conn.is_autocommit() {
             return Err(crate::error::Error::Other(
@@ -3617,6 +3686,14 @@ async fn apply_invite_response(
     let response = InviteResponse::try_from(response.as_str())?;
     let response_text = response.as_str();
     let backend = crate::backend::calendar::for_account(&account);
+    if backend.is_some_and(|provider| provider.protocol() == "graph") {
+        ensure_unique_local_graph_invite(
+            &state.db.reader(),
+            &account_id,
+            &invite_uid,
+            &invite.dtstart,
+        )?;
+    }
     let track_pending_rsvp = backend
         .map(|provider| provider.remote_rsvp_policy() != RemoteRsvpPolicy::RequiredBeforeLocal)
         .unwrap_or(true);
@@ -3953,6 +4030,32 @@ async fn apply_invite_response(
     use tauri::Emitter as _;
     app.emit("calendar-changed", account_id.as_str()).ok();
 
+    Ok(())
+}
+
+fn ensure_unique_local_graph_invite(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    uid: &str,
+    start: &str,
+) -> Result<()> {
+    let candidates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM calendar_events event
+         JOIN calendars calendar ON calendar.id = event.calendar_id
+         WHERE event.account_id = ?1 AND event.uid = ?2
+           AND calendar.is_archived = 0
+           AND (event.start_time = ?3 OR
+                (julianday(event.start_time) IS NOT NULL
+                 AND julianday(event.start_time) = julianday(?3)))",
+        rusqlite::params![account_id, uid, start],
+        |row| row.get(0),
+    )?;
+    if candidates > 1 {
+        return Err(crate::error::Error::Sync(
+            "Multiple local Graph invitations share this UID and start; refusing an ambiguous RSVP"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -4937,6 +5040,72 @@ mod tests {
         RecurrenceIdentity, RecurrenceIdentitySeed, RecurrenceValueType,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn archived_calendar_event_cannot_be_mutated_by_direct_id() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars (id, account_id, name, remote_id, is_archived)
+             VALUES ('old', 'account', 'Old', 'old-identity', 1);
+             INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time, remote_id)
+             VALUES ('retained', 'account', 'old', 'Retained',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z', 'old-event');",
+        )
+        .unwrap();
+        assert!(checked_mutation_target(&conn, "retained", None).is_err());
+        let transaction = conn.transaction().unwrap();
+        let retained = db::calendar::get_event(&transaction, "retained").unwrap();
+        assert!(build_recurrence_mutation_plan(
+            &transaction,
+            retained,
+            "old-occurrence",
+            RecurrenceMutationScope::ThisOccurrence,
+            "graph",
+        )
+        .is_err());
+        assert!(db::calendar::get_event(&transaction, "retained").is_ok());
+        assert!(db::calendar::get_calendar(&transaction, "old").is_err());
+    }
+
+    #[test]
+    fn graph_response_preflight_rejects_two_visible_local_copies() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars(id, account_id, name)
+             VALUES ('first', 'account', 'First'),
+                    ('second', 'account', 'Second');
+             INSERT INTO calendar_events
+                 (id, account_id, calendar_id, uid, title, start_time, end_time)
+             VALUES ('one', 'account', 'first', 'same-uid', 'One',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'),
+                    ('two', 'account', 'second', 'same-uid', 'Two',
+                     '2026-09-14T11:00:00+02:00', '2026-09-14T12:00:00+02:00');",
+        )
+        .unwrap();
+        assert!(ensure_unique_local_graph_invite(
+            &conn,
+            "account",
+            "same-uid",
+            "2026-09-14T09:00:00Z",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous RSVP"));
+        conn.execute(
+            "UPDATE calendars SET is_archived = 1 WHERE id = 'second'",
+            [],
+        )
+        .unwrap();
+        ensure_unique_local_graph_invite(&conn, "account", "same-uid", "2026-09-14T09:00:00Z")
+            .unwrap();
+    }
 
     #[derive(Clone, Copy)]
     enum OccurrenceBackendMode {
@@ -6423,18 +6592,30 @@ mod tests {
             is_subscribed: true,
         };
 
-        for protocol in ["google", "graph"] {
+        for protocol in ["google", "graph", "jmap", "caldav"] {
             let backend = crate::backend::calendar::for_protocol(protocol);
-            assert!(import_target_error(&calendar, backend).is_some());
-            calendar.is_default = true;
-            assert!(import_target_error(&calendar, backend).is_none());
-            calendar.is_default = false;
+            for is_default in [false, true] {
+                calendar.is_default = is_default;
+                calendar.remote_id = Some("remote-calendar".into());
+                assert!(
+                    import_target_error(&calendar, backend).is_none(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = false;
+                assert!(
+                    import_target_error(&calendar, backend).is_some(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = true;
+                for remote_id in [None, Some(String::new())] {
+                    calendar.remote_id = remote_id;
+                    assert!(
+                        import_target_error(&calendar, backend).is_some(),
+                        "{protocol}"
+                    );
+                }
+            }
         }
-
-        let caldav = crate::backend::calendar::for_protocol("caldav");
-        assert!(import_target_error(&calendar, caldav).is_none());
-        calendar.remote_id = None;
-        assert!(import_target_error(&calendar, caldav).is_some());
     }
 
     #[test]

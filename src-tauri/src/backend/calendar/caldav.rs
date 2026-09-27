@@ -2,6 +2,15 @@
 
 use async_trait::async_trait;
 
+mod event_sets;
+mod resource;
+mod timezones;
+
+#[cfg(test)]
+mod tests;
+
+use crate::calendar::event_set::{CalendarEventSet, NativeCalendarResource};
+
 use crate::calendar::ical;
 use crate::calendar::recurrence_identity::{
     OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
@@ -580,6 +589,66 @@ impl CalendarBackend for CalDavCalendarBackend {
         super::RecurringImportFidelity::RawIcalendar
     }
 
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        calendar: &str,
+    ) -> Result<CalendarEventSet> {
+        event_sets::fetch(ctx, account, event, calendar).await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        event_sets::update(ctx, account, before, desired).await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        calendar: &str,
+        desired: &CalendarEventSet,
+        operation: &str,
+    ) -> Result<CalendarEventSet> {
+        event_sets::create(ctx, account, calendar, desired, operation).await
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        event_sets::delete(ctx, account, before).await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        calendar: &str,
+    ) -> Result<super::CalendarCapability<CalendarEventSet>> {
+        event_sets::move_native(ctx, account, before, calendar).await
+    }
+
+    async fn push_updated_event(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<()> {
+        event_sets::ordinary_update(ctx, account, remote_id, event).await
+    }
+
     async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
         let db = ctx.db;
         let account_id = account.id.as_str();
@@ -656,69 +725,189 @@ impl CalendarBackend for CalDavCalendarBackend {
                 cal.name
             );
 
-            let mut conn = db.writer().await;
+            // The REPORT is unbounded. Only a complete, unambiguous UID group
+            // proves that detached resources are part of the master's set.
+            // Validate before changing any rows so a bad sibling cannot leave
+            // an independently projected moved occurrence behind.
+            let mut groups: std::collections::BTreeMap<String, Vec<ParsedCalDavResource>> =
+                std::collections::BTreeMap::new();
+            let mut incomplete_report = false;
             for ev in &caldav_events {
-                // Reparse even with an unchanged etag: legacy rows need source
-                // classification, and the shared upsert persists it on refresh.
                 let Some(parsed) = parse_caldav_resource(ev, account, local_cal_id, &cal.href)
                 else {
-                    log::debug!(
-                        "sync_calendars: could not parse iCal data for event href={}",
-                        ev.href
-                    );
+                    log::warn!("sync_calendars: invalid CalDAV resource href={}", ev.href);
+                    incomplete_report = true;
                     continue;
                 };
-                let cal_event = parsed.event;
-
-                let result = match parsed.recurrence_seeds {
-                    Some(seeds) => db::calendar::upsert_event_by_remote_id_with_recurrence(
-                        &conn, &cal_event, &seeds,
-                    )
-                    .map(|_| ()),
-                    None => db::calendar::upsert_event_by_remote_id(&conn, &cal_event),
-                };
-                if let Err(e) = result {
-                    log::error!(
-                        "sync_calendars: failed to upsert CalDAV event '{}': {}",
-                        cal_event.title,
-                        e
+                if client.validate_resource_href(&cal.href, &ev.href).is_err() {
+                    log::warn!("sync_calendars: out-of-scope CalDAV href={}", ev.href);
+                    incomplete_report = true;
+                    continue;
+                }
+                if parsed.recurrence_seeds.is_none() {
+                    log::warn!(
+                        "sync_calendars: unclassifiable CalDAV resource href={}",
+                        ev.href
                     );
+                    incomplete_report = true;
+                }
+                groups.entry(ev.uid.clone()).or_default().push(parsed);
+            }
+            if incomplete_report {
+                log::warn!(
+                    "sync_calendars: retaining calendar '{}' because its REPORT cannot prove complete recurrence groups",
+                    cal.name
+                );
+                continue;
+            }
+
+            let mut conn = db.writer().await;
+            let mut protected_uids = std::collections::HashSet::new();
+            for (uid, mut group) in groups {
+                group.sort_by(|a, b| a.event.remote_id.cmp(&b.event.remote_id));
+                let masters = group
+                    .iter()
+                    .filter(|resource| {
+                        resource.recurrence_seeds.as_ref().is_some_and(|seeds| {
+                            seeds
+                                .iter()
+                                .any(|seed| seed.kind == RecurrenceObjectKind::Master)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if group.len() == 1
+                    && group[0]
+                        .recurrence_seeds
+                        .as_ref()
+                        .is_some_and(Vec::is_empty)
+                {
+                    let parsed = &group[0];
+                    if let Err(error) = db::calendar::upsert_event_by_remote_id_with_recurrence(
+                        &conn,
+                        &parsed.event,
+                        &[],
+                    ) {
+                        log::error!("sync_calendars: CalDAV UID={uid} ingestion failed: {error}");
+                        protected_uids.insert(uid);
+                    }
+                    continue;
+                }
+                if masters.len() != 1
+                    || group.iter().any(|item| {
+                        item.recurrence_seeds.is_none()
+                            || item.event.uid.as_deref() != Some(uid.as_str())
+                    })
+                {
+                    log::warn!("sync_calendars: ambiguous CalDAV recurrence UID={uid}; retaining cached set");
+                    protected_uids.insert(uid);
+                    continue;
+                }
+                let master = masters[0];
+                let native = group
+                    .iter()
+                    .map(|item| NativeCalendarResource {
+                        protocol: "caldav".into(),
+                        calendar_id: cal.href.clone(),
+                        event_id: item.event.remote_id.clone().expect("REPORT href"),
+                        revision: item.event.etag.clone(),
+                        data: item.event.ical_data.clone().expect("REPORT calendar-data"),
+                    })
+                    .collect::<Vec<_>>();
+                let set = match resource::combine(&native, &master.event) {
+                    Ok(set) => set,
+                    Err(error) => {
+                        if group.len() == 1 {
+                            // Some imported masters (for example floating DTSTART)
+                            // can still be read by the legacy sync parser, but cannot
+                            // prove a canonical set. Preserve that ingestion path.
+                            let parsed = &group[0];
+                            let result = db::calendar::upsert_event_by_remote_id_with_recurrence(
+                                &conn,
+                                &parsed.event,
+                                parsed
+                                    .recurrence_seeds
+                                    .as_deref()
+                                    .expect("validated master"),
+                            );
+                            if let Err(error) = result {
+                                log::error!(
+                                    "sync_calendars: CalDAV UID={uid} ingestion failed: {error}"
+                                );
+                                protected_uids.insert(uid);
+                            }
+                            continue;
+                        }
+                        log::warn!("sync_calendars: invalid CalDAV recurrence UID={uid}: {error}");
+                        protected_uids.insert(uid);
+                        continue;
+                    }
+                };
+                let mut ordered = Vec::with_capacity(group.len());
+                ordered.push(master);
+                ordered.extend(
+                    group
+                        .iter()
+                        .filter(|item| item.event.remote_id != master.event.remote_id),
+                );
+                let resources = ordered
+                    .iter()
+                    .map(|item| {
+                        (
+                            &item.event,
+                            item.recurrence_seeds
+                                .as_deref()
+                                .expect("validated recurrence"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let result = (|| -> Result<bool> {
+                    let tx = conn.transaction()?;
+                    let ingested =
+                        db::calendar_actions::persist_synced_caldav_set(&tx, &resources, &set)?;
+                    tx.commit()?;
+                    Ok(ingested)
+                })();
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::info!("sync_calendars: deferred claimed CalDAV UID={uid}");
+                        protected_uids.insert(uid);
+                    }
+                    Err(error) => {
+                        log::error!("sync_calendars: CalDAV UID={uid} ingestion failed: {error}");
+                        protected_uids.insert(uid);
+                    }
                 }
             }
 
             // Remove local events with remote_id that no longer exist on server
             let server_hrefs: std::collections::HashSet<String> =
                 caldav_events.iter().map(|e| e.href.clone()).collect();
-            let local_synced: Vec<(String, String)> = conn
+            let local_synced: Vec<(String, String, Option<String>)> = conn
                 .prepare(
-                    "SELECT id, remote_id FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id IS NOT NULL AND remote_id != ''",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_map(rusqlite::params![account_id, local_cal_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default();
+                    "SELECT id, remote_id, uid FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id IS NOT NULL AND remote_id != ''",
+                )?
+                .query_map(rusqlite::params![account_id, local_cal_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
 
             let deleted_ids: Vec<String> = local_synced
                 .iter()
-                .filter(|(_, remote_id)| !server_hrefs.contains(remote_id))
-                .map(|(local_id, _)| local_id.clone())
+                .filter(|(_, remote_id, uid)| {
+                    !server_hrefs.contains(remote_id)
+                        && !uid.as_ref().is_some_and(|uid| protected_uids.contains(uid))
+                })
+                .map(|(local_id, _, _)| local_id.clone())
                 .collect();
             let deleted = if deleted_ids.is_empty() {
                 0
             } else {
-                match conn.transaction() {
-                    Ok(transaction) => {
-                        match db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)
-                        {
-                            Ok(result) if transaction.commit().is_ok() => result.deleted,
-                            _ => 0,
-                        }
-                    }
-                    Err(_) => 0,
-                }
+                let transaction = conn.transaction()?;
+                let deleted =
+                    db::calendar_actions::delete_missing_caldav_events(&transaction, &deleted_ids)?;
+                transaction.commit()?;
+                deleted
             };
             if deleted > 0 {
                 log::info!(
@@ -801,22 +990,23 @@ impl CalendarBackend for CalDavCalendarBackend {
         account: &AccountFull,
         request: &RemoteOccurrenceUpdate,
     ) -> Result<RemoteOccurrenceUpdateOutcome> {
-        let (uid, recurrence_id, value_type, recurrence_timezone, native) =
+        let (uid, recurrence_id, value_type, recurrence_timezone, _native) =
             validate_occurrence_update(account, request)?;
-        let updated = ical::rewrite_recurrence_occurrence(
-            native,
-            uid,
-            recurrence_id,
-            value_type,
-            recurrence_timezone,
-            &request.patch,
-            &request.desired,
-        )
-        .map_err(Error::Other)?;
-        let etag = request.expected_provider_revision.as_deref().unwrap();
+        let rewrite_request = request.clone();
+        let updated =
+            tokio::task::spawn_blocking(move || resource::rewrite_occurrence(&rewrite_request))
+                .await
+                .map_err(|e| Error::Other(format!("CalDAV resource preparation failed: {e}")))??;
+        let etag = request
+            .expected_provider_revision
+            .as_deref()
+            .ok_or_else(|| Error::Sync("Missing CalDAV validator".into()))?;
         let client = connect(ctx, account).await?;
+        let etag = client
+            .strong_revision_for(&request.target_id, Some(etag), Some(_native))
+            .await?;
         let put_etag = client
-            .put_event_at_href(&request.target_id, &updated, Some(etag))
+            .put_event_at_href(&request.target_id, &updated, Some(&etag))
             .await?;
         let canonical = client
             .get_event_at_href(&request.target_id)
@@ -914,9 +1104,12 @@ impl CalendarBackend for CalDavCalendarBackend {
             .as_deref()
             .ok_or_else(|| Error::Other("The personal copy has no UID".into()))?;
         let data = personal_copy_ical_data(event, uid)?;
-        connect(ctx, account)
-            .await?
-            .put_event_at_href(remote_id, &data, event.etag.as_deref())
+        let client = connect(ctx, account).await?;
+        let revision = client
+            .strong_revision_for(remote_id, event.etag.as_deref(), event.ical_data.as_deref())
+            .await?;
+        client
+            .put_event_at_href(remote_id, &data, Some(&revision))
             .await
     }
 
@@ -1045,6 +1238,13 @@ mod recurrence_tests {
         services.transports.dav_http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
+            .default_headers(headers.clone())
+            .build()
+            .unwrap();
+        services.transports.dav_resource_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
             .default_headers(headers)
             .build()
             .unwrap();
@@ -1090,6 +1290,445 @@ mod recurrence_tests {
             ),
             ("REPORT", 207, multistatus(events)),
         ]
+    }
+
+    fn report_events(events: &[CalDavEvent]) -> String {
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "<d:response><d:href>{}</d:href><d:propstat><d:prop>\
+             <d:getetag>{}</d:getetag><c:calendar-data><![CDATA[{}]]></c:calendar-data>\
+             </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                    event.href, event.etag, event.ical_data,
+                )
+            })
+            .collect::<String>()
+    }
+
+    fn split_series() -> (CalDavEvent, CalDavEvent) {
+        let master = CalDavEvent {
+            href: "/calendar/master.ics".into(),
+            ..resource(&component("RRULE:FREQ=WEEKLY;COUNT=3\n"))
+        };
+        let detached = CalDavEvent {
+            href: "/calendar/detached.ics".into(),
+            ical_data: resource(&component("RECURRENCE-ID:20260920T100000Z\n"))
+                .ical_data
+                .replace("DTSTART:20260913T100000Z", "DTSTART:20260921T120000Z")
+                .replace("DTEND:20260913T110000Z", "DTEND:20260921T130000Z"),
+            ..master.clone()
+        };
+        (master, detached)
+    }
+
+    fn projected_series(
+        db: &DbPool,
+        master_id: &str,
+        start: &str,
+        end: &str,
+    ) -> crate::calendar::actions::CalendarOccurrencePage {
+        let conn = db.reader();
+        let owner = db::calendar::get_event(&conn, master_id).unwrap();
+        let set = db::calendar_actions::display_owned_set(&conn, master_id)
+            .unwrap()
+            .unwrap();
+        crate::calendar::actions::project(&set, &owner, "test", start, end, 100).unwrap()
+    }
+
+    #[tokio::test]
+    async fn split_moved_exception_syncs_as_one_series_and_recovers_after_removal() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        // Simulate the independent rows left by older versions of sync.
+        let detached_id = {
+            let conn = db.writer().await;
+            let account = account("calendar", "caldav");
+            let parsed = parse_caldav_resource(&detached, &account, "cal1", "/calendar/").unwrap();
+            db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &parsed.event,
+                parsed.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap()
+        };
+        let mut master_id = String::new();
+        for _ in 0..2 {
+            let (root, captured) = serve_dav(sync_responses(&report_events(&[
+                detached.clone(),
+                master.clone(),
+            ])))
+            .await;
+            sync_at(&db, &root).await.unwrap();
+            assert_eq!(captured.await.unwrap().len(), 4);
+            let conn = db.reader();
+            let current_master: String = conn
+                .query_row(
+                    "SELECT id FROM calendar_events WHERE remote_id = '/calendar/master.ics'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if !master_id.is_empty() {
+                assert_eq!(current_master, master_id);
+            }
+            master_id = current_master;
+            assert_eq!(
+                db::calendar_actions::owner_id(&conn, &detached_id).unwrap(),
+                master_id
+            );
+            assert!(db::calendar::get_event(&conn, &detached_id)
+                .unwrap()
+                .remote_id
+                .is_none());
+            assert_eq!(conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND calendar_id = 'cal1'",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 2);
+            drop(conn);
+            let page = projected_series(
+                &db,
+                &master_id,
+                "2026-09-20T00:00:00Z",
+                "2026-09-22T00:00:00Z",
+            );
+            assert_eq!(page.occurrences.len(), 1);
+            assert_eq!(page.occurrences[0].event_id, master_id);
+            assert_eq!(
+                page.occurrences[0].selection.original_start.as_deref(),
+                Some("2026-09-20T10:00:00Z")
+            );
+            assert_eq!(
+                page.occurrences[0].fields.start_time,
+                "2026-09-21T12:00:00Z"
+            );
+        }
+
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[master]))).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let page = projected_series(
+            &db,
+            &master_id,
+            "2026-09-20T00:00:00Z",
+            "2026-09-22T00:00:00Z",
+        );
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(
+            page.occurrences[0].fields.start_time,
+            "2026-09-20T10:00:00Z"
+        );
+        let conn = db.reader();
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM calendar_action_addresses WHERE remote_id = '/calendar/detached.ics'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn split_exception_projects_only_at_its_effective_position_across_windows() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[master, detached]))).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        let master_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = '/calendar/master.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(projected_series(
+            &db,
+            &master_id,
+            "2026-09-20T00:00:00Z",
+            "2026-09-21T00:00:00Z"
+        )
+        .occurrences
+        .is_empty());
+        let moved_in = projected_series(
+            &db,
+            &master_id,
+            "2026-09-21T00:00:00Z",
+            "2026-09-22T00:00:00Z",
+        );
+        assert_eq!(moved_in.occurrences.len(), 1);
+        assert_eq!(
+            moved_in.occurrences[0].selection.original_start.as_deref(),
+            Some("2026-09-20T10:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_moved_exception_uses_one_owner_without_detached_rows() {
+        let (_dir, db) = upload_db().await;
+        let (mut master, detached) = split_series();
+        let exception = detached
+            .ical_data
+            .split_once("BEGIN:VEVENT\n")
+            .unwrap()
+            .1
+            .split_once("END:VEVENT\n")
+            .unwrap()
+            .0;
+        master.ical_data = master.ical_data.replace(
+            "END:VCALENDAR\n",
+            &format!("BEGIN:VEVENT\n{exception}END:VEVENT\nEND:VCALENDAR\n"),
+        );
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[master]))).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        let master_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = '/calendar/master.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND calendar_id = 'cal1'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+        drop(conn);
+        let page = projected_series(
+            &db,
+            &master_id,
+            "2026-09-20T00:00:00Z",
+            "2026-09-22T00:00:00Z",
+        );
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(
+            page.occurrences[0].fields.start_time,
+            "2026-09-21T12:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_split_series_does_not_upload_orphaned_detached_members() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[master, detached]))).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let (root, captured) = serve_dav(sync_responses("")).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND calendar_id = 'cal1'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM calendar_action_addresses WHERE account_id = 'acc1' AND calendar_id = 'cal1' AND retired = 0",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_split_group_preserves_last_canonical_set_and_owner() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[
+            master.clone(),
+            detached.clone(),
+        ])))
+        .await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        let master_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = '/calendar/master.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before = db::calendar_actions::display_owned_set(&conn, &master_id).unwrap();
+        drop(conn);
+
+        let invalid = [
+            vec![detached.clone()],
+            vec![
+                master.clone(),
+                CalDavEvent {
+                    href: "/calendar/second-master.ics".into(),
+                    ..master.clone()
+                },
+            ],
+            vec![
+                master.clone(),
+                CalDavEvent {
+                    ical_data: detached.ical_data.replace(
+                        "RECURRENCE-ID:20260920T100000Z",
+                        "RECURRENCE-ID;RANGE=THISANDFUTURE:20260920T100000Z",
+                    ),
+                    ..detached.clone()
+                },
+            ],
+        ];
+        for events in invalid {
+            let (root, captured) = serve_dav(sync_responses(&report_events(&events))).await;
+            sync_at(&db, &root).await.unwrap();
+            assert_eq!(captured.await.unwrap().len(), 4);
+            let conn = db.reader();
+            assert_eq!(
+                db::calendar_actions::display_owned_set(&conn, &master_id).unwrap(),
+                before
+            );
+            assert_eq!(
+                db::calendar::get_event(&conn, &master_id)
+                    .unwrap()
+                    .remote_id
+                    .as_deref(),
+                Some("/calendar/master.ics")
+            );
+            drop(conn);
+            let page = projected_series(
+                &db,
+                &master_id,
+                "2026-09-20T00:00:00Z",
+                "2026-09-22T00:00:00Z",
+            );
+            assert_eq!(page.occurrences.len(), 1);
+            assert_eq!(
+                page.occurrences[0].fields.start_time,
+                "2026-09-21T12:00:00Z"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unclassifiable_report_resource_cannot_make_another_uid_look_complete() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[
+            master.clone(),
+            detached.clone(),
+        ])))
+        .await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        let master_id: String = conn
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = '/calendar/master.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before = db::calendar_actions::display_owned_set(&conn, &master_id).unwrap();
+        drop(conn);
+
+        let changed_master = CalDavEvent {
+            ical_data: master
+                .ical_data
+                .replace("SUMMARY:Visible event", "SUMMARY:Changed"),
+            ..master
+        };
+        let invalid = CalDavEvent {
+            href: "/calendar/invalid.ics".into(),
+            ical_data: "BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n".into(),
+            ..detached.clone()
+        };
+        let (root, captured) = serve_dav(sync_responses(&report_events(&[
+            changed_master,
+            detached,
+            invalid,
+        ])))
+        .await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let conn = db.reader();
+        assert_eq!(
+            db::calendar_actions::display_owned_set(&conn, &master_id).unwrap(),
+            before
+        );
+        assert_eq!(
+            db::calendar::get_event(&conn, &master_id).unwrap().title,
+            "Visible event"
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_series_defers_split_ingestion_until_operation_finishes() {
+        let (_dir, db) = upload_db().await;
+        let (master, detached) = split_series();
+        let master_id = {
+            let conn = db.writer().await;
+            let parsed = parse_caldav_resource(
+                &master,
+                &account("calendar", "caldav"),
+                "cal1",
+                "/calendar/",
+            )
+            .unwrap();
+            let id = db::calendar::upsert_event_by_remote_id_with_recurrence(
+                &conn,
+                &parsed.event,
+                parsed.recurrence_seeds.as_deref().unwrap(),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_action_operations(operation_id, account_id, event_id, data)
+                 VALUES ('operation', 'acc1', ?1, '{}')",
+                [&id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calendar_action_claims(event_id, operation_id)
+                 VALUES (?1, 'operation')",
+                [&id],
+            )
+            .unwrap();
+            id
+        };
+        let report = report_events(&[master, detached]);
+        let (root, captured) = serve_dav(sync_responses(&report)).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let (root, captured) = serve_dav(sync_responses("")).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        {
+            let conn = db.writer().await;
+            assert!(db::calendar_actions::display_owned_set(&conn, &master_id)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                db::calendar::get_event(&conn, &master_id)
+                    .unwrap()
+                    .remote_id
+                    .as_deref(),
+                Some("/calendar/master.ics")
+            );
+            assert_eq!(conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE account_id = 'acc1' AND calendar_id = 'cal1'",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(), 1);
+            conn.execute(
+                "DELETE FROM calendar_action_claims WHERE operation_id = 'operation'",
+                [],
+            )
+            .unwrap();
+        }
+        let (root, captured) = serve_dav(sync_responses(&report)).await;
+        sync_at(&db, &root).await.unwrap();
+        assert_eq!(captured.await.unwrap().len(), 4);
+        let page = projected_series(
+            &db,
+            &master_id,
+            "2026-09-20T00:00:00Z",
+            "2026-09-22T00:00:00Z",
+        );
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(
+            page.occurrences[0].fields.start_time,
+            "2026-09-21T12:00:00Z"
+        );
     }
 
     async fn serve_dav(
@@ -1308,7 +1947,11 @@ mod recurrence_tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
         assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
-        let put_body = requests[0].split_once("\r\n\r\n").unwrap().1;
+        let put_body = requests[0]
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .1
+            .replace("\r\n", "\n");
         assert!(put_body.contains("SUMMARY:Requested title\n"));
         assert!(!put_body.contains("DESCRIPTION:Old"));
         assert!(!put_body.contains("LOCATION:Old"));
@@ -1363,8 +2006,8 @@ mod recurrence_tests {
             let (_dir, db) = temp_pool();
             let services = injected_services();
             let mut request = occurrence_update_request(native);
-            request.expected_provider_revision = Some(etag.into());
-            request.trusted_identity.provider_revision = Some(etag.into());
+            request.expected_provider_revision = Some("\"old-etag\"".into());
+            request.trusted_identity.provider_revision = Some("\"old-etag\"".into());
 
             let outcome = CalDavCalendarBackend
                 .update_recurrence_occurrence(
@@ -1378,7 +2021,7 @@ mod recurrence_tests {
                 .await
                 .unwrap();
             let requests = captured.await.unwrap();
-            assert!(requests[0].contains(&format!("if-match: {etag}\r\n")));
+            assert!(requests[0].contains("if-match: \"old-etag\"\r\n"));
             assert_eq!(
                 outcome.replacement_identity.provider_revision.as_deref(),
                 Some(etag)
@@ -1395,7 +2038,7 @@ mod recurrence_tests {
 
     #[tokio::test]
     async fn occurrence_update_retains_put_etag_when_canonical_get_omits_it() {
-        for put_etag in ["\"uploaded-etag\"", "W/\"uploaded-etag\""] {
+        for put_etag in ["\"uploaded-etag\""] {
             let native = occurrence_resource_with_sibling("X-KEEP:value\n");
             let canonical = native
                 .replace("SUMMARY:Visible event", "SUMMARY:Canonical")
@@ -1457,7 +2100,11 @@ mod recurrence_tests {
             assert!(requests[2].starts_with("PUT /calendar/event.ics HTTP/1.1\r\n"));
             assert!(requests[2].contains(&format!("if-match: {put_etag}\r\n")));
             assert!(!requests[2].contains("if-match: \"old-etag\"\r\n"));
-            let put_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+            let put_body = requests[2]
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .1
+                .replace("\r\n", "\n");
             assert!(put_body.contains("SUMMARY:Follow-up title\n"));
             assert!(put_body.contains("DESCRIPTION:Old\nLOCATION:Old\nX-KEEP:value\n"));
             assert!(put_body.contains(

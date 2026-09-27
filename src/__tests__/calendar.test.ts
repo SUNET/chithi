@@ -4,8 +4,16 @@ import { setActivePinia, createPinia } from "pinia";
 vi.mock("@/lib/tauri", () => ({
   listAccounts: vi.fn().mockResolvedValue([]),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
+  acknowledgeArchivedGraphCalendar: vi.fn().mockResolvedValue(undefined),
   listRoomSuggestions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+  }),
+  repairCalendarOccurrence: vi.fn().mockResolvedValue({
+    repaired: false, retry_after_seconds: null,
+  }),
   createEvent: vi.fn().mockResolvedValue("evt-1"),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
@@ -43,9 +51,22 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
-import { isOccurrenceId, masterEventId } from "@/lib/rrule";
+import { isOccurrenceId, masterEventId, occurrenceId } from "@/lib/rrule";
 import type { CalendarEvent } from "@/lib/types";
 import * as api from "@/lib/tauri";
+import { monthGridDays, calendarDay } from "@/lib/calendar-days";
+import { useUiStore } from "@/stores/ui";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function settleNavigation(store: ReturnType<typeof useCalendarStore>) {
+  await vi.waitFor(() => expect(store.loading).toBe(false));
+}
 
 function setupAccounts() {
   const accountsStore = useAccountsStore();
@@ -182,6 +203,123 @@ describe("Calendar store", () => {
 
       expect(store.calendars).toEqual([]);
     });
+
+    it("reports archived Graph data separately from live calendars", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const live = makeCalendar("current", "Calendar", "immutable");
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 245, replay_address_count: 2,
+        acknowledged: false,
+      };
+      vi.mocked(api.listCalendars).mockResolvedValueOnce([live]);
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+
+      await store.fetchCalendars();
+
+      expect(store.calendars).toEqual([live]);
+      expect(store.archivedGraphCalendars).toEqual([archived]);
+      expect(api.listArchivedGraphCalendars).toHaveBeenCalledWith("acc1");
+    });
+
+    it("does not hide live calendars when the archive notice read fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Old",
+        retained_event_count: 2, replay_address_count: 1,
+        acknowledged: false,
+      };
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+      await store.fetchCalendars();
+      vi.mocked(api.listCalendars).mockResolvedValueOnce([
+        makeCalendar("current", "Calendar"),
+      ]);
+      vi.mocked(api.listArchivedGraphCalendars).mockRejectedValueOnce(
+        new Error("unavailable"));
+
+      await store.fetchCalendars();
+
+      expect(store.calendars.map((calendar) => calendar.id)).toEqual(["current"]);
+      expect(store.archivedGraphCalendars).toEqual([archived]);
+      expect(store.archivedGraphCalendarsError).toContain("Could not check");
+    });
+
+    it("does not replace archived notice data with a stale request", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const firstLive = deferred<ReturnType<typeof makeCalendar>[]>();
+      const firstArchive = deferred<{
+        id: string; account_id: string; name: string;
+        retained_event_count: number; replay_address_count: number;
+        acknowledged: boolean;
+      }[]>();
+      vi.mocked(api.listCalendars).mockReturnValueOnce(firstLive.promise);
+      vi.mocked(api.listArchivedGraphCalendars)
+        .mockReturnValueOnce(firstArchive.promise);
+      const stale = store.fetchCalendars();
+      const current = {
+        id: "current", account_id: "acc1", name: "Current",
+        retained_event_count: 1, replay_address_count: 0,
+        acknowledged: false,
+      };
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([current]);
+      await store.fetchCalendars();
+      firstLive.resolve([]);
+      firstArchive.resolve([]);
+      await stale;
+
+      expect(store.archivedGraphCalendars).toEqual([current]);
+      expect(store.archivedGraphCalendarsError).toBeNull();
+    });
+
+    it("acknowledges only archived notices, not their retained data", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 26, replay_address_count: 173,
+        acknowledged: false,
+      };
+      store.archivedGraphCalendars = [archived];
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([
+        { ...archived, acknowledged: true },
+      ]);
+
+      await store.acknowledgeArchivedGraphCalendars();
+
+      expect(api.acknowledgeArchivedGraphCalendar).toHaveBeenCalledWith(
+        "acc1", "old");
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([]);
+      expect(store.archivedGraphCalendars).toEqual([
+        { ...archived, acknowledged: true },
+      ]);
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+      await store.fetchCalendars();
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([archived]);
+    });
+
+    it("keeps an archived warning when acknowledgment fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const archived = {
+        id: "old", account_id: "acc1", name: "Calendar",
+        retained_event_count: 26, replay_address_count: 173,
+        acknowledged: false,
+      };
+      store.archivedGraphCalendars = [archived];
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.mocked(api.acknowledgeArchivedGraphCalendar)
+        .mockRejectedValueOnce(new Error("write failed"));
+      vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([archived]);
+
+      await store.acknowledgeArchivedGraphCalendars();
+
+      expect(store.unacknowledgedArchivedGraphCalendars).toEqual([archived]);
+      expect(store.archivedGraphAcknowledgementError).toContain("Could not acknowledge");
+      consoleError.mockRestore();
+    });
   });
 
   describe("visibleEvents with hidden calendars", () => {
@@ -269,6 +407,108 @@ describe("Calendar store", () => {
     });
   });
 
+  it("shows verified events and keeps an explicit warning for unresolved series", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.calendars = [makeCalendar("cal1", "Work")];
+    store.currentDate = "2026-09-15";
+    const master = makeEvent("master", "Series", "2026-09-14T10:00:00Z",
+      "2026-09-14T11:00:00Z", { uid: "same-uid", recurrence_rule: "FREQ=DAILY" });
+    const child = {
+      ...makeEvent("child", "Moved", "2026-09-15T12:00:00Z",
+        "2026-09-15T13:00:00Z", { uid: "same-uid" }),
+      recurrence_kind: "occurrence" as const,
+    };
+    const other = makeEvent("other", "Other", "2026-09-15T15:00:00Z",
+      "2026-09-15T16:00:00Z");
+    vi.mocked(api.getEvents).mockResolvedValue([master, child, other]);
+    const page = {
+      occurrences: [{
+        selection: { event_id: other.id, token: "safe", original_start: null },
+        event_id: other.id, account_id: other.account_id,
+        calendar_id: other.calendar_id,
+        fields: {
+          title: other.title, description: other.description, location: other.location,
+          start_time: other.start_time, end_time: other.end_time,
+          all_day: other.all_day, timezone: other.timezone,
+        },
+        recurrence_kind: "standalone" as const, recurrence_rule: null,
+        is_exception: false,
+      }],
+      has_more: false, needs_hydration: [],
+      unresolved: [{ event_id: child.id, calendar_id: child.calendar_id, account_id: child.account_id }],
+    };
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue(page);
+    await store.fetchEvents();
+    expect(store.visibleEvents.map((event) => event.id)).toEqual([other.id]);
+    expect(store.unresolvedOccurrences).toEqual(page.unresolved);
+    expect(store.loadError).toBeNull();
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.mocked(api.repairCalendarOccurrence).mockRejectedValueOnce(new Error("unverified"));
+      await store.repairIncompleteOccurrences();
+      expect(api.repairCalendarOccurrence).toHaveBeenCalledWith(child.id);
+      expect(store.visibleEvents.map((event) => event.id)).toEqual([other.id]);
+      expect(store.unresolvedOccurrences).toEqual(page.unresolved);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("limits provider verification to one request and honors a throttle cooldown", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "first", calendar_id: "cal1", account_id: "acc1" },
+      { event_id: "second", calendar_id: "cal1", account_id: "acc1" },
+    ];
+    vi.mocked(api.repairCalendarOccurrence).mockResolvedValueOnce({
+      repaired: false, retry_after_seconds: 172_800,
+    });
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledOnce();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledWith("first");
+    expect(store.repairRetryAt).toBeGreaterThan(Date.now() + 86_400_000);
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledOnce();
+    expect(store.unresolvedOccurrences).toHaveLength(2);
+    store.$dispose();
+  });
+
+  it("throttling one account does not block verification of another", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "graph-child", calendar_id: "graph-cal", account_id: "graph-account" },
+      { event_id: "other-child", calendar_id: "other-cal", account_id: "other-account" },
+    ];
+    vi.mocked(api.repairCalendarOccurrence)
+      .mockResolvedValueOnce({ repaired: false, retry_after_seconds: 90 })
+      .mockResolvedValueOnce({ repaired: false, retry_after_seconds: null });
+    await store.repairIncompleteOccurrences();
+    expect(store.repairRetryAt).toBeNull();
+    await store.repairIncompleteOccurrences();
+    expect(vi.mocked(api.repairCalendarOccurrence).mock.calls.map(([id]) => id))
+      .toEqual(["graph-child", "other-child"]);
+    store.$dispose();
+  });
+
+  it("rechecks an already-resolved row instead of leaving a stale warning", async () => {
+    setupAccounts();
+    const store = useCalendarStore();
+    store.unresolvedOccurrences = [
+      { event_id: "resolved-elsewhere", calendar_id: "cal1", account_id: "acc1" },
+    ];
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+      occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+    });
+    await store.repairIncompleteOccurrences();
+    expect(api.repairCalendarOccurrence).toHaveBeenCalledWith("resolved-elsewhere");
+    expect(api.listCalendarOccurrences).toHaveBeenCalled();
+    expect(store.unresolvedOccurrences).toEqual([]);
+  });
+
   describe("recurring occurrences (unclickable-event regression)", () => {
     // Synthetic display identities remain selectable but cannot be mutated.
     function setupRecurring() {
@@ -303,6 +543,82 @@ describe("Calendar store", () => {
           store.visibleEvents.find((e) => e.id === occ.id),
         ).toBeDefined();
       }
+    });
+
+    it("renders a cached moved occurrence while hydration is needed", async () => {
+      const store = setupRecurring();
+      const master = store.events[0];
+      const original = "2026-08-25T09:00:00.000Z";
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [{
+          selection: {
+            event_id: master.id,
+            token: "snapshot",
+            original_start: original,
+          },
+          event_id: master.id,
+          account_id: master.account_id,
+          calendar_id: master.calendar_id,
+          fields: {
+            title: master.title,
+            description: master.description,
+            location: master.location,
+            start_time: "2026-08-25T11:00:00Z",
+            end_time: "2026-08-25T12:00:00Z",
+            all_day: master.all_day,
+            timezone: master.timezone,
+          },
+          recurrence_kind: "series",
+          recurrence_rule: master.recurrence_rule,
+          is_exception: true,
+        }],
+        has_more: false,
+        needs_hydration: [master.id], unresolved: [],
+      });
+
+      await store.fetchEvents();
+
+      expect(store.events).toEqual([master]);
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.visibleEvents[0]).toMatchObject({
+        id: occurrenceId(master.id, new Date(original)),
+        start_time: "2026-08-25T11:00:00Z",
+        end_time: "2026-08-25T12:00:00Z",
+        recurrence_kind: "occurrence",
+      });
+    });
+
+    it("uses local expansion only for series needing hydration", async () => {
+      const store = setupRecurring();
+      const master = store.events[0];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [],
+        has_more: false,
+        needs_hydration: [master.id], unresolved: [],
+      });
+
+      await store.fetchEvents();
+
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.visibleEvents[0].start_time)
+        .toBe("2026-08-25T09:00:00.000Z");
+    });
+
+    it("keeps the previous display when projection exceeds its bound", async () => {
+      const store = setupRecurring();
+      const previous = [...store.events];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [],
+        has_more: true,
+        needs_hydration: [], unresolved: [],
+      });
+
+      await expect(store.fetchEvents()).rejects.toThrow("display limit");
+
+      expect(store.events).toEqual(previous);
     });
 
     it("rejects master and occurrence deletion without clearing selection", async () => {
@@ -378,6 +694,185 @@ describe("Calendar store", () => {
       store.goNext();
       expect(store.currentDate).toBe("2026-05-07");
     });
+
+    it("clamps month-end navigation without skipping months", () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.viewMode = "month";
+      store.currentDate = "2026-01-31";
+      store.goNext();
+      expect(store.currentDate).toBe("2026-02-28");
+      store.currentDate = "2028-01-31";
+      store.goNext();
+      expect(store.currentDate).toBe("2028-02-29");
+      store.currentDate = "2026-05-31";
+      store.goPrev();
+      expect(store.currentDate).toBe("2026-04-30");
+    });
+
+    it("keeps the displayed month until its result commits and ignores older reads", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.currentDate = "2026-04-07";
+      store.viewMode = "month";
+      const april = makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z");
+      const june = makeEvent("june", "June", "2026-06-07T12:00:00Z", "2026-06-07T13:00:00Z");
+      store.events = [april];
+      const mayRead = deferred<CalendarEvent[]>();
+      const juneRead = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => mayRead.promise)
+        .mockImplementationOnce(() => juneRead.promise);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
+        occurrences: [], has_more: false, needs_hydration: ["june"], unresolved: [],
+      });
+
+      store.goToDate("2026-05-07");
+      store.goToDate("2026-06-07");
+      expect(store.currentDate).toBe("2026-06-07");
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.navigationPending).toBe(true);
+
+      juneRead.resolve([june]);
+      await settleNavigation(store);
+      expect(store.displayDate).toBe("2026-06-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["june"]);
+      mayRead.resolve([april]);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(store.displayDate).toBe("2026-06-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["june"]);
+      expect(store.loading).toBe(false);
+    });
+
+    it("ignores stale failures and does not turn a failed month into an empty month", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.currentDate = "2026-04-07";
+      store.viewMode = "month";
+      const april = makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z");
+      store.events = [april];
+      const stale = deferred<CalendarEvent[]>();
+      const failed = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => stale.promise)
+        .mockImplementationOnce(() => failed.promise);
+      store.goToDate("2026-05-07");
+      store.goToDate("2026-06-07");
+      stale.reject(new Error("stale read failed"));
+      await Promise.resolve();
+      expect(store.loading).toBe(true);
+      expect(store.loadError).toBeNull();
+
+      failed.reject(new Error("database unavailable"));
+      await settleNavigation(store);
+      expect(store.currentDate).toBe("2026-04-07");
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.loadError).toMatch(/retry/i);
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      store.retryNavigation();
+      await settleNavigation(store);
+      expect(store.currentDate).toBe("2026-06-07");
+      expect(store.loadError).toBeNull();
+    });
+
+    it("keeps the latest same-range read and its loading state", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.viewMode = "month";
+      store.currentDate = "2026-04-07";
+      const oldRead = deferred<CalendarEvent[]>();
+      const newRead = deferred<CalendarEvent[]>();
+      vi.mocked(api.getEvents)
+        .mockImplementationOnce(() => oldRead.promise)
+        .mockImplementationOnce(() => newRead.promise);
+      const first = store.fetchEvents();
+      const second = store.fetchEvents();
+      oldRead.resolve([]);
+      await first;
+      expect(store.loading).toBe(true);
+      newRead.resolve([]);
+      await second;
+      expect(store.loading).toBe(false);
+    });
+
+    it("preserves the old month when its occurrence projection fails", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      store.viewMode = "month";
+      store.currentDate = "2026-04-07";
+      store.events = [makeEvent("april", "April", "2026-04-07T12:00:00Z", "2026-04-07T13:00:00Z")];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([]);
+      vi.mocked(api.listCalendarOccurrences).mockRejectedValueOnce(new Error("projection failed"));
+      store.goToDate("2026-05-07");
+      await settleNavigation(store);
+      expect(store.displayDate).toBe("2026-04-07");
+      expect(store.visibleEvents.map((event) => event.id)).toEqual(["april"]);
+      expect(store.loadError).toMatch(/retry/i);
+    });
+
+    it("does not replace subscribed calendars with a failed account read", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      store.calendars = [makeCalendar("cal1", "Work")];
+      const otherAccount = { ...useAccountsStore().accounts[0], id: "acc2" };
+      useAccountsStore().accounts.push(otherAccount);
+      vi.mocked(api.listCalendars)
+        .mockResolvedValueOnce([makeCalendar("new", "Other")])
+        .mockRejectedValueOnce(new Error("database unavailable"));
+      await expect(store.fetchCalendars()).rejects.toThrow("database unavailable");
+      expect(store.calendars.map((calendar) => calendar.id)).toEqual(["cal1"]);
+      expect(store.loadError).toMatch(/retry/i);
+    });
+
+    it("queries all visible desktop and mobile month cells in the display timezone", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const ui = useUiStore();
+      ui.weekStartDay = 1;
+      ui.displayTimezone = "Europe/Stockholm";
+      store.currentDate = "2026-05-15";
+      store.viewMode = "month";
+      await store.fetchEvents();
+      const desktop = monthGridDays(store.currentDate, 1);
+      const mobile = monthGridDays(store.currentDate, 0, true);
+      const days = [...desktop, ...mobile].map(calendarDay).sort();
+      const calls = vi.mocked(api.getEvents).mock.calls;
+      const [, start, end] = calls[calls.length - 1];
+      expect(start).toBe("2026-04-25T22:00:00.000Z");
+      expect(end).toBe("2026-06-06T21:59:59.999Z");
+      expect(days[0]).toBe("2026-04-26");
+      expect(days[days.length - 1]).toBe("2026-06-06");
+    });
+
+    it("treats civil month dates consistently across host timezones and DST", async () => {
+      try {
+        for (const timezone of ["America/Los_Angeles", "Europe/Stockholm"]) {
+          vi.stubEnv("TZ", timezone);
+          setActivePinia(createPinia());
+          setupAccounts();
+          const store = useCalendarStore();
+          store.viewMode = "month";
+          store.currentDate = "2026-03-31";
+          const days = monthGridDays(store.currentDate, 0, true).map(calendarDay);
+          expect(days[0]).toBe("2026-03-01");
+          expect(days[days.length - 1]).toBe("2026-04-11");
+          expect(new Set(days).size).toBe(42);
+          store.goNext();
+          expect(store.currentDate).toBe("2026-04-30");
+          expect(store.displayDate).toBe("2026-03-31");
+          await settleNavigation(store);
+        }
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
   });
 
   describe("syncCalendars", () => {
@@ -398,6 +893,17 @@ describe("Calendar store", () => {
       vi.mocked(api.syncCalendars).mockRejectedValueOnce(new Error("Network error"));
 
       await expect(store.syncCalendars()).resolves.not.toThrow();
+    });
+
+    it("honors Graph Retry-After before trying that account again", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      vi.mocked(api.syncCalendars).mockRejectedValueOnce(
+        "Graph throttled (429); retry after 3600 seconds",
+      );
+      await expect(store.syncCalendars("acc1")).rejects.toMatch(/429/);
+      await expect(store.syncCalendars("acc1")).rejects.toThrow("Retry-After");
+      expect(api.syncCalendars).toHaveBeenCalledOnce();
     });
   });
 

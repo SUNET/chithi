@@ -20,12 +20,18 @@ vi.mock("@/lib/tauri", () => ({
   getDefaultContactBook: vi.fn().mockResolvedValue(null),
   setDefaultContactBook: vi.fn().mockResolvedValue(undefined),
   listCalendarImportTargets: vi.fn().mockResolvedValue([]),
+  listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
   getDefaultImportCalendar: vi.fn().mockResolvedValue(null),
   setDefaultImportCalendar: vi.fn().mockResolvedValue(undefined),
   discoverMailServers: vi.fn(),
   meetVisioLoginStart: vi.fn().mockResolvedValue({ session_id: "visio-session" }),
   meetVisioLoginComplete: vi.fn().mockResolvedValue("visio-1"),
   meetVisioLoginCancel: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -160,6 +166,32 @@ function visioAccount(id = "visio-1"): Account {
 }
 
 describe("SettingsView", () => {
+  it("keeps acknowledged Graph archives discoverable on desktop and mobile", async () => {
+    useAccountsStore().accounts = [{
+      ...zoomAccount("graph-account"), display_name: "Micke Nordin",
+      has_calendar_binding: true,
+    }];
+    vi.mocked(api.listArchivedGraphCalendars).mockResolvedValueOnce([{
+      id: "old", account_id: "graph-account", name: "Kalender",
+      retained_event_count: 26, replay_address_count: 173,
+      acknowledged: true,
+    }]);
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [makeRouter()] },
+      attachTo: document.body,
+    });
+    await flushPromises();
+
+    expect(wrapper.get(".desktop-archive-settings").text())
+      .toContain("Micke Nordin · Kalender: 26 cached event(s)");
+    expect(wrapper.get(".desktop-archive-settings").text())
+      .toContain("Acknowledged");
+    usePlatformStore().width = 600;
+    await flushPromises();
+    expect(wrapper.get(".archive-settings").text())
+      .toContain("173 replay address(es)");
+    wrapper.unmount();
+  });
   it("picker pick opens the form pre-set to the picked type", async () => {
     const wrapper = mount(SettingsView, {
       global: { plugins: [makeRouter()] },

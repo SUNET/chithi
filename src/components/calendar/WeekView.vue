@@ -28,6 +28,7 @@ import {
   endOfDayUTC,
 } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
+import { calendarDay, parseCalendarDay } from "@/lib/calendar-days";
 import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 
 const props = defineProps<{
@@ -57,7 +58,7 @@ const hours = Array.from({ length: 24 }, (_, i) => i);
 const HOUR_HEIGHT = 52;
 
 const days = computed(() => {
-  const d = new Date(calendarStore.currentDate);
+  const d = parseCalendarDay(calendarStore.displayDate);
   if (props.singleDay) {
     return [new Date(d)];
   }
@@ -103,7 +104,7 @@ function formatHour(hour: number): string {
 }
 
 function isToday(date: Date): boolean {
-  return getDateInTimezone(date.toISOString(), uiStore.displayTimezone) ===
+  return calendarDay(date) ===
     getDateInTimezone(now.value.toISOString(), uiStore.displayTimezone);
 }
 
@@ -143,7 +144,7 @@ const segmentsByDay = computed(() => {
   const map = new Map<string, EventSegment[]>();
 
   for (const day of days.value) {
-    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStr = calendarDay(day);
     const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
     const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
     const dayStart = new Date(dayStartMs);
@@ -167,7 +168,7 @@ const segmentsByDay = computed(() => {
 });
 
 function segmentsForDay(date: Date): EventSegment[] {
-  const dayStr = getDateInTimezone(date.toISOString(), uiStore.displayTimezone);
+  const dayStr = calendarDay(date);
   return segmentsByDay.value.get(dayStr) || [];
 }
 
@@ -182,7 +183,7 @@ const overlapLayout = computed(() => {
   const layout = new Map<string, OverlapInfo>();
 
   for (const day of days.value) {
-    const dayStr = getDateInTimezone(day.toISOString(), uiStore.displayTimezone);
+    const dayStr = calendarDay(day);
     const dayStartMs = startOfDayUTC(dayStr, uiStore.displayTimezone);
     const dayEndMs = endOfDayUTC(dayStr, uiStore.displayTimezone);
     const dayStart = new Date(dayStartMs);
@@ -284,7 +285,7 @@ function eventBlockStyle(seg: EventSegment): Record<string, string> {
 }
 
 function getAllDayEvents(date: Date) {
-  const dayStr = date.toISOString().split("T")[0];
+  const dayStr = calendarDay(date);
   return calendarStore.visibleEvents.filter((e) => {
     const eStart = new Date(e.start_time);
     const eEnd = new Date(e.end_time);
@@ -399,14 +400,14 @@ function onEventMouseDown(event: MouseEvent, seg: EventSegment) {
 function onColumnMove(day: Date, e: MouseEvent) {
   if (!canDrop.value) return;
   const hour = hourFromEvent(e);
-  const dayStr = day.toISOString().split("T")[0];
+  const dayStr = calendarDay(day);
   if (dragOverCell.value?.day !== dayStr || dragOverCell.value?.hour !== hour) {
     dragOverCell.value = { day: dayStr, hour };
   }
 }
 
 function onColumnLeave(day: Date) {
-  const dayStr = day.toISOString().split("T")[0];
+  const dayStr = calendarDay(day);
   if (dragOverCell.value?.day === dayStr) {
     dragOverCell.value = null;
   }
@@ -414,7 +415,7 @@ function onColumnLeave(day: Date) {
 
 function dragHintVisible(day: Date): boolean {
   return canDrop.value &&
-    dragOverCell.value?.day === day.toISOString().split("T")[0];
+    dragOverCell.value?.day === calendarDay(day);
 }
 
 const dragHintStyle = computed(() => {
@@ -497,7 +498,7 @@ onUnmounted(() => {
       <div class="time-gutter all-day-label">all-day</div>
       <div
         v-for="day in days"
-        :key="day.toISOString() + 'ad'"
+        :key="calendarDay(day) + 'ad'"
         class="all-day-cell"
         :class="{ today: isToday(day) }"
       >
@@ -519,7 +520,7 @@ onUnmounted(() => {
       <div class="time-gutter"></div>
       <div
         v-for="day in days"
-        :key="day.toISOString() + 'h'"
+        :key="calendarDay(day) + 'h'"
         class="day-header"
         :class="{ today: isToday(day), weekend: isWeekend(day) }"
       >
@@ -545,10 +546,10 @@ onUnmounted(() => {
 
       <div
         v-for="day in days"
-        :key="day.toISOString()"
+        :key="calendarDay(day)"
         class="day-column"
         :class="{ today: isToday(day), weekend: isWeekend(day) }"
-        :data-testid="`cal-day-col-${day.toISOString().split('T')[0]}`"
+        :data-testid="`cal-day-col-${calendarDay(day)}`"
         @click="onColumnClick(day, $event)"
         @mousemove="onColumnMove(day, $event)"
         @mouseleave="onColumnLeave(day)"

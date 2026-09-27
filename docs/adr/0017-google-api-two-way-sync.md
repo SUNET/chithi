@@ -27,10 +27,11 @@ Gmail accounts need full two-way sync for calendar events and contacts with Goog
 
 ### Calendar mutation safety amendment (2026-09-13, #288)
 
-[ADR 0052](0052-calendar-occurrence-mutation-safety.md) limits ordinary
-Edit/Delete/Move to confirmed standalone events. Expanded Google instances
-remain viewable but read-only for these actions, including moves to another
-calendar or account. RSVP and invitation delivery are separate workflows.
+The shared [calendar mutation safety invariants](0050-provider-backend-traits.md#calendar-mutation-safety)
+require backend-authoritative selection and scope. Expanded Google instances
+must retain their occurrence identity through edits, deletion and moves;
+selecting an instance cannot implicitly authorize a series mutation.
+RSVP and invitation delivery are separate workflows.
 
 - Full and incremental reads share `singleEvents=true` and `maxResults=500`.
   Incremental reads omit `timeMin`/`timeMax`, which cannot accompany `syncToken`.
@@ -139,15 +140,14 @@ Google returns `backgroundColor` as hex color directly in the calendarList respo
 1. **iCalUID cross-reference**: matching events across accounts by UID to avoid duplicates. Needs cross-account query + dedup logic.
 2. **Recurring event handling**: full and incremental reads use
    `singleEvents=true` and classify expanded instances for mutation safety.
-   Ordinary series and occurrence editing, deletion and moves are blocked. Provider-native
-   recurring creation on Google and the `events.instances` endpoint remain
-   unsupported; the separate local series-creation workflow is not disabled.
+   Mutation eligibility depends on authoritative recurrence identity, scope
+   and provider capabilities, not the expanded display row.
 3. **Push notifications** (`events.watch`): requires a publicly accessible HTTPS webhook URL, not feasible for desktop apps without a relay server.
 4. **Calendar management**: creating/deleting Google calendars from the UI. No calendar management UI exists yet.
 
 ## Consequences
-- Gmail calendar events use two-way provider CRUD, subject to the
-  standalone-only ordinary mutation policy and existing best-effort pushes
+- Gmail calendar events use two-way provider CRUD, subject to backend
+  mutation safety checks and existing best-effort pushes
 - Incremental sync reduces API calls and improves performance after first sync
 - Contact CRUD pushes to Google People API
 - Contact sync uses persisted People API sync tokens, explicit tombstones and

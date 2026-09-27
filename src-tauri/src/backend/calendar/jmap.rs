@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::event_set::{apply_event_fields, event_fields, CalendarEventSet};
 use crate::calendar::recurrence_identity::RecurrenceObjectKind;
 use crate::calendar::{attendee_status_from_json, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -17,11 +18,19 @@ use super::{
 
 pub struct JmapCalendarBackend;
 
+fn validate_account_event(account: &AccountFull, event: &CalendarEvent) -> Result<()> {
+    if account.id != event.account_id {
+        return Err(Error::Sync("JMAP event belongs to another account".into()));
+    }
+    Ok(())
+}
+
 async fn connect(
     ctx: &CalendarBackendCtx<'_>,
     account: &AccountFull,
 ) -> Result<(JmapConfig, JmapConnection)> {
-    let (config, connection) = ctx.services.jmap_client(account).await?;
+    let (config, mut connection) = ctx.services.jmap_client(account).await?;
+    connection.select_calendar_account(&config).await?;
     Ok((config, connection))
 }
 
@@ -134,6 +143,117 @@ fn canonical_occurrence_outcome(
 impl CalendarBackend for JmapCalendarBackend {
     fn protocol(&self) -> &'static str {
         "jmap"
+    }
+
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        validate_account_event(account, event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .fetch_native_event_set(&config, event, remote_calendar_id)
+            .await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .update_native_event_set(&config, before, desired)
+            .await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_calendar_id: &str,
+        desired: &CalendarEventSet,
+        operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        let (config, connection) = connect(ctx, account).await?;
+        let mut result = connection
+            .create_native_event_set(&config, remote_calendar_id, desired, operation_id)
+            .await?;
+        result.event.account_id = account.id.clone();
+        for occurrence in &mut result.overrides {
+            if let Some(event) = &mut occurrence.event {
+                event.account_id = account.id.clone();
+            }
+        }
+        Ok(result)
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection.delete_native_event_set(&config, before).await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .move_native_event_set(&config, before, remote_calendar_id)
+            .await
+            .map(CalendarCapability::Supported)
+    }
+
+    async fn push_updated_event(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<()> {
+        validate_account_event(account, event)?;
+        if event.remote_id.as_deref() != Some(remote_id) {
+            return Err(Error::Sync("JMAP ordinary update target mismatch".into()));
+        }
+        let calendar = db::calendar::get_calendar(&ctx.db.reader(), &event.calendar_id)?;
+        if calendar.account_id != account.id {
+            return Err(Error::Sync(
+                "JMAP calendar belongs to another account".into(),
+            ));
+        }
+        let calendar_id = calendar
+            .remote_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::Sync("JMAP remote calendar missing".into()))?;
+        let (config, connection) = connect(ctx, account).await?;
+        let before = connection
+            .fetch_native_event_set(&config, event, calendar_id)
+            .await?;
+        let mut desired = before.clone();
+        apply_event_fields(&mut desired.event, &event_fields(event));
+        desired.event.recurrence_rule = event.recurrence_rule.clone();
+        desired.event.recurrence_kind = event.recurrence_kind;
+        connection
+            .update_native_event_set(&config, &before, &desired)
+            .await?;
+        Ok(())
     }
 
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
@@ -383,11 +503,11 @@ impl CalendarBackend for JmapCalendarBackend {
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
-        _remote_calendar_id: &str,
+        remote_calendar_id: &str,
     ) -> Result<()> {
         let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         conn_jmap
-            .delete_calendar_event(&jmap_config, remote_id)
+            .delete_calendar_membership(&jmap_config, remote_id, remote_calendar_id)
             .await
     }
 
@@ -918,7 +1038,7 @@ mod deferred_creation_tests {
                                         let id = format!("remote-{}", events.len());
                                         event["id"] = json!(id);
                                         events.push(event);
-                                        json!({"created": {"new1": {"id": id}}})
+                                        json!({"accountId": "remote-account", "oldState": "event-state", "newState": "event-state", "created": {"new1": {"id": id}}})
                                     } else {
                                         assert_eq!(call[1]["sendSchedulingMessages"], false);
                                         let (id, patch) = call[1]["update"]
@@ -928,7 +1048,7 @@ mod deferred_creation_tests {
                                             .next()
                                             .unwrap();
                                         captured.lock().unwrap().push(patch.clone());
-                                        json!({"updated": {id: null}})
+                                        json!({"accountId": "remote-account", "oldState": "event-state", "newState": "event-state", "updated": {id: null}})
                                     }
                                 }
                                 _ => panic!("unexpected JMAP method {method}"),
@@ -1300,6 +1420,8 @@ mod deferred_creation_tests {
                     calendar_id: calendar_id.clone(),
                     title: id.into(),
                     uid: Some(format!("{id}@test")),
+                    start_time: "2026-07-16T10:00:00Z".into(),
+                    end_time: "2026-07-16T10:30:00Z".into(),
                     recurrence_kind: kind,
                     recurrence_rule: rule.map(str::to_string),
                     ical_data: ical,
@@ -1513,6 +1635,11 @@ mod deferred_creation_tests {
     #[tokio::test]
     async fn personal_copy_update_clears_scheduling_and_stale_optional_fields() {
         let server = CalendarServer::start().await;
+        server
+            .events
+            .lock()
+            .unwrap()
+            .push(remote_event("remote-copy", json!({"remote-cal": true})));
         let services = server.services();
         let account = server.account();
         let (_directory, db) = temp_pool();

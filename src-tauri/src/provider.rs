@@ -420,6 +420,7 @@ pub struct ProviderTransports {
     pub oidc_http: reqwest::Client,
     pub oidc_poll_http: reqwest::Client,
     pub dav_http: reqwest::Client,
+    pub dav_resource_http: reqwest::Client,
     pub zoom_http: reqwest::Client,
     pub zoom_api_root: String,
     pub matrix_http: reqwest::Client,
@@ -465,6 +466,7 @@ impl ProviderTransports {
                 .build()
                 .map_err(|error| Error::Other(format!("HTTP client build error: {}", error)))?,
             dav_http: crate::mail::dav_http::build_dav_client()?,
+            dav_resource_http: crate::mail::dav_http::build_dav_resource_client()?,
             zoom_http: build_meet_http_client("zoom")?,
             zoom_api_root: "https://api.zoom.us/v2".into(),
             matrix_http: build_meet_http_client("matrix")?,
@@ -622,9 +624,10 @@ impl ProviderServices {
         &self,
         config: &crate::mail::caldav::CalDavConfig,
     ) -> Result<crate::mail::caldav::CalDavClient> {
-        crate::mail::caldav::CalDavClient::connect_with_client(
+        crate::mail::caldav::CalDavClient::connect_with_clients(
             config,
             self.transports.dav_http.clone(),
+            self.transports.dav_resource_http.clone(),
         )
         .await
     }
