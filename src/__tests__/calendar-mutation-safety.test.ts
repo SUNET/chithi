@@ -4,6 +4,12 @@ import { createPinia, setActivePinia } from "pinia";
 import { nextTick } from "vue";
 
 vi.mock("@/lib/tauri", () => ({
+  readCalendarEventSet: vi.fn(),
+  planCalendarAction: vi.fn(),
+  planCalendarOccurrenceAction: vi.fn(),
+  executeCalendarAction: vi.fn(),
+  discardCalendarAction: vi.fn(),
+  listPendingCalendarActions: vi.fn().mockResolvedValue([]),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
   moveEventToCalendar: vi.fn().mockResolvedValue("moved-event"),
@@ -33,7 +39,7 @@ import type { CalendarEvent } from "@/lib/types";
 import { occurrenceId } from "@/lib/rrule";
 import { formatInTimezone } from "@/lib/datetime";
 import {
-  calendarEditSupport, calendarMutationSupport,
+  calendarMutationSupport, calendarScopedEditSupport,
 } from "@/lib/calendar-mutation-support";
 import { useToasts } from "@/lib/toast";
 import { dragCalendarEvent, isCalendarDragging } from "@/lib/calendar-drag-state";
@@ -76,6 +82,10 @@ const blocked = [
   ["unrecognized", event({ recurrence_kind: "future-kind" as CalendarEvent["recurrence_kind"] }), unknownReason],
   ["synthetic with standalone metadata", event({ id: occurrenceId("master", new Date("2026-09-08T09:00:00Z")) }), recurringReason],
 ] as const;
+
+const scopedBlocked = blocked.filter(([label]) =>
+  label !== "series without a rule" && label !== "series master");
+const scopedNotice = "Recurring deletion remains unavailable";
 
 const wrappers: ReturnType<typeof mount>[] = [];
 const stubs = {
@@ -189,7 +199,7 @@ describe("calendar mutation safety", () => {
     expect(store.selectedEvent?.id).toBe(event().id);
   });
 
-  it.each(blocked)("disables detail controls and forced handlers for %s", async (_label, selected, reason) => {
+  it.each(scopedBlocked)("disables detail controls and forced handlers for %s", async (_label, selected, reason) => {
     setup(selected);
     const wrapper = detail();
     expect(wrapper.text()).toContain(reason);
@@ -198,7 +208,7 @@ describe("calendar mutation safety", () => {
       expect(button.attributes("disabled")).toBeDefined();
       const description = wrapper.get(`#${button.attributes("aria-describedby")}`).text();
       const expected = selector === ".btn-edit"
-        ? calendarEditSupport(selected).reason
+        ? calendarScopedEditSupport(selected).reason
         : reason;
       expect(description).toContain(expected);
     }
@@ -254,7 +264,9 @@ describe("calendar mutation safety", () => {
     await store.fetchEvents();
     await nextTick();
     expect(wrapper.find(".edit-mode").exists()).toBe(false);
-    expect(wrapper.text()).toContain(kind === "unknown" ? unknownReason : recurringReason);
+    expect(wrapper.text()).toContain(
+      kind === "unknown" ? unknownReason : kind === "series" ? scopedNotice : recurringReason,
+    );
     await save();
     expectNoMutations();
   });
@@ -1011,8 +1023,8 @@ describe("real responsive calendar selection", () => {
       expect(store.selectedEvent?.id).toBe(occurrence.id);
       const panel = wrapper.getComponent(EventDetail);
       expect(panel.text()).toContain(formatInTimezone(occurrence.start_time, "Europe/Stockholm", { hour12: useUiStore().hour12 }));
-      expect(panel.text()).toContain(recurringReason);
-      expect(panel.get(".btn-edit").attributes("disabled")).toBeDefined();
+      expect(panel.text()).toContain(scopedNotice);
+      expect(panel.get(".btn-edit").attributes("disabled")).toBeUndefined();
       await panel.get(".close-btn").trigger("click");
     }
     expectNoMutations();
@@ -1038,7 +1050,7 @@ describe("real responsive calendar selection", () => {
     expectNoMutations();
   });
 
-  it.each(blocked)("rejects forced parent reschedule/calendar-drop handlers for %s", async (_label, selected) => {
+  it.each(scopedBlocked)("rejects forced parent reschedule/calendar-drop handlers for %s", async (_label, selected) => {
     const store = setup(selected);
     usePlatformStore().width = 1280;
     const wrapper = calendarView();
@@ -1058,6 +1070,89 @@ describe("real responsive calendar selection", () => {
     expectNoMutations();
     expect(JSON.stringify(store.events)).toBe(snapshot);
     expect(store.selectedEvent?.id).toBe(selected.id);
+  });
+
+  it("routes a recurring drag reschedule to the selected occurrence scope", async () => {
+    const master = event({
+      recurrence_kind: "series",
+      recurrence_rule: "FREQ=DAILY;COUNT=3",
+      attendees_json: null,
+    });
+    const store = setup(master);
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
+      occurrences: [], has_more: false, needs_hydration: [master.id], unresolved: [],
+    });
+    const wrapper = calendarView();
+    await flushPromises();
+    const occurrence = store.visibleEvents[0];
+    const updateOccurrence = vi.spyOn(store, "updateOccurrence").mockResolvedValue();
+    vi.mocked(message).mockResolvedValueOnce("This Occurrence");
+
+    await (wrapper.vm as unknown as {
+      onEventReschedule(payload: object): Promise<void>;
+    }).onEventReschedule({
+      eventId: occurrence.id,
+      newStart: "2026-09-08T11:00:00.000Z",
+      newEnd: "2026-09-08T12:00:00.000Z",
+      attendeesJson: null,
+      organizerEmail: occurrence.organizer_email,
+    });
+
+    expect(updateOccurrence).toHaveBeenCalledExactlyOnceWith(occurrence, {
+      start_time: "2026-09-08T11:00:00.000Z",
+      end_time: "2026-09-08T12:00:00.000Z",
+    });
+    expect(api.updateEvent).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+  });
+
+  it("routes recurring calendar drops through a confirmed whole-series plan", async () => {
+    const master = event({
+      recurrence_kind: "series",
+      recurrence_rule: "FREQ=DAILY;COUNT=3",
+      attendees_json: null,
+    });
+    const store = setup(master);
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
+      occurrences: [], has_more: false, needs_hydration: [master.id], unresolved: [],
+    });
+    const wrapper = calendarView();
+    await flushPromises();
+    const occurrence = store.visibleEvents[0];
+    const plan = {
+      operation_id: "series-move",
+      requires: { replacement_meeting_identity: false, reset_exceptions: false },
+      preview: {
+        title: occurrence.title,
+        description: occurrence.description,
+        location: occurrence.location,
+        start_time: occurrence.start_time,
+        end_time: occurrence.end_time,
+        all_day: occurrence.all_day,
+        timezone: occurrence.timezone,
+      },
+    };
+    const planSeries = vi.spyOn(store, "planEntireSeriesAction").mockResolvedValue(plan);
+    const execute = vi.spyOn(store, "executeCalendarPlan").mockResolvedValue("moved-series");
+    vi.mocked(message).mockResolvedValueOnce("Move Series");
+
+    await (wrapper.vm as unknown as {
+      onCalendarDrop(payload: object): Promise<void>;
+    }).onCalendarDrop({
+      eventId: occurrence.id,
+      targetAccountId: "acc1",
+      targetCalendarId: "cal2",
+      attendeesJson: null,
+      organizerEmail: occurrence.organizer_email,
+    });
+
+    expect(planSeries).toHaveBeenCalledExactlyOnceWith(occurrence, {}, "cal2");
+    expect(execute).toHaveBeenCalledExactlyOnceWith(plan, {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    });
+    expect(api.moveEventToCalendar).not.toHaveBeenCalled();
+    expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
   });
 });
 
@@ -1087,7 +1182,7 @@ describe("calendar drag safety", () => {
     expectNoMutations();
   });
 
-  it.each(blocked)("cannot start or force grid/sidebar drops for %s", async (_label, selected) => {
+  it.each(scopedBlocked)("cannot start or force grid/sidebar drops for %s", async (_label, selected) => {
     const store = setup(selected);
     const week = mount(WeekView);
     const month = mount(MonthView);

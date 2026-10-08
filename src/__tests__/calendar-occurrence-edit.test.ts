@@ -6,8 +6,11 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 vi.mock("@/lib/tauri", () => ({
+  readCalendarEventSet: vi.fn(),
+  planCalendarAction: vi.fn(),
   planCalendarOccurrenceAction: vi.fn(),
   executeCalendarAction: vi.fn(),
+  discardCalendarAction: vi.fn(),
   listPendingCalendarActions: vi.fn().mockResolvedValue([]),
   getEvents: vi.fn().mockResolvedValue([]),
   listCalendarOccurrences: vi.fn().mockResolvedValue({
@@ -20,7 +23,9 @@ vi.mock("@/lib/tauri", () => ({
 
 import * as api from "@/lib/tauri";
 import type { CalendarEvent, CalendarOccurrence } from "@/lib/types";
-import { calendarEditSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarEditSupport, calendarScopedEditSupport,
+} from "@/lib/calendar-mutation-support";
 import { useAccountsStore } from "@/stores/accounts";
 import { useCalendarStore } from "@/stores/calendar";
 
@@ -94,6 +99,27 @@ beforeEach(() => {
     meet_protocol: "",
   }];
   vi.mocked(api.listPendingCalendarActions).mockResolvedValue([]);
+  vi.mocked(api.readCalendarEventSet).mockResolvedValue({
+    master: occurrence({
+      selection: {
+        event_id: "master",
+        token: "series-token",
+        original_start: null,
+      },
+    }),
+    page: {
+      occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+    },
+    exception_count: 0,
+  });
+  vi.mocked(api.planCalendarAction).mockResolvedValue({
+    operation_id: "series-operation",
+    requires: {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    },
+    preview: occurrence().fields,
+  });
   vi.mocked(api.planCalendarOccurrenceAction).mockResolvedValue({
     operation_id: "operation",
     requires: {
@@ -286,5 +312,105 @@ describe("safe occurrence editing", () => {
       id: "master",
       recurrence_kind: "series",
     })).supported).toBe(false);
+  });
+
+  it("plans an entire-series edit from the authoritative token and original slot", async () => {
+    const store = useCalendarStore();
+    const selected = event();
+
+    const plan = await store.planEntireSeriesAction(
+      selected,
+      { title: "All standups" },
+      "target-calendar",
+    );
+
+    expect(api.readCalendarEventSet).toHaveBeenCalledExactlyOnceWith(
+      "master",
+      selected.start_time,
+      selected.end_time,
+      1,
+    );
+    expect(api.planCalendarAction).toHaveBeenCalledExactlyOnceWith({
+      selection: {
+        event_id: "master",
+        token: "series-token",
+        original_start: "2026-09-15T09:00:00.000Z",
+      },
+      scope: "entire-series",
+      edit: { title: "All standups" },
+      destination_calendar_id: "target-calendar",
+      reset_exceptions: false,
+    });
+    expect(plan.operation_id).toBe("series-operation");
+  });
+
+  it("executes and discards series plans through explicit store methods", async () => {
+    const store = useCalendarStore();
+    const plan = await store.planEntireSeriesAction(event(), { title: "All" });
+
+    await expect(store.executeCalendarPlan(plan, {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    })).resolves.toBe("master");
+    expect(api.getEvents).toHaveBeenCalled();
+
+    await store.discardCalendarPlan(plan);
+    expect(api.discardCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "series-operation",
+    );
+  });
+
+  it("discards abandoned plans before starting another series action", async () => {
+    vi.mocked(api.listPendingCalendarActions).mockResolvedValueOnce([{
+      operation_id: "abandoned-plan",
+      stage: "planned",
+      event_id: "master",
+      requires: {
+        replacement_meeting_identity: false,
+        reset_exceptions: false,
+      },
+    }]);
+
+    await expect(useCalendarStore().resumePendingCalendarAction(event()))
+      .resolves.toBeNull();
+    expect(api.discardCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "abandoned-plan",
+    );
+    expect(api.executeCalendarAction).not.toHaveBeenCalled();
+  });
+
+  it("resumes an applying whole-series action with its accepted confirmations", async () => {
+    vi.mocked(api.listPendingCalendarActions).mockResolvedValueOnce([{
+      operation_id: "applying-series",
+      stage: "applying",
+      event_id: "master",
+      requires: {
+        replacement_meeting_identity: true,
+        reset_exceptions: false,
+      },
+    }]);
+
+    await expect(useCalendarStore().resumePendingCalendarAction(event()))
+      .resolves.toBe("master");
+    expect(api.executeCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "applying-series",
+      {
+        replacement_meeting_identity: true,
+        reset_exceptions: false,
+      },
+    );
+    expect(api.getEvents).toHaveBeenCalled();
+  });
+
+  it("offers entire-series scope for meetings while keeping one occurrence blocked", () => {
+    const meeting = event({
+      attendees_json: JSON.stringify([{ email: "guest@example.test" }]),
+    });
+    expect(calendarEditSupport(meeting).supported).toBe(false);
+    expect(calendarScopedEditSupport(meeting)).toEqual({
+      supported: true,
+      scopes: ["entire-series"],
+      reason: null,
+    });
   });
 });

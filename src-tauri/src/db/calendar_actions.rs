@@ -1014,6 +1014,33 @@ pub(crate) fn save_operation(conn: &Connection, operation: &Operation) -> Result
     Ok(())
 }
 
+pub(crate) fn discard_planned_operation(conn: &Connection, id: &str) -> Result<()> {
+    if conn.is_autocommit() {
+        return Err(invalid("discarding an operation requires a transaction"));
+    }
+    let operation = load_operation(conn, id)?;
+    if operation.stage != CalendarActionStage::Planned || operation.auto_resume {
+        return Err(invalid("only an unclaimed planned action can be discarded"));
+    }
+    let claimed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_action_claims WHERE operation_id = ?1)",
+        [id],
+        |row| row.get(0),
+    )?;
+    if claimed {
+        return Err(invalid("a claimed calendar action cannot be discarded"));
+    }
+    let deleted = conn.execute(
+        "DELETE FROM calendar_action_operations
+         WHERE operation_id = ?1 AND completed = 0",
+        [id],
+    )?;
+    if deleted != 1 {
+        return Err(invalid("planned calendar action is unavailable"));
+    }
+    Ok(())
+}
+
 pub(crate) fn pending_operations(conn: &Connection, account_id: &str) -> Result<Vec<Operation>> {
     let mut stmt = conn.prepare("SELECT data FROM calendar_action_operations WHERE account_id = ?1 AND completed = 0 ORDER BY created_at LIMIT 100")?;
     let rows = stmt

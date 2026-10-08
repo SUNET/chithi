@@ -7,7 +7,12 @@ import { usePlatformStore } from "@/stores/platform";
 import type { CalendarViewMode } from "@/stores/calendar";
 import type { CalendarEvent } from "@/lib/types";
 import { showToast, dismissToast } from "@/lib/toast";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarMutationSupport, calendarScopedEditSupport,
+} from "@/lib/calendar-mutation-support";
+import {
+  chooseRescheduleScope, confirmCalendarAction,
+} from "@/lib/calendar-action-confirmation";
 import * as api from "@/lib/tauri";
 import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
 import { getDateInTimezone } from "@/lib/datetime";
@@ -308,18 +313,55 @@ async function onEventReschedule(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
-  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const event = calendarStore.getDisplayedEvent(payload.eventId);
+  const scopedSupport = calendarScopedEditSupport(event);
+  if (!event || !scopedSupport.supported) return;
   const version = selectionVersion;
   const toastId = showToast("Moving event...", "info", 0);
   try {
-    await calendarStore.updateEvent(payload.eventId, {
-      start_time: payload.newStart,
-      end_time: payload.newEnd,
-    });
+    if (scopedSupport.scopes.includes("standalone")) {
+      await calendarStore.updateEvent(payload.eventId, {
+        start_time: payload.newStart,
+        end_time: payload.newEnd,
+      });
+    } else {
+      const scope = await chooseRescheduleScope(
+        scopedSupport.scopes.includes("this-occurrence"),
+      );
+      if (!scope) {
+        dismissToast(toastId);
+        return;
+      }
+      if (scope === "this-occurrence") {
+        await calendarStore.updateOccurrence(event, {
+          start_time: payload.newStart,
+          end_time: payload.newEnd,
+        });
+      } else {
+        if (await calendarStore.resumePendingCalendarAction(event)) {
+          dismissToast(toastId);
+          showToast("Previous recurring action completed", "success");
+          return;
+        }
+        const plan = await calendarStore.planEntireSeriesAction(event, {
+          start_time: payload.newStart,
+          end_time: payload.newEnd,
+        });
+        const confirmations = await confirmCalendarAction(plan);
+        if (!confirmations) {
+          await calendarStore.discardCalendarPlan(plan);
+          dismissToast(toastId);
+          return;
+        }
+        await calendarStore.executeCalendarPlan(plan, confirmations);
+      }
+    }
     dismissToast(toastId);
     showToast("Event rescheduled", "success");
 
-    await promptAttendeeNotification(payload.eventId, version);
+    if (scopedSupport.scopes.includes("standalone")) {
+      await promptAttendeeNotification(payload.eventId, version);
+    }
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);
@@ -334,23 +376,46 @@ async function onCalendarDrop(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
-  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const event = calendarStore.getDisplayedEvent(payload.eventId);
+  const scopedSupport = calendarScopedEditSupport(event);
+  if (!event || !scopedSupport.supported) return;
   const version = selectionVersion;
 
   const toastId = showToast("Moving to calendar...", "info", 0);
   try {
-    const newId = await calendarStore.moveEventToCalendar(
-      payload.eventId,
-      payload.targetCalendarId,
-      payload.targetAccountId,
-    );
+    let newId: string;
+    if (scopedSupport.scopes.includes("standalone")) {
+      newId = await calendarStore.moveEventToCalendar(
+        payload.eventId,
+        payload.targetCalendarId,
+        payload.targetAccountId,
+      );
+    } else {
+      const resumedId = await calendarStore.resumePendingCalendarAction(event);
+      if (resumedId) {
+        dismissToast(toastId);
+        showToast("Previous recurring action completed", "success");
+        return;
+      }
+      const plan = await calendarStore.planEntireSeriesAction(
+        event, {}, payload.targetCalendarId,
+      );
+      const confirmations = await confirmCalendarAction(plan, {
+        confirmSeriesMove: true,
+      });
+      if (!confirmations) {
+        await calendarStore.discardCalendarPlan(plan);
+        dismissToast(toastId);
+        return;
+      }
+      newId = await calendarStore.executeCalendarPlan(plan, confirmations);
+    }
     dismissToast(toastId);
     showToast("Event moved to calendar", "success");
     // Resolve notification eligibility from the persisted destination.
-    await promptAttendeeNotification(
-      newId,
-      version,
-    );
+    if (scopedSupport.scopes.includes("standalone")) {
+      await promptAttendeeNotification(newId, version);
+    }
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);

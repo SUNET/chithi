@@ -2,14 +2,14 @@ import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  ArchivedGraphCalendar, Calendar, CalendarEdit, CalendarEvent, CalendarOccurrence,
-  CalendarOccurrencePage, NewEventInput,
+  ArchivedGraphCalendar, Calendar, CalendarActionPlan, CalendarConfirmations,
+  CalendarEdit, CalendarEvent, CalendarOccurrence, CalendarOccurrencePage, NewEventInput,
 } from "@/lib/types";
 import {
   expandRRule, isOccurrenceId, masterEventId, occurrenceId, parseRRule,
 } from "@/lib/rrule";
 import {
-  calendarEditSupport, calendarMutationSupport,
+  calendarEditSupport, calendarMutationSupport, calendarScopedEditSupport,
 } from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
 import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
@@ -490,6 +490,16 @@ export const useCalendarStore = defineStore("calendar", () => {
     return events.value.find((event) => event.id === eventId);
   }
 
+  function getDisplayedEvent(eventId: string): CalendarEvent | undefined {
+    if (singleEventCache.value.has(eventId)) return getCachedEvent(eventId);
+    if (isOccurrenceId(eventId)) {
+      const master = events.value.find((event) => event.id === masterEventId(eventId));
+      if (master?.recurrence_kind !== "series") return undefined;
+    }
+    return visibleEvents.value.find((event) => event.id === eventId)
+      ?? getCachedEvent(eventId);
+  }
+
   async function refreshSingleEvent(eventId: string): Promise<CalendarEvent> {
     if (isOccurrenceId(eventId)) {
       throw new Error(calendarMutationSupport({ id: eventId }).reason!);
@@ -649,6 +659,82 @@ export const useCalendarStore = defineStore("calendar", () => {
       );
     }
     await fetchEvents({ refreshSelected: false });
+  }
+
+  async function planEntireSeriesAction(
+    event: CalendarEvent,
+    edit: CalendarEdit,
+    destinationCalendarId: string | null = null,
+  ): Promise<CalendarActionPlan> {
+    const support = calendarScopedEditSupport(event);
+    if (!support.supported || !support.scopes.includes("entire-series")) {
+      throw new Error(support.reason || "The selected event has no editable series.");
+    }
+    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const start = event.start_time;
+    const end = event.end_time;
+    const view = await api.readCalendarEventSet(anchorId, start, end, 1);
+    if (view.master.selection.event_id !== anchorId || !view.master.selection.token) {
+      throw new Error("The recurring event identity changed. Refresh and try again.");
+    }
+    return api.planCalendarAction({
+      selection: {
+        ...view.master.selection,
+        original_start: selectedOriginalStart(event),
+      },
+      scope: "entire-series",
+      edit,
+      destination_calendar_id: destinationCalendarId === event.calendar_id
+        ? null : destinationCalendarId,
+      reset_exceptions: false,
+    });
+  }
+
+  async function resumePendingCalendarAction(
+    event: CalendarEvent,
+  ): Promise<string | null> {
+    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const pending = (await api.listPendingCalendarActions(event.account_id))
+      .filter((action) => action.event_id === anchorId);
+    const abandonedPlans = pending.filter((action) =>
+      action.stage === "planned" && action.auto_resume !== true);
+    for (const action of abandonedPlans) {
+      await api.discardCalendarAction(action.operation_id);
+    }
+    const resumable = pending.filter((action) =>
+      action.stage !== "planned" || action.auto_resume === true);
+    if (resumable.length === 0) return null;
+    if (resumable.length !== 1) {
+      throw new Error(
+        "Multiple unfinished calendar actions own this series. Resolve them before editing it again.",
+      );
+    }
+    const action = resumable[0];
+    const result = await api.executeCalendarAction(action.operation_id, {
+      replacement_meeting_identity: action.requires.replacement_meeting_identity,
+      reset_exceptions: action.requires.reset_exceptions,
+    });
+    if (result.stage !== "completed") {
+      throw new Error("The unfinished recurring action still needs reconciliation.");
+    }
+    await fetchEvents({ refreshSelected: false });
+    return result.event_id;
+  }
+
+  async function executeCalendarPlan(
+    plan: CalendarActionPlan,
+    confirmations: CalendarConfirmations,
+  ): Promise<string> {
+    const result = await api.executeCalendarAction(plan.operation_id, confirmations);
+    if (result.stage !== "completed") {
+      throw new Error("The recurring event action still needs reconciliation.");
+    }
+    await fetchEvents({ refreshSelected: false });
+    return result.event_id;
+  }
+
+  async function discardCalendarPlan(plan: CalendarActionPlan): Promise<void> {
+    await api.discardCalendarAction(plan.operation_id);
   }
 
   function getEventMutationSupport(eventId: string) {
@@ -914,9 +1000,14 @@ export const useCalendarStore = defineStore("calendar", () => {
     fetchEvents,
     refreshSingleEvent,
     getCachedEvent,
+    getDisplayedEvent,
     createEvent,
     updateEvent,
     updateOccurrence,
+    resumePendingCalendarAction,
+    planEntireSeriesAction,
+    executeCalendarPlan,
+    discardCalendarPlan,
     getEventMutationSupport,
     moveEventToCalendar,
     deleteEvent,

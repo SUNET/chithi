@@ -477,6 +477,10 @@ export async function listPendingCalendarActions(
   return invoke("list_pending_calendar_actions", { accountId });
 }
 
+export async function discardCalendarAction(operationId: string): Promise<void> {
+  return invoke("discard_calendar_action", { operationId });
+}
+
 export async function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }

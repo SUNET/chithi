@@ -1,5 +1,5 @@
 import { ref } from "vue";
-import { calendarMutationSupport } from "./calendar-mutation-support";
+import { calendarScopedEditSupport } from "./calendar-mutation-support";
 import type { CalendarEvent } from "./types";
 
 /** Shared reactive state for calendar event drag-and-drop. */
@@ -11,6 +11,6 @@ export function canDragCalendarEvent(
   original: CalendarEvent | null,
   current: CalendarEvent | undefined,
 ): boolean {
-  return calendarMutationSupport(original).supported &&
-    current?.id === original?.id && calendarMutationSupport(current).supported;
+  return calendarScopedEditSupport(original).supported &&
+    current?.id === original?.id && calendarScopedEditSupport(current).supported;
 }

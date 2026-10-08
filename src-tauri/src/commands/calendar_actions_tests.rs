@@ -775,6 +775,41 @@ async fn fixture(
 }
 
 #[tokio::test]
+async fn only_unclaimed_non_resumable_plans_can_be_discarded() {
+    let (_directory, state, operation, _) = fixture(None, None, false).await;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::discard_planned_operation(&tx, &operation.id).unwrap();
+        tx.commit().unwrap();
+    }
+    assert!(store::load_operation(&state.db.reader(), &operation.id).is_err());
+
+    let (_directory, state, mut operation, _) = fixture(None, None, false).await;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::claim_operation(&tx, &operation).unwrap();
+        assert!(store::discard_planned_operation(&tx, &operation.id).is_err());
+        operation.stage = CalendarActionStage::Applying;
+        store::save_operation(&tx, &operation).unwrap();
+        assert!(store::discard_planned_operation(&tx, &operation.id).is_err());
+        tx.commit().unwrap();
+    }
+    assert!(store::load_operation(&state.db.reader(), &operation.id).is_ok());
+
+    let (_directory, state, mut operation, _) = fixture(None, None, false).await;
+    operation.auto_resume = true;
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::save_operation(&tx, &operation).unwrap();
+        assert!(store::discard_planned_operation(&tx, &operation.id).is_err());
+        tx.commit().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn local_whole_transfer_is_transactional_and_preserves_shared_meeting() {
     let (_directory, state, operation, _) = fixture(None, None, false).await;
     let outcome = execute(&state, &operation.id, &CalendarConfirmations::default())

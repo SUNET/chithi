@@ -981,6 +981,23 @@ pub async fn list_pending_calendar_actions(
     Ok(results)
 }
 
+#[tauri::command]
+pub async fn discard_calendar_action(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<()> {
+    let account_id = store::load_operation(&state.db.reader(), &operation_id)?
+        .source
+        .anchor
+        .account_id;
+    let _guards = account_guards(&state, &account_id, None).await;
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    store::discard_planned_operation(&tx, &operation_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Creation {
     id: String,

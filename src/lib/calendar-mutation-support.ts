@@ -12,6 +12,8 @@ const meetingOccurrenceReason =
 const unknownReason =
   "Recurrence information is unavailable. Refresh this event before editing.";
 
+export type CalendarEditScope = "standalone" | "this-occurrence" | "entire-series";
+
 /** Ordinary mutations require positive evidence that this is standalone. */
 export function calendarMutationSupport(
   event: RecurrenceMetadata | null | undefined,
@@ -60,4 +62,35 @@ export function calendarEditSupport(
     return { supported: false, occurrence: true, reason: meetingOccurrenceReason };
   }
   return { supported: true, occurrence: true, reason: null };
+}
+
+/** Scoped actions may edit a trustworthy occurrence or its complete series. */
+export function calendarScopedEditSupport(
+  event: RecurrenceMetadata | null | undefined,
+): { supported: true; scopes: CalendarEditScope[]; reason: null } |
+   { supported: false; scopes: CalendarEditScope[]; reason: string } {
+  const ordinary = calendarMutationSupport(event);
+  if (ordinary.supported) {
+    return { supported: true, scopes: ["standalone"], reason: null };
+  }
+  if (!event || event.recurrence_kind === "unknown") {
+    return { supported: false, scopes: [], reason: unknownReason };
+  }
+  if (event.recurrence_kind === "series" && !isOccurrenceId(event.id)) {
+    return { supported: true, scopes: ["entire-series"], reason: null };
+  }
+  if (!isOccurrenceId(event.id) || (event.recurrence_kind !== "occurrence" &&
+    event.recurrence_kind !== "series")) {
+    return { supported: false, scopes: [], reason: recurringReason };
+  }
+  const scopes: CalendarEditScope[] = ["entire-series"];
+  try {
+    const attendees = JSON.parse(event.attendees_json || "[]");
+    if (Array.isArray(attendees) && attendees.length === 0) {
+      scopes.unshift("this-occurrence");
+    }
+  } catch {
+    // Malformed attendee evidence cannot authorize a single-occurrence edit.
+  }
+  return { supported: true, scopes, reason: null };
 }

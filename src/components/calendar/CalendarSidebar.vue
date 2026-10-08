@@ -91,7 +91,7 @@ onBeforeUnmount(() => {
 const dropTargetCalendarId = ref<string | null>(null);
 const canDrop = computed(() => isCalendarDragging.value &&
   canDragCalendarEvent(dragCalendarEvent.value,
-    calendarStore.getCachedEvent(dragCalendarEvent.value?.id ?? "")));
+    calendarStore.getDisplayedEvent(dragCalendarEvent.value?.id ?? "")));
 
 function onCalendarItemEnter(calId: string) {
   if (!canDrop.value || !dragCalendarEvent.value) return;

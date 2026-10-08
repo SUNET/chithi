@@ -4,7 +4,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import {
-  executeCalendarAction, listCalendarOccurrences, listPendingCalendarActions,
+  discardCalendarAction, executeCalendarAction, listCalendarOccurrences, listPendingCalendarActions,
   planCalendarAction, planCalendarOccurrenceAction, readCalendarEventSet,
 } from "@/lib/tauri";
 import type { CalendarActionInput } from "@/lib/types";
@@ -116,6 +116,17 @@ describe("calendar action IPC contract", () => {
     expect(invoke).toHaveBeenCalledExactlyOnceWith(
       "list_pending_calendar_actions",
       { accountId: "account" },
+    );
+  });
+
+  it("discards an unexecuted planned action", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+
+    await discardCalendarAction("operation");
+
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(
+      "discard_calendar_action",
+      { operationId: "operation" },
     );
   });
 });

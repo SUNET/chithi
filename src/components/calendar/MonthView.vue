@@ -84,20 +84,20 @@ const dragGhost = ref<HTMLElement | null>(null);
 const dragOverDay = ref<string | null>(null);
 const canDrop = computed(() => isCalendarDragging.value &&
   canDragCalendarEvent(dragCalendarEvent.value,
-    calendarStore.getCachedEvent(dragCalendarEvent.value?.id ?? "")));
+    calendarStore.getDisplayedEvent(dragCalendarEvent.value?.id ?? "")));
 const DRAG_THRESHOLD = 5;
 let dragCleanup: (() => void) | null = null;
 
 function onEventMouseDown(event: MouseEvent, ev: CalendarEvent) {
   if (event.button !== 0) return;
-  if (ev.all_day || !canDragCalendarEvent(ev, calendarStore.getCachedEvent(ev.id))) return;
+  if (ev.all_day || !canDragCalendarEvent(ev, calendarStore.getDisplayedEvent(ev.id))) return;
 
   dragStartPos.value = { x: event.clientX, y: event.clientY };
   const sourceEvent = ev;
 
   const handleMove = (e: MouseEvent) => {
     if (!dragStartPos.value) return;
-    if (!canDragCalendarEvent(sourceEvent, calendarStore.getCachedEvent(sourceEvent.id))) return;
+    if (!canDragCalendarEvent(sourceEvent, calendarStore.getDisplayedEvent(sourceEvent.id))) return;
     const dx = e.clientX - dragStartPos.value.x;
     const dy = e.clientY - dragStartPos.value.y;
     if (!isCalendarDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
