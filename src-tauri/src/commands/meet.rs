@@ -697,6 +697,9 @@ pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()>
     let _account_guard = account_lock.lock().await;
     let (pending, account) = {
         let conn = state.db.reader();
+        if calendar_creation_reserves_meeting(&conn, lifecycle_id)? {
+            return Err(Error::Other("This meeting is reserved by an unfinished calendar creation. Resolve that creation before deleting the room.".into()));
+        }
         let Some(pending) = db::meet_pending_meetings::get(&conn, lifecycle_id)? else {
             return Ok(());
         };
@@ -726,6 +729,20 @@ pub async fn discard_pending(state: &AppState, lifecycle_id: &str) -> Result<()>
         .await;
     let conn = state.db.writer().await;
     complete_pending_discard(&conn, lifecycle_id, provider_result)
+}
+
+fn calendar_creation_reserves_meeting(
+    conn: &rusqlite::Connection,
+    lifecycle_id: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_action_creations WHERE completed = 0
+         AND json_extract(json_extract(data, '$.request'), '$.meet_binding.lifecycle_id') = ?1)
+         OR EXISTS(SELECT 1 FROM calendar_write_requests WHERE kind = 'create' AND status != 'completed'
+         AND json_extract(request, '$.input.meet_binding.lifecycle_id') = ?1)",
+        [lifecycle_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn cleanup_provider_for(
@@ -846,8 +863,9 @@ fn validate_returned_server_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_provider_for, complete_pending_discard, map_zoom_callback_error,
-        validate_returned_server_url, validate_zoom_reauth_identity, zoom_reauth_identity,
+        calendar_creation_reserves_meeting, cleanup_provider_for, complete_pending_discard,
+        map_zoom_callback_error, validate_returned_server_url, validate_zoom_reauth_identity,
+        zoom_reauth_identity,
     };
     use crate::db;
     use crate::error::Error;
@@ -871,6 +889,44 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn unfinished_creations_reserve_only_their_pending_meeting_until_publication() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute("INSERT INTO accounts(id, display_name, email, username) VALUES ('account', 'Account', 'account@example.test', 'account@example.test')", []).unwrap();
+        for status in ["applying", "needs-refresh", "remote-confirmed"] {
+            let id = db::calendar_writes::begin(
+                &conn,
+                "account",
+                "event",
+                "create",
+                &serde_json::json!({
+                    "input": {"meet_binding": {"lifecycle_id": "legacy-room"}}
+                }),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE calendar_write_requests SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, id],
+            )
+            .unwrap();
+            assert!(calendar_creation_reserves_meeting(&conn, "legacy-room").unwrap());
+            assert!(!calendar_creation_reserves_meeting(&conn, "unrelated-room").unwrap());
+            let tx = conn.transaction().unwrap();
+            db::calendar_writes::published(&tx, &id).unwrap();
+            tx.commit().unwrap();
+            assert!(!calendar_creation_reserves_meeting(&conn, "legacy-room").unwrap());
+        }
+        conn.execute("INSERT INTO calendar_action_creations(operation_id, account_id, event_id, data, completed) VALUES ('creation', 'account', 'event', ?1, 0)", [serde_json::json!({
+            "request": serde_json::json!({"meet_binding": {"lifecycle_id": "action-room"}}).to_string()
+        }).to_string()]).unwrap();
+        assert!(calendar_creation_reserves_meeting(&conn, "action-room").unwrap());
+        assert!(!calendar_creation_reserves_meeting(&conn, "legacy-room").unwrap());
+        conn.execute("UPDATE calendar_action_creations SET completed = 1", [])
+            .unwrap();
+        assert!(!calendar_creation_reserves_meeting(&conn, "action-room").unwrap());
     }
 
     #[test]

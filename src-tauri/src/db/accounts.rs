@@ -639,7 +639,9 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>> {
     Ok(accounts)
 }
 
-pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
+/// Load and resolve database fields only. Keep this private: the compatibility
+/// aggregate is not ready for network callers until its password is hydrated.
+fn query_account_metadata(conn: &Connection, id: &str) -> Result<AccountFull> {
     let mut account = conn
         .query_row(
             "SELECT id, display_name, sender_name, email, username, enabled, signature,
@@ -700,6 +702,44 @@ pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
     // wire format stays unchanged.
     account.bindings = crate::db::service_bindings::list_for_account(conn, id)?;
     account.populate_legacy_from_bindings();
+
+    Ok(account)
+}
+
+/// Fingerprint calendar routing/settings without accessing the credential store.
+/// The tuple order and complete calendar binding are part of the persisted
+/// calendar-action format; changing them would invalidate pending operations.
+pub(crate) fn calendar_route_fingerprint(conn: &Connection, id: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let account = query_account_metadata(conn, id)?;
+    let route = serde_json::to_string(&(
+        &account.id,
+        &account.username,
+        &account.email,
+        &account.auth_method,
+        &account.jmap_url,
+        &account.caldav_url,
+        &account.jmap_auth_method,
+        &account.oidc_token_endpoint,
+        &account.oidc_client_id,
+        account.calendar_binding(),
+        account.enabled,
+        account.calendar_sync_enabled,
+    ))
+    .map_err(|error| {
+        crate::error::Error::Other(format!("cannot serialize calendar route: {error}"))
+    })?;
+    if route.len() > 16 * 1024 * 1024 {
+        return Err(crate::error::Error::Other(
+            "calendar route exceeds 16 MiB budget".into(),
+        ));
+    }
+    Ok(format!("{:x}", Sha256::digest(route)))
+}
+
+pub fn get_account_full(conn: &Connection, id: &str) -> Result<AccountFull> {
+    let mut account = query_account_metadata(conn, id)?;
 
     // Fetch password from the system keyring. OIDC/OAuth accounts don't
     // store a keyring password here — their tokens live under the
@@ -1031,8 +1071,137 @@ mod tests {
         assert_eq!(full.smtp_host, "smtp.example.com");
         assert_eq!(full.smtp_port, 587);
         assert_eq!(full.username, "user");
+        assert_eq!(full.password, config.password);
         assert!(full.use_tls);
         crate::keyring::delete_password(&id).ok();
+    }
+
+    #[test]
+    fn calendar_route_metadata_without_secret_service() {
+        let conn = setup_db();
+        let mut config = make_config("alice@example.com", "Alice");
+        config.password.clear();
+        config.caldav_url = "https://dav.example.com/cal".into();
+        insert_account(&conn, "route-account", &config).unwrap();
+
+        let route = calendar_route_fingerprint(&conn, "route-account").unwrap();
+        assert_eq!(route.len(), 64);
+        assert_eq!(
+            super::super::calendar_actions::account_route(&conn, "route-account").unwrap(),
+            route
+        );
+        assert!(matches!(
+            calendar_route_fingerprint(&conn, "missing"),
+            Err(crate::error::Error::AccountNotFound(id)) if id == "missing"
+        ));
+    }
+
+    #[test]
+    fn calendar_route_metadata_tracks_routing_and_settings() {
+        let conn = setup_db();
+        let mut config = make_config("alice@example.com", "Alice");
+        config.password.clear();
+        config.mail_protocol = "jmap".into();
+        config.jmap_url = "https://jmap.example.com".into();
+        insert_account(&conn, "route-account", &config).unwrap();
+        let original = calendar_route_fingerprint(&conn, "route-account").unwrap();
+
+        for sql in [
+            "UPDATE accounts SET username = 'other'",
+            "UPDATE accounts SET email = 'other@example.com'",
+            "UPDATE accounts SET auth_method = 'oauth-jmap-oidc'",
+            "UPDATE accounts SET oidc_token_endpoint = 'https://auth.example.com/token'",
+            "UPDATE accounts SET oidc_client_id = 'other-client'",
+            "UPDATE accounts SET enabled = 0",
+            "UPDATE service_bindings SET enabled = 0 WHERE service = 'calendar'",
+            "UPDATE service_bindings SET sync_interval_seconds = 120 WHERE service = 'calendar'",
+            "UPDATE service_bindings SET protocol = 'caldav', config_json = '{\"url\":\"https://dav.example.com\"}' WHERE service = 'calendar'",
+            "UPDATE service_bindings SET config_json = '{\"url\":\"https://other.example.com\"}' WHERE service = 'calendar'",
+            "UPDATE service_bindings SET config_json = '{\"url\":\"https://other.example.com\"}' WHERE service = 'mail'",
+            "UPDATE service_bindings SET config_json = '{\"url\":\"https://jmap.example.com\",\"auth_method\":\"bearer\"}' WHERE service = 'mail'",
+            "DELETE FROM service_bindings WHERE service = 'calendar'",
+        ] {
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(sql, []).unwrap();
+            assert_ne!(
+                calendar_route_fingerprint(&tx, "route-account").unwrap(),
+                original,
+                "route must change after {sql}"
+            );
+            tx.rollback().unwrap();
+        }
+
+        conn.execute(
+            "UPDATE accounts SET display_name = 'Renamed', signature = 'New signature',
+                                 pgp_encrypt_subject = 0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            calendar_route_fingerprint(&conn, "route-account").unwrap(),
+            original,
+            "unrelated presentation settings are not part of the route"
+        );
+    }
+
+    #[test]
+    fn calendar_route_preserves_legacy_fingerprint_and_secret_boundary() {
+        use sha2::{Digest, Sha256};
+
+        let conn = setup_db();
+        let id = unique_id();
+        let mut config = make_config("alice@example.com", "Alice");
+        config.password.clear();
+        insert_account(&conn, &id, &config).unwrap();
+        crate::keyring::set_password(&id, "first-secret").unwrap();
+
+        // Include disabled bindings, CardDAV fallback, JMAP auth recovery,
+        // malformed binding JSON, and an account with no calendar binding.
+        for sql in [
+            "SELECT 1",
+            "INSERT INTO service_bindings (id, account_id, service, protocol, config_json)
+             SELECT 'dav', id, 'calendar', 'caldav', '{\"url\":\"https://dav.example.com\"}' FROM accounts",
+            "UPDATE service_bindings SET enabled = 0 WHERE service = 'calendar'",
+            "UPDATE service_bindings SET service = 'contacts', protocol = 'carddav' WHERE id = 'dav'",
+            "UPDATE service_bindings SET protocol = 'jmap', config_json = '{\"url\":\"https://jmap.example.com\",\"auth_method\":\"bearer\"}' WHERE service = 'mail'",
+            "UPDATE accounts SET auth_method = 'oauth-jmap-oidc'",
+            "UPDATE service_bindings SET config_json = 'invalid-json' WHERE service = 'mail'",
+        ] {
+            conn.execute_batch(sql).unwrap();
+            let full = get_account_full(&conn, &id).unwrap();
+            assert_eq!(full.password, "first-secret");
+            let legacy = super::super::calendar_actions::encode(&(
+                &full.id,
+                &full.username,
+                &full.email,
+                &full.auth_method,
+                &full.jmap_url,
+                &full.caldav_url,
+                &full.jmap_auth_method,
+                &full.oidc_token_endpoint,
+                &full.oidc_client_id,
+                full.calendar_binding(),
+                full.enabled,
+                full.calendar_sync_enabled,
+            ))
+            .unwrap();
+            assert_eq!(
+                calendar_route_fingerprint(&conn, &id).unwrap(),
+                format!("{:x}", Sha256::digest(legacy)),
+                "persisted fingerprint compatibility after {sql}"
+            );
+        }
+
+        let route = calendar_route_fingerprint(&conn, &id).unwrap();
+        crate::keyring::set_password(&id, "rotated-secret").unwrap();
+        assert_eq!(calendar_route_fingerprint(&conn, &id).unwrap(), route);
+        assert_eq!(
+            get_account_full(&conn, &id).unwrap().password,
+            "rotated-secret"
+        );
+        crate::keyring::delete_password(&id).unwrap();
+        assert_eq!(calendar_route_fingerprint(&conn, &id).unwrap(), route);
+        assert!(get_account_full(&conn, &id).unwrap().password.is_empty());
     }
 
     /// Regression: O365 (Graph) accounts sync over the Graph API but

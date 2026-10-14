@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+pub mod actions;
+pub(crate) mod display_recurrence;
+mod recurrence_projection;
+
+pub mod event_set;
 pub mod ical;
 pub mod recurrence;
 #[allow(dead_code)]
 pub mod recurrence_identity;
+pub mod simple_recurrence;
 pub mod timezone;
 
 /// Recurrence classification supplied by a provider or known local creation.

@@ -9,6 +9,9 @@ use crate::calendar::recurrence_identity::{OccurrenceFields, UpdateOccurrenceInp
 use crate::calendar::{CalendarEvent, RecurrenceKind};
 use crate::error::{Error, Result};
 
+mod event_sets;
+pub(crate) use event_sets::event_set_content;
+
 const PEOPLE_PAGE_SIZE: usize = 1_000;
 const PEOPLE_PAGE_SIZE_PARAMETER: &str = "1000";
 const PEOPLE_BATCH_SIZE: usize = 200;
@@ -202,22 +205,59 @@ impl GoogleClient {
     /// List the user's calendars (`users/me/calendarList`). Returns the
     /// parsed response body; calendars are under `items`.
     pub async fn list_calendar_list(&self) -> Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(self.calendar_url("users/me/calendarList"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Google Calendar API failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("Google Calendar API error: {}", body)));
+        let mut calendars = Vec::new();
+        let mut token: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_EVENT_PAGES {
+            let mut request = self
+                .http
+                .get(self.calendar_url("users/me/calendarList"))
+                .bearer_auth(&self.token);
+            if let Some(token) = token.as_deref() {
+                request = request.query(&[("pageToken", token)]);
+            }
+            let response = request.send().await.map_err(|error| {
+                Error::Other(format!("Google calendar inventory failed: {error}"))
+            })?;
+            if !response.status().is_success() {
+                return Err(Error::Sync(format!(
+                    "Google calendar inventory returned {}",
+                    response.status()
+                )));
+            }
+            let value: serde_json::Value = response.json().await.map_err(|error| {
+                Error::Sync(format!("Google calendar inventory JSON failed: {error}"))
+            })?;
+            let items = value["items"]
+                .as_array()
+                .ok_or_else(|| Error::Sync("Google calendar inventory omitted items".into()))?;
+            for item in items {
+                if item["id"].as_str().is_none_or(str::is_empty) {
+                    return Err(Error::Sync(
+                        "Google calendar inventory omitted an ID".into(),
+                    ));
+                }
+            }
+            calendars.extend(items.iter().cloned());
+            match value.get("nextPageToken") {
+                None | Some(serde_json::Value::Null) => {
+                    return Ok(serde_json::json!({"items": calendars}))
+                }
+                Some(serde_json::Value::String(next))
+                    if !next.is_empty() && seen.insert(next.clone()) =>
+                {
+                    token = Some(next.clone())
+                }
+                _ => {
+                    return Err(Error::Sync(
+                        "Google calendar inventory has invalid or repeated pagination".into(),
+                    ))
+                }
+            }
         }
-
-        resp.json()
-            .await
-            .map_err(|e| Error::Other(format!("Google Calendar API parse error: {}", e)))
+        Err(Error::Sync(
+            "Google calendar inventory exceeded the page limit".into(),
+        ))
     }
 
     /// Query Calendar FreeBusy for participant calendar addresses.
@@ -263,33 +303,21 @@ impl GoogleClient {
                 urlencoding::encode(calendar_id)
             )))
             .bearer_auth(&self.token)
-            .query(&[("singleEvents", "true"), ("maxResults", "500")])
+            .query(&[("maxResults", "500")])
     }
 
-    /// Incremental events listing using a stored sync token.
-    pub async fn list_events_incremental(
+    /// Resource-level sync uses an unbounded, unexpanded stream. Its tokens
+    /// cannot be mixed with the legacy bounded/expanded calendarView cache.
+    pub(crate) async fn list_resources_sync(
         &self,
         calendar_id: &str,
-        sync_token: &str,
+        token: Option<&str>,
     ) -> Result<EventsPage> {
-        self.list_events(calendar_id, &[("syncToken", sync_token)], true)
-            .await
-    }
-
-    /// Full events listing over a time window (first sync, or after the
-    /// sync token expired).
-    pub async fn list_events_full(
-        &self,
-        calendar_id: &str,
-        time_min: &str,
-        time_max: &str,
-    ) -> Result<EventsPage> {
-        self.list_events(
-            calendar_id,
-            &[("timeMin", time_min), ("timeMax", time_max)],
-            false,
-        )
-        .await
+        let mut query = vec![("singleEvents", "false"), ("showDeleted", "true")];
+        if let Some(token) = token {
+            query.push(("syncToken", token));
+        }
+        self.list_events(calendar_id, &query, token.is_some()).await
     }
 
     async fn list_events(
@@ -326,6 +354,9 @@ impl GoogleClient {
 
         for page_number in 1..=MAX_EVENT_PAGES {
             let mut request = self.list_events_request(calendar_id).query(base_query);
+            if !base_query.iter().any(|(key, _)| *key == "singleEvents") {
+                request = request.query(&[("singleEvents", "true")]);
+            }
             if let Some(token) = page_token.as_deref() {
                 request = request.query(&[("pageToken", token)]);
             }
@@ -2018,16 +2049,10 @@ mod wire_tests {
                     people_api_root: "http://127.0.0.1:1/unused".into(),
                 },
             );
-            let page = if incremental {
-                client
-                    .list_events_incremental("primary", "cached-token")
-                    .await
-            } else {
-                client
-                    .list_events_full("primary", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
-                    .await
-            }
-            .unwrap();
+            let page = client
+                .list_resources_sync("primary", incremental.then_some("cached-token"))
+                .await
+                .unwrap();
             let EventsPage::Events(page) = page else {
                 panic!("unexpected expired token")
             };
@@ -2049,7 +2074,7 @@ mod wire_tests {
             assert!(!query.contains_key("fields"));
             assert_eq!(
                 query.get("singleEvents").map(|value| value.as_ref()),
-                Some("true")
+                Some("false")
             );
             assert_eq!(
                 query.get("maxResults").map(|value| value.as_ref()),
@@ -2061,9 +2086,10 @@ mod wire_tests {
                 assert!(!query.contains_key("timeMax"));
             } else {
                 assert!(!query.contains_key("syncToken"));
-                assert_eq!(query.get("timeMin").unwrap(), "2026-09-01T00:00:00Z");
-                assert_eq!(query.get("timeMax").unwrap(), "2026-10-01T00:00:00Z");
             }
+            assert_eq!(query["showDeleted"], "true");
+            assert!(!query.contains_key("timeMin"));
+            assert!(!query.contains_key("timeMax"));
         }
     }
 
@@ -2087,16 +2113,10 @@ mod wire_tests {
                 ),
             ])
             .await;
-            let result = if incremental {
-                event_client(root)
-                    .list_events_incremental("primary", "stored-sync-token")
-                    .await
-            } else {
-                event_client(root)
-                    .list_events_full("primary", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
-                    .await
-            }
-            .unwrap();
+            let result = event_client(root)
+                .list_resources_sync("primary", incremental.then_some("stored-sync-token"))
+                .await
+                .unwrap();
             let EventsPage::Events(events) = result else {
                 panic!("sync token unexpectedly expired")
             };
@@ -2114,17 +2134,18 @@ mod wire_tests {
             assert_eq!(requests.len(), 2);
             for request in &requests {
                 let query = event_query(request);
-                assert_eq!(query["singleEvents"], "true");
+                assert_eq!(query["singleEvents"], "false");
+                assert_eq!(query["showDeleted"], "true");
                 assert_eq!(query["maxResults"], "500");
                 if incremental {
                     assert_eq!(query["syncToken"], "stored-sync-token");
                     assert!(!query.contains_key("timeMin"));
                     assert!(!query.contains_key("timeMax"));
                 } else {
-                    assert_eq!(query["timeMin"], "2026-09-01T00:00:00Z");
-                    assert_eq!(query["timeMax"], "2026-10-01T00:00:00Z");
                     assert!(!query.contains_key("syncToken"));
                 }
+                assert!(!query.contains_key("timeMin"));
+                assert!(!query.contains_key("timeMax"));
             }
             assert!(!event_query(&requests[0]).contains_key("pageToken"));
             assert_eq!(event_query(&requests[1])["pageToken"], "opaque +/= page");
@@ -2179,7 +2200,7 @@ mod wire_tests {
                 serve_event_responses(responses.into_iter().map(|body| (200, body)).collect())
                     .await;
             let error = event_client(root)
-                .list_events_incremental("primary", "stored")
+                .list_resources_sync("primary", Some("stored"))
                 .await
                 .err()
                 .expect("malformed pagination must fail");
@@ -2203,7 +2224,7 @@ mod wire_tests {
         .await;
         assert!(matches!(
             event_client(root)
-                .list_events_incremental("primary", "expired")
+                .list_resources_sync("primary", Some("expired"))
                 .await
                 .unwrap(),
             EventsPage::SyncTokenExpired
@@ -3049,45 +3070,30 @@ pub fn send_updates_for(attendees_json: Option<&str>) -> &'static str {
     }
 }
 
-/// Calendar v3 payload for creating an event. Includes the local UID
-/// as iCalUID and the attendee list, so Google sends invites and RSVP
-/// replies match back. Recurrence is not represented by this creation payload.
+/// Calendar v3 insert payload, including the supported editor recurrence rules.
+/// Insert generates a new iCalUID; importing an existing UID is a different API.
 pub fn event_to_google_json(event: &CalendarEvent) -> Result<serde_json::Value> {
-    if event.recurrence_kind != RecurrenceKind::Standalone
-        || event
-            .recurrence_rule
-            .as_deref()
-            .is_some_and(|rule| !rule.is_empty())
-    {
+    if !matches!(
+        event.recurrence_kind,
+        RecurrenceKind::Standalone | RecurrenceKind::Series
+    ) {
         return Err(Error::UnsupportedCapability {
             protocol: "google",
             capability: "recurring or unclassified event creation",
         });
     }
-    let mut google_event = serde_json::json!({
-        "summary": event.title,
-        "start": time_json(&event.start_time, event.all_day),
-        "end": time_json(&event.end_time, event.all_day),
-        "iCalUID": event.uid,
-    });
-    if let Some(ref desc) = event.description {
-        google_event["description"] = serde_json::json!(desc);
+    if event.recurrence_kind == RecurrenceKind::Series
+        && event
+            .ical_data
+            .as_deref()
+            .is_some_and(|raw| !crate::calendar::ical::is_rrule_only_series(raw))
+    {
+        return Err(Error::UnsupportedCapability {
+            protocol: "google",
+            capability: "ordinary creation with source-backed recurrence exceptions",
+        });
     }
-    if let Some(ref loc) = event.location {
-        google_event["location"] = serde_json::json!(loc);
-    }
-    if let Some(ref att_json) = event.attendees_json {
-        if let Ok(atts) = serde_json::from_str::<Vec<serde_json::Value>>(att_json) {
-            let google_attendees: Vec<serde_json::Value> = atts
-                .iter()
-                .filter_map(|a| a["email"].as_str().map(|e| serde_json::json!({"email": e})))
-                .collect();
-            if !google_attendees.is_empty() {
-                google_event["attendees"] = serde_json::json!(google_attendees);
-            }
-        }
-    }
-    Ok(google_event)
+    event_set_content(event)
 }
 
 /// Calendar v3 payload for patching an event. Deliberately narrower
@@ -3296,8 +3302,18 @@ mod builder_tests {
             title: "Standup".into(),
             description: Some("daily".into()),
             location: None,
-            start_time: "2026-07-14T09:00:00Z".into(),
-            end_time: "2026-07-14T09:15:00Z".into(),
+            start_time: if all_day {
+                "2026-07-14"
+            } else {
+                "2026-07-14T09:00:00Z"
+            }
+            .into(),
+            end_time: if all_day {
+                "2026-07-15"
+            } else {
+                "2026-07-14T09:15:00Z"
+            }
+            .into(),
             all_day,
             timezone: None,
             recurrence_rule: None,
@@ -3317,7 +3333,7 @@ mod builder_tests {
         let v = event_to_google_json(&event(false, None)).unwrap();
         assert_eq!(v["start"]["dateTime"], "2026-07-14T09:00:00Z");
         assert!(v["start"]["date"].is_null());
-        assert_eq!(v["iCalUID"], "uid-1@chithi");
+        assert!(v.get("iCalUID").is_none());
     }
 
     #[test]
@@ -3325,25 +3341,27 @@ mod builder_tests {
         let v = event_to_google_json(&event(true, None)).unwrap();
         assert_eq!(v["start"]["date"], "2026-07-14");
         assert!(v["start"]["dateTime"].is_null());
-        assert_eq!(v["end"]["date"], "2026-07-14");
+        assert_eq!(v["end"]["date"], "2026-07-15");
     }
 
     #[test]
     fn attendees_map_to_email_objects() {
         let v = event_to_google_json(&event(
             false,
-            Some(r#"[{"email":"a@x.org","name":"A"},{"name":"no-email"}]"#),
+            Some(r#"[{"email":"a@x.org","name":"A","status":"accepted"}]"#),
         ))
         .unwrap();
         let atts = v["attendees"].as_array().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["email"], "a@x.org");
+        assert_eq!(atts[0]["displayName"], "A");
+        assert_eq!(atts[0]["responseStatus"], "accepted");
     }
 
     #[test]
-    fn empty_attendee_list_is_omitted() {
+    fn empty_attendee_list_is_explicit() {
         let v = event_to_google_json(&event(false, Some("[]"))).unwrap();
-        assert!(v["attendees"].is_null());
+        assert_eq!(v["attendees"], serde_json::json!([]));
     }
 
     #[test]

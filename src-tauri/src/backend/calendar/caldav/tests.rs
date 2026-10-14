@@ -1,0 +1,1141 @@
+use super::*;
+use crate::backend::testutil::{account, event, temp_pool};
+use crate::calendar::event_set::{CalendarOverride, NativeCalendarResource};
+use crate::provider::ProviderServices;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn display_template() -> CalendarEvent {
+    CalendarEvent {
+        uid: Some("display".into()),
+        ..event()
+    }
+}
+
+fn display_native(properties: &str) -> NativeCalendarResource {
+    NativeCalendarResource {
+        protocol: "caldav".into(), calendar_id: "/calendar/".into(),
+        event_id: "/calendar/display.ics".into(), revision: Some("etag".into()),
+        data: format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\nBEGIN:VEVENT\r\nUID:display\r\n{properties}END:VEVENT\r\nEND:VCALENDAR\r\n"),
+    }
+}
+
+#[test]
+fn display_accepts_optional_title_and_instantaneous_recurrence_without_authorizing_edits() {
+    let native = display_native("DTSTART:20261008T100000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.title, "");
+    assert_eq!(set.event.start_time, set.event.end_time);
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert!(resource::snapshot(native, &event()).is_err());
+    assert!(set.validate().is_err());
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-10-08",
+        "2026-10-10",
+        10,
+    )
+    .unwrap();
+    assert_eq!(page.occurrences.len(), 2);
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|value| value.fields.title.is_empty()
+            && value.fields.start_time == value.fields.end_time));
+    assert!(crate::calendar::actions::project(
+        &set,
+        &set.event,
+        "edit",
+        "2026-10-08",
+        "2026-10-10",
+        10
+    )
+    .is_err());
+}
+
+#[test]
+fn display_uses_explicit_utc_and_identical_rules_without_rewriting_native_content() {
+    let native = display_native("DTSTART;TZID=Europe/Stockholm:20261008T100000Z\r\nDTEND;TZID=Europe/Stockholm:20261008T110000Z\r\nSUMMARY:Lunch\r\nRRULE:FREQ=DAILY;COUNT=2\r\nRRULE:FREQ=DAILY;COUNT=2\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert!(set.event.timezone.is_none());
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert!(resource::snapshot(native.clone(), &event()).is_err());
+    let conflict = NativeCalendarResource {
+        data: native
+            .data
+            .replacen("RRULE:FREQ=DAILY;COUNT=2", "RRULE:FREQ=WEEKLY;COUNT=2", 1),
+        ..native
+    };
+    assert!(resource::combine_display(&[conflict], &display_template())
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting RRULE"));
+}
+
+#[test]
+fn display_proves_observed_duplicate_cutoffs_equivalent_and_preserves_exceptions_and_native_data() {
+    let native = NativeCalendarResource {
+        data: concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\n",
+            "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\n",
+            "BEGIN:STANDARD\r\nDTSTART:19971026T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n",
+            "BEGIN:DAYLIGHT\r\nDTSTART:19970330T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nSUMMARY:Weekly appointment\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20240318T193000\r\nDTEND;TZID=Europe/Stockholm:20240318T210000\r\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T183000Z\r\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T153000Z\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20241007T193000\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20241007T193000\r\nDTEND;TZID=Europe/Stockholm:20241007T210000\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20241009T193000\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20241009T193000\r\nDTEND;TZID=Europe/Stockholm:20241009T210000\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        ).into(),
+        ..display_native("")
+    };
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert_eq!(set.event.ical_data.as_ref(), Some(&native.data));
+    assert_eq!(
+        set.event.recurrence_rule.as_deref(),
+        Some("FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T153000Z")
+    );
+    assert_eq!(
+        set.overrides
+            .iter()
+            .map(|item| item.original_start.as_str())
+            .collect::<Vec<_>>(),
+        ["2024-10-07T17:30:00Z", "2024-10-09T17:30:00Z"]
+    );
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2024-12-28",
+        "2025-01-03",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|item| item.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        ["2024-12-30T18:30:00Z"]
+    );
+    assert!(resource::snapshot(native.clone(), &event())
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate RRULE"));
+    for cutoff in ["20241230T153000Z", "20250101T183000Z"] {
+        let mut conflict = native.clone();
+        conflict.data = conflict.data.replace("20241231T153000Z", cutoff);
+        assert!(resource::combine_display(&[conflict], &display_template())
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting RRULE"));
+    }
+}
+
+#[test]
+fn display_resolves_known_windows_zones_but_never_guesses_unknown_or_floating_times() {
+    let native = display_native("DTSTART;TZID=\"W. Europe Standard Time\":20261008T120000\r\nDTEND;TZID=\"W. Europe Standard Time\":20261008T130000\r\nSUMMARY:Lunch\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert_eq!(set.event.timezone.as_deref(), Some("Europe/Berlin"));
+    assert!(resource::snapshot(native.clone(), &event()).is_err());
+    let duration = NativeCalendarResource {
+        data: native.data.replace(
+            "DTEND;TZID=\"W. Europe Standard Time\":20261008T130000",
+            "DURATION:PT1H",
+        ),
+        ..native.clone()
+    };
+    let set =
+        resource::combine_display(std::slice::from_ref(&duration), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert_eq!(set.event.end_time, "2026-10-08T11:00:00Z");
+    assert_eq!(set.native.as_ref().unwrap(), &duration);
+    let nominal = NativeCalendarResource {
+        data: duration
+            .data
+            .replace("20261008T120000", "20261024T120000")
+            .replace("DURATION:PT1H", "DURATION:P1D"),
+        ..duration.clone()
+    };
+    let set = resource::combine_display(&[nominal], &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-24T10:00:00Z");
+    assert_eq!(set.event.end_time, "2026-10-25T11:00:00Z");
+    for value in ["invalid", "P1DT", "PT999999999999999999999999H"] {
+        let malformed = NativeCalendarResource {
+            data: duration
+                .data
+                .replace("DURATION:PT1H", &format!("DURATION:{value}")),
+            ..duration.clone()
+        };
+        assert!(resource::combine_display(&[malformed], &display_template()).is_err());
+    }
+    for data in [
+        native
+            .data
+            .replace("W. Europe Standard Time", "Unknown/Zone"),
+        native.data.replace(";TZID=\"W. Europe Standard Time\"", ""),
+    ] {
+        assert!(resource::combine_display(
+            &[NativeCalendarResource {
+                data,
+                ..native.clone()
+            }],
+            &display_template()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn display_expands_rdate_only_sets_without_inventing_a_rule() {
+    let native = display_native("DTSTART;VALUE=DATE:20261008\r\nRDATE;VALUE=DATE:20261009,20261010\r\nEXDATE;VALUE=DATE:20261009\r\n");
+    let set = resource::combine_display(&[native], &display_template()).unwrap();
+    assert!(set.event.recurrence_rule.is_none());
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-10-08",
+        "2026-10-11",
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|value| value.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-10-08", "2026-10-10"]
+    );
+    assert!(set.validate().is_err());
+}
+
+fn raw() -> String {
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\nX-CALENDAR:keep\r\n\
+     BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n\
+     BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260901T100000Z\r\n\
+     DTSTART;TZID=Europe/Stockholm:20260914T100000\r\nDTEND;TZID=Europe/Stockholm:20260914T110000\r\n\
+     SUMMARY:Master\r\nRRULE:FREQ=WEEKLY;COUNT=6\r\n\
+     EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n\
+     RDATE;TZID=Europe/Stockholm:20261001T100000\r\n\
+     ORGANIZER;SCHEDULE-AGENT=SERVER:mailto:owner@example.org\r\n\
+     ATTENDEE;CN=Guest;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=SERVER:mailto:guest@example.org\r\n\
+     X-NATIVE;X-PARAM=keep:untouched\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\n\
+     DESCRIPTION:alarm\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\n\
+     BEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20260901T100000Z\r\n\
+     RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000\r\n\
+     DTSTART:20261005T110000Z\r\nDTEND:20261005T120000Z\r\nSUMMARY:Exception\r\n\
+     X-SIBLING:keep\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into()
+}
+
+fn snapshot(raw: String) -> CalendarEventSet {
+    resource::snapshot(
+        NativeCalendarResource {
+            protocol: "caldav".into(),
+            calendar_id: "/calendar/".into(),
+            event_id: "/calendar/series.ics".into(),
+            revision: Some("\"v1\"".into()),
+            data: raw,
+        },
+        &event(),
+    )
+    .unwrap()
+}
+
+fn modified(before: &CalendarEventSet) -> CalendarEventSet {
+    let mut desired = before.clone();
+    desired.event.title = "New title, semicolon; newline\nwith å".into();
+    desired.event.description = Some("Long description ø".repeat(15));
+    desired.event.location = Some("Room 42".into());
+    desired.event.recurrence_rule = Some("FREQ=DAILY;INTERVAL=2;COUNT=8".into());
+    desired
+}
+
+#[test]
+fn fields_and_rules_preserve_native_siblings_and_roundtrip_text() {
+    let before = snapshot(raw());
+    assert_eq!(before.overrides.len(), 3);
+    assert!(before
+        .overrides
+        .iter()
+        .any(|o| o.original_start == "2026-09-28T08:00:00Z" && o.event.is_none()));
+    let desired = modified(&before);
+    let data = resource::rewrite(&before, &desired).unwrap();
+    for retained in [
+        "X-CALENDAR:keep",
+        "X-TIMEZONE:keep",
+        "X-NATIVE;X-PARAM=keep:untouched",
+        "X-SIBLING:keep",
+        "DESCRIPTION:alarm",
+        "SCHEDULE-AGENT=SERVER",
+        "RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000",
+    ] {
+        assert!(data.contains(retained), "{retained}");
+    }
+    assert!(data.contains("SUMMARY:New title\\, semicolon\\; newline\\nwith å"));
+    assert!(data.contains("RRULE:FREQ=DAILY;INTERVAL=2;COUNT=8"));
+    assert!(data.split("\r\n").all(|line| line.len() <= 75));
+    let after = snapshot(data);
+    assert_eq!(after.event.title, desired.event.title);
+    assert_eq!(after.event.description, desired.event.description);
+    assert!(after
+        .overrides
+        .iter()
+        .any(|o| o.event.as_ref().is_some_and(|e| e.title == "Exception")));
+}
+
+#[test]
+fn generated_occurrence_clones_master_and_existing_exception_keeps_original_id() {
+    let before = snapshot(raw());
+    let mut desired = before.clone();
+    let mut generated = before.event.clone();
+    generated.recurrence_kind = RecurrenceKind::Occurrence;
+    generated.recurrence_rule = None;
+    generated.title = "Generated edit".into();
+    generated.start_time = "2026-09-21T10:00:00Z".into();
+    generated.end_time = "2026-09-21T11:00:00Z".into();
+    desired.overrides.push(CalendarOverride {
+        original_start: "2026-09-21T08:00:00Z".into(),
+        event: Some(generated),
+        native: None,
+    });
+    desired
+        .overrides
+        .iter_mut()
+        .find(|o| o.original_start == "2026-10-05T08:00:00Z")
+        .unwrap()
+        .event
+        .as_mut()
+        .unwrap()
+        .title = "Existing edit".into();
+    let data = resource::rewrite(&before, &desired).unwrap();
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20260921T100000"));
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000"));
+    assert_eq!(data.matches("BEGIN:VALARM").count(), 2);
+    let after = snapshot(data);
+    assert_eq!(after.event.title, before.event.title);
+    assert_eq!(after.overrides.len(), 4);
+    assert!(after.overrides.iter().any(|o| o
+        .event
+        .as_ref()
+        .is_some_and(|e| e.title == "Generated edit")));
+}
+
+#[test]
+fn opaque_structure_can_change_title_but_cannot_be_flattened() {
+    let before = snapshot(raw().replace("FREQ=WEEKLY;COUNT=6", "FREQ=MONTHLY;BYDAY=1MO"));
+    let mut desired = before.clone();
+    desired.event.title = "Safe title".into();
+    assert!(resource::rewrite(&before, &desired)
+        .unwrap()
+        .contains("RRULE:FREQ=MONTHLY;BYDAY=1MO"));
+    desired.event.recurrence_rule = Some("FREQ=DAILY".into());
+    assert!(resource::rewrite(&before, &desired).is_err());
+    assert!(resource::snapshot(
+        NativeCalendarResource {
+            data: raw().replace(
+                "RECURRENCE-ID;TZID",
+                "RECURRENCE-ID;RANGE=THISANDFUTURE;TZID"
+            ),
+            ..before.native.clone().unwrap()
+        },
+        &before.event
+    )
+    .is_err());
+}
+
+#[test]
+fn all_day_date_exclusive_end_and_copy_overrides_exclusions() {
+    let mut desired = CalendarEventSet {
+        event: event(),
+        overrides: Vec::new(),
+        native: None,
+        content: None,
+    };
+    desired.event.all_day = true;
+    desired.event.start_time = "2026-09-14".into();
+    desired.event.end_time = "2026-09-16".into();
+    desired.event.timezone = None;
+    desired.event.recurrence_kind = RecurrenceKind::Series;
+    desired.event.recurrence_rule = Some("FREQ=YEARLY;UNTIL=20300914".into());
+    desired.overrides.push(CalendarOverride {
+        original_start: "2027-09-14".into(),
+        event: None,
+        native: None,
+    });
+    let data = resource::create(&desired, "new-uid", "marker").unwrap();
+    assert!(data.contains("DTSTART;VALUE=DATE:20260914\r\n"));
+    assert!(data.contains("DTEND;VALUE=DATE:20260916\r\n"));
+    assert!(data.contains("EXDATE;VALUE=DATE:20270914\r\n"));
+    resource::verify_operation(&data, "new-uid", "marker").unwrap();
+    let copy = resource::create(&snapshot(raw()), "new-uid", "marker").unwrap();
+    assert_eq!(copy.matches("UID:new-uid\r\n").count(), 2);
+    assert!(copy.contains("EXDATE;TZID=Europe/Stockholm"));
+    assert!(copy.contains("RDATE;TZID=Europe/Stockholm"));
+    assert!(copy.contains("X-SIBLING:keep"));
+}
+
+async fn server(
+    responses: Vec<(u16, Option<&'static str>, String)>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/dav/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (status, etag, body) in responses {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(end) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + size {
+                        break;
+                    }
+                }
+            }
+            requests.push(String::from_utf8(bytes).unwrap());
+            if status == 0 {
+                continue;
+            }
+            let header = etag.map(|v| format!("ETag: {v}\r\n")).unwrap_or_default();
+            socket.write_all(format!("HTTP/1.1 {status} Test\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    (url, task)
+}
+
+fn services() -> ProviderServices {
+    let mut services = super::super::google::sync_testutil::services("");
+    services.transports.dav_http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    services
+}
+
+#[tokio::test]
+async fn actual_conditional_put_and_canonical_get() {
+    let before = snapshot(raw());
+    let desired = modified(&before);
+    let canonical = resource::rewrite(&before, &desired).unwrap();
+    let (url, task) = server(vec![
+        (204, Some("\"put\""), String::new()),
+        (200, Some("W/\"get\""), canonical),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let ctx = CalendarBackendCtx {
+        db: &db,
+        services: &services,
+    };
+    let after = CalDavCalendarBackend
+        .update_event_set(&ctx, &account, &before, &desired)
+        .await
+        .unwrap();
+    assert_eq!(after.event.etag.as_deref(), Some("W/\"get\""));
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("PUT /calendar/series.ics "));
+    assert!(requests[0].contains("if-match: \"v1\"\r\n"));
+    assert!(requests[1].starts_with("GET /calendar/series.ics "));
+}
+
+#[tokio::test]
+async fn weak_revision_requires_fresh_identical_strong_snapshot() {
+    let mut before = snapshot(raw());
+    before.native.as_mut().unwrap().revision = Some("W/\"v1\"".into());
+    let (url, task) = server(vec![(200, Some("W/\"v1\""), raw())]).await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let error = CalDavCalendarBackend
+        .delete_event_set(
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+            &before,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("strong ETag"));
+    assert_eq!(task.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn exact_native_move_and_conditional_delete() {
+    let before = snapshot(raw());
+    let (url, task) = server(vec![
+        (201, None, String::new()),
+        (200, Some("\"moved\""), raw()),
+        (204, None, String::new()),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let ctx = CalendarBackendCtx {
+        db: &db,
+        services: &services,
+    };
+    let super::super::CalendarCapability::Supported(moved) = CalDavCalendarBackend
+        .move_event_set_native(&ctx, &account, &before, "/selected/")
+        .await
+        .unwrap()
+    else {
+        panic!("MOVE unsupported")
+    };
+    CalDavCalendarBackend
+        .delete_event_set(&ctx, &account, &moved)
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("MOVE /calendar/series.ics "));
+    assert!(requests[0].contains("/selected/series.ics\r\n"));
+    assert!(requests[0].contains("overwrite: F\r\n"));
+    assert!(requests[0].contains("if-match: \"v1\"\r\n"));
+    assert!(requests[2].starts_with("DELETE /selected/series.ics "));
+    assert!(requests[2].contains("if-match: \"moved\"\r\n"));
+}
+
+#[tokio::test]
+async fn create_exact_calendar_retry_collision_and_lost_response() {
+    use sha2::{Digest, Sha256};
+    let desired = snapshot(raw());
+    let marker = format!("{:x}", Sha256::digest(b"operation-42"));
+    let uid = format!("chithi-{marker}");
+    let data = resource::create(&desired, &uid, &marker).unwrap();
+    for (status, canonical, success) in [
+        (201, data.clone(), true),
+        (412, data.clone(), true),
+        (0, data.clone(), true),
+        (412, raw(), false),
+    ] {
+        let (url, task) = server(vec![
+            (status, None, String::new()),
+            (200, Some("\"created\""), canonical),
+        ])
+        .await;
+        let mut account = account("calendar", "caldav");
+        account.caldav_url = url;
+        let (_dir, db) = temp_pool();
+        let services = services();
+        let result = CalDavCalendarBackend
+            .create_event_set(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &account,
+                "/selected/",
+                &desired,
+                "operation-42",
+            )
+            .await;
+        assert_eq!(result.is_ok(), success, "{result:?}");
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with(&format!("PUT /selected/{uid}.ics ")));
+        assert!(requests[0].contains("if-none-match: *\r\n"));
+        assert!(!requests[0].contains("if-match:"));
+        assert!(requests[0].contains("X-SIBLING:keep"));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_update_sends_a_real_put_using_database_calendar_routing() {
+    let data = raw().replace("RRULE:FREQ=WEEKLY;COUNT=6\r\n", "");
+    // Use a genuinely standalone object, rather than a master stripped of its rule.
+    let start = data.find("BEGIN:VEVENT").unwrap();
+    let end = data[start..].find("END:VEVENT").unwrap() + start + "END:VEVENT".len();
+    let body = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\n{}\r\nEND:VCALENDAR\r\n",
+        &data[start..end]
+    )
+    .replace("EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n", "")
+    .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", "");
+    let before = snapshot(body.clone());
+    let mut desired = before.event.clone();
+    desired.title = "Ordinary update".into();
+    let (url, task) = server(vec![
+        (200, Some("\"v1\""), body.clone()),
+        (204, None, String::new()),
+        (
+            200,
+            Some("\"v2\""),
+            body.replace("SUMMARY:Master", "SUMMARY:Ordinary update"),
+        ),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    {
+        let conn = db.writer().await;
+        crate::db::schema::initialize(&conn).unwrap();
+        conn.execute("INSERT INTO accounts (id, display_name, email, username) VALUES (?1, 'Test', 'test@example.org', 'test')", [&account.id]).unwrap();
+        conn.execute("INSERT INTO calendars (id, account_id, name, remote_id) VALUES (?1, ?2, 'Calendar', '/calendar/')", rusqlite::params![desired.calendar_id, account.id]).unwrap();
+    }
+    CalDavCalendarBackend
+        .push_updated_event(
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+            "/calendar/series.ics",
+            &desired,
+        )
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[1].starts_with("PUT /calendar/series.ics "));
+    assert!(requests[1].contains("SUMMARY:Ordinary update\r\n"));
+    assert!(requests[1].contains("if-match: \"v1\"\r\n"));
+}
+
+#[tokio::test]
+async fn move_only_explicit_method_rejection_is_unsupported() {
+    for status in [405, 501, 403, 409, 412, 500, 207, 0] {
+        let (url, task) = server(vec![(status, None, String::new())]).await;
+        let mut account = account("calendar", "caldav");
+        account.caldav_url = url;
+        let (_dir, db) = temp_pool();
+        let services = services();
+        let result = CalDavCalendarBackend
+            .move_event_set_native(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &account,
+                &snapshot(raw()),
+                "/destination/",
+            )
+            .await;
+        if [405, 501].contains(&status) {
+            assert_eq!(
+                result.unwrap(),
+                super::super::CalendarCapability::Unsupported
+            );
+        } else {
+            assert!(result.is_err(), "{status}");
+        }
+        assert_eq!(task.await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn conditional_delete_conflict_or_lost_response_is_an_error() {
+    for status in [412, 0] {
+        let (url, task) = server(vec![(status, None, String::new())]).await;
+        let mut account = account("calendar", "caldav");
+        account.caldav_url = url;
+        let (_dir, db) = temp_pool();
+        let services = services();
+        assert!(CalDavCalendarBackend
+            .delete_event_set(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services
+                },
+                &account,
+                &snapshot(raw())
+            )
+            .await
+            .is_err());
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("if-match: \"v1\"\r\n"));
+    }
+}
+
+#[tokio::test]
+async fn detached_exception_is_read_outside_view_and_edited_at_its_own_href() {
+    let full = raw();
+    let rid = full.find("RECURRENCE-ID").unwrap();
+    let begin = full[..rid].rfind("BEGIN:VEVENT").unwrap();
+    let end = full[rid..].find("END:VEVENT").unwrap() + rid + "END:VEVENT\r\n".len();
+    let detached = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Detached//EN\r\n{}END:VCALENDAR\r\n",
+        &full[begin..end]
+    );
+    let master = format!("{}{}", &full[..begin], &full[end..]);
+    let report = format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/calendar/detached.ics</d:href><d:propstat><d:prop><d:getetag>\"detached\"</d:getetag><c:calendar-data>{}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>", detached.replace('&', "&amp;").replace('<', "&lt;"));
+    let (url, task) = server(vec![
+        (200, Some("\"v1\""), master.clone()),
+        (207, None, report),
+        (200, Some("\"detached\""), detached.clone()),
+        (204, None, String::new()),
+        (200, Some("\"v2\""), master.clone()),
+        (
+            200,
+            Some("\"d2\""),
+            detached.replace("SUMMARY:Exception", "SUMMARY:Edited detached"),
+        ),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let ctx = CalendarBackendCtx {
+        db: &db,
+        services: &services,
+    };
+    let template = snapshot(master).event;
+    let before = CalDavCalendarBackend
+        .fetch_event_set(&ctx, &account, &template, "/calendar/")
+        .await
+        .unwrap();
+    let mut desired = before.clone();
+    let exception = desired
+        .overrides
+        .iter_mut()
+        .find(|o| o.original_start == "2026-10-05T08:00:00Z")
+        .unwrap();
+    assert_eq!(
+        exception.native.as_ref().unwrap().event_id,
+        "/calendar/detached.ics"
+    );
+    exception.event.as_mut().unwrap().title = "Edited detached".into();
+    let after = CalDavCalendarBackend
+        .update_event_set(&ctx, &account, &before, &desired)
+        .await
+        .unwrap();
+    assert!(after.overrides.iter().any(|o| o
+        .event
+        .as_ref()
+        .is_some_and(|e| e.title == "Edited detached")));
+    let requests = task.await.unwrap();
+    assert!(requests[1].starts_with("REPORT /calendar/ "));
+    assert!(!requests[1].contains("time-range"));
+    assert!(requests[3].starts_with("PUT /calendar/detached.ics "));
+    assert!(requests[3].contains("if-match: \"detached\"\r\n"));
+    assert!(requests[3].contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000\r\n"));
+}
+
+fn reschedule(before: &CalendarEventSet, start: &str, end: &str) -> CalendarEventSet {
+    use crate::calendar::actions::{CalendarActionInput, CalendarEdit, CalendarSelection};
+    crate::calendar::actions::desired_set(
+        before,
+        &CalendarActionInput {
+            selection: CalendarSelection {
+                event_id: before.event.id.clone(),
+                token: "test".into(),
+                original_start: None,
+            },
+            scope: crate::calendar::recurrence_identity::RecurrenceMutationScope::EntireSeries,
+            edit: CalendarEdit {
+                start_time: Some(start.into()),
+                end_time: Some(end.into()),
+                ..Default::default()
+            },
+            destination_calendar_id: None,
+            reset_exceptions: false,
+        },
+    )
+    .unwrap()
+}
+
+fn detached_reschedule_resources() -> Vec<NativeCalendarResource> {
+    let full = raw()
+        .replace("EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n", "")
+        .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", "");
+    let rid = full.find("RECURRENCE-ID").unwrap();
+    let begin = full[..rid].rfind("BEGIN:VEVENT").unwrap();
+    let end = full[rid..].find("END:VEVENT").unwrap() + rid + "END:VEVENT\r\n".len();
+    vec![
+        NativeCalendarResource {
+            data: format!("{}{}", &full[..begin], &full[end..]),
+            ..snapshot(full.clone()).native.unwrap()
+        },
+        NativeCalendarResource {
+            protocol: "caldav".into(),
+            calendar_id: "/calendar/".into(),
+            event_id: "/calendar/detached.ics".into(),
+            revision: Some("\"detached\"".into()),
+            data: format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Detached//EN\r\n{}END:VCALENDAR\r\n",
+                &full[begin..end]
+            ),
+        },
+    ]
+}
+
+#[test]
+fn rescheduled_native_exceptions_keep_their_source_component_and_new_original() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261102T110000\r\n"));
+    assert!(data.contains("DTSTART;TZID=Europe/Stockholm:20261102T140000\r\n"));
+    assert!(data.contains("X-SIBLING:keep"));
+    assert!(data.contains("SUMMARY:Exception"));
+    assert!(data.contains(
+        "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n"
+    ));
+    assert!(!data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000"));
+    // The same source-component mapping preserves embedded exceptions too.
+    let before = snapshot(
+        raw()
+            .replace("EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n", "")
+            .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", ""),
+    );
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::rewrite(&before, &desired).unwrap();
+    assert!(data.contains("X-SIBLING:keep"));
+    assert_eq!(data.matches("BEGIN:VALARM").count(), 1);
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261102T110000\r\n"));
+}
+
+#[test]
+fn detached_write_generates_a_timezone_only_when_the_set_has_no_native_definition() {
+    let mut sources = detached_reschedule_resources();
+    sources[0].data = sources[0].data.replace(
+        "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n",
+        "",
+    );
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\n"));
+    assert!(data.contains("BEGIN:STANDARD"));
+    assert!(data.contains("BEGIN:DAYLIGHT"));
+    assert!(!data.contains("X-TIMEZONE:keep"));
+}
+
+#[tokio::test]
+async fn whole_series_reschedule_updates_detached_resource_without_embedding_a_duplicate() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let master = sources[0]
+        .data
+        .replace("20260914T100000", "20261012T110000")
+        .replace("20260914T110000", "20261012T120000");
+    let detached = sources[1]
+        .data
+        .replace("20261005T100000", "20261102T110000")
+        .replace(
+            "DTSTART:20261005T110000Z",
+            "DTSTART;TZID=Europe/Stockholm:20261102T140000",
+        )
+        .replace(
+            "DTEND:20261005T120000Z",
+            "DTEND;TZID=Europe/Stockholm:20261102T150000",
+        );
+    let (url, task) = server(vec![
+        (204, None, String::new()),
+        (204, None, String::new()),
+        (200, Some("\"v2\""), master),
+        (200, Some("\"d2\""), detached),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let after = CalDavCalendarBackend
+        .update_event_set(
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+            &before,
+            &desired,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.overrides.len(), 1);
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+    assert_eq!(after.overrides[0].original_start, "2026-11-02T10:00:00Z");
+    assert_eq!(
+        after.overrides[0].event.as_ref().unwrap().start_time,
+        "2026-11-02T13:00:00Z"
+    );
+    assert_eq!(
+        after.overrides[0].native.as_ref().unwrap().event_id,
+        sources[1].event_id
+    );
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("PUT /calendar/series.ics "));
+    assert!(requests[0].contains("if-match: \"v1\"\r\n"));
+    assert!(!requests[0].contains("RECURRENCE-ID"));
+    assert!(requests[1].starts_with("PUT /calendar/detached.ics "));
+    assert!(requests[1].contains("if-match: \"detached\"\r\n"));
+    assert!(requests[1].contains("X-SIBLING:keep"));
+}
+
+#[test]
+fn remapped_embedded_exclusion_and_exception_may_cross_previous_originals() {
+    let before = snapshot(
+        raw()
+            .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", "")
+            .replace("20261005", "20260921"),
+    );
+    let desired = reschedule(&before, "2026-09-21T08:00:00Z", "2026-09-21T09:00:00Z");
+    let data = resource::rewrite(&before, &desired).unwrap();
+    assert!(data.contains("EXDATE;TZID=Europe/Stockholm:20261005T100000\r\n"));
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20260928T100000\r\n"));
+    assert!(data.contains("X-SIBLING:keep"));
+    let after = snapshot(data);
+    assert_eq!(after.overrides.len(), 2);
+    assert!(after
+        .overrides
+        .iter()
+        .any(|item| item.original_start == "2026-10-05T08:00:00Z" && item.event.is_none()));
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+}
+
+#[test]
+fn one_detached_resource_keeps_distinct_live_and_cancelled_remapped_components() {
+    let mut sources = detached_reschedule_resources();
+    let live = sources[1].data.replace("20261005", "20260921");
+    let cancelled = "BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20260928T100000\r\nSTATUS:CANCELLED\r\nX-CANCELLED:keep\r\nEND:VEVENT\r\n";
+    sources[1].data = live.replace("END:VCALENDAR", &format!("{cancelled}END:VCALENDAR"));
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-09-21T08:00:00Z", "2026-09-21T09:00:00Z");
+    sources[1].data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    sources[0].data = sources[0].data.replace("20260914", "20260921");
+    let after = resource::combine(&sources, &before.event).unwrap();
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+    assert_eq!(after.overrides.len(), 2);
+    assert_eq!(sources[1].data.matches("RECURRENCE-ID").count(), 2);
+    assert!(sources[1].data.contains("X-SIBLING:keep"));
+    assert!(sources[1].data.contains("X-CANCELLED:keep"));
+    assert!(after
+        .overrides
+        .iter()
+        .any(|item| item.original_start == "2026-10-05T08:00:00Z" && item.event.is_none()));
+}
+
+#[test]
+fn detached_all_day_remap_preserves_date_identity_and_cancellation() {
+    let mut sources = detached_reschedule_resources();
+    sources[0].data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Dates\r\nDTSTART;VALUE=DATE:20260914\r\nDTEND;VALUE=DATE:20260915\r\nRRULE:FREQ=WEEKLY;COUNT=6\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into();
+    sources[1].data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID;VALUE=DATE:20261005\r\nSTATUS:CANCELLED\r\nX-CANCELLED:keep\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12", "2026-10-13");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("RECURRENCE-ID;VALUE=DATE:20261102\r\n"));
+    assert!(data.contains("STATUS:CANCELLED\r\n"));
+    assert!(data.contains("X-CANCELLED:keep"));
+}
+
+#[test]
+fn remapped_override_must_keep_the_exact_native_owner_and_unique_source_position() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    for field in ["event", "calendar", "revision", "data"] {
+        let mut bad = desired.clone();
+        let native = bad.overrides[0].native.as_mut().unwrap();
+        match field {
+            "event" => native.event_id = "/calendar/foreign.ics".into(),
+            "calendar" => native.calendar_id = "/foreign/".into(),
+            "revision" => native.revision = Some("\"foreign\"".into()),
+            _ => native.data.push_str("foreign"),
+        }
+        assert!(
+            resource::detached_write(&sources[1], &before, &bad).is_err(),
+            "{field}"
+        );
+    }
+    let mut duplicate = desired;
+    duplicate.overrides.push(duplicate.overrides[0].clone());
+    assert!(resource::detached_write(&sources[1], &before, &duplicate).is_err());
+}
+
+#[tokio::test]
+async fn generated_occurrence_is_materialized_by_http_put() {
+    let before = snapshot(raw());
+    let mut desired = before.clone();
+    let mut occurrence = before.event.clone();
+    occurrence.title = "Materialized over HTTP".into();
+    occurrence.recurrence_rule = None;
+    occurrence.recurrence_kind = RecurrenceKind::Occurrence;
+    occurrence.start_time = "2026-09-21T11:00:00Z".into();
+    occurrence.end_time = "2026-09-21T12:00:00Z".into();
+    desired.overrides.push(CalendarOverride {
+        original_start: "2026-09-21T08:00:00Z".into(),
+        event: Some(occurrence),
+        native: None,
+    });
+    let data = resource::rewrite(&before, &desired).unwrap();
+    let (url, task) = server(vec![
+        (204, None, String::new()),
+        (200, Some("\"v2\""), data),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let after = CalDavCalendarBackend
+        .update_event_set(
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+            &before,
+            &desired,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.overrides.len(), 4);
+    let requests = task.await.unwrap();
+    assert!(requests[0].contains("RECURRENCE-ID;TZID=Europe/Stockholm:20260921T100000\r\n"));
+    assert!(requests[0].contains("SUMMARY:Materialized over HTTP\r\n"));
+    assert!(requests[0].contains("X-SIBLING:keep\r\n"));
+    assert_eq!(requests[0].matches("BEGIN:VALARM").count(), 2);
+}
+
+#[tokio::test]
+async fn weak_validator_can_upgrade_but_never_rebase_changed_content() {
+    for changed in [false, true] {
+        let mut before = snapshot(raw());
+        before.native.as_mut().unwrap().revision = Some("W/\"v1\"".into());
+        let mut responses = vec![(
+            200,
+            Some("\"fresh\""),
+            if changed {
+                raw().replace("SUMMARY:Master", "SUMMARY:Concurrent")
+            } else {
+                raw()
+            },
+        )];
+        if !changed {
+            responses.push((204, None, String::new()));
+        }
+        let (url, task) = server(responses).await;
+        let mut account = account("calendar", "caldav");
+        account.caldav_url = url;
+        let (_dir, db) = temp_pool();
+        let services = services();
+        let result = CalDavCalendarBackend
+            .delete_event_set(
+                &CalendarBackendCtx {
+                    db: &db,
+                    services: &services,
+                },
+                &account,
+                &before,
+            )
+            .await;
+        assert_eq!(result.is_err(), changed);
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("GET /calendar/series.ics "));
+        if !changed {
+            assert!(requests[1].contains("if-match: \"fresh\"\r\n"));
+        }
+    }
+}
+
+#[test]
+fn ui_rules_and_transfer_attendees_are_exported_as_complete_content() {
+    for rule in [
+        "FREQ=DAILY;INTERVAL=2;COUNT=8",
+        "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261231",
+        "FREQ=MONTHLY;INTERVAL=3;COUNT=4",
+        "FREQ=YEARLY;COUNT=2",
+    ] {
+        let mut desired = snapshot(raw());
+        desired.native = None;
+        for item in &mut desired.overrides {
+            item.native = None;
+        }
+        desired.event.recurrence_rule = Some(rule.into());
+        let data = resource::create(&desired, "export", "marker").unwrap();
+        assert!(data.contains("ORGANIZER:mailto:owner@example.org\r\n"));
+        assert!(
+            data.contains("ATTENDEE;CN=\"Guest\";PARTSTAT=ACCEPTED:mailto:guest@example.org\r\n")
+        );
+        assert!(data.contains("DTSTART;TZID=Europe/Stockholm:20260914T100000\r\n"));
+        let after = snapshot(data);
+        assert_eq!(after.overrides.len(), desired.overrides.len());
+        if rule.contains("UNTIL") {
+            assert!(after
+                .event
+                .recurrence_rule
+                .as_ref()
+                .unwrap()
+                .contains("UNTIL=20261231T225959Z"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn source_owner_uid_and_collection_mismatches_fail_before_http() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = format!("http://{}/dav/", listener.local_addr().unwrap());
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let ctx = CalendarBackendCtx {
+        db: &db,
+        services: &services,
+    };
+    for mismatch in ["owner", "uid", "collection"] {
+        let mut before = snapshot(raw());
+        match mismatch {
+            "owner" => before.event.account_id = "another-account".into(),
+            "uid" => before.event.uid = Some("another-uid".into()),
+            _ => before.native.as_mut().unwrap().calendar_id = "/another-calendar/".into(),
+        }
+        assert!(CalDavCalendarBackend
+            .delete_event_set(&ctx, &account, &before)
+            .await
+            .is_err());
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}

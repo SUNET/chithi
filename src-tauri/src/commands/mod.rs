@@ -3,6 +3,7 @@ pub mod actions;
 pub mod app;
 pub mod attachments;
 pub mod calendar;
+pub mod calendar_actions;
 pub mod compose;
 pub mod contacts;
 pub mod filters;

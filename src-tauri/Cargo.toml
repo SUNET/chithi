@@ -28,11 +28,12 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 maildir = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+rrule = { version = "0.14", default-features = false }
 iana-time-zone = "0.1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
-ammonia = "4"
-async-trait = "0.1"
+ammonia = "4.1.7"
+async-trait = "0.1.92"
 log = "0.4"
 fern = { version = "0.7", features = ["date-based"] }
 futures = "0.3"

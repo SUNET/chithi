@@ -3,6 +3,7 @@ import { ref, computed, onMounted, watch } from "vue";
 import { useRoute } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useAccountsStore } from "@/stores/accounts";
+import { useCalendarStore } from "@/stores/calendar";
 import { usePlatformStore } from "@/stores/platform";
 import { useUiStore } from "@/stores/ui";
 import { acctColor } from "@/lib/account-colors";
@@ -10,6 +11,7 @@ import * as api from "@/lib/tauri";
 import MobileAppBar from "@/components/mobile/MobileAppBar.vue";
 import AccountTypePicker from "@/components/settings/AccountTypePicker.vue";
 import AccountFormModal from "@/components/settings/AccountFormModal.vue";
+import ArchivedGraphSummary from "@/components/calendar/ArchivedGraphSummary.vue";
 import {
   accountSecondaryLabel,
   accountTypeLabel,
@@ -18,11 +20,20 @@ import {
 
 const route = useRoute();
 const accountsStore = useAccountsStore();
+const calendarStore = useCalendarStore();
 const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
 const viewMounted = ref(false);
 onMounted(() => { viewMounted.value = true; });
+watch(() => accountsStore.accounts.map((account) => account.id), (ids) => {
+  if (ids.length === 0) {
+    calendarStore.archivedGraphCalendars = [];
+    return;
+  }
+  void calendarStore.fetchCalendars().catch((error) =>
+    console.error("Settings: archived calendar read failed:", error));
+}, { immediate: true });
 
 // Mobile toggles — persist to localStorage so they survive reloads.
 const blockRemoteImages = ref(localStorage.getItem("chithi-block-remote-images") !== "false");
@@ -255,6 +266,22 @@ watch([
         </div>
       </div>
 
+      <!-- Archived calendars -->
+      <div class="section">
+        <div class="section-label">Archived Graph calendars</div>
+        <div class="section-card archive-settings">
+          <p v-if="calendarStore.archivedGraphCalendarsError" role="alert">
+            {{ calendarStore.archivedGraphCalendarsError }}
+            <button @click="calendarStore.retryNavigation()">Retry</button>
+          </p>
+          <p v-else-if="!calendarStore.archivedGraphCalendars.length">No archived Graph calendars.</p>
+          <template v-if="calendarStore.archivedGraphCalendars.length">
+            <p>Cached events and action history are retained read-only.</p>
+            <ArchivedGraphSummary :calendars="calendarStore.archivedGraphCalendars" />
+          </template>
+        </div>
+      </div>
+
       <!-- Privacy & storage -->
       <div class="section">
         <div class="section-label">Privacy &amp; storage</div>
@@ -335,6 +362,18 @@ watch([
           </div>
         </div>
       </div>
+      <section class="archive-settings desktop-archive-settings">
+        <h2 class="section-title">Archived Graph calendars</h2>
+        <p v-if="calendarStore.archivedGraphCalendarsError" role="alert">
+          {{ calendarStore.archivedGraphCalendarsError }}
+          <button @click="calendarStore.retryNavigation()">Retry</button>
+        </p>
+        <p v-else-if="!calendarStore.archivedGraphCalendars.length">No archived Graph calendars.</p>
+        <template v-if="calendarStore.archivedGraphCalendars.length">
+          <p>Cached events and action history are retained read-only.</p>
+          <ArchivedGraphSummary :calendars="calendarStore.archivedGraphCalendars" />
+        </template>
+      </section>
     </div>
   </div>
 
@@ -435,6 +474,24 @@ watch([
   font-size: 24px;
   font-weight: 600;
   margin-bottom: 24px;
+}
+
+.archive-settings {
+  padding: 14px 16px;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.desktop-archive-settings {
+  margin-top: 28px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg-secondary);
+}
+
+.archive-settings button {
+  color: var(--color-accent);
+  text-decoration: underline;
 }
 
 .section-header {

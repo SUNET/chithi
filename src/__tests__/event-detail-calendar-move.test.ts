@@ -3,13 +3,22 @@ import { enableAutoUnmount, flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 
 vi.mock("@/lib/tauri", () => ({
+  readCalendarEventSet: vi.fn(),
+  planCalendarAction: vi.fn(),
+  executeCalendarAction: vi.fn(),
+  discardCalendarAction: vi.fn(),
+  listPendingCalendarActions: vi.fn().mockResolvedValue([]),
   updateEvent: vi.fn().mockResolvedValue(undefined),
   deleteEvent: vi.fn().mockResolvedValue(undefined),
   createEvent: vi.fn().mockResolvedValue("evt-new"),
   moveEventToCalendar: vi.fn().mockResolvedValue("evt-new"),
   getEvents: vi.fn().mockResolvedValue([]),
+  listCalendarOccurrences: vi.fn().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+  }),
   getCalendarEvent: vi.fn(),
   listCalendars: vi.fn().mockResolvedValue([]),
+  listArchivedGraphCalendars: vi.fn().mockResolvedValue([]),
   listAccounts: vi.fn().mockResolvedValue([]),
   syncCalendars: vi.fn().mockResolvedValue(undefined),
   sendInvites: vi.fn().mockResolvedValue(undefined),
@@ -26,6 +35,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import EventDetail from "@/components/calendar/EventDetail.vue";
 import * as api from "@/lib/tauri";
+import { message } from "@tauri-apps/plugin-dialog";
 import { occurrenceId } from "@/lib/rrule";
 import { useAccountsStore } from "@/stores/accounts";
 import { useCalendarStore } from "@/stores/calendar";
@@ -105,6 +115,41 @@ describe("EventDetail calendar picker", () => {
       accountId === "acc1" ? [{ ...standaloneEvent }] : [],
     );
     vi.mocked(api.getCalendarEvent).mockImplementation(async (id) => ({ ...standaloneEvent, id }));
+    vi.mocked(api.readCalendarEventSet).mockResolvedValue({
+      master: {
+        selection: { event_id: "evt-r", token: "token", original_start: null },
+        event_id: "evt-r",
+        account_id: "acc1",
+        calendar_id: "cal1",
+        fields: {
+          title: "Series", description: null, location: null,
+          start_time: "2026-09-08T09:00:00.000Z",
+          end_time: "2026-09-08T10:00:00.000Z",
+          all_day: false, timezone: "UTC",
+        },
+        recurrence_kind: "series",
+        recurrence_rule: "FREQ=WEEKLY",
+        is_exception: false,
+      },
+      page: { occurrences: [], has_more: false, needs_hydration: [], unresolved: [] },
+      exception_count: 0,
+    });
+    vi.mocked(api.planCalendarAction).mockResolvedValue({
+      operation_id: "series-operation",
+      requires: { replacement_meeting_identity: false, reset_exceptions: false },
+      preview: {
+        title: "Series", description: null, location: null,
+        start_time: "2026-09-08T09:00:00.000Z",
+        end_time: "2026-09-08T10:00:00.000Z",
+        all_day: false, timezone: "UTC",
+      },
+    });
+    vi.mocked(api.executeCalendarAction).mockResolvedValue({
+      operation_id: "series-operation",
+      stage: "completed",
+      event_id: "evt-r",
+      requires: { replacement_meeting_identity: false, reset_exceptions: false },
+    });
   });
 
   it("lists all subscribed calendars in edit mode", async () => {
@@ -141,7 +186,7 @@ describe("EventDetail calendar picker", () => {
     expect(wrapper.emitted("close")).toBeTruthy();
   });
 
-  it("keeps a later occurrence read-only without substituting master dates", async () => {
+  it("offers only entire-series editing for a meeting occurrence", async () => {
     setupStores();
     const calendarStore = useCalendarStore();
     calendarStore.events = [{
@@ -160,14 +205,91 @@ describe("EventDetail calendar picker", () => {
     };
     const wrapper = mountDetail();
 
-    await wrapper.get(".btn-edit").trigger("click");
-    expect(wrapper.find('[data-testid="event-detail-calendar"]').exists()).toBe(false);
     expect(wrapper.text()).toContain("September 8, 2026");
-    expect(wrapper.text()).toContain("Editing, deleting, or moving recurring events is not supported in Chithi.");
+    await wrapper.get(".btn-edit").trigger("click");
+    expect(wrapper.get('[data-testid="event-detail-scope"]').element)
+      .toHaveProperty("value", "entire-series");
+    expect(wrapper.get('[data-testid="event-detail-calendar"]').attributes("disabled"))
+      .toBeUndefined();
+    expect(wrapper.text()).toContain("Recurring deletion remains unavailable");
     expect(api.updateEvent).not.toHaveBeenCalled();
     expect(api.moveEventToCalendar).not.toHaveBeenCalled();
     expect(api.sendInvites).not.toHaveBeenCalled();
     expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
+  });
+
+  it("edits the whole series through the durable action workflow", async () => {
+    setupStores();
+    const calendarStore = useCalendarStore();
+    calendarStore.events = [{
+      ...standaloneEvent,
+      id: "evt-r",
+      recurrence_kind: "series",
+      recurrence_rule: "FREQ=WEEKLY",
+    }];
+    calendarStore.selectedEvent = {
+      ...calendarStore.events[0],
+      id: occurrenceId("evt-r", new Date("2026-09-08T09:00:00.000Z")),
+      recurrence_kind: "occurrence",
+      start_time: "2026-09-08T09:00:00.000Z",
+      end_time: "2026-09-08T10:00:00.000Z",
+    };
+    const wrapper = mountDetail();
+
+    await wrapper.get(".btn-edit").trigger("click");
+    await wrapper.get('[data-testid="event-detail-scope"]').setValue("entire-series");
+    await wrapper.get('[data-testid="event-form-title"]').setValue("All meetings");
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+
+    expect(api.planCalendarAction).toHaveBeenCalledWith(expect.objectContaining({
+      selection: expect.objectContaining({
+        event_id: "evt-r",
+        token: "token",
+        original_start: "2026-09-08T09:00:00.000Z",
+      }),
+      scope: "entire-series",
+      edit: expect.objectContaining({ title: "All meetings" }),
+      destination_calendar_id: null,
+    }));
+    expect(api.executeCalendarAction).toHaveBeenCalledWith("series-operation", {
+      replacement_meeting_identity: false,
+      reset_exceptions: false,
+    });
+    expect(api.updateEvent).not.toHaveBeenCalled();
+    expect(wrapper.emitted("close")).toBeTruthy();
+  });
+
+  it("discards a planned series move when confirmation is cancelled", async () => {
+    setupStores();
+    const calendarStore = useCalendarStore();
+    calendarStore.events = [{
+      ...standaloneEvent,
+      id: "evt-r",
+      recurrence_kind: "series",
+      recurrence_rule: "FREQ=WEEKLY",
+    }];
+    calendarStore.selectedEvent = {
+      ...calendarStore.events[0],
+      id: occurrenceId("evt-r", new Date("2026-09-08T09:00:00.000Z")),
+      recurrence_kind: "occurrence",
+      start_time: "2026-09-08T09:00:00.000Z",
+      end_time: "2026-09-08T10:00:00.000Z",
+    };
+    vi.mocked(message).mockResolvedValueOnce("Cancel");
+    const wrapper = mountDetail();
+
+    await wrapper.get(".btn-edit").trigger("click");
+    await wrapper.get('[data-testid="event-detail-scope"]').setValue("entire-series");
+    await wrapper.get('[data-testid="event-detail-calendar"]').setValue("cal2");
+    await wrapper.get('[data-testid="event-form-save"]').trigger("click");
+    await flushPromises();
+
+    expect(api.discardCalendarAction).toHaveBeenCalledExactlyOnceWith(
+      "series-operation",
+    );
+    expect(api.executeCalendarAction).not.toHaveBeenCalled();
+    expect(wrapper.find(".edit-mode").exists()).toBe(true);
   });
 
   it("uses the backend move command for standalone cross-account moves", async () => {

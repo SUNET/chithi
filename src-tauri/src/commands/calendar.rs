@@ -62,7 +62,7 @@ fn duration_minutes_between(start: &str, end: &str) -> u32 {
 // Input types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NewEventInput {
     pub account_id: String,
     pub calendar_id: String,
@@ -103,7 +103,7 @@ pub struct UpdateEventInput {
 
 /// Frontend-supplied copy of metadata returned from `meet_create_url`.
 /// The backend accepts it only when it exactly matches a pending lifecycle.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetBindingInput {
     pub lifecycle_id: String,
     pub account_id: String,
@@ -120,7 +120,7 @@ pub struct MeetBindingInput {
 /// account's resolved meet provider stops an attacker from forging
 /// e.g. a Zoom protocol entry against a Talk account and causing
 /// Chithi to PATCH/DELETE arbitrary meetings.
-fn claim_meet_binding(
+pub(crate) fn claim_meet_binding(
     conn: &rusqlite::Connection,
     event_id: &str,
     b: &MeetBindingInput,
@@ -128,6 +128,13 @@ fn claim_meet_binding(
     let pending = matching_pending_meeting(conn, b)?;
     validate_pending_provider(conn, &pending)?;
     transfer_pending_meeting(conn, event_id, b, pending)
+}
+
+pub(crate) fn validate_pending_meet_binding(
+    conn: &rusqlite::Connection,
+    binding: &MeetBindingInput,
+) -> Result<()> {
+    validate_pending_provider(conn, &matching_pending_meeting(conn, binding)?)
 }
 
 fn validate_pending_provider(
@@ -228,7 +235,7 @@ fn replace_meet_binding_ownership(
                 || old.protocol != binding.protocol
                 || old.meeting_id != binding.meeting_id =>
         {
-            Some(queue_meeting_cleanup(conn, old)?)
+            queue_meeting_cleanup(conn, old)?
         }
         _ => None,
     };
@@ -239,7 +246,21 @@ fn replace_meet_binding_ownership(
 fn queue_meeting_cleanup(
     conn: &rusqlite::Connection,
     binding: db::meet_meetings::MeetMeeting,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    let shared: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meet_meetings WHERE event_id != ?1
+         AND account_id = ?2 AND protocol = ?3 AND meeting_id = ?4)",
+        rusqlite::params![
+            binding.event_id,
+            binding.account_id,
+            binding.protocol,
+            binding.meeting_id
+        ],
+        |row| row.get(0),
+    )?;
+    if shared {
+        return Ok(None);
+    }
     let lifecycle_id = uuid::Uuid::new_v4().to_string();
     db::meet_pending_meetings::insert(
         conn,
@@ -253,7 +274,7 @@ fn queue_meeting_cleanup(
             cleanup_requested: true,
         },
     )?;
-    Ok(lifecycle_id)
+    Ok(Some(lifecycle_id))
 }
 
 fn pending_matches_binding(
@@ -281,6 +302,24 @@ pub async fn list_calendars(
     let calendars = db::calendar::list_calendars(&conn, &account_id)?;
     log::debug!("list_calendars: found {} calendars", calendars.len());
     Ok(calendars)
+}
+
+#[tauri::command]
+pub async fn list_archived_graph_calendars(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<db::calendar::ArchivedGraphCalendar>> {
+    db::calendar::list_archived_graph_calendars(&state.db.reader(), &account_id)
+}
+
+#[tauri::command]
+pub async fn acknowledge_archived_graph_calendar(
+    state: State<'_, AppState>,
+    account_id: String,
+    calendar_id: String,
+) -> Result<()> {
+    let conn = state.db.writer().await;
+    db::calendar::acknowledge_archived_graph_calendar(&conn, &account_id, &calendar_id)
 }
 
 #[tauri::command]
@@ -415,6 +454,7 @@ pub async fn delete_calendar(state: State<'_, AppState>, calendar_id: String) ->
     let cleanup_ids = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         let cleanup_ids =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?
                 .cleanup_lifecycle_ids;
@@ -437,6 +477,7 @@ pub async fn unsubscribe_calendar(state: State<'_, AppState>, calendar_id: Strin
     let deletion = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
+        db::calendar::get_calendar(&transaction, &calendar_id)?;
         db::calendar::set_calendar_subscribed(&transaction, &calendar_id, false)?;
         let deletion =
             db::calendar_event_deletion::delete_calendar_events(&transaction, &calendar_id)?;
@@ -474,13 +515,18 @@ pub async fn get_events(
     let events =
         db::calendar::list_events(&conn, &account_id, calendar_id.as_deref(), &start, &end)?;
     log::debug!("get_events: found {} events", events.len());
-    Ok(events)
+    Ok(events.into_iter().map(renderer_event).collect())
+}
+
+fn renderer_event(mut event: CalendarEvent) -> CalendarEvent {
+    event.ical_data = None;
+    event
 }
 
 /// Refresh one selected event independently of the current displayed date range.
 #[tauri::command]
 pub fn get_calendar_event(state: State<'_, AppState>, event_id: String) -> Result<CalendarEvent> {
-    db::calendar::get_event(&state.db.reader(), &event_id)
+    db::calendar::get_event(&state.db.reader(), &event_id).map(renderer_event)
 }
 
 #[tauri::command]
@@ -625,6 +671,8 @@ fn build_recurrence_mutation_plan(
     scope: RecurrenceMutationScope,
     protocol: &str,
 ) -> Result<RecurrenceMutationPlan> {
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
+    db::calendar_actions::ensure_unclaimed(conn, &event.id)?;
     if conn.is_autocommit() {
         return Err(crate::error::Error::Other(
             "Recurrence mutation planning requires a database transaction".into(),
@@ -1261,7 +1309,13 @@ pub async fn list_invites(state: State<'_, AppState>, account_id: String) -> Res
         account_id,
         invites.len()
     );
-    Ok(invites)
+    Ok(invites
+        .into_iter()
+        .map(|mut invite| {
+            invite.event = renderer_event(invite.event);
+            invite
+        })
+        .collect())
 }
 
 /// Mark a stored invitation as handled locally without sending an RSVP.
@@ -1278,10 +1332,20 @@ pub async fn mark_invite_managed(
 }
 
 #[tauri::command]
-pub async fn create_event(state: State<'_, AppState>, event: NewEventInput) -> Result<String> {
-    create_event_inner(&state, event, None).await
+pub async fn create_event(
+    state: State<'_, AppState>,
+    event: NewEventInput,
+    operation_id: String,
+) -> Result<String> {
+    super::calendar_actions::create_completed(&state, event, &operation_id)
+        .await
+        .map(|result| result.event_id)
+        .map_err(|error| {
+            crate::error::Error::Other(format!("Calendar creation {operation_id}: {error}"))
+        })
 }
 
+#[cfg(test)]
 async fn create_event_inner(
     state: &AppState,
     event: NewEventInput,
@@ -1326,62 +1390,6 @@ impl CreatedEventReceipt {
     }
 }
 
-/// Attach only this operation's provider identity and advance its receipt in
-/// one transaction. Never bless intervening writes by taking a fresh snapshot.
-async fn attach_created_event_identity(
-    state: &AppState,
-    created: &mut CreatedEventReceipt,
-    pushed: crate::backend::calendar::PushedEvent,
-) -> Result<()> {
-    let mut conn = state.db.writer().await;
-    let transaction = conn.transaction()?;
-    created.ensure_current(&transaction)?;
-    let mut event = created.event.clone();
-    event.remote_id = Some(pushed.remote_id);
-    event.etag = pushed.etag;
-    if let Some(uid) = pushed.canonical_uid {
-        event.uid = Some(uid);
-    }
-    transaction.execute(
-        "UPDATE calendar_events SET remote_id = ?1, uid = ?2, etag = ?3 WHERE id = ?4",
-        rusqlite::params![event.remote_id, event.uid, event.etag, event.id],
-    )?;
-    let revision = db::calendar_revision::get(&transaction, &event.id)?;
-    transaction.commit()?;
-    created.event = event;
-    created.revision = revision;
-    Ok(())
-}
-
-/// Preserve enough transport identity to reconcile or retry when persisting a
-/// provider-canonical UID fails after remote creation.
-async fn attach_created_event_transport_identity(
-    state: &AppState,
-    created: &mut CreatedEventReceipt,
-    remote_id: String,
-    etag: Option<String>,
-) -> Result<()> {
-    let mut conn = state.db.writer().await;
-    let transaction = conn.transaction()?;
-    created.ensure_current(&transaction)?;
-    let updated = transaction.execute(
-        "UPDATE calendar_events SET remote_id = ?1, etag = ?2
-         WHERE id = ?3 AND (remote_id IS NULL OR remote_id = '')",
-        rusqlite::params![remote_id, etag, created.event.id],
-    )?;
-    if updated != 1 {
-        return Err(crate::error::Error::Other(
-            "The created event is unavailable for transport identity recovery".into(),
-        ));
-    }
-    let event = db::calendar::get_event(&transaction, &created.event.id)?;
-    let revision = db::calendar_revision::get(&transaction, &created.event.id)?;
-    transaction.commit()?;
-    created.event = event;
-    created.revision = revision;
-    Ok(())
-}
-
 async fn create_event_with_receipt(
     state: &AppState,
     event: NewEventInput,
@@ -1391,7 +1399,7 @@ async fn create_event_with_receipt(
     create_event_with_metadata(state, event, move_source, None, account_already_locked).await
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 struct ImportedEventMetadata {
     uid: String,
     recurrence_kind: RecurrenceKind,
@@ -1412,6 +1420,9 @@ async fn create_event_with_metadata(
     imported: Option<ImportedEventMetadata>,
     account_already_locked: bool,
 ) -> Result<CreatedEventReceipt> {
+    let input_request = serde_json::to_value(&event).map_err(|error| {
+        crate::error::Error::Other(format!("Cannot journal creation input: {error}"))
+    })?;
     log::info!(
         "create_event: account={} calendar={} title='{}' attendees={}",
         event.account_id,
@@ -1505,8 +1516,151 @@ async fn create_event_with_metadata(
         None => None,
     };
 
+    let calendar = db::calendar::get_calendar(&state.db.reader(), &cal_event.calendar_id)?;
+    if let Some(remote_calendar) = calendar.remote_id.as_deref().filter(|id| !id.is_empty()) {
+        let account = db::accounts::get_account_full(&state.db.reader(), &cal_event.account_id)?;
+        cal_event.organizer_email = imported
+            .as_ref()
+            .and_then(|metadata| metadata.organizer_email.clone())
+            .or_else(|| Some(account.email.clone()));
+        let backend = crate::backend::calendar::for_account(&account).ok_or_else(|| {
+            crate::error::Error::Other("Remote creation has no calendar provider".into())
+        })?;
+        let mut provider_event = cal_event.clone();
+        if imported
+            .as_ref()
+            .is_some_and(|metadata| metadata.personal_copy)
+        {
+            provider_event.organizer_email = None;
+            provider_event.attendees_json = None;
+        }
+        backend.validate_event_creation(&provider_event, remote_calendar)?;
+        {
+            let conn = state.db.reader();
+            let tx = conn.unchecked_transaction()?;
+            check_target_calendar(&tx, &calendar.id, &account.id)?;
+            if let Some(source) = move_source {
+                checked_mutation_target(&tx, &source.event.id, Some(source))?;
+            }
+            if let Some(binding) = &meet_binding {
+                validate_pending_meet_binding(&tx, binding)?;
+            }
+            tx.commit()?;
+        }
+        let request = db::calendar_writes::begin(
+            &*state.db.writer().await,
+            &account.id,
+            &id,
+            "create",
+            &serde_json::json!({"input": input_request, "event": provider_event, "imported": imported}),
+        )?;
+        let pushed = backend
+            .push_created_event(
+                &calendar_backend_ctx(state),
+                &account,
+                &provider_event,
+                remote_calendar,
+            )
+            .await;
+        let pushed = match pushed {
+            Ok(Some(pushed)) => pushed,
+            other => {
+                let error = match other {
+                    Err(error) => error,
+                    _ => crate::error::Error::UnsupportedCapability {
+                        protocol: backend.protocol(),
+                        capability: "confirmed remote creation",
+                    },
+                };
+                db::calendar_writes::finish(
+                    &*state.db.writer().await,
+                    &request,
+                    &Err(crate::error::Error::Other(error.to_string())),
+                )?;
+                return Err(error);
+            }
+        };
+        db::calendar_writes::created(
+            &*state.db.writer().await,
+            &request,
+            &pushed.remote_id,
+            pushed.canonical_uid.as_deref(),
+            pushed.etag.as_deref(),
+        )?;
+        provider_event.remote_id = Some(pushed.remote_id);
+        provider_event.etag = pushed.etag;
+        if let Some(uid) = pushed.canonical_uid {
+            provider_event.uid = Some(uid);
+        }
+        let mut canonical = backend
+            .fetch_event_set(
+                &calendar_backend_ctx(state),
+                &account,
+                &provider_event,
+                remote_calendar,
+            )
+            .await?;
+        canonical.validate()?;
+        let native = canonical.native.as_ref().ok_or_else(|| {
+            crate::error::Error::Sync("Creation confirmation has no provider identity".into())
+        })?;
+        if native.protocol != backend.protocol()
+            || native.calendar_id != remote_calendar
+            || canonical.event.remote_id != provider_event.remote_id
+        {
+            return Err(crate::error::Error::Sync(
+                "Creation confirmation changed provider addressing".into(),
+            ));
+        }
+        canonical.event.id = id.clone();
+        canonical.event.account_id = account.id.clone();
+        canonical.event.calendar_id = calendar.id.clone();
+        let created = {
+            let mut conn = state.db.writer().await;
+            let tx = conn.transaction()?;
+            check_target_calendar(&tx, &calendar.id, &account.id)?;
+            let current_calendar = db::calendar::get_calendar(&tx, &calendar.id)?;
+            if current_calendar.remote_id != calendar.remote_id
+                || current_calendar.is_subscribed != calendar.is_subscribed
+            {
+                return Err(crate::error::Error::Other(
+                    "Creation destination changed before publication".into(),
+                ));
+            }
+            if let Some(source) = move_source {
+                checked_mutation_target(&tx, &source.event.id, Some(source))?;
+            }
+            db::calendar::insert_event(&tx, &canonical.event)?;
+            db::calendar_actions::persist_embedded(&tx, &canonical.event, &canonical)?;
+            db::calendar_sync::record_confirmed_set(&tx, &canonical)?;
+            if let Some(source) = imported
+                .as_ref()
+                .and_then(|metadata| metadata.invitation_source.as_ref())
+            {
+                db::calendar_invitation_source::record(&tx, &id, source)?;
+            }
+            if let Some(binding) = &meet_binding {
+                claim_meet_binding(&tx, &id, binding)?;
+            }
+            let receipt = CreatedEventReceipt {
+                event: db::calendar::get_event(&tx, &id)?,
+                revision: db::calendar_revision::get(&tx, &id)?,
+                calendar: calendar.clone(),
+            };
+            db::calendar_writes::published(&tx, &request)?;
+            tx.commit()?;
+            receipt
+        };
+        drop(_lifecycle_guard);
+        drop(account_guard);
+        if let Some(binding) = &meet_binding {
+            sync_meet_topic(state, binding, &created.event.title).await;
+        }
+        return Ok(created);
+    }
+
     // Insert the event and transfer meeting ownership in one transaction.
-    let (account, mut created) = {
+    let created = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
         if let Some(source) = move_source {
@@ -1518,9 +1672,6 @@ async fn create_event_with_metadata(
             .and_then(|metadata| metadata.organizer_email.clone())
             .or_else(|| Some(account.email.clone()));
 
-        // The event's calendar's remote handle — the JMAP backend
-        // creates the event on that specific calendar; Google/Graph
-        // write to their default calendar and ignore it.
         check_target_calendar(&transaction, &cal_event.calendar_id, &cal_event.account_id)?;
         let calendar = db::calendar::get_calendar(&transaction, &cal_event.calendar_id)?;
         let remote_cal_id = calendar.remote_id.as_deref().unwrap_or_default();
@@ -1556,120 +1707,9 @@ async fn create_event_with_metadata(
             calendar,
         };
         transaction.commit()?;
-        (account, created)
+        created
     };
     drop(_lifecycle_guard);
-
-    if let Some(backend) = crate::backend::calendar::for_account(&account) {
-        let remote_cal_id = created.calendar.remote_id.clone().unwrap_or_default();
-        if remote_cal_id.is_empty() {
-            log::warn!(
-                "create_event: no remote calendar ID for local calendar '{}'",
-                cal_event.calendar_id
-            );
-        }
-        // Best-effort: a failed push does not roll back the local insert.
-        // Moves still require their unchanged local copy before source deletion.
-        let ctx = calendar_backend_ctx(state);
-        let mut provider_event = cal_event.clone();
-        if imported
-            .as_ref()
-            .is_some_and(|metadata| metadata.personal_copy)
-        {
-            provider_event.organizer_email = None;
-            provider_event.attendees_json = None;
-        }
-        match backend
-            .push_created_event(&ctx, &account, &provider_event, &remote_cal_id)
-            .await
-        {
-            Ok(Some(pushed)) => {
-                let pushed_remote_id = pushed.remote_id.clone();
-                let pushed_etag = pushed.etag.clone();
-                log::info!(
-                    "create_event: pushed via {}, remote_id={}",
-                    backend.protocol(),
-                    pushed.remote_id
-                );
-                if let Err(error) = attach_created_event_identity(state, &mut created, pushed).await
-                {
-                    log::error!(
-                        "create_event: remote creation succeeded but identity attachment failed for {id}: {error}"
-                    );
-                    let recovery = attach_created_event_transport_identity(
-                        state,
-                        &mut created,
-                        pushed_remote_id.clone(),
-                        pushed_etag,
-                    )
-                    .await;
-                    if let Err(recovery_error) = recovery {
-                        let cleanup = backend
-                            .push_deleted_event(&ctx, &account, &pushed_remote_id, &remote_cal_id)
-                            .await;
-                        if let Err(cleanup_error) = cleanup {
-                            return Err(crate::error::Error::Other(format!(
-                                "Remote event creation succeeded, but identity persistence, transport recovery, and remote rollback all failed: identity: {error}; recovery: {recovery_error}; rollback: {cleanup_error}"
-                            )));
-                        }
-                        let mut conn = state.db.writer().await;
-                        let local_cleanup = (|| -> Result<()> {
-                            let transaction = conn.transaction()?;
-                            created.ensure_current(&transaction)?;
-                            db::calendar_event_deletion::delete_event(&transaction, &id)?;
-                            transaction.commit()?;
-                            Ok(())
-                        })();
-                        return Err(crate::error::Error::Other(match local_cleanup {
-                            Ok(()) => format!(
-                                "Remote event creation was rolled back because its identity could not be persisted; the unchanged local copy was also removed: {error}; recovery: {recovery_error}"
-                            ),
-                            Err(local_error) => format!(
-                                "Remote event creation was rolled back because its identity could not be persisted; the changed local copy was retained without a remote identity: {error}; recovery: {recovery_error}; local cleanup: {local_error}"
-                            ),
-                        }));
-                    }
-                    log::warn!(
-                        "create_event: retained transport identity for {id}; canonical UID will reconcile on sync"
-                    );
-                }
-            }
-            Ok(None) => {
-                if imported
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.require_remote_creation)
-                {
-                    let conn = state.db.writer().await;
-                    conn.execute(
-                        "DELETE FROM calendar_events WHERE id = ?1",
-                        rusqlite::params![id],
-                    )?;
-                    return Err(crate::error::Error::UnsupportedCapability {
-                        protocol: backend.protocol(),
-                        capability: "confirmed remote invitation copy creation",
-                    });
-                }
-            }
-            Err(error) => {
-                log::error!(
-                    "create_event: {} push failed: {}",
-                    backend.protocol(),
-                    error
-                );
-                if imported
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.require_remote_creation)
-                {
-                    let conn = state.db.writer().await;
-                    conn.execute(
-                        "DELETE FROM calendar_events WHERE id = ?1",
-                        rusqlite::params![id],
-                    )?;
-                    return Err(error);
-                }
-            }
-        }
-    }
 
     drop(account_guard);
 
@@ -1816,7 +1856,7 @@ fn build_participant_schedule_request(
 /// topic. Best-effort: a provider failure logs but doesn't abort the
 /// event save. Lives here so both `create_event` and `update_event`
 /// share one rename code path.
-async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &str) {
+pub(crate) async fn sync_meet_topic(state: &AppState, binding: &MeetBindingInput, title: &str) {
     let meet_account = {
         let conn = state.db.reader();
         db::accounts::get_account_full(&conn, &binding.account_id).ok()
@@ -1882,7 +1922,9 @@ fn checked_mutation_target(
     expected: Option<&MoveSourceSnapshot>,
 ) -> Result<CalendarEvent> {
     let event = db::calendar::get_event(conn, event_id)?;
+    db::calendar::get_calendar(conn, &event.calendar_id)?;
     event.ensure_mutable()?;
+    db::calendar_actions::ensure_unclaimed(conn, event_id)?;
     if let Some(expected) = expected {
         if conn.is_autocommit() {
             return Err(crate::error::Error::Other(
@@ -1942,23 +1984,37 @@ async fn update_event_inner(
     };
     let account_lock = state.account_lifecycle.acquire(&initial_account_id);
     let account_guard = account_lock.lock().await;
-    let (existing, prev_title, cleanup_lifecycle_id, reschedule_with, account) = {
+    let (mut existing, original, original_revision, prev_title, account) = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
 
         // Load existing event, apply updates
         let mut existing = checked_mutation_target(&transaction, &event_id, None)?;
+        let original = existing.clone();
+        let original_revision = db::calendar_revision::get(&transaction, &event_id)?;
         if existing.account_id != initial_account_id {
             return Err(crate::error::Error::Other(
                 "Event ownership changed while waiting to update it".into(),
             ));
         }
-        let prev_start = existing.start_time.clone();
-        let prev_end = existing.end_time.clone();
         let prev_title = existing.title.clone();
 
         if let Some(calendar_id) = event.calendar_id {
             check_target_calendar(&transaction, &calendar_id, &existing.account_id)?;
+            if calendar_id != existing.calendar_id
+                && (db::calendar::get_calendar(&transaction, &calendar_id)?
+                    .remote_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                    || db::calendar::get_calendar(&transaction, &existing.calendar_id)?
+                        .remote_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty()))
+            {
+                return Err(crate::error::Error::Other(
+                    "Use the calendar move command to change an event's calendar".into(),
+                ));
+            }
             existing.calendar_id = calendar_id;
         }
         if let Some(title) = event.title {
@@ -1993,57 +2049,94 @@ async fn update_event_inner(
             };
         }
 
-        db::calendar::update_event(&transaction, &existing)?;
-        log::info!("update_event: updated event {}", event_id);
-
-        // Queue the old room and claim the new lifecycle in this transaction.
-        let cleanup_lifecycle_id = match meet_binding.as_ref() {
-            Some(binding) => replace_meet_binding(&transaction, &event_id, binding)?,
-            None => None,
-        };
-
-        // If start/end changed and the event has a meet binding, ask the
-        // provider to move the remote meeting to the new slot. Best-effort:
-        // a provider failure logs but doesn't block the local update, since
-        // the user can still open the room via the saved join URL.
-        let time_changed = prev_start != existing.start_time || prev_end != existing.end_time;
-        let reschedule_with = if time_changed && !existing.all_day {
-            match db::meet_meetings::get(&transaction, &event_id)? {
-                Some(b) => db::accounts::get_account_full(&transaction, &b.account_id)
-                    .ok()
-                    .map(|acc| (b, acc)),
-                None => None,
-            }
+        if let Some(binding) = meet_binding.as_ref() {
+            validate_pending_meet_binding(&transaction, binding)?;
+        }
+        crate::calendar::event_set::event_fields(&existing).validate()?;
+        let account = db::accounts::get_account_full(&transaction, &existing.account_id)?;
+        transaction.commit()?;
+        (existing, original, original_revision, prev_title, account)
+    };
+    let calendar = db::calendar::get_calendar(&state.db.reader(), &existing.calendar_id)?;
+    let mut journal_id = None;
+    let canonical =
+        if let Some(remote_calendar) = calendar.remote_id.as_deref().filter(|id| !id.is_empty()) {
+            let remote = existing
+                .remote_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    crate::error::Error::Other("Event has no confirmed provider identity".into())
+                })?;
+            let backend = crate::backend::calendar::for_account(&account).ok_or_else(|| {
+                crate::error::Error::Other("Event account has no calendar provider".into())
+            })?;
+            let request_id = db::calendar_writes::begin(
+                &*state.db.writer().await,
+                &account.id,
+                &event_id,
+                "update",
+                &existing,
+            )?;
+            let write = backend
+                .push_updated_event(&calendar_backend_ctx(state), &account, remote, &existing)
+                .await;
+            db::calendar_writes::finish(&*state.db.writer().await, &request_id, &write)?;
+            write?;
+            journal_id = Some(request_id);
+            let set = backend
+                .fetch_event_set(
+                    &calendar_backend_ctx(state),
+                    &account,
+                    &existing,
+                    remote_calendar,
+                )
+                .await?;
+            existing = set.event.clone();
+            existing.id = event_id.clone();
+            Some(set)
         } else {
             None
         };
-
-        let account = db::accounts::get_account_full(&transaction, &existing.account_id)?;
-        transaction.commit()?;
-        (
-            existing,
-            prev_title,
-            cleanup_lifecycle_id,
-            reschedule_with,
-            account,
-        )
-    };
-    drop(_lifecycle_guard);
-
-    // Keep the account stable through the remote calendar write. Meeting
-    // cleanup acquires lifecycle then account, so release this guard first.
-    if let Some(remote_id) = existing.remote_id.as_ref().filter(|r| !r.is_empty()) {
-        if let Some(backend) = crate::backend::calendar::for_account(&account) {
-            match backend
-                .push_updated_event(&calendar_backend_ctx(state), &account, remote_id, &existing)
-                .await
-            {
-                Ok(()) => log::info!("update_event: pushed via {}", backend.protocol()),
-                Err(e) => log::error!("update_event: {} push failed: {}", backend.protocol(), e),
-            }
+    let (cleanup_lifecycle_id, reschedule_with) = {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction()?;
+        if db::calendar::get_event(&tx, &event_id)? != original
+            || db::calendar_revision::get(&tx, &event_id)? != original_revision
+        {
+            return Err(crate::error::Error::Other(
+                "Event changed during provider write; refresh the calendar before retrying".into(),
+            ));
         }
-    }
+        db::calendar::update_event(&tx, &existing)?;
+        if let Some(mut set) = canonical {
+            set.event = existing.clone();
+            db::calendar_sync::record_confirmed_set(&tx, &set)?;
+        }
+        let cleanup = meet_binding
+            .as_ref()
+            .map(|binding| replace_meet_binding(&tx, &event_id, binding))
+            .transpose()?
+            .flatten();
+        let time_changed =
+            original.start_time != existing.start_time || original.end_time != existing.end_time;
+        let reschedule = if time_changed && !existing.all_day {
+            db::meet_meetings::get(&tx, &event_id)?.and_then(|binding| {
+                db::accounts::get_account_full(&tx, &binding.account_id)
+                    .ok()
+                    .map(|account| (binding, account))
+            })
+        } else {
+            None
+        };
+        if let Some(id) = journal_id {
+            db::calendar_writes::published(&tx, &id)?;
+        }
+        tx.commit()?;
+        (cleanup, reschedule)
+    };
     drop(account_guard);
+    drop(_lifecycle_guard);
 
     if let Some(lifecycle_id) = cleanup_lifecycle_id {
         if let Err(error) = crate::commands::meet::discard_pending(state, &lifecycle_id).await {
@@ -2132,12 +2225,46 @@ async fn delete_event_with_destination(
     let account_lock = state.account_lifecycle.acquire(&initial_account_id);
     let account_guard = account_lock.lock().await;
 
-    // Check recurrence and capture remote targets in the same transaction as
-    // local deletion and meeting-cleanup ownership. Sync cannot race the check.
-    let (event, account, cal_remote_id, cleanup_lifecycle_id) = {
+    let original = {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction()?;
+        let event = checked_mutation_target(&tx, &event_id, expected)?;
+        if let Some(destination) = destination {
+            destination.ensure_current(&tx)?;
+        }
+        let revision = db::calendar_revision::get(&tx, &event_id)?;
+        tx.commit()?;
+        (event, revision)
+    };
+    let calendar = db::calendar::get_calendar(&state.db.reader(), &original.0.calendar_id)?;
+    let mut journal_id = None;
+    if calendar
+        .remote_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty())
+    {
+        let request = db::calendar_writes::begin(
+            &*state.db.writer().await,
+            &original.0.account_id,
+            &event_id,
+            "delete",
+            &original.0,
+        )?;
+        let result = delete_remote_event_required(state, &original.0).await;
+        db::calendar_writes::finish(&*state.db.writer().await, &request, &result)?;
+        result?;
+        journal_id = Some(request);
+    }
+
+    let cleanup_lifecycle_id = {
         let mut conn = state.db.writer().await;
         let transaction = conn.transaction()?;
         let evt = checked_mutation_target(&transaction, &event_id, expected)?;
+        if evt != original.0 || db::calendar_revision::get(&transaction, &event_id)? != original.1 {
+            return Err(crate::error::Error::Other(
+                "Event changed during provider deletion; refresh before retrying".into(),
+            ));
+        }
         if evt.account_id != initial_account_id {
             return Err(crate::error::Error::Other(
                 "Event ownership changed while waiting to delete it".into(),
@@ -2146,44 +2273,16 @@ async fn delete_event_with_destination(
         if let Some(destination) = destination {
             destination.ensure_current(&transaction)?;
         }
-        let acc = db::accounts::get_account_full(&transaction, &evt.account_id)?;
-        let cal = db::calendar::get_calendar(&transaction, &evt.calendar_id).ok();
-        let cal_rid = cal
-            .and_then(|c| c.remote_id)
-            .unwrap_or_else(|| "primary".to_string());
+        db::calendar_sync::forget_confirmed_set(&transaction, &event_id)?;
         let mut cleanup = db::calendar_event_deletion::delete_event(&transaction, &event_id)?
             .cleanup_lifecycle_ids;
+        if let Some(id) = journal_id {
+            db::calendar_writes::published(&transaction, &id)?;
+        }
         transaction.commit()?;
-        (evt, acc, cal_rid, cleanup.pop())
+        cleanup.pop()
     };
 
-    // Delete from the calendar server if the event has a remote_id.
-    // Best-effort: the committed local deletion stands if this fails.
-    if let Some(ref remote_id) = event.remote_id {
-        if !remote_id.is_empty() {
-            if let Some(backend) = crate::backend::calendar::for_account(&account) {
-                match backend
-                    .push_deleted_event(
-                        &calendar_backend_ctx(state),
-                        &account,
-                        remote_id,
-                        &cal_remote_id,
-                    )
-                    .await
-                {
-                    Ok(()) => log::info!(
-                        "delete_event: deleted from server via {}",
-                        backend.protocol()
-                    ),
-                    Err(e) => log::error!(
-                        "delete_event: {} server delete failed: {}",
-                        backend.protocol(),
-                        e
-                    ),
-                }
-            }
-        }
-    }
     drop(account_guard);
 
     if let Some(lifecycle_id) = cleanup_lifecycle_id {
@@ -2383,6 +2482,27 @@ async fn move_event_to_calendar_inner(
         return Ok(snapshot.event.id.clone());
     }
     if snapshot.event.account_id == target_account_id {
+        let remote_move = {
+            let conn = state.db.reader();
+            [
+                snapshot.event.calendar_id.as_str(),
+                target_calendar_id.as_str(),
+            ]
+            .into_iter()
+            .map(|id| db::calendar::get_calendar(&conn, id))
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|calendar| {
+                calendar
+                    .remote_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+            })
+        };
+        if remote_move {
+            return super::calendar_actions::move_standalone(state, &event_id, &target_calendar_id)
+                .await;
+        }
         update_event_inner(
             state,
             event_id.clone(),
@@ -2603,10 +2723,12 @@ pub async fn sync_calendars(
         // unintended pattern matching if the id contains % or _.
         let escaped_id = account_id.replace('%', "\\%").replace('_', "\\_");
         conn.execute(
-            "DELETE FROM app_metadata WHERE key LIKE ?1 ESCAPE '\\'",
-            rusqlite::params![format!("google_sync_token_{escaped_id}_%")],
-        )
-        .ok();
+            "DELETE FROM app_metadata WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'",
+            rusqlite::params![
+                format!("google_sync_token_{escaped_id}_%"),
+                format!("google_resource_sync_token_{escaped_id}_%")
+            ],
+        )?;
         log::info!(
             "sync_calendars: cleared sync tokens for full sync (account={})",
             account_id
@@ -3617,6 +3739,14 @@ async fn apply_invite_response(
     let response = InviteResponse::try_from(response.as_str())?;
     let response_text = response.as_str();
     let backend = crate::backend::calendar::for_account(&account);
+    if backend.is_some_and(|provider| provider.protocol() == "graph") {
+        ensure_unique_local_graph_invite(
+            &state.db.reader(),
+            &account_id,
+            &invite_uid,
+            &invite.dtstart,
+        )?;
+    }
     let track_pending_rsvp = backend
         .map(|provider| provider.remote_rsvp_policy() != RemoteRsvpPolicy::RequiredBeforeLocal)
         .unwrap_or(true);
@@ -3953,6 +4083,32 @@ async fn apply_invite_response(
     use tauri::Emitter as _;
     app.emit("calendar-changed", account_id.as_str()).ok();
 
+    Ok(())
+}
+
+fn ensure_unique_local_graph_invite(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    uid: &str,
+    start: &str,
+) -> Result<()> {
+    let candidates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM calendar_events event
+         JOIN calendars calendar ON calendar.id = event.calendar_id
+         WHERE event.account_id = ?1 AND event.uid = ?2
+           AND calendar.is_archived = 0
+           AND (event.start_time = ?3 OR
+                (julianday(event.start_time) IS NOT NULL
+                 AND julianday(event.start_time) = julianday(?3)))",
+        rusqlite::params![account_id, uid, start],
+        |row| row.get(0),
+    )?;
+    if candidates > 1 {
+        return Err(crate::error::Error::Sync(
+            "Multiple local Graph invitations share this UID and start; refusing an ambiguous RSVP"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -4937,6 +5093,72 @@ mod tests {
         RecurrenceIdentity, RecurrenceIdentitySeed, RecurrenceValueType,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn archived_calendar_event_cannot_be_mutated_by_direct_id() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars (id, account_id, name, remote_id, is_archived)
+             VALUES ('old', 'account', 'Old', 'old-identity', 1);
+             INSERT INTO calendar_events
+                (id, account_id, calendar_id, title, start_time, end_time, remote_id)
+             VALUES ('retained', 'account', 'old', 'Retained',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z', 'old-event');",
+        )
+        .unwrap();
+        assert!(checked_mutation_target(&conn, "retained", None).is_err());
+        let transaction = conn.transaction().unwrap();
+        let retained = db::calendar::get_event(&transaction, "retained").unwrap();
+        assert!(build_recurrence_mutation_plan(
+            &transaction,
+            retained,
+            "old-occurrence",
+            RecurrenceMutationScope::ThisOccurrence,
+            "graph",
+        )
+        .is_err());
+        assert!(db::calendar::get_event(&transaction, "retained").is_ok());
+        assert!(db::calendar::get_calendar(&transaction, "old").is_err());
+    }
+
+    #[test]
+    fn graph_response_preflight_rejects_two_visible_local_copies() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(id, display_name, email, username)
+             VALUES ('account', 'Calendar', 'test@example.test', 'test');
+             INSERT INTO calendars(id, account_id, name)
+             VALUES ('first', 'account', 'First'),
+                    ('second', 'account', 'Second');
+             INSERT INTO calendar_events
+                 (id, account_id, calendar_id, uid, title, start_time, end_time)
+             VALUES ('one', 'account', 'first', 'same-uid', 'One',
+                     '2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'),
+                    ('two', 'account', 'second', 'same-uid', 'Two',
+                     '2026-09-14T11:00:00+02:00', '2026-09-14T12:00:00+02:00');",
+        )
+        .unwrap();
+        assert!(ensure_unique_local_graph_invite(
+            &conn,
+            "account",
+            "same-uid",
+            "2026-09-14T09:00:00Z",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous RSVP"));
+        conn.execute(
+            "UPDATE calendars SET is_archived = 1 WHERE id = 'second'",
+            [],
+        )
+        .unwrap();
+        ensure_unique_local_graph_invite(&conn, "account", "same-uid", "2026-09-14T09:00:00Z")
+            .unwrap();
+    }
 
     #[derive(Clone, Copy)]
     enum OccurrenceBackendMode {
@@ -6423,18 +6645,30 @@ mod tests {
             is_subscribed: true,
         };
 
-        for protocol in ["google", "graph"] {
+        for protocol in ["google", "graph", "jmap", "caldav"] {
             let backend = crate::backend::calendar::for_protocol(protocol);
-            assert!(import_target_error(&calendar, backend).is_some());
-            calendar.is_default = true;
-            assert!(import_target_error(&calendar, backend).is_none());
-            calendar.is_default = false;
+            for is_default in [false, true] {
+                calendar.is_default = is_default;
+                calendar.remote_id = Some("remote-calendar".into());
+                assert!(
+                    import_target_error(&calendar, backend).is_none(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = false;
+                assert!(
+                    import_target_error(&calendar, backend).is_some(),
+                    "{protocol}"
+                );
+                calendar.is_subscribed = true;
+                for remote_id in [None, Some(String::new())] {
+                    calendar.remote_id = remote_id;
+                    assert!(
+                        import_target_error(&calendar, backend).is_some(),
+                        "{protocol}"
+                    );
+                }
+            }
         }
-
-        let caldav = crate::backend::calendar::for_protocol("caldav");
-        assert!(import_target_error(&calendar, caldav).is_none());
-        calendar.remote_id = None;
-        assert!(import_target_error(&calendar, caldav).is_some());
     }
 
     #[test]

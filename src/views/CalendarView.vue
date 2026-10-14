@@ -7,9 +7,19 @@ import { usePlatformStore } from "@/stores/platform";
 import type { CalendarViewMode } from "@/stores/calendar";
 import type { CalendarEvent } from "@/lib/types";
 import { showToast, dismissToast } from "@/lib/toast";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarMutationSupport, calendarScopedEditSupport,
+} from "@/lib/calendar-mutation-support";
+import {
+  chooseRescheduleScope, confirmCalendarAction,
+} from "@/lib/calendar-action-confirmation";
 import * as api from "@/lib/tauri";
+import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
+import { getDateInTimezone } from "@/lib/datetime";
+import { useUiStore } from "@/stores/ui";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
+import ArchivedGraphNotice from "@/components/calendar/ArchivedGraphNotice.vue";
+import CalendarDisplayNotice from "@/components/calendar/CalendarDisplayNotice.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
 import MonthView from "@/components/calendar/MonthView.vue";
 import EventDetail from "@/components/calendar/EventDetail.vue";
@@ -23,7 +33,12 @@ defineOptions({ name: "CalendarView" });
 const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 const platformStore = usePlatformStore();
+const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
+const displayIssues = computed(() => [
+  ...Object.values(calendarStore.syncErrors).map((error) => `Calendar sync could not display every remote resource: ${error}`),
+  ...calendarStore.displayErrors,
+]);
 const showEventForm = ref(false);
 const newEventStart = ref("");
 let selectionVersion = 0;
@@ -44,15 +59,15 @@ const DAY_HOURS = Array.from({ length: 24 }, (_, h) => h); // 0..23
 const WEEK_HOURS = Array.from({ length: 24 }, (_, h) => h);
 
 const mobileHeader = computed(() => {
-  const d = new Date(calendarStore.currentDate);
-  if (calendarStore.viewMode === "day") {
+  const d = parseCalendarDay(calendarStore.displayDate);
+  if (calendarStore.displayViewMode === "day") {
     return d.toLocaleDateString(undefined, {
       weekday: "long",
       month: "long",
       day: "numeric",
     });
   }
-  if (calendarStore.viewMode === "week") {
+  if (calendarStore.displayViewMode === "week") {
     const start = weekStart(d);
     const end = new Date(start);
     end.setDate(end.getDate() + 6);
@@ -75,7 +90,7 @@ function weekStart(d: Date): Date {
 }
 
 function weekDates(): Date[] {
-  const start = weekStart(new Date(calendarStore.currentDate));
+  const start = weekStart(parseCalendarDay(calendarStore.displayDate));
   return Array.from({ length: 7 }, (_, i) => {
     const d = new Date(start);
     d.setDate(start.getDate() + i);
@@ -151,29 +166,18 @@ interface MonthCell {
 }
 
 const monthCells = computed<MonthCell[]>(() => {
-  const anchor = new Date(calendarStore.currentDate);
-  anchor.setDate(1);
-  anchor.setHours(0, 0, 0, 0);
+  const anchor = parseCalendarDay(calendarStore.displayDate);
   const monthIdx = anchor.getMonth();
-
-  // Grid always starts on Sunday and has 6 rows × 7 cols = 42 cells.
-  const gridStart = new Date(anchor);
-  gridStart.setDate(1 - anchor.getDay());
-  const cells: MonthCell[] = [];
-  for (let i = 0; i < 42; i++) {
-    const d = new Date(gridStart);
-    d.setDate(gridStart.getDate() + i);
+  return monthGridDays(calendarStore.displayDate, 0, true).map((d) => {
     const dayEvents = calendarStore.visibleEvents.filter((ev) => {
-      const evStart = new Date(ev.start_time);
-      return isSameDate(evStart, d);
+      return getDateInTimezone(ev.start_time, uiStore.displayTimezone) === calendarDay(d);
     });
-    cells.push({
+    return {
       date: d,
       inMonth: d.getMonth() === monthIdx,
       events: dayEvents,
-    });
-  }
-  return cells;
+    };
+  });
 });
 
 function todayEvents(): CalendarEvent[] {
@@ -212,7 +216,7 @@ function scrollMobileToNow(scrollEl: HTMLElement | null, timedEl?: HTMLElement |
 }
 
 async function recenterMobileGrid() {
-  const mode = calendarStore.viewMode;
+  const mode = calendarStore.displayViewMode;
   if (mode !== "day" && mode !== "week") return;
   await nextTick();
   if (mode === "day") {
@@ -222,7 +226,7 @@ async function recenterMobileGrid() {
   }
 }
 
-watch(() => calendarStore.viewMode, recenterMobileGrid, { immediate: true });
+watch(() => calendarStore.displayViewMode, recenterMobileGrid, { immediate: true });
 
 // CalendarView is wrapped in <KeepAlive>, so leaving and returning to the
 // calendar tab does not change viewMode and would otherwise leave the
@@ -234,8 +238,7 @@ function setMobileViewMode(mode: CalendarViewMode) {
 }
 
 function jumpToDay(date: Date) {
-  calendarStore.setViewMode("day");
-  calendarStore.goToDate(date.toISOString().split("T")[0]);
+  calendarStore.goToDate(calendarDay(date), "day");
 }
 
 function onMobileEventClick(event: CalendarEvent) {
@@ -243,8 +246,14 @@ function onMobileEventClick(event: CalendarEvent) {
 }
 
 function formatCurrentDate(): string {
-  const d = new Date(calendarStore.currentDate);
+  const d = parseCalendarDay(calendarStore.displayDate);
   return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function loadingLabel(): string {
+  if (!calendarStore.navigationPending) return "Refreshing calendar…";
+  const date = parseCalendarDay(calendarStore.currentDate);
+  return `Loading ${date.toLocaleDateString(undefined, { month: "long", year: "numeric" })}…`;
 }
 
 function onTimeSlotClick(dateTime: string) {
@@ -309,18 +318,55 @@ async function onEventReschedule(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
-  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const event = calendarStore.getDisplayedEvent(payload.eventId);
+  const scopedSupport = calendarScopedEditSupport(event);
+  if (!event || !scopedSupport.supported) return;
   const version = selectionVersion;
   const toastId = showToast("Moving event...", "info", 0);
   try {
-    await calendarStore.updateEvent(payload.eventId, {
-      start_time: payload.newStart,
-      end_time: payload.newEnd,
-    });
+    if (scopedSupport.scopes.includes("standalone")) {
+      await calendarStore.updateEvent(payload.eventId, {
+        start_time: payload.newStart,
+        end_time: payload.newEnd,
+      });
+    } else {
+      const scope = await chooseRescheduleScope(
+        scopedSupport.scopes.includes("this-occurrence"),
+      );
+      if (!scope) {
+        dismissToast(toastId);
+        return;
+      }
+      if (scope === "this-occurrence") {
+        await calendarStore.updateOccurrence(event, {
+          start_time: payload.newStart,
+          end_time: payload.newEnd,
+        });
+      } else {
+        if (await calendarStore.resumePendingCalendarAction(event)) {
+          dismissToast(toastId);
+          showToast("Previous recurring action completed", "success");
+          return;
+        }
+        const plan = await calendarStore.planEntireSeriesAction(event, {
+          start_time: payload.newStart,
+          end_time: payload.newEnd,
+        });
+        const confirmations = await confirmCalendarAction(plan);
+        if (!confirmations) {
+          await calendarStore.discardCalendarPlan(plan);
+          dismissToast(toastId);
+          return;
+        }
+        await calendarStore.executeCalendarPlan(plan, confirmations);
+      }
+    }
     dismissToast(toastId);
     showToast("Event rescheduled", "success");
 
-    await promptAttendeeNotification(payload.eventId, version);
+    if (scopedSupport.scopes.includes("standalone")) {
+      await promptAttendeeNotification(payload.eventId, version);
+    }
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);
@@ -335,23 +381,46 @@ async function onCalendarDrop(payload: {
   attendeesJson: string | null;
   organizerEmail: string | null;
 }) {
-  if (!calendarStore.getEventMutationSupport(payload.eventId).supported) return;
+  const event = calendarStore.getDisplayedEvent(payload.eventId);
+  const scopedSupport = calendarScopedEditSupport(event);
+  if (!event || !scopedSupport.supported) return;
   const version = selectionVersion;
 
   const toastId = showToast("Moving to calendar...", "info", 0);
   try {
-    const newId = await calendarStore.moveEventToCalendar(
-      payload.eventId,
-      payload.targetCalendarId,
-      payload.targetAccountId,
-    );
+    let newId: string;
+    if (scopedSupport.scopes.includes("standalone")) {
+      newId = await calendarStore.moveEventToCalendar(
+        payload.eventId,
+        payload.targetCalendarId,
+        payload.targetAccountId,
+      );
+    } else {
+      const resumedId = await calendarStore.resumePendingCalendarAction(event);
+      if (resumedId) {
+        dismissToast(toastId);
+        showToast("Previous recurring action completed", "success");
+        return;
+      }
+      const plan = await calendarStore.planEntireSeriesAction(
+        event, {}, payload.targetCalendarId,
+      );
+      const confirmations = await confirmCalendarAction(plan, {
+        confirmSeriesMove: true,
+      });
+      if (!confirmations) {
+        await calendarStore.discardCalendarPlan(plan);
+        dismissToast(toastId);
+        return;
+      }
+      newId = await calendarStore.executeCalendarPlan(plan, confirmations);
+    }
     dismissToast(toastId);
     showToast("Event moved to calendar", "success");
     // Resolve notification eligibility from the persisted destination.
-    await promptAttendeeNotification(
-      newId,
-      version,
-    );
+    if (scopedSupport.scopes.includes("standalone")) {
+      await promptAttendeeNotification(newId, version);
+    }
   } catch (e) {
     dismissToast(toastId);
     const msg = e instanceof Error ? e.message : String(e);
@@ -369,22 +438,30 @@ onMounted(() => {
       ? accountsStore.fetchAccounts()
       : Promise.resolve();
 
-  ready
-    .then(() => calendarStore.fetchCalendars())
-    .catch((e) => console.error("fetchCalendars error:", e));
-  ready
-    .then(() => calendarStore.fetchEvents())
-    .catch((e) => console.error("fetchEvents error:", e));
+  const localReady = ready.then(async () => {
+    const [calendars, events] = await Promise.allSettled([
+      calendarStore.fetchCalendars(),
+      calendarStore.fetchEvents(),
+    ]);
+    if (calendars.status === "rejected") {
+      console.error("fetchCalendars error:", calendars.reason);
+    }
+    if (events.status === "rejected") {
+      console.error("fetchEvents error:", events.reason);
+    }
+  });
 
-  // Initial sync + start independent interval (5 min).
+  // Render the SQLite cache before network sync can take provider lifecycle
+  // locks. Sync completion emits calendar-changed and refreshes this view.
+  // Then start the independent interval (5 min).
   // The interval is intentionally NOT cleared on unmount — it keeps
   // calendars fresh in the background for the lifetime of the app,
   // matching how mail sync runs continuously. The calendar store's
   // stopCalendarSync() is available if explicit teardown is needed.
-  ready
+  localReady
     .then(() => calendarStore.syncCalendars())
     .catch((e) => console.error("Calendar sync error:", e));
-  ready
+  localReady
     .then(() => calendarStore.startCalendarSync())
     .catch((e) => console.error("startCalendarSync error:", e));
 });
@@ -429,23 +506,54 @@ onMounted(() => {
         v-for="mode in (['day', 'week', 'month'] as CalendarViewMode[])"
         :key="mode"
         class="seg-btn"
-        :class="{ active: calendarStore.viewMode === mode }"
+        :class="{ active: calendarStore.displayViewMode === mode }"
         role="tab"
-        :aria-selected="calendarStore.viewMode === mode"
+        :aria-selected="calendarStore.displayViewMode === mode"
         @click="setMobileViewMode(mode)"
       >
         {{ mode.charAt(0).toUpperCase() + mode.slice(1) }}
       </button>
     </div>
 
+    <div v-if="calendarStore.loading" class="calendar-load-status" role="status">
+      {{ loadingLabel() }}
+    </div>
+    <div v-if="calendarStore.loadError" class="calendar-load-error" role="alert">
+      {{ calendarStore.loadError }}
+      <button @click="calendarStore.retryNavigation()">Retry</button>
+    </div>
+    <ArchivedGraphNotice
+      :calendars="calendarStore.unacknowledgedArchivedGraphCalendars"
+      :error="calendarStore.archivedGraphCalendarsError"
+      :acknowledgement-error="calendarStore.archivedGraphAcknowledgementError"
+      :acknowledging="calendarStore.acknowledgingArchivedGraphCalendars"
+      @retry="calendarStore.retryNavigation()"
+      @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
+    />
+    <CalendarDisplayNotice :errors="displayIssues" />
+    <div v-if="calendarStore.unverifiedSeriesIds.length" class="calendar-incomplete" role="alert">
+      {{ calendarStore.unverifiedSeriesIds.length }} recurring series need a provider refresh.
+      Cached dates may be outdated or missing. Sync calendars to verify them.
+    </div>
+    <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
+      {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
+      Some recurring dates may be incomplete until verified.
+      <button :disabled="calendarStore.repairingOccurrences || calendarStore.repairRetryAt !== null" @click="calendarStore.repairIncompleteOccurrences()">
+        {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
+      </button>
+      <span v-if="calendarStore.repairRetryAt !== null">
+        Graph is throttling verification. Try again after {{ new Date(calendarStore.repairRetryAt).toLocaleString() }}.
+      </span>
+    </div>
+
     <!-- DAY VIEW -->
-    <div v-if="calendarStore.viewMode === 'day'" ref="dayViewRef" class="day-view">
+    <div v-if="calendarStore.displayViewMode === 'day'" ref="dayViewRef" class="day-view" :inert="calendarStore.navigationPending">
       <div
-        v-if="allDayEventsForDay(new Date(calendarStore.currentDate)).length"
+        v-if="allDayEventsForDay(parseCalendarDay(calendarStore.displayDate)).length"
         class="all-day-strip"
       >
         <button
-          v-for="ev in allDayEventsForDay(new Date(calendarStore.currentDate))"
+          v-for="ev in allDayEventsForDay(parseCalendarDay(calendarStore.displayDate))"
           :key="ev.id"
           class="all-day-chip"
           :style="{ background: calendarColor(ev) }"
@@ -467,7 +575,7 @@ onMounted(() => {
               const rect = target.getBoundingClientRect();
               const offsetY = e.clientY - rect.top;
               const hour = Math.floor(offsetY / HOUR_ROW);
-              const base = new Date(calendarStore.currentDate);
+              const base = parseCalendarDay(calendarStore.displayDate);
               base.setHours(hour, 0, 0, 0);
               return base.toISOString();
             })(),
@@ -482,7 +590,7 @@ onMounted(() => {
           />
 
           <!-- "Now" indicator -->
-          <template v-if="isToday(new Date(calendarStore.currentDate))">
+          <template v-if="isToday(parseCalendarDay(calendarStore.displayDate))">
             <span
               class="now-dot"
               :style="{ top: nowTopOffset() - 5 + 'px' }"
@@ -497,7 +605,7 @@ onMounted(() => {
 
           <!-- events -->
           <button
-            v-for="pe in positionedEventsForDay(new Date(calendarStore.currentDate))"
+            v-for="pe in positionedEventsForDay(parseCalendarDay(calendarStore.displayDate))"
             :key="pe.event.id"
             class="day-event"
             :style="{
@@ -507,7 +615,7 @@ onMounted(() => {
             }"
             @click.stop="onMobileEventClick(pe.event)"
           >
-            <span class="day-event-title">{{ pe.event.title }}</span>
+            <span class="day-event-title">{{ pe.event.title || '(No title)' }}</span>
             <span class="day-event-time">
               {{ formatTime(pe.event.start_time) }} – {{ formatTime(pe.event.end_time) }}
             </span>
@@ -517,7 +625,7 @@ onMounted(() => {
     </div>
 
     <!-- WEEK VIEW -->
-    <div v-else-if="calendarStore.viewMode === 'week'" class="week-view">
+    <div v-else-if="calendarStore.displayViewMode === 'week'" class="week-view" :inert="calendarStore.navigationPending">
       <div class="week-strip">
         <button
           v-for="d in weekDates()"
@@ -555,21 +663,21 @@ onMounted(() => {
             }"
             @click="onMobileEventClick(pe.event)"
           >
-            <span class="week-event-title">{{ pe.event.title }}</span>
+            <span class="week-event-title">{{ pe.event.title || '(No title)' }}</span>
           </button>
         </div>
       </div>
     </div>
 
     <!-- MONTH VIEW -->
-    <div v-else class="month-view">
+    <div v-else class="month-view" :inert="calendarStore.navigationPending">
       <div class="month-dow">
         <span v-for="d in ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']" :key="d">{{ d }}</span>
       </div>
       <div class="month-grid">
         <button
-          v-for="(cell, i) in monthCells"
-          :key="i"
+          v-for="cell in monthCells"
+          :key="calendarDay(cell.date)"
           class="month-cell"
           :class="{
             'not-in-month': !cell.inMonth,
@@ -635,7 +743,7 @@ onMounted(() => {
               v-for="mode in (['day', 'week', 'month'] as CalendarViewMode[])"
               :key="mode"
               class="view-btn"
-              :class="{ active: calendarStore.viewMode === mode }"
+              :class="{ active: calendarStore.displayViewMode === mode }"
               :data-testid="`cal-view-${mode}`"
               @click="calendarStore.setViewMode(mode)"
             >{{ mode.charAt(0).toUpperCase() + mode.slice(1) }}</button>
@@ -644,17 +752,47 @@ onMounted(() => {
       </div>
 
       <!-- Calendar grid -->
-      <div class="calendar-content">
+      <div v-if="calendarStore.loading" class="calendar-load-status" role="status">
+        {{ loadingLabel() }}
+      </div>
+      <div v-if="calendarStore.loadError" class="calendar-load-error" role="alert">
+        {{ calendarStore.loadError }}
+        <button @click="calendarStore.retryNavigation()">Retry</button>
+      </div>
+      <ArchivedGraphNotice
+        :calendars="calendarStore.unacknowledgedArchivedGraphCalendars"
+        :error="calendarStore.archivedGraphCalendarsError"
+        :acknowledgement-error="calendarStore.archivedGraphAcknowledgementError"
+        :acknowledging="calendarStore.acknowledgingArchivedGraphCalendars"
+        @retry="calendarStore.retryNavigation()"
+        @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
+      />
+      <CalendarDisplayNotice :errors="displayIssues" />
+      <div v-if="calendarStore.unverifiedSeriesIds.length" class="calendar-incomplete" role="alert">
+        {{ calendarStore.unverifiedSeriesIds.length }} recurring series need a provider refresh.
+        Cached dates may be outdated or missing. Sync calendars to verify them.
+      </div>
+      <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
+        {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
+        Some recurring dates may be incomplete until verified.
+        <button :disabled="calendarStore.repairingOccurrences || calendarStore.repairRetryAt !== null" @click="calendarStore.repairIncompleteOccurrences()">
+          {{ calendarStore.repairingOccurrences ? 'Verifying…' : 'Verify with provider' }}
+        </button>
+        <span v-if="calendarStore.repairRetryAt !== null">
+          Graph is throttling verification. Try again after {{ new Date(calendarStore.repairRetryAt).toLocaleString() }}.
+        </span>
+      </div>
+      <div class="calendar-content" :inert="calendarStore.navigationPending">
         <WeekView
-          v-if="calendarStore.viewMode === 'day' || calendarStore.viewMode === 'week'"
-          :single-day="calendarStore.viewMode === 'day'"
+          v-if="calendarStore.displayViewMode === 'day' || calendarStore.displayViewMode === 'week'"
+          :single-day="calendarStore.displayViewMode === 'day'"
           @time-click="onTimeSlotClick"
           @event-click="onEventClick"
           @event-reschedule="onEventReschedule"
         />
         <MonthView
           v-else
-          @date-click="(d) => { calendarStore.setViewMode('day'); calendarStore.goToDate(d); }"
+          @date-click="(d) => calendarStore.goToDate(d, 'day')"
           @event-click="onEventClick"
           @event-reschedule="onEventReschedule"
         />
@@ -803,6 +941,33 @@ onMounted(() => {
 .calendar-content {
   flex: 1;
   overflow: hidden;
+}
+
+.calendar-load-status,
+.calendar-load-error,
+.calendar-incomplete {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  font-size: 12px;
+  background: var(--color-bg-secondary);
+  color: var(--color-text-muted);
+}
+
+.calendar-load-error,
+.calendar-incomplete {
+  color: var(--color-text);
+}
+
+.calendar-load-error button,
+.calendar-incomplete button {
+  margin-left: 8px;
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+
+.calendar-incomplete button:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 /* ============================================================

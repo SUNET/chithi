@@ -38,7 +38,14 @@ pub fn delete_events(conn: &Connection, event_ids: &[String]) -> Result<Deletion
                 (lifecycle_id, account_id, protocol, meeting_id, join_url, created_at,
                  cleanup_requested)
              SELECT ?1, account_id, protocol, meeting_id, join_url, CURRENT_TIMESTAMP, 1
-             FROM meet_meetings WHERE event_id = ?2",
+             FROM meet_meetings binding WHERE event_id = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM meet_meetings shared
+                   WHERE shared.event_id != binding.event_id
+                     AND shared.account_id = binding.account_id
+                     AND shared.protocol = binding.protocol
+                     AND shared.meeting_id = binding.meeting_id
+               )",
             params![lifecycle_id, event_id],
         )?;
         let deleted = conn.execute(
@@ -78,21 +85,9 @@ pub fn delete_account_events(conn: &Connection, account_id: &str) -> Result<Dele
     delete_events(conn, &event_ids)
 }
 
-pub fn delete_events_by_remote_id(
-    conn: &Connection,
-    account_id: &str,
-    remote_id: &str,
-) -> Result<DeletionResult> {
-    let event_ids = select_event_ids(
-        conn,
-        "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-        &[account_id, remote_id],
-    )?;
-    delete_events(conn, &event_ids)
-}
-
 /// Delete an explicit provider tombstone in its mapped local calendar only.
 /// The caller owns the transaction covering selection, meeting cleanup, and deletion.
+#[cfg(test)]
 pub fn delete_calendar_events_by_remote_id(
     conn: &Connection,
     account_id: &str,
@@ -104,20 +99,6 @@ pub fn delete_calendar_events_by_remote_id(
         "SELECT id FROM calendar_events
          WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
         &[account_id, calendar_id, remote_id],
-    )?;
-    delete_events(conn, &event_ids)
-}
-
-pub fn delete_unpushed_events_by_uid(
-    conn: &Connection,
-    account_id: &str,
-    uid: &str,
-) -> Result<DeletionResult> {
-    let event_ids = select_event_ids(
-        conn,
-        "SELECT id FROM calendar_events
-         WHERE account_id = ?1 AND uid = ?2 AND remote_id IS NULL",
-        &[account_id, uid],
     )?;
     delete_events(conn, &event_ids)
 }
@@ -175,6 +156,33 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn shared_transferred_meeting_is_queued_only_after_its_last_reference() {
+        let mut conn = connection();
+        insert_event(&conn, "source");
+        insert_event(&conn, "destination");
+        bind(&conn, "source");
+        conn.execute(
+            "INSERT INTO meet_meetings(event_id, account_id, protocol, meeting_id, join_url)
+             SELECT 'destination', account_id, protocol, meeting_id, join_url FROM meet_meetings WHERE event_id = 'source'", [],
+        ).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(delete_event(&tx, "source")
+            .unwrap()
+            .cleanup_lifecycle_ids
+            .is_empty());
+        assert_eq!(count(&tx, "meet_pending_meetings"), 0);
+        assert_eq!(
+            delete_event(&tx, "destination")
+                .unwrap()
+                .cleanup_lifecycle_ids
+                .len(),
+            1
+        );
+        tx.commit().unwrap();
+        assert_eq!(count(&conn, "meet_pending_meetings"), 1);
     }
 
     fn record_recurrence(conn: &Connection, event_id: &str) {

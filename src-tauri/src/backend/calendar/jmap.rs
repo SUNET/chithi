@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::calendar::event_set::{apply_event_fields, event_fields, CalendarEventSet};
 use crate::calendar::recurrence_identity::RecurrenceObjectKind;
 use crate::calendar::{attendee_status_from_json, CalendarEvent, RecurrenceKind};
 use crate::db;
@@ -10,18 +11,25 @@ use crate::error::{Error, Result};
 use crate::mail::jmap::{JmapCalendarEvent, JmapConfig, JmapConnection};
 
 use super::{
-    get_unpushed_events, AttendeeResponseUpdate, CalendarBackend, CalendarBackendCtx,
-    CalendarCapability, InviteReplyDelivery, PushedEvent, RemoteOccurrenceUpdate,
-    RemoteOccurrenceUpdateOutcome,
+    AttendeeResponseUpdate, CalendarBackend, CalendarBackendCtx, CalendarCapability,
+    InviteReplyDelivery, PushedEvent, RemoteOccurrenceUpdate, RemoteOccurrenceUpdateOutcome,
 };
 
 pub struct JmapCalendarBackend;
+
+fn validate_account_event(account: &AccountFull, event: &CalendarEvent) -> Result<()> {
+    if account.id != event.account_id {
+        return Err(Error::Sync("JMAP event belongs to another account".into()));
+    }
+    Ok(())
+}
 
 async fn connect(
     ctx: &CalendarBackendCtx<'_>,
     account: &AccountFull,
 ) -> Result<(JmapConfig, JmapConnection)> {
-    let (config, connection) = ctx.services.jmap_client(account).await?;
+    let (config, mut connection) = ctx.services.jmap_client(account).await?;
+    connection.select_calendar_account(&config).await?;
     Ok((config, connection))
 }
 
@@ -136,6 +144,117 @@ impl CalendarBackend for JmapCalendarBackend {
         "jmap"
     }
 
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        validate_account_event(account, event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .fetch_native_event_set(&config, event, remote_calendar_id)
+            .await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .update_native_event_set(&config, before, desired)
+            .await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_calendar_id: &str,
+        desired: &CalendarEventSet,
+        operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        let (config, connection) = connect(ctx, account).await?;
+        let mut result = connection
+            .create_native_event_set(&config, remote_calendar_id, desired, operation_id)
+            .await?;
+        result.event.account_id = account.id.clone();
+        for occurrence in &mut result.overrides {
+            if let Some(event) = &mut occurrence.event {
+                event.account_id = account.id.clone();
+            }
+        }
+        Ok(result)
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection.delete_native_event_set(&config, before).await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        validate_account_event(account, &before.event)?;
+        let (config, connection) = connect(ctx, account).await?;
+        connection
+            .move_native_event_set(&config, before, remote_calendar_id)
+            .await
+            .map(CalendarCapability::Supported)
+    }
+
+    async fn push_updated_event(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_id: &str,
+        event: &CalendarEvent,
+    ) -> Result<()> {
+        validate_account_event(account, event)?;
+        if event.remote_id.as_deref() != Some(remote_id) {
+            return Err(Error::Sync("JMAP ordinary update target mismatch".into()));
+        }
+        let calendar = db::calendar::get_calendar(&ctx.db.reader(), &event.calendar_id)?;
+        if calendar.account_id != account.id {
+            return Err(Error::Sync(
+                "JMAP calendar belongs to another account".into(),
+            ));
+        }
+        let calendar_id = calendar
+            .remote_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::Sync("JMAP remote calendar missing".into()))?;
+        let (config, connection) = connect(ctx, account).await?;
+        let before = connection
+            .fetch_native_event_set(&config, event, calendar_id)
+            .await?;
+        let mut desired = before.clone();
+        apply_event_fields(&mut desired.event, &event_fields(event));
+        desired.event.recurrence_rule = event.recurrence_rule.clone();
+        desired.event.recurrence_kind = event.recurrence_kind;
+        connection
+            .update_native_event_set(&config, &before, &desired)
+            .await?;
+        Ok(())
+    }
+
     fn invite_reply_delivery(&self) -> InviteReplyDelivery {
         InviteReplyDelivery::JmapSubmission
     }
@@ -157,40 +276,44 @@ impl CalendarBackend for JmapCalendarBackend {
         let mut remote_to_local: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        {
-            let conn = db.writer().await;
-            for jcal in &jmap_calendars {
-                let color = jcal.color.as_deref().unwrap_or("#4285f4");
-                let local_id = db::calendar::upsert_calendar_by_remote_id(
-                    &conn,
-                    account_id,
-                    &jcal.id,
-                    &jcal.name,
-                    color,
-                    jcal.is_default,
-                )?;
-                remote_to_local.insert(jcal.id.clone(), local_id);
-            }
-        }
-
         // Step 2: Fetch one complete account snapshot and apply it atomically.
-        let (events, ambiguous_calendars, ambiguous_events) =
-            jmap_conn.fetch_calendar_events(&jmap_config).await?;
+        let events = jmap_conn.fetch_calendar_events(&jmap_config).await?;
         for event in &events {
-            if !remote_to_local.contains_key(&event.calendar_id) {
+            if !jmap_calendars
+                .iter()
+                .any(|calendar| calendar.id == event.calendar_id)
+            {
                 return Err(Error::Sync(format!(
                     "JMAP event {} references an unknown calendar; snapshot not applied",
                     event.id
                 )));
             }
         }
+        let mut read_errors = Vec::new();
         {
             let mut conn = db.writer().await;
+            let transaction = conn.transaction()?;
+            for calendar in &jmap_calendars {
+                let id = db::calendar::upsert_calendar_by_remote_id(
+                    &transaction,
+                    account_id,
+                    &calendar.id,
+                    &calendar.name,
+                    calendar.color.as_deref().unwrap_or("#4285f4"),
+                    calendar.is_default,
+                )?;
+                remote_to_local.insert(calendar.id.clone(), id);
+            }
+            let mut mirrors =
+                std::collections::HashMap::<String, Vec<db::calendar_sync::Resource>>::new();
             for ev in &events {
                 let local_cal_id = remote_to_local
                     .get(&ev.calendar_id)
                     .expect("calendar membership validated")
                     .clone();
+                if !db::calendar::get_calendar(&transaction, &local_cal_id)?.is_subscribed {
+                    continue;
+                }
                 let event_id = uuid::Uuid::new_v4().to_string();
                 let cal_event = CalendarEvent {
                     id: event_id,
@@ -218,135 +341,113 @@ impl CalendarBackend for JmapCalendarBackend {
                     etag: None,
                 };
 
-                match ev.recurrence_seeds.as_deref() {
-                    Some(seeds) => db::calendar::upsert_event_by_remote_id_with_recurrence(
-                        &conn, &cal_event, seeds,
-                    )
-                    .map(|_| ()),
-                    None => db::calendar::upsert_event_by_remote_id(&conn, &cal_event),
-                }
-                .map_err(|error| {
-                    Error::Sync(format!(
-                        "Failed to apply JMAP event {} atomically: {error}",
-                        ev.id
-                    ))
-                })?;
-            }
-
-            let server_ids: std::collections::HashSet<&str> =
-                events.iter().map(|event| event.id.as_str()).collect();
-            let local_synced: Vec<(String, String, String)> = {
-                let mut statement = conn.prepare(
-                    "SELECT id, calendar_id, remote_id FROM calendar_events
-                     WHERE account_id = ?1 AND remote_id IS NOT NULL AND remote_id != ''",
-                )?;
-                let rows = statement
-                    .query_map(rusqlite::params![account_id], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?
-                    .collect::<std::result::Result<_, _>>()?;
-                rows
-            };
-            let protected_local_calendars: std::collections::HashSet<&str> = ambiguous_calendars
-                .iter()
-                .filter_map(|remote_id| remote_to_local.get(remote_id).map(String::as_str))
-                .collect();
-            let deleted_ids: Vec<String> = local_synced
-                .into_iter()
-                .filter(|(_, local_calendar_id, remote_id)| {
-                    !server_ids.contains(remote_id.as_str())
-                        && !ambiguous_events.contains(remote_id)
-                        && !protected_local_calendars.contains(local_calendar_id.as_str())
-                })
-                .map(|(local_id, _, _)| local_id)
-                .collect();
-            let deleted = if deleted_ids.is_empty() {
-                0
-            } else {
-                let transaction = conn.transaction()?;
-                let deleted =
-                    db::calendar_event_deletion::delete_events(&transaction, &deleted_ids)?.deleted;
-                transaction.commit()?;
-                deleted
-            };
-            if deleted != 0 {
-                log::info!("sync_calendars: removed {deleted} server-deleted JMAP events");
-            }
-        }
-
-        // Step 3: Push local events (no remote_id) to the JMAP server
-        let mut push_failures = Vec::new();
-        {
-            let conn = db.writer().await;
-            let local_events: Vec<CalendarEvent> = get_unpushed_events(&conn, account_id)?;
-
-            if !local_events.is_empty() {
-                log::info!(
-                    "sync_calendars: pushing {} local events to JMAP",
-                    local_events.len()
-                );
-                drop(conn); // Release lock for async calls
-
-                for ev in &local_events {
-                    // Find the remote calendar ID for this event's local calendar
-                    let remote_cal_id = remote_to_local
-                        .iter()
-                        .find(|(_, local_id)| **local_id == ev.calendar_id)
-                        .map(|(remote_id, _)| remote_id.clone())
-                        .unwrap_or_default();
-
-                    if remote_cal_id.is_empty() {
-                        push_failures.push(format!(
-                            "{} ({}): destination calendar is unavailable",
-                            ev.title, ev.id
-                        ));
-                        continue;
-                    }
-
-                    let jmap_event = match to_jmap_event(ev, &remote_cal_id) {
-                        Ok(event) => event,
+                let native = crate::calendar::event_set::NativeCalendarResource {
+                    protocol: "jmap".into(),
+                    calendar_id: ev.calendar_id.clone(),
+                    event_id: ev.id.clone(),
+                    revision: ev.response_state.clone(),
+                    data: ev
+                        .native_json
+                        .as_ref()
+                        .ok_or_else(|| Error::Sync("JMAP resource omitted native data".into()))?
+                        .to_string(),
+                };
+                let mirror = mirrors.entry(local_cal_id.clone()).or_default();
+                if matches!(
+                    ev.recurrence_kind,
+                    RecurrenceKind::Series | RecurrenceKind::Standalone
+                ) {
+                    let mut set = match jmap_conn.synced_set(ev, &cal_event, &events) {
+                        Ok(set) => set,
                         Err(error) => {
-                            push_failures.push(format!("{}: {error}", ev.id));
+                            mirror.push(db::calendar_sync::Resource::unsupported(native, error));
                             continue;
                         }
                     };
-
-                    match jmap_conn
-                        .create_calendar_event(&jmap_config, &jmap_event)
-                        .await
-                    {
-                        Ok(remote_id) => {
-                            log::info!(
-                                "sync_calendars: pushed event '{}' to JMAP, remote_id={}",
-                                ev.title,
-                                remote_id
+                    set.event.my_status = attendee_status_from_json(
+                        set.event.attendees_json.as_deref(),
+                        &account.email,
+                    );
+                    for item in &mut set.overrides {
+                        if let Some(event) = &mut item.event {
+                            event.my_status = attendee_status_from_json(
+                                event.attendees_json.as_deref(),
+                                &account.email,
                             );
-                            let conn = db.writer().await;
-                            if let Err(error) = conn.execute(
-                                "UPDATE calendar_events SET remote_id = ?1 WHERE id = ?2",
-                                rusqlite::params![remote_id, ev.id],
-                            ) {
-                                push_failures.push(format!(
-                                    "{} ({}): failed to save remote id: {error}",
-                                    ev.title, ev.id
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            push_failures.push(format!("{} ({}): {e}", ev.title, ev.id));
                         }
                     }
+                    mirror.push(db::calendar_sync::Resource::readable(set)?);
+                } else if ev.recurrence_kind == RecurrenceKind::Occurrence {
+                    let base = ev
+                        .native_json
+                        .as_ref()
+                        .and_then(|value| value["baseEventId"].as_str());
+                    if !events.iter().any(|event| {
+                        Some(event.id.as_str()) == base
+                            && event.calendar_id == ev.calendar_id
+                            && event.recurrence_kind == RecurrenceKind::Series
+                    }) {
+                        mirror.push(db::calendar_sync::Resource::unsupported(
+                            native,
+                            "JMAP detached resource lacks a master",
+                        ));
+                    } else {
+                        mirror.push(db::calendar_sync::Resource {
+                            native,
+                            set: None,
+                            error: None,
+                        });
+                    }
+                } else {
+                    mirror.push(db::calendar_sync::Resource::unsupported(
+                        native,
+                        "JMAP event has ambiguous recurrence",
+                    ));
                 }
             }
+
+            db::calendar_sync::rebind_account_resources(
+                &transaction,
+                account_id,
+                "jmap",
+                &mirrors,
+            )?;
+            for local in remote_to_local.values() {
+                if !db::calendar::get_calendar(&transaction, local)?.is_subscribed {
+                    continue;
+                }
+                let resources = mirrors.remove(local).unwrap_or_default();
+                for resource in &resources {
+                    if let Some(error) = &resource.error {
+                        read_errors.push(format!(
+                            "JMAP resource {} cannot be displayed: {error}",
+                            resource.native.event_id
+                        ));
+                    }
+                }
+                db::calendar_sync::replace_calendar(
+                    &transaction,
+                    account_id,
+                    local,
+                    "jmap",
+                    &resources,
+                )?;
+            }
+            db::calendar_sync::replace_inventory(
+                &transaction,
+                account_id,
+                &remote_to_local.keys().map(String::as_str).collect(),
+            )?;
+            transaction.commit()?;
         }
 
-        if push_failures.is_empty() {
+        if read_errors.is_empty() {
             Ok(())
         } else {
             Err(Error::Sync(format!(
-                "JMAP calendar sync could not create {} local event(s): {}",
-                push_failures.len(),
-                push_failures.join("; ")
+                "JMAP mirror updated, but {} resource(s) cannot be displayed: {}",
+                read_errors.len(),
+                read_errors.join("; ")
             )))
         }
     }
@@ -383,11 +484,11 @@ impl CalendarBackend for JmapCalendarBackend {
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         remote_id: &str,
-        _remote_calendar_id: &str,
+        remote_calendar_id: &str,
     ) -> Result<()> {
         let (jmap_config, conn_jmap) = connect(ctx, account).await?;
         conn_jmap
-            .delete_calendar_event(&jmap_config, remote_id)
+            .delete_calendar_membership(&jmap_config, remote_id, remote_calendar_id)
             .await
     }
 
@@ -492,7 +593,7 @@ impl CalendarBackend for JmapCalendarBackend {
         let Ok((jmap_config, connection)) = connect(ctx, account).await else {
             return Ok(CalendarCapability::Supported(()));
         };
-        let Ok((events, _, _)) = connection.fetch_calendar_events(&jmap_config).await else {
+        let Ok(events) = connection.fetch_calendar_events(&jmap_config).await else {
             return Ok(CalendarCapability::Supported(()));
         };
 
@@ -794,6 +895,7 @@ mod deferred_creation_tests {
         writes: Arc<Mutex<Vec<Value>>>,
         requests: Arc<Mutex<Vec<Value>>>,
         events: Arc<Mutex<Vec<Value>>>,
+        calendars: Arc<Mutex<Vec<Value>>>,
         fault: Arc<Mutex<Option<SnapshotFault>>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -811,10 +913,14 @@ mod deferred_creation_tests {
             let writes = Arc::new(Mutex::new(Vec::new()));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let calendars = Arc::new(Mutex::new(vec![
+                json!({"id":"remote-cal", "name":"Calendar", "isDefault":true}),
+            ]));
             let fault = Arc::new(Mutex::new(None));
             let captured = writes.clone();
             let captured_requests = requests.clone();
             let stored = events.clone();
+            let stored_calendars = calendars.clone();
             let injected_fault = fault.clone();
             let query_count = Arc::new(AtomicUsize::new(0));
             let get_count = Arc::new(AtomicUsize::new(0));
@@ -873,9 +979,9 @@ mod deferred_creation_tests {
                             let fault = *injected_fault.lock().unwrap();
                             let mut response_method = method;
                             let mut body = match method {
-                                "Calendar/get" => json!({"list": [{
-                                    "id": "remote-cal", "name": "Calendar", "isDefault": true
-                                }]}),
+                                "Calendar/get" => {
+                                    json!({"list": *stored_calendars.lock().unwrap()})
+                                }
                                 "CalendarEvent/query" => {
                                     let query_index = query_calls.fetch_add(1, Ordering::SeqCst);
                                     let events = stored.lock().unwrap();
@@ -918,7 +1024,7 @@ mod deferred_creation_tests {
                                         let id = format!("remote-{}", events.len());
                                         event["id"] = json!(id);
                                         events.push(event);
-                                        json!({"created": {"new1": {"id": id}}})
+                                        json!({"accountId": "remote-account", "oldState": "event-state", "newState": "event-state", "created": {"new1": {"id": id}}})
                                     } else {
                                         assert_eq!(call[1]["sendSchedulingMessages"], false);
                                         let (id, patch) = call[1]["update"]
@@ -928,7 +1034,7 @@ mod deferred_creation_tests {
                                             .next()
                                             .unwrap();
                                         captured.lock().unwrap().push(patch.clone());
-                                        json!({"updated": {id: null}})
+                                        json!({"accountId": "remote-account", "oldState": "event-state", "newState": "event-state", "updated": {id: null}})
                                     }
                                 }
                                 _ => panic!("unexpected JMAP method {method}"),
@@ -965,6 +1071,7 @@ mod deferred_creation_tests {
                 writes,
                 requests,
                 events,
+                calendars,
                 fault,
                 task,
             }
@@ -1013,12 +1120,9 @@ mod deferred_creation_tests {
         let services = server.services();
         let (config, connection) = services.jmap_client(&server.account()).await.unwrap();
 
-        let (events, ambiguous_calendars, ambiguous_events) =
-            connection.fetch_calendar_events(&config).await.unwrap();
+        let events = connection.fetch_calendar_events(&config).await.unwrap();
 
         assert_eq!(events.len(), 501);
-        assert!(ambiguous_calendars.is_empty());
-        assert!(ambiguous_events.is_empty());
         let requests = server.requests.lock().unwrap();
         let methods: Vec<&str> = requests
             .iter()
@@ -1061,7 +1165,6 @@ mod deferred_creation_tests {
             SnapshotFault::ChangedQueryState,
             SnapshotFault::ChangedGetState,
             SnapshotFault::MethodError,
-            SnapshotFault::MalformedObject,
             SnapshotFault::NotFound,
             SnapshotFault::MissingList,
         ] {
@@ -1126,7 +1229,60 @@ mod deferred_creation_tests {
     }
 
     #[tokio::test]
-    async fn multi_calendar_ambiguity_retains_existing_row_without_moving_it() {
+    async fn unsupported_object_evicts_stale_content_without_freezing_unrelated_resources() {
+        let server = CalendarServer::start().await;
+        server.events.lock().unwrap().extend([
+            remote_event("bad", json!({"remote-cal":true})),
+            remote_event("good", json!({"remote-cal":true})),
+        ]);
+        let services = server.services();
+        let account = server.account();
+        let (_directory, db) = temp_pool();
+        {
+            let conn = db.writer().await;
+            db::schema::initialize(&conn).unwrap();
+            conn.execute("INSERT INTO accounts(id,display_name,email,username) VALUES ('acc1','Test','u@example.com','u')", []).unwrap();
+        }
+        let ctx = CalendarBackendCtx {
+            db: &db,
+            services: &services,
+        };
+        JmapCalendarBackend.sync(&ctx, &account).await.unwrap();
+        *server.fault.lock().unwrap() = Some(SnapshotFault::MalformedObject);
+        server.events.lock().unwrap()[1]["title"] = json!("Current good content");
+        assert!(JmapCalendarBackend.sync(&ctx, &account).await.is_err());
+        let conn = db.reader();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'bad'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT title FROM calendar_events WHERE remote_id = 'good'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Current good content"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_remote_resources WHERE error IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_calendar_memberships_display_current_content_in_each_calendar() {
         let server = CalendarServer::start().await;
         server
             .events
@@ -1165,6 +1321,11 @@ mod deferred_creation_tests {
             json!({"aaa-first-in-json-order": true, "remote-cal": true}),
         );
         server.events.lock().unwrap()[0]["title"] = json!("Must not overwrite");
+        server
+            .calendars
+            .lock()
+            .unwrap()
+            .push(json!({"id":"aaa-first-in-json-order", "name":"Second"}));
         JmapCalendarBackend.sync(&context, &account).await.unwrap();
 
         let after: (String, String, String) = db
@@ -1175,7 +1336,19 @@ mod deferred_creation_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(after, before);
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1, before.1);
+        assert_eq!(after.2, "Must not overwrite");
+        assert_eq!(
+            db.reader()
+                .query_row(
+                    "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'shared'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1230,7 +1403,196 @@ mod deferred_creation_tests {
     }
 
     #[tokio::test]
-    async fn deferred_creation_blocks_laundering_but_processes_valid_rows_on_each_sync() {
+    async fn external_calendar_move_retires_old_membership_with_same_event_id() {
+        for claimed in [false, true] {
+            let server = CalendarServer::start().await;
+            server
+                .calendars
+                .lock()
+                .unwrap()
+                .push(json!({"id":"other-calendar", "name":"Other"}));
+            let mut master = remote_event("moving-series", json!({"remote-cal":true}));
+            master["recurrenceRules"] = json!([{"@type":"RecurrenceRule", "frequency":"daily"}]);
+            master["timeZone"] = json!("UTC");
+            server.events.lock().unwrap().push(master.clone());
+            let services = server.services();
+            let account = server.account();
+            let (_directory, db) = temp_pool();
+            {
+                let conn = db.writer().await;
+                db::schema::initialize(&conn).unwrap();
+                conn.execute(
+                    "INSERT INTO accounts(id, display_name, email, username)
+                    VALUES ('acc1','Test','u@example.com','u@example.com')",
+                    [],
+                )
+                .unwrap();
+            }
+            let ctx = CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            };
+            JmapCalendarBackend.sync(&ctx, &account).await.unwrap();
+            let owner: String = db
+                .reader()
+                .query_row(
+                    "SELECT id FROM calendar_events WHERE remote_id = 'moving-series'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            {
+                let conn = db.writer().await;
+                conn.execute("INSERT INTO meet_meetings(event_id, account_id, protocol, meeting_id, join_url)
+                    VALUES (?1, 'acc1', 'zoom', 'retained-meeting', 'https://example.test/join')", [&owner]).unwrap();
+                let mut child = db::calendar::get_event(&conn, &owner).unwrap();
+                child.id = "old-child".into();
+                child.remote_id = None;
+                child.recurrence_kind = RecurrenceKind::Occurrence;
+                child.recurrence_rule = None;
+                db::calendar::insert_event(&conn, &child).unwrap();
+                conn.execute("INSERT INTO calendar_action_members(event_id, owner_event_id) VALUES ('old-child', ?1)", [&owner]).unwrap();
+                if claimed {
+                    conn.execute("INSERT INTO calendar_action_operations(operation_id, account_id, event_id, data)
+                        VALUES ('unfinished', 'acc1', ?1, '{}')", [&owner]).unwrap();
+                    conn.execute("INSERT INTO calendar_action_claims(event_id, operation_id) VALUES (?1, 'unfinished')", [&owner]).unwrap();
+                }
+            }
+            master["calendarIds"] = json!({"other-calendar":true});
+            server.events.lock().unwrap()[0] = master;
+            let result = JmapCalendarBackend.sync(&ctx, &account).await;
+            assert!(result.is_ok(), "{result:?}");
+            let conn = db.reader();
+            assert!(db::calendar::get_event(&conn, &owner).is_ok());
+            assert!(db::calendar::get_event(&conn, "old-child").is_err());
+            let actual_calendar: String = conn.query_row("SELECT calendar.remote_id FROM calendar_events event
+                JOIN calendars calendar ON calendar.id = event.calendar_id WHERE event.remote_id = 'moving-series'", [], |r| r.get(0)).unwrap();
+            assert_eq!(actual_calendar, "other-calendar");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'moving-series'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT event_id FROM meet_meetings WHERE meeting_id = 'retained-meeting'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                owner
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM meet_pending_meetings", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(server.writes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_snapshot_refreshes_series_and_retires_members_atomically() {
+        let server = CalendarServer::start().await;
+        let mut master = remote_event("lunch", json!({"remote-cal": true}));
+        master["timeZone"] = json!("Europe/Stockholm");
+        master["recurrenceRules"] = json!([{"@type":"RecurrenceRule", "frequency":"daily"}]);
+        server.events.lock().unwrap().push(master.clone());
+        let services = server.services();
+        let account = server.account();
+        let (_directory, db) = temp_pool();
+        {
+            let conn = db.writer().await;
+            db::schema::initialize(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id, display_name, email, username)
+                VALUES ('acc1','Test','u@example.com','u@example.com')",
+                [],
+            )
+            .unwrap();
+        }
+        let ctx = CalendarBackendCtx {
+            db: &db,
+            services: &services,
+        };
+        JmapCalendarBackend.sync(&ctx, &account).await.unwrap();
+        let owner: String = db
+            .reader()
+            .query_row(
+                "SELECT id FROM calendar_events WHERE remote_id = 'lunch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        {
+            let conn = db.writer().await;
+            let mut child = db::calendar::get_event(&conn, &owner).unwrap();
+            child.id = "addressless-lunch".into();
+            child.remote_id = None;
+            child.recurrence_rule = None;
+            child.recurrence_kind = RecurrenceKind::Occurrence;
+            db::calendar::insert_event(&conn, &child).unwrap();
+            conn.execute(
+                "INSERT INTO calendar_action_members(event_id, owner_event_id, original_start)
+                VALUES ('addressless-lunch', ?1, '2026-09-13T08:00:00Z')",
+                [&owner],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE calendar_action_sets SET dirty = 1 WHERE event_id = ?1",
+                [&owner],
+            )
+            .unwrap();
+        }
+        master["title"] = json!("Lunch moved elsewhere");
+        master["start"] = json!("2026-09-13T12:00:00");
+        server.events.lock().unwrap()[0] = master;
+        JmapCalendarBackend.sync(&ctx, &account).await.unwrap();
+        assert_eq!(
+            db::calendar::get_event(&db.reader(), &owner).unwrap().title,
+            "Lunch moved elsewhere"
+        );
+        {
+            let conn = db.writer().await;
+            conn.execute_batch("CREATE TRIGGER fail_series_retirement BEFORE DELETE ON calendar_events
+                WHEN OLD.remote_id = 'lunch' BEGIN SELECT RAISE(ABORT, 'injected retirement failure'); END;").unwrap();
+        }
+        server.events.lock().unwrap().clear();
+        server
+            .events
+            .lock()
+            .unwrap()
+            .push(remote_event("new-event", json!({"remote-cal":true})));
+        assert!(JmapCalendarBackend.sync(&ctx, &account).await.is_err());
+        assert!(db::calendar::get_event(&db.reader(), &owner).is_ok());
+        assert_eq!(
+            db.reader()
+                .query_row(
+                    "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'new-event'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        db.writer()
+            .await
+            .execute_batch("DROP TRIGGER fail_series_retirement")
+            .unwrap();
+        JmapCalendarBackend.sync(&ctx, &account).await.unwrap();
+        assert!(db::calendar::get_event(&db.reader(), &owner).is_err());
+        assert!(db::calendar::get_event(&db.reader(), "addressless-lunch").is_err());
+        assert_eq!(db.reader().query_row("SELECT COUNT(*) FROM calendar_events WHERE remote_id IS NULL OR remote_id = ''", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert!(server.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_evicts_all_unpublished_rows_without_implicitly_creating_them() {
         let server = CalendarServer::start().await;
         let services = server.services();
         let account = server.account();
@@ -1300,6 +1662,8 @@ mod deferred_creation_tests {
                     calendar_id: calendar_id.clone(),
                     title: id.into(),
                     uid: Some(format!("{id}@test")),
+                    start_time: "2026-07-16T10:00:00Z".into(),
+                    end_time: "2026-07-16T10:30:00Z".into(),
                     recurrence_kind: kind,
                     recurrence_rule: rule.map(str::to_string),
                     ical_data: ical,
@@ -1316,45 +1680,16 @@ mod deferred_creation_tests {
             }
         }
         for _ in 0..2 {
-            let error = JmapCalendarBackend
-                .sync(&context, &account)
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("could not create 5 local event(s)"),
-                "{error}"
-            );
-            assert!(error.contains("source calendar"), "{error}");
+            JmapCalendarBackend.sync(&context, &account).await.unwrap();
             let conn = db.reader();
             for before in &blocked {
-                assert!(error.contains(&before.id), "{error}");
-                let after = db::calendar::get_event(&conn, &before.id).unwrap();
-                assert_eq!(
-                    serde_json::to_value(after).unwrap(),
-                    serde_json::to_value(before).unwrap()
-                );
+                assert!(db::calendar::get_event(&conn, &before.id).is_err());
             }
             for before in &allowed {
-                let after = db::calendar::get_event(&conn, &before.id).unwrap();
-                assert_eq!(after.recurrence_kind, before.recurrence_kind);
-                assert!(after.remote_id.is_some());
+                assert!(db::calendar::get_event(&conn, &before.id).is_err());
             }
             let writes = server.writes.lock().unwrap();
-            assert_eq!(
-                writes.len(),
-                2,
-                "blocked rows must never reach CalendarEvent/set"
-            );
-            assert!(writes
-                .iter()
-                .all(|event| event["uid"].as_str().unwrap().starts_with("valid-")));
-            let series = writes
-                .iter()
-                .find(|event| event["title"] == "valid-series")
-                .unwrap();
-            assert_eq!(series["recurrenceRules"][0]["frequency"], "weekly");
-            assert_eq!(series["recurrenceRules"][0]["count"], 4);
+            assert!(writes.is_empty());
         }
     }
 
@@ -1386,7 +1721,7 @@ mod deferred_creation_tests {
                 .to_string();
             assert!(error.contains("Cannot create JMAP event"), "{error}");
         }
-        let (fetched, _, _) = connection.fetch_calendar_events(&config).await.unwrap();
+        let fetched = connection.fetch_calendar_events(&config).await.unwrap();
         assert_eq!(fetched[0].recurrence_kind, RecurrenceKind::Series);
         assert!(fetched[0].recurrence_rule.is_some());
         assert_eq!(fetched[0].response_state.as_deref(), Some("event-state"));
@@ -1513,6 +1848,11 @@ mod deferred_creation_tests {
     #[tokio::test]
     async fn personal_copy_update_clears_scheduling_and_stale_optional_fields() {
         let server = CalendarServer::start().await;
+        server
+            .events
+            .lock()
+            .unwrap()
+            .push(remote_event("remote-copy", json!({"remote-cal": true})));
         let services = server.services();
         let account = server.account();
         let (_directory, db) = temp_pool();

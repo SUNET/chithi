@@ -4,7 +4,11 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
-import { calendarMutationSupport } from "@/lib/calendar-mutation-support";
+import {
+  calendarEditSupport, calendarMutationSupport, calendarScopedEditSupport,
+} from "@/lib/calendar-mutation-support";
+import type { CalendarEditScope } from "@/lib/calendar-mutation-support";
+import { confirmCalendarAction } from "@/lib/calendar-action-confirmation";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
 import type { Calendar, CalendarEvent } from "@/lib/types";
@@ -30,19 +34,38 @@ const event = computed(() => {
 const mutationSupport = computed(() =>
   calendarStore.getEventMutationSupport(event.value?.id ?? ""),
 );
+const occurrenceEditSupport = computed(() => calendarEditSupport(event.value));
+const editSupport = computed(() => calendarScopedEditSupport(event.value));
+const mutationNotice = computed(() => {
+  if (editSupport.value.supported && !editSupport.value.scopes.includes("standalone")) {
+    return editSupport.value.scopes.includes("this-occurrence")
+      ? "Recurring deletion remains unavailable. Choose whether an edit applies to this occurrence or the entire series."
+      : "Recurring deletion remains unavailable. Only the entire series can be edited.";
+  }
+  if (editSupport.value.reason && mutationSupport.value.reason &&
+    editSupport.value.reason !== mutationSupport.value.reason) {
+    return `${editSupport.value.reason} ${mutationSupport.value.reason}`;
+  }
+  return editSupport.value.reason ?? mutationSupport.value.reason;
+});
 const mutationReasonId = useId();
 
 const editing = ref(false);
 const saving = ref(false);
 const error = ref<string | null>(null);
 const editingEventId = ref<string | null>(null);
+const editScope = ref<CalendarEditScope>("standalone");
 let selectionVersion = 0;
 
 watch(() => calendarStore.selectedEvent?.id, () => {
   selectionVersion++;
 }, { flush: "sync" });
 
-watch([() => event.value?.id, () => mutationSupport.value.reason], () => {
+watch([
+  () => event.value?.id,
+  () => editSupport.value.reason,
+  () => mutationSupport.value.reason,
+], () => {
   editing.value = false;
   editingEventId.value = null;
   error.value = null;
@@ -86,6 +109,12 @@ const editLocation = ref("");
 const editDescription = ref("");
 const editCalendarId = ref("");
 
+watch(editScope, (scope) => {
+  if (scope === "this-occurrence" && event.value) {
+    editCalendarId.value = event.value.calendar_id;
+  }
+});
+
 function calendarLabel(cal: Calendar): string {
   // Same label format as EventForm's calendar picker.
   const account = accountsStore.accounts.find((a) => a.id === cal.account_id);
@@ -115,7 +144,7 @@ function statusClass(status: string | null): string {
 }
 
 function startEditing() {
-  if (saving.value || !event.value || !mutationSupport.value.supported) return;
+  if (saving.value || !event.value || !editSupport.value.supported) return;
   const current = event.value;
   editTitle.value = current.title;
   editStartDate.value = getDateInTimezone(current.start_time, uiStore.displayTimezone);
@@ -126,6 +155,7 @@ function startEditing() {
   editLocation.value = current.location || "";
   editDescription.value = current.description || "";
   editCalendarId.value = current.calendar_id;
+  editScope.value = editSupport.value.scopes[0] ?? "standalone";
   editingEventId.value = current.id;
   editing.value = true;
   error.value = null;
@@ -148,19 +178,77 @@ async function refreshMutationTarget(eventId: string, purpose: "attendee notific
 
 async function saveEdit() {
   if (saving.value || !editing.value || !event.value ||
-    editingEventId.value !== event.value.id || !mutationSupport.value.supported) return;
+    editingEventId.value !== event.value.id || !editSupport.value.supported) return;
   const original = event.value;
   const version = selectionVersion;
   const targetCalendarId = editCalendarId.value;
   saving.value = true;
   error.value = null;
   try {
+    const occurrenceEdit = editScope.value === "this-occurrence";
+    const entireSeriesEdit = editScope.value === "entire-series";
+    const recurringEdit = occurrenceEdit || entireSeriesEdit;
     const startISO = editAllDay.value
-      ? `${editStartDate.value}T00:00:00Z`
+      ? recurringEdit ? editStartDate.value : `${editStartDate.value}T00:00:00Z`
       : localInputToUTC(editStartDate.value, editStartTime.value, uiStore.displayTimezone);
     const endISO = editAllDay.value
-      ? `${editEndDate.value}T23:59:59Z`
+      ? recurringEdit ? editEndDate.value : `${editEndDate.value}T23:59:59Z`
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
+
+    if (occurrenceEdit) {
+      if (!occurrenceEditSupport.value.supported || !occurrenceEditSupport.value.occurrence) {
+        throw new Error(occurrenceEditSupport.value.reason || "This occurrence cannot be edited.");
+      }
+      if (targetCalendarId !== original.calendar_id) {
+        throw new Error("Moving a recurring occurrence is not supported yet.");
+      }
+      await calendarStore.updateOccurrence(original, {
+        title: editTitle.value,
+        description: editDescription.value,
+        location: editLocation.value,
+        start_time: startISO,
+        end_time: endISO,
+        all_day: editAllDay.value,
+        timezone: original.timezone || "",
+      });
+      if (isCurrentSelection(original.id, version)) {
+        editing.value = false;
+        emit("close");
+      }
+      return;
+    }
+
+    if (entireSeriesEdit) {
+      if (await calendarStore.resumePendingCalendarAction(original)) {
+        if (isCurrentSelection(original.id, version)) {
+          editing.value = false;
+          emit("close");
+        }
+        return;
+      }
+      const plan = await calendarStore.planEntireSeriesAction(original, {
+        title: editTitle.value,
+        description: editDescription.value,
+        location: editLocation.value,
+        start_time: startISO,
+        end_time: endISO,
+        all_day: editAllDay.value,
+        timezone: original.timezone || "",
+      }, targetCalendarId);
+      const confirmations = await confirmCalendarAction(plan, {
+        confirmSeriesMove: targetCalendarId !== original.calendar_id,
+      });
+      if (!confirmations) {
+        await calendarStore.discardCalendarPlan(plan);
+        return;
+      }
+      await calendarStore.executeCalendarPlan(plan, confirmations);
+      if (isCurrentSelection(original.id, version)) {
+        editing.value = false;
+        emit("close");
+      }
+      return;
+    }
 
     await calendarStore.updateEvent(original.id, {
       account_id: original.account_id,
@@ -266,14 +354,14 @@ async function handleDelete() {
   <div v-if="event" class="event-detail-overlay" @click.self="emit('close')">
     <div class="event-detail">
       <div class="detail-header">
-        <h3 v-if="!editing">{{ event.title }}</h3>
+        <h3 v-if="!editing">{{ event.title || '(No title)' }}</h3>
         <input v-else v-model="editTitle" class="edit-title" type="text" data-testid="event-form-title" />
         <button class="close-btn" @click="emit('close')">&times;</button>
       </div>
 
       <div v-if="error" class="detail-error">{{ error }}</div>
-      <p v-if="!mutationSupport.supported" :id="mutationReasonId" class="mutation-reason">
-        {{ mutationSupport.reason }}
+      <p v-if="mutationNotice" :id="mutationReasonId" class="mutation-reason">
+        {{ mutationNotice }}
       </p>
 
       <!-- View mode -->
@@ -339,6 +427,13 @@ async function handleDelete() {
 
       <!-- Edit mode -->
       <div v-else class="detail-body edit-mode">
+        <div v-if="!editSupport.scopes.includes('standalone')" class="edit-group">
+          <label>Edit scope</label>
+          <select v-model="editScope" data-testid="event-detail-scope">
+            <option v-if="editSupport.scopes.includes('this-occurrence')" value="this-occurrence">This occurrence</option>
+            <option value="entire-series">Entire series</option>
+          </select>
+        </div>
         <label class="checkbox-row">
           <input type="checkbox" v-model="editAllDay" data-testid="event-form-allday" />
           All day
@@ -365,7 +460,7 @@ async function handleDelete() {
         </div>
         <div class="edit-group">
           <label>Calendar</label>
-          <select v-model="editCalendarId" data-testid="event-detail-calendar">
+          <select v-model="editCalendarId" :disabled="editScope === 'this-occurrence'" data-testid="event-detail-calendar">
             <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
               {{ calendarLabel(cal) }}
             </option>
@@ -383,11 +478,11 @@ async function handleDelete() {
 
       <div class="detail-footer">
         <template v-if="!editing">
-          <button class="btn-edit" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="startEditing">Edit</button>
+          <button class="btn-edit" :disabled="saving || !editSupport.supported" :aria-describedby="editSupport.reason ? mutationReasonId : undefined" @click="startEditing">Edit</button>
           <button class="btn-danger" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="handleDelete" data-testid="event-form-delete">Delete</button>
         </template>
         <template v-else>
-          <button class="btn-save" :disabled="saving || !mutationSupport.supported" :aria-describedby="mutationSupport.reason ? mutationReasonId : undefined" @click="saveEdit" data-testid="event-form-save">
+          <button class="btn-save" :disabled="saving || !editSupport.supported" :aria-describedby="editSupport.reason ? mutationReasonId : undefined" @click="saveEdit" data-testid="event-form-save">
             {{ saving ? "Saving..." : "Save" }}
           </button>
           <button class="btn-cancel" @click="editing = false">Cancel</button>

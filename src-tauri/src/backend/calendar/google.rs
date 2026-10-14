@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
+use crate::calendar::event_set::CalendarEventSet;
 use crate::calendar::recurrence_identity::{
     OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
 };
@@ -10,6 +11,8 @@ use crate::calendar::{Attendee, CalendarEvent, RecurrenceKind};
 use crate::db;
 use crate::db::accounts::AccountFull;
 use crate::error::{Error, Result};
+
+mod event_sets;
 use crate::mail::google::{
     event_patch_to_google_json, event_to_google_json, google_recurrence_kind,
     invitation_copy_patch_to_google_json, occurrence_patch_to_google_json, send_updates_for,
@@ -23,81 +26,6 @@ use super::{
 };
 
 pub struct GoogleCalendarBackend;
-
-/// Incremental tokens cannot refresh unchanged rows created before recurrence
-/// classification existed. Local-only rows do not need provider metadata reads.
-fn needs_recurrence_refresh(
-    conn: &rusqlite::Connection,
-    account_id: &str,
-    calendar_id: &str,
-) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM calendar_events
-         WHERE account_id = ?1 AND calendar_id = ?2
-           AND remote_id IS NOT NULL AND remote_id != ''
-           AND recurrence_kind = 'unknown')",
-        rusqlite::params![account_id, calendar_id],
-        |row| row.get(0),
-    )?)
-}
-
-/// Supplement incremental sync with one bounded metadata read. Only positively
-/// classified cached unknown rows are updated; cursors, event contents, and
-/// deletions belong exclusively to the normal sync stream.
-async fn refresh_recurrence(
-    db: &db::pool::DbPool,
-    client: &GoogleClient,
-    account_id: &str,
-    calendar_id: &str,
-    remote_calendar_id: &str,
-) -> Result<()> {
-    let now = chrono::Utc::now();
-    let time_min = (now - chrono::Duration::days(30)).to_rfc3339();
-    let time_max = (now + chrono::Duration::days(180)).to_rfc3339();
-    let data = match client
-        .list_events_full(remote_calendar_id, &time_min, &time_max)
-        .await?
-    {
-        EventsPage::Events(data) => data,
-        EventsPage::SyncTokenExpired => {
-            return Err(Error::Other(
-                "Google recurrence metadata read returned HTTP 410 without a sync token".into(),
-            ));
-        }
-    };
-    let conn = db.writer().await;
-    for event in &data.items {
-        // A cancelled resource may contain only its ID. Its missing recurrence
-        // fields are not positive standalone evidence, nor is this a deletion
-        // stream: the normal incremental read applies cancellation tombstones.
-        if event["status"].as_str() == Some("cancelled") {
-            continue;
-        }
-        let kind = google_recurrence_kind(event);
-        if kind == RecurrenceKind::Unknown {
-            continue;
-        }
-        let Some(remote_id) = event["id"].as_str() else {
-            continue;
-        };
-        let local_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM calendar_events
-                 WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3
-                   AND recurrence_kind = 'unknown'",
-                rusqlite::params![account_id, calendar_id, remote_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(local_id) = local_id else {
-            continue;
-        };
-        let mut cached = db::calendar::get_event(&conn, &local_id)?;
-        cached.recurrence_kind = kind;
-        upsert_google_event(&conn, event, &cached, remote_calendar_id)?;
-    }
-    Ok(())
-}
 
 fn google_response_status(status: Option<&str>) -> String {
     match status {
@@ -300,32 +228,6 @@ fn canonical_google_occurrence(
     })
 }
 
-fn upsert_google_event(
-    conn: &rusqlite::Connection,
-    source: &serde_json::Value,
-    event: &CalendarEvent,
-    provider_calendar_id: &str,
-) -> Result<()> {
-    match event.recurrence_kind {
-        RecurrenceKind::Standalone => {
-            db::calendar::upsert_event_by_remote_id_with_recurrence(conn, event, &[]).map(|_| ())
-        }
-        RecurrenceKind::Series | RecurrenceKind::Occurrence => {
-            if let Some(seed) = google_recurrence_seed(source, event, provider_calendar_id) {
-                db::calendar::upsert_event_by_remote_id_with_recurrence(conn, event, &[seed])
-                    .map(|_| ())
-            } else {
-                log::warn!(
-                    "sync_calendars_google: recurrence identity extraction failed for {}",
-                    source["id"].as_str().unwrap_or("<unknown>")
-                );
-                db::calendar::upsert_event_by_remote_id(conn, event)
-            }
-        }
-        RecurrenceKind::Unknown => db::calendar::upsert_event_by_remote_id(conn, event),
-    }
-}
-
 /// Convert Google attendees to the provider-neutral representation and pick
 /// the signed-in account's authoritative response status.
 fn parse_google_attendees(
@@ -408,43 +310,64 @@ fn readable_foreground(bg_hex: &str) -> &'static str {
 }
 
 /// The account-level sync body. Split out so `sync` can wrap it with
-/// the CalDAV fallback without recursing through the trait object.
+/// the credential-only CalDAV fallback without recursing through the trait object.
 async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
     let db = ctx.db;
     let account_id = account.id.as_str();
-    let client = ctx.services.google_client(account_id).await?;
+    let client = match ctx.services.google_client(account_id).await {
+        Ok(client) => client,
+        Err(error) if !account.caldav_url.is_empty() => {
+            log::warn!(
+                "Google calendar credentials unavailable; using configured CalDAV route: {error}"
+            );
+            return super::caldav::CalDavCalendarBackend
+                .sync(ctx, account)
+                .await;
+        }
+        Err(error) => return Err(error),
+    };
 
     // Step 1: List calendars via Google Calendar API
     let data = client.list_calendar_list().await?;
-    let items = data["items"].as_array();
-    log::info!(
-        "sync_calendars_google: fetched {} calendars",
-        items.map(|i| i.len()).unwrap_or(0)
-    );
+    let items = data["items"]
+        .as_array()
+        .ok_or_else(|| Error::Sync("Google calendar inventory omitted its items".into()))?;
+    log::info!("sync_calendars_google: fetched {} calendars", items.len());
 
-    let mut remote_to_local: std::collections::HashMap<String, (String, bool)> =
+    let mut remote_to_local: std::collections::HashMap<String, (String, bool, bool)> =
         std::collections::HashMap::new();
 
     {
         let conn = db.writer().await;
-        if let Some(calendars) = items {
-            for cal in calendars {
-                let cal_id = cal["id"].as_str().unwrap_or_default();
-                let name = cal["summary"].as_str().unwrap_or("Calendar");
-                let color = cal["backgroundColor"].as_str().unwrap_or("#4285f4");
-                let is_primary = cal["primary"].as_bool().unwrap_or(false);
+        for cal in items {
+            let cal_id = cal["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    Error::Sync("Google calendar inventory omitted a calendar ID".into())
+                })?;
+            let name = cal["summary"].as_str().unwrap_or("Calendar");
+            let color = cal["backgroundColor"].as_str().unwrap_or("#4285f4");
+            let is_primary = cal["primary"].as_bool().unwrap_or(false);
 
-                let local_id = db::calendar::upsert_calendar_by_remote_id(
-                    &conn, account_id, cal_id, name, color, is_primary,
-                )?;
-                remote_to_local.insert(cal_id.to_string(), (local_id, is_primary));
-            }
+            let local_id = db::calendar::upsert_calendar_by_remote_id(
+                &conn, account_id, cal_id, name, color, is_primary,
+            )?;
+            let subscribed = db::calendar::get_calendar(&conn, &local_id)?.is_subscribed;
+            remote_to_local.insert(cal_id.to_string(), (local_id, is_primary, subscribed));
         }
     }
 
-    // Step 2: Fetch events for each calendar (with syncToken for incremental sync)
-    for (remote_cal_id, (local_cal_id, is_primary)) in &remote_to_local {
-        let sync_key = format!("google_sync_token_{}_{}", account_id, remote_cal_id);
+    let mut read_errors = Vec::new();
+    // Incremental transport always produces a complete current wire mirror.
+    for (remote_cal_id, (local_cal_id, is_primary, subscribed)) in &remote_to_local {
+        if !subscribed {
+            continue;
+        }
+        let sync_key = format!(
+            "google_resource_sync_token_{}_{}",
+            account_id, remote_cal_id
+        );
 
         // Check for existing syncToken
         let existing_token: Option<String> = {
@@ -454,69 +377,63 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                 rusqlite::params![sync_key],
                 |row| row.get(0),
             )
-            .ok()
+            .optional()?
         };
 
-        let has_unknown_events = {
-            let conn = db.reader();
-            needs_recurrence_refresh(&conn, account_id, local_cal_id)?
+        let cached = db::calendar_sync::native_resources(&db.reader(), local_cal_id, "google")?;
+        let mut full = existing_token.is_none() || cached.is_none();
+        let page = client
+            .list_resources_sync(
+                remote_cal_id,
+                if full {
+                    None
+                } else {
+                    existing_token.as_deref()
+                },
+            )
+            .await?;
+        let mut events_data = match page {
+            EventsPage::Events(data) => data,
+            EventsPage::SyncTokenExpired => {
+                full = true;
+                match client.list_resources_sync(remote_cal_id, None).await? {
+                    EventsPage::Events(data) => data,
+                    EventsPage::SyncTokenExpired => {
+                        return Err(Error::Sync(
+                            "Google full resource read expired without a token".into(),
+                        ))
+                    }
+                }
+            }
         };
-        // The initial normal full read already provides classification. With
-        // an existing cursor, recovery supplements rather than replaces delta
-        // catch-up, including when an old unknown row is outside the window.
-        if has_unknown_events && existing_token.is_some() {
-            if let Err(error) =
-                refresh_recurrence(db, &client, account_id, local_cal_id, remote_cal_id).await
-            {
-                log::warn!(
-                    "sync_calendars_google: recurrence refresh failed for {}: {}",
-                    remote_cal_id,
-                    error
+        if !full {
+            let mut merged = std::collections::BTreeMap::new();
+            for resource in cached.expect("incremental read requires a mirror") {
+                merged.insert(
+                    resource.event_id,
+                    serde_json::from_str::<serde_json::Value>(&resource.data).map_err(|error| {
+                        Error::Sync(format!("Invalid Google wire mirror: {error}"))
+                    })?,
                 );
             }
+            for value in events_data.items {
+                let id = value["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| Error::Sync("Google resource omitted its ID".into()))?
+                    .to_owned();
+                if value["status"].as_str() == Some("cancelled")
+                    && value.get("recurringEventId").is_none()
+                {
+                    merged.remove(&id);
+                    // A deleted master owns its finite exception resources too.
+                    merged.retain(|_, item| item["recurringEventId"].as_str() != Some(&id));
+                } else {
+                    merged.insert(id, value);
+                }
+            }
+            events_data.items = merged.into_values().collect();
         }
-        let page = if let Some(token) = existing_token.as_deref() {
-            // Incremental sync
-            log::debug!(
-                "sync_calendars_google: incremental sync for calendar {}",
-                remote_cal_id
-            );
-            client.list_events_incremental(remote_cal_id, token).await
-        } else {
-            // Full sync
-            let now = chrono::Utc::now();
-            let time_min = (now - chrono::Duration::days(30)).to_rfc3339();
-            let time_max = (now + chrono::Duration::days(180)).to_rfc3339();
-            client
-                .list_events_full(remote_cal_id, &time_min, &time_max)
-                .await
-        };
-
-        let events_data = match page {
-            Ok(EventsPage::Events(data)) => data,
-            Ok(EventsPage::SyncTokenExpired) => {
-                // syncToken expired — clear it and retry with full sync on next cycle
-                log::info!(
-                    "sync_calendars_google: syncToken expired for {}, will full sync next time",
-                    remote_cal_id
-                );
-                let conn = db.writer().await;
-                conn.execute(
-                    "DELETE FROM app_metadata WHERE key = ?1",
-                    rusqlite::params![sync_key],
-                )
-                .ok();
-                continue;
-            }
-            Err(e) => {
-                log::error!(
-                    "sync_calendars_google: events fetch failed for {}: {}",
-                    remote_cal_id,
-                    e
-                );
-                continue;
-            }
-        };
 
         let count = events_data.items.len();
         log::info!(
@@ -525,45 +442,28 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
             remote_cal_id
         );
 
-        let mut conn = db.writer().await;
+        let mut resources = Vec::new();
         {
             for ev in &events_data.items {
-                let event_id_remote = ev["id"].as_str().unwrap_or_default();
+                let event_id_remote = ev["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| Error::Sync("Google resource omitted its ID".into()))?;
 
-                // Incremental sync: cancelled events should be deleted locally
+                let native = crate::calendar::event_set::NativeCalendarResource {
+                    protocol: "google".into(),
+                    calendar_id: remote_cal_id.clone(),
+                    event_id: event_id_remote.into(),
+                    revision: ev["etag"].as_str().map(str::to_owned),
+                    data: ev.to_string(),
+                };
                 if ev["status"].as_str() == Some("cancelled") {
-                    let transaction = match conn.transaction() {
-                        Ok(transaction) => transaction,
-                        Err(_) => continue,
-                    };
-                    let deleted = match db::calendar_event_deletion::delete_events_by_remote_id(
-                        &transaction,
-                        account_id,
-                        event_id_remote,
-                    ) {
-                        Ok(result) => result.deleted,
-                        Err(_) => continue,
-                    };
-                    // Also delete by iCalUID for events created locally via respond_to_invite
-                    if let Some(ical_uid) = ev["iCalUID"].as_str() {
-                        if db::calendar_event_deletion::delete_unpushed_events_by_uid(
-                            &transaction,
-                            account_id,
-                            ical_uid,
-                        )
-                        .is_err()
-                        {
-                            continue;
-                        }
-                    }
-                    if transaction.commit().is_err() {
-                        continue;
-                    }
-                    if deleted > 0 {
-                        log::info!(
-                            "sync_calendars_google: deleted cancelled event '{}'",
-                            event_id_remote
-                        );
+                    if ev.get("recurringEventId").is_some() {
+                        resources.push(db::calendar_sync::Resource {
+                            native,
+                            set: None,
+                            error: None,
+                        });
                     }
                     continue;
                 }
@@ -582,6 +482,10 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                 } else if let Some(d) = ev["start"]["date"].as_str() {
                     (d.to_string(), true)
                 } else {
+                    resources.push(db::calendar_sync::Resource::unsupported(
+                        native,
+                        "Google event omitted its start",
+                    ));
                     continue;
                 };
 
@@ -591,7 +495,11 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                 } else if let Some(d) = ev["end"]["date"].as_str() {
                     d.to_string()
                 } else {
-                    start_time.clone()
+                    resources.push(db::calendar_sync::Resource::unsupported(
+                        native,
+                        "Google event omitted its end",
+                    ));
+                    continue;
                 };
 
                 let organizer_email = parse_google_organizer(ev, &account.email, *is_primary);
@@ -622,36 +530,104 @@ async fn sync_google(ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Res
                     etag: ev["etag"].as_str().map(|s| s.to_string()),
                 };
 
-                if let Err(e) = upsert_google_event(&conn, ev, &cal_event, remote_cal_id) {
-                    log::error!("sync_calendars_google: upsert event failed: {}", e);
+                if cal_event.recurrence_kind == RecurrenceKind::Series {
+                    match event_sets::from_sync_resources(
+                        account,
+                        &cal_event,
+                        remote_cal_id,
+                        ev,
+                        &events_data.items,
+                    ) {
+                        Ok(set) => resources.push(db::calendar_sync::Resource::readable(set)?),
+                        Err(error) => {
+                            resources.push(db::calendar_sync::Resource::unsupported(native, error))
+                        }
+                    }
+                } else if cal_event.recurrence_kind == RecurrenceKind::Standalone {
+                    // This is a complete resource, including a series converted
+                    // into a standalone event. Do not let old ownership absorb it.
+                    let set = CalendarEventSet {
+                        native: Some(native),
+                        event: cal_event,
+                        overrides: vec![],
+                        content: None,
+                    };
+                    resources.push(db::calendar_sync::Resource::readable(set)?);
+                } else if cal_event.recurrence_kind == RecurrenceKind::Occurrence {
+                    // Finite overrides are persisted with the master's set below.
+                    if !events_data.items.iter().any(|master| {
+                        master["id"].as_str() == ev["recurringEventId"].as_str()
+                            && master["status"].as_str() != Some("cancelled")
+                    }) {
+                        resources.push(db::calendar_sync::Resource::unsupported(
+                            native,
+                            "Google exception lacks a master",
+                        ));
+                    } else {
+                        resources.push(db::calendar_sync::Resource {
+                            native,
+                            set: None,
+                            error: None,
+                        });
+                    }
+                } else {
+                    resources.push(db::calendar_sync::Resource::unsupported(
+                        native,
+                        "Google event has ambiguous recurrence",
+                    ));
                 }
             }
         }
 
-        // Drop the conn lock before acquiring again for syncToken
-        drop(conn);
-
-        // Save nextSyncToken for incremental sync next time
-        let conn = db.writer().await;
-        conn.execute(
+        for resource in &resources {
+            if let Some(error) = &resource.error {
+                read_errors.push(format!(
+                    "Google resource {} cannot be displayed: {error}",
+                    resource.native.event_id
+                ));
+            }
+        }
+        let mut conn = db.writer().await;
+        let transaction = conn.transaction()?;
+        db::calendar_sync::replace_calendar(
+            &transaction,
+            account_id,
+            local_cal_id,
+            "google",
+            &resources,
+        )?;
+        // Publishing the cursor and the cache is one transaction. An apply error
+        // rolls both back, so the next sync cannot skip a lost provider change.
+        transaction.execute(
             "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
             rusqlite::params![sync_key, events_data.next_sync_token],
-        )
-        .ok();
+        )?;
+        transaction.commit()?;
         log::debug!(
             "sync_calendars_google: saved syncToken for calendar {}",
             remote_cal_id
         );
-
-        // The initial list is time-bounded, so absence cannot prove deletion.
-        // Incremental sync supplies explicit cancelled tombstones above.
     }
 
+    {
+        let mut conn = db.writer().await;
+        let tx = conn.transaction()?;
+        db::calendar_sync::replace_inventory(
+            &tx,
+            account_id,
+            &remote_to_local.keys().map(String::as_str).collect(),
+        )?;
+        tx.commit()?;
+    }
     log::info!(
         "sync_calendars_google: completed for account {}",
         account_id
     );
-    Ok(())
+    if read_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Sync(read_errors.join("; ")))
+    }
 }
 
 #[async_trait]
@@ -661,7 +637,75 @@ impl CalendarBackend for GoogleCalendarBackend {
     }
 
     fn event_creation_target(&self) -> super::EventCreationTarget {
-        super::EventCreationTarget::AccountDefault
+        super::EventCreationTarget::SelectedCalendar
+    }
+
+    async fn fetch_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        event: &CalendarEvent,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarEventSet> {
+        if event.account_id != account.id {
+            return Err(Error::Other("Google source account mismatch".into()));
+        }
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::fetch(&client, account, event, remote_calendar_id).await
+    }
+
+    async fn update_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        desired: &CalendarEventSet,
+    ) -> Result<CalendarEventSet> {
+        event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::update(&client, account, before, desired).await
+    }
+
+    async fn create_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        remote_calendar_id: &str,
+        desired: &CalendarEventSet,
+        operation_id: &str,
+    ) -> Result<CalendarEventSet> {
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::create(&client, account, remote_calendar_id, desired, operation_id).await
+    }
+
+    async fn delete_event_set(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+    ) -> Result<()> {
+        let native = event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::check_current(&client, account, before).await?;
+        client
+            .delete_set_event(
+                &native.calendar_id,
+                &native.event_id,
+                event_sets::revision(native)?,
+            )
+            .await
+    }
+
+    async fn move_event_set_native(
+        &self,
+        ctx: &CalendarBackendCtx<'_>,
+        account: &AccountFull,
+        before: &CalendarEventSet,
+        remote_calendar_id: &str,
+    ) -> Result<CalendarCapability<CalendarEventSet>> {
+        event_sets::validate_source(before, account)?;
+        let client = ctx.services.google_client(&account.id).await?;
+        event_sets::move_native(&client, account, before, remote_calendar_id).await
     }
 
     fn remote_rsvp_policy(&self) -> RemoteRsvpPolicy {
@@ -879,46 +923,29 @@ impl CalendarBackend for GoogleCalendarBackend {
         })
     }
 
-    /// REST sync with a CalDAV fallback: accounts configured before
-    /// OAuth (or with a broken token) keep syncing through their
-    /// `caldav_url` instead of failing outright.
+    /// Credentials may select the legacy CalDAV route, but a failed REST read or
+    /// deferred reconciliation must never silently switch provider namespaces.
     async fn sync(&self, ctx: &CalendarBackendCtx<'_>, account: &AccountFull) -> Result<()> {
-        match sync_google(ctx, account).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                log::warn!(
-                    "sync_calendars: Gmail CalDAV sync failed (OAuth may not be configured): {}",
-                    e
-                );
-                if !account.caldav_url.is_empty() {
-                    super::caldav::CalDavCalendarBackend
-                        .sync(ctx, account)
-                        .await
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        sync_google(ctx, account).await
     }
 
     fn validate_event_creation(&self, event: &CalendarEvent, _: &str) -> Result<()> {
         event_to_google_json(event).map(|_| ())
     }
 
-    /// Google events are always created on the primary calendar (the
-    /// pre-trait behaviour); `remote_calendar_id` is ignored.
+    /// Insert into the exact selected calendar.
     async fn push_created_event(
         &self,
         ctx: &CalendarBackendCtx<'_>,
         account: &AccountFull,
         event: &CalendarEvent,
-        _remote_calendar_id: &str,
+        remote_calendar_id: &str,
     ) -> Result<Option<PushedEvent>> {
         let google_event = event_to_google_json(event)?;
         let client = ctx.services.google_client(&account.id).await?;
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         let (remote_id, canonical_uid) = client
-            .create_event("primary", &google_event, send_updates)
+            .create_event(remote_calendar_id, &google_event, send_updates)
             .await?;
         Ok(Some(PushedEvent {
             remote_id,
@@ -934,11 +961,12 @@ impl CalendarBackend for GoogleCalendarBackend {
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<()> {
+        let calendar = event_sets::stored_calendar(ctx, account, event, remote_id)?;
         let client = ctx.services.google_client(&account.id).await?;
         let patch = event_patch_to_google_json(event);
         let send_updates = send_updates_for(event.attendees_json.as_deref());
         client
-            .patch_event("primary", remote_id, &patch, send_updates)
+            .patch_event(&calendar, remote_id, &patch, send_updates)
             .await
     }
 
@@ -949,10 +977,11 @@ impl CalendarBackend for GoogleCalendarBackend {
         remote_id: &str,
         event: &CalendarEvent,
     ) -> Result<Option<String>> {
+        let calendar = event_sets::stored_calendar(ctx, account, event, remote_id)?;
         let client = ctx.services.google_client(&account.id).await?;
         let patch = invitation_copy_patch_to_google_json(event)?;
         client
-            .patch_event("primary", remote_id, &patch, "none")
+            .patch_event(&calendar, remote_id, &patch, "none")
             .await?;
         Ok(None)
     }
@@ -1128,7 +1157,7 @@ fn google_rsvp_attendees_patch(
 
 /// Shared Google/Graph sync fixtures use real HTTP clients and the real schema.
 #[cfg(test)]
-pub(super) mod sync_testutil {
+pub(crate) mod sync_testutil {
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1355,7 +1384,11 @@ pub(super) mod sync_testutil {
         let captured = tokio::spawn(async move {
             let mut requests = Vec::new();
             for (method, status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("fixture request was not made")
+                        .unwrap();
                 let mut bytes = Vec::new();
                 loop {
                     let mut chunk = [0; 4096];
@@ -1382,6 +1415,10 @@ pub(super) mod sync_testutil {
                 let request = String::from_utf8(bytes).unwrap();
                 assert_eq!(request.split_whitespace().next(), Some(method), "{request}");
                 requests.push(request);
+                if status == 0 {
+                    // Simulate a committed write whose HTTP response was lost.
+                    continue;
+                }
                 let body = body.to_string();
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let response = format!(
@@ -1427,7 +1464,12 @@ pub(super) mod creation_testutil {
                 if kind == RecurrenceKind::Standalone && rule.is_none_or(str::is_empty) {
                     continue;
                 }
+                if kind == RecurrenceKind::Series && rule == Some("FREQ=WEEKLY") {
+                    continue;
+                }
                 let mut event = event();
+                event.start_time.push('Z');
+                event.end_time.push('Z');
                 event.id = uuid::Uuid::new_v4().to_string();
                 event.recurrence_kind = kind;
                 event.recurrence_rule = rule.map(str::to_string);
@@ -1443,10 +1485,7 @@ pub(super) mod creation_testutil {
                 assert!(
                     matches!(
                         error,
-                        Error::UnsupportedCapability {
-                            protocol,
-                            capability: "recurring or unclassified event creation",
-                        } if protocol == backend.protocol()
+                        Error::UnsupportedCapability { .. } | Error::Sync(_) | Error::Other(_)
                     ),
                     "{kind:?}, {rule:?}: {error}"
                 );
@@ -1476,6 +1515,10 @@ pub(super) mod creation_testutil {
             let (root, captured) = serve_create_response(response.clone()).await;
             let services = services(&root);
             let mut event = event();
+            if backend.protocol() == "google" {
+                event.start_time.push('Z');
+                event.end_time.push('Z');
+            }
             event.recurrence_rule = rule.map(str::to_string);
             let pushed = backend
                 .push_created_event(
@@ -1508,7 +1551,7 @@ pub(super) mod creation_testutil {
 
 #[cfg(test)]
 mod creation_tests {
-    use super::creation_testutil::{assert_rejected_before_io, assert_standalone_creation};
+    use super::creation_testutil::assert_standalone_creation;
     use super::sync_testutil::{serve_patch_response, services, setup_db};
     use super::GoogleCalendarBackend;
     use crate::backend::calendar::{CalendarBackend, CalendarBackendCtx};
@@ -1517,7 +1560,25 @@ mod creation_tests {
 
     #[tokio::test]
     async fn rejects_lossy_creation_before_credentials_and_preserves_local_event() {
-        assert_rejected_before_io(&GoogleCalendarBackend).await;
+        super::creation_testutil::assert_rejected_before_io(&GoogleCalendarBackend).await;
+        let (_directory, db) = setup_db().await;
+        let services = super::sync_testutil::services_with_credentials("http://127.0.0.1:1", false);
+        for kind in [RecurrenceKind::Unknown, RecurrenceKind::Occurrence] {
+            let mut event = event();
+            event.recurrence_kind = kind;
+            assert!(GoogleCalendarBackend
+                .push_created_event(
+                    &CalendarBackendCtx {
+                        db: &db,
+                        services: &services
+                    },
+                    &account("calendar", "google"),
+                    &event,
+                    "selected",
+                )
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]
@@ -1556,6 +1617,8 @@ mod creation_tests {
         );
         let provider_services = services(&root);
 
+        event.remote_id = Some("remote-series".into());
+        crate::db::calendar::insert_event(&*db.writer().await, &event).unwrap();
         GoogleCalendarBackend
             .push_updated_invitation_copy(
                 &CalendarBackendCtx {
@@ -1597,6 +1660,8 @@ mod creation_tests {
             Some(serde_json::json!([{"email": "guest@example.test"}]).to_string());
         let provider_services = services(&root);
 
+        event.remote_id = Some("remote-event".into());
+        crate::db::calendar::insert_event(&*db.writer().await, &event).unwrap();
         GoogleCalendarBackend
             .push_updated_invitation_copy(
                 &CalendarBackendCtx {
@@ -2103,9 +2168,7 @@ mod occurrence_update_tests {
 #[cfg(test)]
 mod recurrence_sync_tests {
     use super::sync_testutil::{cache_event, serve_responses, services, setup_db};
-    use super::{
-        google_recurrence_seed, needs_recurrence_refresh, sync_google, CalendarBackendCtx,
-    };
+    use super::{google_recurrence_seed, sync_google, CalendarBackendCtx};
     use crate::backend::testutil::{account, event};
     use crate::calendar::recurrence_identity::{
         OccurrenceFields, RecurrenceIdentitySeed, RecurrenceObjectKind, RecurrenceValueType,
@@ -2115,7 +2178,7 @@ mod recurrence_sync_tests {
     use rusqlite::OptionalExtension;
     use serde_json::json;
 
-    const SYNC_KEY: &str = "google_sync_token_acc1_primary";
+    const SYNC_KEY: &str = "google_resource_sync_token_acc1_primary";
 
     fn assert_events_query(request: &str, sync_token: Option<&str>) {
         let target = request.split_whitespace().nth(1).unwrap();
@@ -2124,7 +2187,7 @@ mod recurrence_sync_tests {
         assert_eq!(url.path(), "/calendar-api/calendars/primary/events");
         assert_eq!(
             query.get("singleEvents").map(|value| value.as_ref()),
-            Some("true")
+            Some("false")
         );
         assert_eq!(
             query.get("maxResults").map(|value| value.as_ref()),
@@ -2135,11 +2198,7 @@ mod recurrence_sync_tests {
             sync_token
         );
         for bound in ["timeMin", "timeMax"] {
-            assert_eq!(
-                query.contains_key(bound),
-                sync_token.is_none(),
-                "{bound}: {request}"
-            );
+            assert!(!query.contains_key(bound), "{bound}: {request}");
         }
     }
 
@@ -2257,11 +2316,12 @@ mod recurrence_sync_tests {
     }
 
     #[tokio::test]
-    async fn sync_ingests_stable_identity_and_fails_closed_for_malformed_data() {
+    async fn sync_ingests_complete_series_and_replaces_its_cached_identity() {
         let (_dir, db) = setup_db().await;
         {
             let conn = db.writer().await;
-            for id in ["standalone", "malformed"] {
+            {
+                let id = "standalone";
                 cache_event(&conn, id, Some(id));
                 let cached = db::calendar::get_event(&conn, id).unwrap();
                 db::calendar::upsert_event_by_remote_id_with_recurrence(
@@ -2277,24 +2337,11 @@ mod recurrence_sync_tests {
             "id": "master",
             "iCalUID": "master@example.test",
             "summary": "Master",
-            "start": {"dateTime": "2026-09-15T09:00:00+02:00"},
-            "end": {"dateTime": "2026-09-15T10:00:00+02:00"},
+            "start": {"dateTime": "2026-09-15T09:00:00+02:00", "timeZone": "Europe/Stockholm"},
+            "end": {"dateTime": "2026-09-15T10:00:00+02:00", "timeZone": "Europe/Stockholm"},
             "recurrence": ["RRULE:FREQ=WEEKLY"],
             "etag": "master-etag",
             "providerOnly": {"preserved": true}
-        });
-        let all_day = json!({
-            "id": "all-day",
-            "iCalUID": "master@example.test",
-            "summary": "All day occurrence",
-            "start": {"date": "2026-09-22"},
-            "end": {"date": "2026-09-23"},
-            "recurringEventId": "master",
-            "originalStartTime": {
-                "date": "2026-09-22",
-                "timeZone": "Europe/Stockholm"
-            },
-            "etag": "all-day-etag"
         });
         let timed = json!({
             "id": "timed",
@@ -2313,18 +2360,10 @@ mod recurrence_sync_tests {
             "providerOnly": [1, 2, 3]
         });
         let standalone = remote_event("standalone");
-        let mut malformed = remote_event("malformed");
-        malformed["recurringEventId"] = json!("master");
         let calendars = json!({
             "items": [{"id": "primary", "summary": "Calendar", "primary": true}]
         });
-        let items = vec![
-            master.clone(),
-            all_day.clone(),
-            timed.clone(),
-            standalone,
-            malformed,
-        ];
+        let items = vec![master.clone(), timed.clone(), standalone];
         let (root, captured) = serve_responses(vec![
             (200, calendars.clone()),
             (
@@ -2332,7 +2371,7 @@ mod recurrence_sync_tests {
                 json!({"items": items.clone(), "nextSyncToken": "token-1"}),
             ),
             (200, calendars),
-            (200, json!({"items": items, "nextSyncToken": "token-2"})),
+            (200, json!({"items": [], "nextSyncToken": "token-2"})),
         ])
         .await;
         let provider_services = services(&root);
@@ -2344,14 +2383,15 @@ mod recurrence_sync_tests {
         sync_google(&ctx, &account).await.unwrap();
         let first_object_ids: Vec<String> = {
             let conn = db.reader();
-            ["master", "all-day", "timed"]
+            ["master", "timed"]
                 .iter()
                 .map(|remote_id| {
                     conn.query_row(
                         "SELECT recurrence.object_id
                          FROM calendar_recurrence_objects recurrence
                          JOIN calendar_events event ON event.id = recurrence.event_id
-                         WHERE event.remote_id = ?1",
+                         WHERE (recurrence.provider_series_id = ?1 AND recurrence.object_kind = 'master')
+                            OR recurrence.provider_occurrence_id = ?1",
                         [remote_id],
                         |row| row.get(0),
                     )
@@ -2365,19 +2405,21 @@ mod recurrence_sync_tests {
         assert_events_query(&requests[3], Some("token-1"));
 
         let conn = db.reader();
-        let identities = ["master", "all-day", "timed"]
+        let identities = ["master", "timed"]
             .iter()
             .map(|remote_id| {
                 conn.query_row(
-                    "SELECT event.id FROM calendar_events event WHERE event.remote_id = ?1",
+                    "SELECT recurrence.event_id FROM calendar_recurrence_objects recurrence
+                     WHERE (recurrence.provider_series_id = ?1 AND recurrence.object_kind = 'master')
+                        OR recurrence.provider_occurrence_id = ?1",
                     [remote_id],
                     |row| row.get::<_, String>(0),
                 )
                 .map(|event_id| {
-                    db::calendar_recurrence::get_by_event_id(&conn, &event_id)
-                        .unwrap()
-                        .pop()
-                        .unwrap()
+                    db::calendar_recurrence::get_by_event_id(&conn, &event_id).unwrap()
+                        .into_iter().find(|identity| if *remote_id == "master" {
+                            identity.kind == RecurrenceObjectKind::Master
+                        } else { identity.provider_occurrence_id.as_deref() == Some(*remote_id) }).unwrap()
                 })
                 .unwrap()
             })
@@ -2394,32 +2436,27 @@ mod recurrence_sync_tests {
             .iter()
             .all(|identity| identity.provider_calendar_id.as_deref() == Some("primary")));
         assert_eq!(identities[0].occurrence.start_time, "2026-09-15T07:00:00Z");
-        assert_eq!(identities[1].recurrence_id.as_deref(), Some("2026-09-22"));
         assert_eq!(
-            identities[1].recurrence_value_type,
-            Some(RecurrenceValueType::Date)
+            identities[1].recurrence_id.as_deref(),
+            Some("2026-09-29T07:00:00Z")
         );
+        assert_eq!(identities[1].occurrence.title, "Timed occurrence");
         assert_eq!(
-            identities[2].recurrence_id.as_deref(),
-            Some("2026-09-29T09:00:00+02:00")
-        );
-        assert_eq!(identities[2].occurrence.title, "Timed occurrence");
-        assert_eq!(
-            identities[2].occurrence.description.as_deref(),
+            identities[1].occurrence.description.as_deref(),
             Some("Exception description")
         );
         assert_eq!(
-            identities[2].occurrence.location.as_deref(),
+            identities[1].occurrence.location.as_deref(),
             Some("Exception room")
         );
-        assert_eq!(identities[2].occurrence.start_time, "2026-09-29T09:00:00Z");
+        assert_eq!(identities[1].occurrence.start_time, "2026-09-29T09:00:00Z");
         assert_eq!(
-            identities[2].provider_revision.as_deref(),
+            identities[1].provider_revision.as_deref(),
             Some("timed-etag")
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
-                identities[2].provider_native_data.as_deref().unwrap()
+                identities[1].provider_native_data.as_deref().unwrap()
             )
             .unwrap(),
             timed
@@ -2436,25 +2473,37 @@ mod recurrence_sync_tests {
                 .unwrap()
                 .is_empty()
         );
-        let malformed_id: String = conn
-            .query_row(
-                "SELECT id FROM calendar_events WHERE remote_id = 'malformed'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let malformed_identity = db::calendar_recurrence::get_by_event_id(&conn, &malformed_id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(
-            malformed_identity.provider_revision.as_deref(),
-            Some("trusted revision")
-        );
     }
 
     #[tokio::test]
-    async fn old_unknown_metadata_recovery_never_starves_incremental_deletions() {
+    async fn rest_reconciliation_failure_cannot_switch_to_configured_caldav_namespace() {
+        let (_dir, db) = setup_db().await;
+        let (root, captured) =
+            serve_responses(vec![(500, json!({"error":"inventory unavailable"}))]).await;
+        let services = services(&root);
+        let mut account = account("calendar", "google");
+        account.caldav_url = "http://127.0.0.1:1/caldav/".into();
+        let error = super::CalendarBackend::sync(
+            &super::GoogleCalendarBackend,
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Google calendar inventory returned"),
+            "{error}"
+        );
+        assert_eq!(captured.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_recovery_removes_old_cache_only_after_a_successful_snapshot() {
         for metadata_status in [200, 404, 410, 500] {
             let (_dir, db) = setup_db().await;
             let old_start = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
@@ -2483,22 +2532,21 @@ mod recurrence_sync_tests {
             }
             let (root, captured) = serve_responses(vec![
                 (200, json!({"items": [{"id": "primary", "summary": "Calendar"}]})),
-                (metadata_status, json!({"items": [], "nextSyncToken": "metadata-token"})),
-                (200, json!({
+                (metadata_status, json!({
                     "items": [{"id": "upcoming", "status": "cancelled"}, remote_event("new-event")],
                     "nextSyncToken": "delta-token"
                 })),
             ])
             .await;
-            sync_google(
+            let result = sync_google(
                 &CalendarBackendCtx {
                     db: &db,
                     services: &services(&root),
                 },
                 &account("calendar", "google"),
             )
-            .await
-            .unwrap();
+            .await;
+            assert_eq!(result.is_ok(), metadata_status == 200);
 
             let conn = db.reader();
             let remaining: i64 = conn
@@ -2509,17 +2557,20 @@ mod recurrence_sync_tests {
                 )
                 .unwrap();
             assert_eq!(
-                remaining, 0,
-                "metadata HTTP {metadata_status} blocked deletion"
+                remaining,
+                i64::from(metadata_status != 200),
+                "snapshot HTTP {metadata_status}"
             );
-            let old = db::calendar::get_event(&conn, "old-unknown").unwrap();
-            assert_eq!(old.start_time, old_start);
-            assert_eq!(old.recurrence_kind, RecurrenceKind::Unknown);
+            if metadata_status == 200 {
+                assert!(db::calendar::get_event(&conn, "old-unknown").is_err());
+            } else {
+                let old = db::calendar::get_event(&conn, "old-unknown").unwrap();
+                assert_eq!(old.start_time, old_start);
+                assert_eq!(old.recurrence_kind, RecurrenceKind::Unknown);
+            }
             assert_eq!(
-                db::calendar::get_event(&conn, "local-only")
-                    .unwrap()
-                    .recurrence_kind,
-                RecurrenceKind::Unknown
+                db::calendar::get_event(&conn, "local-only").is_ok(),
+                metadata_status != 200
             );
             let token: String = conn
                 .query_row(
@@ -2528,29 +2579,127 @@ mod recurrence_sync_tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(token, "delta-token");
+            assert_eq!(
+                token,
+                if metadata_status == 200 {
+                    "delta-token"
+                } else {
+                    "old-token"
+                }
+            );
             let new_kind: String = conn
                 .query_row(
-                    "SELECT recurrence_kind FROM calendar_events WHERE remote_id = 'new-event'",
+                    "SELECT COALESCE((SELECT recurrence_kind FROM calendar_events WHERE remote_id = 'new-event'), 'absent')",
                     [],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(new_kind, "standalone");
+            assert_eq!(
+                new_kind,
+                if metadata_status == 200 {
+                    "standalone"
+                } else {
+                    "absent"
+                }
+            );
             drop(conn);
 
             let requests = tokio::time::timeout(std::time::Duration::from_secs(2), captured)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), 2);
             assert_events_query(&requests[1], None);
-            assert_events_query(&requests[2], Some("old-token"));
         }
     }
 
     #[tokio::test]
-    async fn unknown_cached_rows_are_reclassified_in_place_without_deleting_omitted_rows() {
+    async fn expired_cursor_rebuild_retires_series_regardless_of_claims() {
+        for claimed in [false, true] {
+            let (_dir, db) = setup_db().await;
+            let mut master = remote_event("lunch");
+            master["recurrence"] = json!(["RRULE:FREQ=DAILY"]);
+            master["start"]["timeZone"] = json!("UTC");
+            master["end"]["timeZone"] = json!("UTC");
+            master["etag"] = json!("master-etag");
+            let (root, captured) = serve_responses(vec![
+                (
+                    200,
+                    json!({"items":[{"id":"primary","summary":"Calendar"}]}),
+                ),
+                (200, json!({"items":[master], "nextSyncToken":"old-token"})),
+                (
+                    200,
+                    json!({"items":[{"id":"primary","summary":"Calendar"}]}),
+                ),
+                (410, json!({"error":"expired"})),
+                (
+                    200,
+                    json!({"items":[remote_event("new-event")], "nextSyncToken":"rebuilt-token"}),
+                ),
+            ])
+            .await;
+            let services = services(&root);
+            let ctx = CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            };
+            let account = account("calendar", "google");
+            sync_google(&ctx, &account).await.unwrap();
+            let owner: String = db
+                .reader()
+                .query_row(
+                    "SELECT id FROM calendar_events WHERE remote_id = 'lunch'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            {
+                let conn = db.writer().await;
+                let mut child = db::calendar::get_event(&conn, &owner).unwrap();
+                child.id = "addressless-child".into();
+                child.remote_id = None;
+                child.recurrence_rule = None;
+                child.recurrence_kind = RecurrenceKind::Occurrence;
+                db::calendar::insert_event(&conn, &child).unwrap();
+                conn.execute("INSERT INTO calendar_action_members(event_id, owner_event_id) VALUES ('addressless-child', ?1)", [&owner]).unwrap();
+                if claimed {
+                    conn.execute("INSERT INTO calendar_action_operations(operation_id, account_id, event_id, data)
+                        VALUES ('unfinished', 'acc1', ?1, '{}')", [&owner]).unwrap();
+                    conn.execute("INSERT INTO calendar_action_claims(event_id, operation_id) VALUES (?1, 'unfinished')", [&owner]).unwrap();
+                }
+            }
+            let result = sync_google(&ctx, &account).await;
+            assert!(result.is_ok(), "{result:?}");
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 5);
+            assert_events_query(&requests[3], Some("old-token"));
+            assert_events_query(&requests[4], None);
+            let conn = db.reader();
+            let token: String = conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    [SYNC_KEY],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(token, "rebuilt-token");
+            assert!(db::calendar::get_event(&conn, &owner).is_err());
+            assert!(db::calendar::get_event(&conn, "addressless-child").is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'new-event'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_resources_are_isolated_without_retaining_their_old_projections() {
         for has_token in [false, true] {
             let (_dir, db) = setup_db().await;
             {
@@ -2588,16 +2737,10 @@ mod recurrence_sync_tests {
                 200,
                 json!({"items": [{"id": "primary", "summary": "Calendar", "primary": true}]}),
             )];
-            if has_token {
-                responses.push((
-                    200,
-                    json!({"items": events, "nextSyncToken": "metadata-token"}),
-                ));
-            }
             responses.push((
                 200,
                 json!({
-                    "items": if has_token { vec![new_occurrence] } else { events },
+                    "items": events,
                     "nextSyncToken": "new-token"
                 }),
             ));
@@ -2610,40 +2753,53 @@ mod recurrence_sync_tests {
                 &account("calendar", "google"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
             let requests = captured.await.unwrap();
-            assert_eq!(requests.len(), if has_token { 3 } else { 2 });
+            assert_eq!(requests.len(), 2);
             assert_events_query(&requests[1], None);
-            if has_token {
-                assert_events_query(&requests[2], Some("old-token"));
-            }
             let conn = db.reader();
-            for (id, expected) in [
-                ("standalone", RecurrenceKind::Standalone),
-                ("occurrence", RecurrenceKind::Occurrence),
-                ("malformed", RecurrenceKind::Unknown),
-                ("omitted", RecurrenceKind::Unknown),
-                ("local-null", RecurrenceKind::Unknown),
-                ("local-empty", RecurrenceKind::Unknown),
+            assert_eq!(
+                db::calendar::get_event(&conn, "standalone")
+                    .unwrap()
+                    .recurrence_kind,
+                RecurrenceKind::Standalone
+            );
+            for id in [
+                "occurrence",
+                "malformed",
+                "omitted",
+                "local-null",
+                "local-empty",
             ] {
-                let event = db::calendar::get_event(&conn, id).unwrap();
-                assert_eq!(event.id, id);
-                assert_eq!(event.recurrence_kind, expected, "{id}");
+                assert!(db::calendar::get_event(&conn, id).is_err(), "{id}");
             }
-            let new_kind: String = conn.query_row(
-                "SELECT recurrence_kind FROM calendar_events WHERE remote_id = 'new-occurrence'", [], |row| row.get(0)
-            ).unwrap();
-            assert_eq!(new_kind, "occurrence");
-            let token: String = conn
+            let new_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM calendar_events WHERE remote_id = 'new-occurrence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(new_count, 0);
+            let token: Option<String> = conn
                 .query_row(
                     "SELECT value FROM app_metadata WHERE key = ?1",
                     [SYNC_KEY],
                     |row| row.get(0),
                 )
+                .optional()
                 .unwrap();
-            assert_eq!(token, "new-token");
-            assert!(needs_recurrence_refresh(&conn, "acc1", "cal1").unwrap());
+            assert_eq!(token.as_deref(), Some("new-token"));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM calendar_remote_resources WHERE error IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                3
+            );
         }
     }
 
@@ -2691,6 +2847,9 @@ mod recurrence_sync_tests {
             let (_dir, db) = setup_db().await;
             let before = {
                 let conn = db.writer().await;
+                if incremental {
+                    conn.execute("INSERT INTO calendar_remote_sync(calendar_id, protocol) VALUES ('cal1', 'google')", []).unwrap();
+                }
                 cache_event(&conn, "cached", remote_id);
                 conn.execute(
                     "UPDATE calendar_events SET recurrence_kind = ?1 WHERE id = 'cached'",
@@ -2706,17 +2865,11 @@ mod recurrence_sync_tests {
                 }
                 serde_json::to_value(db::calendar::get_event(&conn, "cached").unwrap()).unwrap()
             };
-            let metadata_read = token.is_some()
-                && kind == RecurrenceKind::Unknown
-                && remote_id.is_some_and(|id| !id.is_empty());
             let mut responses = vec![(
                 200,
                 json!({"items": [{"id": "primary", "summary": "Calendar"}]}),
             )];
-            if metadata_read {
-                responses.push((status, json!({"error": "injected metadata read failure"})));
-            }
-            responses.push((500, json!({"error": "injected normal read failure"})));
+            responses.push((status, json!({"error": "injected normal read failure"})));
             let (root, captured) = serve_responses(responses).await;
             sync_google(
                 &CalendarBackendCtx {
@@ -2726,12 +2879,9 @@ mod recurrence_sync_tests {
                 &account("calendar", "google"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
             let requests = captured.await.unwrap();
-            assert_eq!(requests.len(), if metadata_read { 3 } else { 2 });
-            if metadata_read {
-                assert_events_query(&requests[1], None);
-            }
+            assert_eq!(requests.len(), 2);
             let normal_request = requests.last().unwrap();
             assert_events_query(normal_request, incremental.then_some("old-token"));
             let conn = db.reader();
@@ -2756,6 +2906,7 @@ mod recurrence_sync_tests {
             let (_dir, db) = setup_db().await;
             {
                 let conn = db.writer().await;
+                conn.execute("INSERT INTO calendar_remote_sync(calendar_id, protocol) VALUES ('cal1', 'google')", []).unwrap();
                 cache_event(&conn, "cancelled", Some("cancelled"));
                 conn.execute(
                     "UPDATE calendar_events SET recurrence_kind = 'standalone'
@@ -2769,7 +2920,7 @@ mod recurrence_sync_tests {
                 )
                 .unwrap();
             }
-            let (root, captured) = serve_responses(vec![
+            let mut responses = vec![
                 (
                     200,
                     json!({"items": [{"id": "primary", "summary": "Calendar"}]}),
@@ -2785,8 +2936,11 @@ mod recurrence_sync_tests {
                     }),
                 ),
                 (status, json!({"error": "injected later-page failure"})),
-            ])
-            .await;
+            ];
+            if status == 410 {
+                responses.push((500, json!({"error": "injected full recovery failure"})));
+            }
+            let (root, captured) = serve_responses(responses).await;
 
             sync_google(
                 &CalendarBackendCtx {
@@ -2796,10 +2950,10 @@ mod recurrence_sync_tests {
                 &account("calendar", "google"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
             let requests = captured.await.unwrap();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), if status == 410 { 4 } else { 3 });
             assert_events_query(&requests[1], Some("old-token"));
             assert_events_query(&requests[2], Some("old-token"));
             let second_query = url::Url::parse(&format!(
@@ -2831,14 +2985,7 @@ mod recurrence_sync_tests {
                 )
                 .optional()
                 .unwrap();
-            assert_eq!(
-                token.as_deref(),
-                if status == 410 {
-                    None
-                } else {
-                    Some("old-token")
-                }
-            );
+            assert_eq!(token.as_deref(), Some("old-token"));
         }
     }
 
@@ -2860,9 +3007,8 @@ mod recurrence_sync_tests {
             (200, calendars.clone()),
             (
                 200,
-                json!({"items": [remote_event("remote")], "nextSyncToken": "metadata-token"}),
+                json!({"items": [remote_event("remote")], "nextSyncToken": "delta-token"}),
             ),
-            (200, json!({"items": [], "nextSyncToken": "delta-token"})),
             (200, calendars),
             (
                 200,
@@ -2877,14 +3023,17 @@ mod recurrence_sync_tests {
         };
         let account = account("calendar", "google");
         sync_google(&ctx, &account).await.unwrap();
-        assert!(!needs_recurrence_refresh(&db.reader(), "acc1", "cal1").unwrap());
+        assert!(
+            db::calendar_sync::native_resources(&db.reader(), "cal1", "google")
+                .unwrap()
+                .is_some()
+        );
         sync_google(&ctx, &account).await.unwrap();
 
         let requests = captured.await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         assert_events_query(&requests[1], None);
-        assert_events_query(&requests[2], Some("old-token"));
-        assert_events_query(&requests[4], Some("delta-token"));
+        assert_events_query(&requests[3], Some("delta-token"));
         let conn = db.reader();
         assert_eq!(
             db::calendar::get_event(&conn, "cached")
@@ -2892,17 +3041,12 @@ mod recurrence_sync_tests {
                 .recurrence_kind,
             RecurrenceKind::Standalone
         );
-        assert_eq!(
-            db::calendar::get_event(&conn, "local-only")
-                .unwrap()
-                .recurrence_kind,
-            RecurrenceKind::Unknown
-        );
+        assert!(db::calendar::get_event(&conn, "local-only").is_err());
     }
 
     #[tokio::test]
-    async fn metadata_recovery_cannot_advance_cursor_or_apply_content_and_deletions() {
-        for (normal_status, expected_token) in [(500, Some("old-token")), (410, None)] {
+    async fn unreadable_resources_do_not_block_related_updates_or_deletions() {
+        for malformed_recurring in [true, false] {
             let (_dir, db) = setup_db().await;
             {
                 let conn = db.writer().await;
@@ -2922,8 +3066,12 @@ mod recurrence_sync_tests {
                 .unwrap();
             }
             let mut known = remote_event("known");
-            known["recurringEventId"] = json!("master");
-            known["originalStartTime"] = known["start"].clone();
+            if malformed_recurring {
+                known["recurringEventId"] = json!("master");
+                known["originalStartTime"] = known["start"].clone();
+            } else {
+                known.as_object_mut().unwrap().remove("end");
+            }
             let (root, captured) = serve_responses(vec![
                 (
                     200,
@@ -2938,10 +3086,6 @@ mod recurrence_sync_tests {
                         "nextSyncToken": "metadata-token"
                     }),
                 ),
-                (
-                    normal_status,
-                    json!({"error": "injected normal read failure"}),
-                ),
             ])
             .await;
             sync_google(
@@ -2952,11 +3096,10 @@ mod recurrence_sync_tests {
                 &account("calendar", "google"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
             let requests = captured.await.unwrap();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), 2);
             assert_events_query(&requests[1], None);
-            assert_events_query(&requests[2], Some("old-token"));
             let conn = db.reader();
             let token: Option<String> = conn
                 .query_row(
@@ -2966,21 +3109,17 @@ mod recurrence_sync_tests {
                 )
                 .optional()
                 .unwrap();
-            assert_eq!(token.as_deref(), expected_token);
-            for (id, kind) in [
-                ("unknown", RecurrenceKind::Standalone),
-                ("known", RecurrenceKind::Standalone),
-                ("cancelled", RecurrenceKind::Unknown),
-                ("local-only", RecurrenceKind::Unknown),
-            ] {
-                let event = db::calendar::get_event(&conn, id).unwrap();
-                assert_eq!(event.recurrence_kind, kind, "{id}");
-                assert_eq!(event.title, "Cached event", "{id}");
+            assert_eq!(token.as_deref(), Some("metadata-token"));
+            let event = db::calendar::get_event(&conn, "unknown").unwrap();
+            assert_eq!(event.recurrence_kind, RecurrenceKind::Standalone);
+            assert_eq!(event.title, "Refreshed event");
+            for id in ["known", "cancelled", "local-only"] {
+                assert!(db::calendar::get_event(&conn, id).is_err());
             }
             let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM calendar_events", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count, 4);
+            assert_eq!(count, 3);
         }
     }
 }

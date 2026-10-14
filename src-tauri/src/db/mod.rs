@@ -1,11 +1,14 @@
 pub mod accounts;
 pub mod calendar;
+pub(crate) mod calendar_actions;
 pub mod calendar_event_deletion;
 pub(crate) mod calendar_invitation;
 pub(crate) mod calendar_invitation_source;
 #[allow(dead_code)]
 pub mod calendar_recurrence;
 pub(crate) mod calendar_revision;
+pub(crate) mod calendar_sync;
+pub(crate) mod calendar_writes;
 pub mod contacts;
 pub mod filters;
 pub mod folders;
