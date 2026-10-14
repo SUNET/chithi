@@ -296,6 +296,65 @@ fn finite_old_series_and_small_result_windows_stop_without_losing_counts_or_limi
 }
 
 #[test]
+fn expired_subday_counts_finish_before_the_distant_window_budget() {
+    for (frequency, next) in [
+        ("HOURLY", "2000-01-01T10:00:00.125Z"),
+        ("MINUTELY", "2000-01-01T09:01:00.125Z"),
+        ("SECONDLY", "2000-01-01T09:00:01.125Z"),
+    ] {
+        let mut event = event(&format!("FREQ={frequency};COUNT=2"));
+        event.all_day = false;
+        event.timezone = Some("UTC".into());
+        event.start_time = "2000-01-01T09:00:00.125Z".into();
+        event.end_time = "2000-01-01T09:00:00.625Z".into();
+        let page = expand(&event, "2026-10-01", "2026-11-01", 100).unwrap();
+        assert!(page.occurrences.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(
+            dates(&event, "2000-01-01", "2026-11-01"),
+            [event.start_time.clone(), next.into()]
+        );
+        let proof = verify_original_positions(&event, "2026-11-01", &[next.into()]).unwrap();
+        assert_eq!(proof.count, 2);
+        assert_eq!(proof.last.as_deref(), Some(next));
+        event.recurrence_rule = Some(format!("FREQ={frequency}"));
+        assert!(expand(&event, "2026-10-01", "2026-11-01", 100)
+            .unwrap_err()
+            .to_string()
+            .contains("budget"));
+    }
+}
+
+#[test]
+fn counted_rules_still_bound_sparse_search_and_per_period_allocations() {
+    let mut event = event("FREQ=HOURLY;BYMONTH=2;BYMONTHDAY=30;COUNT=2");
+    event.all_day = false;
+    event.timezone = Some("UTC".into());
+    event.start_time = "2000-01-01T09:00:00Z".into();
+    event.end_time = "2000-01-01T10:00:00Z".into();
+    assert!(expand(&event, "2026-10-01", "2026-11-01", 100)
+        .unwrap_err()
+        .to_string()
+        .contains("budget"));
+    // One candidate can jump past the period budget without exhausting COUNT.
+    event.recurrence_rule =
+        Some("FREQ=HOURLY;INTERVAL=24;BYMONTH=1;BYMONTHDAY=1;COUNT=1000".into());
+    assert!(expand(&event, "2300-10-01", "2300-11-01", 100)
+        .unwrap_err()
+        .to_string()
+        .contains("budget"));
+    let hours = (0..24).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let minutes = (0..60).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    event.recurrence_rule = Some(format!(
+        "FREQ=YEARLY;BYHOUR={hours};BYMINUTE={minutes};BYSECOND={minutes};COUNT=1"
+    ));
+    assert!(expand(&event, "2000-01-01", "2026-11-01", 100)
+        .unwrap_err()
+        .to_string()
+        .contains("per-period"));
+}
+
+#[test]
 fn engine_budget_exhaustion_cannot_be_mistaken_for_a_complete_empty_window() {
     let event = event("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30");
     assert!(expand(&event, "2026-10-01", "2026-11-01", 100)

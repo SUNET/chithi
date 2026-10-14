@@ -133,10 +133,22 @@ Mail and contact operation semantics are unchanged. Whole-series editing and
 moves retain the plan/execute confirmation boundary; recurring user deletion is
 not added by this decision.
 
+CalDAV series edits associate each retained override with its source by verified
+recurrence phase and unchanged native resource identity. Resource partitioning
+uses the mapped original positions, and embedded/detached RECURRENCE-ID values
+and explicit dates are remapped without cloning the master over native siblings.
+Exception displacement is measured in the series zone even if the exception's
+wire boundaries use UTC. Every resource retains its own conditional validator.
+Detached writes reuse verified native timezone definitions; a definition is
+generated only when the source set does not supply it.
+
 Visible-window reads filter standalone resources using the canonical mirror's
 dates before decoding master DTOs. They do not deserialize unrelated provider
 history. Recurrence expansion streams candidates and stops at the original
 COUNT, cutoff, or established result limit, retaining DST and work-budget checks.
+For COUNT-bounded rules the period budget applies to the visited candidate span,
+not the distance to an unused future window. Early count completion is a complete
+result; sparse/impossible searches and per-period allocations remain bounded.
 Only sets with visible positions need editing snapshots; navigation does not
 publish new content or use a stale projection cache to hide expensive reads.
 

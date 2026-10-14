@@ -518,13 +518,15 @@ pub(crate) fn desired_set(
                     "change all-day mode using the series master selection",
                 ));
             }
+            let mut template = before.event.clone();
+            if input.edit.timezone.is_some() {
+                template.timezone = edited.timezone.clone();
+            }
             let shift =
-                local(&edited.start_time, &edited)? - local(&selected.start_time, &selected)?;
+                local(&edited.start_time, &template)? - local(&selected.start_time, &before.event)?;
             let new_start = local(&before.event.start_time, &before.event)?
                 .checked_add_signed(shift)
                 .ok_or_else(|| invalid("date overflow"))?;
-            let mut template = before.event.clone();
-            template.timezone = edited.timezone.clone();
             if input.edit.start_time.is_some() || input.edit.timezone.is_some() {
                 master_edit.start_time = Some(from_local(new_start, &template)?);
             }
@@ -607,7 +609,7 @@ pub(crate) fn desired_set(
                     invalid("new pattern cannot retain all exceptions; explicitly reset exceptions")
                 })?;
                 if let Some(event) = &mut exception.event {
-                    let displacement = local(&event.start_time, event)?
+                    let displacement = local(&event.start_time, &before.event)?
                         - local(&exception.original_start, &before.event)?;
                     let duration = boundary(&event.end_time)? - boundary(&event.start_time)?;
                     let new_local = local(&new_key, &desired.event)?
@@ -643,10 +645,10 @@ pub(crate) fn desired_set(
                 let index = recurrence::occurrence_index(&before.event, key)?;
                 let new_key = recurrence::position_at(&desired.event, index)?;
                 let old_fields = recurrence::resolve(&before.event, key)?;
-                let displacement = local(&selected.start_time, &selected)?
+                let displacement = local(&selected.start_time, &before.event)?
                     - local(&old_fields.start_time, &before.event)?;
                 if local(&new_key, &desired.event)? + displacement
-                    != local(&edited.start_time, &edited)?
+                    != local(&edited.start_time, &desired.event)?
                 {
                     return Err(invalid(
                         "reschedule cannot preserve the selected recurrence phase",
@@ -1779,6 +1781,43 @@ mod tests {
             "2026-03-10T15:00:00Z"
         );
         assert!(recurrence::position_at(&desired.event, 4).is_err());
+    }
+
+    #[test]
+    fn drag_from_utc_exception_uses_the_series_wall_clock_across_dst() {
+        let mut before = series();
+        let original = "2026-03-07T14:00:00Z";
+        let mut exception = selected_event(&before, Some(original)).unwrap();
+        exception.timezone = Some("UTC".into());
+        exception.start_time = "2026-03-07T17:00:00Z".into();
+        exception.end_time = "2026-03-07T19:00:00Z".into();
+        before.overrides.push(CalendarOverride {
+            original_start: original.into(),
+            event: Some(exception),
+            native: None,
+        });
+        let desired = desired_set(
+            &before,
+            &input(
+                original,
+                RecurrenceMutationScope::EntireSeries,
+                CalendarEdit {
+                    start_time: Some("2026-03-08T16:00:00Z".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(desired.event.start_time, "2026-03-08T13:00:00Z");
+        assert_eq!(desired.event.end_time, "2026-03-08T14:00:00Z");
+        assert_eq!(desired.event.timezone, before.event.timezone);
+        assert_eq!(
+            desired.overrides[0].original_start,
+            desired.event.start_time
+        );
+        let exception = desired.overrides[0].event.as_ref().unwrap();
+        assert_eq!(exception.start_time, "2026-03-08T16:00:00Z");
+        assert_eq!(exception.end_time, "2026-03-08T18:00:00Z");
     }
 
     #[test]

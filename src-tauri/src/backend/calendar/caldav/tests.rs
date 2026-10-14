@@ -749,6 +749,248 @@ async fn detached_exception_is_read_outside_view_and_edited_at_its_own_href() {
     assert!(requests[3].contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000\r\n"));
 }
 
+fn reschedule(before: &CalendarEventSet, start: &str, end: &str) -> CalendarEventSet {
+    use crate::calendar::actions::{CalendarActionInput, CalendarEdit, CalendarSelection};
+    crate::calendar::actions::desired_set(
+        before,
+        &CalendarActionInput {
+            selection: CalendarSelection {
+                event_id: before.event.id.clone(),
+                token: "test".into(),
+                original_start: None,
+            },
+            scope: crate::calendar::recurrence_identity::RecurrenceMutationScope::EntireSeries,
+            edit: CalendarEdit {
+                start_time: Some(start.into()),
+                end_time: Some(end.into()),
+                ..Default::default()
+            },
+            destination_calendar_id: None,
+            reset_exceptions: false,
+        },
+    )
+    .unwrap()
+}
+
+fn detached_reschedule_resources() -> Vec<NativeCalendarResource> {
+    let full = raw()
+        .replace("EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n", "")
+        .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", "");
+    let rid = full.find("RECURRENCE-ID").unwrap();
+    let begin = full[..rid].rfind("BEGIN:VEVENT").unwrap();
+    let end = full[rid..].find("END:VEVENT").unwrap() + rid + "END:VEVENT\r\n".len();
+    vec![
+        NativeCalendarResource {
+            data: format!("{}{}", &full[..begin], &full[end..]),
+            ..snapshot(full.clone()).native.unwrap()
+        },
+        NativeCalendarResource {
+            protocol: "caldav".into(),
+            calendar_id: "/calendar/".into(),
+            event_id: "/calendar/detached.ics".into(),
+            revision: Some("\"detached\"".into()),
+            data: format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Detached//EN\r\n{}END:VCALENDAR\r\n",
+                &full[begin..end]
+            ),
+        },
+    ]
+}
+
+#[test]
+fn rescheduled_native_exceptions_keep_their_source_component_and_new_original() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261102T110000\r\n"));
+    assert!(data.contains("DTSTART;TZID=Europe/Stockholm:20261102T140000\r\n"));
+    assert!(data.contains("X-SIBLING:keep"));
+    assert!(data.contains("SUMMARY:Exception"));
+    assert!(data.contains(
+        "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n"
+    ));
+    assert!(!data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261005T100000"));
+    // The same source-component mapping preserves embedded exceptions too.
+    let before = snapshot(
+        raw()
+            .replace("EXDATE;TZID=Europe/Stockholm:20260928T100000\r\n", "")
+            .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", ""),
+    );
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::rewrite(&before, &desired).unwrap();
+    assert!(data.contains("X-SIBLING:keep"));
+    assert_eq!(data.matches("BEGIN:VALARM").count(), 1);
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20261102T110000\r\n"));
+}
+
+#[test]
+fn detached_write_generates_a_timezone_only_when_the_set_has_no_native_definition() {
+    let mut sources = detached_reschedule_resources();
+    sources[0].data = sources[0].data.replace(
+        "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n",
+        "",
+    );
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\n"));
+    assert!(data.contains("BEGIN:STANDARD"));
+    assert!(data.contains("BEGIN:DAYLIGHT"));
+    assert!(!data.contains("X-TIMEZONE:keep"));
+}
+
+#[tokio::test]
+async fn whole_series_reschedule_updates_detached_resource_without_embedding_a_duplicate() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    let master = sources[0]
+        .data
+        .replace("20260914T100000", "20261012T110000")
+        .replace("20260914T110000", "20261012T120000");
+    let detached = sources[1]
+        .data
+        .replace("20261005T100000", "20261102T110000")
+        .replace(
+            "DTSTART:20261005T110000Z",
+            "DTSTART;TZID=Europe/Stockholm:20261102T140000",
+        )
+        .replace(
+            "DTEND:20261005T120000Z",
+            "DTEND;TZID=Europe/Stockholm:20261102T150000",
+        );
+    let (url, task) = server(vec![
+        (204, None, String::new()),
+        (204, None, String::new()),
+        (200, Some("\"v2\""), master),
+        (200, Some("\"d2\""), detached),
+    ])
+    .await;
+    let mut account = account("calendar", "caldav");
+    account.caldav_url = url;
+    let (_dir, db) = temp_pool();
+    let services = services();
+    let after = CalDavCalendarBackend
+        .update_event_set(
+            &CalendarBackendCtx {
+                db: &db,
+                services: &services,
+            },
+            &account,
+            &before,
+            &desired,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.overrides.len(), 1);
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+    assert_eq!(after.overrides[0].original_start, "2026-11-02T10:00:00Z");
+    assert_eq!(
+        after.overrides[0].event.as_ref().unwrap().start_time,
+        "2026-11-02T13:00:00Z"
+    );
+    assert_eq!(
+        after.overrides[0].native.as_ref().unwrap().event_id,
+        sources[1].event_id
+    );
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("PUT /calendar/series.ics "));
+    assert!(requests[0].contains("if-match: \"v1\"\r\n"));
+    assert!(!requests[0].contains("RECURRENCE-ID"));
+    assert!(requests[1].starts_with("PUT /calendar/detached.ics "));
+    assert!(requests[1].contains("if-match: \"detached\"\r\n"));
+    assert!(requests[1].contains("X-SIBLING:keep"));
+}
+
+#[test]
+fn remapped_embedded_exclusion_and_exception_may_cross_previous_originals() {
+    let before = snapshot(
+        raw()
+            .replace("RDATE;TZID=Europe/Stockholm:20261001T100000\r\n", "")
+            .replace("20261005", "20260921"),
+    );
+    let desired = reschedule(&before, "2026-09-21T08:00:00Z", "2026-09-21T09:00:00Z");
+    let data = resource::rewrite(&before, &desired).unwrap();
+    assert!(data.contains("EXDATE;TZID=Europe/Stockholm:20261005T100000\r\n"));
+    assert!(data.contains("RECURRENCE-ID;TZID=Europe/Stockholm:20260928T100000\r\n"));
+    assert!(data.contains("X-SIBLING:keep"));
+    let after = snapshot(data);
+    assert_eq!(after.overrides.len(), 2);
+    assert!(after
+        .overrides
+        .iter()
+        .any(|item| item.original_start == "2026-10-05T08:00:00Z" && item.event.is_none()));
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+}
+
+#[test]
+fn one_detached_resource_keeps_distinct_live_and_cancelled_remapped_components() {
+    let mut sources = detached_reschedule_resources();
+    let live = sources[1].data.replace("20261005", "20260921");
+    let cancelled = "BEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20260928T100000\r\nSTATUS:CANCELLED\r\nX-CANCELLED:keep\r\nEND:VEVENT\r\n";
+    sources[1].data = live.replace("END:VCALENDAR", &format!("{cancelled}END:VCALENDAR"));
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-09-21T08:00:00Z", "2026-09-21T09:00:00Z");
+    sources[1].data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    sources[0].data = sources[0].data.replace("20260914", "20260921");
+    let after = resource::combine(&sources, &before.event).unwrap();
+    assert!(crate::calendar::actions::semantic_eq(&desired, &after));
+    assert_eq!(after.overrides.len(), 2);
+    assert_eq!(sources[1].data.matches("RECURRENCE-ID").count(), 2);
+    assert!(sources[1].data.contains("X-SIBLING:keep"));
+    assert!(sources[1].data.contains("X-CANCELLED:keep"));
+    assert!(after
+        .overrides
+        .iter()
+        .any(|item| item.original_start == "2026-10-05T08:00:00Z" && item.event.is_none()));
+}
+
+#[test]
+fn detached_all_day_remap_preserves_date_identity_and_cancellation() {
+    let mut sources = detached_reschedule_resources();
+    sources[0].data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nSUMMARY:Dates\r\nDTSTART;VALUE=DATE:20260914\r\nDTEND;VALUE=DATE:20260915\r\nRRULE:FREQ=WEEKLY;COUNT=6\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into();
+    sources[1].data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID;VALUE=DATE:20261005\r\nSTATUS:CANCELLED\r\nX-CANCELLED:keep\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".into();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12", "2026-10-13");
+    let data = resource::detached_write(&sources[1], &before, &desired)
+        .unwrap()
+        .unwrap();
+    assert!(data.contains("RECURRENCE-ID;VALUE=DATE:20261102\r\n"));
+    assert!(data.contains("STATUS:CANCELLED\r\n"));
+    assert!(data.contains("X-CANCELLED:keep"));
+}
+
+#[test]
+fn remapped_override_must_keep_the_exact_native_owner_and_unique_source_position() {
+    let sources = detached_reschedule_resources();
+    let before = resource::combine(&sources, &snapshot(sources[0].data.clone()).event).unwrap();
+    let desired = reschedule(&before, "2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z");
+    for field in ["event", "calendar", "revision", "data"] {
+        let mut bad = desired.clone();
+        let native = bad.overrides[0].native.as_mut().unwrap();
+        match field {
+            "event" => native.event_id = "/calendar/foreign.ics".into(),
+            "calendar" => native.calendar_id = "/foreign/".into(),
+            "revision" => native.revision = Some("\"foreign\"".into()),
+            _ => native.data.push_str("foreign"),
+        }
+        assert!(
+            resource::detached_write(&sources[1], &before, &bad).is_err(),
+            "{field}"
+        );
+    }
+    let mut duplicate = desired;
+    duplicate.overrides.push(duplicate.overrides[0].clone());
+    assert!(resource::detached_write(&sources[1], &before, &duplicate).is_err());
+}
+
 #[tokio::test]
 async fn generated_occurrence_is_materialized_by_http_put() {
     let before = snapshot(raw());

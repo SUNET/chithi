@@ -164,12 +164,22 @@ pub(super) async fn update(
         })
         .map(|o| o.original_start.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let mapping = resource::override_mapping(before, desired)?;
+    let detached_desired_positions = mapping
+        .iter()
+        .filter(|(old, _)| detached_positions.contains(old.as_str()))
+        .map(|(_, new)| new.original_start.as_str())
+        .collect::<std::collections::HashSet<_>>();
     main_before
         .overrides
         .retain(|o| !detached_positions.contains(o.original_start.as_str()));
-    main_desired
-        .overrides
-        .retain(|o| !detached_positions.contains(o.original_start.as_str()));
+    main_desired.overrides.retain(|o| {
+        !detached_desired_positions.contains(o.original_start.as_str())
+            && !o
+                .native
+                .as_ref()
+                .is_some_and(|native| native.event_id != source.event_id)
+    });
     let rewrite_before = main_before.clone();
     let rewrite_desired = main_desired.clone();
     let data =

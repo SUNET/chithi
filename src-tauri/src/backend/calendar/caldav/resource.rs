@@ -198,6 +198,13 @@ impl Component {
 }
 
 fn ensure_timezones(root: &mut Component) -> Result<()> {
+    ensure_timezones_with_sources(root, std::iter::empty())
+}
+
+fn ensure_timezones_with_sources<'a>(
+    root: &mut Component,
+    sources: impl IntoIterator<Item = &'a NativeCalendarResource>,
+) -> Result<()> {
     let mut needed = HashSet::new();
     for event in root.events() {
         for entry in &event.entries {
@@ -208,9 +215,43 @@ fn ensure_timezones(root: &mut Component) -> Result<()> {
             }
         }
     }
+    // Detached writes must use the verified set's original definitions, not
+    // introduce a second, incompatible definition of the same TZID.
+    let mut inherited = BTreeMap::<String, Component>::new();
+    let mut seen = HashSet::new();
+    for source in sources {
+        if !seen.insert((&source.calendar_id, &source.event_id)) {
+            continue;
+        }
+        for entry in Component::parse(&source.data)?.entries {
+            let Entry::Component(component) = entry else {
+                continue;
+            };
+            if !component.name.eq_ignore_ascii_case("VTIMEZONE") {
+                continue;
+            }
+            let Some(tzid) = component.value("TZID")? else {
+                continue;
+            };
+            if !needed.contains(tzid) {
+                continue;
+            }
+            if inherited
+                .get(tzid)
+                .is_some_and(|existing| existing.render() != component.render())
+            {
+                return Err(invalid("conflicting detached timezone definitions"));
+            }
+            inherited.insert(tzid.to_owned(), component);
+        }
+    }
     for tzid in needed {
         if root.entries.iter().any(|entry| matches!(entry, Entry::Component(c)
             if c.name.eq_ignore_ascii_case("VTIMEZONE") && c.value("TZID").ok().flatten() == Some(tzid.as_str()))) {
+            continue;
+        }
+        if let Some(definition) = inherited.remove(&tzid) {
+            root.entries.push(Entry::Component(definition));
             continue;
         }
         let definition = super::timezones::definition(&tzid)?;
@@ -921,6 +962,124 @@ pub(super) fn same_set(a: &CalendarEventSet, b: &CalendarEventSet) -> bool {
         })
 }
 
+/// Associate source overrides with desired originals. Structural edits retain
+/// recurrence phase and the exact native payload/revision; matching
+/// only the new date can select a different sibling when shifted slots overlap.
+pub(super) fn override_mapping<'a>(
+    before: &CalendarEventSet,
+    desired: &'a CalendarEventSet,
+) -> Result<BTreeMap<String, &'a CalendarOverride>> {
+    let retained = desired
+        .overrides
+        .iter()
+        .filter(|item| item.native.is_some());
+    let structural = before.event.recurrence_rule != desired.event.recurrence_rule
+        || before.event.start_time != desired.event.start_time
+        || before.event.timezone != desired.event.timezone
+        || before.event.all_day != desired.event.all_day;
+    let remapped = retained.clone().any(|new| {
+        !before
+            .overrides
+            .iter()
+            .any(|old| old.original_start == new.original_start && old.native == new.native)
+    }) || (structural
+        && before.overrides.len() == desired.overrides.len()
+        && desired.overrides.iter().any(|new| {
+            !before
+                .overrides
+                .iter()
+                .any(|old| old.original_start == new.original_start)
+        }));
+    let mut mapping = BTreeMap::new();
+    for new in &desired.overrides {
+        let original = if remapped {
+            let index = crate::calendar::simple_recurrence::occurrence_index(
+                &desired.event,
+                &new.original_start,
+            )?;
+            crate::calendar::simple_recurrence::position_at(&before.event, index)?
+        } else {
+            new.original_start.clone()
+        };
+        let old = before
+            .overrides
+            .iter()
+            .find(|old| old.original_start == original);
+        if old.is_none() && new.native.is_none() && !remapped {
+            continue;
+        }
+        if old.is_none_or(|old| new.native.is_some() && old.native != new.native) {
+            return Err(invalid("desired override lost its native source identity"));
+        }
+        if mapping.insert(original, new).is_some() {
+            return Err(invalid(
+                "multiple desired overrides claim one native original",
+            ));
+        }
+    }
+    Ok(mapping)
+}
+
+fn remap_dates(
+    component: &mut Component,
+    mapping: &BTreeMap<String, &CalendarOverride>,
+    master: &CalendarEvent,
+) -> Result<()> {
+    for key in ["EXDATE", "RDATE"] {
+        let lines = component
+            .properties(key)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for line in lines {
+            let (head, values) = split(&line)?;
+            let originals = values
+                .split(',')
+                .map(|value| {
+                    let original = position(&format!("{head}:{value}"))?;
+                    Ok((value, original))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !originals.iter().any(|(_, old)| {
+                mapping
+                    .get(old)
+                    .is_some_and(|new| new.original_start != *old)
+            }) {
+                continue;
+            }
+            component
+                .entries
+                .retain(|entry| !matches!(entry, Entry::Property(property) if property == &line));
+            for (value, old) in originals {
+                let property = if let Some(new) = mapping.get(&old) {
+                    date_property(
+                        key,
+                        &new.original_start,
+                        master.all_day,
+                        master.timezone.as_deref(),
+                    )?
+                } else {
+                    format!("{head}:{value}")
+                };
+                component.entries.push(Entry::Property(property));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_original(component: &mut Component, original: &str, master: &CalendarEvent) -> Result<()> {
+    component.set(
+        "RECURRENCE-ID",
+        Some(date_property(
+            "RECURRENCE-ID",
+            original,
+            master.all_day,
+            master.timezone.as_deref(),
+        )?),
+    );
+    Ok(())
+}
+
 /// Edit one whole resource; unmodified exception siblings are never regenerated.
 pub(super) fn rewrite(before: &CalendarEventSet, desired: &CalendarEventSet) -> Result<String> {
     let native = before
@@ -932,6 +1091,34 @@ pub(super) fn rewrite(before: &CalendarEventSet, desired: &CalendarEventSet) -> 
         return Err(invalid("source UID contradicts native resource"));
     }
     let mut root = Component::parse(&native.data)?;
+    let mapping = override_mapping(before, desired)?;
+    let mut rebased = before.clone();
+    for entry in &mut root.entries {
+        let Entry::Component(component) = entry else {
+            continue;
+        };
+        if !component.name.eq_ignore_ascii_case("VEVENT") {
+            continue;
+        }
+        let Some(rid) = component.property("RECURRENCE-ID")? else {
+            remap_dates(component, &mapping, &desired.event)?;
+            continue;
+        };
+        if let Some(new) = mapping.get(&position(rid)?) {
+            if position(rid)? != new.original_start
+                || before.event.all_day != desired.event.all_day
+                || before.event.timezone != desired.event.timezone
+            {
+                set_original(component, &new.original_start, &desired.event)?;
+            }
+        }
+    }
+    for old in &mut rebased.overrides {
+        if let Some(new) = mapping.get(&old.original_start) {
+            old.original_start = new.original_start.clone();
+        }
+    }
+    let before = &rebased;
     let mut positions = HashSet::new();
     for item in &desired.overrides {
         if !positions.insert(&item.original_start) {
@@ -1201,6 +1388,7 @@ pub(super) fn detached_write(
     before: &CalendarEventSet,
     desired: &CalendarEventSet,
 ) -> Result<Option<String>> {
+    let mapping = override_mapping(before, desired)?;
     let mut root = Component::parse(&native.data)?;
     let mut changed = false;
     for entry in &mut root.entries {
@@ -1218,15 +1406,23 @@ pub(super) fn detached_write(
             .overrides
             .iter()
             .find(|o| o.original_start == original);
-        let new = desired
-            .overrides
-            .iter()
-            .find(|o| o.original_start == original);
-        if same_override(old, new) {
+        let new = mapping.get(&original).copied().or_else(|| {
+            desired
+                .overrides
+                .iter()
+                .find(|o| o.original_start == original && o.native.is_none())
+        });
+        let original_changed = new.is_some_and(|new| new.original_start != original)
+            || before.event.all_day != desired.event.all_day
+            || before.event.timezone != desired.event.timezone;
+        if same_override(old, new) && !original_changed {
             continue;
         }
         let new =
             new.ok_or_else(|| invalid("removing a detached override requires explicit exclusion"))?;
+        if original_changed {
+            set_original(component, &new.original_start, &desired.event)?;
+        }
         if let Some(event) = &new.event {
             let inherited = at_position(&before.event, &original)?;
             overlay(
@@ -1245,7 +1441,19 @@ pub(super) fn detached_write(
         }
         changed = true;
     }
-    Ok(changed.then(|| root.render()))
+    if !changed {
+        return Ok(None);
+    }
+    ensure_timezones_with_sources(
+        &mut root,
+        before.native.iter().chain(
+            before
+                .overrides
+                .iter()
+                .filter_map(|item| item.native.as_ref()),
+        ),
+    )?;
+    Ok(Some(root.render()))
 }
 
 pub(super) fn create(desired: &CalendarEventSet, uid: &str, marker: &str) -> Result<String> {

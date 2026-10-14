@@ -104,7 +104,7 @@ fn rule_text(value: &str, zone: Tz) -> Result<String> {
     Ok(parts.join(";"))
 }
 
-fn check_work(rule: &RRule, start: DateTime<Utc>, upper: DateTime<Utc>) -> Result<()> {
+fn check_period_work(rule: &RRule, start: DateTime<Utc>, upper: DateTime<Utc>) -> Result<()> {
     let unit = match rule.get_freq() {
         Frequency::Yearly => 365 * 86400,
         Frequency::Monthly => 28 * 86400,
@@ -121,6 +121,16 @@ fn check_work(rule: &RRule, start: DateTime<Utc>, upper: DateTime<Utc>) -> Resul
         return Err(invalid(
             "historical expansion exceeds the display work budget",
         ));
+    }
+    Ok(())
+}
+
+fn check_work(rule: &RRule, start: DateTime<Utc>, upper: DateTime<Utc>) -> Result<()> {
+    // A finite COUNT can finish long before the requested window. Check its
+    // visited period span below instead of charging the unused window history.
+    // Sparse searches still use the engine limit and the same period budget.
+    if rule.get_count().is_none() {
+        check_period_work(rule, start, upper)?;
     }
     // A yearly BYHOUR/BYMINUTE/BYSECOND cross product can allocate millions of
     // candidates before yielding even one result. Bound that per-period work.
@@ -363,6 +373,11 @@ fn visit_original_starts(
         let generated = dates.next().ok_or_else(|| {
             invalid("recurrence engine stopped before the window boundary; display work budget exhausted")
         })?;
+        check_period_work(
+            &rule,
+            dtstart.with_timezone(&Utc),
+            generated.with_timezone(&Utc),
+        )?;
         if generated > civil_upper {
             return Ok(());
         }
