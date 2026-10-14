@@ -478,6 +478,7 @@ fn reconcile_duplicate_invite_rows(
 /// Upsert an event by remote ID, falling back to a single unpushed UID match.
 /// Owns the transaction for reconciliation, provider values, and invitation
 /// proof invalidation; callers must not open a transaction around this operation.
+#[cfg(test)]
 pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Result<()> {
     let transaction = conn.unchecked_transaction()?;
     upsert_event_by_remote_id_in_transaction(&transaction, event)?;
@@ -487,6 +488,7 @@ pub fn upsert_event_by_remote_id(conn: &Connection, event: &CalendarEvent) -> Re
 
 /// Reconcile a provider event inside a caller-owned transaction.
 /// The caller must roll back the transaction on error.
+#[cfg(test)]
 pub(crate) fn upsert_event_by_remote_id_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     event: &CalendarEvent,
@@ -544,7 +546,7 @@ pub(crate) fn upsert_event_by_remote_id_with_recurrence_in_transaction(
     Ok(event_id)
 }
 
-fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<String> {
+pub(crate) fn upsert_provider_event(conn: &Connection, event: &CalendarEvent) -> Result<String> {
     if let Some(ref remote_id) = event.remote_id {
         let remote_existing: Option<ExistingEventForSync> = conn
             .query_row(
@@ -745,6 +747,20 @@ pub(crate) fn replace_event_recurrence_objects(
     let previous = super::calendar_recurrence::get_by_event_id(conn, event_id)?;
     let mut retained_ids = std::collections::HashSet::new();
 
+    // Retire changed addresses before inserting replacements. A master has one
+    // identity per event; inserting its new calendar address first violates that
+    // invariant during an otherwise valid authoritative external move.
+    for identity in &previous {
+        if identity.kind == crate::calendar::recurrence_identity::RecurrenceObjectKind::Master
+            && !seeds.iter().any(|seed| {
+                recurrence_seed_key(account_id, Some(event_id), seed)
+                    == recurrence_seed_key(account_id, Some(event_id), &identity_seed(identity))
+            })
+        {
+            super::calendar_recurrence::delete(conn, &identity.object_id)?;
+        }
+    }
+
     for seed in seeds {
         if let Some(local_series_event_id) = seed.local_series_event_id.as_deref() {
             let same_account: bool = conn.query_row(
@@ -940,65 +956,47 @@ pub fn list_events(
     start: &str,
     end: &str,
 ) -> Result<Vec<CalendarEvent>> {
-    // Single-shot events are filtered to those that overlap the visible
-    // window. Recurring events (`recurrence_rule` non-empty) ALWAYS pass
-    // through regardless of their master row's date range — their
-    // occurrences are computed by the frontend's expandRRule, and the
-    // master row's start_time can be years before the visible window.
-    // Without this carve-out, an event whose RRULE master sits in 2021
-    // never reaches expandRRule when the user views 2026.
-    let (query, do_calendar_filter) = if calendar_id.is_some() {
-        (
-            "SELECT id, account_id, calendar_id, uid, title, description, location,
-                    start_time, end_time, all_day, timezone, recurrence_rule,
-                    organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag, recurrence_kind
-             FROM calendar_events
-             WHERE account_id = ?1 AND calendar_id = ?2
-               AND EXISTS (SELECT 1 FROM calendars calendar
-                           WHERE calendar.id = calendar_events.calendar_id
-                             AND calendar.is_archived = 0)
+    // Filter using canonical mirror content, never competing event-row dates.
+    // Only decode the master DTO: get_events does not need provider payloads or
+    // exceptions. Series stay eligible regardless of the master date because
+    // list_calendar_occurrences projects their actual visible positions.
+    let mut stmt = conn.prepare(
+        "SELECT event.id, event.account_id, event.calendar_id, event.uid, event.title,
+                event.description, event.location, event.start_time, event.end_time,
+                event.all_day, event.timezone, event.recurrence_rule, event.organizer_email,
+                event.attendees_json, event.my_status, event.source_message_id,
+                event.ical_data, event.remote_id, event.etag, event.recurrence_kind,
+                CASE WHEN calendar.remote_id IS NOT NULL AND calendar.remote_id != ''
+                     THEN json_extract(resource.set_data, '$.event') END
+         FROM calendar_events event JOIN calendars calendar ON calendar.id = event.calendar_id
+         LEFT JOIN calendar_remote_resources resource ON resource.event_id = event.id
+         WHERE event.account_id = ?1 AND (?2 IS NULL OR event.calendar_id = ?2)
+           AND calendar.is_archived = 0
+           AND (
+             ((calendar.remote_id IS NULL OR calendar.remote_id = '')
                AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
-                               WHERE member.event_id = calendar_events.id
-                                 AND member.owner_event_id != calendar_events.id)
-               AND ((start_time < ?4 AND end_time > ?3)
-                    OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
-             ORDER BY start_time ASC",
-            true,
-        )
-    } else {
-        (
-            "SELECT id, account_id, calendar_id, uid, title, description, location,
-                    start_time, end_time, all_day, timezone, recurrence_rule,
-                    organizer_email, attendees_json, my_status, source_message_id,
-                    ical_data, remote_id, etag, recurrence_kind
-             FROM calendar_events
-             WHERE account_id = ?1
-               AND EXISTS (SELECT 1 FROM calendars calendar
-                           WHERE calendar.id = calendar_events.calendar_id
-                             AND calendar.is_archived = 0)
-               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
-                               WHERE member.event_id = calendar_events.id
-                                 AND member.owner_event_id != calendar_events.id)
-               AND ((start_time < ?3 AND end_time > ?2)
-                    OR (recurrence_rule IS NOT NULL AND recurrence_rule != ''))
-             ORDER BY start_time ASC",
-            false,
-        )
-    };
-
-    let mut stmt = conn.prepare(query)?;
-
-    let rows = if do_calendar_filter {
-        let cal_id = calendar_id.unwrap_or("");
-        stmt.query_map(params![account_id, cal_id, start, end], map_event_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map(params![account_id, start, end], map_event_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    Ok(rows)
+                               WHERE member.event_id = event.id AND member.owner_event_id != event.id)
+               AND ((event.start_time < ?4 AND event.end_time > ?3)
+                    OR (event.recurrence_rule IS NOT NULL AND event.recurrence_rule != '')))
+             OR (calendar.remote_id IS NOT NULL AND calendar.remote_id != ''
+               AND resource.set_data IS NOT NULL
+               AND (json_extract(resource.set_data, '$.event.recurrence_kind') = 'series'
+                 OR (julianday(json_extract(resource.set_data, '$.event.start_time')) < julianday(?4)
+                   AND (julianday(json_extract(resource.set_data, '$.event.end_time')) > julianday(?3)
+                     OR (json_extract(resource.set_data, '$.event.start_time') = json_extract(resource.set_data, '$.event.end_time')
+                       AND julianday(json_extract(resource.set_data, '$.event.start_time')) >= julianday(?3)))))))
+         ORDER BY event.start_time ASC",
+    )?;
+    let rows = stmt.query_map(params![account_id, calendar_id, start, end], |row| {
+        if let Some(data) = row.get::<_, Option<String>>(20)? {
+            Ok(serde_json::from_str(&data).map_err(|error| {
+                crate::error::Error::Sync(format!("Cannot decode remote calendar event: {error}"))
+            }))
+        } else {
+            Ok(Ok(map_event_row(row)?))
+        }
+    })?;
+    rows.map(|row| row?).collect()
 }
 
 /// List all invites for an account — events where the account is an
@@ -1534,6 +1532,7 @@ mod tests {
             );
             CREATE TABLE calendar_action_sets (event_id TEXT);
             CREATE TABLE calendar_action_claims (event_id TEXT);
+            CREATE TABLE calendar_remote_resources (calendar_id TEXT, event_id TEXT, set_data TEXT);
             INSERT INTO accounts (id, display_name, email, provider, username, password)
             VALUES
                 ('acc1', 'Test', 'test@example.com', 'generic', 'user', 'pass'),

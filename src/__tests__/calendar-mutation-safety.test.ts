@@ -35,7 +35,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import * as api from "@/lib/tauri";
 import { message } from "@tauri-apps/plugin-dialog";
-import type { CalendarEvent } from "@/lib/types";
+import type { CalendarEvent, CalendarOccurrencePage } from "@/lib/types";
 import { occurrenceId } from "@/lib/rrule";
 import { formatInTimezone } from "@/lib/datetime";
 import {
@@ -69,6 +69,21 @@ function event(patch: Partial<CalendarEvent> = {}): CalendarEvent {
     attendees_json: '[{"email":"guest@example.test","name":null,"status":"accepted"}]',
     my_status: null, source_message_id: null,
     ...patch,
+  };
+}
+
+function verifiedSeriesPage(master: CalendarEvent): CalendarOccurrencePage {
+  return {
+    occurrences: [0, 1, 2].map((day) => ({
+      selection: { event_id: master.id, token: "verified-set", original_start: `2026-09-${String(8 + day).padStart(2, "0")}T09:00:00Z` },
+      event_id: master.id, account_id: master.account_id, calendar_id: master.calendar_id,
+      fields: { title: master.title, description: master.description, location: master.location,
+        start_time: new Date(Date.parse(master.start_time) + day * 86_400_000).toISOString(),
+        end_time: new Date(Date.parse(master.end_time) + day * 86_400_000).toISOString(),
+        all_day: master.all_day, timezone: master.timezone },
+      recurrence_kind: "series", recurrence_rule: master.recurrence_rule, is_exception: false,
+    })),
+    has_more: false, needs_hydration: [], unresolved: [],
   };
 }
 
@@ -1003,11 +1018,7 @@ describe("real responsive calendar selection", () => {
   it.each([500, 1280])("keeps first/later occurrence IDs and local times at width %s", async (width) => {
     const master = event({ recurrence_kind: "series", recurrence_rule: "FREQ=DAILY;COUNT=3" });
     const store = setup(master);
-    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
-      occurrences: [],
-      has_more: false,
-      needs_hydration: [master.id], unresolved: [],
-    });
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue(verifiedSeriesPage(master));
     store.selectEvent(null);
     usePlatformStore().width = width;
     const wrapper = calendarView();
@@ -1079,9 +1090,7 @@ describe("real responsive calendar selection", () => {
       attendees_json: null,
     });
     const store = setup(master);
-    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
-      occurrences: [], has_more: false, needs_hydration: [master.id], unresolved: [],
-    });
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue(verifiedSeriesPage(master));
     const wrapper = calendarView();
     await flushPromises();
     const occurrence = store.visibleEvents[0];
@@ -1113,9 +1122,7 @@ describe("real responsive calendar selection", () => {
       attendees_json: null,
     });
     const store = setup(master);
-    vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
-      occurrences: [], has_more: false, needs_hydration: [master.id], unresolved: [],
-    });
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValue(verifiedSeriesPage(master));
     const wrapper = calendarView();
     await flushPromises();
     const occurrence = store.visibleEvents[0];

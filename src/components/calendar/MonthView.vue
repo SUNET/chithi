@@ -219,7 +219,7 @@ function onCellDrop(day: Date) {
               @click.stop="emit('eventClick', event.id)"
               @mousedown="onEventMouseDown($event, event)"
             >
-              {{ event.title }}
+              {{ event.title || '(No title)' }}
             </div>
             <div
               v-if="getEventsForDay(day).length > 3"

@@ -152,6 +152,16 @@ impl OccurrenceFields {
         if self.title.trim().is_empty() {
             return Err(Error::Other("occurrence title must be non-empty".into()));
         }
+        self.validate_range(false)
+    }
+
+    /// Provider display is not permission to edit. SUMMARY is optional and a
+    /// timed VEVENT without DTEND/DURATION represents an instantaneous event.
+    pub(crate) fn validate_display(&self) -> Result<()> {
+        self.validate_range(true)
+    }
+
+    fn validate_range(&self, display: bool) -> Result<()> {
         if self
             .timezone
             .as_deref()
@@ -176,7 +186,11 @@ impl OccurrenceFields {
             let end = DateTime::parse_from_rfc3339(&self.end_time).map_err(|_| {
                 Error::Other("timed occurrences require RFC 3339 start and end values".into())
             })?;
-            validate_positive_range(start, end)
+            if display && end == start {
+                Ok(())
+            } else {
+                validate_positive_range(start, end)
+            }
         }
     }
 }

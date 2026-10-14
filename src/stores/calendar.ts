@@ -37,8 +37,11 @@ export const useCalendarStore = defineStore("calendar", () => {
   const loading = ref(false);
   const eventsError = ref<string | null>(null);
   const calendarsError = ref<string | null>(null);
+  const syncErrors = ref<Record<string, string>>({});
+  const displayErrors = ref<string[]>([]);
   const loadError = computed(() => calendarsError.value ?? eventsError.value);
   const unresolvedOccurrences = ref<CalendarOccurrencePage["unresolved"]>([]);
+  const unverifiedSeriesIds = ref<string[]>([]);
   const repairingOccurrences = ref(false);
   const repairCooldowns = ref(new Map<string, number>());
   const repairTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -284,7 +287,9 @@ export const useCalendarStore = defineStore("calendar", () => {
       }
       try {
         await api.syncCalendars(accountId);
+        delete syncErrors.value[accountId];
       } catch (error) {
+        syncErrors.value[accountId] = String(error);
         recordCalendarSyncThrottle(accountId, error);
         throw error;
       }
@@ -305,8 +310,11 @@ export const useCalendarStore = defineStore("calendar", () => {
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
       if (r.status === "rejected") {
+        syncErrors.value[targets[i].id] = String(r.reason);
         recordCalendarSyncThrottle(targets[i].id, r.reason);
         console.error("Calendar sync failed for", targets[i].id, r.reason);
+      } else {
+        delete syncErrors.value[targets[i].id];
       }
     }
     await fetchCalendars();
@@ -394,56 +402,50 @@ export const useCalendarStore = defineStore("calendar", () => {
     eventsError.value = null;
     try {
       const range = getDateRange();
-      // Same parallelization as fetchCalendars — purely local reads.
-      const results = await Promise.all(accountsStore.accounts.map((account) =>
-        api.getEvents(account.id, range.start, range.end)));
-      const occurrencePages = await Promise.all(
-        accountsStore.accounts.map((account) =>
-          api.listCalendarOccurrences(
-            account.id,
-            null,
-            range.start,
-            range.end,
-            2000,
-          )),
-      );
-      if (occurrencePages.some((page) => page.has_more)) {
-        throw new Error(
-          "The visible calendar range exceeds the occurrence display limit.",
-        );
-      }
-      const rawEvents = results.flat();
-      const masters = new Map(rawEvents.map((event) => [event.id, event]));
+      // Each account is a coherent read unit. A failed account contributes no
+      // stale dates, but cannot discard another account's current projection.
+      const accounts = [...accountsStore.accounts];
+      const results = await Promise.allSettled(accounts.map(async (account) => {
+        const [events, page] = await Promise.all([
+          api.getEvents(account.id, range.start, range.end),
+          api.listCalendarOccurrences(account.id, null, range.start, range.end, 2000),
+        ]);
+        const masters = new Map(events.map((event) => [event.id, event]));
+        const projectedIds = new Set<string>();
+        const projected = page.occurrences.map((occurrence) => {
+          const master = masters.get(occurrence.event_id);
+          if (!master) throw new Error("Calendar occurrence has no matching local master event.");
+          const event = occurrenceEvent(occurrence, master);
+          if (projectedIds.has(event.id)) throw new Error("Calendar occurrence projection contains duplicate IDs.");
+          projectedIds.add(event.id);
+          return event;
+        });
+        return { events, page, projected };
+      }));
+      const errors: string[] = [];
+      const rawEvents: CalendarEvent[] = [];
       const projected: CalendarEvent[] = [];
-      const projectedIds = new Set<string>();
-      const projectedMasters = new Set<string>();
       const needsHydration = new Set<string>();
       const unresolved = new Map<string, CalendarOccurrencePage["unresolved"][number]>();
-      for (const page of occurrencePages) {
+      for (const [index, result] of results.entries()) {
+        if (result.status === "rejected") {
+          errors.push(`${accounts[index].display_name}: could not load calendar dates: ${String(result.reason)}`);
+          continue;
+        }
+        const { events, page, projected: dates } = result.value;
+        rawEvents.push(...events);
+        projected.push(...dates);
+        if (page.has_more) errors.push(`${accounts[index].display_name}: the visible range exceeds the display limit; some events are not shown.`);
+        for (const error of page.display_errors ?? []) errors.push(`${accounts[index].display_name}: event ${error.event_id} could not be displayed: ${error.message}`);
         for (const row of page.unresolved) unresolved.set(row.event_id, row);
         for (const id of page.needs_hydration) needsHydration.add(id);
-        for (const occurrence of page.occurrences) {
-          projectedMasters.add(occurrence.event_id);
-          const master = masters.get(occurrence.event_id);
-          if (!master) {
-            throw new Error(
-              "Calendar occurrence has no matching local master event.",
-            );
-          }
-          const event = occurrenceEvent(occurrence, master);
-          if (projectedIds.has(event.id)) {
-            throw new Error("Calendar occurrence projection contains duplicate IDs.");
-          }
-          projectedIds.add(event.id);
-          projected.push(event);
-        }
       }
-      projected.push(...expandRawEvents(
-        rawEvents.filter((event) =>
-          needsHydration.has(event.id) && !projectedMasters.has(event.id)),
-        new Date(range.start),
-        new Date(range.end),
-      ));
+      if (results.length && results.every((result) => result.status === "rejected")) {
+        throw new Error(errors.join("; "));
+      }
+      // A bare provider master cannot prove its exceptions or even that it
+      // still exists. Sync supplies complete sets; never invent provider dates
+      // from a legacy master or a historical completed action.
       if (request !== rangeRequest) return;
       const activeRange = getDateRange();
       if (activeRange.start !== range.start || activeRange.end !== range.end) {
@@ -454,7 +456,9 @@ export const useCalendarStore = defineStore("calendar", () => {
       const hadSingleEvent = selectedId && singleEventCache.value.has(selectedId);
       events.value = rawEvents;
       projectedEvents.value = projected;
+      displayErrors.value = errors;
       unresolvedOccurrences.value = [...unresolved.values()];
+      unverifiedSeriesIds.value = [...needsHydration];
       pendingDisplay.value = null;
       failedNavigation.value = null;
       if (refreshSelected && selectedId && hadSingleEvent) {
@@ -476,6 +480,7 @@ export const useCalendarStore = defineStore("calendar", () => {
           pendingDisplay.value = null;
         }
         eventsError.value = "Could not load calendar dates. Please retry.";
+        displayErrors.value = [String(error)];
       }
       if (request === rangeRequest) throw error;
     } finally {
@@ -536,8 +541,15 @@ export const useCalendarStore = defineStore("calendar", () => {
     requireMutableEvent(eventId);
   }
 
+  const creationRequests = new Map<string, string>();
   async function createEvent(event: NewEventInput): Promise<string> {
-    const id = await api.createEvent(event);
+    // A retry of the same failed request reuses the provider idempotency key.
+    // This is write intent only; it never contributes a visible event.
+    const request = JSON.stringify(event);
+    const operationId = creationRequests.get(request) ?? crypto.randomUUID();
+    creationRequests.set(request, operationId);
+    const id = await api.createEvent(event, operationId);
+    creationRequests.delete(request);
     await fetchEvents();
     return id;
   }
@@ -547,30 +559,8 @@ export const useCalendarStore = defineStore("calendar", () => {
     patch: Partial<NewEventInput>,
   ): Promise<void> {
     requireMutableEvent(eventId);
-    // Save original values for rollback on failure
-    const original = getCachedEvent(eventId)!;
-    const snapshot = { ...original };
-    const optimisticFields = ["start_time", "end_time", "calendar_id"] as const;
-
-    // Optimistic local update first for instant UI feedback
-    for (const field of optimisticFields) {
-      if (patch[field]) original[field] = patch[field];
-    }
-    try {
-      await api.updateEvent(eventId, patch);
-      await refreshAfterMutation(eventId);
-    } catch (e) {
-      // A refresh owns its new row and recurrence metadata. Roll back only
-      // our optimistic fields on the original object if they still match.
-      if (getCachedEvent(eventId) === original) {
-        for (const field of optimisticFields) {
-          if (patch[field] && original[field] === patch[field]) {
-            original[field] = snapshot[field];
-          }
-        }
-      }
-      throw e;
-    }
+    await api.updateEvent(eventId, patch);
+    await refreshAfterMutation(eventId);
   }
 
   function selectedOriginalStart(event: CalendarEvent): string | null {
@@ -948,6 +938,15 @@ export const useCalendarStore = defineStore("calendar", () => {
   // Listen for backend calendar-changed events to refresh UI
   let stopCalendarChangedListener: null | (() => void) = null;
   let calendarDisposed = false;
+  const stopSyncListeners: (() => void)[] = [];
+  void listen<{ account_id: string; error: string }>("calendar-sync-error", ({ payload }) => {
+    if (!calendarDisposed) syncErrors.value[payload.account_id] = payload.error;
+  }).then((stop) => calendarDisposed ? stop() : stopSyncListeners.push(stop))
+    .catch((error) => console.error("Failed to subscribe to calendar-sync-error:", error));
+  void listen<string>("calendar-sync-complete", ({ payload }) => {
+    if (!calendarDisposed) delete syncErrors.value[payload];
+  }).then((stop) => calendarDisposed ? stop() : stopSyncListeners.push(stop))
+    .catch((error) => console.error("Failed to subscribe to calendar-sync-complete:", error));
   void listen<string>("calendar-changed", () => {
     if (calendarDisposed) return;
     fetchCalendars().then(() => fetchEvents()).catch((error) =>
@@ -968,6 +967,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     calendarDisposed = true;
     stopCalendarSync();
     stopCalendarChangedListener?.();
+    for (const stop of stopSyncListeners) stop();
     for (const timer of repairTimers.values()) clearTimeout(timer);
   });
 
@@ -987,8 +987,11 @@ export const useCalendarStore = defineStore("calendar", () => {
     displayDate,
     loading,
     loadError,
+    syncErrors,
+    displayErrors,
     unresolvedOccurrences,
     repairingOccurrences,
+    unverifiedSeriesIds,
     repairRetryAt,
     navigationPending,
     selectedEvent,

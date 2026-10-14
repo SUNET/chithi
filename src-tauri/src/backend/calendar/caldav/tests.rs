@@ -4,6 +4,158 @@ use crate::calendar::event_set::{CalendarOverride, NativeCalendarResource};
 use crate::provider::ProviderServices;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn display_template() -> CalendarEvent {
+    CalendarEvent {
+        uid: Some("display".into()),
+        ..event()
+    }
+}
+
+fn display_native(properties: &str) -> NativeCalendarResource {
+    NativeCalendarResource {
+        protocol: "caldav".into(), calendar_id: "/calendar/".into(),
+        event_id: "/calendar/display.ics".into(), revision: Some("etag".into()),
+        data: format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\nBEGIN:VEVENT\r\nUID:display\r\n{properties}END:VEVENT\r\nEND:VCALENDAR\r\n"),
+    }
+}
+
+#[test]
+fn display_accepts_optional_title_and_instantaneous_recurrence_without_authorizing_edits() {
+    let native = display_native("DTSTART:20261008T100000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.title, "");
+    assert_eq!(set.event.start_time, set.event.end_time);
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert!(resource::snapshot(native, &event()).is_err());
+    assert!(set.validate().is_err());
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-10-08",
+        "2026-10-10",
+        10,
+    )
+    .unwrap();
+    assert_eq!(page.occurrences.len(), 2);
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|value| value.fields.title.is_empty()
+            && value.fields.start_time == value.fields.end_time));
+    assert!(crate::calendar::actions::project(
+        &set,
+        &set.event,
+        "edit",
+        "2026-10-08",
+        "2026-10-10",
+        10
+    )
+    .is_err());
+}
+
+#[test]
+fn display_uses_explicit_utc_and_identical_rules_without_rewriting_native_content() {
+    let native = display_native("DTSTART;TZID=Europe/Stockholm:20261008T100000Z\r\nDTEND;TZID=Europe/Stockholm:20261008T110000Z\r\nSUMMARY:Lunch\r\nRRULE:FREQ=DAILY;COUNT=2\r\nRRULE:FREQ=DAILY;COUNT=2\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert!(set.event.timezone.is_none());
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert!(resource::snapshot(native.clone(), &event()).is_err());
+    let conflict = NativeCalendarResource {
+        data: native
+            .data
+            .replacen("RRULE:FREQ=DAILY;COUNT=2", "RRULE:FREQ=WEEKLY;COUNT=2", 1),
+        ..native
+    };
+    assert!(resource::combine_display(&[conflict], &display_template())
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting RRULE"));
+}
+
+#[test]
+fn display_resolves_known_windows_zones_but_never_guesses_unknown_or_floating_times() {
+    let native = display_native("DTSTART;TZID=\"W. Europe Standard Time\":20261008T120000\r\nDTEND;TZID=\"W. Europe Standard Time\":20261008T130000\r\nSUMMARY:Lunch\r\n");
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert_eq!(set.event.timezone.as_deref(), Some("Europe/Berlin"));
+    assert!(resource::snapshot(native.clone(), &event()).is_err());
+    let duration = NativeCalendarResource {
+        data: native.data.replace(
+            "DTEND;TZID=\"W. Europe Standard Time\":20261008T130000",
+            "DURATION:PT1H",
+        ),
+        ..native.clone()
+    };
+    let set =
+        resource::combine_display(std::slice::from_ref(&duration), &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-08T10:00:00Z");
+    assert_eq!(set.event.end_time, "2026-10-08T11:00:00Z");
+    assert_eq!(set.native.as_ref().unwrap(), &duration);
+    let nominal = NativeCalendarResource {
+        data: duration
+            .data
+            .replace("20261008T120000", "20261024T120000")
+            .replace("DURATION:PT1H", "DURATION:P1D"),
+        ..duration.clone()
+    };
+    let set = resource::combine_display(&[nominal], &display_template()).unwrap();
+    assert_eq!(set.event.start_time, "2026-10-24T10:00:00Z");
+    assert_eq!(set.event.end_time, "2026-10-25T11:00:00Z");
+    for value in ["invalid", "P1DT", "PT999999999999999999999999H"] {
+        let malformed = NativeCalendarResource {
+            data: duration
+                .data
+                .replace("DURATION:PT1H", &format!("DURATION:{value}")),
+            ..duration.clone()
+        };
+        assert!(resource::combine_display(&[malformed], &display_template()).is_err());
+    }
+    for data in [
+        native
+            .data
+            .replace("W. Europe Standard Time", "Unknown/Zone"),
+        native.data.replace(";TZID=\"W. Europe Standard Time\"", ""),
+    ] {
+        assert!(resource::combine_display(
+            &[NativeCalendarResource {
+                data,
+                ..native.clone()
+            }],
+            &display_template()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn display_expands_rdate_only_sets_without_inventing_a_rule() {
+    let native = display_native("DTSTART;VALUE=DATE:20261008\r\nRDATE;VALUE=DATE:20261009,20261010\r\nEXDATE;VALUE=DATE:20261009\r\n");
+    let set = resource::combine_display(&[native], &display_template()).unwrap();
+    assert!(set.event.recurrence_rule.is_none());
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-10-08",
+        "2026-10-11",
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|value| value.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-10-08", "2026-10-10"]
+    );
+    assert!(set.validate().is_err());
+}
+
 fn raw() -> String {
     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\nX-CALENDAR:keep\r\n\
      BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\nX-TIMEZONE:keep\r\nEND:VTIMEZONE\r\n\

@@ -85,21 +85,9 @@ pub fn delete_account_events(conn: &Connection, account_id: &str) -> Result<Dele
     delete_events(conn, &event_ids)
 }
 
-pub fn delete_events_by_remote_id(
-    conn: &Connection,
-    account_id: &str,
-    remote_id: &str,
-) -> Result<DeletionResult> {
-    let event_ids = select_event_ids(
-        conn,
-        "SELECT id FROM calendar_events WHERE account_id = ?1 AND remote_id = ?2",
-        &[account_id, remote_id],
-    )?;
-    delete_events(conn, &event_ids)
-}
-
 /// Delete an explicit provider tombstone in its mapped local calendar only.
 /// The caller owns the transaction covering selection, meeting cleanup, and deletion.
+#[cfg(test)]
 pub fn delete_calendar_events_by_remote_id(
     conn: &Connection,
     account_id: &str,
@@ -111,20 +99,6 @@ pub fn delete_calendar_events_by_remote_id(
         "SELECT id FROM calendar_events
          WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
         &[account_id, calendar_id, remote_id],
-    )?;
-    delete_events(conn, &event_ids)
-}
-
-pub fn delete_unpushed_events_by_uid(
-    conn: &Connection,
-    account_id: &str,
-    uid: &str,
-) -> Result<DeletionResult> {
-    let event_ids = select_event_ids(
-        conn,
-        "SELECT id FROM calendar_events
-         WHERE account_id = ?1 AND uid = ?2 AND remote_id IS NULL",
-        &[account_id, uid],
     )?;
     delete_events(conn, &event_ids)
 }

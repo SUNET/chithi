@@ -47,8 +47,41 @@ pub struct JmapCalendarEvent {
     pub native_json: Option<serde_json::Value>,
     #[serde(default)]
     pub response_state: Option<String>,
-    #[serde(skip)]
-    pub(crate) recurrence_seeds: Option<Vec<RecurrenceIdentitySeed>>,
+}
+
+impl JmapConnection {
+    /// The sync reader has already verified one stable account snapshot. Decode
+    /// masters and all detached resources from that snapshot without another GET.
+    pub(crate) fn synced_set(
+        &self,
+        event: &JmapCalendarEvent,
+        template: &crate::calendar::CalendarEvent,
+        events: &[JmapCalendarEvent],
+    ) -> Result<crate::calendar::event_set::CalendarEventSet> {
+        let native = event
+            .native_json
+            .as_ref()
+            .ok_or_else(|| Error::Sync("JMAP snapshot lacks native event content".into()))?;
+        let state = event
+            .response_state
+            .as_deref()
+            .ok_or_else(|| Error::Sync("JMAP snapshot lacks its state".into()))?;
+        let detached = events
+            .iter()
+            .filter(|item| item.calendar_id == event.calendar_id)
+            .filter_map(|event| event.native_json.as_ref())
+            .filter(|value| value["baseEventId"].as_str() == Some(event.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        event_set::decode_display_set(
+            template,
+            &self.account_id,
+            &event.calendar_id,
+            state,
+            native,
+            &detached,
+        )
+    }
 }
 
 impl JmapCalendarEvent {
@@ -82,7 +115,6 @@ impl JmapCalendarEvent {
             attendees_json: event.attendees_json.clone(),
             native_json: None,
             response_state: None,
-            recurrence_seeds: None,
         };
         wire.creation_recurrence_rules()?;
         Ok(wire)
@@ -282,6 +314,10 @@ fn event_calendar_ids(event: &serde_json::Value) -> Result<Vec<String>> {
 }
 
 fn validate_event_object(event: &serde_json::Value) -> Result<String> {
+    validate_event_object_for(event, false)
+}
+
+fn validate_event_object_for(event: &serde_json::Value, display: bool) -> Result<String> {
     if !event.is_object() || event["@type"].as_str() != Some("Event") {
         return Err(Error::Sync(
             "JMAP CalendarEvent/get returned a malformed event object".into(),
@@ -294,7 +330,7 @@ fn validate_event_object(event: &serde_json::Value) -> Result<String> {
     if !event["uid"].as_str().is_some_and(valid_identifier)
         || !event["title"].is_string()
         || event_calendar_ids(event).is_err()
-        || occurrence_fields(event, None, None).is_none()
+        || occurrence_fields_for(event, None, None, display).is_none()
     {
         return Err(Error::Sync(format!(
             "JMAP CalendarEvent object {id} is malformed"
@@ -551,6 +587,15 @@ fn effective_range(
     timezone: Option<&str>,
     duration: &str,
 ) -> Option<(String, String)> {
+    effective_range_for(start, timezone, duration, false)
+}
+
+fn effective_range_for(
+    start: &str,
+    timezone: Option<&str>,
+    duration: &str,
+    display: bool,
+) -> Option<(String, String)> {
     use chrono::{SecondsFormat, TimeZone};
 
     if !valid_local_datetime(start) {
@@ -576,7 +621,7 @@ fn effective_range(
     let end = to_utc(end_local_date)?
         .checked_add_signed(chrono::Duration::try_seconds(duration.seconds)?)?
         .checked_add_signed(chrono::Duration::nanoseconds(duration.nanoseconds))?;
-    if end <= start {
+    if end < start || (!display && end == start) {
         return None;
     }
     Some((
@@ -615,6 +660,15 @@ fn occurrence_fields(
     event: &serde_json::Value,
     patch: Option<&serde_json::Map<String, serde_json::Value>>,
     recurrence_id: Option<&str>,
+) -> Option<OccurrenceFields> {
+    occurrence_fields_for(event, patch, recurrence_id, false)
+}
+
+fn occurrence_fields_for(
+    event: &serde_json::Value,
+    patch: Option<&serde_json::Map<String, serde_json::Value>>,
+    recurrence_id: Option<&str>,
+    display: bool,
 ) -> Option<OccurrenceFields> {
     let empty = serde_json::Map::new();
     let patch = patch.unwrap_or(&empty);
@@ -667,7 +721,7 @@ fn occurrence_fields(
             end.date().format("%Y-%m-%d").to_string(),
         )
     } else {
-        effective_range(start, timezone, duration)?
+        effective_range_for(start, timezone, duration, display)?
     };
     let fields = OccurrenceFields {
         title: title.to_string(),
@@ -678,7 +732,11 @@ fn occurrence_fields(
         all_day,
         timezone: timezone.map(str::to_string),
     };
-    fields.validate().ok()?;
+    if display {
+        fields.validate_display().ok()?;
+    } else {
+        fields.validate().ok()?;
+    }
     Some(fields)
 }
 
@@ -1123,13 +1181,12 @@ impl JmapConnection {
 
     /// Fetch a complete, stable account-wide CalendarEvent snapshot.
     ///
-    /// The second and third tuple members identify calendars and remote events
-    /// for which absence-based reconciliation is unsafe because the local row
-    /// model cannot represent multiple calendar memberships.
+    /// Each membership receives its own projection; wire identity and snapshot
+    /// completeness are verified before resource-local content decoding.
     pub async fn fetch_calendar_events(
         &self,
         config: &JmapConfig,
-    ) -> Result<(Vec<JmapCalendarEvent>, HashSet<String>, HashSet<String>)> {
+    ) -> Result<Vec<JmapCalendarEvent>> {
         log::debug!("JMAP fetching complete calendar event snapshot");
 
         let mut ids = Vec::new();
@@ -1297,7 +1354,14 @@ impl JmapConnection {
             }
             let expected: HashSet<&str> = chunk.iter().map(String::as_str).collect();
             for event in list {
-                let id = validate_event_object(event)?;
+                // Identity delimits the inventory. Unsupported content is
+                // decoded per resource after this stable read completes.
+                let id = event["id"]
+                    .as_str()
+                    .filter(|id| valid_identifier(id))
+                    .ok_or_else(|| Error::Sync("JMAP resource omitted a valid ID".into()))?
+                    .to_owned();
+                event_calendar_ids(event)?;
                 if !expected.contains(id.as_str()) || !returned_ids.insert(id) {
                     return Err(Error::Sync(
                         "JMAP CalendarEvent/get returned duplicate or unexpected objects".into(),
@@ -1335,22 +1399,11 @@ impl JmapConnection {
         let response_state = get_state.as_deref();
 
         let mut events = Vec::new();
-        let mut ambiguous_calendars = HashSet::new();
-        let mut ambiguous_events = HashSet::new();
         for ev in events_json {
             let memberships = event_calendar_ids(&ev)?;
-            if memberships.len() != 1 {
-                ambiguous_calendars.extend(memberships);
-                ambiguous_events.insert(ev["id"].as_str().expect("validated id").to_string());
-                continue;
-            }
             let recurrence_kind = classify_recurrence(&ev);
-            let native_data = serde_json::to_string(&ev)
-                .map_err(|error| Error::Other(format!("Invalid CalendarEvent JSON: {error}")))?;
-            let recurrence_seeds =
-                recurrence_seeds(&ev, recurrence_kind, &native_data, response_state);
             let id = ev["id"].as_str().expect("validated id").to_string();
-            let title = ev["title"].as_str().expect("validated title").to_string();
+            let title = ev["title"].as_str().unwrap_or_default().to_string();
             let description = ev["description"].as_str().map(|s| s.to_string());
             let uid = ev["uid"].as_str().map(|s| s.to_string());
 
@@ -1470,7 +1523,7 @@ impl JmapConnection {
                 end,
                 attendees.len()
             );
-            events.push(JmapCalendarEvent {
+            let decoded = JmapCalendarEvent {
                 id,
                 calendar_id: cal_id,
                 title,
@@ -1488,12 +1541,16 @@ impl JmapConnection {
                 attendees_json,
                 native_json: Some(ev),
                 response_state: response_state.map(str::to_string),
-                recurrence_seeds,
-            });
+            };
+            for calendar in memberships {
+                let mut copy = decoded.clone();
+                copy.calendar_id = calendar;
+                events.push(copy);
+            }
         }
 
         log::info!("JMAP fetched {} unambiguous calendar events", events.len());
-        Ok((events, ambiguous_calendars, ambiguous_events))
+        Ok(events)
     }
 
     /// Create a calendar event on the server via CalendarEvent/set.

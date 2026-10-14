@@ -147,6 +147,19 @@ impl Component {
             .transpose()
     }
 
+    fn display_rule(&self) -> Result<Option<&str>> {
+        let mut values = self
+            .properties("RRULE")
+            .map(|line| split(line).map(|(_, value)| value));
+        let first = values.next().transpose()?;
+        for value in values {
+            if Some(value?) != first {
+                return Err(invalid("conflicting RRULE properties"));
+            }
+        }
+        Ok(first)
+    }
+
     fn remove(&mut self, key: &str) {
         self.entries.retain(
             |entry| !matches!(entry, Entry::Property(line) if name(line).eq_ignore_ascii_case(key)),
@@ -253,6 +266,10 @@ fn unescape(value: &str) -> String {
 
 /// Decode original positions without applying the effective DTSTART or host zone.
 pub(super) fn position(line: &str) -> Result<String> {
+    position_for(line, false)
+}
+
+fn position_for(line: &str, display: bool) -> Result<String> {
     if parameter(line, "RANGE")?.is_some() {
         return Err(invalid(
             "RANGE recurrence is structurally unsupported; source must remain intact",
@@ -277,11 +294,17 @@ pub(super) fn position(line: &str) -> Result<String> {
     let dt = NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), "%Y%m%dT%H%M%S")
         .map_err(|_| invalid("invalid DATE-TIME"))?;
     let timezone = parameter(line, "TZID")?;
-    let instant = if utc && timezone.is_none() {
+    let instant = if utc && (timezone.is_none() || display) {
         dt.and_utc()
     } else if !utc {
-        let tz: chrono_tz::Tz = timezone
-            .ok_or_else(|| invalid("floating time has no authoritative timezone"))?
+        let name =
+            timezone.ok_or_else(|| invalid("floating time has no authoritative timezone"))?;
+        let name = if display {
+            crate::calendar::timezone::windows_to_iana(name).unwrap_or(name)
+        } else {
+            name
+        };
+        let tz: chrono_tz::Tz = name
             .parse()
             .map_err(|_| invalid("unknown native timezone"))?;
         tz.from_local_datetime(&dt)
@@ -342,10 +365,103 @@ fn date_property(key: &str, value: &str, all_day: bool, timezone: Option<&str>) 
     }
 }
 
-fn component_event(component: &Component, template: &CalendarEvent) -> Result<CalendarEvent> {
+/// RFC 5545 nominal days precede elapsed seconds, so P1D is not PT24H across DST.
+fn display_duration_end(event: &CalendarEvent, value: &str) -> Result<String> {
+    if !crate::calendar::ical::valid_duration_value(value) {
+        return Err(invalid("invalid DURATION"));
+    }
+    let (mut days, mut seconds, mut number) = (0i64, 0i64, 0i64);
+    for ch in value.strip_prefix('+').unwrap_or(value).chars().skip(1) {
+        if let Some(digit) = ch.to_digit(10) {
+            number = number
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(digit.into()))
+                .ok_or_else(|| invalid("duration overflow"))?;
+            continue;
+        }
+        let multiply = |factor| {
+            number
+                .checked_mul(factor)
+                .ok_or_else(|| invalid("duration overflow"))
+        };
+        match ch {
+            'W' => days = multiply(7)?,
+            'D' => days = number,
+            'H' => {
+                seconds = seconds
+                    .checked_add(multiply(3600)?)
+                    .ok_or_else(|| invalid("duration overflow"))?
+            }
+            'M' => {
+                seconds = seconds
+                    .checked_add(multiply(60)?)
+                    .ok_or_else(|| invalid("duration overflow"))?
+            }
+            'S' => {
+                seconds = seconds
+                    .checked_add(number)
+                    .ok_or_else(|| invalid("duration overflow"))?
+            }
+            'T' => {}
+            _ => return Err(invalid("invalid DURATION")),
+        }
+        number = 0;
+    }
+    let nominal = chrono::Duration::try_days(days).ok_or_else(|| invalid("duration overflow"))?;
+    if event.all_day {
+        if seconds != 0 {
+            return Err(invalid("date-valued DURATION requires whole days"));
+        }
+        return NaiveDate::parse_from_str(&event.start_time, "%Y-%m-%d")
+            .ok()
+            .and_then(|start| start.checked_add_signed(nominal))
+            .map(|end| end.to_string())
+            .ok_or_else(|| invalid("duration date overflow"));
+    }
+    let start = DateTime::parse_from_rfc3339(&event.start_time)
+        .map_err(|_| invalid("invalid duration start"))?
+        .with_timezone(&Utc);
+    let zone: chrono_tz::Tz = event
+        .timezone
+        .as_deref()
+        .unwrap_or("UTC")
+        .parse()
+        .map_err(|_| invalid("unknown duration timezone"))?;
+    let end = if days == 0 {
+        start
+    } else {
+        let local = start
+            .with_timezone(&zone)
+            .naive_local()
+            .checked_add_signed(nominal)
+            .ok_or_else(|| invalid("duration date overflow"))?;
+        zone.from_local_datetime(&local)
+            .single()
+            .ok_or_else(|| invalid("ambiguous or nonexistent duration end"))?
+            .with_timezone(&Utc)
+    };
+    end.checked_add_signed(
+        chrono::Duration::try_seconds(seconds).ok_or_else(|| invalid("duration overflow"))?,
+    )
+    .map(|end| end.to_rfc3339_opts(SecondsFormat::Secs, true))
+    .ok_or_else(|| invalid("duration date overflow"))
+}
+
+fn component_event_for(
+    component: &Component,
+    template: &CalendarEvent,
+    display: bool,
+) -> Result<CalendarEvent> {
+    // The tolerant invitation parser cannot establish display duration: it may
+    // guess a timezone or turn malformed duration into an instantaneous event.
+    // Read scheduling fields separately, leaving the persisted wire untouched.
+    let mut readable = component.clone();
+    if display {
+        readable.remove("DURATION");
+    }
     let raw = format!(
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Chithi//EN\r\n{}END:VCALENDAR\r\n",
-        component.render()
+        readable.render()
     );
     let parsed = crate::calendar::ical::parse_ical_data(&raw);
     let [invite] = parsed.as_slice() else {
@@ -366,15 +482,26 @@ fn component_event(component: &Component, template: &CalendarEvent) -> Result<Ca
     let start = component
         .property("DTSTART")?
         .ok_or_else(|| invalid("missing DTSTART"))?;
-    event.start_time = position(start)?;
+    event.start_time = position_for(start, display)?;
     event.all_day = parameter(start, "VALUE")?.is_some_and(|v| v.eq_ignore_ascii_case("DATE"));
     event.timezone = parameter(start, "TZID")?.map(str::to_owned);
+    if display {
+        event.timezone = if split(start)?.1.ends_with('Z') || event.all_day {
+            None
+        } else {
+            event.timezone.map(|name| {
+                crate::calendar::timezone::windows_to_iana(&name)
+                    .unwrap_or(&name)
+                    .to_owned()
+            })
+        };
+    }
     event.end_time = match component.property("DTEND")? {
         Some(end) => {
             if component.property("DURATION")?.is_some() {
                 return Err(invalid("DTEND and DURATION coexist"));
             }
-            position(end)?
+            position_for(end, display)?
         }
         None if event.all_day && component.property("DURATION")?.is_none() => {
             NaiveDate::parse_from_str(&event.start_time, "%Y-%m-%d")
@@ -384,9 +511,18 @@ fn component_event(component: &Component, template: &CalendarEvent) -> Result<Ca
                 .format("%Y-%m-%d")
                 .to_string()
         }
+        None if display => match component.value("DURATION")? {
+            Some(duration) => display_duration_end(&event, duration)?,
+            None => event.start_time.clone(),
+        },
         None => invite.dtend.clone(),
     };
-    event.recurrence_rule = component.value("RRULE")?.map(str::to_owned);
+    event.recurrence_rule = if display {
+        component.display_rule()?
+    } else {
+        component.value("RRULE")?
+    }
+    .map(str::to_owned);
     event.recurrence_kind = if component.property("RECURRENCE-ID")?.is_some() {
         RecurrenceKind::Occurrence
     } else if event.recurrence_rule.is_some() || component.properties("RDATE").next().is_some() {
@@ -401,16 +537,21 @@ fn component_event(component: &Component, template: &CalendarEvent) -> Result<Ca
         Some(serde_json::to_string(&invite.attendees).map_err(|e| invalid(&e.to_string()))?)
     };
     event.source_message_id = None;
-    crate::calendar::event_set::event_fields(&event).validate()?;
+    let fields = crate::calendar::event_set::event_fields(&event);
+    if display {
+        fields.validate_display()?;
+    } else {
+        fields.validate()?;
+    }
     Ok(event)
 }
 
-fn recurrence_dates(component: &Component, key: &str) -> Result<Vec<String>> {
+fn recurrence_dates_for(component: &Component, key: &str, display: bool) -> Result<Vec<String>> {
     let mut result = Vec::new();
     for line in component.properties(key) {
         let (head, values) = split(line)?;
         for value in values.split(',') {
-            result.push(position(&format!("{head}:{value}"))?);
+            result.push(position_for(&format!("{head}:{value}"), display)?);
         }
     }
     Ok(result)
@@ -442,9 +583,35 @@ fn at_position(master: &CalendarEvent, original: &str) -> Result<CalendarEvent> 
     Ok(event)
 }
 
+/// Read resource identity without requiring mutation or recurrence support.
+pub(super) fn resource_uid(raw: &str) -> Result<String> {
+    let root = Component::parse(raw)?;
+    let mut uid = None;
+    for event in root.events() {
+        let current = event
+            .value("UID")?
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| invalid("missing UID"))?;
+        if uid.as_ref().is_some_and(|uid| uid != current) {
+            return Err(invalid("mixed resource UIDs"));
+        }
+        uid = Some(current.to_owned());
+    }
+    uid.map(|uid| unescape(&uid))
+        .ok_or_else(|| invalid("resource has no VEVENT"))
+}
+
 pub(super) fn snapshot(
     native: NativeCalendarResource,
     template: &CalendarEvent,
+) -> Result<CalendarEventSet> {
+    snapshot_for(native, template, false)
+}
+
+fn snapshot_for(
+    native: NativeCalendarResource,
+    template: &CalendarEvent,
+    display: bool,
 ) -> Result<CalendarEventSet> {
     let root = Component::parse(&native.data)?;
     let mut masters = Vec::new();
@@ -464,12 +631,12 @@ pub(super) fn snapshot(
     let [master] = masters.as_slice() else {
         return Err(invalid("expected exactly one master or standalone event"));
     };
-    let mut event = component_event(master, template)?;
+    let mut event = component_event_for(master, template, display)?;
     event.remote_id = Some(native.event_id.clone());
     event.etag = native.revision.clone();
     event.ical_data = Some(native.data.clone());
     let mut overrides = BTreeMap::new();
-    for original in recurrence_dates(master, "RDATE")? {
+    for original in recurrence_dates_for(master, "RDATE", display)? {
         overrides.insert(
             original.clone(),
             CalendarOverride {
@@ -479,7 +646,7 @@ pub(super) fn snapshot(
             },
         );
     }
-    for original in recurrence_dates(master, "EXDATE")? {
+    for original in recurrence_dates_for(master, "EXDATE", display)? {
         overrides.insert(
             original.clone(),
             CalendarOverride {
@@ -494,7 +661,7 @@ pub(super) fn snapshot(
         let Some(rid) = component.property("RECURRENCE-ID")? else {
             continue;
         };
-        let original = position(rid)?;
+        let original = position_for(rid, display)?;
         if !seen.insert(original.clone()) {
             return Err(invalid("duplicate original occurrence"));
         }
@@ -504,7 +671,7 @@ pub(super) fn snapshot(
         let live = if cancelled {
             None
         } else {
-            Some(component_event(component, &event)?)
+            Some(component_event_for(component, &event, display)?)
         };
         if overrides.get(&original).is_some_and(|v| v.event.is_none()) && live.is_some() {
             return Err(invalid("live override contradicts EXDATE"));
@@ -937,6 +1104,23 @@ pub(super) fn combine(
     resources: &[NativeCalendarResource],
     template: &CalendarEvent,
 ) -> Result<CalendarEventSet> {
+    combine_for(resources, template, false)
+}
+
+/// Display decoding preserves the original resources. Tolerated redundant wire
+/// metadata never becomes permission to rewrite that resource.
+pub(super) fn combine_display(
+    resources: &[NativeCalendarResource],
+    template: &CalendarEvent,
+) -> Result<CalendarEventSet> {
+    combine_for(resources, template, true)
+}
+
+fn combine_for(
+    resources: &[NativeCalendarResource],
+    template: &CalendarEvent,
+    display: bool,
+) -> Result<CalendarEventSet> {
     let mut master_native = None;
     let mut roots = Vec::new();
     let mut owners = BTreeMap::new();
@@ -947,7 +1131,10 @@ pub(super) fn combine(
                 return Err(invalid("detached resource UID mismatch"));
             }
             if let Some(rid) = event.property("RECURRENCE-ID")? {
-                if owners.insert(position(rid)?, native.clone()).is_some() {
+                if owners
+                    .insert(position_for(rid, display)?, native.clone())
+                    .is_some()
+                {
                     return Err(invalid("duplicate detached position"));
                 }
             } else if master_native.replace(native.clone()).is_some() {
@@ -989,12 +1176,13 @@ pub(super) fn combine(
             }
         }
     }
-    let mut set = snapshot(
+    let mut set = snapshot_for(
         NativeCalendarResource {
             data: merged.render(),
             ..master_native.clone()
         },
         template,
+        display,
     )?;
     for item in &mut set.overrides {
         if let Some(owner) = owners.get(&item.original_start) {

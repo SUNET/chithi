@@ -32,6 +32,10 @@ pub enum Error {
     #[error("Sync error: {0}")]
     Sync(String),
 
+    /// A provider read cannot establish an authoritative complete snapshot.
+    #[error("Calendar read incomplete: {0}")]
+    CalendarReadIncomplete(String),
+
     /// Safe, bounded provider cooldown exposed to calendar verification.
     #[error("Graph throttled (429); retry after {retry_after_seconds} seconds")]
     GraphThrottled { retry_after_seconds: u64 },

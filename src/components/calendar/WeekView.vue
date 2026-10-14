@@ -510,7 +510,7 @@ onUnmounted(() => {
           :style="{ backgroundColor: getEventColor(event), ...getEventStyle(event) }"
           @click="emit('eventClick', event.id)"
         >
-          {{ event.title }}
+          {{ event.title || '(No title)' }}
         </div>
       </div>
     </div>
@@ -580,7 +580,7 @@ onUnmounted(() => {
           @click.stop="emit('eventClick', seg.event.id)"
           @mousedown="onEventMouseDown($event, seg)"
         >
-          <span class="event-title">{{ seg.event.title }}</span>
+          <span class="event-title">{{ seg.event.title || '(No title)' }}</span>
           <span class="event-time">
             {{ formatInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone, { hour: 'numeric', minute: '2-digit', hour12: uiStore.hour12 }) }}
           </span>

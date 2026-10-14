@@ -8,6 +8,17 @@ use crate::backend::testutil::{account, event};
 
 type Step = (&'static str, u16, Value);
 
+#[test]
+fn sync_display_accepts_untitled_instantaneous_series_without_edit_permission() {
+    let mut value = master();
+    value["summary"] = json!("");
+    value["end"] = value["start"].clone();
+    let account = account("calendar", "google");
+    let set = from_sync_resources(&account, &event(), "source@calendar.test", &value, &[]).unwrap();
+    assert!(set.validate_display().is_ok());
+    assert!(validate_source(&set, &account).is_err());
+}
+
 fn master() -> Value {
     json!({"id": "series1", "etag": "\"master-v1\"", "iCalUID": "series@example.test",
         "summary": "Weekly planning", "description": "<p>Full native body</p>", "location": "Room 2",

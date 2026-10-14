@@ -308,7 +308,23 @@ impl CalendarEventSet {
     }
 
     pub fn validate(&self) -> Result<()> {
-        event_fields(&self.event).validate()?;
+        self.validate_for(false)
+    }
+
+    /// Validate readable content without granting structural mutation support.
+    pub(crate) fn validate_display(&self) -> Result<()> {
+        self.validate_for(true)
+    }
+
+    fn validate_for(&self, display: bool) -> Result<()> {
+        let validate = |event: &CalendarEvent| {
+            if display {
+                event_fields(event).validate_display()
+            } else {
+                event_fields(event).validate()
+            }
+        };
+        validate(&self.event)?;
         match self.event.recurrence_kind {
             RecurrenceKind::Standalone
                 if self
@@ -322,7 +338,8 @@ impl CalendarEventSet {
                     .event
                     .recurrence_rule
                     .as_deref()
-                    .is_some_and(|rule| !rule.is_empty()) => {}
+                    .is_some_and(|rule| !rule.is_empty())
+                    || (display && !self.overrides.is_empty()) => {}
             _ => {
                 return Err(Error::Other(
                     "Incomplete calendar event-set classification".into(),
@@ -338,7 +355,7 @@ impl CalendarEventSet {
                 ));
             }
             if let Some(event) = &exception.event {
-                event_fields(event).validate()?;
+                validate(event)?;
                 if event
                     .recurrence_rule
                     .as_deref()

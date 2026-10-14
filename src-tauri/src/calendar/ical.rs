@@ -1064,7 +1064,7 @@ fn parse_ical_date_property(
 }
 
 /// Validate a positive RFC 5545 duration without relying on the tolerant viewer.
-fn valid_duration_value(value: &str) -> bool {
+pub(crate) fn valid_duration_value(value: &str) -> bool {
     let Some(mut rest) = value.strip_prefix('+').unwrap_or(value).strip_prefix('P') else {
         return false;
     };

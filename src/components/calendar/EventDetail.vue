@@ -354,7 +354,7 @@ async function handleDelete() {
   <div v-if="event" class="event-detail-overlay" @click.self="emit('close')">
     <div class="event-detail">
       <div class="detail-header">
-        <h3 v-if="!editing">{{ event.title }}</h3>
+        <h3 v-if="!editing">{{ event.title || '(No title)' }}</h3>
         <input v-else v-model="editTitle" class="edit-title" type="text" data-testid="event-form-title" />
         <button class="close-btn" @click="emit('close')">&times;</button>
       </div>

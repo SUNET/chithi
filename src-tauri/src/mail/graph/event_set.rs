@@ -1,6 +1,12 @@
 //! Complete Graph snapshots and conditional mutations. IDs are opaque; only
 //! `originalStart` and the documented MAPI recurrence property identify slots.
 
+mod continuation;
+#[cfg(test)]
+mod continuation_tests;
+mod display_pattern;
+#[cfg(test)]
+mod display_tests;
 mod recurrence_blob;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -134,9 +140,38 @@ fn native(value: &Value, calendar: &str) -> Result<NativeCalendarResource> {
     })
 }
 
+fn display_native(value: &Value, calendar: &str) -> Result<NativeCalendarResource> {
+    Ok(NativeCalendarResource {
+        protocol: "graph".into(),
+        calendar_id: calendar.into(),
+        event_id: required_string(value, "id")?.into(),
+        revision: value["@odata.etag"].as_str().map(str::to_owned),
+        data: value.to_string(),
+    })
+}
+
 /// Strict full-content projection. The UTC response preference is undone for
 /// all-day dates using the original zone, never by truncating a UTC timestamp.
 fn canonical(value: &Value, template: &CalendarEvent, calendar: &str) -> Result<CalendarEvent> {
+    project_event(value, template, calendar, true)
+}
+
+/// Display does not require a conditional-write validator. Its absence disables
+/// writes through the ordinary planner, not reading the remote calendar.
+pub(crate) fn display_event(
+    value: &Value,
+    template: &CalendarEvent,
+    calendar: &str,
+) -> Result<CalendarEvent> {
+    project_event(value, template, calendar, false)
+}
+
+fn project_event(
+    value: &Value,
+    template: &CalendarEvent,
+    calendar: &str,
+    require_revision: bool,
+) -> Result<CalendarEvent> {
     let kind = super::graph_recurrence_kind(value);
     if kind == RecurrenceKind::Unknown {
         return Err(invalid("incomplete recurrence classification"));
@@ -154,7 +189,13 @@ fn canonical(value: &Value, template: &CalendarEvent, calendar: &str) -> Result<
         "originalStartTimeZone",
         "originalEndTimeZone",
     ] {
-        required_string(value, key)?;
+        if key == "subject" && !require_revision {
+            if !value[key].is_null() && !value[key].is_string() {
+                return Err(invalid("subject must be a string or null"));
+            }
+        } else if key != "@odata.etag" || require_revision {
+            required_string(value, key)?;
+        }
     }
     if !matches!(value["body"]["contentType"].as_str(), Some("html" | "text"))
         || !value["body"]["content"].is_string()
@@ -204,12 +245,15 @@ fn canonical(value: &Value, template: &CalendarEvent, calendar: &str) -> Result<
     };
     // Reuse the existing attendee/status projection after strict validation.
     let mut normalized = value.clone();
+    if !require_revision && value["subject"].is_null() {
+        normalized["subject"] = json!("");
+    }
     normalized["start"] = json!({"dateTime": if all_day { format!("{start_text}T00:00:00") } else { start_text.clone() }, "timeZone": "UTC"});
     normalized["end"] = json!({"dateTime": if all_day { format!("{end_text}T00:00:00") } else { end_text.clone() }, "timeZone": "UTC"});
     let parsed = super::parse_graph_event(&normalized, calendar)?.into_live()?;
     let mut event = template.clone();
     event.remote_id = Some(required_string(value, "id")?.into());
-    event.etag = Some(required_string(value, "@odata.etag")?.into());
+    event.etag = value["@odata.etag"].as_str().map(str::to_owned);
     event.uid = parsed.ical_uid;
     event.title = parsed.subject;
     event.description = parsed.body_preview;
@@ -221,14 +265,23 @@ fn canonical(value: &Value, template: &CalendarEvent, calendar: &str) -> Result<
     event.attendees_json = parsed.attendees_json;
     event.organizer_email = parsed.organizer_email;
     event.my_status = parsed.my_status;
-    event.recurrence_kind = kind;
+    event.recurrence_kind = parsed.recurrence_kind;
     event.ical_data = None;
     event.recurrence_rule = if kind == RecurrenceKind::Series {
-        Some(read_rule(&value["recurrence"], &event)?)
+        Some(if require_revision {
+            read_rule(&value["recurrence"], &event)?
+        } else {
+            display_pattern::project_recurrence(&value["recurrence"], &mut event)?
+        })
     } else {
         None
     };
-    crate::calendar::event_set::event_fields(&event).validate()?;
+    let fields = crate::calendar::event_set::event_fields(&event);
+    if require_revision {
+        fields.validate()?;
+    } else {
+        fields.validate_display()?;
+    }
     Ok(event)
 }
 
@@ -293,7 +346,12 @@ fn read_rule(recurrence: &Value, event: &CalendarEvent) -> Result<String> {
             .0;
         rule.push_str(&format!(";WKST={code}"));
     }
-    if required_string(range, "startDate")? != local.date().to_string() {
+    append_rule_range(range, local.date(), &mut rule)?;
+    simple_recurrence::normalize_rule(&rule, event)
+}
+
+fn append_rule_range(range: &Value, start: NaiveDate, rule: &mut String) -> Result<()> {
+    if required_string(range, "startDate")? != start.to_string() {
         return Err(invalid("recurrence startDate differs from DTSTART"));
     }
     match range["type"].as_str() {
@@ -312,7 +370,7 @@ fn read_rule(recurrence: &Value, event: &CalendarEvent) -> Result<String> {
         }
         _ => return Err(invalid("invalid recurrence range")),
     }
-    simple_recurrence::normalize_rule(&rule, event)
+    Ok(())
 }
 
 pub(super) fn recurrence_json(
@@ -449,27 +507,34 @@ impl GraphClient {
             )
             .await?;
         let status = response.status();
-        let text = response.text().await.map_err(invalid)?;
+        let read_error = |message: String| {
+            if method == Method::GET {
+                Error::CalendarReadIncomplete(message)
+            } else {
+                invalid(message)
+            }
+        };
+        let text = response
+            .text()
+            .await
+            .map_err(|error| read_error(error.to_string()))?;
         if !status.is_success() {
-            return Err(invalid(format!(
-                "{method} returned {status}: {}",
-                super::truncate(&text, 1000)
-            )));
+            return Err(read_error(format!("{method} returned {status}")));
         }
         if text.is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text).map_err(invalid)
+        serde_json::from_str(&text).map_err(|error| read_error(error.to_string()))
     }
 
-    async fn set_pages(&self, mut page: Value, scope: &str) -> Result<Vec<Value>> {
+    pub(super) async fn set_pages(&self, mut page: Value, scope: &str) -> Result<Vec<Value>> {
         let mut items = BTreeMap::new();
         let mut visited = HashSet::new();
+        let mut collection = continuation::CollectionGuard::new(self, scope)?;
         loop {
-            for value in page["value"]
-                .as_array()
-                .ok_or_else(|| invalid("collection value must be an array"))?
-            {
+            for value in page["value"].as_array().ok_or_else(|| {
+                Error::CalendarReadIncomplete("collection value must be an array".into())
+            })? {
                 let id = required_string(value, "id")?.to_owned();
                 if let Some(previous) = items.insert(id, value.clone()) {
                     if previous != *value {
@@ -481,10 +546,7 @@ impl GraphClient {
                 None | Some(Value::Null) => break,
                 Some(Value::String(next)) if !next.trim().is_empty() => {
                     let url = self.calendar_set_url(next)?;
-                    let expected = self.calendar_set_url(scope)?;
-                    if url.path() != expected.path() {
-                        return Err(invalid("continuation left selected calendar collection"));
-                    }
+                    collection.validate(self, &url).await?;
                     if !visited.insert(next.clone()) || visited.len() > 10_000 {
                         return Err(invalid("repeated or excessive pagination link"));
                     }
@@ -513,7 +575,9 @@ impl GraphClient {
             .calendar_set_request(Method::GET, &event_path(calendar, id)?, &query, None, None)
             .await?;
         if required_string(&value, "id")? != id {
-            return Err(invalid("GET returned a different immutable ID"));
+            return Err(Error::CalendarReadIncomplete(
+                "GET returned a different immutable ID".into(),
+            ));
         }
         Ok(value)
     }
@@ -524,7 +588,7 @@ impl GraphClient {
         id: &str,
         template: &CalendarEvent,
     ) -> Result<CalendarEventSet> {
-        self.fetch_calendar_event_set_internal(calendar, id, template, false)
+        self.fetch_calendar_event_set_internal(calendar, id, template, false, true)
             .await
             .map(|(set, _)| set)
     }
@@ -535,8 +599,19 @@ impl GraphClient {
         id: &str,
         template: &CalendarEvent,
     ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
-        self.fetch_calendar_event_set_internal(calendar, id, template, true)
+        self.fetch_calendar_event_set_internal(calendar, id, template, true, true)
             .await
+    }
+
+    pub(crate) async fn fetch_calendar_display_set(
+        &self,
+        calendar: &str,
+        id: &str,
+        template: &CalendarEvent,
+    ) -> Result<CalendarEventSet> {
+        self.fetch_calendar_event_set_internal(calendar, id, template, false, false)
+            .await
+            .map(|(set, _)| set)
     }
 
     async fn fetch_calendar_event_set_internal(
@@ -545,6 +620,7 @@ impl GraphClient {
         id: &str,
         template: &CalendarEvent,
         prove_child: bool,
+        require_revision: bool,
     ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
         let first = self.set_get(calendar, id, false).await?;
         let kind = super::graph_recurrence_kind(&first);
@@ -558,7 +634,7 @@ impl GraphClient {
         } else {
             self.set_get(calendar, master_id, true).await?
         };
-        let event = canonical(&master, template, calendar)?;
+        let event = project_event(&master, template, calendar, require_revision)?;
         if !matches!(
             event.recurrence_kind,
             RecurrenceKind::Standalone | RecurrenceKind::Series
@@ -568,40 +644,55 @@ impl GraphClient {
         let mut result = CalendarEventSet {
             event,
             overrides: Vec::new(),
-            native: Some(native(&master, calendar)?),
+            native: Some(if require_revision {
+                native(&master, calendar)?
+            } else {
+                display_native(&master, calendar)?
+            }),
             content: None,
         };
         if result.event.recurrence_kind == RecurrenceKind::Series {
-            let exceptions = master["exceptionOccurrences"]
-                .as_array()
-                .ok_or_else(|| invalid("missing authoritative exceptionOccurrences"))?;
+            let exceptions = master["exceptionOccurrences"].as_array().ok_or_else(|| {
+                Error::CalendarReadIncomplete("missing authoritative exceptionOccurrences".into())
+            })?;
             let page = json!({"value": exceptions, "@odata.nextLink": master.get("exceptionOccurrences@odata.nextLink").cloned().unwrap_or(Value::Null)});
             let scope = format!("{}/exceptionOccurrences", event_path(calendar, master_id)?);
             let ids = self
                 .set_pages(page, &scope)
-                .await?
+                .await
+                .map_err(|error| Error::CalendarReadIncomplete(error.to_string()))?
                 .into_iter()
-                .map(|reference| Ok(required_string(&reference, "id")?.to_owned()))
+                .map(|reference| {
+                    required_string(&reference, "id")
+                        .map(str::to_owned)
+                        .map_err(|error| Error::CalendarReadIncomplete(error.to_string()))
+                })
                 .collect::<Result<Vec<_>>>()?;
             let series = &result.event;
             let overrides = stream::iter(ids.into_iter().map(|id| async move {
                 let value = self.set_get(calendar, &id, false).await?;
                 if value["type"] != "exception" || value["seriesMasterId"] != master_id {
-                    return Err(invalid("exception belongs to a different master"));
+                    return Err(Error::CalendarReadIncomplete(
+                        "exception belongs to a different master".into(),
+                    ));
                 }
                 Ok(CalendarOverride {
                     original_start: original(series, &value)?,
-                    event: Some(canonical(&value, template, calendar)?),
-                    native: Some(native(&value, calendar)?),
+                    event: Some(project_event(&value, template, calendar, require_revision)?),
+                    native: Some(if require_revision {
+                        native(&value, calendar)?
+                    } else {
+                        display_native(&value, calendar)?
+                    }),
                 })
             }))
             .buffered(EXCEPTION_READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
             result.overrides.extend(overrides);
-            let cancelled = master["cancelledOccurrences"]
-                .as_array()
-                .ok_or_else(|| invalid("missing authoritative cancelledOccurrences"))?;
+            let cancelled = master["cancelledOccurrences"].as_array().ok_or_else(|| {
+                Error::CalendarReadIncomplete("missing authoritative cancelledOccurrences".into())
+            })?;
             let mut ids = HashSet::new();
             for id in cancelled {
                 let id = id
@@ -652,17 +743,20 @@ impl GraphClient {
             // Graph has no snapshot transaction across expanded exception pages.
             // A changed master revision invalidates this entire read.
             let after = self.set_get(calendar, master_id, true).await?;
-            if after["@odata.etag"] != master["@odata.etag"]
-                || after["cancelledOccurrences"] != master["cancelledOccurrences"]
-                || after["exceptionOccurrences"] != master["exceptionOccurrences"]
-            {
-                return Err(invalid("master changed while reading its exceptions"));
+            if after != master {
+                return Err(Error::CalendarReadIncomplete(
+                    "master changed while reading its exceptions".into(),
+                ));
             }
         }
         result
             .overrides
             .sort_by(|a, b| a.original_start.cmp(&b.original_start));
-        result.validate()?;
+        if require_revision {
+            result.validate()?;
+        } else {
+            result.validate_display()?;
+        }
         let membership = if prove_child && kind == RecurrenceKind::Occurrence {
             let original_start = original(&result.event, &first)?;
             let first_event = canonical(&first, template, calendar)?;

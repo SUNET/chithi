@@ -250,6 +250,43 @@ fn parse_event(
     })
 }
 
+/// Decode one complete master group from an unexpanded sync snapshot. Generated
+/// instances are not finite overrides; events.list(singleEvents=false) excludes them.
+pub(super) fn from_sync_resources(
+    account: &AccountFull,
+    template: &CalendarEvent,
+    calendar: &str,
+    value: &Value,
+    resources: &[Value],
+) -> Result<CalendarEventSet> {
+    let event = parse_event(value, account, template)?;
+    let resource = native(value, calendar)?;
+    let mut overrides = Vec::new();
+    for item in resources
+        .iter()
+        .filter(|item| item["recurringEventId"].as_str() == Some(resource.event_id.as_str()))
+    {
+        overrides.push(CalendarOverride {
+            original_start: original(item, &event)?,
+            event: if item["status"].as_str() == Some("cancelled") {
+                None
+            } else {
+                Some(parse_event(item, account, template)?)
+            },
+            native: Some(native(item, calendar)?),
+        });
+    }
+    overrides.sort_by(|a, b| a.original_start.cmp(&b.original_start));
+    let set = CalendarEventSet {
+        event,
+        overrides,
+        native: Some(resource),
+        content: None,
+    };
+    set.validate_display()?;
+    Ok(set)
+}
+
 pub(super) async fn fetch(
     client: &GoogleClient,
     account: &AccountFull,

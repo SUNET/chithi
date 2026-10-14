@@ -19,6 +19,7 @@ import { getDateInTimezone } from "@/lib/datetime";
 import { useUiStore } from "@/stores/ui";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
 import ArchivedGraphNotice from "@/components/calendar/ArchivedGraphNotice.vue";
+import CalendarDisplayNotice from "@/components/calendar/CalendarDisplayNotice.vue";
 import WeekView from "@/components/calendar/WeekView.vue";
 import MonthView from "@/components/calendar/MonthView.vue";
 import EventDetail from "@/components/calendar/EventDetail.vue";
@@ -34,6 +35,10 @@ const accountsStore = useAccountsStore();
 const platformStore = usePlatformStore();
 const uiStore = useUiStore();
 const { isMobile } = storeToRefs(platformStore);
+const displayIssues = computed(() => [
+  ...Object.values(calendarStore.syncErrors).map((error) => `Calendar sync could not display every remote resource: ${error}`),
+  ...calendarStore.displayErrors,
+]);
 const showEventForm = ref(false);
 const newEventStart = ref("");
 let selectionVersion = 0;
@@ -525,6 +530,11 @@ onMounted(() => {
       @retry="calendarStore.retryNavigation()"
       @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
     />
+    <CalendarDisplayNotice :errors="displayIssues" />
+    <div v-if="calendarStore.unverifiedSeriesIds.length" class="calendar-incomplete" role="alert">
+      {{ calendarStore.unverifiedSeriesIds.length }} recurring series need a provider refresh.
+      Cached dates may be outdated or missing. Sync calendars to verify them.
+    </div>
     <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
       {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
       Some recurring dates may be incomplete until verified.
@@ -605,7 +615,7 @@ onMounted(() => {
             }"
             @click.stop="onMobileEventClick(pe.event)"
           >
-            <span class="day-event-title">{{ pe.event.title }}</span>
+            <span class="day-event-title">{{ pe.event.title || '(No title)' }}</span>
             <span class="day-event-time">
               {{ formatTime(pe.event.start_time) }} – {{ formatTime(pe.event.end_time) }}
             </span>
@@ -653,7 +663,7 @@ onMounted(() => {
             }"
             @click="onMobileEventClick(pe.event)"
           >
-            <span class="week-event-title">{{ pe.event.title }}</span>
+            <span class="week-event-title">{{ pe.event.title || '(No title)' }}</span>
           </button>
         </div>
       </div>
@@ -757,6 +767,11 @@ onMounted(() => {
         @retry="calendarStore.retryNavigation()"
         @acknowledge="calendarStore.acknowledgeArchivedGraphCalendars()"
       />
+      <CalendarDisplayNotice :errors="displayIssues" />
+      <div v-if="calendarStore.unverifiedSeriesIds.length" class="calendar-incomplete" role="alert">
+        {{ calendarStore.unverifiedSeriesIds.length }} recurring series need a provider refresh.
+        Cached dates may be outdated or missing. Sync calendars to verify them.
+      </div>
       <div v-if="calendarStore.unresolvedOccurrences.length" class="calendar-incomplete" role="alert">
         {{ calendarStore.unresolvedOccurrences.length }} recurring event(s) could not be placed.
         Some recurring dates may be incomplete until verified.

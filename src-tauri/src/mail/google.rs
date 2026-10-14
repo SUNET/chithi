@@ -205,22 +205,59 @@ impl GoogleClient {
     /// List the user's calendars (`users/me/calendarList`). Returns the
     /// parsed response body; calendars are under `items`.
     pub async fn list_calendar_list(&self) -> Result<serde_json::Value> {
-        let resp = self
-            .http
-            .get(self.calendar_url("users/me/calendarList"))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("Google Calendar API failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Other(format!("Google Calendar API error: {}", body)));
+        let mut calendars = Vec::new();
+        let mut token: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_EVENT_PAGES {
+            let mut request = self
+                .http
+                .get(self.calendar_url("users/me/calendarList"))
+                .bearer_auth(&self.token);
+            if let Some(token) = token.as_deref() {
+                request = request.query(&[("pageToken", token)]);
+            }
+            let response = request.send().await.map_err(|error| {
+                Error::Other(format!("Google calendar inventory failed: {error}"))
+            })?;
+            if !response.status().is_success() {
+                return Err(Error::Sync(format!(
+                    "Google calendar inventory returned {}",
+                    response.status()
+                )));
+            }
+            let value: serde_json::Value = response.json().await.map_err(|error| {
+                Error::Sync(format!("Google calendar inventory JSON failed: {error}"))
+            })?;
+            let items = value["items"]
+                .as_array()
+                .ok_or_else(|| Error::Sync("Google calendar inventory omitted items".into()))?;
+            for item in items {
+                if item["id"].as_str().is_none_or(str::is_empty) {
+                    return Err(Error::Sync(
+                        "Google calendar inventory omitted an ID".into(),
+                    ));
+                }
+            }
+            calendars.extend(items.iter().cloned());
+            match value.get("nextPageToken") {
+                None | Some(serde_json::Value::Null) => {
+                    return Ok(serde_json::json!({"items": calendars}))
+                }
+                Some(serde_json::Value::String(next))
+                    if !next.is_empty() && seen.insert(next.clone()) =>
+                {
+                    token = Some(next.clone())
+                }
+                _ => {
+                    return Err(Error::Sync(
+                        "Google calendar inventory has invalid or repeated pagination".into(),
+                    ))
+                }
+            }
         }
-
-        resp.json()
-            .await
-            .map_err(|e| Error::Other(format!("Google Calendar API parse error: {}", e)))
+        Err(Error::Sync(
+            "Google calendar inventory exceeded the page limit".into(),
+        ))
     }
 
     /// Query Calendar FreeBusy for participant calendar addresses.
@@ -269,30 +306,18 @@ impl GoogleClient {
             .query(&[("maxResults", "500")])
     }
 
-    /// Incremental events listing using a stored sync token.
-    pub async fn list_events_incremental(
+    /// Resource-level sync uses an unbounded, unexpanded stream. Its tokens
+    /// cannot be mixed with the legacy bounded/expanded calendarView cache.
+    pub(crate) async fn list_resources_sync(
         &self,
         calendar_id: &str,
-        sync_token: &str,
+        token: Option<&str>,
     ) -> Result<EventsPage> {
-        self.list_events(calendar_id, &[("syncToken", sync_token)], true)
-            .await
-    }
-
-    /// Full events listing over a time window (first sync, or after the
-    /// sync token expired).
-    pub async fn list_events_full(
-        &self,
-        calendar_id: &str,
-        time_min: &str,
-        time_max: &str,
-    ) -> Result<EventsPage> {
-        self.list_events(
-            calendar_id,
-            &[("timeMin", time_min), ("timeMax", time_max)],
-            false,
-        )
-        .await
+        let mut query = vec![("singleEvents", "false"), ("showDeleted", "true")];
+        if let Some(token) = token {
+            query.push(("syncToken", token));
+        }
+        self.list_events(calendar_id, &query, token.is_some()).await
     }
 
     async fn list_events(
@@ -2024,16 +2049,10 @@ mod wire_tests {
                     people_api_root: "http://127.0.0.1:1/unused".into(),
                 },
             );
-            let page = if incremental {
-                client
-                    .list_events_incremental("primary", "cached-token")
-                    .await
-            } else {
-                client
-                    .list_events_full("primary", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
-                    .await
-            }
-            .unwrap();
+            let page = client
+                .list_resources_sync("primary", incremental.then_some("cached-token"))
+                .await
+                .unwrap();
             let EventsPage::Events(page) = page else {
                 panic!("unexpected expired token")
             };
@@ -2055,7 +2074,7 @@ mod wire_tests {
             assert!(!query.contains_key("fields"));
             assert_eq!(
                 query.get("singleEvents").map(|value| value.as_ref()),
-                Some("true")
+                Some("false")
             );
             assert_eq!(
                 query.get("maxResults").map(|value| value.as_ref()),
@@ -2067,9 +2086,10 @@ mod wire_tests {
                 assert!(!query.contains_key("timeMax"));
             } else {
                 assert!(!query.contains_key("syncToken"));
-                assert_eq!(query.get("timeMin").unwrap(), "2026-09-01T00:00:00Z");
-                assert_eq!(query.get("timeMax").unwrap(), "2026-10-01T00:00:00Z");
             }
+            assert_eq!(query["showDeleted"], "true");
+            assert!(!query.contains_key("timeMin"));
+            assert!(!query.contains_key("timeMax"));
         }
     }
 
@@ -2093,16 +2113,10 @@ mod wire_tests {
                 ),
             ])
             .await;
-            let result = if incremental {
-                event_client(root)
-                    .list_events_incremental("primary", "stored-sync-token")
-                    .await
-            } else {
-                event_client(root)
-                    .list_events_full("primary", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z")
-                    .await
-            }
-            .unwrap();
+            let result = event_client(root)
+                .list_resources_sync("primary", incremental.then_some("stored-sync-token"))
+                .await
+                .unwrap();
             let EventsPage::Events(events) = result else {
                 panic!("sync token unexpectedly expired")
             };
@@ -2120,17 +2134,18 @@ mod wire_tests {
             assert_eq!(requests.len(), 2);
             for request in &requests {
                 let query = event_query(request);
-                assert_eq!(query["singleEvents"], "true");
+                assert_eq!(query["singleEvents"], "false");
+                assert_eq!(query["showDeleted"], "true");
                 assert_eq!(query["maxResults"], "500");
                 if incremental {
                     assert_eq!(query["syncToken"], "stored-sync-token");
                     assert!(!query.contains_key("timeMin"));
                     assert!(!query.contains_key("timeMax"));
                 } else {
-                    assert_eq!(query["timeMin"], "2026-09-01T00:00:00Z");
-                    assert_eq!(query["timeMax"], "2026-10-01T00:00:00Z");
                     assert!(!query.contains_key("syncToken"));
                 }
+                assert!(!query.contains_key("timeMin"));
+                assert!(!query.contains_key("timeMax"));
             }
             assert!(!event_query(&requests[0]).contains_key("pageToken"));
             assert_eq!(event_query(&requests[1])["pageToken"], "opaque +/= page");
@@ -2185,7 +2200,7 @@ mod wire_tests {
                 serve_event_responses(responses.into_iter().map(|body| (200, body)).collect())
                     .await;
             let error = event_client(root)
-                .list_events_incremental("primary", "stored")
+                .list_resources_sync("primary", Some("stored"))
                 .await
                 .err()
                 .expect("malformed pagination must fail");
@@ -2209,7 +2224,7 @@ mod wire_tests {
         .await;
         assert!(matches!(
             event_client(root)
-                .list_events_incremental("primary", "expired")
+                .list_resources_sync("primary", Some("expired"))
                 .await
                 .unwrap(),
             EventsPage::SyncTokenExpired

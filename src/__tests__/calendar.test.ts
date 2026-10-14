@@ -122,6 +122,9 @@ function makeEvent(
 // into InviteCard / EventForm / regression suites below.
 beforeEach(() => {
   localStorage.clear();
+  vi.mocked(api.listCalendarOccurrences).mockReset().mockResolvedValue({
+    occurrences: [], has_more: false, needs_hydration: [], unresolved: [],
+  });
 });
 
 describe("Calendar store", () => {
@@ -146,10 +149,27 @@ describe("Calendar store", () => {
 
       const id = await store.createEvent(input);
 
-      expect(api.createEvent).toHaveBeenCalledWith(input);
+      expect(api.createEvent).toHaveBeenCalledWith(input, expect.any(String));
       expect(id).toBe("evt-1");
       // fetchEvents is called after create
       expect(api.getEvents).toHaveBeenCalled();
+    });
+
+    it("reuses a failed creation's key without displaying a pending event", async () => {
+      setupAccounts();
+      const store = useCalendarStore();
+      const input = {
+        account_id: "acc1", calendar_id: "cal1", title: "Meeting",
+        description: null, location: null, start_time: "2026-04-07T17:00:00Z",
+        end_time: "2026-04-07T18:00:00Z", all_day: false, timezone: null,
+        recurrence_rule: null, attendees: [],
+      };
+      vi.mocked(api.createEvent).mockRejectedValueOnce(new Error("Response lost"));
+      await expect(store.createEvent(input)).rejects.toThrow("Response lost");
+      expect(store.events).toEqual([]);
+      const operationId = vi.mocked(api.createEvent).mock.calls[0][1];
+      await store.createEvent(input);
+      expect(api.createEvent).toHaveBeenLastCalledWith(input, operationId);
     });
   });
 
@@ -589,7 +609,7 @@ describe("Calendar store", () => {
       });
     });
 
-    it("uses local expansion only for series needing hydration", async () => {
+    it("withholds an unverified bare master instead of inventing remote occurrences", async () => {
       const store = setupRecurring();
       const master = store.events[0];
       vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
@@ -601,14 +621,12 @@ describe("Calendar store", () => {
 
       await store.fetchEvents();
 
-      expect(store.visibleEvents).toHaveLength(1);
-      expect(store.visibleEvents[0].start_time)
-        .toBe("2026-08-25T09:00:00.000Z");
+      expect(store.visibleEvents).toHaveLength(0);
+      expect(store.unverifiedSeriesIds).toEqual([master.id]);
     });
 
-    it("keeps the previous display when projection exceeds its bound", async () => {
+    it("shows the current bounded result with a warning rather than stale dates", async () => {
       const store = setupRecurring();
-      const previous = [...store.events];
       vi.mocked(api.getEvents).mockResolvedValueOnce([]);
       vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
         occurrences: [],
@@ -616,9 +634,57 @@ describe("Calendar store", () => {
         needs_hydration: [], unresolved: [],
       });
 
-      await expect(store.fetchEvents()).rejects.toThrow("display limit");
+      await store.fetchEvents();
+      expect(store.events).toEqual([]);
+      expect(store.loadError).toBeNull();
+      expect(store.displayErrors[0]).toContain("display limit");
+    });
 
-      expect(store.events).toEqual(previous);
+    it("keeps supported remote dates visible alongside resource-specific errors", async () => {
+      const store = setupRecurring();
+      const master = store.events[0];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]);
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [{
+          event_id: master.id, calendar_id: master.calendar_id, account_id: master.account_id,
+          selection: { event_id: master.id, original_start: master.start_time, token: "" },
+          fields: { title: "", description: null, location: null, start_time: master.start_time, end_time: master.start_time, all_day: false, timezone: null },
+          recurrence_kind: "series", recurrence_rule: master.recurrence_rule, is_exception: false,
+        }],
+        has_more: false, unresolved: [], needs_hydration: [],
+        display_errors: [{ event_id: "opaque", calendar_id: "cal1", account_id: "acc1", message: "unsupported RRULE" }],
+      });
+      await store.fetchEvents();
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.visibleEvents[0].title).toBe("");
+      expect(store.loadError).toBeNull();
+      expect(store.displayErrors[0]).toContain("unsupported RRULE");
+    });
+
+    it("isolates a failed account and removes its previous dates without hiding healthy accounts", async () => {
+      const store = setupRecurring();
+      const accounts = useAccountsStore();
+      accounts.accounts.push({ ...accounts.accounts[0], id: "expired", display_name: "Expired" });
+      store.calendars.push({ ...store.calendars[0], id: "expired-calendar", account_id: "expired" });
+      store.events.push({ ...store.events[0], id: "stale", account_id: "expired", calendar_id: "expired-calendar" });
+      const master = store.events[0];
+      vi.mocked(api.getEvents).mockResolvedValueOnce([master]).mockRejectedValueOnce(new Error("sign-in expired"));
+      vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+        occurrences: [{
+          event_id: master.id, calendar_id: master.calendar_id, account_id: master.account_id,
+          selection: { event_id: master.id, original_start: master.start_time, token: "snapshot" },
+          fields: { title: master.title, description: null, location: null, start_time: master.start_time, end_time: master.end_time, all_day: false, timezone: null },
+          recurrence_kind: "series", recurrence_rule: master.recurrence_rule, is_exception: false,
+        }], has_more: false, unresolved: [], needs_hydration: [],
+      });
+      await store.fetchEvents();
+      expect(store.visibleEvents).toHaveLength(1);
+      expect(store.events).toEqual([master]);
+      expect(store.loadError).toBeNull();
+      expect(store.displayErrors[0]).toContain("Expired: could not load calendar dates");
+      expect(store.displayErrors[0]).toContain("sign-in expired");
+      await store.fetchEvents();
+      expect(store.displayErrors).toEqual([]);
     });
 
     it("rejects master and occurrence deletion without clearing selection", async () => {
@@ -725,7 +791,13 @@ describe("Calendar store", () => {
         .mockImplementationOnce(() => mayRead.promise)
         .mockImplementationOnce(() => juneRead.promise);
       vi.mocked(api.listCalendarOccurrences).mockResolvedValue({
-        occurrences: [], has_more: false, needs_hydration: ["june"], unresolved: [],
+        occurrences: [{
+          selection: { event_id: june.id, token: "verified", original_start: null },
+          event_id: june.id, account_id: june.account_id, calendar_id: june.calendar_id,
+          fields: { title: june.title, description: june.description, location: june.location,
+            start_time: june.start_time, end_time: june.end_time, all_day: june.all_day, timezone: june.timezone },
+          recurrence_kind: "standalone", recurrence_rule: null, is_exception: false,
+        }], has_more: false, needs_hydration: [], unresolved: [],
       });
 
       store.goToDate("2026-05-07");

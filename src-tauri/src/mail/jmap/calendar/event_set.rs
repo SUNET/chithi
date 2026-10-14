@@ -254,8 +254,12 @@ fn original_position(master: &CalendarEvent, local: &str, zone: Option<&str>) ->
 }
 
 fn project(template: &CalendarEvent, native: &Value) -> Result<CalendarEvent> {
+    project_for(template, native, false)
+}
+
+fn project_for(template: &CalendarEvent, native: &Value, display: bool) -> Result<CalendarEvent> {
     let mut event = template.clone();
-    let fields = occurrence_fields(native, None, None)
+    let fields = occurrence_fields_for(native, None, None, display)
         .ok_or_else(|| invalid("incomplete canonical fields"))?;
     apply_event_fields(&mut event, &fields);
     event.uid = native["uid"].as_str().map(str::to_string);
@@ -276,6 +280,9 @@ fn project(template: &CalendarEvent, native: &Value) -> Result<CalendarEvent> {
     event.recurrence_rule = native_rules.and_then(|rules| {
         crate::calendar::recurrence::jscalendar_to_rrule(rules, fields.timezone.as_deref())
     });
+    if native_rules.is_some() && event.recurrence_rule.is_none() {
+        return Err(invalid("unsupported native recurrence rules"));
+    }
     if fields.all_day {
         // A date-valued series has no UTC cutoff. The codec's timed UNTIL
         // projection must retain the native local calendar date instead.
@@ -325,7 +332,7 @@ fn project(template: &CalendarEvent, native: &Value) -> Result<CalendarEvent> {
     Ok(event)
 }
 
-fn decode_set(
+pub(crate) fn decode_set(
     template: &CalendarEvent,
     account: &str,
     calendar: &str,
@@ -333,7 +340,30 @@ fn decode_set(
     master: &Value,
     detached: &[Value],
 ) -> Result<CalendarEventSet> {
-    validate_event_object(master)?;
+    decode_for(template, account, calendar, state, master, detached, false)
+}
+
+pub(crate) fn decode_display_set(
+    template: &CalendarEvent,
+    account: &str,
+    calendar: &str,
+    state: &str,
+    master: &Value,
+    detached: &[Value],
+) -> Result<CalendarEventSet> {
+    decode_for(template, account, calendar, state, master, detached, true)
+}
+
+fn decode_for(
+    template: &CalendarEvent,
+    account: &str,
+    calendar: &str,
+    state: &str,
+    master: &Value,
+    detached: &[Value],
+    display: bool,
+) -> Result<CalendarEventSet> {
+    validate_event_object_for(master, display)?;
     if master
         .get("excludedRecurrenceRules")
         .is_some_and(|rules| !rules.is_null() && !rules.as_array().is_some_and(Vec::is_empty))
@@ -345,7 +375,7 @@ fn decode_set(
     if !event_calendar_ids(master)?.iter().any(|id| id == calendar) {
         return Err(invalid("selected calendar membership is missing"));
     }
-    let event = project(template, master)?;
+    let event = project_for(template, master, display)?;
     let native = native_resource(account, calendar, state, master);
     let mut overrides = Vec::new();
     if let Some(patches) = master
@@ -372,7 +402,7 @@ fn decode_set(
             let value = if patch.get("excluded") == Some(&Value::Bool(true)) {
                 None
             } else {
-                let mut value = project(&event, &effective)?;
+                let mut value = project_for(&event, &effective, display)?;
                 value.recurrence_rule = None;
                 value.recurrence_kind = RecurrenceKind::Occurrence;
                 Some(value)
@@ -385,7 +415,7 @@ fn decode_set(
         }
     }
     for object in detached {
-        validate_event_object(object)?;
+        validate_event_object_for(object, display)?;
         if classify_recurrence(object) != RecurrenceKind::Occurrence
             || object["baseEventId"] != master["id"]
             || object["uid"] != master["uid"]
@@ -401,7 +431,7 @@ fn decode_set(
             .unwrap_or(&master["timeZone"])
             .as_str();
         let original_start = original_position(&event, key, zone)?;
-        let mut value = project(&event, object)?;
+        let mut value = project_for(&event, object, display)?;
         value.recurrence_rule = None;
         value.recurrence_kind = RecurrenceKind::Occurrence;
         overrides.push(CalendarOverride {
@@ -417,7 +447,11 @@ fn decode_set(
         native: Some(native),
         content: None,
     };
-    set.validate()?;
+    if display {
+        set.validate_display()?;
+    } else {
+        set.validate()?;
+    }
     Ok(set)
 }
 

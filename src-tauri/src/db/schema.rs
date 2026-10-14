@@ -439,6 +439,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     run_migrations(conn)?;
     initialize_calendar_event_state(conn)?;
     super::calendar_actions::initialize(conn)?;
+    super::calendar_sync::initialize(conn)?;
+    super::calendar_writes::initialize(conn)?;
 
     Ok(())
 }

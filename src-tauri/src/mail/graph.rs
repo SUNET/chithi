@@ -22,7 +22,7 @@ const GRAPH_BETA_BASE: &str = "https://graph.microsoft.com/beta";
 
 const CALENDAR_EVENT_SELECT: &str = "id,subject,body,bodyPreview,start,end,location,isAllDay,\
     organizer,attendees,iCalUId,responseStatus,isCancelled,type,seriesMasterId,originalStart,\
-    recurrence,changeKey,lastModifiedDateTime";
+    recurrence,changeKey,lastModifiedDateTime,originalStartTimeZone,originalEndTimeZone";
 
 /// Graph JSON batching allows at most 20 sub-requests per `$batch` call.
 const BATCH_SIZE: usize = 20;
@@ -2665,9 +2665,29 @@ impl GraphClient {
             .await
     }
 
+    /// Unbounded resource inventory. Unlike calendarView, this includes masters
+    /// and proves whether a cached series still exists, even outside the window.
+    pub(crate) async fn list_calendar_resources(
+        &self,
+        calendar_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let path = event_set::collection_path(calendar_id)?;
+        let page = self
+            .calendar_set_request(
+                reqwest::Method::GET,
+                &path,
+                &[("$select", CALENDAR_EVENT_SELECT), ("$top", "100")],
+                None,
+                None,
+            )
+            .await?;
+        self.set_pages(page, &path).await
+    }
+
     /// Fetch events for a specific calendar via `GET /me/calendars/{id}/calendarView`.
     /// Uses UTC and immutable IDs on every page and follows `@odata.nextLink`.
     /// Returns only a complete, validated view, with identical duplicates removed.
+    #[cfg(test)]
     pub async fn list_events_for_calendar(
         &self,
         calendar_id: &str,
@@ -3343,6 +3363,7 @@ pub enum GraphCalendarItem {
 }
 
 impl GraphCalendarItem {
+    #[cfg(test)]
     fn remote_id(&self) -> &str {
         match self {
             Self::Live(event) => &event.id,
@@ -3353,9 +3374,10 @@ impl GraphCalendarItem {
     fn into_live(self) -> Result<GraphCalendarEvent> {
         match self {
             Self::Live(event) => Ok(*event),
-            Self::Cancelled(_) => Err(Error::Sync(
-                "Graph event is cancelled and cannot be used as a live event".into(),
-            )),
+            Self::Cancelled(tombstone) => Err(Error::Sync(format!(
+                "Graph event {} is cancelled and cannot be used as a live event",
+                tombstone.remote_id()
+            ))),
         }
     }
 }

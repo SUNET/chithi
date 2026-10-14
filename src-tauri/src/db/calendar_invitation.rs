@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 /// migration, or invitation-send paths. The field checks defend that contract;
 /// they cannot establish provenance on their own.
 pub fn record_local_series(conn: &Connection, event: &CalendarEvent) -> Result<()> {
+    supported_series_rule(event)?;
     if conn.is_autocommit() {
         return Err(Error::Other(
             "Local series invitation proof requires the event insertion transaction".into(),
@@ -31,6 +32,32 @@ pub fn record_local_series(conn: &Connection, event: &CalendarEvent) -> Result<(
         "INSERT INTO calendar_invitation_recurrence (event_id, recurrence_rule)
          VALUES (?1, ?2)",
         params![event.id, rule],
+    )?;
+    Ok(())
+}
+
+/// Record proof after a journaled creation has been canonically verified. Native
+/// source content is permitted only here, never as evidence of local provenance.
+pub(crate) fn record_confirmed_creation(
+    conn: &Connection,
+    event: &CalendarEvent,
+    desired: &CalendarEvent,
+) -> Result<()> {
+    if conn.is_autocommit() || desired.remote_id.is_some() || desired.ical_data.is_some() {
+        return Err(unrepresentable(
+            "creation requires a new validated request and its publication transaction",
+        ));
+    }
+    let expected = supported_series_rule(desired)?;
+    let (_, actual) = matching_persisted_series(conn, event)?;
+    if actual != expected {
+        return Err(unrepresentable(
+            "canonical creation recurrence differs from its request",
+        ));
+    }
+    conn.execute(
+        "INSERT INTO calendar_invitation_recurrence(event_id, recurrence_rule) VALUES (?1, ?2)",
+        params![event.id, actual],
     )?;
     Ok(())
 }
@@ -75,11 +102,17 @@ fn matching_persisted_series(
     conn: &Connection,
     event: &CalendarEvent,
 ) -> Result<(CalendarEvent, String)> {
-    let rule = supported_series_rule(event)?;
+    let mut projection = event.clone();
+    projection.ical_data = None;
+    let rule = supported_series_rule(&projection)?;
     let persisted = super::calendar::get_event(conn, &event.id)?;
-    let persisted_rule = supported_series_rule(&persisted)?;
+    let mut persisted_projection = persisted.clone();
+    persisted_projection.ical_data = None;
+    let persisted_rule = supported_series_rule(&persisted_projection)?;
     if event.account_id != persisted.account_id
         || event.timezone != persisted.timezone
+        || event.ical_data != persisted.ical_data
+        || event.source_message_id != persisted.source_message_id
         || rule != persisted_rule
     {
         return Err(unrepresentable(

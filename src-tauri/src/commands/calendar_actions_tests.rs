@@ -717,6 +717,9 @@ async fn fixture(
     let tx = conn.transaction().unwrap();
     db::calendar::insert_event(&tx, &event).unwrap();
     store::persist_embedded(&tx, &event, &set).unwrap();
+    if set.native.is_some() {
+        db::calendar_sync::record_confirmed_set(&tx, &set).unwrap();
+    }
     db::meet_meetings::upsert(
         &tx,
         &db::meet_meetings::MeetMeeting {
@@ -1339,6 +1342,12 @@ async fn persisted_attendee_occurrence_plan_is_rejected_before_execution() {
 #[tokio::test]
 async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_positions() {
     let (_directory, state, operation, _) = fixture(Some("jmap"), Some("caldav"), false).await;
+    state
+        .db
+        .writer()
+        .await
+        .execute("DELETE FROM calendar_remote_resources", [])
+        .unwrap();
     let page = list_occurrences(
         &state,
         "source".into(),
@@ -1350,15 +1359,13 @@ async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_pos
     .await
     .unwrap();
     assert!(page.occurrences.is_empty());
-    assert_eq!(page.needs_hydration, ["source-event"]);
+    assert!(page.needs_hydration.is_empty());
     {
-        let conn = state.db.writer().await;
-        store::cache_canonical(
-            &conn,
-            operation.source.anchor.clone(),
-            &operation.source.set,
-        )
-        .unwrap();
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        store::cache_canonical(&tx, operation.source.anchor.clone(), &operation.source.set)
+            .unwrap();
+        tx.commit().unwrap();
     }
     let page = list_occurrences(
         &state,
@@ -1392,8 +1399,8 @@ async fn provider_sync_requires_rehydration_instead_of_resurrecting_excluded_pos
     )
     .await
     .unwrap();
-    assert!(page.occurrences.is_empty());
-    assert_eq!(page.needs_hydration, ["source-event"]);
+    assert_eq!(page.occurrences.len(), 3);
+    assert!(page.needs_hydration.is_empty());
 }
 
 #[tokio::test]
@@ -1424,7 +1431,7 @@ async fn archived_provider_calendar_cannot_project_cached_events() {
 }
 
 #[tokio::test]
-async fn identityless_detached_row_withholds_its_series_but_not_other_events() {
+async fn legacy_identityless_rows_cannot_override_or_withhold_the_remote_mirror() {
     let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
     {
         let conn = state.db.writer().await;
@@ -1461,12 +1468,12 @@ async fn identityless_detached_row_withholds_its_series_but_not_other_events() {
     )
     .await
     .unwrap();
-    assert_eq!(page.unresolved.len(), 1);
-    assert_eq!(page.unresolved[0].event_id, "unresolved-child");
-    assert_eq!(page.unresolved[0].calendar_id, "source-calendar");
-    assert_eq!(page.unresolved[0].account_id, "source");
-    assert_eq!(page.occurrences.len(), 1);
-    assert_eq!(page.occurrences[0].event_id, "other-event");
+    assert!(page.unresolved.is_empty());
+    assert_eq!(page.occurrences.len(), 3);
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|item| item.event_id == "source-event"));
     assert!(page.needs_hydration.is_empty());
     assert!(
         store::latest_snapshot(&state.db.reader(), "unresolved-child")
@@ -1494,12 +1501,12 @@ async fn identityless_detached_row_withholds_its_series_but_not_other_events() {
     )
     .await
     .unwrap();
-    assert_eq!(page.unresolved.len(), 1);
+    assert!(page.unresolved.is_empty());
     assert!(page
         .occurrences
         .iter()
         .any(|item| item.event_id == "source-event"));
-    assert!(page
+    assert!(!page
         .occurrences
         .iter()
         .any(|item| item.event_id == "other-event"));
@@ -1524,9 +1531,12 @@ async fn identityless_detached_row_withholds_its_series_but_not_other_events() {
     )
     .await
     .unwrap();
-    assert_eq!(page.unresolved.len(), 1);
-    assert_eq!(page.occurrences.len(), 1);
-    assert_eq!(page.occurrences[0].event_id, "other-event");
+    assert!(page.unresolved.is_empty());
+    assert_eq!(page.occurrences.len(), 3);
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|item| item.event_id == "source-event"));
 }
 
 #[tokio::test]
@@ -1679,7 +1689,7 @@ async fn verified_generated_graph_child_joins_master_without_exception_or_uid_gu
         "source-event"
     );
     let conn = state.db.reader();
-    let set = store::display_owned_set(&conn, "source-event")
+    let set = db::calendar_sync::displayed_set(&conn, "source-event")
         .unwrap()
         .unwrap();
     assert_eq!(set.overrides.len(), 1);
@@ -1708,7 +1718,7 @@ async fn verified_generated_graph_child_joins_master_without_exception_or_uid_gu
 }
 
 #[tokio::test]
-async fn dirty_graph_set_remains_coherent_for_display_only() {
+async fn dirty_action_set_does_not_override_remote_display() {
     let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
     {
         let conn = state.db.writer().await;
@@ -1727,10 +1737,356 @@ async fn dirty_graph_set_remains_coherent_for_display_only() {
     .unwrap();
 
     assert_eq!(page.occurrences.len(), 3);
-    assert_eq!(page.needs_hydration, ["source-event"]);
+    assert!(page.needs_hydration.is_empty());
     assert!(store::latest_snapshot(&state.db.reader(), "source-event")
         .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn complete_sync_replaces_dirty_series_instead_of_preserving_action_history() {
+    for protocol in ["graph", "google", "jmap", "caldav"] {
+        let (_directory, state, operation, _) = fixture(Some(protocol), None, false).await;
+        let mut current = operation.source.set.clone();
+        current.event.title = "Lunch at the current remote time".into();
+        current.event.start_time = "2026-09-15".into();
+        current.event.end_time = "2026-09-17".into();
+        current.event.recurrence_rule = Some("FREQ=DAILY;COUNT=2".into());
+        current.overrides.clear();
+        {
+            let mut conn = state.db.writer().await;
+            // This is the partial sync path that previously left the old set
+            // dirty but still authoritative for all future display reads.
+            db::calendar::upsert_event_by_remote_id(&conn, &current.event).unwrap();
+            assert!(store::latest_snapshot(&conn, "source-event")
+                .unwrap()
+                .is_none());
+            let tx = conn.transaction().unwrap();
+            db::calendar_sync::replace_calendar(
+                &tx,
+                "source",
+                "source-calendar",
+                protocol,
+                &[db::calendar_sync::Resource::readable(current.clone()).unwrap()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let page = list_occurrences(
+            &state,
+            "source".into(),
+            None,
+            "2026-09-14".into(),
+            "2026-09-20".into(),
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(page.needs_hydration.is_empty(), "{protocol}");
+        assert_eq!(page.occurrences.len(), 2, "{protocol}");
+        assert!(page
+            .occurrences
+            .iter()
+            .all(|item| item.fields.title == current.event.title));
+        assert!(page
+            .occurrences
+            .iter()
+            .all(|item| item.fields.start_time != "2026-09-14"));
+    }
+}
+
+#[tokio::test]
+async fn remote_mirror_displays_month_and_ordinal_rules_and_utc_date_cutoffs() {
+    for (rule, expected) in [
+        ("FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=8", vec!["2026-10-08"]),
+        ("FREQ=MONTHLY;BYDAY=2TH", vec!["2026-10-08"]),
+        (
+            "FREQ=DAILY;UNTIL=20261008T235959Z",
+            vec!["2026-10-07", "2026-10-08"],
+        ),
+        ("FREQ=DAILY;UNTIL=20190101T000000Z", vec![]),
+    ] {
+        let (_directory, state, operation, _) = fixture(Some("caldav"), None, false).await;
+        let mut current = operation.source.set;
+        current.event.start_time = "2020-01-01".into();
+        current.event.end_time = "2020-01-02".into();
+        current.event.recurrence_rule = Some(rule.into());
+        current.overrides.clear();
+        {
+            let mut conn = state.db.writer().await;
+            let tx = conn.transaction().unwrap();
+            db::calendar_sync::replace_calendar(
+                &tx,
+                "source",
+                "source-calendar",
+                "caldav",
+                &[db::calendar_sync::Resource::readable(current).unwrap()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let page = list_occurrences(
+            &state,
+            "source".into(),
+            None,
+            "2026-10-07".into(),
+            "2026-10-09".into(),
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page.display_errors.is_empty(),
+            "{rule}: {:?}",
+            page.display_errors
+        );
+        assert_eq!(
+            page.occurrences
+                .iter()
+                .map(|value| value.fields.start_time.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{rule}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn month_navigation_saves_editing_snapshots_only_for_visible_remote_positions() {
+    let (_directory, state, operation, _) = fixture(Some("caldav"), None, false).await;
+    let mut current = operation.source.set;
+    current.event.start_time = "1990-01-01".into();
+    current.event.end_time = "1990-01-02".into();
+    current.event.recurrence_rule = Some("FREQ=DAILY;COUNT=3".into());
+    current.overrides.clear();
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        db::calendar_sync::replace_calendar(
+            &tx,
+            "source",
+            "source-calendar",
+            "caldav",
+            &[db::calendar_sync::Resource::readable(current).unwrap()],
+        )
+        .unwrap();
+        tx.execute("DELETE FROM calendar_action_snapshots", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    for month in ["2026-10", "2026-11"] {
+        let page = list_occurrences(
+            &state,
+            "source".into(),
+            None,
+            format!("{month}-01"),
+            format!("{month}-28"),
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(page.occurrences.is_empty());
+        assert!(page.display_errors.is_empty(), "{:?}", page.display_errors);
+        let conn = state.db.reader();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM calendar_action_snapshots",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "1990-01-01".into(),
+        "1990-01-04".into(),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.occurrences.len(), 3);
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|item| !item.selection.token.is_empty()));
+    let snapshot = store::load_snapshot(
+        &state.db.reader(),
+        &page.occurrences[0].selection.token,
+        &page.occurrences[0].event_id,
+    )
+    .unwrap();
+    assert_eq!(snapshot.set.event.start_time, "1990-01-01");
+    assert_eq!(
+        snapshot.set.event.recurrence_rule.as_deref(),
+        Some("FREQ=DAILY;COUNT=3")
+    );
+}
+
+#[tokio::test]
+async fn display_errors_isolate_opaque_rules_and_keep_untitled_instantaneous_remote_events() {
+    let (_directory, state, operation, _) = fixture(Some("caldav"), None, false).await;
+    let mut readable = operation.source.set.clone();
+    readable.event.all_day = false;
+    readable.event.timezone = None;
+    readable.event.start_time = "2026-10-08T10:00:00Z".into();
+    readable.event.end_time = readable.event.start_time.clone();
+    readable.event.title.clear();
+    readable.event.recurrence_rule = Some("FREQ=DAILY;COUNT=2".into());
+    readable.overrides.clear();
+    let mut unsupported = readable.clone();
+    unsupported.event.id = "opaque-event".into();
+    unsupported.event.remote_id = Some("opaque-resource".into());
+    unsupported.native.as_mut().unwrap().event_id = "opaque-resource".into();
+    unsupported.event.recurrence_rule = Some("FREQ=DAILY;BYBOGUS=1".into());
+    {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction().unwrap();
+        db::calendar_sync::replace_calendar(
+            &tx,
+            "source",
+            "source-calendar",
+            "caldav",
+            &[
+                db::calendar_sync::Resource::readable(readable.clone()).unwrap(),
+                db::calendar_sync::Resource::readable(unsupported).unwrap(),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let page = list_occurrences(
+        &state,
+        "source".into(),
+        None,
+        "2026-10-08".into(),
+        "2026-10-10".into(),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.occurrences.len(), 2);
+    assert_eq!(page.display_errors.len(), 1);
+    assert!(page.display_errors[0].message.contains("BYBOGUS"));
+    assert!(page
+        .occurrences
+        .iter()
+        .all(|value| value.fields.title.is_empty() && value.selection.token.is_empty()));
+    let conn = state.db.reader();
+    assert_eq!(
+        db::calendar::list_events(&conn, "source", None, "2026-10-08", "2026-10-10")
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store::latest_snapshot(&conn, &page.occurrences[0].event_id)
+        .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn provider_absence_removes_owned_children_but_preserves_claimed_recovery() {
+    for claimed in [false, true] {
+        let (_directory, state, operation, _) = fixture(Some("graph"), None, false).await;
+        let mut conn = state.db.writer().await;
+        let child = CalendarEvent {
+            id: "addressless-child".into(),
+            remote_id: None,
+            recurrence_kind: RecurrenceKind::Occurrence,
+            recurrence_rule: None,
+            ..operation.source.anchor.clone()
+        };
+        db::calendar::insert_event(&conn, &child).unwrap();
+        conn.execute("INSERT INTO calendar_action_members(event_id, owner_event_id) VALUES (?1, 'source-event')",
+            [&child.id]).unwrap();
+        let tx = conn.transaction().unwrap();
+        if claimed {
+            store::claim_operation(&tx, &operation).unwrap();
+        }
+        db::calendar_sync::replace_calendar(&tx, "source", "source-calendar", "graph", &[])
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(db::calendar::get_event(&conn, "source-event").is_err());
+        assert!(db::calendar::get_event(&conn, &child.id).is_err());
+        assert!(
+            store::load_operation(&conn, &operation.id).is_ok(),
+            "journal survives cache retirement"
+        );
+    }
+}
+
+#[tokio::test]
+async fn evicted_action_recovers_only_from_current_provider_content_not_journal_history() {
+    for outcome in ["absent", "current", "changed"] {
+        let (_directory, state, mut operation, remote) = fixture(Some("graph"), None, false).await;
+        operation.destination = None;
+        operation.input.destination_calendar_id = None;
+        operation.stage = CalendarActionStage::Applying;
+        operation.canonical = Some(operation.source.set.clone());
+        {
+            let mut conn = state.db.writer().await;
+            let tx = conn.transaction().unwrap();
+            let legacy_child = CalendarEvent {
+                id: "legacy-child".into(),
+                remote_id: None,
+                recurrence_rule: None,
+                recurrence_kind: RecurrenceKind::Occurrence,
+                ..operation.source.anchor.clone()
+            };
+            db::calendar::insert_event(&tx, &legacy_child).unwrap();
+            operation
+                .source
+                .members
+                .push(store::event_version(&tx, legacy_child).unwrap());
+            store::claim_operation(&tx, &operation).unwrap();
+            store::save_operation(&tx, &operation).unwrap();
+            db::calendar_sync::replace_calendar(&tx, "source", "source-calendar", "graph", &[])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        if outcome == "absent" {
+            remote.lock().unwrap().sets.clear();
+        } else if outcome == "changed" {
+            let mut provider = remote.lock().unwrap();
+            let current = provider.sets.values_mut().next().unwrap();
+            current.event.title = "Independent upstream edit".into();
+            refresh_native(current, "graph");
+        }
+        let backend = Fake {
+            protocol: "graph",
+            remote,
+        };
+        let backends: [&dyn CalendarBackend; 1] = [&backend];
+        let result = execute_with_backends(
+            &state,
+            &operation.id,
+            &CalendarConfirmations::default(),
+            Some(&backends),
+        )
+        .await;
+        if outcome == "current" {
+            assert_eq!(result.unwrap().stage, CalendarActionStage::Completed);
+            assert_eq!(
+                db::calendar_sync::displayed_set(&state.db.reader(), "source-event")
+                    .unwrap()
+                    .unwrap()
+                    .event
+                    .title,
+                operation.desired.event.title
+            );
+        } else {
+            assert!(result.is_err());
+            assert!(db::calendar::get_event(&state.db.reader(), "source-event").is_err());
+            assert!(
+                db::calendar_sync::displayed_set(&state.db.reader(), "source-event")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1852,7 +2208,7 @@ async fn atomic_occurrence_plan_rejects_stale_display_before_claiming() {
 }
 
 #[tokio::test]
-async fn completed_caldav_occurrence_survives_sync_and_legacy_restart() {
+async fn completed_caldav_occurrence_cache_survives_but_history_cannot_replace_missing_cache() {
     let (_directory, state, operation, remote) = fixture(Some("caldav"), None, false).await;
     let expected =
         event_fields(&selected_event(&operation.source.set, Some("2026-09-14")).unwrap());
@@ -1910,12 +2266,12 @@ async fn completed_caldav_occurrence_survives_sync_and_legacy_restart() {
         occurrence.selection.original_start.as_deref() == Some("2026-09-14")
             && occurrence.fields.title == "Durable CalDAV edit"
     }));
-    assert_eq!(page.needs_hydration, ["source-event"]);
+    assert!(page.needs_hydration.is_empty());
 
     {
         let conn = state.db.writer().await;
         conn.execute(
-            "DELETE FROM calendar_action_sets WHERE event_id = 'source-event'",
+            "DELETE FROM calendar_remote_resources WHERE event_id = 'source-event'",
             [],
         )
         .unwrap();
@@ -1935,11 +2291,8 @@ async fn completed_caldav_occurrence_survives_sync_and_legacy_restart() {
     )
     .await
     .unwrap();
-    assert!(recovered.occurrences.iter().any(|occurrence| {
-        occurrence.selection.original_start.as_deref() == Some("2026-09-14")
-            && occurrence.fields.title == "Durable CalDAV edit"
-    }));
-    assert_eq!(recovered.needs_hydration, ["source-event"]);
+    assert!(recovered.occurrences.is_empty());
+    assert!(recovered.needs_hydration.is_empty());
 }
 
 #[tokio::test]
@@ -2465,7 +2818,7 @@ async fn expanded_whole_and_occurrence_moves_retire_all_source_addresses() {
                 )
                 .unwrap()
                 .len(),
-                2
+                1
             );
         }
     }

@@ -222,6 +222,54 @@ describe("CalendarView responsive event form lifecycle", () => {
     wrapper.unmount();
   });
 
+  it("shows partial-display errors without hiding events on desktop and mobile", async () => {
+    const calendarStore = useCalendarStore();
+    calendarStore.currentDate = "2026-04-07";
+    calendarStore.viewMode = "month";
+    calendarStore.displayErrors = Array.from({ length: 40 }, (_, index) => `Remote resource ${index} has an unsupported RRULE`);
+    calendarStore.events = [{
+      id: "untitled", account_id: "calendar-account", calendar_id: "calendar", uid: "untitled",
+      title: "", description: null, location: null,
+      start_time: "2026-04-07T10:00:00Z", end_time: "2026-04-07T10:00:00Z",
+      all_day: false, timezone: null, recurrence_rule: null, recurrence_kind: "standalone",
+      organizer_email: null, attendees_json: null, my_status: null, source_message_id: null,
+    }];
+    vi.spyOn(calendarStore, "fetchCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "fetchEvents").mockResolvedValue();
+    vi.spyOn(calendarStore, "syncCalendars").mockResolvedValue();
+    vi.spyOn(calendarStore, "startCalendarSync").mockResolvedValue();
+    const wrapper = mount(CalendarView, { global: { stubs: {
+      CalendarSidebar: true, WeekView: true, EventDetail: true,
+      MobileAppBar: true, MobileIconButton: true, EventForm: true,
+    } } });
+    await flushPromises();
+    expect(wrapper.get(".calendar-incomplete").text()).toContain("unsupported RRULE");
+    expect(wrapper.findAll(".calendar-display-notice")).toHaveLength(1);
+    expect(wrapper.get(".calendar-display-notice").attributes("open")).toBeUndefined();
+    expect(wrapper.get(".calendar-display-notice summary").text()).toContain("40 issue(s)");
+    expect(wrapper.get("[data-testid=cal-event-untitled]").text()).toContain("(No title)");
+    // Switching to mobile reloads its narrower day window through the store's
+    // navigation path; return the same partial result for that authoritative read.
+    const event = calendarStore.events[0];
+    vi.mocked(api.getEvents).mockResolvedValueOnce([event]).mockResolvedValueOnce([]);
+    vi.mocked(api.listCalendarOccurrences).mockResolvedValueOnce({
+      occurrences: [{
+        selection: { event_id: event.id, original_start: null, token: "" },
+        event_id: event.id, account_id: event.account_id, calendar_id: event.calendar_id,
+        fields: { title: event.title, description: null, location: null, start_time: event.start_time, end_time: event.end_time, all_day: false, timezone: null },
+        recurrence_kind: "standalone", recurrence_rule: null, is_exception: false,
+      }], has_more: false, unresolved: [], needs_hydration: [],
+      display_errors: [{ event_id: "opaque", account_id: event.account_id, calendar_id: event.calendar_id, message: "unsupported RRULE" }],
+    });
+    usePlatformStore().width = 390;
+    await flushPromises();
+    expect(wrapper.get(".calendar-incomplete").text()).toContain("unsupported RRULE");
+    expect(wrapper.findAll(".calendar-display-notice")).toHaveLength(1);
+    expect(wrapper.get(".calendar-display-notice").attributes("open")).toBeUndefined();
+    expect(wrapper.text()).toContain("(No title)");
+    wrapper.unmount();
+  });
+
   it("shows archived Graph data outside the sidebar on desktop and mobile", async () => {
     const calendarStore = useCalendarStore();
     calendarStore.archivedGraphCalendars = [{

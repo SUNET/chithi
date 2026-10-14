@@ -401,8 +401,9 @@ export async function getParticipantSchedules(
 
 export async function createEvent(
   event: import("./types").NewEventInput,
+  operationId: string,
 ): Promise<string> {
-  return invoke("create_event", { event });
+  return invoke("create_event", { event, operationId });
 }
 
 export async function updateEvent(

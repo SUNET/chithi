@@ -507,28 +507,6 @@ pub fn for_protocol(protocol: &str) -> Option<&'static dyn CalendarBackend> {
         .find(|backend| backend.protocol() == protocol)
 }
 
-/// Local events that have never been pushed (no remote_id). Members of a
-/// canonical provider set have no independent address and must not be uploaded.
-/// Shared by the JMAP and CalDAV syncs' push pass.
-pub(crate) fn get_unpushed_events(
-    conn: &rusqlite::Connection,
-    account_id: &str,
-) -> Result<Vec<CalendarEvent>> {
-    let mut stmt = conn.prepare(
-        "SELECT event.id FROM calendar_events event
-         WHERE event.account_id = ?1 AND (event.remote_id IS NULL OR event.remote_id = '')
-           AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
-                           WHERE member.event_id = event.id
-                             AND member.owner_event_id != event.id)",
-    )?;
-    let ids = stmt
-        .query_map(rusqlite::params![account_id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    ids.iter()
-        .map(|id| crate::db::calendar::get_event(conn, id))
-        .collect()
-}
-
 #[cfg(test)]
 mod registry_tests {
     use super::*;
@@ -575,9 +553,13 @@ mod registry_tests {
             crate::db::calendar::insert_event(&conn, &event).unwrap();
         }
 
-        let events = get_unpushed_events(&conn, "account").unwrap();
-        assert_eq!(events.len(), 4);
-        for event in events {
+        for kind in [
+            RecurrenceKind::Unknown,
+            RecurrenceKind::Standalone,
+            RecurrenceKind::Series,
+            RecurrenceKind::Occurrence,
+        ] {
+            let event = crate::db::calendar::get_event(&conn, kind.as_str()).unwrap();
             assert_eq!(event.id, event.recurrence_kind.as_str());
             assert_eq!(
                 event.recurrence_rule.as_deref(),
@@ -587,7 +569,7 @@ mod registry_tests {
     }
 
     #[test]
-    fn canonical_members_are_not_unpushed_events() {
+    fn canonical_members_keep_their_explicit_owner() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::schema::initialize(&conn).unwrap();
         conn.execute_batch(
@@ -613,9 +595,10 @@ mod registry_tests {
             [],
         )
         .unwrap();
-        let unpushed = get_unpushed_events(&conn, "account").unwrap();
-        assert_eq!(unpushed.len(), 1);
-        assert_eq!(unpushed[0].id, "local");
+        assert_eq!(
+            crate::db::calendar_actions::owner_id(&conn, "detached").unwrap(),
+            "master"
+        );
     }
 
     fn account(calendar_protocol: &str, caldav_url: &str) -> AccountFull {

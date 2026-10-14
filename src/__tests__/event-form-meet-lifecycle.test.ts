@@ -110,7 +110,7 @@ describe("EventForm pending meeting lifecycle", () => {
     vm.attendeeEmails = ["guest@example.test"];
     await wrapper.get('[data-testid="event-form-save"]').trigger("click");
     await flushPromises();
-    expect(api.createEvent).toHaveBeenCalledWith(expect.objectContaining({ recurrence_rule: "FREQ=WEEKLY" }));
+    expect(api.createEvent).toHaveBeenCalledWith(expect.objectContaining({ recurrence_rule: "FREQ=WEEKLY" }), expect.any(String));
     expect(api.sendInvites).toHaveBeenCalledExactlyOnceWith("calendar-account", "event-1", ["guest@example.test"]);
     expect(api.notifyCalendarEvent).not.toHaveBeenCalled();
     wrapper.unmount();

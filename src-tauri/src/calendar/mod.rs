@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod actions;
+pub(crate) mod display_recurrence;
+mod recurrence_projection;
 
 pub mod event_set;
 pub mod ical;

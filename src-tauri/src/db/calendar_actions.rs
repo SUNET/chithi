@@ -292,6 +292,7 @@ pub(crate) fn load_snapshot(conn: &Connection, token: &str, event_id: &str) -> R
     Ok(snapshot)
 }
 
+#[cfg(test)]
 pub(crate) fn latest_snapshot(conn: &Connection, event_id: &str) -> Result<Option<Snapshot>> {
     let owner = owner_id(conn, event_id)?;
     if let Some(set) = owned_set(conn, &owner)? {
@@ -326,11 +327,22 @@ pub(crate) fn cache_canonical(
     if owned {
         save_owned_set(conn, &anchor, set)?;
     }
+    if set.native.is_some() {
+        let mut current = set.clone();
+        current.event.id = anchor.id.clone();
+        current.event.account_id = anchor.account_id.clone();
+        current.event.calendar_id = anchor.calendar_id.clone();
+        super::calendar_sync::record_confirmed_set(conn, &current)?;
+    }
     let snapshot = snapshot_for_set(conn, &anchor.id, set.clone())?;
     save_snapshot(conn, &snapshot)
 }
 
-fn snapshot_for_set(conn: &Connection, event_id: &str, set: CalendarEventSet) -> Result<Snapshot> {
+pub(crate) fn snapshot_for_set(
+    conn: &Connection,
+    event_id: &str,
+    set: CalendarEventSet,
+) -> Result<Snapshot> {
     let anchor = super::calendar::get_event(conn, event_id)?;
     let calendar = super::calendar::get_calendar(conn, &anchor.calendar_id)?;
     let members = set_members(conn, &anchor, &set)?;
@@ -347,8 +359,8 @@ fn snapshot_for_set(conn: &Connection, event_id: &str, set: CalendarEventSet) ->
     Ok(snapshot)
 }
 
-/// Reconstruct a clean local projection for a claimed operation whose remote
-/// effect may already have been imported. Planned actions never use this path.
+/// Reconstruct a confirmed projection for a claimed operation whose remote
+/// effect may already have been read. Planned actions never use this path.
 pub(crate) fn recovery_snapshot(
     conn: &Connection,
     operation: &Operation,
@@ -357,7 +369,12 @@ pub(crate) fn recovery_snapshot(
         return Ok(None);
     }
     let owner = owner_id(conn, &operation.source.anchor.id)?;
-    let Some(set) = owned_set(conn, &owner)? else {
+    let set = if operation.source.set.native.is_some() {
+        super::calendar_sync::displayed_set(conn, &owner)?
+    } else {
+        owned_set(conn, &owner)?
+    };
+    let Some(set) = set else {
         log::warn!(
             "Calendar action recovery projection is absent or dirty: operation_id={} owner_event_id={owner}",
             operation.id
@@ -388,7 +405,10 @@ pub(crate) fn recovery_snapshot(
         .iter()
         .map(|member| member.event.id.as_str())
         .collect();
-    if current != expected {
+    // The mirror embeds provider exceptions and may evict superseded legacy
+    // member rows. Their absence is not a competing edit or missing remote
+    // content; only a provider-backed complete set may relax that cache check.
+    if current != expected && !(snapshot.set.native.is_some() && current.is_subset(&expected)) {
         log::warn!(
             "Calendar action recovery member set changed: operation_id={} current_members={} expected_members={} current_is_subset={} expected_is_subset={}",
             operation.id,
@@ -439,53 +459,6 @@ fn owned_set(conn: &Connection, event_id: &str) -> Result<Option<CalendarEventSe
         )
         .optional()?;
     data.map(|data| decode(&data)).transpose()
-}
-
-/// Last complete provider set for display only. A dirty set is not proof for
-/// planning or mutation, but remains more coherent than expanding its master
-/// while dropping all known exceptions.
-pub(crate) fn display_owned_set(
-    conn: &Connection,
-    event_id: &str,
-) -> Result<Option<CalendarEventSet>> {
-    let owner = owner_id(conn, event_id)?;
-    let data: Option<String> = conn
-        .query_row(
-            "SELECT data FROM calendar_action_sets WHERE event_id = ?1",
-            [owner],
-            |row| row.get(0),
-        )
-        .optional()?;
-    data.map(|data| decode(&data)).transpose()
-}
-
-/// Last provider-verified result from a completed in-place action. This is a
-/// display-only bridge for operations completed before recurring sets were
-/// stored durably; callers must still require hydration before mutation.
-pub(crate) fn completed_canonical_for_display(
-    conn: &Connection,
-    event_id: &str,
-) -> Result<Option<CalendarEventSet>> {
-    let mut stmt = conn.prepare(
-        "SELECT data FROM calendar_action_operations
-         WHERE event_id = ?1 AND completed = 1
-         ORDER BY created_at DESC, operation_id DESC LIMIT 10",
-    )?;
-    let rows = stmt
-        .query_map([event_id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for data in rows {
-        let operation: Operation = decode(&data)?;
-        if operation.stage == CalendarActionStage::Completed
-            && operation.destination.is_none()
-            && operation.source.anchor.id == event_id
-        {
-            if let Some(set) = operation.canonical {
-                return Ok(Some(set));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// Membership is determined by exact addresses and explicit recurrence identity,
@@ -595,121 +568,6 @@ pub(crate) fn persist_source(
     persist_verified_set(conn, &source.anchor, &source.set, set)
 }
 
-/// Sync may verify a complete provider set without a renderer selection token.
-/// Keep ingestion, membership and the canonical cache in the caller's transaction.
-pub(crate) fn persist_synced_caldav_set(
-    tx: &rusqlite::Transaction<'_>,
-    resources: &[(&CalendarEvent, &[RecurrenceIdentitySeed])],
-    set: &CalendarEventSet,
-) -> Result<bool> {
-    if tx.is_autocommit()
-        || resources.is_empty()
-        || set.native.as_ref().is_none_or(|native| {
-            native.protocol != "caldav"
-                || set.event.remote_id.as_deref() != Some(native.event_id.as_str())
-        })
-    {
-        return Err(invalid("sync requires a complete CalDAV source"));
-    }
-    set.validate()?;
-    let master = set.native.as_ref().expect("checked native CalDAV source");
-    let claimed: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM calendar_action_claims claim
-         JOIN calendar_events event ON event.id = claim.event_id
-         WHERE event.account_id = ?1 AND event.calendar_id = ?2
-           AND (event.uid = ?3 OR event.remote_id = ?4))",
-        params![
-            set.event.account_id,
-            set.event.calendar_id,
-            set.event.uid,
-            master.event_id
-        ],
-        |row| row.get(0),
-    )?;
-    if claimed {
-        return Ok(false);
-    }
-    for (event, seeds) in resources {
-        if event.account_id != set.event.account_id
-            || event.calendar_id != set.event.calendar_id
-            || event.uid != set.event.uid
-        {
-            return Err(invalid("sync resource belongs to another series"));
-        }
-        super::calendar::upsert_event_by_remote_id_with_recurrence_in_transaction(
-            tx, event, seeds,
-        )?;
-    }
-    let anchor_id: String = tx.query_row(
-        "SELECT id FROM calendar_events WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3",
-        params![set.event.account_id, set.event.calendar_id, master.event_id],
-        |row| row.get(0),
-    )?;
-    let anchor = super::calendar::get_event(tx, &anchor_id)?;
-    let owner = persist_verified_set(tx, &anchor, set, set)?;
-    let mut active = std::collections::HashSet::from([master.event_id.as_str()]);
-    for native in set.overrides.iter().filter_map(|item| item.native.as_ref()) {
-        active.insert(native.event_id.as_str());
-    }
-    let mut stmt = tx.prepare(
-        "SELECT remote_id FROM calendar_action_addresses
-         WHERE account_id = ?1 AND calendar_id = ?2 AND owner_event_id = ?3 AND retired = 0",
-    )?;
-    let addresses = stmt
-        .query_map(
-            params![owner.account_id, owner.calendar_id, owner.id],
-            |row| row.get::<_, String>(0),
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for remote in addresses {
-        if !active.contains(remote.as_str()) {
-            tx.execute(
-                "DELETE FROM calendar_action_addresses WHERE account_id = ?1 AND calendar_id = ?2 AND remote_id = ?3 AND owner_event_id = ?4 AND retired = 0",
-                params![owner.account_id, owner.calendar_id, remote, owner.id],
-            )?;
-        }
-    }
-    Ok(true)
-}
-
-/// Delete missing CalDAV owners with their addressless detached rows. A claim
-/// keeps the whole set intact until its in-progress action is resolved.
-pub(crate) fn delete_missing_caldav_events(
-    tx: &rusqlite::Transaction<'_>,
-    missing_owners: &[String],
-) -> Result<usize> {
-    let mut deleted = 0;
-    for owner in missing_owners {
-        let mut members = vec![owner.clone()];
-        let mut stmt = tx.prepare(
-            "SELECT event_id FROM calendar_action_members WHERE owner_event_id = ?1 AND event_id != ?1",
-        )?;
-        members.extend(
-            stmt.query_map([owner], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        );
-        let mut claimed = false;
-        for id in &members {
-            let active: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM calendar_action_claims WHERE event_id = ?1)",
-                [id],
-                |row| row.get(0),
-            )?;
-            claimed |= active;
-        }
-        if claimed {
-            log::info!("sync_calendars: deferred deletion of claimed CalDAV owner={owner}");
-            continue;
-        }
-        tx.execute(
-            "DELETE FROM calendar_action_addresses WHERE owner_event_id = ?1 AND retired = 0",
-            [owner],
-        )?;
-        deleted += super::calendar_event_deletion::delete_events(tx, &members)?.deleted;
-    }
-    Ok(deleted)
-}
-
 fn persist_verified_set(
     conn: &Connection,
     anchor: &CalendarEvent,
@@ -787,6 +645,11 @@ fn persist_verified_set(
     if set.event.recurrence_kind == RecurrenceKind::Series
         || members.len() > 1
         || anchor.recurrence_kind == RecurrenceKind::Occurrence
+        || conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM calendar_action_sets WHERE event_id = ?1)",
+            [&owner.id],
+            |row| row.get::<_, bool>(0),
+        )?
     {
         save_owned_set(conn, &owner, set)?;
     }
@@ -819,6 +682,23 @@ pub(crate) fn retire_source(
     source: &Snapshot,
     target: &CalendarEvent,
 ) -> Result<()> {
+    if let Some(native) = &source.set.native {
+        conn.execute(
+            "DELETE FROM calendar_remote_resources WHERE calendar_id = ?1 AND remote_id = ?2",
+            params![source.anchor.calendar_id, native.event_id],
+        )?;
+        for resource in source
+            .set
+            .overrides
+            .iter()
+            .filter_map(|item| item.native.as_ref())
+        {
+            conn.execute(
+                "DELETE FROM calendar_remote_resources WHERE calendar_id = ?1 AND remote_id = ?2",
+                params![source.anchor.calendar_id, resource.event_id],
+            )?;
+        }
+    }
     if let Some(native) = &source.set.native {
         address(conn, &source.anchor, &native.event_id, &target.id, true)?;
     }
@@ -1377,6 +1257,78 @@ mod tests {
             source_after: None,
             native_move: false,
             auto_resume: false,
+        }
+    }
+
+    #[test]
+    fn absent_remote_calendar_evicts_content_even_with_pending_history() {
+        for state in [
+            "cache",
+            "unpublished",
+            "claim",
+            "creation",
+            "operation",
+            "planned",
+            "cross-calendar",
+            "planned-resumable",
+        ] {
+            let (mut conn, _) = fixture();
+            conn.execute(
+                "UPDATE calendars SET remote_id = 'remote-calendar' WHERE id = 'calendar'",
+                [],
+            )
+            .unwrap();
+            if state != "unpublished" {
+                conn.execute(
+                    "UPDATE calendar_events SET remote_id = 'remote-event' WHERE id = 'event'",
+                    [],
+                )
+                .unwrap();
+            }
+            if state == "claim" {
+                conn.execute("INSERT INTO calendar_action_operations(operation_id, account_id, event_id, data)
+                    VALUES ('operation', 'account', 'event', '{}')", []).unwrap();
+                conn.execute("INSERT INTO calendar_action_claims(event_id, operation_id) VALUES ('event', 'operation')", []).unwrap();
+            } else if matches!(
+                state,
+                "creation" | "operation" | "planned" | "planned-resumable"
+            ) {
+                // Pending destinations belong to the journal, not the mirror.
+                let data = serde_json::json!({"destination":{"calendar_id":"calendar"},
+                    "stage": if state.starts_with("planned") { "planned" } else { "applying" },
+                    "auto_resume": state == "planned-resumable" })
+                .to_string();
+                let sql = if state == "creation" {
+                    "INSERT INTO calendar_action_creations(operation_id, account_id, event_id, data) VALUES ('operation', 'account', 'not-created', ?1)"
+                } else {
+                    "INSERT INTO calendar_action_operations(operation_id, account_id, event_id, data) VALUES ('operation', 'account', 'not-created', ?1)"
+                };
+                conn.execute(sql, [data]).unwrap();
+            } else if state == "cross-calendar" {
+                conn.execute("INSERT INTO calendars(id, account_id, name, remote_id) VALUES ('other', 'account', 'Other', 'remote-other')", []).unwrap();
+                let mut child = crate::db::calendar::get_event(&conn, "event").unwrap();
+                child.id = "child".into();
+                child.calendar_id = "other".into();
+                child.remote_id = None;
+                crate::db::calendar::insert_event(&conn, &child).unwrap();
+                conn.execute("INSERT INTO calendar_action_members(event_id, owner_event_id) VALUES ('child', 'event')", []).unwrap();
+            }
+            let tx = conn.transaction().unwrap();
+            let result = super::super::calendar_sync::replace_inventory(
+                &tx,
+                "account",
+                &std::collections::HashSet::from(["remote-other"]),
+            );
+            assert!(result.is_ok(), "{state}: {result:?}");
+            tx.commit().unwrap();
+            assert!(
+                crate::db::calendar::get_event(&conn, "event").is_err(),
+                "{state}"
+            );
+            assert!(
+                crate::db::calendar::get_calendar(&conn, "calendar").is_err(),
+                "{state}"
+            );
         }
     }
 

@@ -727,6 +727,44 @@ async fn ordinary_backend_callback_performs_a_conditional_native_update() {
 }
 
 #[test]
+fn display_accepts_untitled_zero_duration_without_weakening_mutation_decoding() {
+    let mut object = master();
+    object["title"] = json!("");
+    object["duration"] = json!("PT0S");
+    let set = decode_display_set(
+        &template(),
+        "calendar-account",
+        "source",
+        "revision",
+        &object,
+        &[],
+    )
+    .unwrap();
+    assert!(set.event.title.is_empty());
+    assert_eq!(set.event.start_time, set.event.end_time);
+    assert!(decode_set(
+        &template(),
+        "calendar-account",
+        "source",
+        "revision",
+        &object,
+        &[]
+    )
+    .is_err());
+    object["recurrenceRules"] =
+        json!([{"@type": "RecurrenceRule", "frequency": "daily", "byMonthDay": [1]}]);
+    assert!(decode_display_set(
+        &template(),
+        "calendar-account",
+        "source",
+        "revision",
+        &object,
+        &[]
+    )
+    .is_err());
+}
+
+#[test]
 fn fractional_duration_and_native_nested_override_paths_are_lossless() {
     let mut object = master();
     object["recurrenceOverrides"]["2026-09-20T10:00:00"] =

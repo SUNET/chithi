@@ -41,7 +41,7 @@ async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
         .unwrap();
 }
 
-async fn server(
+pub(super) async fn server(
     build: impl FnOnce(&str) -> Vec<(u16, Value)>,
 ) -> (GraphClient, tokio::task::JoinHandle<Vec<String>>) {
     let (root, task) = serve_json(build).await;
@@ -80,7 +80,7 @@ pub(crate) async fn serve_json(
                 continue;
             }
             let mut body = body;
-            if let Some(values) = body["value"].as_array_mut() {
+            if let Some(values) = body.get_mut("value").and_then(Value::as_array_mut) {
                 for value in values {
                     if value.get("__creation").is_some() {
                         value.as_object_mut().unwrap().remove("__creation");
@@ -111,13 +111,25 @@ fn fixture(id: &str) -> Value {
         "originalStartTimeZone": "Europe/Stockholm", "originalEndTimeZone": "Europe/Stockholm"})
 }
 
-fn master() -> Value {
+pub(crate) fn master() -> Value {
     let mut value = fixture("master");
     value["type"] = json!("seriesMaster");
     value["recurrence"] = json!({"pattern": {"type": "daily", "interval": 1}, "range": {"type": "numbered", "numberOfOccurrences": 4, "startDate": "2026-09-14", "recurrenceTimeZone": "Europe/Stockholm"}});
     value["exceptionOccurrences"] = json!([]);
     value["cancelledOccurrences"] = json!([]);
     value
+}
+
+#[test]
+fn display_accepts_empty_subject_and_zero_duration_without_weakening_canonical_reads() {
+    let mut value = master();
+    value["subject"] = json!("");
+    value["end"] = value["start"].clone();
+    let template = crate::backend::testutil::event();
+    let event = display_event(&value, &template, "selected").unwrap();
+    assert!(event.title.is_empty());
+    assert_eq!(event.start_time, event.end_time);
+    assert!(canonical(&value, &template, "selected").is_err());
 }
 
 fn exception(id: &str, position: &str) -> Value {
@@ -825,6 +837,57 @@ async fn complete_cancellation_read_uses_legacy_slots_not_opaque_id_suffixes() {
     let requests = captured.await.unwrap();
     headers(&requests);
     assert!(requests[1].contains("singleValueExtendedProperties"));
+}
+
+#[tokio::test]
+async fn display_keeps_verified_cancellations_for_previously_supported_absolute_patterns() {
+    for (kind, frequency, period, deleted, last, position) in [
+        (
+            "absoluteMonthly",
+            0x200c_u16,
+            1_u32,
+            "2026-10-14",
+            "2026-12-14",
+            "2026-10-14T09:00:00Z",
+        ),
+        (
+            "absoluteYearly",
+            0x200d_u16,
+            12_u32,
+            "2027-09-14",
+            "2029-09-14",
+            "2027-09-14T09:00:00Z",
+        ),
+    ] {
+        let epoch = NaiveDate::from_ymd_opt(1601, 1, 1).unwrap();
+        let date = |value| NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap();
+        let deleted_days = date(deleted)
+            .signed_duration_since(date("2026-09-14"))
+            .num_days() as u32;
+        let mut blob = cancellation_blob(&[deleted_days], &[]);
+        blob[4..6].copy_from_slice(&frequency.to_le_bytes());
+        blob[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        blob[14..18].copy_from_slice(&period.to_le_bytes());
+        blob[50..54].copy_from_slice(
+            &(date(last).signed_duration_since(epoch).num_minutes() as u32).to_le_bytes(),
+        );
+        blob.splice(22..22, 14_u32.to_le_bytes());
+        let mut source = master();
+        source["recurrence"]["pattern"] =
+            json!({"type":kind, "interval":1, "dayOfMonth":14, "month":9});
+        source["cancelledOccurrences"] = json!(["opaque-cancelled-instance"]);
+        source["singleValueExtendedProperties"] = json!([{"id":RECUR_PROPERTY, "value":base64::engine::general_purpose::STANDARD.encode(blob)}]);
+        let (client, captured) =
+            server(|_| vec![(200, source.clone()), (200, source.clone()), (200, source)]).await;
+        let set = client
+            .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+            .await
+            .unwrap();
+        assert_eq!(set.overrides.len(), 1, "{kind}");
+        assert_eq!(set.overrides[0].original_start, position, "{kind}");
+        assert!(set.overrides[0].event.is_none());
+        assert_eq!(captured.await.unwrap().len(), 3);
+    }
 }
 
 #[tokio::test]

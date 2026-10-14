@@ -287,6 +287,67 @@ async fn refresh_source_snapshot(
     Ok(snapshot)
 }
 
+/// Journals retain addressing evidence, not display content. When sync evicts an
+/// unfinished action's cache, restore only a freshly read, identity-checked
+/// provider resource. An absent or independently changed source stays absent.
+async fn refresh_evicted_source(
+    state: &AppState,
+    operation: &store::Operation,
+    backends: Option<&[&dyn providers::CalendarBackend]>,
+) -> Result<()> {
+    if operation.stage == CalendarActionStage::Planned || operation.destination.is_some() {
+        return Ok(());
+    }
+    let exists: bool = state.db.reader().query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE id = ?1)",
+        [&operation.source.anchor.id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    let remote = operation
+        .source
+        .remote_calendar_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("a missing local source cannot be recovered from history"))?;
+    let target = destination(&state.db.reader(), &operation.source.anchor.calendar_id)?;
+    if target.remote_calendar_id.as_deref() != Some(remote)
+        || target.account_route != operation.source.account_route
+    {
+        return Err(invalid("source routing changed during recovery"));
+    }
+    let account = db::accounts::get_account_full(&state.db.reader(), &target.account_id)?;
+    let backend = backend_for(&account, backends)?;
+    let mut current = backend
+        .fetch_event_set(
+            &context(state),
+            &account,
+            &operation.source.set.event,
+            remote,
+        )
+        .await?;
+    if !same_event_identity(&operation.source.set, &current)
+        || (!semantic_eq(&current, &operation.source.set)
+            && !semantic_eq(&current, &operation.desired))
+    {
+        return Err(invalid(
+            "provider source changed independently; refresh and re-plan",
+        ));
+    }
+    current.event.id = operation.source.anchor.id.clone();
+    current.event.account_id = target.account_id;
+    current.event.calendar_id = target.calendar_id;
+    let mut conn = state.db.writer().await;
+    let tx = conn.transaction()?;
+    db::calendar::insert_event(&tx, &current.event)?;
+    store::persist_embedded(&tx, &current.event, &current)?;
+    store::cache_canonical(&tx, current.event.clone(), &current)?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn read_calendar_event_set(
     state: State<'_, AppState>,
@@ -481,11 +542,17 @@ async fn list_occurrences(
             "SELECT event.id FROM calendar_events event JOIN calendars calendar ON calendar.id = event.calendar_id
               WHERE event.account_id = ?1 AND (?2 IS NULL OR event.calendar_id = ?2) AND calendar.is_subscribed = 1
                 AND calendar.is_archived = 0
-               AND NOT EXISTS (SELECT 1 FROM calendar_action_members member
-                               WHERE member.event_id = event.id
-                                 AND member.owner_event_id != event.id)
-               AND ((julianday(event.start_time) < julianday(?4) AND julianday(event.end_time) > julianday(?3))
-                 OR event.recurrence_kind = 'series')
+               AND (calendar.remote_id IS NULL OR calendar.remote_id = '' OR EXISTS (
+                    SELECT 1 FROM calendar_remote_resources resource WHERE resource.event_id = event.id AND resource.set_data IS NOT NULL))
+               AND (calendar.remote_id IS NOT NULL AND calendar.remote_id != '' OR NOT EXISTS (SELECT 1 FROM calendar_action_members member
+                                WHERE member.event_id = event.id
+                                  AND member.owner_event_id != event.id))
+               AND ((calendar.remote_id IS NULL OR calendar.remote_id = '') AND (
+                     (julianday(event.start_time) < julianday(?4) AND julianday(event.end_time) > julianday(?3)) OR event.recurrence_kind = 'series')
+                 OR EXISTS (SELECT 1 FROM calendar_remote_resources resource WHERE resource.event_id = event.id AND (
+                     json_extract(resource.set_data, '$.event.recurrence_kind') = 'series' OR (
+                     julianday(json_extract(resource.set_data, '$.event.start_time')) < julianday(?4)
+                     AND julianday(json_extract(resource.set_data, '$.event.end_time')) >= julianday(?3)))))
              ORDER BY event.start_time, event.id LIMIT 2001")?;
         let rows = stmt.query_map(
             rusqlite::params![account_id, calendar_id, start, end],
@@ -498,6 +565,7 @@ async fn list_occurrences(
         has_more: ids.len() > 2000,
         needs_hydration: Vec::new(),
         unresolved: Vec::new(),
+        display_errors: Vec::new(),
     };
     // Inspect the whole selected page before projecting any master. An
     // identityless child may sort after its master; projecting first would
@@ -511,6 +579,13 @@ async fn list_occurrences(
     let mut calendars_with_unknown_uid = HashSet::new();
     let mut unresolved_ids = HashSet::new();
     for anchor in &anchors {
+        if db::calendar::get_calendar(&tx, &anchor.calendar_id)?
+            .remote_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
         if anchor.recurrence_kind != RecurrenceKind::Occurrence {
             continue;
         }
@@ -541,11 +616,7 @@ async fn list_occurrences(
             account_id
         );
     }
-    let mut projected_members = HashSet::new();
     for anchor in anchors {
-        if projected_members.contains(&anchor.id) {
-            continue;
-        }
         if unresolved_ids.contains(&anchor.id) {
             continue;
         }
@@ -564,64 +635,53 @@ async fn list_occurrences(
         }
         let id = anchor.id.clone();
         let calendar = db::calendar::get_calendar(&tx, &anchor.calendar_id)?;
-        if matches!(
-            anchor.recurrence_kind,
-            RecurrenceKind::Series | RecurrenceKind::Unknown
-        ) && calendar
+        if calendar
             .remote_id
             .as_deref()
             .is_some_and(|id| !id.is_empty())
         {
-            if let Some(snapshot) = store::latest_snapshot(&tx, &id)? {
-                let members: HashSet<_> = snapshot
-                    .members
-                    .iter()
-                    .map(|member| member.event.id.as_str())
-                    .collect();
-                page.occurrences
-                    .retain(|row| !members.contains(row.event_id.as_str()));
-                page.needs_hydration
-                    .retain(|id| !members.contains(id.as_str()));
-                projected_members.extend(members.into_iter().map(str::to_owned));
-                let projected =
-                    project(&snapshot.set, &anchor, &snapshot.token, &start, &end, limit)?;
-                store::save_snapshot(&tx, &snapshot)?;
+            if let Some(set) = db::calendar_sync::displayed_set(&tx, &id)? {
+                // The mirror already has one projection per remote resource.
+                // Action ownership and historical snapshots do not select what
+                // is rendered; this snapshot exists only for mutation tokens.
+                let editable = set.validate().is_ok();
+                let token = if editable {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    String::new()
+                };
+                let projected = match crate::calendar::actions::project_display(
+                    &set, &set.event, &token, &start, &end, limit,
+                ) {
+                    Ok(projected) => projected,
+                    Err(error) => {
+                        page.display_errors
+                            .push(crate::calendar::actions::CalendarDisplayError {
+                                event_id: id,
+                                calendar_id: anchor.calendar_id,
+                                account_id: anchor.account_id,
+                                message: error.to_string(),
+                            });
+                        continue;
+                    }
+                };
+                if editable && !projected.occurrences.is_empty() {
+                    let snapshot = store::Snapshot {
+                        calendar_revision: store::calendar_revision(&tx, &anchor.calendar_id)?,
+                        invitation_source: store::invitation_source(&tx, &id)?,
+                        account_route: store::account_route(&tx, &anchor.account_id)?,
+                        token,
+                        members: vec![store::event_version(&tx, anchor.clone())?],
+                        anchor: anchor.clone(),
+                        set,
+                        remote_calendar_id: calendar.remote_id,
+                    };
+                    store::save_snapshot(&tx, &snapshot)?;
+                }
                 page.has_more |= projected.has_more;
                 page.occurrences.extend(projected.occurrences);
                 page.has_more |= page.occurrences.len() > limit;
-                page.occurrences.sort_by(|a, b| {
-                    a.fields
-                        .start_time
-                        .cmp(&b.fields.start_time)
-                        .then(a.event_id.cmp(&b.event_id))
-                });
-                page.occurrences.truncate(limit);
-            } else {
-                let display_set = match store::display_owned_set(&tx, &id)? {
-                    Some(set) => Some(set),
-                    None => store::completed_canonical_for_display(&tx, &id)?,
-                };
-                if let Some(set) = display_set {
-                    let members: HashSet<_> = store::set_members(&tx, &anchor, &set)?
-                        .into_iter()
-                        .map(|member| member.event.id)
-                        .collect();
-                    page.occurrences
-                        .retain(|row| !members.contains(&row.event_id));
-                    page.needs_hydration
-                        .retain(|event_id| !members.contains(event_id));
-                    projected_members.extend(members);
-                    let projected = project(
-                        &set,
-                        &anchor,
-                        &uuid::Uuid::new_v4().to_string(),
-                        &start,
-                        &end,
-                        limit,
-                    )?;
-                    page.has_more |= projected.has_more;
-                    page.occurrences.extend(projected.occurrences);
-                    page.has_more |= page.occurrences.len() > limit;
+                if page.occurrences.len() > limit {
                     page.occurrences.sort_by(|a, b| {
                         a.fields
                             .start_time
@@ -629,10 +689,9 @@ async fn list_occurrences(
                             .then(a.event_id.cmp(&b.event_id))
                     });
                     page.occurrences.truncate(limit);
-                    page.needs_hydration.push(id);
-                } else {
-                    page.needs_hydration.push(id);
                 }
+            } else {
+                page.needs_hydration.push(id);
             }
             continue;
         }
@@ -675,7 +734,19 @@ async fn list_occurrences(
         } else {
             (store::local_set(&tx, &anchor)?, None)
         };
-        let mut projected = project(&set, &anchor, &token, &start, &end, limit)?;
+        let mut projected = match project(&set, &anchor, &token, &start, &end, limit) {
+            Ok(projected) => projected,
+            Err(error) => {
+                page.display_errors
+                    .push(crate::calendar::actions::CalendarDisplayError {
+                        event_id: id,
+                        calendar_id: anchor.calendar_id,
+                        account_id: anchor.account_id,
+                        message: error.to_string(),
+                    });
+                continue;
+            }
+        };
         for occurrence in &mut projected.occurrences {
             if let Some(original) = &original {
                 occurrence.selection.original_start = Some(original.clone());
@@ -700,13 +771,15 @@ async fn list_occurrences(
         if page.occurrences.len() > limit {
             page.has_more = true;
         }
-        page.occurrences.sort_by(|a, b| {
-            a.fields
-                .start_time
-                .cmp(&b.fields.start_time)
-                .then(a.event_id.cmp(&b.event_id))
-        });
-        page.occurrences.truncate(limit);
+        if page.occurrences.len() > limit {
+            page.occurrences.sort_by(|a, b| {
+                a.fields
+                    .start_time
+                    .cmp(&b.fields.start_time)
+                    .then(a.event_id.cmp(&b.event_id))
+            });
+            page.occurrences.truncate(limit);
+        }
     }
     page.occurrences.sort_by(|a, b| {
         a.fields
@@ -1057,6 +1130,36 @@ pub(crate) async fn create_completed(
     create_with_backends(state, input, operation_id, None).await
 }
 
+/// Ordinary remote moves use the same durable, provider-confirmed transfer as
+/// whole-series moves. No local calendar-id edit may stand in for a remote move.
+pub(crate) async fn move_standalone(
+    state: &AppState,
+    event: &str,
+    destination: &str,
+) -> Result<String> {
+    let snapshot = hydrate_with_backends(state, event, None).await?;
+    store::save_snapshot(&*state.db.writer().await, &snapshot)?;
+    let plan = plan_with_backends(
+        state,
+        CalendarActionInput {
+            selection: CalendarSelection {
+                event_id: event.into(),
+                token: snapshot.token,
+                original_start: None,
+            },
+            scope: RecurrenceMutationScope::EntireSeries,
+            edit: CalendarEdit::default(),
+            destination_calendar_id: Some(destination.into()),
+            reset_exceptions: false,
+        },
+        None,
+    )
+    .await?;
+    execute(state, &plan.operation_id, &CalendarConfirmations::default())
+        .await
+        .map(|result| result.event_id)
+}
+
 async fn create_with_backends(
     state: &AppState,
     input: super::calendar::NewEventInput,
@@ -1101,11 +1204,22 @@ async fn create_with_backends(
             return Ok(creation.result());
         }
         ensure_destination(&state.db.reader(), &creation.destination)?;
+        let mut creation = creation;
+        // Recovery evidence is not fresh display truth. Re-read before resuming
+        // publication so a deleted/changed resource cannot be resurrected.
+        if let (Some(canonical), Some(remote)) = (
+            &creation.canonical,
+            &creation.destination.remote_calendar_id,
+        ) {
+            let backend = backend_for(&account, backends)?;
+            let current = backend
+                .fetch_event_set(&context(state), &account, &canonical.event, remote)
+                .await?;
+            verify_created(&current, &creation.desired, remote, backend.protocol())?;
+            creation.canonical = Some(current);
+        }
         creation
     } else {
-        if input.meet_binding.is_some() && target.remote_calendar_id.is_some() {
-            return Err(invalid("remote recurring creation with a pending meeting requires durable meeting reservation integration"));
-        }
         if let Some(binding) = &input.meet_binding {
             super::calendar::validate_pending_meet_binding(&state.db.reader(), binding)?;
         }
@@ -1181,29 +1295,41 @@ async fn create_with_backends(
         let conn = state.db.writer().await;
         creation.save(&conn)?;
     }
-    let mut conn = state.db.writer().await;
-    let tx = conn.transaction()?;
-    ensure_destination(&tx, &creation.destination)?;
-    let canonical = creation
-        .canonical
-        .as_ref()
-        .ok_or_else(|| invalid("creation has no verified result"))?;
-    let mut event = canonical.event.clone();
-    event.id = creation.desired.event.id.clone();
-    event.account_id = creation.destination.account_id.clone();
-    event.calendar_id = creation.destination.calendar_id.clone();
-    db::calendar::insert_event(&tx, &creation.desired.event)?;
-    if creation.desired.event.recurrence_kind == RecurrenceKind::Series {
-        db::calendar_invitation::record_local_series(&tx, &creation.desired.event)?;
-    }
-    store::persist_embedded(&tx, &event, canonical)?;
+    let title = {
+        let mut conn = state.db.writer().await;
+        let tx = conn.transaction()?;
+        ensure_destination(&tx, &creation.destination)?;
+        let canonical = creation
+            .canonical
+            .as_ref()
+            .ok_or_else(|| invalid("creation has no verified result"))?;
+        let mut event = canonical.event.clone();
+        event.id = creation.desired.event.id.clone();
+        event.account_id = creation.destination.account_id.clone();
+        event.calendar_id = creation.destination.calendar_id.clone();
+        db::calendar::insert_event(&tx, &creation.desired.event)?;
+        store::persist_embedded(&tx, &event, canonical)?;
+        if creation.desired.event.recurrence_kind == RecurrenceKind::Series {
+            db::calendar_invitation::record_confirmed_creation(
+                &tx,
+                &event,
+                &creation.desired.event,
+            )?;
+        }
+        if let Some(binding) = input.meet_binding.as_ref() {
+            super::calendar::claim_meet_binding(&tx, &event.id, binding)?;
+        }
+        store::cache_canonical(&tx, db::calendar::get_event(&tx, &event.id)?, canonical)?;
+        creation.completed = true;
+        creation.save(&tx)?;
+        tx.commit()?;
+        event.title
+    };
+    drop(_guards);
+    drop(_meeting_guard);
     if let Some(binding) = input.meet_binding.as_ref() {
-        super::calendar::claim_meet_binding(&tx, &event.id, binding)?;
+        super::calendar::sync_meet_topic(state, binding, &title).await;
     }
-    store::cache_canonical(&tx, db::calendar::get_event(&tx, &event.id)?, canonical)?;
-    creation.completed = true;
-    creation.save(&tx)?;
-    tx.commit()?;
     Ok(creation.result())
 }
 
@@ -1366,6 +1492,29 @@ fn ensure_operation_current_or_recover_projected(
     conn: &rusqlite::Connection,
     operation: &mut store::Operation,
 ) -> Result<OperationCurrency> {
+    // A confirmed whole-source removal is recoverable without preserving its
+    // cache row. The destination is re-read by execution before publication.
+    if operation.stage != CalendarActionStage::Planned
+        && operation.destination.is_some()
+        && operation.source_after.is_some()
+        && operation.input.scope == RecurrenceMutationScope::EntireSeries
+    {
+        let absent: bool = conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM calendar_events WHERE id = ?1)",
+            [&operation.source.anchor.id],
+            |row| row.get(0),
+        )?;
+        if absent {
+            let calendar = db::calendar::get_calendar(conn, &operation.source.anchor.calendar_id)?;
+            if calendar.account_id == operation.source.anchor.account_id
+                && calendar.remote_id == operation.source.remote_calendar_id
+                && store::account_route(conn, &calendar.account_id)?
+                    == operation.source.account_route
+            {
+                return Ok(OperationCurrency::Current);
+            }
+        }
+    }
     let stale = match store::ensure_operation_current(conn, operation) {
         Ok(()) => return Ok(OperationCurrency::Current),
         Err(error) => error,
@@ -1542,6 +1691,35 @@ async fn execute_with_backends(
         return Err(invalid(
             "replacement meeting identity confirmation is required",
         ));
+    }
+    refresh_evicted_source(state, &operation, backends).await?;
+    if operation.stage != CalendarActionStage::Planned {
+        if let Some(canonical) = &operation.canonical {
+            if let Some(native) = &canonical.native {
+                let account_id = operation
+                    .destination
+                    .as_ref()
+                    .map_or(operation.source.anchor.account_id.as_str(), |target| {
+                        target.account_id.as_str()
+                    });
+                let account = db::accounts::get_account_full(&state.db.reader(), account_id)?;
+                let backend = backend_for(&account, backends)?;
+                let current = backend
+                    .fetch_event_set(
+                        &context(state),
+                        &account,
+                        &canonical.event,
+                        &native.calendar_id,
+                    )
+                    .await?;
+                if !same_event_identity(canonical, &current) || !semantic_eq(canonical, &current) {
+                    return Err(invalid(
+                        "confirmed resource changed upstream before recovery",
+                    ));
+                }
+                operation.canonical = Some(current);
+            }
+        }
     }
     if operation.stage != CalendarActionStage::Planned
         && operation.destination.is_none()
@@ -2022,7 +2200,14 @@ async fn commit_operation(state: &AppState, operation: &mut store::Operation) ->
                     .ok_or_else(|| invalid("missing source exclusion"))?,
             )?;
         } else {
-            store::retire_source(&tx, &operation.source, &event)?;
+            let source_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE id = ?1)",
+                [&operation.source.anchor.id],
+                |row| row.get(0),
+            )?;
+            if source_exists {
+                store::retire_source(&tx, &operation.source, &event)?;
+            }
         }
         store::cache_canonical(&tx, db::calendar::get_event(&tx, &event.id)?, &canonical)?;
     } else {

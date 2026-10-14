@@ -43,6 +43,15 @@ pub struct CalendarOccurrencePage {
     /// Rows which cannot be placed without a verified original recurrence
     /// position. Never treat these as standalone or generated occurrences.
     pub unresolved: Vec<UnresolvedCalendarOccurrence>,
+    pub display_errors: Vec<CalendarDisplayError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CalendarDisplayError {
+    pub event_id: String,
+    pub calendar_id: String,
+    pub account_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -180,8 +189,11 @@ pub(crate) fn window(start: &str, end: &str, limit: usize) -> Result<()> {
 }
 
 fn overlaps(fields: &OccurrenceFields, start: &str, end: &str) -> Result<bool> {
-    Ok(boundary(&fields.start_time)? < boundary(end)?
-        && boundary(&fields.end_time)? > boundary(start)?)
+    let lower = boundary(start)?;
+    let event_start = boundary(&fields.start_time)?;
+    let event_end = boundary(&fields.end_time)?;
+    Ok(event_start < boundary(end)?
+        && (event_end > lower || (event_start == event_end && event_start >= lower)))
 }
 
 pub(crate) fn selected_event(set: &CalendarEventSet, key: Option<&str>) -> Result<CalendarEvent> {
@@ -218,8 +230,35 @@ pub(crate) fn project(
     end: &str,
     limit: usize,
 ) -> Result<CalendarOccurrencePage> {
+    project_for(set, anchor, token, (start, end), limit, false)
+}
+
+pub(crate) fn project_display(
+    set: &CalendarEventSet,
+    anchor: &CalendarEvent,
+    token: &str,
+    start: &str,
+    end: &str,
+    limit: usize,
+) -> Result<CalendarOccurrencePage> {
+    project_for(set, anchor, token, (start, end), limit, true)
+}
+
+fn project_for(
+    set: &CalendarEventSet,
+    anchor: &CalendarEvent,
+    token: &str,
+    range: (&str, &str),
+    limit: usize,
+    display: bool,
+) -> Result<CalendarOccurrencePage> {
+    let (start, end) = range;
     window(start, end, limit)?;
-    set.validate()?;
+    if display {
+        set.validate_display()?;
+    } else {
+        set.validate()?;
+    }
     let mut values = Vec::new();
     let mut has_more = false;
     if set.event.recurrence_kind == RecurrenceKind::Series {
@@ -230,7 +269,25 @@ pub(crate) fn project(
         if budget > 10_000 {
             return Err(invalid("projection exceeds exception budget"));
         }
-        let expanded = recurrence::expand(&set.event, start, end, budget)?;
+        let expanded = if display && set.event.recurrence_rule.is_none() {
+            // RDATE-only recurrence includes DTSTART and explicitly supplied
+            // dates; never invent a frequency for it.
+            recurrence::Expansion {
+                occurrences: if overlaps(&event_fields(&set.event), start, end)? {
+                    vec![recurrence::GeneratedOccurrence {
+                        original_start: canonical_position(&set.event, &set.event.start_time)?,
+                        fields: event_fields(&set.event),
+                    }]
+                } else {
+                    vec![]
+                },
+                has_more: false,
+            }
+        } else if display {
+            super::display_recurrence::expand(&set.event, start, end, budget)?
+        } else {
+            recurrence::expand(&set.event, start, end, budget)?
+        };
         has_more = expanded.has_more;
         for occurrence in expanded.occurrences {
             if !set
@@ -254,7 +311,7 @@ pub(crate) fn project(
         values.push((None, event_fields(&set.event), false));
     }
     for (_, fields, _) in &mut values {
-        *fields = normalized_fields(fields.clone())?;
+        *fields = normalized_fields_for(fields.clone(), display)?;
     }
     values.sort_by(|a, b| a.1.start_time.cmp(&b.1.start_time).then(a.0.cmp(&b.0)));
     has_more |= values.len() > limit;
@@ -262,6 +319,7 @@ pub(crate) fn project(
     Ok(CalendarOccurrencePage {
         needs_hydration: Vec::new(),
         unresolved: Vec::new(),
+        display_errors: Vec::new(),
         occurrences: values
             .into_iter()
             .map(
@@ -867,8 +925,16 @@ fn rules_equivalent(a: &CalendarEvent, b: &CalendarEvent) -> Result<bool> {
             .all(|o| boundary(&o.original_start).is_ok_and(|start| start < lo)))
 }
 
-pub(crate) fn normalized_fields(mut fields: OccurrenceFields) -> Result<OccurrenceFields> {
-    fields.validate()?;
+pub(crate) fn normalized_fields(fields: OccurrenceFields) -> Result<OccurrenceFields> {
+    normalized_fields_for(fields, false)
+}
+
+fn normalized_fields_for(mut fields: OccurrenceFields, display: bool) -> Result<OccurrenceFields> {
+    if display {
+        fields.validate_display()?;
+    } else {
+        fields.validate()?;
+    }
     fields.description = fields.description.filter(|value| !value.is_empty());
     fields.location = fields.location.filter(|value| !value.is_empty());
     if !fields.all_day {
