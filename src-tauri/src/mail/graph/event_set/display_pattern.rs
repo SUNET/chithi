@@ -3,7 +3,7 @@
 
 use chrono::Datelike;
 
-use super::{append_rule_range, invalid, CalendarEvent, Result, Value, DAYS};
+use super::{append_rule_range, invalid, CalendarEvent, CalendarOverride, Result, Value, DAYS};
 
 fn integer(pattern: &Value, key: &str, maximum: u64) -> Result<u64> {
     pattern[key]
@@ -154,5 +154,50 @@ fn anchor_first_occurrence(rule: &str, kind: &str, event: &mut CalendarEvent) ->
         .ok_or_else(|| invalid("display recurrence has no matching Gregorian date"))?;
     event.start_time = first.fields.start_time;
     event.end_time = first.fields.end_time;
+    Ok(())
+}
+
+/// An explicitly cancelled exception is a verified original exclusion, even
+/// when Graph's separate cancelledOccurrences list is empty. Prove all such
+/// originals in one bounded pass; never infer positions from occurrence IDs.
+pub(super) fn verify_cancelled_exceptions(
+    event: &CalendarEvent,
+    overrides: &[CalendarOverride],
+) -> Result<()> {
+    let positions = overrides
+        .iter()
+        .filter(|item| item.event.is_none())
+        .map(|item| item.original_start.clone())
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let mut last = None;
+    for position in &positions {
+        let time = if event.all_day {
+            chrono::NaiveDate::parse_from_str(position, "%Y-%m-%d")
+                .map_err(invalid)?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| invalid("invalid cancelled exception date"))?
+                .and_utc()
+        } else {
+            super::instant(position)?
+        };
+        last = Some(last.map_or(time, |last: chrono::DateTime<chrono::Utc>| last.max(time)));
+    }
+    let upper = last
+        .expect("nonempty cancelled original positions")
+        .checked_add_signed(if event.all_day {
+            chrono::Duration::days(1)
+        } else {
+            chrono::Duration::nanoseconds(1)
+        })
+        .ok_or_else(|| invalid("cancelled exception proof overflow"))?;
+    crate::calendar::display_recurrence::verify_original_positions(
+        event,
+        &super::utc(upper),
+        &positions,
+    )
+    .map_err(invalid)?;
     Ok(())
 }

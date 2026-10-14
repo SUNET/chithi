@@ -332,14 +332,25 @@ impl CalendarBackend for GraphCalendarBackend {
                             .await
                         {
                             Ok(set) => resources.push(db::calendar_sync::Resource::readable(set)?),
-                            Err(Error::Sync(error)) => {
-                                read_errors.push(format!(
-                                    "Graph resource {id} cannot be displayed: {error}"
-                                ));
-                                resources
-                                    .push(db::calendar_sync::Resource::unsupported(native, error));
-                            }
-                            Err(error) => return Err(error),
+                            Err(failure) => match failure.error {
+                                Error::Sync(error) => {
+                                    let failed_native =
+                                        failure.native.map(|native| *native).unwrap_or(native);
+                                    if failed_native.event_id != id
+                                        || failed_native.calendar_id != calendar.id
+                                    {
+                                        return Err(Error::CalendarReadIncomplete("failed Graph master read belongs to another inventory resource".into()));
+                                    }
+                                    read_errors.push(format!(
+                                        "Graph resource {id} cannot be displayed: {error}"
+                                    ));
+                                    resources.push(db::calendar_sync::Resource::unsupported(
+                                        failed_native,
+                                        error,
+                                    ));
+                                }
+                                error => return Err(error),
+                            },
                         }
                     }
                     Ok(_) => resources.push(db::calendar_sync::Resource::unsupported(

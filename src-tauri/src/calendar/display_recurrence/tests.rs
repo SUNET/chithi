@@ -318,6 +318,139 @@ fn exact_candidate_budget_requires_count_completion_without_an_extra_candidate()
 }
 
 #[test]
+fn original_position_proof_uses_inclusive_cutoffs_and_exact_keys_not_event_overlap() {
+    let mut event = event("FREQ=MONTHLY;BYDAY=TH;BYSETPOS=2;UNTIL=20261210T000000Z");
+    event.start_time = "2026-10-08".into();
+    event.end_time = "2026-10-12".into();
+    let summary = verify_original_positions(
+        &event,
+        "2026-12-10T00:00:00.000000001Z",
+        &["2026-11-12".into()],
+    )
+    .unwrap();
+    assert_eq!(summary.count, 3);
+    assert_eq!(summary.first.as_deref(), Some("2026-10-08"));
+    assert_eq!(summary.last.as_deref(), Some("2026-12-10"));
+    assert!(verify_original_positions(&event, "2027-01-01", &["2026-11-13".into()]).is_err());
+    assert!(verify_original_positions(&event, "2026-12-10", &["2026-12-10".into()]).is_err());
+}
+
+#[test]
+fn original_position_proof_shares_dst_counts_and_explicit_budget_errors() {
+    let mut event = event("FREQ=DAILY;COUNT=3");
+    event.all_day = false;
+    event.timezone = Some("Europe/Stockholm".into());
+    event.start_time = "2026-03-28T01:30:00Z".into();
+    event.end_time = "2026-03-28T02:30:00Z".into();
+    let summary =
+        verify_original_positions(&event, "2026-04-02", &["2026-03-30T00:30:00Z".into()]).unwrap();
+    assert_eq!(summary.count, 3);
+    assert_eq!(summary.last.as_deref(), Some("2026-03-31T00:30:00Z"));
+    assert!(
+        verify_original_positions(&event, "2026-04-02", &["2026-03-29T01:30:00Z".into()]).is_err()
+    );
+    event.start_time = "1800-01-01T09:00:00Z".into();
+    event.end_time = "1800-01-01T10:00:00Z".into();
+    event.recurrence_rule = Some("FREQ=DAILY".into());
+    assert!(verify_original_positions(&event, "2026-11-01", &[])
+        .unwrap_err()
+        .to_string()
+        .contains("budget"));
+}
+
+#[test]
+fn equivalent_cutoffs_compare_complete_difference_and_not_overlapping_event_ends() {
+    let mut event = event("FREQ=WEEKLY;BYDAY=MO,WE");
+    event.all_day = false;
+    event.timezone = Some("Europe/Stockholm".into());
+    event.start_time = "2024-03-18T18:30:00Z".into();
+    event.end_time = "2024-03-25T20:00:00Z".into();
+    let a = "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T183000Z";
+    let b = "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T153000Z";
+    for rules in [[a, b], [b, a]] {
+        assert_eq!(equivalent_rule_cutoffs(&rules, &event).unwrap(), b);
+    }
+    for other in [
+        "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241230T153000Z",
+        "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20250101T183000Z",
+        "FREQ=WEEKLY;BYDAY=MO,WE",
+        "FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2;UNTIL=20241231T153000Z",
+        "FREQ=WEEKLY;BYDAY=MO,FR;UNTIL=20241231T153000Z",
+    ] {
+        assert!(
+            equivalent_rule_cutoffs(&[a, other], &event).is_err(),
+            "{other}"
+        );
+        assert!(
+            equivalent_rule_cutoffs(&[other, a], &event).is_err(),
+            "{other}"
+        );
+    }
+    assert!(equivalent_rule_cutoffs(
+        &[a, "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241230T183000Z"],
+        &event
+    )
+    .is_ok());
+}
+
+#[test]
+fn equivalent_cutoff_proofs_resolve_dst_and_all_day_until_and_fail_on_budget_exhaustion() {
+    let mut event = event("FREQ=DAILY");
+    event.all_day = false;
+    event.timezone = Some("Europe/Stockholm".into());
+    event.start_time = "2026-10-24T00:30:00Z".into();
+    event.end_time = "2026-10-24T01:30:00Z".into();
+    assert!(equivalent_rule_cutoffs(
+        &[
+            "FREQ=DAILY;UNTIL=20261025T010000Z",
+            "FREQ=DAILY;UNTIL=20261025T014000Z"
+        ],
+        &event
+    )
+    .is_ok());
+    assert!(equivalent_rule_cutoffs(
+        &[
+            "FREQ=DAILY;UNTIL=20261025T000000Z",
+            "FREQ=DAILY;UNTIL=20261025T003000Z"
+        ],
+        &event
+    )
+    .is_err());
+    event.all_day = true;
+    event.timezone = None;
+    event.start_time = "2026-10-08".into();
+    event.end_time = "2026-10-09".into();
+    assert!(equivalent_rule_cutoffs(
+        &[
+            "FREQ=DAILY;UNTIL=20261008",
+            "FREQ=DAILY;UNTIL=20261008T183000Z"
+        ],
+        &event
+    )
+    .is_ok());
+    assert!(equivalent_rule_cutoffs(
+        &[
+            "FREQ=DAILY;UNTIL=20261008",
+            "FREQ=DAILY;UNTIL=20261009T000000Z"
+        ],
+        &event
+    )
+    .is_err());
+    event.start_time = "1800-01-01".into();
+    event.end_time = "1800-01-02".into();
+    assert!(equivalent_rule_cutoffs(
+        &[
+            "FREQ=DAILY;UNTIL=20261008T183000Z",
+            "FREQ=DAILY;UNTIL=20261008T193000Z"
+        ],
+        &event
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("budget"));
+}
+
+#[test]
 #[ignore = "manual performance comparison, no wall-clock assertion"]
 fn profile_old_counted_series_projection() {
     let mut event = event("FREQ=DAILY;COUNT=3");

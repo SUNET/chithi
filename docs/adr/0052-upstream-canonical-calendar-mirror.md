@@ -51,7 +51,11 @@ Display field validation is independent of edit validation: optional titles and
 instantaneous timed events remain readable without granting mutation support.
 CalDAV display decoding accepts explicit UTC values with redundant TZID,
 known Windows-to-IANA timezone mappings, and identical repeated RRULE properties,
-without rewriting the original resource. Conflicting rules, floating times, and
+without rewriting the original resource. Repeated rules with matching selectors
+and differing UNTIL cutoffs are readable only after bounded enumeration proves
+there are no original starts between those inclusive cutoffs. The earlier
+equivalent cutoff is the display projection; the native rules remain untouched.
+Conflicting or unprovable rules, floating times, and
 unknown timezones are not guessed. RDATE-only sets use their explicit positions.
 Unsupported recurrence projection is reported per event; one event or account
 failure cannot discard another's readable dates. Bounded results remain visible
@@ -74,6 +78,33 @@ interval counting at the first matching date, following Graph's documented
 semantics. Missing or null subjects remain untitled display events. These
 projections never alter native content or relax strict mutation reads, timezone
 resolution, complete exception reads, or recurrence-blob verification.
+
+Standalone timed display uses the explicit response boundary zone, not legacy
+creation-zone metadata. All-day display restores dates in the original boundary
+zone independently of a series' recurrence zone. Unknown boundary zones and
+non-midnight all-day bounds remain errors; strict mutation decoding is unchanged.
+When a series read cannot be displayed, the mirror retains the fetched master
+privately (including legacy recurrence data), rather than only its inventory
+summary. Public errors include claimed/computed dates, never native payloads.
+
+Display cancellation proofs support Microsoft's MonthNth weekday-mask/index
+encoding for relative monthly/yearly patterns. Blob selectors and interval phase
+must match the projected Graph pattern. One bounded pass through the display
+engine verifies all deleted/modified original positions and the complete bounded
+range's count and final date. Corrupt or unprovable blobs remain resource errors;
+the strict editor cancellation decoder and mutation grammar are unchanged.
+Observed imported date-bounded blobs may store Graph's inclusive range boundary
+rather than the final matching occurrence date. Display accepts that exact date
+only when it matches the source Graph endDate and projected event-local cutoff,
+and complete enumeration proves the same count and all required original slots.
+Count-bounded blobs still require the exact final occurrence date; unrelated
+later dates, selector/phase mismatches and unprovable ranges remain errors.
+Graph can return an explicitly cancelled exception even when the master's
+cancelledOccurrences list is empty. Display verifies that exception's immutable
+identity, master link and original position, then records an exclusion while
+retaining live exceptions and native data. All cancelled exception originals
+are checked in one bounded recurrence pass. The final master recheck remains
+mandatory, and strict mutation reads still reject cancelled exception content.
 
 The engine enumerates civil-time candidates; the adapter applies the event's
 zone explicitly. Nonexistent DST times are skipped without consuming COUNT;

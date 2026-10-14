@@ -6,8 +6,10 @@ mod continuation;
 mod continuation_tests;
 mod display_pattern;
 #[cfg(test)]
-mod display_tests;
+pub(crate) mod display_tests;
 mod recurrence_blob;
+#[cfg(test)]
+pub(crate) mod recurrence_blob_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 mod writes;
@@ -222,7 +224,12 @@ fn project_event(
     }
     let start = native_time(&value["start"])?;
     let end = native_time(&value["end"])?;
-    let timezone = if kind == RecurrenceKind::Series {
+    // A standalone instant does not depend on its historical creation zone.
+    // All-day dates, conversely, must be restored in their boundary zone, not
+    // shifted into an independently configured series recurrence zone.
+    let timezone = if !require_revision && !all_day && kind == RecurrenceKind::Standalone {
+        required_string(&value["start"], "timeZone")?
+    } else if kind == RecurrenceKind::Series && (require_revision || !all_day) {
         value["recurrence"]["range"]["recurrenceTimeZone"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -294,6 +301,37 @@ const DAYS: [(&str, &str); 7] = [
     ("SA", "saturday"),
     ("SU", "sunday"),
 ];
+
+/// Private failure evidence for mirror persistence, never an IPC/error payload.
+/// Debug/Display intentionally omit the provider resource and recurrence blob.
+pub(crate) struct CalendarDisplayReadFailure {
+    pub error: Error,
+    pub native: Option<Box<NativeCalendarResource>>,
+}
+
+impl std::fmt::Debug for CalendarDisplayReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CalendarDisplayReadFailure")
+            .field("error", &self.error)
+            .field("has_native", &self.native.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for CalendarDisplayReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl From<Error> for CalendarDisplayReadFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            native: None,
+        }
+    }
+}
 
 fn read_rule(recurrence: &Value, event: &CalendarEvent) -> Result<String> {
     let p = &recurrence["pattern"];
@@ -608,10 +646,33 @@ impl GraphClient {
         calendar: &str,
         id: &str,
         template: &CalendarEvent,
-    ) -> Result<CalendarEventSet> {
-        self.fetch_calendar_event_set_internal(calendar, id, template, false, false)
-            .await
-            .map(|(set, _)| set)
+    ) -> std::result::Result<CalendarEventSet, CalendarDisplayReadFailure> {
+        let (first, master) = self.event_set_inputs(calendar, id).await?;
+        let native = display_native(&master, calendar)?;
+        self.project_calendar_event_set_internal(
+            calendar, id, template, false, false, &first, &master,
+        )
+        .await
+        .map(|(set, _)| set)
+        .map_err(|error| CalendarDisplayReadFailure {
+            error,
+            native: Some(Box::new(native)),
+        })
+    }
+
+    async fn event_set_inputs(&self, calendar: &str, id: &str) -> Result<(Value, Value)> {
+        let first = self.set_get(calendar, id, false).await?;
+        let master_id = if super::graph_recurrence_kind(&first) == RecurrenceKind::Occurrence {
+            required_string(&first, "seriesMasterId")?
+        } else {
+            id
+        };
+        let master = if super::graph_recurrence_kind(&first) == RecurrenceKind::Standalone {
+            first.clone()
+        } else {
+            self.set_get(calendar, master_id, true).await?
+        };
+        Ok((first, master))
     }
 
     async fn fetch_calendar_event_set_internal(
@@ -622,19 +683,36 @@ impl GraphClient {
         prove_child: bool,
         require_revision: bool,
     ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
-        let first = self.set_get(calendar, id, false).await?;
-        let kind = super::graph_recurrence_kind(&first);
+        let (first, master) = self.event_set_inputs(calendar, id).await?;
+        self.project_calendar_event_set_internal(
+            calendar,
+            id,
+            template,
+            prove_child,
+            require_revision,
+            &first,
+            &master,
+        )
+        .await
+    }
+
+    async fn project_calendar_event_set_internal(
+        &self,
+        calendar: &str,
+        id: &str,
+        template: &CalendarEvent,
+        prove_child: bool,
+        require_revision: bool,
+        first: &Value,
+        master: &Value,
+    ) -> Result<(CalendarEventSet, Option<VerifiedOccurrenceMembership>)> {
+        let kind = super::graph_recurrence_kind(first);
         let master_id = if kind == RecurrenceKind::Occurrence {
-            required_string(&first, "seriesMasterId")?
+            required_string(first, "seriesMasterId")?
         } else {
             id
         };
-        let master = if kind == RecurrenceKind::Standalone {
-            first.clone()
-        } else {
-            self.set_get(calendar, master_id, true).await?
-        };
-        let event = project_event(&master, template, calendar, require_revision)?;
+        let event = project_event(master, template, calendar, require_revision)?;
         if !matches!(
             event.recurrence_kind,
             RecurrenceKind::Standalone | RecurrenceKind::Series
@@ -645,9 +723,9 @@ impl GraphClient {
             event,
             overrides: Vec::new(),
             native: Some(if require_revision {
-                native(&master, calendar)?
+                native(master, calendar)?
             } else {
-                display_native(&master, calendar)?
+                display_native(master, calendar)?
             }),
             content: None,
         };
@@ -678,7 +756,11 @@ impl GraphClient {
                 }
                 Ok(CalendarOverride {
                     original_start: original(series, &value)?,
-                    event: Some(project_event(&value, template, calendar, require_revision)?),
+                    event: if !require_revision && value["isCancelled"].as_bool() == Some(true) {
+                        None
+                    } else {
+                        Some(project_event(&value, template, calendar, require_revision)?)
+                    },
                     native: Some(if require_revision {
                         native(&value, calendar)?
                     } else {
@@ -690,6 +772,9 @@ impl GraphClient {
             .try_collect::<Vec<_>>()
             .await?;
             result.overrides.extend(overrides);
+            if !require_revision {
+                display_pattern::verify_cancelled_exceptions(&result.event, &result.overrides)?;
+            }
             let cancelled = master["cancelledOccurrences"].as_array().ok_or_else(|| {
                 Error::CalendarReadIncomplete("missing authoritative cancelledOccurrences".into())
             })?;
@@ -718,11 +803,29 @@ impl GraphClient {
                         "cancelled slots require exactly one PidLidAppointmentRecur",
                     ));
                 }
-                let positions = recurrence_blob::deleted_positions(
-                    required_string(matches[0], "value")?,
-                    &result.event,
-                    &result.overrides,
-                )?;
+                let encoded = required_string(matches[0], "value")?;
+                let positions = if require_revision {
+                    recurrence_blob::deleted_positions(encoded, &result.event, &result.overrides)?
+                } else {
+                    let range = &master["recurrence"]["range"];
+                    let graph_range_end = if range["type"] == "endDate" {
+                        Some(
+                            NaiveDate::parse_from_str(
+                                required_string(range, "endDate")?,
+                                "%Y-%m-%d",
+                            )
+                            .map_err(invalid)?,
+                        )
+                    } else {
+                        None
+                    };
+                    recurrence_blob::deleted_display_positions(
+                        encoded,
+                        &result.event,
+                        &result.overrides,
+                        graph_range_end,
+                    )?
+                };
                 if positions.len() != cancelled.len() {
                     return Err(invalid(
                         "legacy deleted slots disagree with cancelledOccurrences count",
@@ -743,7 +846,7 @@ impl GraphClient {
             // Graph has no snapshot transaction across expanded exception pages.
             // A changed master revision invalidates this entire read.
             let after = self.set_get(calendar, master_id, true).await?;
-            if after != master {
+            if after != *master {
                 return Err(Error::CalendarReadIncomplete(
                     "master changed while reading its exceptions".into(),
                 ));
@@ -758,10 +861,10 @@ impl GraphClient {
             result.validate_display()?;
         }
         let membership = if prove_child && kind == RecurrenceKind::Occurrence {
-            let original_start = original(&result.event, &first)?;
-            let first_event = canonical(&first, template, calendar)?;
-            let first_native = native(&first, calendar)?;
-            let child_type = required_string(&first, "type")?;
+            let original_start = original(&result.event, first)?;
+            let first_event = canonical(first, template, calendar)?;
+            let first_native = native(first, calendar)?;
+            let child_type = required_string(first, "type")?;
             match child_type {
                 "exception" => {
                     let override_item = result

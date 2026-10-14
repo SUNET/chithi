@@ -2,6 +2,7 @@
 //! to edit it; structural mutations continue to use the editor's small grammar.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use chrono::{
     DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
@@ -12,6 +13,9 @@ use super::event_set::event_fields;
 use super::recurrence_projection::{Expansion, GeneratedOccurrence};
 use super::CalendarEvent;
 use crate::error::{Error, Result};
+
+mod equivalence;
+pub(crate) use equivalence::equivalent_rule_cutoffs;
 
 // Bound historical enumeration as well as results in the requested window. The
 // crate's `after` filter alone does not bound work spent reaching that window.
@@ -202,6 +206,93 @@ pub(crate) fn expand(
     }
     let (start, end) = (boundary(&event.start_time)?, boundary(&event.end_time)?);
     let duration = end.signed_duration_since(start);
+    let mut expansion = Expansion {
+        occurrences: Vec::new(),
+        has_more: false,
+    };
+    visit_original_starts(event, lower, upper, |generated| {
+        let end = generated
+            .checked_add_signed(duration)
+            .ok_or_else(|| invalid("end overflow"))?;
+        if end <= lower && !(duration == Duration::zero() && generated >= lower) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if expansion.occurrences.len() == limit {
+            expansion.has_more = true;
+            return Ok(ControlFlow::Break(()));
+        }
+        let mut fields = event_fields(event);
+        fields.start_time = format_position(event, generated);
+        fields.end_time = format_position(event, end);
+        expansion.occurrences.push(GeneratedOccurrence {
+            original_start: fields.start_time.clone(),
+            fields,
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(expansion)
+}
+
+fn format_position(event: &CalendarEvent, time: DateTime<Utc>) -> String {
+    if event.all_day {
+        time.date_naive().to_string()
+    } else {
+        time.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    }
+}
+
+/// Original positions before exclusions/overrides, for read-only provider proofs.
+/// Enumeration shares the display engine's COUNT, DST and work-budget semantics.
+#[derive(Debug)]
+pub(crate) struct OriginalPositionSummary {
+    pub count: u32,
+    pub first: Option<String>,
+    pub last: Option<String>,
+}
+
+pub(crate) fn verify_original_positions(
+    event: &CalendarEvent,
+    upper: &str,
+    required: &[String],
+) -> Result<OriginalPositionSummary> {
+    let mut remaining = required.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut summary = OriginalPositionSummary {
+        count: 0,
+        first: None,
+        last: None,
+    };
+    visit_original_starts(
+        event,
+        boundary(&event.start_time)?,
+        boundary(upper)?,
+        |generated| {
+            let position = format_position(event, generated);
+            remaining.remove(position.as_str());
+            summary.count += 1;
+            summary.first.get_or_insert_with(|| position.clone());
+            summary.last = Some(position);
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    if !remaining.is_empty() {
+        return Err(invalid(
+            "requested original position is outside the recurrence",
+        ));
+    }
+    Ok(summary)
+}
+
+fn visit_original_starts(
+    event: &CalendarEvent,
+    lower: DateTime<Utc>,
+    upper: DateTime<Utc>,
+    mut visit: impl FnMut(DateTime<Utc>) -> Result<ControlFlow<()>>,
+) -> Result<()> {
+    event_fields(event).validate_display()?;
+    engine_date(lower)?;
+    engine_date(upper)?;
+    let (start, end) = (boundary(&event.start_time)?, boundary(&event.end_time)?);
+    let duration = end.signed_duration_since(start);
     let zone = zone(event)?;
     let text = rule_text(
         event
@@ -210,15 +301,11 @@ pub(crate) fn expand(
             .ok_or_else(|| invalid("missing RRULE"))?,
         zone,
     )?;
-    let mut expansion = Expansion {
-        occurrences: Vec::new(),
-        has_more: false,
-    };
     let Some(rule) = validate_rule(&text, start, zone, event.all_day)? else {
-        return Ok(expansion);
+        return Ok(());
     };
     if upper <= start {
-        return Ok(expansion);
+        return Ok(());
     }
     let cutoff = rule
         .get_until()
@@ -229,7 +316,7 @@ pub(crate) fn expand(
         .checked_add_signed(duration)
         .is_some_and(|end| end < lower)
     {
-        return Ok(expansion);
+        return Ok(());
     }
     check_work(&rule, start, cutoff)?;
     // The library shifts nonexistent local times forward. Generate the RFC
@@ -266,7 +353,7 @@ pub(crate) fn expand(
     let mut generated_count = 0;
     loop {
         if rule.get_count().is_some_and(|maximum| count >= maximum) {
-            return Ok(expansion);
+            return Ok(());
         }
         // Stream instead of collecting the whole history before checking COUNT
         // or the requested result limit. Keep both candidate and engine limits.
@@ -277,7 +364,7 @@ pub(crate) fn expand(
             invalid("recurrence engine stopped before the window boundary; display work budget exhausted")
         })?;
         if generated > civil_upper {
-            return Ok(expansion);
+            return Ok(());
         }
         generated_count += 1;
         let local = generated
@@ -301,33 +388,12 @@ pub(crate) fn expand(
             continue;
         }
         count += 1;
-        let end = generated
-            .checked_add_signed(duration)
-            .ok_or_else(|| invalid("end overflow"))?;
         if generated >= upper {
             continue;
         }
-        if end <= lower && !(duration == Duration::zero() && generated >= lower) {
-            continue;
+        if visit(generated)?.is_break() {
+            return Ok(());
         }
-        if expansion.occurrences.len() == limit {
-            expansion.has_more = true;
-            return Ok(expansion);
-        }
-        let format = |time: DateTime<Utc>| {
-            if event.all_day {
-                time.date_naive().to_string()
-            } else {
-                time.to_rfc3339_opts(SecondsFormat::AutoSi, true)
-            }
-        };
-        let mut fields = event_fields(event);
-        fields.start_time = format(generated);
-        fields.end_time = format(end);
-        expansion.occurrences.push(GeneratedOccurrence {
-            original_start: fields.start_time.clone(),
-            fields,
-        });
     }
 }
 

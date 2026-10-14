@@ -27,6 +27,336 @@ fn positions(event: &CalendarEvent, start: &str, end: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn cancelled_exception_fixture() -> (Value, BTreeMap<String, Value>) {
+    let mut source = master();
+    let mut children = BTreeMap::new();
+    let mut cancelled = source.clone();
+    cancelled["id"] = json!("cancelled");
+    cancelled["type"] = json!("exception");
+    cancelled["seriesMasterId"] = json!("master");
+    cancelled["isCancelled"] = json!(true);
+    cancelled["originalStart"] = json!("2026-09-15T09:00:00Z");
+    cancelled["recurrence"] = Value::Null;
+    children.insert("cancelled".into(), cancelled);
+    for (id, date, hour) in [("live-a", "2026-09-16", 12), ("live-b", "2026-09-17", 14)] {
+        let mut child = source.clone();
+        child["id"] = json!(id);
+        child["type"] = json!("exception");
+        child["seriesMasterId"] = json!("master");
+        child["originalStart"] = json!(format!("{date}T09:00:00Z"));
+        child["start"]["dateTime"] = json!(format!("{date}T{hour}:00:00"));
+        child["end"]["dateTime"] = json!(format!("{date}T{}:00:00", hour + 1));
+        child["recurrence"] = Value::Null;
+        children.insert(id.into(), child);
+    }
+    source["exceptionOccurrences"] = json!(children.values().collect::<Vec<_>>());
+    (source, children)
+}
+
+/// Route by resource ID so concurrent exception reads are not order-dependent.
+pub(crate) async fn serve_display_series(
+    source: Value,
+    children: BTreeMap<String, Value>,
+    expected_requests: usize,
+    after: Option<Value>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}/graph", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        let mut master_reads = 0;
+        for _ in 0..expected_requests {
+            let (mut socket, request) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tests::accept_request(&listener),
+            )
+            .await
+            .unwrap();
+            let path = request
+                .split_ascii_whitespace()
+                .nth(1)
+                .unwrap()
+                .split('?')
+                .next()
+                .unwrap();
+            let id = path.rsplit('/').next().unwrap();
+            let value = match id {
+                "calendars" => {
+                    json!({"value":[{"id":"primary", "name":"Calendar", "isDefaultCalendar":true, "color":"auto"}]})
+                }
+                "events" => json!({"value":[source.clone()]}),
+                "master" => {
+                    master_reads += 1;
+                    if master_reads == 3 {
+                        after.as_ref().unwrap_or(&source).clone()
+                    } else {
+                        source.clone()
+                    }
+                }
+                id => children.get(id).unwrap().clone(),
+            };
+            requests.push(request);
+            tests::respond(&mut socket, 200, &value.to_string()).await;
+        }
+        requests
+    });
+    (root, task)
+}
+
+fn display_client(root: &str) -> GraphClient {
+    GraphClient::with_client(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        "secret-test-token",
+        super::super::GraphEndpoints::new(root, root),
+    )
+}
+
+#[tokio::test]
+async fn cancelled_exception_is_an_exclusion_while_live_exceptions_and_native_data_survive() {
+    let (source, children) = cancelled_exception_fixture();
+    let (root, requests) = serve_display_series(source.clone(), children.clone(), 6, None).await;
+    let set = display_client(&root)
+        .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap();
+    assert_eq!(set.overrides.len(), 3);
+    let cancelled = &set.overrides[0];
+    assert_eq!(cancelled.original_start, "2026-09-15T09:00:00Z");
+    assert!(cancelled.event.is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(&cancelled.native.as_ref().unwrap().data).unwrap(),
+        children["cancelled"]
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&set.native.as_ref().unwrap().data).unwrap(),
+        source
+    );
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-09-14",
+        "2026-09-18",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|item| item.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "2026-09-14T09:00:00Z",
+            "2026-09-16T12:00:00Z",
+            "2026-09-17T14:00:00Z"
+        ]
+    );
+    assert!(!serde_json::to_string(&page)
+        .unwrap()
+        .contains("isCancelled"));
+    assert!(requests
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.starts_with("GET ")));
+}
+
+#[tokio::test]
+async fn sparse_cancelled_exception_needs_identity_and_original_not_live_content() {
+    let (mut source, children) = cancelled_exception_fixture();
+    let complete = &children["cancelled"];
+    let sparse = [
+        "id",
+        "type",
+        "seriesMasterId",
+        "isCancelled",
+        "originalStart",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), complete[key].clone()))
+    .collect::<serde_json::Map<_, _>>();
+    source["exceptionOccurrences"] = json!([{"id":"cancelled"}]);
+    let (root, requests) = serve_display_series(
+        source,
+        BTreeMap::from([("cancelled".into(), Value::Object(sparse))]),
+        4,
+        None,
+    )
+    .await;
+    let set = display_client(&root)
+        .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap();
+    assert!(set.overrides[0].event.is_none());
+    assert_eq!(set.overrides[0].original_start, "2026-09-15T09:00:00Z");
+    assert_eq!(requests.await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn cancelled_exception_does_not_grant_strict_mutation_reads_or_accept_bad_originals() {
+    let (mut source, mut children) = cancelled_exception_fixture();
+    let child = children.remove("cancelled").unwrap();
+    source["exceptionOccurrences"] = json!([{"id":"cancelled"}]);
+    let children = BTreeMap::from([("cancelled".into(), child.clone())]);
+    let (root, requests) = serve_display_series(source.clone(), children, 3, None).await;
+    let error = display_client(&root)
+        .fetch_calendar_event_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("isCancelled must be false"));
+    assert_eq!(requests.await.unwrap().len(), 3);
+    for (key, value) in [
+        ("id", json!("foreign")),
+        ("type", json!("occurrence")),
+        ("seriesMasterId", json!("foreign")),
+        ("originalStart", Value::Null),
+        ("originalStart", json!("invalid")),
+        ("originalStart", json!("2026-09-15T08:00:00Z")),
+        ("originalStart", json!("2026-09-20T09:00:00Z")),
+        ("isCancelled", Value::Null),
+        ("isCancelled", json!("true")),
+    ] {
+        let mut bad = child.clone();
+        bad[key] = value;
+        let (root, requests) = serve_display_series(
+            source.clone(),
+            BTreeMap::from([("cancelled".into(), bad)]),
+            3,
+            None,
+        )
+        .await;
+        assert!(
+            display_client(&root)
+                .fetch_calendar_display_set(
+                    "selected",
+                    "master",
+                    &crate::backend::testutil::event()
+                )
+                .await
+                .is_err(),
+            "{key}"
+        );
+        assert_eq!(requests.await.unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_exception_keeps_master_revision_and_cancellation_boundaries_fail_closed() {
+    let (mut source, mut children) = cancelled_exception_fixture();
+    let child = children.remove("cancelled").unwrap();
+    source["exceptionOccurrences"] = json!([{"id":"cancelled"}]);
+    let mut changed = source.clone();
+    changed["@odata.etag"] = json!("W/\"new\"");
+    let (root, requests) = serve_display_series(
+        source.clone(),
+        BTreeMap::from([("cancelled".into(), child.clone())]),
+        4,
+        Some(changed),
+    )
+    .await;
+    let failure = display_client(&root)
+        .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::CalendarReadIncomplete(_)));
+    assert_eq!(requests.await.unwrap().len(), 4);
+    source["isCancelled"] = json!(true);
+    let (root, requests) = serve_display_series(
+        source,
+        BTreeMap::from([("cancelled".into(), child)]),
+        2,
+        None,
+    )
+    .await;
+    let failure = display_client(&root)
+        .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("isCancelled must be false"));
+    assert_eq!(requests.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cancelled_exception_original_proofs_preserve_dates_and_fractional_instants() {
+    for all_day in [false, true] {
+        let (mut source, mut children) = cancelled_exception_fixture();
+        let mut child = children.remove("cancelled").unwrap();
+        source["exceptionOccurrences"] = json!([{"id":"cancelled"}]);
+        let expected = if all_day {
+            source["isAllDay"] = json!(true);
+            source["originalStartTimeZone"] = json!("UTC");
+            source["originalEndTimeZone"] = json!("UTC");
+            source["start"]["dateTime"] = json!("2026-09-14T00:00:00");
+            source["end"]["dateTime"] = json!("2026-09-15T00:00:00");
+            child["originalStart"] = json!("2026-09-15T00:00:00Z");
+            "2026-09-15"
+        } else {
+            source["start"]["dateTime"] = json!("2026-09-14T09:00:00.125");
+            source["end"]["dateTime"] = json!("2026-09-14T10:00:00.125");
+            child["originalStart"] = json!("2026-09-15T09:00:00.125Z");
+            "2026-09-15T09:00:00.125Z"
+        };
+        let (root, requests) = serve_display_series(
+            source,
+            BTreeMap::from([("cancelled".into(), child)]),
+            4,
+            None,
+        )
+        .await;
+        let set = display_client(&root)
+            .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+            .await
+            .unwrap();
+        assert_eq!(set.overrides[0].original_start, expected);
+        assert!(set.overrides[0].event.is_none());
+        assert_eq!(requests.await.unwrap().len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_exception_and_blob_deleted_slot_have_independent_verified_counts() {
+    use base64::Engine;
+    let (mut source, mut children) = cancelled_exception_fixture();
+    let child = children.remove("cancelled").unwrap();
+    source["exceptionOccurrences"] = json!([{"id":"cancelled"}]);
+    source["cancelledOccurrences"] = json!(["opaque-deleted-slot"]);
+    source["singleValueExtendedProperties"] = json!([{"id":RECUR_PROPERTY, "value":base64::engine::general_purpose::STANDARD.encode(tests::cancellation_blob(&[1,2], &[(1,1)]))}]);
+    let (root, requests) = serve_display_series(
+        source,
+        BTreeMap::from([("cancelled".into(), child)]),
+        4,
+        None,
+    )
+    .await;
+    let set = display_client(&root)
+        .fetch_calendar_display_set("selected", "master", &crate::backend::testutil::event())
+        .await
+        .unwrap();
+    assert_eq!(set.overrides.len(), 2);
+    assert!(set.overrides.iter().all(|item| item.event.is_none()));
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2026-09-14",
+        "2026-09-18",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|item| item.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-09-14T09:00:00Z", "2026-09-17T09:00:00Z"]
+    );
+    assert_eq!(requests.await.unwrap().len(), 4);
+}
+
 #[test]
 fn optional_subject_is_display_only_and_never_replaced_in_native_content() {
     for series in [true, false] {
@@ -349,6 +679,51 @@ fn unrelated_custom_zone_all_day_and_cancellation_errors_are_not_relaxed() {
             .to_string()
             .contains("isCancelled must be false")
     );
+}
+
+#[test]
+fn utc_standalone_display_does_not_require_resolving_legacy_creation_metadata() {
+    let mut value = source(json!({"type":"daily", "interval":1}), "2026-05-27");
+    value["type"] = json!("singleInstance");
+    value["recurrence"] = Value::Null;
+    value["start"]["dateTime"] = json!("2026-05-27T08:00:00.0000000");
+    value["end"]["dateTime"] = json!("2026-05-27T09:00:00.0000000");
+    value["originalStartTimeZone"] = json!("tzone://Microsoft/Custom");
+    value["originalEndTimeZone"] = json!("tzone://Microsoft/Custom");
+    let original = value.clone();
+    let event = display(&value);
+    assert_eq!(event.start_time, "2026-05-27T08:00:00Z");
+    assert_eq!(event.end_time, "2026-05-27T09:00:00Z");
+    assert_eq!(event.timezone.as_deref(), Some("UTC"));
+    assert_eq!(value, original);
+    assert!(canonical(&value, &event, "selected").is_err());
+    value["start"]["timeZone"] = json!("Unknown/BoundaryZone");
+    assert!(display_event(&value, &event, "selected").is_err());
+}
+
+#[test]
+fn all_day_display_restores_boundary_dates_independently_of_recurrence_zone() {
+    let mut value = source(
+        json!({"type":"absoluteYearly", "interval":1, "month":11, "dayOfMonth":3}),
+        "1978-11-03",
+    );
+    value["isAllDay"] = json!(true);
+    value["start"]["dateTime"] = json!("1978-11-03T00:00:00.0000000");
+    value["end"]["dateTime"] = json!("1978-11-04T00:00:00.0000000");
+    value["recurrence"]["range"] = json!({"type":"noEnd", "startDate":"1978-11-03", "endDate":"0001-01-01", "numberOfOccurrences":0, "recurrenceTimeZone":"W. Europe Standard Time"});
+    let original = value.clone();
+    let event = display(&value);
+    assert_eq!(event.start_time, "1978-11-03");
+    assert_eq!(event.end_time, "1978-11-04");
+    assert_eq!(event.timezone.as_deref(), Some("UTC"));
+    assert_eq!(
+        positions(&event, "2026-11-01", "2026-12-01"),
+        ["2026-11-03"]
+    );
+    assert_eq!(value, original);
+    assert!(canonical(&value, &event, "selected").is_err());
+    value["end"]["dateTime"] = json!("1978-11-04T01:00:00");
+    assert!(display_event(&value, &event, "selected").is_err());
 }
 
 #[tokio::test]

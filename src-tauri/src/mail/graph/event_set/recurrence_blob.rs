@@ -7,6 +7,8 @@ use super::*;
 use base64::Engine;
 use std::collections::BTreeSet;
 
+mod display;
+
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -84,6 +86,25 @@ pub(super) fn deleted_positions(
     master: &CalendarEvent,
     overrides: &[CalendarOverride],
 ) -> Result<Vec<String>> {
+    deleted_positions_for(encoded, master, overrides, false, None)
+}
+
+pub(super) fn deleted_display_positions(
+    encoded: &str,
+    master: &CalendarEvent,
+    overrides: &[CalendarOverride],
+    graph_range_end: Option<NaiveDate>,
+) -> Result<Vec<String>> {
+    deleted_positions_for(encoded, master, overrides, true, graph_range_end)
+}
+
+fn deleted_positions_for(
+    encoded: &str,
+    master: &CalendarEvent,
+    overrides: &[CalendarOverride],
+    display: bool,
+    graph_range_end: Option<NaiveDate>,
+) -> Result<Vec<String>> {
     if encoded.len() > 16 * 1024 * 1024 {
         return Err(invalid("recurrence blob exceeds size budget"));
     }
@@ -105,11 +126,18 @@ pub(super) fn deleted_positions(
         .recurrence_rule
         .as_deref()
         .ok_or_else(|| invalid("blob without recurrence"))?;
-    let normalized = simple_recurrence::normalize_rule(recurrence, master)?;
+    let normalized = if display {
+        crate::calendar::display_recurrence::normalize_rule(recurrence, master).map_err(invalid)?
+    } else {
+        simple_recurrence::normalize_rule(recurrence, master)?
+    };
     let fields: BTreeMap<_, _> = normalized
         .split(';')
         .filter_map(|p| p.split_once('='))
         .collect();
+    if display {
+        display::validate_fields(&fields)?;
+    }
     let interval = fields
         .get("INTERVAL")
         .copied()
@@ -120,8 +148,24 @@ pub(super) fn deleted_positions(
     {
         Some("DAILY") => (0x200a, 0, interval * 1440),
         Some("WEEKLY") => (0x200b, 1, interval),
-        Some("MONTHLY") => (0x200c, 2, interval),
-        Some("YEARLY") => (0x200d, 2, interval * 12),
+        Some("MONTHLY") => (
+            0x200c,
+            if fields.contains_key("BYSETPOS") {
+                3
+            } else {
+                2
+            },
+            interval,
+        ),
+        Some("YEARLY") => (
+            0x200d,
+            if fields.contains_key("BYSETPOS") {
+                3
+            } else {
+                2
+            },
+            interval * 12,
+        ),
         _ => return Err(invalid("unrepresentable blob recurrence")),
     };
     if (frequency, pattern, period) != (expected_frequency, expected_pattern, expected_period)
@@ -135,7 +179,7 @@ pub(super) fn deleted_positions(
         master.all_day,
         master.timezone.as_deref(),
     )?;
-    if pattern == 1 {
+    if matches!(pattern, 1 | 3) {
         let mask = r.u32()?;
         let days = fields
             .get("BYDAY")
@@ -151,8 +195,29 @@ pub(super) fn deleted_positions(
         if mask != expected {
             return Err(invalid("blob weekdays differ from Graph"));
         }
-    } else if pattern == 2 && r.u32()? != local_start.day() {
-        return Err(invalid("blob day of month differs from Graph"));
+        if pattern == 3 {
+            let expected = match fields.get("BYSETPOS").copied() {
+                Some("1") => 1,
+                Some("2") => 2,
+                Some("3") => 3,
+                Some("4") => 4,
+                Some("-1") => 5,
+                _ => return Err(invalid("unsupported blob weekday index")),
+            };
+            if r.u32()? != expected {
+                return Err(invalid("blob weekday index differs from Graph"));
+            }
+        }
+    } else if pattern == 2 {
+        let expected = fields
+            .get("BYMONTHDAY")
+            .map(|day| day.parse::<u32>())
+            .transpose()
+            .map_err(invalid)?
+            .unwrap_or(local_start.day());
+        if r.u32()? != expected {
+            return Err(invalid("blob day of month differs from Graph"));
+        }
     }
     let end_type = r.u32()?;
     let count = r.u32()?;
@@ -187,7 +252,7 @@ pub(super) fn deleted_positions(
         None if matches!(end_type, 0x2023 | 0xffffffff) && end_date == 0x5ae980df => {}
         None => return Err(invalid("blob range differs from Graph")),
     }
-    if matches!(end_type, 0x2021 | 0x2022) {
+    if !display && matches!(end_type, 0x2021 | 0x2022) {
         let last = simple_recurrence::position_at(
             master,
             count
@@ -318,8 +383,28 @@ pub(super) fn deleted_positions(
                 .ok_or_else(|| invalid("deleted position falls in a timezone gap"))?;
             utc(time.with_timezone(&Utc))
         };
-        simple_recurrence::resolve(master, &position)?;
+        if !display {
+            simple_recurrence::resolve(master, &position)?;
+        }
         positions.push(position);
+    }
+    if display {
+        display::verify_positions(
+            master,
+            overrides,
+            &positions,
+            &fields,
+            display::BlobRange {
+                first,
+                period,
+                first_dow,
+                start_date,
+                end_date,
+                end_type,
+                count,
+            },
+            graph_range_end,
+        )?;
     }
     Ok(positions)
 }

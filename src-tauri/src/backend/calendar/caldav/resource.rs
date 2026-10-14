@@ -147,17 +147,20 @@ impl Component {
             .transpose()
     }
 
-    fn display_rule(&self) -> Result<Option<&str>> {
-        let mut values = self
+    fn display_rule(&self, event: &CalendarEvent) -> Result<Option<String>> {
+        let values = self
             .properties("RRULE")
-            .map(|line| split(line).map(|(_, value)| value));
-        let first = values.next().transpose()?;
-        for value in values {
-            if Some(value?) != first {
-                return Err(invalid("conflicting RRULE properties"));
-            }
+            .map(|line| split(line).map(|(_, value)| value))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(first) = values.first() else {
+            return Ok(None);
+        };
+        if values.iter().all(|value| value == first) {
+            return Ok(Some((*first).to_owned()));
         }
-        Ok(first)
+        crate::calendar::display_recurrence::equivalent_rule_cutoffs(&values, event)
+            .map(Some)
+            .map_err(|error| invalid(&format!("conflicting RRULE properties: {error}")))
     }
 
     fn remove(&mut self, key: &str) {
@@ -518,11 +521,10 @@ fn component_event_for(
         None => invite.dtend.clone(),
     };
     event.recurrence_rule = if display {
-        component.display_rule()?
+        component.display_rule(&event)?
     } else {
-        component.value("RRULE")?
-    }
-    .map(str::to_owned);
+        component.value("RRULE")?.map(str::to_owned)
+    };
     event.recurrence_kind = if component.property("RECURRENCE-ID")?.is_some() {
         RecurrenceKind::Occurrence
     } else if event.recurrence_rule.is_some() || component.properties("RDATE").next().is_some() {

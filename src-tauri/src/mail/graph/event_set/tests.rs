@@ -2,7 +2,9 @@ use super::*;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn accept_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+pub(super) async fn accept_request(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, String) {
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut bytes = Vec::new();
     loop {
@@ -28,7 +30,7 @@ async fn accept_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpS
     (socket, String::from_utf8(bytes).unwrap())
 }
 
-async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
+pub(super) async fn respond(socket: &mut tokio::net::TcpStream, status: u16, body: &str) {
     socket
         .write_all(
             format!(
@@ -737,7 +739,7 @@ async fn foreign_identity_and_crossing_boundary_fail_before_io() {
     assert!(captured.await.unwrap().is_empty());
 }
 
-fn cancellation_blob(deleted: &[u32], modified: &[(u32, u32)]) -> Vec<u8> {
+pub(super) fn cancellation_blob(deleted: &[u32], modified: &[(u32, u32)]) -> Vec<u8> {
     let epoch = NaiveDate::from_ymd_opt(1601, 1, 1).unwrap();
     let start = NaiveDate::from_ymd_opt(2026, 9, 14)
         .unwrap()
@@ -868,6 +870,12 @@ async fn display_keeps_verified_cancellations_for_previously_supported_absolute_
         blob[4..6].copy_from_slice(&frequency.to_le_bytes());
         blob[6..8].copy_from_slice(&2_u16.to_le_bytes());
         blob[14..18].copy_from_slice(&period.to_le_bytes());
+        if kind == "absoluteYearly" {
+            let first_month = NaiveDate::from_ymd_opt(1601, 9, 1).unwrap();
+            blob[10..14].copy_from_slice(
+                &(first_month.signed_duration_since(epoch).num_minutes() as u32).to_le_bytes(),
+            );
+        }
         blob[50..54].copy_from_slice(
             &(date(last).signed_duration_since(epoch).num_minutes() as u32).to_le_bytes(),
         );

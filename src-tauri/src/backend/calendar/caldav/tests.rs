@@ -77,6 +77,70 @@ fn display_uses_explicit_utc_and_identical_rules_without_rewriting_native_conten
 }
 
 #[test]
+fn display_proves_observed_duplicate_cutoffs_equivalent_and_preserves_exceptions_and_native_data() {
+    let native = NativeCalendarResource {
+        data: concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fixture//EN\r\n",
+            "BEGIN:VTIMEZONE\r\nTZID:Europe/Stockholm\r\n",
+            "BEGIN:STANDARD\r\nDTSTART:19971026T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n",
+            "BEGIN:DAYLIGHT\r\nDTSTART:19970330T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nSUMMARY:Weekly appointment\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20240318T193000\r\nDTEND;TZID=Europe/Stockholm:20240318T210000\r\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T183000Z\r\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T153000Z\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20241007T193000\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20241007T193000\r\nDTEND;TZID=Europe/Stockholm:20241007T210000\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:display\r\nRECURRENCE-ID;TZID=Europe/Stockholm:20241009T193000\r\n",
+            "DTSTART;TZID=Europe/Stockholm:20241009T193000\r\nDTEND;TZID=Europe/Stockholm:20241009T210000\r\nSTATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        ).into(),
+        ..display_native("")
+    };
+    let set =
+        resource::combine_display(std::slice::from_ref(&native), &display_template()).unwrap();
+    assert_eq!(set.native.as_ref().unwrap(), &native);
+    assert_eq!(set.event.ical_data.as_ref(), Some(&native.data));
+    assert_eq!(
+        set.event.recurrence_rule.as_deref(),
+        Some("FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20241231T153000Z")
+    );
+    assert_eq!(
+        set.overrides
+            .iter()
+            .map(|item| item.original_start.as_str())
+            .collect::<Vec<_>>(),
+        ["2024-10-07T17:30:00Z", "2024-10-09T17:30:00Z"]
+    );
+    let page = crate::calendar::actions::project_display(
+        &set,
+        &set.event,
+        "",
+        "2024-12-28",
+        "2025-01-03",
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        page.occurrences
+            .iter()
+            .map(|item| item.fields.start_time.as_str())
+            .collect::<Vec<_>>(),
+        ["2024-12-30T18:30:00Z"]
+    );
+    assert!(resource::snapshot(native.clone(), &event())
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate RRULE"));
+    for cutoff in ["20241230T153000Z", "20250101T183000Z"] {
+        let mut conflict = native.clone();
+        conflict.data = conflict.data.replace("20241231T153000Z", cutoff);
+        assert!(resource::combine_display(&[conflict], &display_template())
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting RRULE"));
+    }
+}
+
+#[test]
 fn display_resolves_known_windows_zones_but_never_guesses_unknown_or_floating_times() {
     let native = display_native("DTSTART;TZID=\"W. Europe Standard Time\":20261008T120000\r\nDTEND;TZID=\"W. Europe Standard Time\":20261008T130000\r\nSUMMARY:Lunch\r\n");
     let set =
