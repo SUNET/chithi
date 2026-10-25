@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRoute } from "vue-router";
-import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useActivityStore } from "@/stores/activity";
 import { useOpsStore } from "@/stores/ops";
 import { useUiStore } from "@/stores/ui";
@@ -19,7 +18,7 @@ const accountsStore = useAccountsStore();
 const foldersStore = useFoldersStore();
 const calendarStore = useCalendarStore();
 const lastSyncTime = ref<Date | null>(null);
-const connectionStatus = ref<"connected" | "disconnected" | "reconnecting">("connected");
+const connectionStatus = ref<"connected" | "disconnected">("connected");
 const syncError = ref<string | null>(null);
 
 const unlistenFns: UnlistenFn[] = [];
@@ -83,8 +82,8 @@ async function syncAll() {
           foldersStore.activeFolderPath ?? undefined,
         );
       }
-    } catch (e) {
-      console.error("Sync failed:", e);
+    } catch (error) {
+      console.error("Sync failed:", error);
     }
   }
 
@@ -135,12 +134,6 @@ async function syncAll() {
         </svg>
         <span v-if="activityStore.activeOperations.length > 0" class="ops-badge">{{ activityStore.activeOperations.length }}</span>
       </button>
-      <button class="help-btn" title="Help">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10" />
-          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01" />
-        </svg>
-      </button>
     </div>
   </div>
 </template>
@@ -159,12 +152,7 @@ async function syncAll() {
   flex-shrink: 0;
 }
 
-.status-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
+.status-left,
 .status-right {
   display: flex;
   align-items: center;
@@ -213,10 +201,6 @@ async function syncAll() {
   background: var(--color-danger);
 }
 
-.status-dot.reconnecting {
-  background: var(--color-warning);
-}
-
 .sync-error-msg {
   color: var(--color-danger-text);
   font-size: 11px;
@@ -233,7 +217,6 @@ async function syncAll() {
 
 .disconnect-msg {
   color: var(--color-warning);
-  font-size: 11px;
 }
 
 .op-spinner {
@@ -253,7 +236,6 @@ async function syncAll() {
 .hover-url {
   color: var(--color-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -267,9 +249,8 @@ async function syncAll() {
 }
 
 .ops-toggle-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   position: relative;
   width: 24px;
   height: 20px;
@@ -295,25 +276,8 @@ async function syncAll() {
   color: #fff;
   font-size: 9px;
   font-weight: 600;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   padding: 0 3px;
-}
-
-.help-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  color: var(--color-text-muted);
-  transition: all 0.12s;
-}
-
-.help-btn:hover {
-  color: var(--color-text);
-  background: var(--color-bg-hover);
 }
 </style>
