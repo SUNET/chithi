@@ -13,19 +13,16 @@ const version = __APP_VERSION__;
 async function openExternal(url: string) {
   try {
     await openUrl(url);
-  } catch (e) {
-    console.error("Failed to open URL:", url, e);
+  } catch (error) {
+    console.error("Failed to open URL:", url, error);
   }
 }
 
-function onKeyDown(e: KeyboardEvent) {
-  if (!props.open || e.key !== "Escape") return;
-  // Vue mounts children before parents, so this listener registers BEFORE
-  // any ancestor menubar's keydown listener. Use stopImmediatePropagation
-  // so the parent's Esc-bound action (e.g. close-window in compose) does
-  // not fire when the user is just dismissing this modal.
-  e.stopImmediatePropagation();
-  e.preventDefault();
+function onKeyDown(event: KeyboardEvent) {
+  if (!props.open || event.key !== "Escape") return;
+  // Prevent an ancestor's Escape shortcut after dismissing this modal.
+  event.stopImmediatePropagation();
+  event.preventDefault();
   emit("close");
 }
 
