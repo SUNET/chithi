@@ -1,39 +1,25 @@
 <script setup lang="ts">
-// Theme-aware dropdown used in place of native <select>. WebKitGTK renders
-// the expanded popup with its own chrome (ignoring our CSS tokens), so the
-// dropdown looks out of place in both the dark and light themes. This
-// component replaces the native picker with an in-DOM popup that uses the
-// same CSS variables as DateInput / TimeInput.
-//
-// The v-model contract stays a single primitive value (string / number /
-// boolean) and the component accepts an `options` array of { value, label }.
-// Options can be disabled individually.
+// Replaces WebKitGTK's unthemeable native select popup.
 
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
-export interface SelectOption<T> {
-  value: T;
+// Keeps v-model compatible with each caller's primitive subtype.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type SelectValue = any;
+
+interface SelectOption {
+  value: SelectValue;
   label: string;
   disabled?: boolean;
 }
 
-// Using `any` on the prop type so each call site can constrain the value
-// type via its template binding without the parent having to type-narrow
-// the whole component generic (Vue 3.5 supports generics on defineProps
-// but they're still fiddly for v-model with primitives).
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type SelectValue = any;
-
 const props = defineProps<{
-  modelValue: SelectValue;
-  options: SelectOption<SelectValue>[];
+  options: SelectOption[];
   placeholder?: string;
   testid?: string;
   ariaLabel?: string;
 }>();
-const emit = defineEmits<{
-  "update:modelValue": [value: SelectValue];
-}>();
+const model = defineModel<SelectValue>({ required: true });
 
 const rootEl = ref<HTMLElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
@@ -46,7 +32,7 @@ const MENU_VIEWPORT_PADDING = 8;
 const menuMaxHeight = ref(`${MENU_MAX_HEIGHT}px`);
 
 const selectedOption = computed(() =>
-  props.options.find((o) => o.value === props.modelValue),
+  props.options.find((o) => o.value === model.value),
 );
 
 const selectedLabel = computed(
@@ -55,12 +41,12 @@ const selectedLabel = computed(
 
 function openMenu() {
   const idx = props.options.findIndex(
-    (o) => o.value === props.modelValue && !o.disabled,
+    (o) => o.value === model.value && !o.disabled,
   );
   highlight.value = idx >= 0 ? idx : firstEnabledIndex();
   open.value = true;
   updateMenuPlacement();
-  nextTick(() => scrollHighlightedIntoView());
+  nextTick(scrollHighlightedIntoView);
 }
 
 function closeMenu() {
@@ -120,7 +106,7 @@ function scrollHighlightedIntoView() {
 function commit(idx: number) {
   const opt = props.options[idx];
   if (!opt || opt.disabled) return;
-  emit("update:modelValue", opt.value);
+  model.value = opt.value;
   closeMenu();
 }
 
@@ -162,10 +148,6 @@ function onOptionMouseEnter(idx: number) {
   if (!props.options[idx].disabled) highlight.value = idx;
 }
 
-function onOptionClick(idx: number) {
-  commit(idx);
-}
-
 function onDocMouseDown(e: MouseEvent) {
   if (!open.value) return;
   if (rootEl.value && !rootEl.value.contains(e.target as Node)) {
@@ -173,12 +155,11 @@ function onDocMouseDown(e: MouseEvent) {
   }
 }
 
-// When parent updates the model while open, move the highlight to match.
 watch(
-  () => props.modelValue,
+  () => model.value,
   () => {
     if (!open.value) return;
-    const idx = props.options.findIndex((o) => o.value === props.modelValue);
+    const idx = props.options.findIndex((o) => o.value === model.value);
     if (idx >= 0) highlight.value = idx;
   },
 );
@@ -198,7 +179,7 @@ onUnmounted(() => {
     <button
       type="button"
       class="select-trigger"
-      :aria-haspopup="'listbox'"
+      aria-haspopup="listbox"
       :aria-expanded="open"
       :aria-label="ariaLabel"
       :data-testid="testid"
@@ -237,13 +218,13 @@ onUnmounted(() => {
         role="option"
         class="select-option"
         :class="{
-          selected: opt.value === modelValue,
+          selected: opt.value === model,
           highlighted: idx === highlight,
           disabled: opt.disabled,
         }"
-        :aria-selected="opt.value === modelValue"
+        :aria-selected="opt.value === model"
         :aria-disabled="opt.disabled"
-        @mousedown.prevent="onOptionClick(idx)"
+        @mousedown.prevent="commit(idx)"
         @mouseenter="onOptionMouseEnter(idx)"
       >
         {{ opt.label }}
@@ -259,9 +240,7 @@ onUnmounted(() => {
   width: 100%;
 }
 
-/* Sizing tokens inherited from the nearest enclosing parent (see
-   EventForm .form-group / EventDetail .edit-group / RecurrenceEditor
-   .recurrence-row). Defaults cover compact / standalone use. */
+/* Parent forms override these sizing tokens. */
 .select-trigger {
   display: flex;
   align-items: center;
