@@ -20,7 +20,7 @@ const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
 const dropTarget = ref<string | null>(null);
 
-// Folder expand/collapse state, persisted per account in localStorage
+// Folder collapse state persists per account.
 const collapsedFolders = ref<Record<string, string[]>>(loadCollapsedFolders());
 
 function loadCollapsedFolders(): Record<string, string[]> {
@@ -29,9 +29,8 @@ function loadCollapsedFolders(): Record<string, string[]> {
     if (!stored) return {};
     const parsed: unknown = JSON.parse(stored);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-    // Validate all values are string arrays
-    for (const v of Object.values(parsed as Record<string, unknown>)) {
-      if (!Array.isArray(v) || !v.every((item) => typeof item === "string")) return {};
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return {};
     }
     return parsed as Record<string, string[]>;
   } catch {
@@ -49,17 +48,12 @@ function isFolderCollapsed(accountId: string, folderPath: string): boolean {
 
 function toggleFolderCollapse(accountId: string, folderPath: string) {
   const current = collapsedFolders.value[accountId] ?? [];
-  if (current.includes(folderPath)) {
-    collapsedFolders.value = {
-      ...collapsedFolders.value,
-      [accountId]: current.filter(p => p !== folderPath),
-    };
-  } else {
-    collapsedFolders.value = {
-      ...collapsedFolders.value,
-      [accountId]: [...current, folderPath],
-    };
-  }
+  collapsedFolders.value = {
+    ...collapsedFolders.value,
+    [accountId]: current.includes(folderPath)
+      ? current.filter((path) => path !== folderPath)
+      : [...current, folderPath],
+  };
   saveCollapsedFolders();
 }
 
@@ -67,12 +61,18 @@ interface FlatFolder {
   folder: Folder;
   depth: number;
   hasChildren: boolean;
+  icon: string;
 }
 
 function flattenTree(folders: Folder[], depth: number, accountId: string): FlatFolder[] {
   const result: FlatFolder[] = [];
   for (const folder of folders) {
-    result.push({ folder, depth, hasChildren: folder.children.length > 0 });
+    result.push({
+      folder,
+      depth,
+      hasChildren: folder.children.length > 0,
+      icon: folderIcon(folder),
+    });
     if (folder.children.length > 0 && !isFolderCollapsed(accountId, folder.path)) {
       result.push(...flattenTree(folder.children, depth + 1, accountId));
     }
@@ -100,30 +100,33 @@ function folderIcon(folder: Folder): string {
   }
 }
 
+function accountAvatarStyle(accountId: string) {
+  const { fill, soft } = acctColor(accountId);
+  return { background: soft, color: fill, boxShadow: `inset 0 0 0 1.5px ${fill}` };
+}
+
 function toggleAccountCollapse(accountId: string) {
-  const idx = collapsedAccounts.value.indexOf(accountId);
-  if (idx !== -1) {
-    collapsedAccounts.value = collapsedAccounts.value.filter(id => id !== accountId);
-  } else {
-    collapsedAccounts.value = [...collapsedAccounts.value, accountId];
-  }
+  collapsedAccounts.value = collapsedAccounts.value.includes(accountId)
+    ? collapsedAccounts.value.filter((id) => id !== accountId)
+    : [...collapsedAccounts.value, accountId];
+}
+
+function isActiveFolder(accountId: string, folderPath: string): boolean {
+  return (
+    accountsStore.activeAccountId === accountId &&
+    foldersStore.activeFolderPath === folderPath
+  );
 }
 
 function selectFolder(accountId: string, folderPath: string) {
-  // Set the folder path BEFORE switching accounts so the watcher
-  // in the folders store doesn't reset it to Inbox.
+  // Set the path first; account changes otherwise reset it to Inbox.
   const accountChanged = accountsStore.activeAccountId !== accountId;
   const folderChanged = foldersStore.activeFolderPath !== folderPath;
   foldersStore.setActiveFolder(folderPath);
   if (accountChanged) {
     accountsStore.setActiveAccount(accountId);
   }
-  // When both accounts share a folder name (the typical IMAP case where
-  // both have "INBOX"), neither ref changes by value if the user clicks
-  // the other account's same-named folder, so the messages-store watcher
-  // doesn't always fire reliably. Dispatch the refetch explicitly when
-  // the account changes to make this case work without relying on the
-  // exact ordering of folder/account reactivity.
+  // Same-named folders need an explicit refetch when only the account changes.
   if (accountChanged && !folderChanged) {
     messagesStore.fetchMessages();
   }
@@ -133,13 +136,7 @@ onMounted(() => {
   foldersStore.fetchAllAccountFolders();
 });
 
-// Re-fetch all folders when accounts list changes (e.g. after initial load)
-watch(
-  () => accountsStore.accounts.length,
-  () => {
-    foldersStore.fetchAllAccountFolders();
-  },
-);
+watch(() => accountsStore.accounts.length, () => foldersStore.fetchAllAccountFolders());
 
 const folderMenuEl = ref<HTMLElement | null>(null);
 const accountMenuEl = ref<HTMLElement | null>(null);
@@ -195,8 +192,8 @@ async function markAccountRead() {
     if (accountsStore.activeAccountId === accountId) {
       await messagesStore.fetchMessages();
     }
-  } catch (e) {
-    console.error("Mark account read failed:", e);
+  } catch (error) {
+    console.error("Mark account read failed:", error);
   }
 }
 
@@ -208,18 +205,16 @@ async function syncThisFolder() {
   syncing.value = folder.path;
   try {
     await api.syncFolder(accountId, folder.path);
-  } catch (e) {
-    console.error("Folder sync failed:", e);
+  } catch (error) {
+    console.error("Folder sync failed:", error);
   } finally {
     syncing.value = null;
   }
 }
 
-
 function openNewFolderModal() {
   if (!contextMenu.value) return;
   const { folder, accountId } = contextMenu.value;
-  // Default parent to the right-clicked folder's path
   newFolderParent.value = `${accountId}|${folder.path}`;
   newFolderName.value = "";
   newFolderError.value = null;
@@ -238,16 +233,17 @@ function buildParentOptions(): { label: string; value: string }[] {
     }
   }
 
-  // Folder picker is mail-only; calendar/contacts-only accounts have no folders to list.
-  for (const acc of accountsStore.mailAccounts) {
-    options.push({ label: `${acc.display_name} (root)`, value: `${acc.id}|` });
-    addFolders(foldersStore.getAccountFolders(acc.id), acc.id, acc.email, "");
+  // Calendar- and contacts-only accounts have no folders.
+  for (const account of accountsStore.mailAccounts) {
+    options.push({ label: `${account.display_name} (root)`, value: `${account.id}|` });
+    addFolders(foldersStore.getAccountFolders(account.id), account.id, account.email, "");
   }
   return options;
 }
 
 async function createNewFolder() {
-  if (!newFolderName.value.trim()) {
+  const folderName = newFolderName.value.trim();
+  if (!folderName) {
     newFolderError.value = "Folder name is required";
     return;
   }
@@ -256,21 +252,20 @@ async function createNewFolder() {
     newFolderError.value = "Select a location";
     return;
   }
-  // Build full path: parent/name or just name if root
   const folderPath = parentPath
-    ? `${parentPath}/${newFolderName.value.trim()}`
-    : newFolderName.value.trim();
+    ? `${parentPath}/${folderName}`
+    : folderName;
 
   newFolderSaving.value = true;
   newFolderError.value = null;
-  const createToastId = showToast(`Creating folder...`, "info", 0);
+  const createToastId = showToast("Creating folder...", "info", 0);
   try {
     await api.createFolder(accountId, folderPath);
     showNewFolderModal.value = false;
     await api.triggerSync(accountId);
     await foldersStore.fetchAllAccountFolders();
-  } catch (e) {
-    newFolderError.value = String(e);
+  } catch (error) {
+    newFolderError.value = String(error);
   } finally {
     newFolderSaving.value = false;
     dismissToast(createToastId);
@@ -281,10 +276,7 @@ let dragExpandTimer: ReturnType<typeof setTimeout> | null = null;
 
 function onFolderMouseEnter(accountId: string, folderPath: string) {
   if (!isDragging.value) return;
-  // Allow drops on any account (cross-account moves are supported)
-  if (dragSourceAccountId.value === accountId &&
-      foldersStore.activeFolderPath === folderPath &&
-      accountsStore.activeAccountId === accountId) return;
+  if (dragSourceAccountId.value === accountId && isActiveFolder(accountId, folderPath)) return;
   dropTarget.value = `${accountId}:${folderPath}`;
   if (isFolderCollapsed(accountId, folderPath)) {
     dragExpandTimer = setTimeout(() => {
@@ -308,9 +300,7 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
   dropTarget.value = null;
   const sourceAccountId = dragSourceAccountId.value;
   if (!sourceAccountId) return;
-  if (sourceAccountId === accountId &&
-      foldersStore.activeFolderPath === folderPath &&
-      accountsStore.activeAccountId === accountId) return;
+  if (sourceAccountId === accountId && isActiveFolder(accountId, folderPath)) return;
 
   const messageIds = [...dragMessageIds.value];
   const isCrossAccount = sourceAccountId !== accountId;
@@ -319,9 +309,9 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
   try {
     if (isCrossAccount) {
       await api.moveMessagesCrossAccount(sourceAccountId, messageIds, accountId, folderPath);
-      // Sync the destination account so the moved messages appear immediately
-      api.triggerSync(accountId, folderPath).catch((e) =>
-        console.error("Post-move sync failed:", e),
+      // Refresh the destination asynchronously.
+      void api.triggerSync(accountId, folderPath).catch((error) =>
+        console.error("Post-move sync failed:", error),
       );
     } else {
       await api.moveMessages(accountId, messageIds, folderPath);
@@ -329,9 +319,9 @@ async function onFolderMouseUp(accountId: string, folderPath: string) {
     messagesStore.clearSelection();
     messagesStore.activeMessage = null;
     messagesStore.activeMessageId = null;
-  } catch (e) {
-    console.error("Drag-and-drop move failed:", e);
-    const message = e instanceof Error ? e.message : String(e);
+  } catch (error) {
+    console.error("Drag-and-drop move failed:", error);
+    const message = error instanceof Error ? error.message : String(error);
     showToast(`Move failed: ${message}`, "error", 5000);
   } finally {
     dismissToast(moveToastId);
@@ -344,17 +334,17 @@ async function markFolderRead() {
   closeContextMenu();
 
   try {
-    // Get all messages in the folder (large page to capture all)
+    // Fetch a large page so every unread message is included.
     const result = await api.getMessages(accountId, folder.path, 0, 10000, "date", false);
     const unreadIds = result.messages
-      .filter((m: { flags: string[] }) => !m.flags.includes("seen"))
-      .map((m: { id: string }) => m.id);
+      .filter((message) => !message.flags.includes("seen"))
+      .map((message) => message.id);
 
     if (unreadIds.length > 0) {
       await api.setMessageFlags(accountId, unreadIds, ["seen"], true);
     }
-  } catch (e) {
-    console.error("Mark folder read failed:", e);
+  } catch (error) {
+    console.error("Mark folder read failed:", error);
   }
 }
 
@@ -374,18 +364,15 @@ async function doDeleteFolder() {
   try {
     await api.deleteFolder(accountId, folder.path);
     await foldersStore.fetchAllAccountFolders();
-    if (
-      accountsStore.activeAccountId === accountId &&
-      foldersStore.activeFolderPath === folder.path
-    ) {
+    if (isActiveFolder(accountId, folder.path)) {
       const folders = foldersStore.getAccountFolders(accountId);
-      const inbox = folders.find((f: Folder) => f.folder_type === "inbox");
-      foldersStore.setActiveFolder(inbox?.path ?? (folders[0]?.path ?? ""));
+      const inbox = folders.find((candidate) => candidate.folder_type === "inbox");
+      foldersStore.setActiveFolder(inbox?.path ?? folders[0]?.path ?? "");
     }
     showToast(`Deleted "${folder.name}"`, "success");
-  } catch (e) {
-    console.error("Delete folder failed:", e);
-    const message = e instanceof Error ? e.message : String(e);
+  } catch (error) {
+    console.error("Delete folder failed:", error);
+    const message = error instanceof Error ? error.message : String(error);
     showToast(`Failed to delete "${folder.name}": ${message}`, "error", 5000);
   } finally {
     dismissToast(deleteToastId);
@@ -409,11 +396,7 @@ async function doDeleteFolder() {
       >
         <span
           class="account-avatar"
-          :style="{
-            background: acctColor(account.id).soft,
-            color: acctColor(account.id).fill,
-            boxShadow: 'inset 0 0 0 1.5px ' + acctColor(account.id).fill,
-          }"
+          :style="accountAvatarStyle(account.id)"
         >
           {{ account.email.slice(0, 1).toUpperCase() }}
         </span>
@@ -437,7 +420,7 @@ async function doDeleteFolder() {
           :key="account.id + '/' + item.folder.path"
           class="folder-item"
           :class="{
-            active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === item.folder.path,
+            active: isActiveFolder(account.id, item.folder.path),
             syncing: syncing === item.folder.path,
             'drop-target': dropTarget === `${account.id}:${item.folder.path}`,
           }"
@@ -469,41 +452,37 @@ async function doDeleteFolder() {
           </span>
           <span v-else class="folder-toggle-spacer"></span>
 
-          <!-- Folder icons as SVG — filled, per-type color (PATCHES.md §2) -->
           <svg
             class="folder-svg"
-            :class="'folder-svg--' + folderIcon(item.folder)"
+            :class="'folder-svg--' + item.icon"
             width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
           >
-            <template v-if="folderIcon(item.folder) === 'inbox'">
+            <template v-if="item.icon === 'inbox'">
               <path fill="currentColor" d="M3 13h4l1.5 2h7L17 13h4v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>
               <path fill="currentColor" opacity=".55" d="M7 4h10l3 8h-5l-1.5 2h-3L9 12H4l3-8Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'sent'">
+            <template v-else-if="item.icon === 'sent'">
               <path fill="currentColor" d="M21 3 3 11l7 2 2 7 9-17Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'drafts'">
+            <template v-else-if="item.icon === 'drafts'">
               <path fill="currentColor" opacity=".55" d="M5 3h10l4 4v14H5V3Z"/>
               <path fill="currentColor" d="m14 8 3 3-6.5 6.5H8V15l6-7Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'trash'">
+            <template v-else-if="item.icon === 'trash'">
               <path fill="currentColor" d="M6 7h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7Z"/>
               <path fill="currentColor" d="M9 4h6l1 3H8l1-3Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'spam'">
+            <template v-else-if="item.icon === 'spam'">
               <path fill="currentColor" d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3Z"/>
               <path fill="#fff" d="M11 7h2v6h-2V7Zm0 8h2v2h-2v-2Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'archive'">
+            <template v-else-if="item.icon === 'archive'">
               <path fill="currentColor" opacity=".55" d="M3 4h18v4H3V4Z"/>
               <path fill="currentColor" d="M4 9h16v11H4V9Zm5 3h6v2H9v-2Z"/>
             </template>
-            <template v-else-if="folderIcon(item.folder) === 'outbox'">
+            <template v-else-if="item.icon === 'outbox'">
               <path fill="currentColor" d="M3 13h5l1 2h6l1-2h5v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5Z"/>
               <path fill="currentColor" opacity=".55" d="m12 3 5 6h-3v4h-4V9H7l5-6Z"/>
-            </template>
-            <template v-else-if="folderIcon(item.folder) === 'starred'">
-              <path fill="currentColor" d="m12 2 3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7l3-7Z"/>
             </template>
             <template v-else>
               <path fill="currentColor" d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6Z"/>
@@ -515,12 +494,11 @@ async function doDeleteFolder() {
           <span v-else-if="item.folder.unread_count > 0" class="unread-badge">{{ item.folder.unread_count }}</span>
         </button>
 
-        <!-- Synthetic per-account Outbox node. Clicking activates the
-             Outbox view in the main pane. -->
+        <!-- Outbox is synthetic rather than part of the server folder tree. -->
         <button
           class="folder-item"
           :class="{
-            active: accountsStore.activeAccountId === account.id && foldersStore.activeFolderPath === OUTBOX_FOLDER,
+            active: isActiveFolder(account.id, OUTBOX_FOLDER),
           }"
           :data-testid="`folder-${account.id}-outbox`"
           :style="{ paddingLeft: '12px' }"
@@ -539,7 +517,6 @@ async function doDeleteFolder() {
       </div>
     </div>
 
-    <!-- Right-click context menu -->
     <Teleport to="body">
       <div v-if="contextMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
       <div
@@ -549,23 +526,17 @@ async function doDeleteFolder() {
         data-testid="folder-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
-        <button class="ctx-item disabled">Open in New Tab</button>
-        <button class="ctx-item disabled">Open in New Window</button>
-        <button class="ctx-item disabled">Search Messages...</button>
-        <div class="ctx-separator"></div>
         <button class="ctx-item" data-testid="ctx-new-folder" @click="openNewFolderModal">New Folder...</button>
         <div class="ctx-separator"></div>
         <button class="ctx-item" data-testid="ctx-mark-read" @click="markFolderRead">Mark Folder Read</button>
         <div class="ctx-separator"></div>
         <button class="ctx-item danger" data-testid="ctx-delete-folder" @click="confirmDeleteFolder">Delete Folder</button>
         <div class="ctx-separator"></div>
-        <button class="ctx-item disabled">Properties</button>
         <button class="ctx-item" data-testid="ctx-sync-folder" @click="syncThisFolder">
           Sync "{{ contextMenu.folder.name }}"
         </button>
       </div>
     </Teleport>
-    <!-- Account right-click context menu -->
     <Teleport to="body">
       <div v-if="accountMenu" class="folder-menu-overlay" @click="closeContextMenu"></div>
       <div
@@ -579,7 +550,6 @@ async function doDeleteFolder() {
       </div>
     </Teleport>
 
-    <!-- New Folder Modal -->
     <Teleport to="body">
       <div v-if="showNewFolderModal" class="modal-overlay" @click.self="showNewFolderModal = false">
         <div class="new-folder-modal">
@@ -614,7 +584,6 @@ async function doDeleteFolder() {
       </div>
     </Teleport>
 
-    <!-- Delete Folder Confirmation -->
     <Teleport to="body">
       <div v-if="deletingFolder" class="modal-overlay" @click.self="deletingFolder = null">
         <div class="new-folder-modal">
@@ -669,10 +638,8 @@ async function doDeleteFolder() {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  /* color + background + boxShadow are set inline per-account via acctColor() */
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   font-size: 11px;
   font-weight: 700;
   flex-shrink: 0;
@@ -737,10 +704,6 @@ async function doDeleteFolder() {
   color: var(--color-accent);
 }
 
-/* Folder icons keep their type hue at all times — active state is
- * communicated by row background + text weight, not icon color (PATCHES.md §2). */
-.folder-item.active .folder-svg { /* intentionally empty */ }
-
 .folder-item.syncing {
   opacity: 0.6;
 }
@@ -752,9 +715,8 @@ async function doDeleteFolder() {
 }
 
 .folder-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   width: 16px;
   height: 16px;
   flex-shrink: 0;
@@ -781,8 +743,7 @@ async function doDeleteFolder() {
 .folder-svg--trash    { color: #8a3a24; }
 .folder-svg--archive  { color: #6b4226; }
 .folder-svg--outbox   { color: #b8404d; }
-.folder-svg--starred  { color: #c2410c; }
-.folder-svg--folder   { color: #8a8079; }  /* user folders, neutral */
+.folder-svg--folder   { color: #8a8079; }
 
 .folder-name {
   flex: 1;
@@ -843,18 +804,10 @@ async function doDeleteFolder() {
   text-align: left;
   font-size: 13px;
   color: var(--color-text);
-  background: none;
-  border: none;
-  cursor: pointer;
 }
 
-.folder-context-menu .ctx-item:hover:not(.disabled) {
+.folder-context-menu .ctx-item:hover {
   background: var(--color-bg-hover);
-}
-
-.folder-context-menu .ctx-item.disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 
 .folder-context-menu .ctx-item.danger {
@@ -875,9 +828,8 @@ async function doDeleteFolder() {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   z-index: 10000;
 }
 
@@ -904,10 +856,7 @@ async function doDeleteFolder() {
 
 .nf-close {
   font-size: 20px;
-  background: none;
-  border: none;
   color: var(--color-text-muted);
-  cursor: pointer;
 }
 
 .nf-body {
@@ -958,8 +907,7 @@ async function doDeleteFolder() {
   --input-font-size: 14px;
 }
 
-.nf-input:focus,
-.nf-select:focus {
+.nf-input:focus {
   outline: none;
   border-color: var(--color-accent);
 }
@@ -977,10 +925,8 @@ async function doDeleteFolder() {
   padding: 0 16px;
   background: var(--color-bg-hover);
   color: var(--color-text);
-  border: none;
   border-radius: 6px;
   font-size: 13px;
-  cursor: pointer;
 }
 
 .nf-btn-create {
@@ -988,11 +934,9 @@ async function doDeleteFolder() {
   padding: 0 16px;
   background: var(--color-accent);
   color: white;
-  border: none;
   border-radius: 6px;
   font-size: 13px;
   font-weight: 500;
-  cursor: pointer;
 }
 
 .nf-btn-create:hover {
