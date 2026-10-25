@@ -1,10 +1,4 @@
 <script setup lang="ts">
-/// Right pane of the desktop contacts view: the selected contact's
-/// details with clickable email (opens compose) and phone (hands off
-/// to the OS dialer) rows. Edit/delete are emitted; the modals stay in
-/// ContactsView. The root keeps the `detail-panel` class so the view's
-/// layout-mode rules (right: fixed 400px / bottom: flexible) still
-/// size it.
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import type { Contact, ContactBook } from "@/lib/types";
@@ -25,12 +19,10 @@ const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 
 function bookAccountId(bookId: string): string {
-  return props.books.find((b) => b.id === bookId)?.account_id ?? "";
+  return props.books.find((book) => book.id === bookId)?.account_id ?? "";
 }
 
-// Clicking a contact's email opens compose with `to` prefilled, matching
-// how a mailto: link inside a mail body behaves. The address is built
-// via mailto: so it goes through the same parser and routing.
+// Reuse mailto parsing so compose links share one normalization path.
 function onEmailClick(email: string) {
   const params = parseMailto(`mailto:${encodeMailtoAddress(email)}`);
   if (!params) return;
@@ -40,19 +32,11 @@ function onEmailClick(email: string) {
   });
 }
 
-// Phone numbers hand off to the OS via the same backend command that
-// powers the LinkPopup's Open button; tel: is in its allow-list.
+// The backend validates tel: against its scheme allowlist.
 function onPhoneClick(number: string) {
   const tel = sanitizeTel(number);
   if (!tel) return;
-  api.openLink(`tel:${tel}`).catch((e) => console.error("openLink tel: failed:", e));
-}
-
-function onLinkEnter(url: string) {
-  uiStore.setHoverUrl(url);
-}
-function onLinkLeave() {
-  uiStore.setHoverUrl(null);
+  api.openLink(`tel:${tel}`).catch((error) => console.error("openLink tel: failed:", error));
 }
 </script>
 
@@ -89,8 +73,8 @@ function onLinkLeave() {
             data-testid="contact-detail-email"
             :href="`mailto:${encodeMailtoAddress(em.email)}`"
             @click.prevent="onEmailClick(em.email)"
-            @mouseenter="onLinkEnter(`mailto:${encodeMailtoAddress(em.email)}`)"
-            @mouseleave="onLinkLeave"
+            @mouseenter="uiStore.setHoverUrl(`mailto:${encodeMailtoAddress(em.email)}`)"
+            @mouseleave="uiStore.setHoverUrl(null)"
           >{{ em.email }}</a>
         </div>
         <div v-for="ph in parsePhones(contact.phones_json)" :key="ph.number" class="field-row">
@@ -100,8 +84,8 @@ function onLinkLeave() {
             data-testid="contact-detail-phone"
             :href="`tel:${sanitizeTel(ph.number)}`"
             @click.prevent="onPhoneClick(ph.number)"
-            @mouseenter="onLinkEnter(`tel:${sanitizeTel(ph.number)}`)"
-            @mouseleave="onLinkLeave"
+            @mouseenter="uiStore.setHoverUrl(`tel:${sanitizeTel(ph.number)}`)"
+            @mouseleave="uiStore.setHoverUrl(null)"
           >{{ ph.number }}</a>
         </div>
         <div v-if="contact.notes" class="field-row">
@@ -131,11 +115,9 @@ function onLinkLeave() {
   width: 56px;
   height: 56px;
   border-radius: 50%;
-  /* background set inline by acctColor() */
   color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   font-size: 20px;
   font-weight: 600;
   flex-shrink: 0;
@@ -193,7 +175,6 @@ function onLinkLeave() {
 .field-link {
   color: var(--color-accent);
   text-decoration: underline;
-  cursor: pointer;
 }
 .field-link:hover { filter: brightness(1.1); }
 
