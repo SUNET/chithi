@@ -8,19 +8,11 @@ const props = defineProps<{
 
 const uiStore = useUiStore();
 
-// Trailing punctuation that a user almost never means as part of a URL but
-// which the regex would otherwise capture. Stripped at split-time and
-// returned as plain text so it stays visible in the rendered output.
-// Closing brackets get a balanced-pair check below (Wikipedia URLs like
-// .../Foo_(disambiguation) keep the trailing ')').
+// Strip sentence punctuation while preserving balanced URL brackets.
 const TRAILING_PUNCT_ALWAYS = /[.,!?;:>'"]+$/;
 const URL_RE = /https?:\/\/[^\s<>"']+/g;
 const BRACKET_PAIRS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
 
-// Walk trailing punctuation off the end of a matched URL. Symmetric
-// brackets are only stripped when the URL has more of them at the end
-// than openers inside it; otherwise we leave them so URLs containing
-// balanced parens (Wikipedia, MDN, ...) survive unscathed.
 function trimTrailingPunct(url: string): { url: string; trailing: string } {
   let trailing = "";
   while (url.length > 0) {
@@ -42,31 +34,19 @@ function trimTrailingPunct(url: string): { url: string; trailing: string } {
   return { url, trailing };
 }
 
-// Exchange/Outlook calendar descriptions sometimes arrive as a full HTML
-// document instead of plain text. Decode them to text so the user sees the
-// content rather than raw markup, preserving line breaks from <br> and
-// common block elements. <a href> values are appended to the text output
-// so links that only existed as anchors (no visible URL) still get
-// linkified by the regex pass below.
-//
-// The trigger requires a doctype/<html>/<body> root marker, or both an
-// opening and matching closing tag of the same element. Notes that just
-// mention a stray close-tag in prose do not qualify, so they go through
-// the regex pass without DOMParser's whitespace rewriting.
+// Parse only rooted or balanced HTML so prose with stray tags remains intact.
 function looksLikeHtml(input: string): boolean {
   if (/<!doctype html\b|<html\b|<body\b/i.test(input)) return true;
-  const m = input.match(/<([a-z][a-z0-9]*)\b[^>]*>/i);
-  if (!m) return false;
-  const tag = m[1].toLowerCase();
+  const match = input.match(/<([a-z][a-z0-9]*)\b[^>]*>/i);
+  if (!match) return false;
+  const tag = match[1].toLowerCase();
   return new RegExp(`</${tag}\\s*>`, "i").test(input);
 }
 
 function htmlToPlain(input: string): string {
   if (!looksLikeHtml(input)) return input;
   const doc = new DOMParser().parseFromString(input, "text/html");
-  // Outlook/Word HTML exports embed large <style> blocks ("p.MsoNormal {...}")
-  // and the occasional <script>. textContent would otherwise dump that
-  // CSS/JS into the user-visible description.
+  // Exclude embedded CSS and scripts from visible text.
   doc.querySelectorAll("style, script, head, noscript").forEach((el) => el.remove());
   doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
   doc
@@ -78,11 +58,10 @@ function htmlToPlain(input: string): string {
     const text = (a.textContent ?? "").trim();
     if (!text || !text.includes(href)) a.append(` (${href})`);
   });
-  const out = (doc.body?.textContent ?? input)
+  return (doc.body?.textContent ?? input)
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return out;
 }
 
 interface Segment {
@@ -111,8 +90,8 @@ const segments = computed<Segment[]>(() => {
   return out;
 });
 
-function onLinkClick(url: string, e: MouseEvent) {
-  e.preventDefault();
+function onLinkClick(url: string, event: MouseEvent) {
+  event.preventDefault();
   uiStore.setHoverUrl(null);
   uiStore.openLinkPopup(url);
 }
