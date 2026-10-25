@@ -54,6 +54,10 @@ describe("getHourInTimezone", () => {
   it("returns 0 for invalid input", () => {
     expect(getHourInTimezone("bad", "UTC")).toBe(0);
   });
+
+  it("normalizes midnight to hour zero", () => {
+    expect(getHourInTimezone("2026-04-14T00:30:00Z", "UTC")).toBe(0);
+  });
 });
 
 describe("getMinutesInTimezone", () => {
@@ -126,6 +130,11 @@ describe("localInputToUTC", () => {
     // 13:00 Stockholm (CET) on Jan 14 = 12:00 UTC
     const result = localInputToUTC("2026-01-14", "13:00", "Europe/Stockholm");
     expect(new Date(result).toISOString()).toBe("2026-01-14T12:00:00.000Z");
+  });
+
+  it("handles the previous year in a negative-offset timezone", () => {
+    const result = localInputToUTC("2026-01-01", "00:30", "America/New_York");
+    expect(result).toBe("2026-01-01T05:30:00.000Z");
   });
 });
 
