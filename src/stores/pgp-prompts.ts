@@ -4,37 +4,30 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-// Drives PassphraseDialog.vue and PinDialog.vue. Subscribes once on app
-// boot to the backend `pgp-secret-needed` event and queues each request
-// FIFO so back-to-back sign/decrypt calls don't lose prompts. The head of
-// the queue is what the active dialog renders.
+// FIFO ordering prevents concurrent signing/decryption prompts from being lost.
 
-export type PgpSecretKind = "passphrase" | "pin";
+type PgpSecretKind = "passphrase" | "pin";
 
 export interface PgpSecretPrompt {
   requestId: string;
   kind: PgpSecretKind;
   /** Fingerprint (passphrase) or card ident (pin). */
   target: string;
-  /** Human-readable reason: "Decrypt message from Alice", etc. */
   reason: string;
 }
 
 export const usePgpPromptsStore = defineStore("pgp-prompts", () => {
-  // Queue of pending prompts. Append on event, shift on resolve/cancel.
   const queue = ref<PgpSecretPrompt[]>([]);
   let unlisten: UnlistenFn | null = null;
 
   const currentPrompt = computed<PgpSecretPrompt | null>(() =>
-    queue.value.length > 0 ? queue.value[0] : null,
+    queue.value[0] ?? null,
   );
 
-  /** Idempotent — call from App.vue's onMounted. */
+  /** Idempotent. */
   async function start() {
     if (unlisten) return;
     unlisten = await listen<PgpSecretPrompt>("pgp-secret-needed", (event) => {
-      // Backend payload uses camelCase already (serde rename_all =
-      // "camelCase" on SecretPromptPayload). Trust the shape.
       queue.value.push(event.payload);
     });
   }
@@ -63,8 +56,10 @@ export const usePgpPromptsStore = defineStore("pgp-prompts", () => {
   }
 
   function removeFromQueue(requestId: string) {
-    const idx = queue.value.findIndex((p) => p.requestId === requestId);
-    if (idx >= 0) queue.value.splice(idx, 1);
+    const index = queue.value.findIndex(
+      (prompt) => prompt.requestId === requestId,
+    );
+    if (index >= 0) queue.value.splice(index, 1);
   }
 
   return {
