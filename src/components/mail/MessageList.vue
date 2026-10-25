@@ -7,6 +7,7 @@ import { useAccountsStore } from "@/stores/accounts";
 import { useFoldersStore } from "@/stores/folders";
 import { useUiStore } from "@/stores/ui";
 import type { SortColumn } from "@/stores/messages";
+import type { MessageSummary } from "@/lib/types";
 import { openComposeWindow } from "@/lib/compose-window";
 import * as api from "@/lib/tauri";
 import MessageListItem from "./MessageListItem.vue";
@@ -23,37 +24,33 @@ const emit = defineEmits<{
   openMessage: [messageId: string];
 }>();
 
-const props = withDefaults(
+withDefaults(
   defineProps<{ mode?: "desktop" | "mobile" }>(),
   { mode: "desktop" },
 );
 
 async function onMobileSwipeArchive(messageId: string) {
-  // Move the single message to the account's Archive folder (best-effort:
-  // if there is no archive folder we just mark it as read so the row
-  // disappears from the unread filter).
   const accountId = accountsStore.activeAccountId;
   if (!accountId) return;
-  // Use the backend-normalized folder_type so we match archive folders
-  // across providers/locales (e.g. "All Mail", "Archiv", nested paths).
+  // folder_type is provider-normalized across names and locales.
   const archive = foldersStore
     .getFlatFolders()
     .find((f) => f.folder_type === "archive");
   if (!archive) {
-    // Fallback: mark as read.
+    // Without an archive folder, fall back to marking the message read.
     try {
       await api.setMessageFlags(accountId, [messageId], ["seen"], true);
-      messagesStore.fetchMessages();
-    } catch (e) {
-      console.error("swipe archive fallback failed", e);
+      void messagesStore.fetchMessages();
+    } catch (error) {
+      console.error("swipe archive fallback failed", error);
     }
     return;
   }
   try {
     await api.moveMessages(accountId, [messageId], archive.path);
-    messagesStore.fetchMessages();
-  } catch (e) {
-    console.error("swipe archive failed", e);
+    void messagesStore.fetchMessages();
+  } catch (error) {
+    console.error("swipe archive failed", error);
   }
 }
 
@@ -65,8 +62,7 @@ async function onMobileSwipeDelete(messageId: string) {
   await messagesStore.deleteSelected();
 }
 
-// Track modifier keys independently via keydown/keyup since
-// WebKitGTK can lose event.shiftKey on click events.
+// WebKitGTK can lose click-event modifier state, so track it independently.
 const shiftHeld = ref(false);
 const ctrlHeld = ref(false);
 
@@ -79,10 +75,7 @@ function onKeyDown(event: KeyboardEvent) {
   }
   if (event.key === "/" && !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)) {
     event.preventDefault();
-    messagesStore.quickFilterVisible = !messagesStore.quickFilterVisible;
-    if (!messagesStore.quickFilterVisible) {
-      messagesStore.clearQuickFilters();
-    }
+    toggleQuickFilter();
   }
   if (event.key === "Escape" && messagesStore.quickFilterVisible) {
     messagesStore.quickFilterVisible = false;
@@ -105,12 +98,10 @@ onUnmounted(() => {
   window.removeEventListener("keyup", onKeyUp);
 });
 
-// Right-click context menu
 const contextMenu = ref<{
   x: number;
   y: number;
   messageId: string;
-  threadId?: string;
 } | null>(null);
 const subMenu = ref<"move" | "copy" | null>(null);
 
@@ -123,8 +114,7 @@ function onChildSelect(messageId: string) {
 
 function onSelect(messageId: string, event?: MouseEvent) {
   closeContextMenu();
-  // Check both keyboard tracker AND MouseEvent for modifier keys.
-  // WebKitGTK may lose one or the other depending on context.
+  // Check tracked and click-event modifiers because WebKitGTK may lose either.
   const isShift = shiftHeld.value || (event?.shiftKey ?? false);
   const isCtrl = ctrlHeld.value || (event?.ctrlKey ?? false) || (event?.metaKey ?? false);
   messagesStore.selectMessage(messageId, {
@@ -134,11 +124,11 @@ function onSelect(messageId: string, event?: MouseEvent) {
   });
 }
 
-// Custom drag-and-drop via mouse events (WebKitGTK doesn't support HTML5 DnD)
+// WebKitGTK requires mouse-driven drag and drop.
 const dragStartPos = ref<{ x: number; y: number } | null>(null);
 const dragSourceId = ref<string | null>(null);
 const dragGhost = ref<HTMLElement | null>(null);
-const DRAG_THRESHOLD = 5; // pixels before drag starts
+const DRAG_THRESHOLD = 5;
 
 function onDragMouseDown(event: MouseEvent, messageId: string) {
   if (event.button !== 0) return;
@@ -146,15 +136,15 @@ function onDragMouseDown(event: MouseEvent, messageId: string) {
   dragStartPos.value = { x: event.clientX, y: event.clientY };
   dragSourceId.value = messageId;
 
-  const handleMove = (e: MouseEvent) => {
+  const handleMove = (moveEvent: MouseEvent) => {
     if (!dragStartPos.value || !dragSourceId.value) return;
 
-    const dx = e.clientX - dragStartPos.value.x;
-    const dy = e.clientY - dragStartPos.value.y;
-    if (!isDragging.value && Math.sqrt(dx * dx + dy * dy) < DRAG_THRESHOLD) return;
+    const dx = moveEvent.clientX - dragStartPos.value.x;
+    const dy = moveEvent.clientY - dragStartPos.value.y;
+    if (!isDragging.value && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
 
     if (!isDragging.value) {
-      // Select for drag without triggering read/open side effects
+      // Select for drag without triggering read/open side effects.
       if (!messagesStore.isSelected(dragSourceId.value)) {
         messagesStore.selectedIds = [dragSourceId.value];
       }
@@ -162,26 +152,22 @@ function onDragMouseDown(event: MouseEvent, messageId: string) {
       dragSourceAccountId.value = accountsStore.activeAccountId;
       isDragging.value = true;
 
-      // Ghost badge showing drag count — positioned away from cursor
-      // so it doesn't intercept mouse events on drop targets
+      // Keep the non-interactive badge away from drop targets.
       const ghost = document.createElement("div");
       ghost.textContent = `${dragMessageIds.value.length} message(s)`;
       ghost.style.cssText = "position:fixed;z-index:99999;padding:4px 10px;background:#3366cc;color:white;border-radius:4px;font-size:12px;font-weight:500;white-space:nowrap;pointer-events:none;";
       document.body.appendChild(ghost);
       dragGhost.value = ghost;
-      // Test: also change body cursor
-      document.body.style.cursor = "grabbing";
       document.body.classList.add("dragging-messages");
     }
 
     if (dragGhost.value) {
-      dragGhost.value.style.left = e.clientX + 12 + "px";
-      dragGhost.value.style.top = e.clientY + 12 + "px";
+      dragGhost.value.style.left = moveEvent.clientX + 12 + "px";
+      dragGhost.value.style.top = moveEvent.clientY + 12 + "px";
     }
   };
 
   const handleUp = () => {
-    document.body.style.cursor = "";
     document.body.classList.remove("dragging-messages");
     if (isDragging.value) {
       setTimeout(() => {
@@ -242,7 +228,6 @@ function closeContextMenu() {
 
 function onRowRightClick(event: MouseEvent, messageId: string) {
   event.preventDefault();
-  // Ensure right-clicked message is in selection
   if (!messagesStore.selectedIds.includes(messageId)) {
     messagesStore.selectMessage(messageId, { shiftKey: false, ctrlKey: false, metaKey: false });
   }
@@ -250,20 +235,26 @@ function onRowRightClick(event: MouseEvent, messageId: string) {
   subMenu.value = null;
 }
 
-async function ctxReply() {
-  const msgId = contextMenu.value?.messageId;
+async function loadContextMessage() {
+  const messageId = contextMenu.value?.messageId;
   closeContextMenu();
-  if (!msgId) return;
-  await messagesStore.loadMessage(msgId);
-  const msg = messagesStore.activeMessage;
-  if (!msg) return;
+  if (!messageId) return null;
+  await messagesStore.loadMessage(messageId);
+  const message = messagesStore.activeMessage;
+  return message ? { messageId, message } : null;
+}
+
+async function ctxReply() {
+  const context = await loadContextMessage();
+  if (!context) return;
+  const { messageId, message: msg } = context;
   const body = msg.body_text || "";
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
-  const quoted = body.split("\n").map((l: string) => `> ${l}`).join("\n");
+  const quoted = body.split("\n").map((line) => `> ${line}`).join("\n");
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
-    replyTo: msgId,
+    replyTo: messageId,
     to: msg.from.email,
     subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
     body: `\n\nOn ${date}, ${from} wrote:\n${quoted}`,
@@ -271,22 +262,19 @@ async function ctxReply() {
 }
 
 async function ctxReplyAll() {
-  const msgId = contextMenu.value?.messageId;
-  closeContextMenu();
-  if (!msgId) return;
-  await messagesStore.loadMessage(msgId);
-  const msg = messagesStore.activeMessage;
-  if (!msg) return;
+  const context = await loadContextMessage();
+  if (!context) return;
+  const { messageId, message: msg } = context;
   const myEmail = accountsStore.activeAccount()?.email ?? "";
-  const allTo = [msg.from.email, ...msg.to.map((a: { email: string }) => a.email).filter((e: string) => e !== myEmail)];
-  const allCc = msg.cc.map((a: { email: string }) => a.email).filter((e: string) => e !== myEmail);
+  const allTo = [msg.from.email, ...msg.to.map((address) => address.email).filter((email) => email !== myEmail)];
+  const allCc = msg.cc.map((address) => address.email).filter((email) => email !== myEmail);
   const body = msg.body_text || "";
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
-  const quoted = body.split("\n").map((l: string) => `> ${l}`).join("\n");
+  const quoted = body.split("\n").map((line) => `> ${line}`).join("\n");
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
-    replyTo: msgId,
+    replyTo: messageId,
     to: allTo.join(", "),
     cc: allCc.join(", "),
     subject: msg.subject?.startsWith("Re:") ? msg.subject : `Re: ${msg.subject || ""}`,
@@ -295,21 +283,24 @@ async function ctxReplyAll() {
 }
 
 async function ctxForward() {
-  const msgId = contextMenu.value?.messageId;
-  closeContextMenu();
-  if (!msgId) return;
-  await messagesStore.loadMessage(msgId);
-  const msg = messagesStore.activeMessage;
-  if (!msg) return;
+  const context = await loadContextMessage();
+  if (!context) return;
+  const { message: msg } = context;
   const text = msg.body_text || "";
   const date = new Date(msg.date).toLocaleString(undefined, { hour12: uiStore.hour12 });
   const from = msg.from.name ? `${msg.from.name} <${msg.from.email}>` : msg.from.email;
-  const toStr = msg.to.map((a: { name: string | null; email: string }) => a.name || a.email).join(", ");
+  const toStr = msg.to.map((address) => address.name || address.email).join(", ");
   openComposeWindow({
     accountId: accountsStore.activeAccountId ?? undefined,
     subject: msg.subject?.startsWith("Fwd:") ? msg.subject : `Fwd: ${msg.subject || ""}`,
     body: `\n\n---------- Forwarded message ----------\nFrom: ${from}\nDate: ${date}\nSubject: ${msg.subject || ""}\nTo: ${toStr}\n\n${text}`,
   });
+}
+
+function clearSelectionAndMessage() {
+  messagesStore.clearSelection();
+  messagesStore.activeMessage = null;
+  messagesStore.activeMessageId = null;
 }
 
 async function ctxMoveTo(folderPath: string) {
@@ -320,11 +311,9 @@ async function ctxMoveTo(folderPath: string) {
   const toastId = showToast(`Moving ${ids.length} message(s)...`, "info", 0);
   try {
     await api.moveMessages(accountId, ids, folderPath);
-    messagesStore.clearSelection();
-    messagesStore.activeMessage = null;
-    messagesStore.activeMessageId = null;
-  } catch (e) {
-    console.error("Move failed:", e);
+    clearSelectionAndMessage();
+  } catch (error) {
+    console.error("Move failed:", error);
   } finally {
     dismissToast(toastId);
   }
@@ -337,8 +326,8 @@ async function ctxCopyTo(folderPath: string) {
   closeContextMenu();
   try {
     await api.copyMessages(accountId, ids, folderPath);
-  } catch (e) {
-    console.error("Copy failed:", e);
+  } catch (error) {
+    console.error("Copy failed:", error);
   }
 }
 
@@ -347,39 +336,25 @@ async function ctxDelete() {
   await messagesStore.deleteSelected();
 }
 
-function ctxMarkRead() {
+function ctxSetReadStatus(read: boolean) {
   const ids = messagesStore.resolveSelectedIds();
   closeContextMenu();
-  messagesStore.setReadStatus(ids, true);
+  messagesStore.setReadStatus(ids, read);
 }
 
-function ctxMarkUnread() {
+function hasSelectedReadStatus(read: boolean): boolean {
   const ids = messagesStore.resolveSelectedIds();
-  closeContextMenu();
-  messagesStore.setReadStatus(ids, false);
+  for (const id of ids) {
+    const message = messagesStore.messages.find((candidate) => candidate.id === id);
+    if (message && message.flags.includes("seen") === read) return true;
+    const thread = messagesStore.threads.find((candidate) => candidate.message_ids.includes(id));
+    if (
+      thread &&
+      (read ? thread.unread_count < thread.message_count : thread.unread_count > 0)
+    ) return true;
+  }
+  return false;
 }
-
-const hasUnreadSelected = () => {
-  const ids = messagesStore.resolveSelectedIds();
-  for (const id of ids) {
-    const msg = messagesStore.messages.find(m => m.id === id);
-    if (msg && !msg.flags.includes("seen")) return true;
-    const thread = messagesStore.threads.find(t => t.message_ids.includes(id));
-    if (thread && thread.unread_count > 0) return true;
-  }
-  return false;
-};
-
-const hasReadSelected = () => {
-  const ids = messagesStore.resolveSelectedIds();
-  for (const id of ids) {
-    const msg = messagesStore.messages.find(m => m.id === id);
-    if (msg && msg.flags.includes("seen")) return true;
-    const thread = messagesStore.threads.find(t => t.message_ids.includes(id));
-    if (thread && thread.unread_count < thread.message_count) return true;
-  }
-  return false;
-};
 
 async function ctxSaveAsEml() {
   const msgId = contextMenu.value?.messageId;
@@ -388,10 +363,10 @@ async function ctxSaveAsEml() {
   if (!msgId || !accountId) return;
   try {
     await api.saveMessageAsEml(accountId, msgId, "message.eml");
-  } catch (e) {
-    console.error("Save as .eml failed:", e);
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast(`Save as .eml failed: ${msg}`, "error");
+  } catch (error) {
+    console.error("Save as .eml failed:", error);
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`Save as .eml failed: ${message}`, "error");
   }
 }
 
@@ -425,32 +400,29 @@ async function ctxNotSpam() {
   closeContextMenu();
   try {
     await api.moveMessages(accountId, ids, inboxFolder.path);
-    messagesStore.clearSelection();
-    messagesStore.activeMessage = null;
-    messagesStore.activeMessageId = null;
-  } catch (e) {
-    console.error("Not Spam failed:", e);
+    clearSelectionAndMessage();
+  } catch (error) {
+    console.error("Not Spam failed:", error);
   }
 }
 
-const allSelected = computed(() => {
-  if (uiStore.threadingEnabled) {
-    return messagesStore.threads.length > 0 &&
-      messagesStore.threads.every(t => messagesStore.isSelected(t.message_ids[0]));
-  }
-  return messagesStore.messages.length > 0 &&
-    messagesStore.messages.every(m => messagesStore.isSelected(m.id));
-});
+const visibleMessageIds = computed(() =>
+  uiStore.threadingEnabled
+    ? messagesStore.threads.map((thread) => thread.message_ids[0])
+    : messagesStore.messages.map((message) => message.id),
+);
+
+const allSelected = computed(
+  () =>
+    visibleMessageIds.value.length > 0 &&
+    visibleMessageIds.value.every((messageId) => messagesStore.isSelected(messageId)),
+);
 
 function toggleSelectAll() {
   if (allSelected.value) {
     messagesStore.clearSelection();
   } else {
-    if (uiStore.threadingEnabled) {
-      messagesStore.selectedIds = messagesStore.threads.map(t => t.message_ids[0]);
-    } else {
-      messagesStore.selectedIds = messagesStore.messages.map(m => m.id);
-    }
+    messagesStore.selectedIds = [...visibleMessageIds.value];
   }
 }
 
@@ -474,37 +446,19 @@ function formatHitDate(secs: number): string {
 }
 
 interface ThreadChildEntry {
-  message: import("@/lib/types").MessageSummary;
+  message: MessageSummary;
   depth: number;
 }
 
-/**
- * Strip surrounding angle brackets and whitespace so a Message-ID
- * stored as `<mid@host>` by one backend lines up with the same id
- * stored as `mid@host` by another. Matching is case-sensitive
- * (Message-IDs are technically case-sensitive per RFC 5322).
- */
-function normMid(s: string | null | undefined): string | null {
-  if (!s) return null;
-  const trimmed = s.trim();
-  if (trimmed.length === 0) return null;
+// Normalize brackets without changing Message-ID case.
+function normMid(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
   return trimmed.replace(/^<+/, "").replace(/>+$/, "");
 }
 
-/**
- * Build a depth-annotated, in-order list of a thread's children
- * (everything except the root message). Depth comes from walking
- * `in_reply_to` against `message_id` of other messages in the same
- * thread; messages whose parent isn't in the chain collapse to
- * depth 0 alongside other roots. This can still happen for
- * Microsoft Graph messages when `in_reply_to` could not be
- * backfilled from `internetMessageHeaders` or when the parent
- * message is unavailable in the thread.
- *
- * Children are emitted depth-first under each parent (a parent's
- * subtree comes before the next sibling) so the visual tree
- * matches the conversation flow.
- */
+// Emit children depth-first; missing parents become depth-zero orphans.
 function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   const all = messagesStore.threadMessages[threadId] ?? [];
   if (all.length <= 1) return [];
@@ -512,48 +466,34 @@ function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   const root = all[0];
   const rest = all.slice(1);
 
-  // Index every message in the thread by its normalised Message-ID so
-  // children can find their parent regardless of angle-bracket
-  // conventions on either side.
-  const byMid = new Map<string, import("@/lib/types").MessageSummary>();
-  for (const m of all) {
-    const mid = normMid(m.message_id);
-    if (mid) byMid.set(mid, m);
+  const byMid = new Map<string, MessageSummary>();
+  for (const message of all) {
+    const messageId = normMid(message.message_id);
+    if (messageId) byMid.set(messageId, message);
   }
 
-  // Group children by their direct parent's normalised Message-ID so
-  // depth-first emission keeps the conversation flow.
-  const childrenByParent = new Map<string, import("@/lib/types").MessageSummary[]>();
-  const orphans: import("@/lib/types").MessageSummary[] = [];
-  for (const m of rest) {
-    const parentMid = normMid(m.in_reply_to);
+  const childrenByParent = new Map<string, MessageSummary[]>();
+  const orphans: MessageSummary[] = [];
+  for (const message of rest) {
+    const parentMid = normMid(message.in_reply_to);
     if (parentMid && byMid.has(parentMid)) {
-      const arr = childrenByParent.get(parentMid) ?? [];
-      arr.push(m);
-      childrenByParent.set(parentMid, arr);
+      const children = childrenByParent.get(parentMid) ?? [];
+      children.push(message);
+      childrenByParent.set(parentMid, children);
     } else {
-      orphans.push(m);
+      orphans.push(message);
     }
   }
 
-  if (typeof window !== "undefined" && (window as { __THREAD_DEBUG__?: boolean }).__THREAD_DEBUG__) {
-    console.log("[thread]", threadId, {
-      total: all.length,
-      bymid_keys: Array.from(byMid.keys()),
-      childrenOf: Array.from(childrenByParent.entries()).map(([k, v]) => [k, v.length]),
-      orphans: orphans.length,
-      messages: all.map((m) => ({ id: m.id, mid: m.message_id, irt: m.in_reply_to })),
-    });
-  }
   const out: ThreadChildEntry[] = [];
   const emitted = new Set<string>();
   function emitChildrenOf(parentMid: string | null, depth: number) {
-    const set = parentMid === null ? orphans : childrenByParent.get(parentMid) ?? [];
-    for (const m of set) {
-      if (emitted.has(m.id)) continue;
-      emitted.add(m.id);
-      out.push({ message: m, depth });
-      const childMid = normMid(m.message_id);
+    const children = parentMid === null ? orphans : childrenByParent.get(parentMid) ?? [];
+    for (const message of children) {
+      if (emitted.has(message.id)) continue;
+      emitted.add(message.id);
+      out.push({ message, depth });
+      const childMid = normMid(message.message_id);
       if (childMid) emitChildrenOf(childMid, depth + 1);
     }
   }
@@ -561,23 +501,20 @@ function childrenWithDepth(threadId: string): ThreadChildEntry[] {
   if (rootMid) emitChildrenOf(rootMid, 0);
   emitChildrenOf(null, 0);
 
-  // Safety net: anything we somehow missed (cycle, unreachable parent)
-  // gets emitted at depth 0 so it's still visible.
-  for (const m of rest) {
-    if (!emitted.has(m.id)) {
-      emitted.add(m.id);
-      out.push({ message: m, depth: 0 });
+  // Keep cycles and unreachable children visible.
+  for (const message of rest) {
+    if (!emitted.has(message.id)) {
+      emitted.add(message.id);
+      out.push({ message, depth: 0 });
     }
   }
 
   return out;
 }
 
-// JMAP and Graph hits report the backend's folder/mailbox ID, which is
-// opaque to the user. Build a path -> name index once per folder-tree
-// change so rendering N hits stays O(N) instead of O(N * folder_count).
+// Index backend folder IDs once per tree change.
 const folderNameByPath = computed(
-  () => new Map(foldersStore.getFlatFolders().map((f) => [f.path, f.name])),
+  () => new Map(foldersStore.getFlatFolders().map((folder) => [folder.path, folder.name])),
 );
 
 function resolveFolderName(path: string): string {
@@ -637,7 +574,6 @@ function resolveFolderName(path: string): string {
       class="empty"
     >No messages</div>
 
-    <!-- Threaded view -->
     <div
       v-else-if="uiStore.threadingEnabled"
       ref="scrollContainer"
@@ -661,7 +597,6 @@ function resolveFolderName(path: string): string {
             @toggle-star="messagesStore.toggleStar(thread.message_ids[0])"
           />
         </div>
-        <!-- Expanded thread messages, indented by reply-depth -->
         <template v-if="messagesStore.isThreadExpanded(thread.thread_id)">
           <div
             v-for="entry in childrenWithDepth(thread.thread_id)"
@@ -676,7 +611,7 @@ function resolveFolderName(path: string): string {
               :message="entry.message"
               :active="messagesStore.activeMessageId === entry.message.id"
               :selected="messagesStore.isSelected(entry.message.id)"
-              :mode="props.mode"
+              :mode="mode"
               @toggle="messagesStore.toggleSelectMessage(entry.message.id)"
               @open="onOpen(entry.message.id)"
               @toggle-star="messagesStore.toggleStar(entry.message.id)"
@@ -689,7 +624,6 @@ function resolveFolderName(path: string): string {
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>
     </div>
 
-    <!-- Flat view -->
     <div v-else ref="scrollContainer" class="message-items" @scroll="onScroll">
       <div
         v-for="msg in messagesStore.messages"
@@ -702,7 +636,7 @@ function resolveFolderName(path: string): string {
           :message="msg"
           :active="messagesStore.activeMessageId === msg.id"
           :selected="messagesStore.isSelected(msg.id)"
-          :mode="props.mode"
+          :mode="mode"
           @toggle="messagesStore.toggleSelectMessage(msg.id)"
           @open="onOpen(msg.id)"
           @toggle-star="messagesStore.toggleStar(msg.id)"
@@ -713,7 +647,6 @@ function resolveFolderName(path: string): string {
       <div v-if="messagesStore.loadingMore" class="loading-more">Loading more...</div>
     </div>
 
-    <!-- Server-side search results: rendered after local list when present -->
     <div
       v-if="messagesStore.serverHits.length > 0"
       class="server-results"
@@ -756,14 +689,12 @@ function resolveFolderName(path: string): string {
       </button>
     </div>
 
-    <!-- Right-click context menu -->
     <Teleport to="body">
       <div
         v-if="contextMenu"
         class="msg-context-menu"
         :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
       >
-        <!-- Single message actions -->
         <template v-if="isSingleSelection()">
           <button class="ctx-item" data-testid="ctx-reply" @click="ctxReply">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" /></svg>
@@ -784,7 +715,6 @@ function resolveFolderName(path: string): string {
           <div class="ctx-separator"></div>
         </template>
 
-        <!-- Move To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'move'" @mouseleave="subMenu = null">
           <button class="ctx-item" data-testid="ctx-move-to" @click="subMenu = 'move'">
             Move To
@@ -802,7 +732,6 @@ function resolveFolderName(path: string): string {
           </div>
         </div>
 
-        <!-- Copy To submenu -->
         <div class="ctx-item-parent" @mouseenter="subMenu = 'copy'" @mouseleave="subMenu = null">
           <button class="ctx-item" data-testid="ctx-copy-to" @click="subMenu = 'copy'">
             Copy To
@@ -821,11 +750,11 @@ function resolveFolderName(path: string): string {
 
         <div class="ctx-separator"></div>
 
-        <button v-if="hasReadSelected()" class="ctx-item" data-testid="ctx-mark-unread" @click="ctxMarkUnread">
+        <button v-if="hasSelectedReadStatus(true)" class="ctx-item" data-testid="ctx-mark-unread" @click="ctxSetReadStatus(false)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><circle cx="12" cy="12" r="3" fill="currentColor" /></svg>
           Mark Unread
         </button>
-        <button v-if="hasUnreadSelected()" class="ctx-item" data-testid="ctx-mark-read" @click="ctxMarkRead">
+        <button v-if="hasSelectedReadStatus(false)" class="ctx-item" data-testid="ctx-mark-read" @click="ctxSetReadStatus(true)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M9 12l2 2 4-4" /></svg>
           Mark Read
         </button>
@@ -883,9 +812,8 @@ function resolveFolderName(path: string): string {
 .col-check {
   width: 28px;
   flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   cursor: pointer;
   align-self: stretch;
 }
@@ -898,12 +826,10 @@ function resolveFolderName(path: string): string {
 }
 
 .col-icons {
-  display: flex;
-  align-items: center;
-  gap: 2px;
+  display: grid;
+  place-items: center;
   width: 28px;
   flex-shrink: 0;
-  justify-content: center;
 }
 
 .col-icon {
@@ -930,7 +856,6 @@ function resolveFolderName(path: string): string {
 }
 
 .sortable {
-  cursor: pointer;
   transition: color 0.15s;
 }
 
@@ -952,11 +877,7 @@ function resolveFolderName(path: string): string {
 
 .thread-child {
   background: var(--color-bg-tertiary);
-  /* `--reply-depth` is set as an inline custom property per row from
-     childrenWithDepth(). margin-left pushes the row's box, which is
-     more robust than padding when MessageListItem's own layout
-     constrains its content. The 22px step lines up with the typical
-     row height so the indentation tree reads cleanly. */
+  /* Margin preserves the child layout while applying reply depth. */
   margin-left: calc(20px + var(--reply-depth, 0) * 22px);
   border-left: 2px solid var(--color-border);
 }
@@ -1067,7 +988,6 @@ function resolveFolderName(path: string): string {
   background: var(--color-bg);
   color: var(--color-text-muted);
   font-size: 11px;
-  cursor: pointer;
 }
 
 .quick-filter-toggle:hover {
@@ -1109,9 +1029,6 @@ function resolveFolderName(path: string): string {
   text-align: left;
   font-size: 13px;
   color: var(--color-text);
-  background: none;
-  border: none;
-  cursor: pointer;
 }
 
 .msg-context-menu .ctx-item:hover {
