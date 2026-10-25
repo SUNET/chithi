@@ -1,6 +1,14 @@
 import { createRouter, createWebHistory } from "vue-router";
 import MailView from "@/views/MailView.vue";
 import CalendarView from "@/views/CalendarView.vue";
+import { useAccountsStore } from "@/stores/accounts";
+
+const ACCOUNT_OPTIONAL_ROUTES = new Set([
+  "onboarding",
+  "compose",
+  "reader",
+  "settings",
+]);
 
 const router = createRouter({
   history: createWebHistory(),
@@ -11,10 +19,7 @@ const router = createRouter({
       component: MailView,
     },
     {
-      // Eager-imported so its module chunk is in memory before the user
-      // first navigates (see #72). Component still only mounts on
-      // navigation, but KeepAlive (App.vue) keeps the instance warm after
-      // the first mount.
+      // Eager loading avoids a delay on the first calendar navigation.
       path: "/calendar",
       name: "calendar",
       component: CalendarView,
@@ -60,7 +65,6 @@ const router = createRouter({
       component: () => import("@/views/PreferencesView.vue"),
     },
     {
-      // Mobile-only thread detail (pushed from MailView on tap).
       path: "/mail/thread/:id",
       name: "mobile-reader",
       component: () => import("@/views/MobileThreadView.vue"),
@@ -73,46 +77,28 @@ const router = createRouter({
   ],
 });
 
-// Redirect to onboarding if no accounts are configured. The guard only
-// runs on the main window — standalone compose/reader windows have
-// their own param-driven initialization and should pass through.
 router.beforeEach(async (to) => {
-  if (to.name === "onboarding") return true;
-  if (to.name === "compose" || to.name === "reader") return true;
-  // Settings is the canonical "add account" surface (it covers provider
-  // types that onboarding's picker omits, like Zoom). Always allow it
-  // through — otherwise tapping the gear icon on a zero-account install
-  // bounces to onboarding, which is what confused the Zoom marketplace
-  // tester who just wanted to add a Zoom account.
-  if (to.name === "settings") return true;
+  if (
+    typeof to.name === "string" &&
+    ACCOUNT_OPTIONAL_ROUTES.has(to.name)
+  ) {
+    return true;
+  }
 
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("messageId") || params.get("draftId")) return true;
-
-  // "Skip and add an account later" sets this flag so the guard stops
-  // redirecting back to onboarding on every navigation.
   if (localStorage.getItem("chithi-onboarding-skipped") === "true") return true;
 
   try {
-    const { useAccountsStore } = await import("@/stores/accounts");
     const accountsStore = useAccountsStore();
     if (accountsStore.accounts.length === 0) {
-      // Guard runs before onMounted in App.vue, so the store may just be
-      // empty from a cold start. Always await fetchAccounts() — it is
-      // de-duplicated, so if App.vue already started a fetch we await that
-      // same in-flight promise instead of redirecting to onboarding
-      // before the real account list has loaded.
       await accountsStore.fetchAccounts();
     }
-    if (accountsStore.accounts.length === 0) {
-      return { name: "onboarding" };
-    }
-  } catch (e) {
-    // Guard can fire before Pinia is fully active on very first navigation;
-    // fall through and let App.vue handle it after mount.
-    console.warn("router guard: account check skipped", e);
+    return accountsStore.accounts.length === 0
+      ? { name: "onboarding" }
+      : true;
+  } catch (error) {
+    console.warn("router guard: account check skipped", error);
+    return true;
   }
-  return true;
 });
 
 export default router;
