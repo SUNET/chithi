@@ -1,26 +1,4 @@
-/// Account-type vocabulary shared by the settings view, the
-/// add-account picker and the per-type form sections.
-
-export type AccountType =
-  | "gmail"
-  | "imap"
-  | "jmap"
-  | "fastmail"
-  | "caldav"
-  | "carddav"
-  | "o365"
-  | "talk"
-  | "matrix"
-  | "zoom"
-  | "visio";
-
-/// Cross-account contact-book option for the default-book dropdowns.
-/// The label is "Account / Book" so the same book name on two
-/// different accounts (e.g. "Personal") stays distinguishable.
-export type BookOption = { id: string; label: string };
-
-/// Order of the cards in the add-account picker dialog.
-export const ADD_ACCOUNT_TYPES: AccountType[] = [
+export const ADD_ACCOUNT_TYPES = [
   "gmail",
   "o365",
   "fastmail",
@@ -32,119 +10,116 @@ export const ADD_ACCOUNT_TYPES: AccountType[] = [
   "matrix",
   "zoom",
   "visio",
-];
+] as const;
 
-/// Strict Fastmail JMAP endpoint check. Mirrors the Rust
-/// `is_fastmail_jmap_url` helper in `db/accounts.rs`: returns
-/// `true` only when the URL parses, uses https, and its hostname
-/// is *exactly* `api.fastmail.com` (case-insensitive). A plain
-/// `startsWith("https://api.fastmail.com")` would also approve
-/// lookalike hosts like `api.fastmail.com.attacker.example`.
-export function isFastmailJmapUrl(u: string): boolean {
+export type AccountType = (typeof ADD_ACCOUNT_TYPES)[number];
+
+export type BookOption = { id: string; label: string };
+
+const ACCOUNT_TYPE_DETAILS = {
+  gmail: {
+    label: "Gmail",
+    description: "Mail, calendar and contacts via Google",
+  },
+  o365: {
+    label: "Microsoft 365",
+    description: "Mail, calendar and contacts via Microsoft 365",
+  },
+  fastmail: {
+    label: "Fastmail",
+    description: "Fastmail mail, calendar and contacts via JMAP API token",
+  },
+  imap: {
+    label: "IMAP",
+    description: "Generic IMAP / SMTP mail account",
+  },
+  jmap: {
+    label: "JMAP",
+    description: "JMAP mail (Stalwart, generic JMAP servers)",
+  },
+  caldav: {
+    label: "CALDAV",
+    description: "Standalone calendar via CalDAV",
+  },
+  carddav: {
+    label: "CARDDAV",
+    description: "Standalone contacts via CardDAV",
+  },
+  talk: {
+    label: "Nextcloud Talk",
+    description: "Video conferencing on a Nextcloud server",
+  },
+  matrix: {
+    label: "Matrix",
+    description: "Video conferencing via Matrix / Element Call",
+  },
+  zoom: {
+    label: "Zoom",
+    description: "Video conferencing via Zoom",
+  },
+  visio: {
+    label: "La Suite Visio",
+    description: "Video conferencing via a La Suite Visio instance",
+  },
+} satisfies Record<AccountType, { label: string; description: string }>;
+
+/** Matches backend validation by requiring HTTPS and the exact Fastmail API host. */
+export function isFastmailJmapUrl(url: string): boolean {
   try {
-    const parsed = new URL(u);
+    const parsed = new URL(url);
     return (
-      parsed.protocol === "https:"
-      && parsed.hostname.toLowerCase() === "api.fastmail.com"
+      parsed.protocol === "https:" &&
+      parsed.hostname.toLowerCase() === "api.fastmail.com"
     );
   } catch {
     return false;
   }
 }
 
-/// Long-form label for the type-selector buttons in the modal.
-/// Mostly the same as `accountTypeLabel` for the listing, but the
-/// modal is wider and benefits from "Nextcloud Talk" and "Matrix"
-/// spelled out instead of an upper-case acronym.
-export function accountTypeLabelLong(t: AccountType): string {
-  switch (t) {
-    case "gmail":
-      return "Gmail";
-    case "o365":
-      return "Microsoft 365";
-    case "fastmail":
-      return "Fastmail";
-    case "talk":
-      return "Nextcloud Talk";
-    case "matrix":
-      return "Matrix";
-    case "zoom":
-      return "Zoom";
-    case "visio":
-      return "La Suite Visio";
-    default:
-      return t.toUpperCase();
-  }
+export function accountTypeLabelLong(accountType: AccountType): string {
+  return ACCOUNT_TYPE_DETAILS[accountType].label;
 }
 
-export function accountTypeLabel(acc: {
+export function accountTypeLabel(account: {
   provider?: string;
   mail_protocol?: string;
   has_calendar_binding?: boolean;
   has_contacts_binding?: boolean;
   meet_protocol?: string;
 }): string {
-  if (acc.provider === "gmail") return "GMAIL";
-  if (acc.provider === "o365") return "MICROSOFT 365";
-  if (acc.provider === "fastmail") return "FASTMAIL";
-  if (acc.mail_protocol) return acc.mail_protocol.toUpperCase();
-  // Standalone DAV accounts: name them by the user-visible service
-  // they provide rather than the protocol acronym. "Calendar" and
-  // "Contacts" mean something to a user; "CALDAV" and "CARDDAV"
-  // mean something to a protocol nerd.
-  const hasCal = !!acc.has_calendar_binding;
-  const hasCon = !!acc.has_contacts_binding;
-  if (hasCal && hasCon) return "Calendar and Contacts";
-  if (hasCal) return "Calendar";
-  if (hasCon) return "Contacts";
-  // Meet-only accounts (#148). Same user-visible naming approach.
-  switch (acc.meet_protocol) {
+  if (
+    account.provider === "gmail" ||
+    account.provider === "o365" ||
+    account.provider === "fastmail"
+  ) {
+    return ACCOUNT_TYPE_DETAILS[account.provider].label.toUpperCase();
+  }
+  if (account.mail_protocol) return account.mail_protocol.toUpperCase();
+
+  const hasCalendar = Boolean(account.has_calendar_binding);
+  const hasContacts = Boolean(account.has_contacts_binding);
+  if (hasCalendar && hasContacts) return "Calendar and Contacts";
+  if (hasCalendar) return "Calendar";
+  if (hasContacts) return "Contacts";
+
+  switch (account.meet_protocol) {
     case "talk":
-      return "Nextcloud Talk";
     case "matrix":
-      return "Matrix";
     case "zoom":
-      return "Zoom";
     case "visio":
-      return "La Suite Visio";
+      return ACCOUNT_TYPE_DETAILS[account.meet_protocol].label;
     default:
       return "";
   }
 }
 
-/// Secondary line for the settings account list. Standalone CalDAV /
-/// CardDAV accounts created before the email back-fill landed have
-/// `email = ""`; falling back to `username` means they still show
-/// something identifying instead of a blank gap.
-export function accountSecondaryLabel(acc: { email: string; username: string }): string {
-  return acc.email || acc.username || "";
+export function accountSecondaryLabel(account: {
+  email: string;
+  username: string;
+}): string {
+  return account.email || account.username;
 }
 
-/// Brief subtitle shown under each card in the picker dialog.
-/// Kept terse — the card's title already says what the type is.
-export function accountTypeDescription(t: AccountType): string {
-  switch (t) {
-    case "gmail":
-      return "Mail, calendar and contacts via Google";
-    case "o365":
-      return "Mail, calendar and contacts via Microsoft 365";
-    case "imap":
-      return "Generic IMAP / SMTP mail account";
-    case "jmap":
-      return "JMAP mail (Stalwart, generic JMAP servers)";
-    case "fastmail":
-      return "Fastmail mail, calendar and contacts via JMAP API token";
-    case "caldav":
-      return "Standalone calendar via CalDAV";
-    case "carddav":
-      return "Standalone contacts via CardDAV";
-    case "talk":
-      return "Video conferencing on a Nextcloud server";
-    case "matrix":
-      return "Video conferencing via Matrix / Element Call";
-    case "zoom":
-      return "Video conferencing via Zoom";
-    case "visio":
-      return "Video conferencing via a La Suite Visio instance";
-  }
+export function accountTypeDescription(accountType: AccountType): string {
+  return ACCOUNT_TYPE_DETAILS[accountType].description;
 }
