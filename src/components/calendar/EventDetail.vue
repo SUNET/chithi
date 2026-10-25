@@ -11,7 +11,7 @@ import type { CalendarEditScope } from "@/lib/calendar-mutation-support";
 import { confirmCalendarAction } from "@/lib/calendar-action-confirmation";
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import * as api from "@/lib/tauri";
-import type { Calendar, CalendarEvent } from "@/lib/types";
+import type { Attendee, Calendar, CalendarEvent } from "@/lib/types";
 import TimeInput from "@/components/common/TimeInput.vue";
 import DateInput from "@/components/common/DateInput.vue";
 import LinkifiedText from "@/components/common/LinkifiedText.vue";
@@ -71,34 +71,33 @@ watch([
   error.value = null;
 }, { flush: "sync" });
 
-interface Attendee {
-  email: string;
-  name: string | null;
-  status: string;
-}
-
 const attendees = computed<Attendee[]>(() => {
   if (!event.value?.attendees_json) return [];
   try { return JSON.parse(event.value.attendees_json); } catch { return []; }
 });
 
 function canNotify(current: CalendarEvent): boolean {
-  const account = accountsStore.accounts.find(a => a.id === current.account_id);
+  const account = accountsStore.accounts.find(
+    (candidate) => candidate.id === current.account_id,
+  );
   if (!current.organizer_email || account?.email.toLowerCase() !== current.organizer_email.toLowerCase()) return false;
   try { return JSON.parse(current.attendees_json || "[]").length > 0; } catch { return false; }
 }
 
 const calendarInfo = computed(() => {
-  const cal = calendarStore.calendars.find(c => c.id === event.value?.calendar_id);
-  const account = accountsStore.accounts.find(a => a.id === event.value?.account_id);
+  const calendar = calendarStore.calendars.find(
+    (candidate) => candidate.id === event.value?.calendar_id,
+  );
+  const account = accountsStore.accounts.find(
+    (candidate) => candidate.id === event.value?.account_id,
+  );
   return {
-    name: cal?.name || "Unknown calendar",
-    color: cal?.color || "#4285f4",
+    name: calendar?.name || "Unknown calendar",
+    color: calendar?.color || "#4285f4",
     accountEmail: account?.email || "",
   };
 });
 
-// Edit form state — convert UTC to display timezone
 const editTitle = ref("");
 const editStartDate = ref("");
 const editStartTime = ref("");
@@ -115,10 +114,11 @@ watch(editScope, (scope) => {
   }
 });
 
-function calendarLabel(cal: Calendar): string {
-  // Same label format as EventForm's calendar picker.
-  const account = accountsStore.accounts.find((a) => a.id === cal.account_id);
-  return `${cal.name} (${account?.display_name || cal.account_id})`;
+function calendarLabel(calendar: Calendar): string {
+  const account = accountsStore.accounts.find(
+    (candidate) => candidate.id === calendar.account_id,
+  );
+  return `${calendar.name} (${account?.display_name || calendar.account_id})`;
 }
 
 function formatDateTime(iso: string): string {
@@ -280,7 +280,6 @@ async function saveEdit() {
     if (!isCurrentSelection(original.id, version)) return;
     const fresh = await refreshMutationTarget(notifyEventId, "attendee notification");
     if (!isCurrentSelection(original.id, version)) return;
-    // Notify attendees if organizer and event has attendees
     if (canNotify(fresh)) {
       const result = await tauriMessage(
         "This event has attendees. Send an update notification?",
@@ -294,8 +293,7 @@ async function saveEdit() {
         return;
       }
       if (!isCurrentSelection(original.id, version)) return;
-      // A background range refresh can evict the moved destination while
-      // the dialog is open. Revalidate the captured target, not the source.
+      // Revalidate the captured destination after the dialog wait.
       const notificationTarget = await refreshMutationTarget(notifyEventId, "attendee notification");
       if (!isCurrentSelection(original.id, version)) return;
       if ((result === "Send Update" || result === "Yes") && canNotify(notificationTarget)) {
@@ -307,8 +305,8 @@ async function saveEdit() {
       editing.value = false;
       emit("close");
     }
-  } catch (e) {
-    if (isCurrentSelection(original.id, version)) error.value = String(e);
+  } catch (cause) {
+    if (isCurrentSelection(original.id, version)) error.value = String(cause);
   } finally {
     saving.value = false;
   }
@@ -342,8 +340,8 @@ async function handleDelete() {
       !calendarStore.getEventMutationSupport(original.id).supported) return;
     await calendarStore.deleteEvent(original.id);
     if (!calendarStore.selectedEvent) emit("close");
-  } catch (e) {
-    if (isCurrentSelection(original.id, version)) error.value = String(e);
+  } catch (cause) {
+    if (isCurrentSelection(original.id, version)) error.value = String(cause);
   } finally {
     saving.value = false;
   }
@@ -364,7 +362,6 @@ async function handleDelete() {
         {{ mutationNotice }}
       </p>
 
-      <!-- View mode -->
       <div v-if="!editing" class="detail-body">
         <div class="detail-row">
           <span class="detail-icon">&#x1F4C5;</span>
@@ -405,10 +402,10 @@ async function handleDelete() {
         <div v-if="attendees.length > 0" class="detail-row">
           <span class="detail-icon">&#x1F465;</span>
           <div>
-            <div v-for="a in attendees" :key="a.email" class="attendee">
-              {{ a.name || a.email }}
-              <span class="attendee-status" :class="statusClass(a.status)">
-                ({{ a.status }})
+            <div v-for="attendee in attendees" :key="attendee.email" class="attendee">
+              {{ attendee.name || attendee.email }}
+              <span class="attendee-status" :class="statusClass(attendee.status)">
+                ({{ attendee.status }})
               </span>
             </div>
           </div>
@@ -425,7 +422,6 @@ async function handleDelete() {
         </div>
       </div>
 
-      <!-- Edit mode -->
       <div v-else class="detail-body edit-mode">
         <div v-if="!editSupport.scopes.includes('standalone')" class="edit-group">
           <label>Edit scope</label>
@@ -461,8 +457,8 @@ async function handleDelete() {
         <div class="edit-group">
           <label>Calendar</label>
           <select v-model="editCalendarId" :disabled="editScope === 'this-occurrence'" data-testid="event-detail-calendar">
-            <option v-for="cal in calendarStore.calendars" :key="cal.id" :value="cal.id">
-              {{ calendarLabel(cal) }}
+            <option v-for="calendar in calendarStore.calendars" :key="calendar.id" :value="calendar.id">
+              {{ calendarLabel(calendar) }}
             </option>
           </select>
         </div>
@@ -604,7 +600,6 @@ async function handleDelete() {
   margin: 0;
 }
 
-/* Edit mode */
 .edit-mode { display: flex; flex-direction: column; gap: 10px; }
 
 .edit-row { display: flex; gap: 12px; }
@@ -617,9 +612,7 @@ async function handleDelete() {
   color: var(--color-text-secondary);
 }
 
-/* Sizing tokens consumed by DateInput / TimeInput so they match the
-   native inputs in this form. See .date-input-trigger / .time-input-text
-   in src/components/common/{DateInput,TimeInput}.vue. */
+/* Shared sizing tokens for DateInput and TimeInput. */
 .edit-group {
   --input-height: 28px;
   --input-padding: 6px 8px;
