@@ -451,13 +451,7 @@ onMounted(() => {
     }
   });
 
-  // Render the SQLite cache before network sync can take provider lifecycle
-  // locks. Sync completion emits calendar-changed and refreshes this view.
-  // Then start the independent interval (5 min).
-  // The interval is intentionally NOT cleared on unmount — it keeps
-  // calendars fresh in the background for the lifetime of the app,
-  // matching how mail sync runs continuously. The calendar store's
-  // stopCalendarSync() is available if explicit teardown is needed.
+  // Render cached data before provider sync acquires lifecycle locks.
   localReady
     .then(() => calendarStore.syncCalendars())
     .catch((e) => console.error("Calendar sync error:", e));

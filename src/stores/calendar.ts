@@ -2,14 +2,27 @@ import { defineStore } from "pinia";
 import { ref, computed, watch, onScopeDispose } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  ArchivedGraphCalendar, Calendar, CalendarActionPlan, CalendarConfirmations,
-  CalendarEdit, CalendarEvent, CalendarOccurrence, CalendarOccurrencePage, NewEventInput,
+  ArchivedGraphCalendar,
+  Calendar,
+  CalendarActionPlan,
+  CalendarConfirmations,
+  CalendarEdit,
+  CalendarEvent,
+  CalendarOccurrence,
+  CalendarOccurrencePage,
+  NewEventInput,
 } from "@/lib/types";
 import {
-  expandRRule, isOccurrenceId, masterEventId, occurrenceId, parseRRule,
+  expandRRule,
+  isOccurrenceId,
+  masterEventId,
+  occurrenceId,
+  parseRRule,
 } from "@/lib/rrule";
 import {
-  calendarEditSupport, calendarMutationSupport, calendarScopedEditSupport,
+  calendarEditSupport,
+  calendarMutationSupport,
+  calendarScopedEditSupport,
 } from "@/lib/calendar-mutation-support";
 import * as api from "@/lib/tauri";
 import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
@@ -18,6 +31,23 @@ import { useAccountsStore } from "./accounts";
 import { useUiStore } from "./ui";
 
 export type CalendarViewMode = "day" | "week" | "month";
+
+const HIDDEN_CALENDARS_KEY = "chithi-hidden-calendars";
+const DEFAULT_CALENDAR_SYNC_INTERVAL_MS = 5 * 60_000;
+const CALENDAR_SYNC_TICK_MS = 60_000;
+const MILLISECONDS_PER_SECOND = 1_000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_DATE_MS = 8_639_999_999_999_999;
+
+function eventAnchorId(event: CalendarEvent): string {
+  return isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+}
+
+function requiresConfirmation(confirmations: CalendarConfirmations): boolean {
+  return (
+    confirmations.replacement_meeting_identity || confirmations.reset_exceptions
+  );
+}
 
 export const useCalendarStore = defineStore("calendar", () => {
   const uiStore = useUiStore();
@@ -31,8 +61,7 @@ export const useCalendarStore = defineStore("calendar", () => {
   const events = ref<CalendarEvent[]>([]);
   const projectedEvents = ref<CalendarEvent[] | null>(null);
   const viewMode = ref<CalendarViewMode>("week");
-  // currentDate/viewMode are the requested target. While it loads, the grid
-  // keeps rendering the previous coherent date/mode with its old projection.
+  // Keep rendering the last coherent range while the requested range loads.
   const currentDate = ref(toDateInTimezone(new Date(), uiStore.displayTimezone));
   const loading = ref(false);
   const eventsError = ref<string | null>(null);
@@ -64,12 +93,14 @@ export const useCalendarStore = defineStore("calendar", () => {
       repairTimers.delete(accountId);
       return;
     }
-    // Browsers clamp timers above 2^31 - 1 ms. Re-arm without shortening
-    // a longer provider cooldown.
-    repairTimers.set(accountId, setTimeout(
-      () => scheduleRepairCooldown(accountId, until),
-      Math.min(remaining, 2_147_483_647),
-    ));
+    // Re-arm cooldowns that exceed the browser's maximum timer duration.
+    repairTimers.set(
+      accountId,
+      setTimeout(
+        () => scheduleRepairCooldown(accountId, until),
+        Math.min(remaining, MAX_TIMEOUT_MS),
+      ),
+    );
   }
   let repairOffset = 0;
   const failedNavigation = ref<{ date: string; mode: CalendarViewMode } | null>(null);
@@ -80,8 +111,7 @@ export const useCalendarStore = defineStore("calendar", () => {
   let rangeRequest = 0;
   let calendarListRequest = 0;
   const selectedEvent = ref<CalendarEvent | null>(null);
-  // Exact-ID detail/capability data is independent of the rendered date range.
-  // Null revokes authorization while a refresh is pending or has failed.
+  // Null cache entries revoke mutation authorization after failed exact reads.
   const singleEventCache = ref(new Map<string, CalendarEvent | null>());
   const singleEventRequests = new Map<string, symbol>();
 
@@ -100,18 +130,16 @@ export const useCalendarStore = defineStore("calendar", () => {
     if (!match) return;
     const seconds = Number(match[1]);
     if (!Number.isFinite(seconds) || seconds <= 0) return;
-    calendarSyncCooldowns.set(accountId, Math.min(
-      8_639_999_999_999_999, Date.now() + seconds * 1000,
-    ));
+    calendarSyncCooldowns.set(
+      accountId,
+      Math.min(MAX_DATE_MS, Date.now() + seconds * MILLISECONDS_PER_SECOND),
+    );
   }
 
   function calendarSyncIsCoolingDown(accountId: string): boolean {
     return Date.now() < (calendarSyncCooldowns.get(accountId) ?? 0);
   }
 
-  // Visible calendars (all by default). Persisted to localStorage so the
-  // user's hide/show picks survive across sessions.
-  const HIDDEN_CALENDARS_KEY = "chithi-hidden-calendars";
   const hiddenCalendarIds = ref<string[]>(loadHiddenCalendarIds());
 
   function loadHiddenCalendarIds(): string[] {
@@ -134,34 +162,25 @@ export const useCalendarStore = defineStore("calendar", () => {
         JSON.stringify(hiddenCalendarIds.value),
       );
     } catch {
-      // Swallow quota / disabled-storage errors so toggling visibility
-      // never breaks the calendar UI.
+      // Visibility changes remain usable when storage is unavailable.
     }
   }
 
-  // Expand recurring events into individual occurrences for display
   const visibleEvents = computed(() => {
     const range = getDateRange(displayDate.value, displayViewMode.value);
     const rangeStart = new Date(range.start);
     const rangeEnd = new Date(range.end);
 
-    // Drop events whose calendar isn't in the (subscribed-only)
-    // calendar list. Without this filter, events linger from
-    // calendars the user unsubscribed from in the past — the next
-    // backend sync re-pulls them and they become "ghost" events
-    // visible in the grid even though the calendar is hidden in the
-    // sidebar.
-    const visibleCalendarIds = new Set(calendars.value.map((c) => c.id));
-
-    if (projectedEvents.value) {
-      return projectedEvents.value.filter((event) =>
+    const visibleCalendarIds = new Set(
+      calendars.value.map((calendar) => calendar.id),
+    );
+    const source =
+      projectedEvents.value ?? expandRawEvents(events.value, rangeStart, rangeEnd);
+    return source.filter(
+      (event) =>
         visibleCalendarIds.has(event.calendar_id) &&
-        !hiddenCalendarIds.value.includes(event.calendar_id));
-    }
-    return expandRawEvents(events.value, rangeStart, rangeEnd)
-      .filter((event) =>
-        visibleCalendarIds.has(event.calendar_id) &&
-        !hiddenCalendarIds.value.includes(event.calendar_id));
+        !hiddenCalendarIds.value.includes(event.calendar_id),
+    );
   });
 
   function expandRawEvents(
@@ -229,19 +248,19 @@ export const useCalendarStore = defineStore("calendar", () => {
     date = currentDate.value,
     mode = viewMode.value,
   ): { start: string; end: string } {
-    const d = parseCalendarDay(date);
+    const anchor = parseCalendarDay(date);
     let start: Date;
     let end: Date;
 
     if (mode === "day") {
-      start = new Date(d);
+      start = new Date(anchor);
       start.setHours(0, 0, 0, 0);
-      end = new Date(d);
+      end = new Date(anchor);
       end.setHours(23, 59, 59, 999);
     } else if (mode === "week") {
-      start = new Date(d);
-      const offset = (d.getDay() - uiStore.weekStartDay + 7) % 7;
-      start.setDate(d.getDate() - offset);
+      start = new Date(anchor);
+      const offset = (anchor.getDay() - uiStore.weekStartDay + 7) % 7;
+      start.setDate(anchor.getDate() - offset);
       start.setHours(0, 0, 0, 0);
       end = new Date(start);
       end.setDate(start.getDate() + 6);
@@ -277,11 +296,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       await accountsStore.fetchAccounts();
     }
     if (accountId) {
-      // Single-account sync used by the per-binding tick (#43): one
-      // account per call so each can run on its own cadence. The
-      // backend emits `calendar-changed` when the sync completes, and
-      // the listener below already triggers fetchCalendars() +
-      // fetchEvents() — so don't run them inline or we'd refresh twice.
+      // calendar-changed refreshes the UI after this per-account sync.
       if (calendarSyncIsCoolingDown(accountId)) {
         throw new Error("Graph calendar sync is waiting for its Retry-After cooldown.");
       }
@@ -295,26 +310,22 @@ export const useCalendarStore = defineStore("calendar", () => {
       }
       return;
     }
-    // Sync all accounts in parallel so a hanging account doesn't block others.
-    // Each backend sync_calendars emits "calendar-changed" when done, which
-    // triggers fetchCalendars + fetchEvents via the event listener.
-    // The final fetchCalendars/fetchEvents below is a safety net to ensure
-    // the UI is consistent after all syncs settle.
-    const targets = accountsStore.accounts.filter((account) =>
-      !calendarSyncIsCoolingDown(account.id));
-    const results = await Promise.allSettled(
-      targets.map((account) =>
-        api.syncCalendars(account.id),
-      ),
+    // Settle accounts independently, then perform one final coherent refresh.
+    const targets = accountsStore.accounts.filter(
+      (account) => !calendarSyncIsCoolingDown(account.id),
     );
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r.status === "rejected") {
-        syncErrors.value[targets[i].id] = String(r.reason);
-        recordCalendarSyncThrottle(targets[i].id, r.reason);
-        console.error("Calendar sync failed for", targets[i].id, r.reason);
+    const results = await Promise.allSettled(
+      targets.map((account) => api.syncCalendars(account.id)),
+    );
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      const target = targets[index];
+      if (result.status === "rejected") {
+        syncErrors.value[target.id] = String(result.reason);
+        recordCalendarSyncThrottle(target.id, result.reason);
+        console.error("Calendar sync failed for", target.id, result.reason);
       } else {
-        delete syncErrors.value[targets[i].id];
+        delete syncErrors.value[target.id];
       }
     }
     await fetchCalendars();
@@ -323,7 +334,6 @@ export const useCalendarStore = defineStore("calendar", () => {
 
   async function fetchCalendars() {
     const request = ++calendarListRequest;
-    // Ensure accounts are loaded
     try {
       if (accountsStore.accounts.length === 0) {
         await accountsStore.fetchAccounts();
@@ -336,13 +346,16 @@ export const useCalendarStore = defineStore("calendar", () => {
         archivedGraphCalendarsError.value = null;
         return;
       }
-      // Archive notices are independent of the subscribed calendar read.
-      // Neither failed query can replace the other's last complete result.
+      // Active and archived reads retain independent last-known-good state.
       const [active, archived] = await Promise.allSettled([
-        Promise.all(accountsStore.accounts.map((account) =>
-          api.listCalendars(account.id))),
-        Promise.all(accountsStore.accounts.map((account) =>
-          api.listArchivedGraphCalendars(account.id))),
+        Promise.all(
+          accountsStore.accounts.map((account) => api.listCalendars(account.id)),
+        ),
+        Promise.all(
+          accountsStore.accounts.map((account) =>
+            api.listArchivedGraphCalendars(account.id),
+          ),
+        ),
       ]);
       if (request !== calendarListRequest) return;
       if (archived.status === "fulfilled") {
@@ -356,7 +369,9 @@ export const useCalendarStore = defineStore("calendar", () => {
           "Could not check archived Graph calendars. Please retry.";
       }
       if (active.status === "rejected") throw active.reason;
-      calendars.value = active.value.flat().filter((c) => c.is_subscribed);
+      calendars.value = active.value
+        .flat()
+        .filter((calendar) => calendar.is_subscribed);
       calendarsError.value = null;
     } catch (error) {
       if (request !== calendarListRequest) return;
@@ -371,16 +386,20 @@ export const useCalendarStore = defineStore("calendar", () => {
     if (!pending.length) return;
     acknowledgingArchivedGraphCalendars.value = true;
     archivedGraphAcknowledgementError.value = null;
-    // Any older list read started before this write must not resurrect a
-    // warning that the database has already acknowledged.
-    ++calendarListRequest;
+    // Invalidate older reads so they cannot resurrect acknowledged warnings.
+    calendarListRequest += 1;
     try {
       for (const calendar of pending) {
         await api.acknowledgeArchivedGraphCalendar(
-          calendar.account_id, calendar.id);
-        archivedGraphCalendars.value = archivedGraphCalendars.value.map((item) =>
-          item.id === calendar.id && item.account_id === calendar.account_id
-            ? { ...item, acknowledged: true } : item);
+          calendar.account_id,
+          calendar.id,
+        );
+        archivedGraphCalendars.value = archivedGraphCalendars.value.map(
+          (item) =>
+            item.id === calendar.id && item.account_id === calendar.account_id
+              ? { ...item, acknowledged: true }
+              : item,
+        );
       }
     } catch (error) {
       archivedGraphAcknowledgementError.value =
@@ -443,9 +462,8 @@ export const useCalendarStore = defineStore("calendar", () => {
       if (results.length && results.every((result) => result.status === "rejected")) {
         throw new Error(errors.join("; "));
       }
-      // A bare provider master cannot prove its exceptions or even that it
-      // still exists. Sync supplies complete sets; never invent provider dates
-      // from a legacy master or a historical completed action.
+      // Provider masters cannot prove their exceptions or current existence.
+      // Only verified occurrence projections may supply provider dates.
       if (request !== rangeRequest) return;
       const activeRange = getDateRange();
       if (activeRange.start !== range.start || activeRange.end !== range.end) {
@@ -586,8 +604,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       );
     }
     const action = pending[0];
-    if (action.requires.replacement_meeting_identity ||
-      action.requires.reset_exceptions) {
+    if (requiresConfirmation(action.requires)) {
       throw new Error(
         "The unfinished calendar action requires confirmation before recovery.",
       );
@@ -613,7 +630,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     if (!support.supported || !support.occurrence) {
       throw new Error(support.reason || "The selected event is not an occurrence.");
     }
-    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const anchorId = eventAnchorId(event);
     if (await resumePendingOccurrenceAction(event, anchorId)) return;
     const originalStart = selectedOriginalStart(event);
     if (!originalStart) {
@@ -635,8 +652,7 @@ export const useCalendarStore = defineStore("calendar", () => {
       },
       edit,
     );
-    if (plan.requires.replacement_meeting_identity ||
-      plan.requires.reset_exceptions) {
+    if (requiresConfirmation(plan.requires)) {
       throw new Error("This occurrence edit requires unsupported confirmation.");
     }
     const result = await api.executeCalendarAction(plan.operation_id, {
@@ -660,7 +676,7 @@ export const useCalendarStore = defineStore("calendar", () => {
     if (!support.supported || !support.scopes.includes("entire-series")) {
       throw new Error(support.reason || "The selected event has no editable series.");
     }
-    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const anchorId = eventAnchorId(event);
     const start = event.start_time;
     const end = event.end_time;
     const view = await api.readCalendarEventSet(anchorId, start, end, 1);
@@ -683,7 +699,7 @@ export const useCalendarStore = defineStore("calendar", () => {
   async function resumePendingCalendarAction(
     event: CalendarEvent,
   ): Promise<string | null> {
-    const anchorId = isOccurrenceId(event.id) ? masterEventId(event.id) : event.id;
+    const anchorId = eventAnchorId(event);
     const pending = (await api.listPendingCalendarActions(event.account_id))
       .filter((action) => action.event_id === anchorId);
     const abandonedPlans = pending.filter((action) =>
@@ -723,8 +739,8 @@ export const useCalendarStore = defineStore("calendar", () => {
     return result.event_id;
   }
 
-  async function discardCalendarPlan(plan: CalendarActionPlan): Promise<void> {
-    await api.discardCalendarAction(plan.operation_id);
+  function discardCalendarPlan(plan: CalendarActionPlan): Promise<void> {
+    return api.discardCalendarAction(plan.operation_id);
   }
 
   function getEventMutationSupport(eventId: string) {
@@ -746,7 +762,9 @@ export const useCalendarStore = defineStore("calendar", () => {
   ): Promise<string> {
     requireMutableEvent(eventId);
     const newId = await api.moveEventToCalendar(
-      eventId, targetCalendarId, targetAccountId,
+      eventId,
+      targetCalendarId,
+      targetAccountId,
     );
     await refreshAfterMutation(newId);
     return newId;
@@ -769,7 +787,7 @@ export const useCalendarStore = defineStore("calendar", () => {
 
   function goToDate(date: string, mode = viewMode.value) {
     if (pendingDisplay.value && date === displayDate.value && mode === displayViewMode.value) {
-      rangeRequest++;
+      rangeRequest += 1;
       currentDate.value = date;
       viewMode.value = mode;
       pendingDisplay.value = null;
@@ -819,10 +837,9 @@ export const useCalendarStore = defineStore("calendar", () => {
       try {
         const outcome = await api.repairCalendarOccurrence(row.event_id);
         if (outcome.retry_after_seconds !== null) {
-          const until = Math.min(
-            8_639_999_999_999_999,
-            Date.now() + Math.max(1, outcome.retry_after_seconds) * 1000,
-          );
+          const retryDelayMs =
+            Math.max(1, outcome.retry_after_seconds) * MILLISECONDS_PER_SECOND;
+          const until = Math.min(MAX_DATE_MS, Date.now() + retryDelayMs);
           repairCooldowns.value.set(row.account_id, until);
           scheduleRepairCooldown(row.account_id, until);
           return;
@@ -843,35 +860,37 @@ export const useCalendarStore = defineStore("calendar", () => {
     goToDate(toDateInTimezone(new Date(), uiStore.displayTimezone));
   }
 
-  function goPrev() {
-    const d = parseCalendarDay(currentDate.value);
-    if (viewMode.value === "day") d.setDate(d.getDate() - 1);
-    else if (viewMode.value === "week") d.setDate(d.getDate() - 7);
-    else {
-      const day = d.getDate();
-      d.setDate(1);
-      d.setMonth(d.getMonth() - 1);
-      d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+  function navigateBy(direction: -1 | 1): void {
+    const date = parseCalendarDay(currentDate.value);
+    if (viewMode.value === "day") {
+      date.setDate(date.getDate() + direction);
+    } else if (viewMode.value === "week") {
+      date.setDate(date.getDate() + 7 * direction);
+    } else {
+      const originalDay = date.getDate();
+      date.setDate(1);
+      date.setMonth(date.getMonth() + direction);
+      const lastDay = new Date(
+        date.getFullYear(),
+        date.getMonth() + 1,
+        0,
+      ).getDate();
+      date.setDate(Math.min(originalDay, lastDay));
     }
-    goToDate(calendarDay(d));
+    goToDate(calendarDay(date));
   }
 
-  function goNext() {
-    const d = parseCalendarDay(currentDate.value);
-    if (viewMode.value === "day") d.setDate(d.getDate() + 1);
-    else if (viewMode.value === "week") d.setDate(d.getDate() + 7);
-    else {
-      const day = d.getDate();
-      d.setDate(1);
-      d.setMonth(d.getMonth() + 1);
-      d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
-    }
-    goToDate(calendarDay(d));
+  function goPrev(): void {
+    navigateBy(-1);
+  }
+
+  function goNext(): void {
+    navigateBy(1);
   }
 
   function toggleCalendarVisibility(calendarId: string) {
-    const idx = hiddenCalendarIds.value.indexOf(calendarId);
-    if (idx !== -1) {
+    const index = hiddenCalendarIds.value.indexOf(calendarId);
+    if (index !== -1) {
       hiddenCalendarIds.value = hiddenCalendarIds.value.filter(
         (id) => id !== calendarId,
       );
@@ -885,38 +904,25 @@ export const useCalendarStore = defineStore("calendar", () => {
     selectedEvent.value = event;
   }
 
-  // --- Independent calendar sync ---
-  // Calendar sync is decoupled from mail sync and runs on its own timer.
-  // The timer ticks every minute and evaluates each account's calendar
-  // binding interval (#43): an account whose binding has
-  // sync_interval_seconds=900 syncs every 15 minutes; one with `null`
-  // falls back to DEFAULT_CALENDAR_INTERVAL (5 minutes).
-  const DEFAULT_CALENDAR_INTERVAL_MS = 5 * 60 * 1000;
-  const TICK_MS = 60 * 1000;
   let calendarSyncIntervalId: ReturnType<typeof setInterval> | null = null;
   const lastCalendarSync = new Map<string, number>();
 
-  // We need access to the accounts store inside the timer. Importing it
-  // at module scope would create a cycle (calendar -> accounts -> ...);
-  // resolve it lazily on first tick instead.
-  async function tick() {
-    const { useAccountsStore } = await import("@/stores/accounts");
-    const accounts = useAccountsStore();
+  async function tick(): Promise<void> {
     const now = Date.now();
-    for (const acc of accounts.accounts) {
-      if (!acc.enabled) continue;
-      if (calendarSyncIsCoolingDown(acc.id)) continue;
+    for (const account of accountsStore.accounts) {
+      if (!account.enabled || calendarSyncIsCoolingDown(account.id)) continue;
+      const intervalSeconds = account.calendar_sync_interval_seconds;
       const intervalMs =
-        (acc.calendar_sync_interval_seconds ?? 0) > 0
-          ? (acc.calendar_sync_interval_seconds as number) * 1000
-          : DEFAULT_CALENDAR_INTERVAL_MS;
-      const last = lastCalendarSync.get(acc.id) ?? 0;
+        intervalSeconds !== null && intervalSeconds > 0
+          ? intervalSeconds * MILLISECONDS_PER_SECOND
+          : DEFAULT_CALENDAR_SYNC_INTERVAL_MS;
+      const last = lastCalendarSync.get(account.id) ?? 0;
       if (now - last < intervalMs) continue;
-      lastCalendarSync.set(acc.id, now);
+      lastCalendarSync.set(account.id, now);
       try {
-        await syncCalendars(acc.id);
-      } catch (e) {
-        console.error(`Periodic calendar sync failed for ${acc.id}:`, e);
+        await syncCalendars(account.id);
+      } catch (error) {
+        console.error(`Periodic calendar sync failed for ${account.id}:`, error);
       }
     }
   }
@@ -924,8 +930,10 @@ export const useCalendarStore = defineStore("calendar", () => {
   function startCalendarSync() {
     if (calendarSyncIntervalId) return;
     calendarSyncIntervalId = setInterval(() => {
-      tick().catch((e) => console.error("Calendar tick failed:", e));
-    }, TICK_MS);
+      void tick().catch((error) =>
+        console.error("Calendar tick failed:", error),
+      );
+    }, CALENDAR_SYNC_TICK_MS);
   }
 
   function stopCalendarSync() {
@@ -935,39 +943,47 @@ export const useCalendarStore = defineStore("calendar", () => {
     }
   }
 
-  // Listen for backend calendar-changed events to refresh UI
-  let stopCalendarChangedListener: null | (() => void) = null;
   let calendarDisposed = false;
-  const stopSyncListeners: (() => void)[] = [];
-  void listen<{ account_id: string; error: string }>("calendar-sync-error", ({ payload }) => {
-    if (!calendarDisposed) syncErrors.value[payload.account_id] = payload.error;
-  }).then((stop) => calendarDisposed ? stop() : stopSyncListeners.push(stop))
-    .catch((error) => console.error("Failed to subscribe to calendar-sync-error:", error));
-  void listen<string>("calendar-sync-complete", ({ payload }) => {
-    if (!calendarDisposed) delete syncErrors.value[payload];
-  }).then((stop) => calendarDisposed ? stop() : stopSyncListeners.push(stop))
-    .catch((error) => console.error("Failed to subscribe to calendar-sync-complete:", error));
-  void listen<string>("calendar-changed", () => {
-    if (calendarDisposed) return;
-    fetchCalendars().then(() => fetchEvents()).catch((error) =>
-      console.error("Calendar refresh failed:", error));
-  })
-    .then((unlisten) => {
-      if (calendarDisposed) {
-        unlisten();
-        return;
-      }
-      stopCalendarChangedListener = unlisten;
+  const calendarUnlistenFns: Array<() => void> = [];
+
+  function registerCalendarListener<T>(
+    name: string,
+    handler: (payload: T) => void,
+  ): void {
+    void listen<T>(name, ({ payload }) => {
+      if (!calendarDisposed) handler(payload);
     })
-    .catch((error) => {
-      console.error("Failed to subscribe to calendar-changed:", error);
-    });
+      .then((unlisten) => {
+        if (calendarDisposed) {
+          unlisten();
+        } else {
+          calendarUnlistenFns.push(unlisten);
+        }
+      })
+      .catch((error) =>
+        console.error(`Failed to subscribe to ${name}:`, error),
+      );
+  }
+
+  registerCalendarListener<{ account_id: string; error: string }>(
+    "calendar-sync-error",
+    (payload) => {
+      syncErrors.value[payload.account_id] = payload.error;
+    },
+  );
+  registerCalendarListener<string>("calendar-sync-complete", (accountId) => {
+    delete syncErrors.value[accountId];
+  });
+  registerCalendarListener<unknown>("calendar-changed", () => {
+    void fetchCalendars()
+      .then(() => fetchEvents())
+      .catch((error) => console.error("Calendar refresh failed:", error));
+  });
 
   onScopeDispose(() => {
     calendarDisposed = true;
     stopCalendarSync();
-    stopCalendarChangedListener?.();
-    for (const stop of stopSyncListeners) stop();
+    for (const unlisten of calendarUnlistenFns) unlisten();
     for (const timer of repairTimers.values()) clearTimeout(timer);
   });
 
@@ -995,7 +1011,6 @@ export const useCalendarStore = defineStore("calendar", () => {
     repairRetryAt,
     navigationPending,
     selectedEvent,
-    singleEventCache,
     hiddenCalendarIds,
     unsubscribeCalendar,
     syncCalendars,
@@ -1024,6 +1039,5 @@ export const useCalendarStore = defineStore("calendar", () => {
     toggleCalendarVisibility,
     selectEvent,
     startCalendarSync,
-    stopCalendarSync,
   };
 });
