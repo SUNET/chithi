@@ -1,16 +1,9 @@
 <script setup lang="ts">
-// Theme-aware date input used in place of `<input type="date">`. WebKitGTK's
-// native date picker ignores our CSS variables, can only be dismissed with
-// Esc (not by clicking outside), and uses a hostile light background on the
-// dark theme. This component renders a trigger button that matches the rest
-// of the app's surfaces and opens an in-DOM calendar popup.
-//
-// The v-model contract is the same as the native input: a "YYYY-MM-DD"
-// string (blank when no date is selected), so callers and existing
-// `localInputToUTC` logic don't need to change.
+// Replaces WebKitGTK's unthemeable native picker while retaining YYYY-MM-DD.
 
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useUiStore } from "@/stores/ui";
+import { calendarDay, parseCalendarDay } from "@/lib/calendar-days";
 
 const props = defineProps<{
   modelValue: string;
@@ -27,17 +20,8 @@ const open = ref(false);
 const viewYear = ref(new Date().getFullYear());
 const viewMonth = ref(new Date().getMonth());
 
-function parseYMD(s: string): Date | null {
-  const m = s?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
-}
-
-function toYMD(d: Date): string {
-  const y = d.getFullYear();
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
-  return `${y}-${mo}-${da}`;
+function parseYMD(value: string): Date | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? parseCalendarDay(value) : null;
 }
 
 function openPicker() {
@@ -51,8 +35,7 @@ function closePicker() {
   open.value = false;
 }
 
-// Keep the calendar's viewed month in sync when the parent replaces the
-// value while the popup is open (e.g. watchers that push endDate forward).
+// Follow parent updates while the picker is open.
 watch(
   () => props.modelValue,
   (v) => {
@@ -94,22 +77,18 @@ const monthLabel = computed(() => {
   return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 });
 
+function moveMonth(offset: -1 | 1) {
+  const next = new Date(viewYear.value, viewMonth.value + offset, 1);
+  viewYear.value = next.getFullYear();
+  viewMonth.value = next.getMonth();
+}
+
 function goPrev() {
-  if (viewMonth.value === 0) {
-    viewMonth.value = 11;
-    viewYear.value--;
-  } else {
-    viewMonth.value--;
-  }
+  moveMonth(-1);
 }
 
 function goNext() {
-  if (viewMonth.value === 11) {
-    viewMonth.value = 0;
-    viewYear.value++;
-  } else {
-    viewMonth.value++;
-  }
+  moveMonth(1);
 }
 
 function isToday(d: Date): boolean {
@@ -122,7 +101,7 @@ function isToday(d: Date): boolean {
 }
 
 function isSelected(d: Date): boolean {
-  return toYMD(d) === props.modelValue;
+  return calendarDay(d) === props.modelValue;
 }
 
 function isCurrentMonth(d: Date): boolean {
@@ -130,12 +109,12 @@ function isCurrentMonth(d: Date): boolean {
 }
 
 function isDisabled(d: Date): boolean {
-  return props.min ? toYMD(d) < props.min : false;
+  return props.min ? calendarDay(d) < props.min : false;
 }
 
 function selectDay(d: Date) {
   if (isDisabled(d)) return;
-  emit("update:modelValue", toYMD(d));
+  emit("update:modelValue", calendarDay(d));
   closePicker();
 }
 
@@ -234,7 +213,7 @@ onUnmounted(() => {
               disabled: isDisabled(day),
             }"
             :disabled="isDisabled(day)"
-            :data-testid="`date-picker-day-${toYMD(day)}`"
+            :data-testid="`date-picker-day-${calendarDay(day)}`"
             @click="selectDay(day)"
           >
             {{ day.getDate() }}
@@ -252,9 +231,7 @@ onUnmounted(() => {
   width: 100%;
 }
 
-/* Sizing tokens are inherited from the nearest enclosing parent (see
-   EventForm .form-group / EventDetail .edit-group / RecurrenceEditor
-   .recurrence-row). Defaults cover compact/standalone use. */
+/* Parent forms override these sizing tokens. */
 .date-input-trigger {
   display: flex;
   align-items: center;
