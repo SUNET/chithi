@@ -1,36 +1,34 @@
-export interface Account {
-  id: string;
-  display_name: string;
-  email: string;
-  // Carried in the summary so the settings list can show *something*
-  // for standalone CalDAV / CardDAV accounts whose `email` was never
-  // set (older accounts created before the DAV-tab email back-fill).
-  username: string;
-  provider: "generic" | "gmail" | "microsoft365" | "o365" | "fastmail";
-  // Empty string means "no mail binding" — calendar-only / contacts-only
-  // accounts (#43). Existing screens that need a mail account should
-  // filter these out.
-  mail_protocol: "" | "imap" | "jmap" | "graph";
-  enabled: boolean;
-  // Phase 4 (#43): per-binding sync intervals exposed on the summary
-  // so periodic-sync timers can pick the right cadence per account
-  // without a separate get_account_config call.
+export type AccountProvider =
+  | "generic"
+  | "gmail"
+  | "microsoft365"
+  | "o365"
+  | "fastmail";
+
+export type MailProtocol = "" | "imap" | "jmap" | "graph";
+export type MeetProtocol = "" | "talk" | "matrix" | "zoom" | "visio";
+
+/** Null leaves the service's default sync cadence unchanged. */
+interface SyncIntervals {
   mail_sync_interval_seconds: number | null;
   calendar_sync_interval_seconds: number | null;
   contacts_sync_interval_seconds: number | null;
-  // Whether the account has a calendar / contacts binding *and*
-  // that binding is currently enabled. The settings list keys off
-  // these to label standalone CalDAV-only vs CardDAV-only accounts
-  // (a CalDAV-tab account derives a disabled contacts binding;
-  // existence-only flags would always say true for both).
+}
+
+export interface Account extends SyncIntervals {
+  id: string;
+  display_name: string;
+  email: string;
+  username: string;
+  provider: AccountProvider;
+  /** Empty means the account has no mail binding. */
+  mail_protocol: MailProtocol;
+  enabled: boolean;
+  /** True only when the corresponding binding exists and is enabled. */
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
-  // #148. Protocol of the account's enabled meet binding —
-  // `talk`, `matrix`, `zoom`, or whatever else is registered
-  // in `meet::registry()` — empty when there is none. Lets the
-  // calendar event editor populate its "Add video link"
-  // dropdown without an extra round-trip per row.
-  meet_protocol: "" | "talk" | "matrix" | "zoom" | "visio";
+  /** Empty means the account has no enabled meeting binding. */
+  meet_protocol: MeetProtocol;
 }
 
 export interface QuickFilter {
@@ -78,15 +76,12 @@ export interface Folder {
   children: Folder[];
 }
 
-// The account/folder the user was last viewing, persisted via
-// `save_last_view` and restored on startup (#191). Either field is
-// `null` on a fresh install or before the first navigation is saved.
 export interface LastView {
   account_id: string | null;
   folder_path: string | null;
 }
 
-export interface Address {
+interface Address {
   name: string | null;
   email: string;
 }
@@ -126,7 +121,7 @@ export interface MessageSummary {
   in_reply_to: string | null;
 }
 
-export type PgpKind = "mimeEncrypted" | "mimeSigned" | "inlineArmor";
+type PgpKind = "mimeEncrypted" | "mimeSigned" | "inlineArmor";
 
 export interface MessageBody {
   id: string;
@@ -143,8 +138,7 @@ export interface MessageBody {
   is_signed: boolean;
   list_id: string | null;
   has_remote_images: boolean;
-  /** Detected PGP shape — absent for plain mail. Drives the reader UI's
-   *  Decrypt button / signature badge. */
+  /** Detected PGP shape; absent for plain mail. */
   pgp_kind?: PgpKind;
 }
 
@@ -201,31 +195,22 @@ export interface ThreadedPage {
   per_page: number;
 }
 
-export interface AccountConfig {
+export interface AccountConfig extends SyncIntervals {
   display_name: string;
   sender_name: string;
   email: string;
-  provider: "generic" | "gmail" | "microsoft365" | "o365" | "fastmail";
-  /// Empty string means "no mail binding" (CalDAV-only / CardDAV-only).
-  mail_protocol: "" | "imap" | "jmap" | "graph";
+  provider: AccountProvider;
+  /** Empty means the account has no mail binding. */
+  mail_protocol: MailProtocol;
   imap_host: string;
   imap_port: number;
   smtp_host: string;
   smtp_port: number;
   jmap_url: string;
   caldav_url: string;
-  /// #148. Server URL the provider keys off. Nextcloud root for
-  /// Talk, homeserver for Matrix. For Zoom this is a marker
-  /// (`https://zoom.us`) since Zoom is a hosted service with no
-  /// per-user URL — `create_url` reads the OAuth token from the
-  /// keyring and ignores this. Empty when the account has no
-  /// meet binding.
+  /** Provider server URL; hosted Zoom accounts use a marker URL. */
   meet_url: string;
-  /// Provider discriminator chosen by the Settings tab the user
-  /// signed in through. The set in this union is whatever the
-  /// `meet::registry()` exposes today; empty when there's no
-  /// meet binding.
-  meet_protocol: "" | "talk" | "matrix" | "zoom" | "visio";
+  meet_protocol: MeetProtocol;
   username: string;
   password: string;
   use_tls: boolean;
@@ -233,40 +218,19 @@ export interface AccountConfig {
   jmap_auth_method: "basic" | "bearer" | "oidc";
   oidc_token_endpoint: string;
   oidc_client_id: string;
-  /// Whether the calendar binding is enabled. Mirrors mail_sync_enabled
-  /// for the calendar service.
   calendar_sync_enabled: boolean;
-  /// Phase 4 (#43): per-binding enabled flags + sync intervals.
   mail_sync_enabled: boolean;
   contacts_sync_enabled: boolean;
-  /// Override the default sync cadence (in seconds). `null` keeps the
-  /// service's default (mail handled by IDLE/push, calendar 5 min,
-  /// contacts 30 min).
-  mail_sync_interval_seconds: number | null;
-  calendar_sync_interval_seconds: number | null;
-  contacts_sync_interval_seconds: number | null;
-  /// Whether a calendar / contacts binding actually exists for this
-  /// account (regardless of its enabled state). Used by the Settings
-  /// edit form to disambiguate standalone CalDAV-only vs CardDAV-only
-  /// accounts even when the user has unchecked the matching Sync flag.
-  /// Backend-populated; treated as read-only in form state.
+  /** Binding existence, independent of the enabled flags above. */
   has_calendar_binding: boolean;
   has_contacts_binding: boolean;
-  /// Per-account OpenPGP "Advanced settings". All default `true`. The
-  /// compose / draft backend reads these to govern feature behavior at
-  /// send / save time.
+  /** Per-account OpenPGP settings; all default to true. */
   pgp_attach_pubkey_on_sign: boolean;
   pgp_autocrypt_header: boolean;
   pgp_encrypt_subject: boolean;
   pgp_encrypt_drafts: boolean;
 }
 
-/// IMAP / SMTP discovery result returned by `discoverMailServers`.
-/// Mail-only — CalDAV / CardDAV are not probed here, those have
-/// dedicated account types. Empty strings / zero ports mean "not
-/// found"; the frontend only applies non-empty fields to the form.
-/// `source` is informational: "isp-db" | "domain-autoconfig" |
-/// "well-known" | "mx" | "host-probe" | "".
 export interface AutoconfigResult {
   imap_host: string;
   imap_port: number;
@@ -274,7 +238,13 @@ export interface AutoconfigResult {
   smtp_host: string;
   smtp_port: number;
   smtp_use_tls: boolean;
-  source: string;
+  source:
+    | ""
+    | "isp-db"
+    | "domain-autoconfig"
+    | "well-known"
+    | "mx"
+    | "host-probe";
 }
 
 export interface FilterRule {
@@ -289,8 +259,15 @@ export interface FilterRule {
   stop_processing: boolean;
 }
 
-export interface FilterCondition {
-  field: "from" | "to" | "cc" | "to_cc" | "subject" | "size" | "has_attachment";
+interface FilterCondition {
+  field:
+    | "from"
+    | "to"
+    | "cc"
+    | "to_cc"
+    | "subject"
+    | "size"
+    | "has_attachment";
   op:
     | "contains"
     | "not_contains"
@@ -312,7 +289,6 @@ export type FilterAction =
   | { action: "mark_unread" }
   | { action: "stop" };
 
-// Calendar types
 export interface Calendar {
   id: string;
   account_id: string;
@@ -354,7 +330,7 @@ export interface CalendarEvent {
   source_message_id: string | null;
 }
 
-export interface CalendarSelection {
+interface CalendarSelection {
   event_id: string;
   token: string;
   original_start: string | null;
@@ -385,10 +361,15 @@ export interface CalendarOccurrencePage {
   occurrences: CalendarOccurrence[];
   has_more: boolean;
   needs_hydration: string[];
-  /** Unverified detached rows; never project or edit them as occurrences. */
+  /** Unverified rows that must not be projected or edited as occurrences. */
   unresolved: { event_id: string; calendar_id: string; account_id: string }[];
-  /** Resource-specific display failures; unrelated occurrences remain usable. */
-  display_errors?: { event_id: string; calendar_id: string; account_id: string; message: string }[];
+  /** Per-resource failures that do not invalidate other occurrences. */
+  display_errors?: Array<{
+    event_id: string;
+    calendar_id: string;
+    account_id: string;
+    message: string;
+  }>;
 }
 
 export interface CalendarEventSetView {
@@ -429,8 +410,13 @@ export interface CalendarActionPlan {
 
 export interface CalendarActionResult {
   operation_id: string;
-  stage: "planned" | "applying" | "destination-verified" |
-    "source-removal-pending" | "reconciling" | "completed";
+  stage:
+    | "planned"
+    | "applying"
+    | "destination-verified"
+    | "source-removal-pending"
+    | "reconciling"
+    | "completed";
   event_id: string;
   requires: CalendarConfirmations;
   auto_resume?: boolean;
@@ -443,11 +429,7 @@ export interface Attendee {
   is_self?: boolean;
 }
 
-/**
- * A calendar invite returned by `list_invites` — a CalendarEvent the
- * account was invited to (attendee, not organizer), plus the row's
- * `created_at` arrival timestamp used for the "recently received" sort.
- */
+/** Stored invitation with local handling and arrival metadata. */
 export interface Invite extends CalendarEvent {
   manually_managed_at: string | null;
   created_at: string | null;
@@ -505,16 +487,11 @@ export interface NewEventInput {
   timezone: string | null;
   recurrence_rule: string | null;
   attendees: Attendee[];
-  /** Optional meet binding to persist with the event so later
-   * reschedule / cancel calls can act on the right remote meeting.
-   * Comes from `meetCreateUrl` when the user adds a video link. */
+  /** Remote meeting identity needed for later rescheduling or cancellation. */
   meet_binding?: MeetBinding | null;
 }
 
-/** Provider-agnostic handle for a remote meeting Chithi created on
- * behalf of an event. Returned by `meetCreateUrl` and accepted by
- * `createEvent` / `updateEvent` so the backend can persist the
- * link in `meet_meetings`. */
+/** Provider-agnostic handle for a remote meeting created for an event. */
 export interface MeetBinding {
   lifecycle_id: string;
   account_id: string;
@@ -531,15 +508,12 @@ export interface ComposeMessage {
   body_text: string;
   body_html: string | null;
   attachments: ComposeAttachment[];
-  /** chithi's internal id of the message being replied to. Drives
-   *  In-Reply-To / References on the outgoing email. Omit for new mails. */
+  /** Internal message ID used to generate In-Reply-To and References. */
   reply_to_message_id?: string | null;
-  /** OpenPGP toggles. Default false. */
+  /** OpenPGP toggles; both default to false. */
   pgp_sign?: boolean;
   pgp_encrypt?: boolean;
-  /** "Compose in Markdown": when true the backend treats `body_text` as
-   *  Markdown, rendering it to safe HTML and sending both parts. Ignored
-   *  when `body_html` is already set. Default false. */
+  /** Renders body_text as Markdown unless body_html is already set. */
   markdown?: boolean;
 }
 
@@ -549,12 +523,8 @@ export interface PgpRecipientStatus {
   fingerprint: string | null;
 }
 
-/** Result of `save_draft`. Lets the composer tell the user when the
- *  "Store drafts encrypted" toggle could not be honored. */
 export interface DraftSaveOutcome {
-  /** True when encryption was requested for this account but the draft
-   *  was stored in plaintext anyway (Microsoft Graph account, or no
-   *  usable public key in the keystore). */
+  /** True when requested draft encryption fell back to plaintext. */
   plaintext_fallback: boolean;
 }
 
@@ -563,7 +533,6 @@ export interface ComposeAttachment {
   name: string;
 }
 
-// Contacts types
 export interface ContactBook {
   id: string;
   account_id: string;
@@ -597,8 +566,6 @@ export interface CollectedContact {
   use_count: number;
 }
 
-// --- Operation status types (for sync architecture) ---
-
 export interface FailedOp {
   account_id: string;
   op_type: string;
@@ -612,11 +579,7 @@ export interface OfflineQueueChange {
   action_type: string;
 }
 
-// --- Outbox ---
-
-/// Synthetic folder path used by the FolderTree to flag the per-account
-/// Outbox node. Picked to be invalid as a real IMAP/JMAP mailbox name so
-/// it can never collide with a server-side folder.
+/** Invalid as an IMAP/JMAP mailbox name, preventing remote-folder collisions. */
 export const OUTBOX_FOLDER = "__chithi_outbox__";
 
 export interface OutboxRow {
@@ -633,14 +596,12 @@ export interface OutboxRow {
   bcc: string[];
 }
 
-// --- OpenPGP ---
-
-export interface PgpUserId {
+interface PgpUserId {
   uid: string;
   email: string | null;
 }
 
-export interface PgpSubkey {
+interface PgpSubkey {
   fingerprint: string;
   keyId: string;
   /** "signing" | "encryption" | "authentication" | "certification" | "unknown" */

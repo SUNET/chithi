@@ -152,7 +152,7 @@ describe("ImapServerSection", () => {
       smtp_host: "smtp.found.org",
       smtp_port: 587,
       smtp_use_tls: true,
-      source: "autoconfig",
+      source: "domain-autoconfig",
     });
     const form = makeForm({
       email: "u@found.org",
@@ -180,7 +180,7 @@ describe("ImapServerSection", () => {
       smtp_host: "smtp.found.org",
       smtp_port: 587,
       smtp_use_tls: false,
-      source: "autoconfig",
+      source: "domain-autoconfig",
     });
     const form = makeForm({
       email: "u@found.org",
